@@ -44,6 +44,18 @@ que la fusion a fait entrer (`class_at_merge`, `lot_measures.diff_range`) —
 jamais `cible..gel`, vide dès que le gel est un ancêtre de la cible — avec les
 indices de l'appelant ; seule `light` ouvre, un doute n'ouvre rien, et
 l'idempotence reste celle de `open_after_merge`.
+
+#1280 (R codex3 B2) : un avis (`review-after-merge:#P`, `REVUE #N` ou mission
+`R1`/`R2`) n'ouvre **jamais** la relecture d'un avis — la garde est posée ici,
+avant toute lecture de classe, pour couper la récursion des fausses fusions
+d'avis. Le corps du lot de relecture dit aussi au lecteur de clore sa mission
+par `ameesh work close <id> --done` après avoir livré son verdict.
+
+#2377 : la famille écrite au corps n'était qu'une consigne — la prise au repos
+(L165) ouvrait le lot à toute l'équipe, et un agent de la famille de l'auteur
+pouvait le prendre (#2340). `required_family` relit la même preuve au moment
+de la prise et `may_take` n'ouvre le lot qu'à la famille opposée ; l'auteur
+inconnu ne se devine pas, et le lot attend alors une attribution explicite.
 """
 from __future__ import annotations
 
@@ -326,6 +338,51 @@ def _author_at_freeze(db, lot: int, item: dict) -> dict:
     return out
 
 
+def required_family(db, item: dict) -> Optional[str]:
+    """La famille de harnais qu'exige la prise d'un lot de relecture (#2377).
+
+    `None` quand ce n'est pas un lot de relecture (`issue_ref` hors du préfixe
+    `review-after-merge:`) : aucune garde. Une chaîne vide quand la famille de
+    l'auteur au gel est inconnue, ou quand sa trace est illisible : le lot
+    n'est alors **pris par personne** au repos (doute -> non pris, canon §8) et
+    attend une attribution explicite. Sinon la famille opposée à celle de
+    l'auteur au gel (`reviewer_family`), celle que le canon §2 demande au
+    relecteur.
+
+    La lecture réutilise `_author_at_freeze` : c'est la même preuve que celle
+    qui a écrit le corps du lot (gel, acteur, tours tracés), jamais le registre
+    courant — il ne dit rien du harnais qui a produit le travail (#1053)."""
+    ref = str((item or {}).get("issue_ref") or "").strip().lower()
+    if not ref.startswith(PREFIX):
+        return None
+    try:
+        lot = int(ref[len(PREFIX):].strip().lstrip("#"))
+        source = work.get(db, lot)
+        if source is None:
+            return ""
+        family = reviewer_family(_author_at_freeze(db, lot, source).get("harness"))
+    except Exception:  # noqa: BLE001 - lecture impossible : famille inconnue
+        return ""
+    return "" if family == UNKNOWN_FAMILY else family
+
+
+def may_take(db, item: dict, agent: dict) -> bool:
+    """Un agent au repos peut-il prendre ce lot ? (#2377)
+
+    Hors lot de relecture, oui, sans autre condition. Pour un lot de
+    relecture, seule la famille opposée à celle de l'auteur au gel le prend ;
+    la session vivante du preneur fait foi (`registry.live_harness`, #1037),
+    et un harnais hors des familles connues (`family_of`) ne compte pas.
+    Famille de l'auteur inconnue ou famille du preneur inconnue : non — la
+    prise ne devine jamais une indépendance d'avis (#1374)."""
+    family = required_family(db, item)
+    if family is None:
+        return True
+    from . import registry
+    mine = family_of(registry.live_harness(agent or {}))
+    return bool(family) and family == mine
+
+
 def title_of(item: dict, lot: int) -> str:
     """Le titre du lot de relecture."""
     return "REVUE #%d : relecture après fusion — %s" % (
@@ -362,6 +419,9 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
         % (merged_sha[:12] if merged_sha else "<sha>"),
         "- livrer le verdict (`ameesh work milestone %d verdict ok|blocked --sha %s`) ;"
         % (int(lot), merged_sha or "<sha>"),
+        "- **livré le verdict ? clore cette mission** : `ameesh work close <id> --done` — "
+        "elle n'a ni branche ni fusion, et le verdict du parent relu en est la preuve "
+        "(#1280) ;",
         "- si un défaut **non bloquant** se corrige en moins de 5 minutes, le corriger "
         "et pousser la correction sur la cible : le relecteur corrige lui-même dès le "
         "premier tour (canon §2, home#81) ; les autres défauts non bloquants vont au "
@@ -382,6 +442,15 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
         "relecteur disponible de la bonne famille le prend.",
     ]
     return "\n".join(lines)
+
+
+def _review_recursion(item: dict) -> str:
+    """Garde anti-récursion (#1280 B2) : rendre la raison si `item` est
+    lui-même un avis, "" sinon. Un avis n'a ni code ni fusion à relire."""
+    if work.is_review(item):
+        return ("lot #%d : c'est un avis (relecture), la relecture d'un avis ne "
+                "s'ouvre pas" % int(item.get("id") or 0))
+    return ""
 
 
 def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
@@ -409,6 +478,10 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
         item = work.get(db, lot)
     if item is None:
         out["why"] = "lot #%d introuvable" % lot
+        return out
+    recursion = _review_recursion(item)
+    if recursion:
+        out["why"] = recursion
         return out
     ref = ref_of(lot)
     ops = storage.of(db).work
@@ -535,6 +608,10 @@ def open_for_merge(db, lot: int, *, merged_sha: str = "", pr=None,
         item = work.get(db, lot)
         if item is None:
             out["why"] = "lot #%d introuvable" % lot
+            return out
+        recursion = _review_recursion(item)
+        if recursion:
+            out["why"] = recursion
             return out
         existing = _open(storage.of(db).work, ref_of(lot))
         if existing is not None:

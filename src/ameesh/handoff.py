@@ -438,7 +438,7 @@ def budget_handoff(cfg, db, *, now: float | None = None,
                                         dict(agent, team=project),
                                         auditor=row["name"] in auditors,
                                         card=auditors.get(row["name"]),
-                                        others=listing):
+                                        others=listing, db=db):
                     continue
                 target = row
                 break

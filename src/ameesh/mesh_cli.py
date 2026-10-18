@@ -1798,7 +1798,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 delivered = next((m.get("sha") for m in item.get("milestones", [])
                                   if m.get("kind") == "delivered" and m.get("sha")), "")
                 print("closed   : %s%s" % (
-                    work.close_label(item),
+                    work.close_how(item.get("close_reason"), item.get("superseded_by")),
                     " (head %s)" % delivered[:12] if delivered else ""))
             if item.get("pr_ref"):
                 print("PR       : %s" % item["pr_ref"])
