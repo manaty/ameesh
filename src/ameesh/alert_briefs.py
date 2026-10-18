@@ -267,7 +267,9 @@ def _slo_breach(alert: dict) -> str:
     composeur et ne prescrit ni relance ni réassignation du porteur.
 
     #2378 : de même pour une demande de décision ouverte et échue
-    (`waiting.decision`) : le geste est de relancer le décideur."""
+    (`waiting.decision`) : le geste est de vérifier l'échéance avec le
+    demandeur (renouveler ou retirer la demande) ; le décideur a le rappel de
+    sa demande, l'alerte SLO ne le relance pas (canon §9, owner 18/10)."""
     lot = int(alert["lot"])
     title = alert.get("title")
     level = int(alert.get("level") or 1)
@@ -312,17 +314,21 @@ def _slo_breach(alert: dict) -> str:
         late = (" (deadline %s passed)" % time.strftime("%Y-%m-%d %H:%M",
                                                          time.localtime(float(due)))
                 if due is not None else "")
+        # Canon §9 (owner 18/10) : rien sur les SLO pour l'owner — le rappel
+        # du décideur est celui de la demande (`decision_overdue`), pas un
+        # geste dicté par l'alerte SLO.
         if level >= 3:
             move = ("bureau or auditor: the lot is `waiting_human` on decision #%d for "
                     "%s%s — reassigning or nudging its holder does not advance it; push "
-                    "the pilot to remind the decider or to have the request renewed or "
-                    "withdrawn (ameesh decide show %d)" % (decision, decider, late,
-                                                            decision))
+                    "the pilot to check the deadline with the requester, who renews or "
+                    "withdraws the request (ameesh decide show %d)"
+                    % (decision, decider, late, decision))
         else:
             move = ("pilot: the lot is `waiting_human` on decision #%d for %s%s — do not "
-                    "reassign its holder; remind the decider, or check the deadline with "
-                    "the requester (ameesh decide show %d)" % (decision, decider, late,
-                                                              decision))
+                    "reassign its holder; check the deadline with the requester, who "
+                    "renews or withdraws the request (ameesh decide show %d); the "
+                    "decider gets the request's own reminder, not an SLO nudge"
+                    % (decision, decider, late, decision))
     elif what == "unblock":
         if level >= 3:
             move = ("bureau or auditor: the lot is `blocked` and the pilot owns the "

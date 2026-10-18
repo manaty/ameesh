@@ -264,8 +264,9 @@ class AttentePorteurTest(_Base):
 class AttenteDecisionTest(_Base):
     """#2378 : un lot `waiting_human` à demande de décision ouverte attend son
     décideur. Non échue, c'est une attente prévue (aucune alerte) ; échue,
-    l'alerte vise le pilote et prescrit de relancer le décideur, jamais de
-    réassigner le porteur. Sans demande, rien ne change."""
+    l'alerte vise le pilote et prescrit de vérifier l'échéance avec le
+    demandeur, jamais de réassigner le porteur ni de relancer l'owner (canon
+    §9). Sans demande, rien ne change."""
 
     def ask(self, due_in_s=2 * HEURE):
         view = decisions.ask(self.cfg, self.db, requester="dev1",
@@ -310,7 +311,8 @@ class AttenteDecisionTest(_Base):
         self.assertEqual(sorted(out), ["auditeur", "bureau", "orch"])
         for text in out.values():
             self.assertIn("decision #%d" % view["id"], text)
-            self.assertIn("remind the decider", text)
+            self.assertIn("check the deadline with the requester", text)
+            self.assertNotIn("remind the decider", text)
             self.assertIn("deadline", text)
             self.assertNotIn("reassign it now", text)
             self.assertNotIn("ameesh work assign", text)
