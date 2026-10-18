@@ -559,9 +559,15 @@ class NotifyTest(_Lots):
         self.assertEqual(notify.take_settings(parser.parse_args(["--take-idle", "0"])),
                          {"idle_s": 0.0, "max_per_hour": 0,
                           "lot_idle_s": backlog.DEFAULT_LOT_IDLE_S,
-                          "lot_max_per_hour": backlog.DEFAULT_LOT_MAX_PER_HOUR})
+                          "lot_max_per_hour": backlog.DEFAULT_LOT_MAX_PER_HOUR,
+                          "review_max_per_hour": backlog.REVIEW_PROPOSAL_MAX_PER_HOUR})
         self.assertEqual(notify.take_settings(parser.parse_args(["--take-lot-idle", "0"]))
                          ["lot_max_per_hour"], 0)
+        # #1738 (N3) : les propositions de relecture/correction ont leur propre
+        # interrupteur, à 0 = coupées.
+        self.assertEqual(notify.take_settings(
+            parser.parse_args(["--take-review-max-per-hour", "0"]))
+            ["review_max_per_hour"], 0)
         # #754 : l'ancien `--take-paid` reste accepté, sans effet : la prise
         # par un agent au token est acquise après les forfaits.
         self.assertEqual(notify.take_settings(parser.parse_args(["--take-idle", "60"])),

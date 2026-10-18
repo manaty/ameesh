@@ -692,7 +692,7 @@ class WorkItems(interface.WorkItems):
                             actor)
 
     def _designate_reviewer(self, item_id, reviewer, actor, *, remove=False,
-                            event=None) -> dict | None:
+                            event=None, vacant=False) -> dict | None:
         """`designate_reviewer` dans la transaction ouverte : l'écriture et sa
         ligne de journal ensemble. #705 r2 (B1) : la règle « le relecteur n'est
         pas l'assigné » est relue DANS l'update — l'appelant a lu la ligne
@@ -702,7 +702,11 @@ class WorkItems(interface.WorkItems):
         La liste est lue sous le verrou de la ligne, dans la même transaction,
         puis comparée à l'écriture : `--remove` d'un nom non désigné, ou
         `--remove` global sur une liste déjà vide, ne laisse aucun faux
-        « removed » au journal."""
+        « removed » au journal.
+
+        #1738 R1 (B1) : `vacant` en fait un compare-and-set — un relecteur
+        posé entre-temps (par le pilote, hors verrou) n'est pas écrasé par
+        une proposition de relecture."""
         if remove or not reviewer:
             locked = self.db.query(
                 "SELECT " + item_columns(self.db) + " FROM work_items"
@@ -730,7 +734,8 @@ class WorkItems(interface.WorkItems):
             "UPDATE work_items SET reviewers = " + expression + ", updated_at = now()"
             " WHERE id = %s AND state = 'qa'"
             "   AND (assignee IS DISTINCT FROM %s OR %s)"
-            " RETURNING " + item_columns(self.db),
+            + (" AND coalesce(reviewer, '') = ''" if vacant and not remove else "")
+            + " RETURNING " + item_columns(self.db),
             tuple(params + [int(item_id), reviewer, bool(remove)]))
         if not rows:
             return None
@@ -2432,6 +2437,12 @@ class WorkItems(interface.WorkItems):
         pas le même lot deux fois. B1 : le verdict lu est le verdict courant —
         un `ok` portant sur une tête regelée depuis ne dispense plus de la
         relecture."""
+        return self._proposal_rows(limit, proposal_prefix, window_s)
+
+    def _proposal_rows(self, limit, proposal_prefix, window_s, item_id=None):
+        """`review_proposals`, restreint à un lot si `item_id` (#1738 R1 B1 :
+        la prise revalide le même prédicat sous son verrou)."""
+        only = "   AND w.id = %d" % int(item_id) if item_id is not None else ""
         reviewer_guard = "   AND coalesce(w.reviewer, '') = ''" if has_reviewer(self.db) else ""
         frozen_sha = _last_freeze_sha("w")
         current = _current_verdict("w")
@@ -2444,7 +2455,7 @@ class WorkItems(interface.WorkItems):
             "  FROM work_items w"
             "  LEFT JOIN work_packages k ON k.id = w.package_id"
             "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
-            " WHERE w.state = 'qa'"
+            " WHERE w.state = 'qa'" + only +
             "   AND w.assignee IS NOT NULL AND btrim(w.assignee) <> ''"
             "   AND left(w.assignee, 6) <> 'human:'"
             "   AND " + frozen_sha + " IS NOT NULL"
@@ -2457,6 +2468,44 @@ class WorkItems(interface.WorkItems):
             " ORDER BY coalesce(w.priority, 2), w.id"
             " LIMIT %s",
             (str(proposal_prefix), float(window_s), int(limit)))
+
+    def claim_review_proposal(self, item_id, *, agent, kind, proposal_prefix,
+                              window_s, actor) -> bool:
+        """#1738 (N5/N7) : voir l'interface."""
+        item = int(item_id)
+        with self.db.transaction() as tx:
+            # Un verrou consultatif par lot : deux passages (hôtes distincts)
+            # sérialisent ici, et le second relit la fenêtre APRÈS le premier.
+            tx.query("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                     ("review proposal:%d" % item,))
+            # Les jalons et la désignation du pilote prennent ce verrou de
+            # ligne, pas le verrou consultatif. Le prédicat est relu APRÈS
+            # l'attente : il voit les verdicts/gels validés entre-temps, et
+            # aucun ne peut s'insérer entre cette lecture et la proposition.
+            if not tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                            (item,)):
+                return False
+            # #1738 R1 (B1) : sous le verrou, le lot est relu avec le prédicat
+            # de `review_proposals` (qa, gel, relecteur vide, verdict courant,
+            # fenêtre) et le `kind` doit être celui qu'il donne aujourd'hui.
+            me = WorkItems(tx)
+            rows = me._proposal_rows(1, proposal_prefix, window_s, item_id=item)
+            if not rows or (rows[0].get("assignee") or "").strip() == agent:
+                return False
+            if kind != ("correction" if rows[0].get("last_verdict") == "blocked"
+                        else "review"):
+                return False
+            if kind == "review" and has_reviewer(tx):
+                # N7 : une relecture désigne son relecteur (#705) — le lot sort
+                # des propositions suivantes et `stale_lot` s'adresse à lui.
+                # B1 : compare-and-set, le pilote ne prend pas ce verrou.
+                if me._designate_reviewer(item, agent, actor, vacant=True) is None:
+                    return False
+            me._event(item, "qa",
+                      "%s: lot #%d to %s (%s)" % (proposal_prefix, item, agent, kind),
+                      actor)
+            tx.execute("UPDATE work_items SET updated_at = now() WHERE id = %s", (item,))
+            return True
 
     def assignment_events(self, item_id, prefixes) -> list[dict]:
         return self.db.query(

@@ -729,7 +729,10 @@ def _propose_reviews(db, st, listing, *, pool, room, dry_run=False, canons=(),
     Rend les propositions dans la forme des prises (`item`, `agent`,
     `message_id`, `kind` valant `review` ou `correction`, `notified`). Le lot
     est marqué au journal (`REVIEW_PROPOSAL_NOTE`), ce qui l'écarte des
-    passages suivants le temps de `REVIEW_PROPOSAL_WINDOW_S`."""
+    passages suivants le temps de `REVIEW_PROPOSAL_WINDOW_S` ; le contrôle de
+    la fenêtre et la note sont pris sous un verrou consultatif par lot
+    (#1738 N5), et une relecture désigne son relecteur (#705, #1738 N7) — la
+    double relecture est écartée et `stale_lot` sait à qui s'adresser."""
     from . import mail, registry, review_lot
     if room <= 0 or not pool:
         return []
@@ -806,13 +809,20 @@ def _propose_reviews(db, st, listing, *, pool, room, dry_run=False, canons=(),
             payload = {"review_proposal": {"lot": lot, "agent": name, "kind": kind}}
             message_id = None
             if not dry_run:
+                # #1738 (N5/N7) : le contrôle de la fenêtre, la désignation du
+                # relecteur (#705, pour une relecture) et la note tiennent sous
+                # un verrou consultatif par lot — deux passages, même sur des
+                # hôtes distincts, ne proposent pas le même lot deux fois.
+                if not st.work.claim_review_proposal(
+                        lot, agent=name, kind=kind,
+                        proposal_prefix=REVIEW_PROPOSAL_NOTE,
+                        window_s=REVIEW_PROPOSAL_WINDOW_S, actor=SENDER):
+                    used.add(lot)     # pris par un autre passage : on n'y revient pas
+                    continue
                 message_id = mail.send(
                     db, SENDER, name,
                     review_proposal_message(item, name, kind=kind, family=family),
                     kind="event", work_item_id=str(lot), payload=payload)
-                st.work.note(lot, item.get("state") or "qa",
-                             "%s: lot #%d to %s (%s)" % (REVIEW_PROPOSAL_NOTE, lot, name, kind),
-                             SENDER)
             used.add(lot)
             out.append({"item": item, "agent": name, "message_id": message_id,
                         "kind": kind, "notified": []})
@@ -855,7 +865,9 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
               alerts: list | None = None, listing: list | None = None, paid=None,
               budget_check=None, dry_run: bool = False,
               lot_idle_s: float = DEFAULT_LOT_IDLE_S,
-              lot_max_per_hour: int = DEFAULT_LOT_MAX_PER_HOUR, orchestras=None,
+              lot_max_per_hour: int = DEFAULT_LOT_MAX_PER_HOUR,
+              review_max_per_hour: int = REVIEW_PROPOSAL_MAX_PER_HOUR,
+              orchestras=None,
               agents: set[str] | None = None) -> list:
     """Un passage de prise automatique ; rend les prises faites (ou prévues
     en `dry_run`) : `[{item, agent, message_id, kind, notified}]`, `kind`
@@ -865,7 +877,10 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     aucun lot n'est prenable) ou `backlog` (file d'amélioration, L119). Les
     lots de l'équipe passent d'abord ; tant qu'un lot du projet attend,
     personne ne prend d'amélioration. Un seuil nul désactive la prise
-    correspondante.
+    correspondante — `review_max_per_hour` à 0 coupe les propositions
+    (#1738 N3). Une proposition faite passe avant la file d'amélioration du
+    même passage (« du travail réel sur des lots en cours ») ; propositions
+    coupées, la file reprend la main.
 
     Les candidats sont triés forfaits d'abord : chaque agent au forfait prend
     ce qui lui va, puis les agents payés au token prennent ce qu'il reste
@@ -913,8 +928,10 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         # #1677 (c) : même sans lot prenable, un lot en qa sans verdict (ou à
         # correction due) peut occuper un agent au repos — la sonde est bon
         # marché, le reste du passage ne se paie que s'il y a de quoi proposer.
-        if not st.work.review_proposals(1, proposal_prefix=REVIEW_PROPOSAL_NOTE,
-                                        window_s=REVIEW_PROPOSAL_WINDOW_S):
+        # #1738 (N3) : propositions coupées, ce passage n'a plus rien à faire.
+        if review_max_per_hour <= 0 \
+                or not st.work.review_proposals(1, proposal_prefix=REVIEW_PROPOSAL_NOTE,
+                                                window_s=REVIEW_PROPOSAL_WINDOW_S):
             return []
     # #1900 N2 / #2162 : une lecture paresseuse des notes de dossier pour toute
     # la passe (les deux boucles ci-dessous la partagent), bornée aux ids
@@ -1088,8 +1105,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     # puis une correction (verdict courant bloquant, auteur occupé). Ces
     # propositions passent avant la file d'améliorations : du travail réel sur
     # des lots en cours. Elles suivent les mêmes gardes qu'une prise (B4, N1).
-    if not taken:
-        proposal_room = max(0, REVIEW_PROPOSAL_MAX_PER_HOUR
+    if not taken and review_max_per_hour > 0:
+        proposal_room = max(0, int(review_max_per_hour)
                             - st.work.auto_takes_since(TAKE_WINDOW_S, REVIEW_PROPOSAL_NOTE))
 
         def wakeable(name):
