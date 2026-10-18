@@ -165,6 +165,7 @@ class Publisher:
 
     def _run(self):
         cfg = dataclasses.replace(self.cfg, statement_timeout_ms=3000, connect_timeout=3)
+        failing = False
         while True:
             db = None
             try:
@@ -176,9 +177,13 @@ class Publisher:
                 if not storage.of(db).operations.publish_peek(
                         self.agent, self.owner, self.epoch, payload):
                     break  # lease fenced: never overwrite a successor's snapshot
+                failing = False
             except Exception:
                 # No exception text: a transport error can contain credentials.
-                self.warn("agent peek %s: snapshot unavailable" % self.agent)
+                # Once per failure streak: an old server refuses every capture.
+                if not failing:
+                    self.warn("agent peek %s: snapshot unavailable" % self.agent)
+                failing = True
             finally:
                 if db is not None:
                     db.close()

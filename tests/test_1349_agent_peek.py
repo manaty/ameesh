@@ -93,6 +93,18 @@ class SelectionTest(unittest.TestCase):
             self.assertIn("tracked.txt", data["diff_stat"])
             self.assertIn("2 insertions", data["diff_stat"])
 
+    def test_publisher_warns_once_per_failure_streak(self):
+        warnings = []
+        with mock.patch.object(peek, "INTERVAL", 0.01), \
+                mock.patch("ameesh.db.connect", side_effect=OSError("PRIVATE dsn")) as connect:
+            publisher = peek.Publisher(config.Config(), agent="worker", owner="runner", epoch=1,
+                                       cwd=lambda: "", reader=lambda: None, warn=warnings.append)
+            while connect.call_count < 5:
+                publisher.stop.wait(0.01)
+            publisher.close()
+            publisher.thread.join(timeout=10)
+        self.assertEqual(warnings, ["agent peek worker: snapshot unavailable"])
+
     def test_cli_denies_agent_context_without_exporting_a_snapshot(self):
         with mock.patch("ameesh.config.load"), mock.patch("ameesh.db.connect") as connect, \
                 mock.patch.object(decisions, "human_session", side_effect=decisions.DecisionError("agent context")), \

@@ -942,9 +942,7 @@ class AgentWorker(threading.Thread):
         retour, gardé par l'epoch, ne touche pas celui d'un autre."""
         # L76 : rien ne survit au bail, pas même un processus résident inactif
         self._close_resident("lease released")
-        publisher = getattr(self, "_peek_publisher", None)
-        if publisher is not None:
-            publisher.close()
+        AgentWorker._close_peek(self)  # aussi sur les doublures de test
         self._release_session_lock()
         self.watchdog_stop.set()  # le veilleur n'a plus de bail à défendre
         # L113 : le travail part au serveur sous le bail, puis le dossier est
@@ -6647,6 +6645,11 @@ class AgentWorker(threading.Thread):
                 cwd=lambda: self.agent.get("cwd") or "",
                 reader=lambda: getattr(self, "_peek_reader", None), warn=log_async)
 
+    def _close_peek(self) -> None:
+        publisher = getattr(self, "_peek_publisher", None)
+        if publisher is not None:
+            publisher.close()
+
     def process_once(self, wait_seconds: float) -> bool:
         """Mode banc : au plus un tour, en attendant `wait_seconds` du travail."""
         self.ensure_watchdog()
@@ -6793,6 +6796,7 @@ class AgentWorker(threading.Thread):
             # et rien n'est touché).
             self._deferral_over()
             self._mark_power_stop()
+            self._close_peek()  # #1349 : l'aperçu ne survit pas au worker
             self.release_lease()
 
 
