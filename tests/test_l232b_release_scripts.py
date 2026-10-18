@@ -219,6 +219,35 @@ class MigrationPinningTest(unittest.TestCase):
         self.assertIn('/bin/sh -c "$0" redemarrer', lancements[0])
         self.assertNotIn("--user restart ameesh-notify.service", self.systemctl_calls())
 
+    def test_emergency_install_failure_stops_before_activation_and_restart(self):
+        bascule = self.script.with_name("bascule.py")
+        bascule.write_text(FAKE_BASCULE + '\nif sys.argv[1] == "preparer": sys.exit(42)\n')
+        done = self.run_script("migrer", self.a, AUTO_TAKE_PROBE_STATUS="1")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("ÉCHEC de l'installation immédiate", done.stderr)
+        self.assertEqual([c["args"][0] for c in self.calls() if c["release"] == "bascule"],
+                         ["preparer"])
+        self.assertFalse((self.share / "src-current").is_symlink())
+        self.assertEqual(self.systemctl_calls(), [])
+        self.assertEqual(self.systemd_run_calls(), [])
+
+    def test_emergency_direct_restart_failure_is_reported(self):
+        systemctl = self.root / "bin/systemctl"
+        systemctl.write_text('#!/bin/sh\nexit 42\n')
+        done = self.run_script("migrer", self.a, AUTO_TAKE_PROBE_STATUS="1")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("ÉCHEC du redémarrage immédiat", done.stderr)
+
+    def test_target_probe_failure_stops_before_installed_probe(self):
+        snapshot = self.share / ("src-" + self.a[:7]) / "src/ameesh/__main__.py"
+        self.run_script("migrer", self.a)
+        snapshot.write_text(FAKE_MODULE + '\nif args[0] == "doctor": sys.exit(42)\n')
+        (self.root / "calls").unlink()
+        done = self.run_script("migrer", self.a, MIGRER_SANS_REDEMARRAGE="1")
+        self.assertEqual(done.returncode, 42)
+        self.assertEqual([c["args"][0] for c in self.calls()], ["migrate", "migrate", "doctor"])
+        self.assertEqual(self.systemctl_calls(), [])
+
     def test_staging_defers_the_emergency_install_and_restart(self):
         # staging.sh runs migrer before its per-host sequence (VMs first, poste
         # last, canon §14). It must not be stopped, and the poste must not be

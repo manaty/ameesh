@@ -339,7 +339,9 @@ redemarrer_urgence() {
     return 0
   fi
   echo "unité transitoire indisponible ou en échec : redémarrage direct (un agent lancé depuis son propre exécuteur serait interrompu)." >&2
-  redemarrer
+  # A fresh dispatcher preserves errexit even when this function is tested
+  # by `if ! redemarrer_urgence` (Bash disables it throughout that call).
+  "$ICI/poste.sh" redemarrer
 }
 
 # Migrations du commit REF (défaut HEAD, comme installer) : garde additive même
@@ -382,7 +384,9 @@ migrer() {
       # The venv already holds REF (re-run, or MIGRER_APRES=1): do not touch
       # the recorded previous version, only load REF into the runners.
       echo "code de $cible déjà installé : redémarrage immédiat sans réinstallation." >&2
-    elif ! installer "$sha"; then
+    # Keep installer's fail-fast shell: a conditional function call disables
+    # errexit, allowing a failed venv preparation to reach activation.
+    elif ! "$ICI/poste.sh" installer "$sha"; then
       echo "ÉCHEC de l'installation immédiate : l'ancien code sert encore le schéma migré." >&2
       echo "Traiter tout de suite (installer/redémarrer à la main, correction compatible)." >&2
       return 1
@@ -405,7 +409,7 @@ migrer_base() {
     echo "Plan non additif séparé à faire approuver ; migrer conserve toujours la garde additive." >&2
   fi
   [ "$code" = 0 ] || exit "$code"
-  ameesh_de "$cible" doctor --probe
+  ameesh_de "$cible" doctor --probe || exit "$?"
   # #2339: run the INSTALLED code, not the migration snapshot, read-only.
   # #2357: a failure no longer stops the update; migrer installs the target
   # code and restarts immediately (the database is already migrated).
