@@ -192,7 +192,7 @@ def _stale_lot(alert: dict) -> str:
             "--sha <merge commit>; if it was delivered outside the target (report, note, head "
             "reviewed on a branch, no merge), close it: ameesh work close %d --delivered "
             "--sha <reviewed head>; %s; %s; otherwise %s; if it is no longer needed: ameesh work "
-            "close %d --abandoned (or --superseded-by <id>)."
+            "close %d --abandoned (or --superseded-by <id>, or --done if it has no branch)."
             % (head, lot, lot, hold, park, move, lot))
 
 

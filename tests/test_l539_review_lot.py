@@ -118,6 +118,9 @@ class RuleTest(unittest.TestCase):
         self.assertNotIn("codex ou claude", body)
         self.assertIn("a" * 12, body)
         self.assertIn("ameesh work milestone 539 verdict", body)
+        # #1280 B2 : la mission dit au lecteur comment la clore après verdict
+        self.assertIn("clore cette mission", body)
+        self.assertIn("--done", body)
 
     def test_sans_tour_trace_la_famille_reste_inconnue(self):
         """#1053 : aucun tour au gel — le registre courant (deepseek) ne sert
@@ -128,6 +131,19 @@ class RuleTest(unittest.TestCase):
         body = self.ops.added[0]["body"]
         self.assertIn("harnais non tracé au gel", body)
         self.assertIn("codex ou claude", body)
+
+    def test_un_avis_n_ouvre_pas_la_relecture_d_un_avis(self):
+        """R codex3 #1280 B2 : un avis déclaré fusionné ne rouvre pas la
+        relecture d'un avis — la garde coupe la récursion avant la création."""
+        self.ops.items[LOT] = {
+            "id": LOT, "title": "REVUE #12 : relecture après fusion",
+            "source": "review-after-merge:#12",
+            "issue_ref": "review-after-merge:#12",
+            "state": "merged", "app": "ameesh"}
+        out = self.open()
+        self.assertFalse(out["created"], out)
+        self.assertIn("avis", out["why"])
+        self.assertEqual(self.ops.added, [])
 
     def test_la_seconde_ouverture_est_un_no_op(self):
         first = self.open()

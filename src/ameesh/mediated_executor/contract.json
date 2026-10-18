@@ -4458,6 +4458,7 @@
     "recent_or_cited",
     "record_landed_migration",
     "record_resolution",
+    "rectify_close",
     "reference",
     "refresh_package_parents",
     "release_agent",
