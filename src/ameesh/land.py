@@ -365,7 +365,7 @@ def pr_status(slug: str, branch: str, gh=_gh, *, project=None) -> dict | None:
     rows = _json(proc, "gh pr list", list)
     if not rows:
         return None
-    rollup = rows[0].get("statusCheckRollup") or []
+    rollup = radar.latest_rollup(rows[0].get("statusCheckRollup"))
     required = radar.required_statuses(project, branch)
     pending = any((c.get("status") or "COMPLETED") != "COMPLETED"
                   or (c.get("state") or "") == "PENDING" for c in rollup)

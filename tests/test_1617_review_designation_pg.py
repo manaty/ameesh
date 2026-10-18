@@ -99,6 +99,25 @@ class Test1617ReviewDesignationPg(PgTestCase):
         return [rd.Candidate("r1", "claude"), rd.Candidate("r2", "codex")]
 
     # -- tests ------------------------------------------------------------
+    def test_a_reviewer_holding_a_request_gets_no_second_mail(self):
+        """#2495 : r1 désigné à la main avant le gel (request non lu, sans
+        tête) ; l'auto au gel ne lui renvoie rien, r2 reçoit le sien. Une fois
+        ce request lu, un nouveau gel le réveille à nouveau."""
+        from ameesh import mail
+        manual = mail.send(self.db, "chef", "r1", "Review request: lot", kind="request",
+                           work_item_id=str(self.lot),
+                           payload={"review_request": {"lot": self.lot, "reviewer": "r1",
+                                                       "manual": True}})
+        self.freeze()
+        out = self.run_apply(pg.PgPort(self.db), candidates=self.two_families())
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1", "r2"])
+        self.assertEqual([(m["recipient"], m["id"] == manual) for m in self.mailbox()],
+                         [("r1", True), ("r2", False)])
+        mail.mark_delivered(self.db, [m["id"] for m in self.mailbox()])
+        self.freeze(SHA_B)
+        self.run_apply(pg.PgPort(self.db), candidates=self.two_families())
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["r1", "r2", "r1", "r2"])
+
     def test_designated_records_and_mails_once(self):
         freeze = self.freeze()
         out = self.run_apply(pg.PgPort(self.db), candidates=self.two_families())

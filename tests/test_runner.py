@@ -24,6 +24,66 @@ HARNESSES = {
     "deepseek": {"session": "dsh-session-1", "reprise": ["--session-id", "dsh-session-1"]},
 }
 
+#: #2497 : motifs du journal par lesquels le battement ou le veilleur arrêtent
+#: un harnais dont le bail est perdu (`AgentWorker.renew`,
+#: `AgentWorker._deadline_watchdog`) ; `RaisonsDArretDeBailTest` les tient à jour.
+ARRETS_DE_BAIL = ("lease lost", "lease deadline reached",
+                  "renewal unanswered past the lease", "database unreachable")
+
+#: #2502 : lignes que `stop_group_now` écrit *quand il arrête* le harnais. Un
+#: diagnostic non définitif de `renew()` (« database unreachable … the turn
+#: continues ») porte un motif d'arrêt sans qu'aucun arrêt n'ait eu lieu : le
+#: témoin exige donc l'une de ces lignes en plus du motif.
+LIGNES_ARRET = ("harness stopped (", "stop requested (")
+
+
+def arret_de_bail(ligne: str) -> bool:
+    """#2502 : la ligne prouve-t-elle un arrêt de bail (motif + ligne d'arrêt) ?
+
+    « database unreachable » seul ne prouve rien : `renew()` le journalise
+    aussi quand le bail court encore et que le tour continue.
+    """
+    return (any(p in ligne for p in LIGNES_ARRET)
+            and any(m in ligne for m in ARRETS_DE_BAIL))
+
+
+class RaisonsDArretDeBailTest(unittest.TestCase):
+    def test_chaque_arret_de_bail_est_attendu_par_le_temoin(self):
+        """#2497 : `test_bail_perdu_interrompt_le_tour` attendait deux raisons
+        sur quatre ; sous charge, « renewal unanswered past the lease » arrêtait
+        bien le harnais mais le témoin restait rouge. Toute raison d'arrêt de
+        ces deux chemins doit figurer dans `ARRETS_DE_BAIL`."""
+        import inspect
+        import re
+        raisons = []
+        for fn in (AgentWorker.renew, AgentWorker._deadline_watchdog):
+            raisons += re.findall(r'stop_group_now\(\s*"([^"]+)"', inspect.getsource(fn))
+        self.assertGreaterEqual(len(raisons), 5)
+        for raison in raisons:
+            self.assertTrue(any(m in raison for m in ARRETS_DE_BAIL), raison)
+
+    def test_diagnostic_non_definitif_ne_vaut_pas_un_arret(self):
+        """#2502 : le diagnostic « database unreachable … the turn continues »
+        de `renew()` n'arrête pas le harnais ; le témoin ne doit pas le prendre
+        pour une preuve d'arrêt. Seules les lignes de `stop_group_now` en sont
+        une."""
+        diagnostic = ("[vole] heartbeat: database unreachable (connection "
+                      "timeout exceeded) — failure 1, lease still valid for 2s: "
+                      "the turn continues, retrying soon")
+        # le diagnostic porte bien un motif d'arrêt : c'est le piège que le
+        # resserrement doit écarter (sinon ce témoin ne prouverait rien)
+        self.assertTrue(any(m in diagnostic for m in ARRETS_DE_BAIL))
+        self.assertFalse(arret_de_bail(diagnostic))
+        self.assertTrue(arret_de_bail(
+            "[vole] harness stopped (database unreachable)"))
+        self.assertTrue(arret_de_bail(
+            "[vole] stop requested (lease lost): harness not yet published"))
+
+    def test_arret_sans_motif_de_bail_ne_compte_pas(self):
+        """#2502 : une ligne d'arrêt d'une autre cause (budget, préemption,
+        redémarrage) ne prouve pas la perte du bail."""
+        self.assertFalse(arret_de_bail("[vole] harness stopped (budget guard)"))
+
 
 class RunnerTest(PgTestCase):
     def _cwd(self, name: str) -> str:
@@ -212,14 +272,17 @@ class RunnerTest(PgTestCase):
                 "lease_epoch = lease_epoch + 1, lease_expires_at = now() + interval '60 seconds', "
                 "status = 'running' WHERE name = 'vole'"
             )
-            # Deux issues également justes : le renouvellement voit l'epoch
-            # volé (« bail perdu ») ou l'échéance est atteinte avant l'appel
-            # (« échéance du bail atteinte »). Dans les deux cas le harnais est
-            # arrêté et le tour n'est pas compté.
+            # Toute issue de perte de bail est juste : le renouvellement voit
+            # l'epoch volé (« bail perdu »), l'échéance est atteinte avant
+            # l'appel, ou — sous charge, avec le battement à ttl/3 de #2483 —
+            # l'appel ne répond pas avant l'échéance (#2497). Dans tous les cas
+            # le harnais est arrêté et le tour n'est pas compté. #2502 : la
+            # ligne doit prouver l'arrêt (`stop_group_now`), pas seulement
+            # porter un motif — `renew()` journalise « database unreachable »
+            # sans arrêter quand le bail court encore.
             self.wait_for(
-                lambda: any(("lease lost" in l or "lease deadline reached" in l)
-                            for l in lignes),
-                timeout=10)
+                lambda: any(arret_de_bail(l) for l in lignes),
+                timeout=10, msg=lambda: "".join(lignes))
             self.assertLess(
                 time.monotonic() - debut, 7.0,
                 "le harnais aurait dû être terminé par le battement de bail (12 s de sommeil)",

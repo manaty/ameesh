@@ -20,7 +20,8 @@ The level found in the range is a floor, from what a script can see:
   removed; a new migration that drops a table, column (`DROP x` included),
   schema, type or sequence, renames, changes a column type, adds `NOT NULL`,
   truncates or deletes rows (dropping a view, trigger, index, constraint,
-  default or function to recreate it is not a break); a command or command
+  default or function to recreate it is not a break, nor is the `ON COMMIT
+  DROP` of a temporary table: it holds no data); a command or command
   alias removed, an option string removed from a command (each command has
   its own: removing `show --json` while `list --json` stays is a break), an
   `AMEESH_*` setting no longer read; a commit with the trailer
@@ -93,6 +94,9 @@ _DESTRUCTIVE = re.compile(
     r"|\brename\b"
     r"|\balter\s+(?:column\s+)?%s\s+(?:set\s+data\s+)?type\b"
     r"|\bset\s+not\s+null\b|\btruncate\b|\bdelete\s+from\b" % _IDENT, re.I)
+#: a temporary table dropped at the end of the migration's transaction
+#: (`CREATE TEMP TABLE t ON COMMIT DROP AS …`, 0460, #2470): not a drop
+_ON_COMMIT_DROP = re.compile(r"\bon\s+commit\s+drop\b", re.I)
 _MAIN_COMMAND = re.compile(r"""command\s*(?:==\s*["']([\w-]+)["']|in\s*\(([^)]*)\))""")
 _SETTING = re.compile(r"""["'](AMEESH_[A-Z0-9_]+)["']""")
 
@@ -662,7 +666,8 @@ def level(base: str, head: str) -> tuple[str, list[str]]:
             reasons["major"].append("migration %s %s" % (
                 name.rsplit("/", 1)[-1], "removed" if status == "D" else "changed"))
             continue
-        found = _DESTRUCTIVE.search(_sql(git("show", "%s:%s" % (head, name))))
+        found = _DESTRUCTIVE.search(_ON_COMMIT_DROP.sub(
+            " ", _sql(git("show", "%s:%s" % (head, name)))))
         if found:
             reasons["major"].append("migration %s: %s" % (
                 name.rsplit("/", 1)[-1], " ".join(found.group(0).lower().split())))

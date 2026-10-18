@@ -80,6 +80,7 @@ import weakref
 from dataclasses import dataclass, field
 from typing import Iterable
 
+from . import work_lifecycle as lifecycle
 from . import plan as plan_mod
 from . import process_projection as projection_mod
 from . import process_workflow as workflow_mod
@@ -99,17 +100,21 @@ LOT_HEAD_RE = re.compile(r"^lot/([1-9][0-9]{0,17})(?:-|$)")
 _MARKER_RE = re.compile(r"<!-- ameesh:package=([A-Za-z0-9][A-Za-z0-9._-]*)(?: d=([0-9a-f.]*))? -->")
 
 #: labels d'état d'une issue de lot
-STATE_LABELS = ("intake", "build", "qa", "merged", "blocked", "waiting_human")
+STATE_LABELS = (lifecycle.REQUESTED, lifecycle.IN_PROGRESS, lifecycle.TO_VALIDATE,
+                lifecycle.DELIVERY_RECORDED, lifecycle.BLOCKED, lifecycle.WAITING_HUMAN)
 BASE_LABEL = "ameesh"
 EPIC_LABEL = "ameesh:epic"
-LABEL_COLORS = {"intake": "c5def5", "build": "1d76db", "qa": "fbca04", "merged": "0e8a16",
-                "blocked": "b60205", "waiting_human": "d93f0b", "epic": "5319e7", "": "ededed",
+LABEL_COLORS = {lifecycle.REQUESTED: "c5def5", lifecycle.IN_PROGRESS: "1d76db",
+                lifecycle.TO_VALIDATE: "fbca04", lifecycle.DELIVERY_RECORDED: "0e8a16",
+                lifecycle.BLOCKED: "b60205", lifecycle.WAITING_HUMAN: "d93f0b",
+                "epic": "5319e7", "": "ededed",
                 # L126 : étiquettes des issues de lot (état, type, priorité)
-                "promoted": "0e8a16", "closed": "cccccc", "bug": "d73a4a",
+                lifecycle.PROMOTED: "0e8a16", lifecycle.CLOSED: "cccccc", "bug": "d73a4a",
                 "evolution": "a2eeef", "improvement": "7057ff", "p1": "b60205",
                 "p2": "fbca04", "p3": "c2e0c6"}
 #: priorité d'attention quand une fiche a plusieurs lots ouverts
-_ATTENTION = ("waiting_human", "blocked", "qa", "build", "intake")
+_ATTENTION = (lifecycle.WAITING_HUMAN, lifecycle.BLOCKED, lifecycle.TO_VALIDATE,
+              lifecycle.IN_PROGRESS, lifecycle.REQUESTED)
 
 
 class GithubError(RuntimeError):
@@ -1264,7 +1269,7 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
                                       annulled_ts=annulled.get(item_id),
                                       merged_ts=merged_ts)
                         if item["state"] not in work_mod.MERGED_STATES
-                        and item["state"] != "closed" else None)
+                        and item["state"] != lifecycle.CLOSED else None)
                 if text:
                     if not dry_run:
                         # #1693 (N3) : un relevé répété ne répète pas le même
@@ -1279,7 +1284,7 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
                 elif dry_run:
                     state = item["state"]
                     entry.update(result=("already" if state in work_mod.MERGED_STATES else
-                                         "refused" if state == "closed" else "would-merge"),
+                                         "refused" if state == lifecycle.CLOSED else "would-merge"),
                                  detail="%s (dry run)" % state)
                 else:
                     done = work_mod.close_merged(
@@ -1370,17 +1375,17 @@ def lot_state(items: list[dict]) -> tuple[str | None, str]:
     """(label d'état, état de l'issue) d'une fiche `lot` d'après ses lots."""
     status = plan_mod.package_status(items)
     if status == "pending":
-        return "intake", "open"
+        return lifecycle.REQUESTED, "open"
     if status == "merged":
-        return "merged", "closed"
+        return lifecycle.DELIVERY_RECORDED, "closed"
     if status == "abandoned":
         return None, "closed"
-    states = {("merged" if i["state"] in work_mod.MERGED_STATES else i["state"])
-              for i in items if i.get("state") != "closed"}
+    states = {(lifecycle.DELIVERY_RECORDED if i["state"] in lifecycle.DELIVERED else i["state"])
+              for i in items if i.get("state") != lifecycle.CLOSED}
     for state in _ATTENTION:
         if state in states:
             return state, "open"
-    return "intake", "open"
+    return lifecycle.REQUESTED, "open"
 
 
 _HEADER = ("_View projected by ameesh: the source is the canon (package below) and "
@@ -1731,14 +1736,15 @@ _SUMMARY_RE = re.compile(r"(?im)^[ \t>*-]*(?:r[ée]sum[ée][ \t]+public|public[ 
 #: d'ameesh n'envoie de notification à personne
 _MENTION_RE = re.compile(r"(?<![\w`@])@(?=[A-Za-z0-9])")
 
-LOT_TERMINAL = ("merged", "promoted", "closed")
+LOT_TERMINAL = lifecycle.COMPLETED
 LOT_TYPES = ("bug", "evolution", "improvement")
 PRIORITY_LABELS = {1: "p1", 2: "p2", 3: "p3"}
 _TYPE_FR = {"bug": "bug", "evolution": "evolution", "improvement": "improvement"}
 _PRIORITY_FR = {1: "high priority", 2: "normal priority", 3: "low priority"}
-_STATE_FR = {"intake": "to do", "build": "in progress", "qa": "in review",
-             "merged": "merged", "promoted": "delivered", "blocked": "blocked",
-             "waiting_human": "waiting for a human", "closed": "closed"}
+_STATE_FR = {lifecycle.REQUESTED: "to do", lifecycle.IN_PROGRESS: "in progress",
+             lifecycle.TO_VALIDATE: "in review",
+             lifecycle.DELIVERY_RECORDED: "merged", lifecycle.PROMOTED: "delivered", lifecycle.BLOCKED: "blocked",
+             lifecycle.WAITING_HUMAN: "waiting for a human", lifecycle.CLOSED: "closed"}
 _LOT_FIELD_FR = {"title": "title", "body": "body", "labels": "ameesh labels",
                  "state": "state"}
 
@@ -2185,7 +2191,7 @@ def lot_issue_state(item: dict) -> tuple[str, str | None]:
     state = item.get("state")
     if state in work_mod.MERGED_STATES:
         return "closed", "completed"
-    if state == "closed":
+    if state == lifecycle.CLOSED:
         # #988 : livré hors cible = terminé, pas « non prévu »
         return "closed", ("completed" if item.get("close_reason") == "delivered"
                           else "not_planned")
@@ -2365,7 +2371,7 @@ def _closing(item: dict, *, repo: str, public: bool, issue_of,
     il diffère de l'état de la ligne (retenue, ou cœur projeté)."""
     n = int(item["id"])
     state = core or item.get("state")
-    if state == "merged":
+    if state == lifecycle.DELIVERY_RECORDED:
         pr = _ref_parts(item.get("pr_ref"))
         where = ""
         if pr and pr[0].casefold() == repo.casefold():
@@ -2373,9 +2379,9 @@ def _closing(item: dict, *, repo: str, public: bool, issue_of,
         elif pr and not public:
             where = " by PR %s#%d" % pr
         return "Work item %d merged%s: issue closed by ameesh." % (n, where)
-    if state == "promoted":
+    if state == lifecycle.PROMOTED:
         return "Work item %d delivered: issue closed by ameesh." % n
-    if state == "closed":
+    if state == lifecycle.CLOSED:
         if item.get("close_reason") == "delivered":
             return "Work item %d delivered outside the target: issue closed by ameesh." % n
         other = item.get("superseded_by")

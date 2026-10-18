@@ -576,8 +576,14 @@ class ActionsCycleTest(ActionsBase):
         def lost():
             raise ConnectionError("connexion perdue")
 
+        # #2514 : le connecteur lent ne répond qu'une fois l'exécution rendue.
+        # La preuve est cet état, pas une durée murale : sous charge CI, les
+        # allers-retours base dépassaient l'ancien plafond de 2,5 s alors que
+        # le délai du connecteur (0,5 s) était bien respecté.
+        release = threading.Event()
+
         def slow():
-            time.sleep(3)
+            release.wait(30)
             return Outcome.confirmed("trop tard")
 
         cases = {"exception": boom, "connexion": lost, "délai": slow,
@@ -587,16 +593,19 @@ class ActionsCycleTest(ActionsBase):
                 connector = Scripted(behaviour)
                 action = self.propose("send", connector=connector)
                 self.approve(action)
-                started = time.monotonic()
                 result = self.execute(action, connector)
                 self.assertEqual(result["state"], "unknown", result)
-                self.assertLess(time.monotonic() - started, 2.5)
+                if label == "délai":
+                    self.assertFalse(release.is_set(),
+                                     "l'exécution a attendu la réponse du connecteur")
                 self.assertEqual(connector.calls, 1)
                 row = self.get(action)
                 self.assertEqual(row["state"], "unknown")
                 self.assertTrue(row["last_error"])
                 self.refused(actions.STATE, self.execute, action, connector)
                 self.assertEqual(connector.calls, 1)
+                if label == "délai":
+                    release.set()
         # un échec n'est « certain » que si le connecteur le dit
         connector = Scripted(lambda: Outcome.failed("refus du système externe"))
         action = self.propose("send", connector=connector)

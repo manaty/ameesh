@@ -42,11 +42,12 @@ from .db import Db, DbError, is_unique_violation
 from .storage import interface
 from .storage.postgres import work as _pg
 
-STATES = ("intake", "build", "qa", "merged", "promoted", "blocked", "waiting_human",
-          "closed")
-TERMINAL = ("promoted", "closed")
+# Public compatibility exports; the vocabulary is also usable without importing
+# storage or the command layer (housekeeping, progress and capacity readers).
+from .work_lifecycle import (ACTIVE, COMPLETED, DELIVERED, STATES, TERMINAL,
+                             TO_VALIDATE, WAITING, delivery_connector)
 #: déjà fusionnés : une fusion constatée n'y change rien
-MERGED_STATES = ("merged", "promoted")
+MERGED_STATES = DELIVERED
 #: raisons d'une fermeture explicite (`ameesh work close`) : abandonné,
 #: remplacé par un autre lot, livré hors cible avec sa tête relue (#988),
 #: ou livré sans fusion (`done`, #1280)
@@ -88,7 +89,6 @@ TRANSITIONS = {
     "blocked": {"intake", "build", "qa", "merged", "waiting_human"},
     "waiting_human": {"intake", "build", "qa", "merged", "blocked"},
 }
-WAITING = {"blocked", "waiting_human"}
 #: corrections d'un état posé par erreur (`move(..., correct=…)`) : (depuis,
 #: vers). Un `promoted` à tort revient en `merged` ; un `merged` à tort (une
 #: PR d'étape fermée trop tôt, #759) revient en `build` ; ensuite, les
@@ -115,7 +115,7 @@ RETURN_NOTE = interface.RETURNED_NOTE
 #: §4 : états d'un lot que le geste `work return` rend à la file. Un lot en
 #: revue (`qa`), en attente d'un humain ou bloqué n'est pas de l'en-cours d'un
 #: agent : il ne se rend pas par ce geste.
-RETURN_STATES = ("intake", "build")
+RETURN_STATES = ACTIVE
 #: acteur d'un geste dont l'auteur n'est pas connu : jamais un acteur vide
 UNKNOWN_ACTOR = "inconnu"
 #: un commit de fusion déclaré (`merged --sha`)
@@ -1100,10 +1100,12 @@ def _reviewer_request(db: Db, item: dict, reviewer: str, who: str) -> dict:
     The designation is already written when this runs: a delivery failure is
     returned as a warning (same pattern as `delegate`), never raised, so the
     caller can surface it without losing the designation. A human reviewer has
-    no runner to wake and gets no mailbox request.
+    no runner to wake and gets no mailbox request. An earlier request that
+    already covers this reviewer and head is reused, not sent again (#2495).
     """
     from . import mail, plan_git
-    from .review_designation import REQUEST_KIND, manual_reviewer_message
+    from .review_designation import (REQUEST_HISTORY, REQUEST_KIND, covering_request,
+                                     manual_reviewer_message)
 
     name = (reviewer or "").strip()
     if not name or name.startswith(HUMAN_PREFIX) or name == REVIEWER_NONE:
@@ -1114,6 +1116,17 @@ def _reviewer_request(db: Db, item: dict, reviewer: str, who: str) -> dict:
         latest = None
     freeze = ({"id": int(latest["id"]), "sha": str(latest.get("sha") or "")}
               if latest is not None else None)
+    # #2495 : one request per (lot, reviewer, head). A re-designation, or a
+    # designation after the freeze already woke this reviewer, sends nothing.
+    try:
+        prior = covering_request(mail.history(db, name, REQUEST_HISTORY),
+                                 lot=int(item["id"]), reviewer=name,
+                                 sha=freeze["sha"] if freeze else "")
+    except Exception:  # noqa: BLE001 - unreadable history: send, as before #2495
+        prior = None
+    if prior is not None:
+        return {"reviewer_request_message_id": int(prior["id"]),
+                "reviewer_request_reused": True}
     payload = {"review_request": {"lot": int(item["id"]), "reviewer": name,
                                   "manual": True}}
     if freeze:
