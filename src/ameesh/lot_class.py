@@ -151,8 +151,9 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
             previous = files_by_path.get(entry["path"])
             if previous is None or RANK[entry["class"]] > RANK[previous["class"]]:
                 files_by_path[entry["path"]] = entry
-        # Même un diff entièrement léger garde ses chemins : la porte des
-        # avis doit pouvoir constater un chemin critique oublié du canon.
+        # #2374 : un diff entièrement léger garde ses chemins. Sans eux, la
+        # porte des avis (et l'ouverture de la relecture après fusion) ne peut
+        # pas constater un chemin critique que le canon a classé `light`.
         if not files or RANK[result["class"]] > RANK[worst]:
             worst, files = result["class"], result["files"]
             why = "policy of %s" % (root or "canon")

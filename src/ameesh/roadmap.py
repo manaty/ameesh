@@ -48,9 +48,10 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
+import stat
 import sys
-import tempfile
 import textwrap
 import time
 from typing import Iterable
@@ -704,7 +705,9 @@ def overdue(db, *, now: float | None = None) -> list[dict]:
         # has no gesture on its date, so it is not a date-driven alert
         if not dev.active(item.get("state")):
             continue
-        if str(item.get("planned_source") or "").startswith(SOURCE):
+        # The scheduler only writes start/end; delivery remains a manual
+        # date even when those fields still carry the scheduler's source.
+        if key != "planned_delivery" and str(item.get("planned_source") or "").startswith(SOURCE):
             continue
         dated.append((item, key, due))
     waits = {}
@@ -1162,12 +1165,29 @@ def _read_plan_text(filename: str) -> str:
 def _write_atomic(filename: str, text: str) -> None:
     """Write the export beside its target, then replace it in one step."""
     target = Path(filename)
+    # A symlinked target is written through, as a plain ``write_text`` did:
+    # replacing the link itself would silently turn it into a regular file.
+    if target.is_symlink():
+        target = Path(os.path.realpath(target))
+    tmp = None
     try:
-        fd, tmp = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp",
-                                   dir=str(target.parent))
-    except OSError as exc:
-        raise RoadmapError("cannot write %s: %s" % (filename, exc)) from None
-    try:
+        # New exports honour the umask. Replacements inherit the target's
+        # permissions from creation, before any private content is written.
+        try:
+            mode = stat.S_IMODE(target.stat().st_mode)
+        except FileNotFoundError:
+            mode = 0o666
+        fd = None
+        for _ in range(16):
+            candidate = str(target.parent / ("%s.%s.tmp" % (target.name, secrets.token_hex(8))))
+            try:
+                fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+            except FileExistsError:
+                continue
+            tmp = candidate
+            break
+        if fd is None:
+            raise OSError("cannot create a temporary file beside %s" % target)
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
             stream.write(text)
             stream.flush()
@@ -1176,10 +1196,11 @@ def _write_atomic(filename: str, text: str) -> None:
             shutil.copymode(target, tmp)
         os.replace(tmp, target)
     except OSError as exc:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        if tmp is not None and os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         raise RoadmapError("cannot write %s: %s" % (filename, exc)) from None
 
 

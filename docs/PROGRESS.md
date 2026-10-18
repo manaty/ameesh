@@ -209,6 +209,7 @@ due), otherwise `review` (a refrozen lot goes back to review); `active` otherwis
 | `since_ts` | start of the current turn (`working`), end of the last turn (`idle`), last update otherwise |
 | `turn` | current turn or null: `{started_ts, duration_s, label, task}` (`task` = current prompt, truncated to 140 characters) |
 | `turns`, `unread`, `pending_prompt`, `lease_live` | turns counted, unread, pending prompt, live lease |
+| `builds` | lots in `build` assigned to the agent, **all projects** (the §4 WIP cap of `ameesh work wip` is global, owner 14/10/2026); the text view flags the count when it is above the cap |
 | `mode`, `stop_reason` | `execute` \| `externe`; structured stop reason when the state is `stopped`, otherwise `null` (L37, decision 0030) |
 
 State: `running` under a live lease → `working`; `running` without a live lease,

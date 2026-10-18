@@ -10,16 +10,19 @@ import json
 import os
 import subprocess
 
-from . import land, merge_queue, plan_git, radar, resolutions, train_ci, train_transports
+from . import (land, merge_queue, plan_git, radar, resolutions, train_ci,
+               train_migrations, train_transports)
 from .canon import FETCH_TIMEOUT, GitError
 from .train import MemberDeferred, TrainError, digest, identity
 
 
 class Repository:
-    def __init__(self, project, replayer, *, transports=None):
+    def __init__(self, project, replayer, *, transports=None, migrations=None):
         self.project, self.clone = project, replayer
         self.source = merge_queue.source_of(project.repo)
         self.transports = transports
+        # #2400: composition-time migration numbering; None keeps Git-only use.
+        self.migrations = migrations
 
     def _guard(self, target):
         branch = merge_queue._remote_branch(target)
@@ -79,7 +82,8 @@ class Repository:
             self._transport(plan["target"], members[lot], receipt.get("base"), expected=receipt)
         return list(receipts.values())
 
-    def compose(self, target, base, rows, nonce="", *, transports=None):
+    def compose(self, target, base, rows, nonce="", *, transports=None,
+                migrations=None):
         branch = self._guard(target)
         if not rows or self.target(branch) != base:
             raise TrainError("composition requires members and the exact current base")
@@ -87,6 +91,9 @@ class Repository:
         if transports is not None and not isinstance(transports, list):
             raise TrainError("persisted transport list required for reconstruction")
         pending = list(transports or [])
+        pending_migrations = list(migrations) if migrations is not None else None
+        migration_layout = train_migrations.layout(self.project)
+        recorded_migrations = []
         head, receipts = base, []
         for row in rows:
             expected = next((r for r in pending if isinstance(r, dict) and
@@ -94,6 +101,11 @@ class Repository:
             receipt = (self._transport(branch, row, head, expected=expected)
                        if transports is None or expected is not None else None)
             if receipt is not None:
+                # #2400: a transport freezes its tree and reviewed delta, so
+                # composition cannot renumber the migration it carries.
+                if self.migrations is not None and migration_layout is not None:
+                    train_migrations.guard_transport(
+                        self.clone.path, head, receipt["head"], migration_layout, row)
                 head = receipt["head"]
                 receipts.append(receipt)
                 if expected is not None:
@@ -111,11 +123,29 @@ class Repository:
             # Stable intermediate identities let an exact transport context
             # survive reconstruction after the first publication was lost.
             tree = plan_git._out(self.clone.path, "rev-parse", merged["sha"] + "^{tree}")
+            if self.migrations is not None and migration_layout is not None:
+                expected = next((entry for entry in (pending_migrations or ())
+                                 if entry.get("work_item_id") == row["work_item_id"]), None)
+                renumbered = train_migrations.rewrite(
+                    self.clone.path, head, merged["sha"], migration_layout, row,
+                    expected=expected,
+                    allocator=(self.migrations if pending_migrations is None else None))
+                if renumbered is not None and pending_migrations is not None \
+                        and expected is None:
+                    raise TrainError("persisted migration mapping missing for lot #%s"
+                                     % row["work_item_id"])
+                if renumbered is not None:
+                    tree = renumbered["tree"]
+                    recorded_migrations.append(renumbered["migration"])
+                    if expected is not None:
+                        pending_migrations.remove(expected)
             head = self._commit(tree, list(dict.fromkeys([head, row["frozen_sha"]])),
                 "Train intermediate\n\n" + json.dumps(dict(source=self.source,
                     target=branch, base=head, admission=identity(row)), sort_keys=True))
         if pending:
             raise TrainError("persisted transport no longer belongs to this composition")
+        if pending_migrations:
+            raise TrainError("persisted migration mapping no longer belongs to this composition")
         resolutions._check(resolutions._run(self.clone.path, "checkout", "-q", "-f", "--detach", head),
                            "checkout composed train")
         checked = land.gates(self.project, self.clone.path,
@@ -135,12 +165,19 @@ class Repository:
                  members=[identity(r) for r in rows]), sort_keys=True) + "\n\n"
         if receipts:
             message += "transport-proof: " + digest(receipts) + "\n\n"
+        if migration_layout is not None and self.migrations is not None:
+            train_migrations.audit(self.clone.path, base, tree, migration_layout)
+        message += "".join("ameesh-migration: %d %d %d\n" % (
+            entry["work_item_id"], entry["reserved"], entry["landed"])
+            for entry in recorded_migrations)
         message += "".join("ameesh-work: %d\n" % r["work_item_id"] for r in rows)
         parents = list(dict.fromkeys([base] + [r["frozen_sha"] for r in rows]
                                      + [r["head"] for r in receipts]))
         result = dict(head=self._commit(tree, parents, message), tree=tree)
         if receipts:
             result["transports"] = receipts
+        if recorded_migrations:
+            result["migrations"] = recorded_migrations
         return result
 
     def _commit(self, tree, parents, message):
@@ -171,7 +208,8 @@ class Repository:
         receipts = self.validate_transports(plan)
         if not plan_git._commit(self.clone.path, plan["head"]):
             rebuilt = self.compose(branch, plan["base"], plan["members"], plan.get("nonce", ""),
-                                   transports=receipts)
+                                   transports=receipts,
+                                   migrations=plan.get("migrations", []))
             rebuilt = {key: rebuilt[key] for key in ("head", "tree")}
             if rebuilt != {"head": plan["head"], "tree": plan["tree"]}:
                 raise TrainError("reconstructed train differs from persisted intent")
