@@ -24,6 +24,8 @@ dédoublonnage sont dans `notify.Notifier`.
 
 from __future__ import annotations
 
+import time
+
 from . import sous_utilisation
 
 #: types adressés aux agents (en plus de l'humain, s'ils sont dans `notify.types`)
@@ -192,7 +194,7 @@ def _stale_lot(alert: dict) -> str:
             "--sha <merge commit>; if it was delivered outside the target (report, note, head "
             "reviewed on a branch, no merge), close it: ameesh work close %d --delivered "
             "--sha <reviewed head>; %s; %s; otherwise %s; if it is no longer needed: ameesh work "
-            "close %d --abandoned (or --superseded-by <id>)."
+            "close %d --abandoned (or --superseded-by <id>, or --done if it has no branch)."
             % (head, lot, lot, hold, park, move, lot))
 
 
@@ -262,7 +264,12 @@ def _slo_breach(alert: dict) -> str:
 
     #2231 : quand l'attente est une fusion (`merge*`) ou un déblocage
     (`unblock`), le porteur n'est pas le blocage — le brief vise le pilote/le
-    composeur et ne prescrit ni relance ni réassignation du porteur."""
+    composeur et ne prescrit ni relance ni réassignation du porteur.
+
+    #2378 : de même pour une demande de décision ouverte et échue
+    (`waiting.decision`) : le geste est de vérifier l'échéance avec le
+    demandeur (renouveler ou retirer la demande) ; le décideur a le rappel de
+    sa demande, l'alerte SLO ne le relance pas (canon §9, owner 18/10)."""
     lot = int(alert["lot"])
     title = alert.get("title")
     level = int(alert.get("level") or 1)
@@ -280,7 +287,13 @@ def _slo_breach(alert: dict) -> str:
     holder = " --if-holder %s" % who if who else ""
     waiting = alert.get("waiting") or {}
     what = waiting.get("what") if isinstance(waiting, dict) else None
-    if alert.get("step") != "verdict_merge":
+    # #2378 : une demande ouverte et échue (sinon le lot serait en attente
+    # prévue) ; les cibles sont passées au pilote à toute étape
+    # (`exploitation._slo_targets`), le brief les suit. Sans demande,
+    # l'attente `decision` garde le texte ordinaire.
+    decision = waiting.get("decision") if what == "decision" else None
+    if decision is None and (what == "decision"
+                             or alert.get("step") != "verdict_merge"):
         # The targets move to the pilot on `verdict_merge` only
         # (`exploitation._slo_targets`): the brief follows them, so a text
         # addressed to the pilot never reaches the assignee.
@@ -295,6 +308,27 @@ def _slo_breach(alert: dict) -> str:
             move = ("pilot: the lot is frozen with its review verdict acquired and waits "
                     "for its merge vehicle/package — the composer/pilot carries it; do not "
                     "reassign or nudge its holder, include it in the next package")
+    elif decision is not None:
+        decider = waiting.get("owner") or "its decider"
+        due = waiting.get("due_ts")
+        late = (" (deadline %s passed)" % time.strftime("%Y-%m-%d %H:%M",
+                                                         time.localtime(float(due)))
+                if due is not None else "")
+        # Canon §9 (owner 18/10) : rien sur les SLO pour l'owner — le rappel
+        # du décideur est celui de la demande (`decision_overdue`), pas un
+        # geste dicté par l'alerte SLO.
+        if level >= 3:
+            move = ("bureau or auditor: the lot is `waiting_human` on decision #%d for "
+                    "%s%s — reassigning or nudging its holder does not advance it; push "
+                    "the pilot to check the deadline with the requester, who renews or "
+                    "withdraws the request (ameesh decide show %d)"
+                    % (decision, decider, late, decision))
+        else:
+            move = ("pilot: the lot is `waiting_human` on decision #%d for %s%s — do not "
+                    "reassign its holder; check the deadline with the requester, who "
+                    "renews or withdraws the request (ameesh decide show %d); the "
+                    "decider gets the request's own reminder, not an SLO nudge"
+                    % (decision, decider, late, decision))
     elif what == "unblock":
         if level >= 3:
             move = ("bureau or auditor: the lot is `blocked` and the pilot owns the "

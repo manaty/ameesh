@@ -115,6 +115,18 @@ class NumerosDuDepotTest(unittest.TestCase):
                                               also_skip=("integration/paquet-5",))
             self.assertEqual(sorted(skipped), [375])
 
+    def test_l_arbre_de_travail_peut_etre_ignore(self):
+        """#2400 : le train compose la migration qu'il réserve ; le scan de
+        réservation ignore alors l'arbre de travail, jamais les branches."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _depot(os.path.join(tmp, "nexlink"), "manaty/nexlink", NEXLINK.directory,
+                          ["375_a.sql"], {"agent/y-417": ["377_c.sql"]})
+            with open(os.path.join(repo, NEXLINK.directory, "378_wt.sql"), "w") as fh:
+                fh.write("--")
+            self.assertEqual(sorted(migrations.repo_numbers(repo, NEXLINK)), [375, 377, 378])
+            self.assertEqual(sorted(migrations.repo_numbers(repo, NEXLINK, worktree=False)),
+                             [375, 377])
+
     def test_le_paquet_ameesh_ne_compte_que_pour_ameesh(self):
         with tempfile.TemporaryDirectory() as tmp:
             package = os.path.join(tmp, "paquet")

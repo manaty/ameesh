@@ -47,10 +47,11 @@ class TextTest(unittest.TestCase):
                       "frozen head", "cancelled", "Sober proofs",
                       "a proof is a link", "sha256", "merge-tree", "3 lines"):
             self.assertIn(words, text)
-        # #1676/#1658 : le paquet est horaire (canon §11 bis, owner 15/10 19:50) ;
-        # la coupure 11:00/23:00 ne compose plus de paquet
+        # #1676/#1658/#2332 : le paquet est horaire (canon §11 bis, owner 15/10
+        # 19:50) ; la coupure 11:00/23:00 ne compose plus de paquet
         self.assertIn("a new package waits for the previous one", text)
         self.assertNotIn("about ten lots", text)
+        self.assertNotIn("next cut", text)
         self.assertIsNone(fil.unreadable_reason(text))
 
     def test_units(self):

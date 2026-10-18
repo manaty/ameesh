@@ -264,6 +264,10 @@ class ReviewGateTest(unittest.TestCase):
             klass = lot_class.class_of_paths([canon], "ameesh", [path])
             self.assertEqual(klass["class"], "sensitive", (path, klass))
             self.assertFalse(klass["doubt"], (path, klass))
+            # #2374 : ces trois chemins comptent pour la porte, même quand le
+            # canon les classe par une règle groupée (le motif de secours les
+            # reconnaît et exige les deux familles).
+            self.assertEqual(merge_queue.required_verdicts(klass), 2, (path, klass))
         critical = lot_class.class_of_paths(
             [canon], "ameesh", [self.CRITICAL_CANON_PATH])
         self.assertEqual(critical["class"], "sensitive", critical)
@@ -540,7 +544,8 @@ class ActTest(unittest.TestCase):
         names = ("_repo_of", "_slug", "_project", "_pr_status", "_repo_info", "_target",
                  "ready_verdicts", "ready_pr", "_merge_pr", "_disarm_auto", "_reconcile",
                  "_invalidate", "_disarm", "_open_pr", "_queue", "_passive", "_wake",
-                 "_leave_queue", "_fresh", "_renew", "_target_lock", "_unlock")
+                 "_leave_queue", "_fresh", "_renew", "_target_lock", "_unlock",
+                 "landing_path")
         packet_patch = (
             mock.patch.object(fire.packet_guard, "check_merge",
                               side_effect=packet_guard.PacketGuardError(packet_refusal))
@@ -552,6 +557,11 @@ class ActTest(unittest.TestCase):
             patched["_repo_of"].return_value = None
             patched["_slug"].return_value = "manaty/ameesh"
             patched["_project"].return_value = project
+            # #2256 : le routage est testé ici ; la décision de voie a son
+            # propre témoin (tests/test_2256_fire_landing_path.py).
+            land = getattr(project, "land", "off") if project is not None else "off"
+            patched["landing_path"].return_value = (
+                "queue" if land != "off" else "direct", "test")
             if statuses is not None:
                 patched["_pr_status"].side_effect = list(statuses)
             else:

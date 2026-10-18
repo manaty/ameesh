@@ -178,7 +178,7 @@ class PriseDeLotTest(_Lots):
         self.agent("claude1", team="nexlink")
         premier = self.lot("premier", priority=1)
         second = self.lot("second", priority=2)
-        assign = WorkItems.assign
+        assign = WorkItems.assign_capped
         calls = []
 
         def deadlock_once(store, item_id, *args, **kwargs):
@@ -187,7 +187,7 @@ class PriseDeLotTest(_Lots):
                 raise db_mod.DbError("deadlock detected", sqlstate=db_mod.DEADLOCK_DETECTED)
             return assign(store, item_id, *args, **kwargs)
 
-        with patch.object(WorkItems, "assign", deadlock_once):
+        with patch.object(WorkItems, "assign_capped", deadlock_once):
             out = self.take()
         self.assertEqual(calls, [premier["id"], second["id"]])
         self.assertEqual([t["item"]["id"] for t in out], [second["id"]])
@@ -202,14 +202,14 @@ class PriseDeLotTest(_Lots):
         self.agent("claude1")
         premier = self.element("premier", 80)
         second = self.element("second", 40)
-        assign = WorkItems.assign
+        assign = WorkItems.assign_capped
 
         def deadlock_once(store, item_id, *args, **kwargs):
             if int(item_id) == premier["id"]:
                 raise db_mod.DbError("deadlock detected", sqlstate=db_mod.DEADLOCK_DETECTED)
             return assign(store, item_id, *args, **kwargs)
 
-        with patch.object(WorkItems, "assign", deadlock_once):
+        with patch.object(WorkItems, "assign_capped", deadlock_once):
             out = self.take()
         self.assertEqual([(t["kind"], t["item"]["id"]) for t in out],
                          [("backlog", second["id"])])
@@ -222,7 +222,7 @@ class PriseDeLotTest(_Lots):
         def unique_violation(*args, **kwargs):
             raise db_mod.DbError("duplicate key", sqlstate=db_mod.UNIQUE_VIOLATION)
 
-        with patch.object(WorkItems, "assign", unique_violation):
+        with patch.object(WorkItems, "assign_capped", unique_violation):
             with self.assertRaises(db_mod.DbError):
                 self.take()
 
@@ -559,9 +559,15 @@ class NotifyTest(_Lots):
         self.assertEqual(notify.take_settings(parser.parse_args(["--take-idle", "0"])),
                          {"idle_s": 0.0, "max_per_hour": 0,
                           "lot_idle_s": backlog.DEFAULT_LOT_IDLE_S,
-                          "lot_max_per_hour": backlog.DEFAULT_LOT_MAX_PER_HOUR})
+                          "lot_max_per_hour": backlog.DEFAULT_LOT_MAX_PER_HOUR,
+                          "review_max_per_hour": backlog.REVIEW_PROPOSAL_MAX_PER_HOUR})
         self.assertEqual(notify.take_settings(parser.parse_args(["--take-lot-idle", "0"]))
                          ["lot_max_per_hour"], 0)
+        # #1738 (N3) : les propositions de relecture/correction ont leur propre
+        # interrupteur, à 0 = coupées.
+        self.assertEqual(notify.take_settings(
+            parser.parse_args(["--take-review-max-per-hour", "0"]))
+            ["review_max_per_hour"], 0)
         # #754 : l'ancien `--take-paid` reste accepté, sans effet : la prise
         # par un agent au token est acquise après les forfaits.
         self.assertEqual(notify.take_settings(parser.parse_args(["--take-idle", "60"])),

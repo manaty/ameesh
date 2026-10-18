@@ -19,8 +19,10 @@ SELECT 'CREATE ROLE ameesh_it_qa NOLOGIN'
 SELECT format('GRANT USAGE ON SCHEMA %I TO ameesh_canon_sync, ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
 -- Canon sync executes the existing registry/authenticator/package transaction.
 SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %I TO ameesh_canon_sync', :'schema') \gexec
+-- #2274: the review catch-up activation bound is the owner's alone
+-- (migration 0438); canon sync must not move it.
 SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.%I FROM ameesh_canon_sync', :'schema', name)
-  FROM unnest(ARRAY['host_release_operations','host_release_fences','host_release_fence_receipts']) name
+  FROM unnest(ARRAY['review_catch_up','host_release_operations','host_release_fences','host_release_fence_receipts']) name
  WHERE to_regclass(format('%I.%I', :'schema', name)) IS NOT NULL \gexec
 SELECT format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %I TO ameesh_canon_sync', :'schema') \gexec
 SELECT format('GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA %I TO ameesh_canon_sync, ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
@@ -86,6 +88,14 @@ BEGIN
     END IF;
     IF has_table_privilege('ameesh_it_qa', 'project_modules', 'INSERT,UPDATE,DELETE') THEN
         RAISE EXCEPTION 'QA writer must not change module policies, including PUBLIC grants';
+    END IF;
+    -- #2274: the catch-up bound is owner-only; a write left to canon sync
+    -- would let the sync service move the review horizon.
+    IF to_regclass(format('%I.%I', current_schema(), 'review_catch_up')) IS NOT NULL
+       AND has_table_privilege('ameesh_canon_sync',
+            to_regclass(format('%I.%I', current_schema(), 'review_catch_up')),
+            'INSERT,UPDATE,DELETE') THEN
+        RAISE EXCEPTION 'canon sync must not change the review catch-up activation bound';
     END IF;
 END
 $audit$;
