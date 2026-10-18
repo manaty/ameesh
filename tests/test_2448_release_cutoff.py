@@ -385,8 +385,8 @@ class ReleaseFixture(unittest.TestCase):
             "actif-%s.json" % report["release_sha"][:12])
         self.assertTrue(attestation.exists(), report)
 
-    def test_red_landing_next_cutoff_uses_the_published_green_content(self):
-        """B1: a red landing must not make the next cutoff replay v1.11.8."""
+    def test_red_landing_next_cutoff_is_a_no_op(self):
+        """B1/N4: a red landing neither replays v1.11.8 nor tags an empty 1.11.9."""
         green = self.head
         self.write("red.txt", "red\n")
         self.commit("red change")
@@ -406,15 +406,18 @@ class ReleaseFixture(unittest.TestCase):
              mock.patch.object(release_cutoff, "ci_reading", side_effect=reading):
             second = release_cutoff.execute(self.cfg, None, self.project,
                                             now=_paris(23, 5))
-        self.assertEqual(second["result"], "released", second)
-        self.assertEqual(second["version"], "1.11.9")
-        self.assertEqual(self.git(self.clone, "rev-parse", "%s^" % second["release_sha"]),
-                         first["release_sha"])
+        self.assertEqual(second["result"], "nothing-new", second)
+        self.assertEqual(second["version"], "1.11.8")
+        self.assertEqual(second["base"], first["release_sha"])
+        self.assertEqual(self.git(self.clone, "tag", "--list", "v1.11.9"), "")
         self.assertEqual(self.git(self.clone, "rev-parse", "origin/main"),
-                         second["landing_sha"])
+                         first["landing_sha"])
+        state = release_cutoff.load_state(self.cfg)["projects"]["ameesh"]
+        self.assertEqual(state["last_result"], "nothing-new")
+        self.assertEqual(state["last_cutoff"], _paris(23))
 
-    def test_seven_red_cutoffs_keep_the_release_chain_green(self):
-        """B1: the green chain is durable across >=7 successive red cutoffs."""
+    def test_seven_red_cutoffs_release_once_then_no_op(self):
+        """B1/N4: a main that stays red is released once, then each cutoff is a no-op."""
         green = self.head
         self.write("red.txt", "red\n")
         self.commit("red change")
@@ -427,14 +430,26 @@ class ReleaseFixture(unittest.TestCase):
                  _paris(11, day=19), _paris(23, day=19),
                  _paris(11, day=20), _paris(23, day=20),
                  _paris(11, day=21)]
-        versions = []
+        results = []
         with mock.patch.object(release_cutoff, "ci_reading", side_effect=reading):
             for slot in slots:
                 report = release_cutoff.execute(self.cfg, None, self.project, now=slot)
-                self.assertEqual(report["result"], "released", report)
-                versions.append(report["version"])
-        self.assertEqual(versions, ["1.11.8", "1.11.9", "1.11.10", "1.11.11",
-                                    "1.11.12", "1.11.13", "1.11.14"])
+                results.append((report["result"], report["version"]))
+        self.assertEqual(results, [("released", "1.11.8")] + [("nothing-new", "1.11.8")] * 6)
+        self.assertEqual(sorted(self.git(self.clone, "tag", "--list", "v1.11.*").split()),
+                         ["v1.11.7", "v1.11.8"])
+
+    def test_green_head_already_tagged_is_a_no_op(self):
+        """N4: nothing merged since the last release: no empty release."""
+        first = self.execute()
+        self.assertEqual(first["result"], "released", first)
+        second = self.execute(now=_paris(23, 5))
+        self.assertEqual(second["result"], "nothing-new", second)
+        self.assertEqual(second["tag"], "v1.11.8")
+        self.assertIsNone(second.get("staging"))
+        self.assertEqual(self.git(self.clone, "tag", "--list", "v1.11.9"), "")
+        self.assertEqual(self.git(self.clone, "rev-parse", "origin/main"),
+                         first["release_sha"])
 
     def test_last_green_returns_none_without_any_green(self):
         """N5: no green in the walk means refuse, never fall back silently."""
@@ -452,6 +467,34 @@ class ReleaseFixture(unittest.TestCase):
         self.assertEqual(report["result"], "refused-no-green", report)
         self.assertEqual(self.git(self.clone, "tag", "--list", "v1.11.8"), "")
         self.assertTrue(Path(report["report_path"]).exists())
+
+    def test_red_history_without_green_refuses_end_to_end(self):
+        """N5: the real last_green walk finds no green and never uses v1.11.7."""
+        with mock.patch.object(release_cutoff, "ci_reading",
+                               return_value={"green": False}):
+            report = release_cutoff.execute(self.cfg, None, self.project,
+                                            now=_paris(11, 5))
+        self.assertEqual(report["result"], "refused-no-green", report)
+        self.assertEqual(self.git(self.clone, "tag", "--list", "v1.11.8"), "")
+        self.assertEqual(self.git(self.clone, "rev-parse", "origin/main"), self.head)
+
+    def test_explicit_version_below_the_floor_is_refused(self):
+        """N6: `--version` below the content's minor floor, without a bump on main."""
+        self.write("src/ameesh/migrations/0499_test.sql",
+                   "alter table example add column extra integer;\n")
+        self.commit("new migration")
+        self.git(self.seed, "push", "-q", "origin", "main")
+        head = self.git(self.seed, "rev-parse", "HEAD")
+        with mock.patch.object(release_cutoff, "ci_reading",
+                               return_value={"green": True}):
+            with self.assertRaisesRegex(release_cutoff.ReleaseError, "minor floor"):
+                release_cutoff.execute(self.cfg, None, self.project, now=_paris(11, 5),
+                                       version="1.11.8")
+            plan = release_cutoff.build_plan(self.cfg, self.project, now=_paris(11, 5),
+                                             version="1.12.0")
+        self.assertEqual(plan.version, "1.12.0")
+        self.assertEqual(self.git(self.clone, "tag", "--list", "v1.11.8"), "")
+        self.assertEqual(self.git(self.clone, "rev-parse", "origin/main"), head)
 
     def test_version_level_minor_is_used(self):
         self.write("src/ameesh/migrations/0499_test.sql",
