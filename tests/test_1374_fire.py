@@ -16,6 +16,9 @@ et autorité pilote déclarée. Tests sans base (routage, jalons, GitHub simulé
 puis sur Postgres (règles de `give`/`withdraw`, bail, CLI, garde de `land`)."""
 from __future__ import annotations
 
+import os
+import subprocess
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -41,6 +44,17 @@ def _mark(kind, sha="", **extra):
 
 def _marks(*rows):
     return [dict(row, at_ts=float(i), id=i) for i, row in enumerate(rows, start=1)]
+
+
+def _git_repo(root: str) -> str:
+    """Un dépôt git d'un commit vide : rend le SHA complet."""
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+    subprocess.run(["git", "init", "-q", "-b", "main", root], check=True, env=env)
+    subprocess.run(["git", "-C", root, "commit", "-q", "--allow-empty", "-m", "t"],
+                   check=True, env=env)
+    return subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], check=True,
+                          capture_output=True, text=True).stdout.strip()
 
 
 def _verdict(actor, sha=A, verdict="ok", **extra):
@@ -105,6 +119,42 @@ class MarkersTest(unittest.TestCase):
             now = fire.state(None, 3)
         self.assertFalse(now["active"])
         self.assertTrue(now["withdrawn"])
+
+    def test_state_covers_an_abbreviated_freeze(self):
+        # #2370 : un gel en abrégé (352ba651) et un feu à la tête complète.
+        item = {"id": 3, "title": "t", "state": "build", "branch": "lot/3-x"}
+        marks = _marks(_mark("frozen", A[:8]), _mark("fire", A))
+        with mock.patch.object(fire.work, "get", return_value=item), \
+                mock.patch.object(fire.work, "milestones", return_value=marks):
+            now = fire.state(None, 3)
+        self.assertTrue(now["active"])
+        self.assertTrue(now["covered"])
+
+
+class ReconcileTest(unittest.TestCase):
+    """#2370 : la réconciliation d'une PR fusionnée résout un gel abrégé."""
+
+    ROW = {"id": 42, "title": "un lot", "assignee": "author", "app": "ameesh"}
+
+    def test_an_abbreviated_freeze_covers_the_full_merged_head(self):
+        with tempfile.TemporaryDirectory() as repo:
+            full = _git_repo(repo)
+            marks = _marks(_mark("frozen", full[:8]), _mark("fire", full[:8]))
+            status = _status(state="MERGED", merged=True, head=full, merge_commit=full)
+            with mock.patch.object(
+                    fire.work, "close_merged",
+                    return_value={"result": "merged", "detail": ""}) as close, \
+                    mock.patch.object(fire, "_passive"), \
+                    mock.patch.object(fire, "_wake") as wake, \
+                    mock.patch.object(fire.lot_class, "of_lot",
+                                      return_value={"class": "light"}), \
+                    mock.patch("ameesh.review_lot.open_after_merge",
+                               return_value={"id": None, "created": False}):
+                out = fire._reconcile(None, self.ROW, marks, status, slug="manaty/ameesh",
+                                      repo=repo, target="main", dry_run=False)
+        self.assertTrue(out["covered"])
+        wake.assert_not_called()
+        self.assertEqual(close.call_args.kwargs.get("extra"), "")
 
 
 class ReviewGateTest(unittest.TestCase):
