@@ -25,9 +25,11 @@ courrier :
   lot prêt comme unité, la remise servant de source (`source`), si ses
   parents sont le gel relu et un commit de la cible, si elle fusionne
   proprement dans la base, et si un verdict la couvre (même porte que le
-  gel) ou si c'est une union mécanique — ajouts purs des deux côtés dans
-  chaque conflit, arbre égal à la fusion `merge=union` (§2 : conflit
-  mécanique, aucun avis). Un blocage sur la remise la refuse toujours.
+  gel, classe la plus stricte du gel et du contenu composé ; la dispense
+  du gel ne la couvre pas) ou si c'est une union mécanique — ajouts purs
+  des deux côtés dans chaque conflit, arbre égal à la fusion `merge=union`
+  (§2 : conflit mécanique, aucun avis). Un blocage sur la remise la refuse
+  toujours ; un verdict du gel n'est jamais écarté par une ref de remise.
   Sinon le lot reste `conflict`, avec le motif du refus de chaque remise.
 
 Chaque refus porte un **code** stable (`freeze-not-head`, `verdicts-missing`,
@@ -274,16 +276,40 @@ def _base_sections_empty(text: str) -> str:
     return ""
 
 
+def _stricter(*classes) -> dict:
+    """#2496 : la classe la plus exigeante — avis requis, puis rang, puis
+    doute (un doute vaut sensible). Jamais moins que la plus stricte."""
+    def key(klass: dict) -> tuple:
+        rank = lot_class.RANK.get(str(klass.get("class") or lot_class.SENSITIVE), 2)
+        if klass.get("doubt"):
+            rank = max(rank, lot_class.RANK[lot_class.SENSITIVE])
+        return (merge_queue.required_verdicts(klass), rank, bool(klass.get("doubt")))
+    return max((k or {} for k in classes), key=key)
+
+
+def _without_waiver(row: dict) -> dict:
+    """#2496 (B2 cx2) : la dispense `-none` du pilote couvre la tête gelée,
+    jamais une remise : son contenu (la résolution) n'a pas été vu."""
+    return dict(row, reviewer="" if str(row.get("reviewer") or "").strip()
+                == work.REVIEWER_NONE else row.get("reviewer"),
+                reviewers=[r for r in (row.get("reviewers") or ())
+                           if r != work.REVIEWER_NONE])
+
+
 def evaluate_remise(db, row: dict, marks, *, repo: str, package_base: str,
-                    frozen: str, ref: str, sha: str, klass) -> dict:
+                    frozen: str, ref: str, sha: str, klass, cfg=None,
+                    canons=None) -> dict:
     """#2496 : une remise du lot peut-elle être sa source dans le paquet ?
 
-    Rend `{ref, sha, ok, why, cover, target_parent}` ; `cover` dit ce qui
-    couvre la remise : `verdict` (porte des avis sur la remise, mêmes règles
-    que le gel), `waiver` (dispense du pilote, #1979) ou `mechanical`
-    (`mechanical_union`). Ne lève jamais : un doute refuse."""
+    Rend `{ref, sha, ok, why, cover, target_parent, review_class}` ; `cover`
+    dit ce qui couvre la remise : `verdict` (porte des avis sur le SHA de la
+    remise) ou `mechanical` (`mechanical_union`, §2 : aucun avis). La porte
+    des avis applique la classe **la plus stricte** du gel (`klass`) et du
+    contenu réellement composé (la remise contre `package_base`) ; la
+    dispense du pilote, liée à la tête gelée, ne la couvre jamais. Ne lève
+    jamais : un doute refuse."""
     out = {"ref": ref, "sha": sha, "ok": False, "why": "", "cover": "",
-           "target_parent": ""}
+           "target_parent": "", "review_class": None}
     parents = _text(_git_out(repo, "rev-parse", sha + "^@")).split()
     if len(parents) != 2 or parents.count(frozen) != 1:
         out["why"] = ("parents are not the reviewed freeze %s and one target commit"
@@ -304,8 +330,26 @@ def evaluate_remise(db, row: dict, marks, *, repo: str, package_base: str,
                       if merged["state"] == "conflict" else merged["detail"]
                       or "merge with the base unreadable")
         return out
+    # B2 (cx1, cx2) : la classe du contenu composé, jamais moins que le gel
     try:
-        gate = merge_queue.review_gate(db, marks, sha, repo=repo, klass=klass, item=row)
+        composed = lot_class.of_lot(db, int(row["id"]), cfg=cfg, item=row, repo=repo,
+                                    base=package_base, head=sha, milestones=marks,
+                                    canons=canons)
+    except Exception as exc:  # noqa: BLE001 - classe illisible : on refuse
+        out["why"] = "review class of the remise unreadable: %s" % exc
+        return out
+    effective = _stricter(klass, composed)
+    out["review_class"] = effective
+    if effective.get("class") == lot_class.RELEASE:
+        out["why"] = "class release: the release procedure, not a package, carries it"
+        return out
+    # une résolution jugée demande au moins un avis indépendant, même pour un
+    # lot léger : une porte à zéro avis ne prouve rien sur la résolution
+    gate_class = effective if merge_queue.required_verdicts(effective) else \
+        dict(effective, **{"class": lot_class.NORMAL})
+    try:
+        gate = merge_queue.review_gate(db, marks, sha, repo=repo, klass=gate_class,
+                                       item=_without_waiver(row))
     except Exception as exc:  # noqa: BLE001 - porte illisible : on refuse
         out["why"] = "review gate of the remise unreadable: %s" % exc
         return out
@@ -313,15 +357,16 @@ def evaluate_remise(db, row: dict, marks, *, repo: str, package_base: str,
         # un blocage sur la remise n'est jamais levé par l'union mécanique
         out["why"] = gate.get("why") or "blocked verdict on the remise"
         return out
-    if gate.get("ok"):
-        out["ok"], out["cover"] = True, "waiver" if gate.get("waived") else "verdict"
+    if gate.get("ok") and gate.get("accepted"):
+        out["ok"], out["cover"] = True, "verdict"
         return out
     union = mechanical_union(repo, parents[0], parents[1], sha)
     if not union:
         out["ok"], out["cover"] = True, "mechanical"
         return out
     out["why"] = "%s; not mechanical: %s" % (
-        gate.get("why") or "no verdict on the remise", union)
+        gate.get("why") if not gate.get("ok") and gate.get("why")
+        else "no verdict on the remise", union)
     return out
 
 
@@ -416,14 +461,16 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
                for lot, refs in found.items()}
     for row in rows:
         lot = int(row["id"])
-        shas = {sha for _ref, _listed, sha in remises.get(lot, []) if sha}
+        shas = _remise_shas(where, remises.get(lot, []), marks.get(lot, []),
+                            tips.get(str(row.get("branch") or ""), ""))
         candidates.append(_candidate(
             db, row, target_branch=target_branch, tips=tips, where=where,
             package_base=package_base,
             marks=[m for m in marks.get(lot, []) if not _names_remise(m, shas)],
             cfg=cfg, canons=canons))
     _apply_remises(db, candidates, {int(row["id"]): row for row in rows}, marks,
-                   remises, remise_error, where=where, package_base=package_base)
+                   remises, remise_error, where=where, package_base=package_base,
+                   cfg=cfg, canons=canons)
     for entry in candidates:
         if entry["ready"] and not entry["source"]:
             entry["source"] = entry["published_head"]
@@ -449,6 +496,26 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     }
 
 
+def _remise_shas(repo: str, remises: list, marks: list, tip: str) -> set:
+    """#2496 (B1 cx1) : les SHA de remise dont les verdicts sont mis de côté
+    pour lire le gel. Seule une **fusion à deux parents** peut être une
+    remise ; jamais la tête publiée de la branche ni un SHA gelé du lot :
+    une ref de remise qui pointe sur le gel (ou un alias) ne fait jamais
+    disparaître un verdict du gel, un blocage surtout."""
+    def same(a: str, b: str) -> bool:
+        a, b = a.strip().lower(), b.strip().lower()
+        return len(min(a, b, key=len)) >= 7 and (a.startswith(b) or b.startswith(a))
+
+    frozen = [str(m.get("sha") or "") for m in marks if m.get("kind") == "frozen"]
+    out = set()
+    for _ref, _listed, sha in remises:
+        if not sha or (tip and same(sha, tip)) or any(same(sha, f) for f in frozen):
+            continue
+        if len(_text(_git_out(repo, "rev-parse", sha + "^@")).split()) == 2:
+            out.add(sha)
+    return out
+
+
 def _names_remise(mark: dict, shas: set) -> bool:
     """Un verdict qui nomme une remise du lot (SHA complet ou abrégé)."""
     sha = str(mark.get("sha") or "").strip().lower()
@@ -457,7 +524,8 @@ def _names_remise(mark: dict, shas: set) -> bool:
 
 
 def _apply_remises(db, candidates: list[dict], rows: dict, marks: dict, remises: dict,
-                   error: str, *, where: str, package_base: str) -> None:
+                   error: str, *, where: str, package_base: str, cfg=None,
+                   canons=None) -> None:
     """#2496 : un lot dont `conflict` est le seul motif devient prêt comme
     unité quand une de ses remises sur la cible passe `evaluate_remise` ; la
     remise est alors sa `source`. Sinon le motif `conflict` garde la raison du
@@ -480,7 +548,8 @@ def _apply_remises(db, candidates: list[dict], rows: dict, marks: dict, remises:
                 continue
             evaluated.append(evaluate_remise(
                 db, rows[lot], marks.get(lot, []), repo=where, package_base=package_base,
-                frozen=entry["frozen_sha"], ref=ref, sha=sha, klass=entry["review_class"]))
+                frozen=entry["frozen_sha"], ref=ref, sha=sha, klass=entry["review_class"],
+                cfg=cfg, canons=canons))
         entry["remises"] = evaluated
         good = [e for e in evaluated if e["ok"]]
         if not good:

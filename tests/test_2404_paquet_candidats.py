@@ -21,7 +21,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import lot_class, merge_queue, packet_candidates, resolutions, storage
+from ameesh import lot_class, merge_queue, packet_candidates, resolutions, storage, work
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -187,9 +187,15 @@ class InventoryTest(unittest.TestCase):
             3: [{"path": "migrations/0009_x.sql", "class": "sensitive", "rule": None}],
         }
         self.families = {"author": "deepseek", "reviewer": "claude"}
+        self.head_classes: dict[str, tuple] = {}
 
     def inventory(self, **kwargs):
         def fake_class(db, lot, **rest):
+            # #2496 : la classe du contenu composé d'une remise, par SHA
+            if rest.get("head") in self.head_classes:
+                cls, files = self.head_classes[rest["head"]]
+                return {"lot": lot, "class": cls, "doubt": False, "why": "test",
+                        "files": files}
             return {"lot": lot, "class": self.classes[lot], "doubt": False,
                     "why": "test", "files": self.files.get(
                         lot, [{"path": "src/ameesh/x.py", "class": "light", "rule": None}])}
@@ -403,6 +409,60 @@ class RemiseTest(InventoryTest):
         entry = self.by_id(self.inventory())[4]
         self.assertFalse(entry["ready"])
         self.assertEqual(entry["remises"], [])
+
+    def test_remise_ref_on_the_freeze_never_hides_its_blocked_verdict(self):
+        """B1 (cx1) : une ref de remise qui pointe sur le gel lui-même (un
+        alias) ne fait pas disparaître le blocage rendu sur ce gel."""
+        self.marks[5].append({"id": 5000, "work_item_id": 5, "kind": "verdict",
+                              "sha": self.tips[5], "actor": "reviewer",
+                              "verdict": "blocked", "at_ts": 5000.0})
+        self.assertFalse(self.by_id(self.inventory())[5]["ready"])
+        ref = "refs/ameesh/resolutions/5/main-alias"
+        _git(self.repo, "update-ref", ref, self.tips[5])
+        _git(self.repo, "push", "-q", "origin", "%s:%s" % (ref, ref))
+        entry = self.by_id(self.inventory())[5]
+        self.assertFalse(entry["ready"])
+        self.assertIn("blocked-verdict", [c["code"] for c in entry["causes"]])
+
+    def test_remise_is_classed_on_its_composed_content(self):
+        """B2 (cx1, cx2) : une remise qui ajoute une migration passe la porte
+        de son contenu (deux avis), pas celle du gel normal (un avis)."""
+        sha = self._remise(4, "main-sql", {"shared.py": "FOUR MAIN\ntwo\n",
+                                           "migrations/9999_review.sql": "-- x\n"},
+                           verdict="ok")
+        self.head_classes[sha] = ("sensitive", [
+            {"path": "migrations/9999_review.sql", "class": "sensitive", "rule": None}])
+        entry = self.by_id(self.inventory())[4]
+        self.assertFalse(entry["ready"])
+        remise = entry["remises"][0]
+        self.assertFalse(remise["ok"])
+        self.assertEqual(remise["review_class"]["class"], "sensitive")
+
+    def test_remise_of_a_light_lot_needs_an_independent_verdict(self):
+        """B2 (cx1) : une porte légère à zéro avis ne prouve rien sur une
+        résolution jugée ; l'avis de l'auteur ne compte pas."""
+        self.classes[4] = "light"
+        sha = self._remise(4, "main-abc", {"shared.py": "FOUR MAIN\ntwo\n"})
+        self.marks[4].append({"id": 9500, "work_item_id": 4, "kind": "verdict", "sha": sha,
+                              "actor": "author", "verdict": "ok", "at_ts": 9500.0})
+        entry = self.by_id(self.inventory())[4]
+        self.assertFalse(entry["ready"])
+        self.marks[4].append({"id": 9501, "work_item_id": 4, "kind": "verdict", "sha": sha,
+                              "actor": "reviewer", "verdict": "ok", "at_ts": 9501.0})
+        entry = self.by_id(self.inventory())[4]
+        self.assertTrue(entry["ready"], entry["causes"])
+        self.assertEqual(entry["remise"]["cover"], "verdict")
+
+    def test_waiver_of_the_freeze_does_not_cover_a_remise(self):
+        """B2 (cx2) : la dispense `-none` du gel ne couvre pas la résolution
+        d'une remise jamais relue."""
+        for row in self.rows:
+            if row["id"] == 4:
+                row["reviewer"] = work.REVIEWER_NONE
+        self._remise(4, "main-abc", {"shared.py": "FOUR MAIN\ntwo\n", "extra.py": "x\n"})
+        entry = self.by_id(self.inventory())[4]
+        self.assertFalse(entry["ready"])
+        self.assertNotEqual(entry["remises"][0]["cover"], "waiver")
 
     def test_is_remise_names(self):
         self.assertTrue(packet_candidates.is_remise(
