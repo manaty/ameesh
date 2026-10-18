@@ -424,6 +424,41 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     return out
 
 
+def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None) -> dict | None:
+    """La porte des avis du dernier gel d'un lot, lue comme la composition du
+    paquet (`packet_candidates`) : dépôt retrouvé par le commit gelé (#2559,
+    l'hôte qui lit le lot n'est pas toujours celui de son auteur), classe du
+    diff gelé, puis `review_gate`.
+
+    Rend None quand la lecture n'est pas concluante (pas de gel, dépôt
+    introuvable, classe en doute sans chemin lisible) : l'appelant ne doit
+    jamais lire None comme une porte ouverte. Lecture seule."""
+    from . import lot_class
+
+    freeze = plan_git.latest_freeze(marks or ())
+    frozen = str((freeze or {}).get("sha") or "").strip()
+    repo = lot_class.repo_for_freeze(db, cfg, item, frozen) if frozen else ""
+    try:
+        klass = klass or lot_class.of_lot(
+            db, int((item or {}).get("id") or 0), cfg=cfg, item=item,
+            repo=repo or None, head=frozen or None, milestones=marks or None)
+    except Exception:  # noqa: BLE001 - une lecture ratée ne conclut pas
+        return None
+    if not klass:
+        return None
+    if klass.get("doubt") and not klass.get("files"):
+        return None
+    frozen = str(klass.get("frozen_sha") or frozen or "").strip()
+    if not frozen:
+        return None
+    try:
+        return review_gate(db, marks or [], frozen,
+                           repo=klass.get("repo") or repo or None,
+                           klass=klass, item=item)
+    except Exception:  # noqa: BLE001 - une porte illisible ne conclut pas
+        return None
+
+
 def _remote_branch(name: str) -> str:
     """The branch of `origin` that a lot branch or a target names:
     `origin/main`, `refs/remotes/origin/main` and `main` all name `main`."""
