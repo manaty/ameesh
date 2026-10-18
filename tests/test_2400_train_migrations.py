@@ -145,6 +145,21 @@ class RewriteTest(unittest.TestCase):
         with self.assertRaisesRegex(train.TrainError, "not contiguous"):
             train_migrations.audit(self.repo, self.base, head, self.layout)
 
+    def test_historical_file_type_changes_are_refused_by_every_guard(self):
+        name = "supabase/migrations/516_base.sql"
+        os.remove(os.path.join(self.repo, name))
+        os.symlink("../../replacement.sql", os.path.join(self.repo, name))
+        _git(self.repo, "add", ".")
+        _git(self.repo, "commit", "-qm", "replace historical SQL with symlink")
+        head = _git(self.repo, "rev-parse", "HEAD")
+        with self.assertRaisesRegex(train.MemberDeferred, "historical migration"):
+            train_migrations.rewrite(self.repo, self.base, head, self.layout, self.row)
+        with self.assertRaisesRegex(train.MemberDeferred, "historical migration"):
+            train_migrations.guard_transport(
+                self.repo, self.base, head, self.layout, self.row)
+        with self.assertRaisesRegex(train.TrainError, "historical migration"):
+            train_migrations.audit(self.repo, self.base, head, self.layout)
+
     def test_a_transport_carrying_a_migration_is_deferred(self):
         _, head = self.merge("lot/1", {
             "supabase/migrations/517_media.sql": "-- 517 media\n"})

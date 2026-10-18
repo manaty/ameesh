@@ -160,7 +160,8 @@ class Runtime:
         self._belongs(plan)
         self._held(epoch)
         receipt = self.fires.reconcile(plan, fire["id"], epoch, target=self.target)
-        self._migrations_landed(plan)
+        if receipt is not None:
+            self._migrations_landed(plan)
         return receipt
 
     def _migrations_landed(self, plan):

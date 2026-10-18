@@ -1,11 +1,36 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Real SQL receipts through the runtime, including final-gate races/restart."""
 import types
+import unittest
 from unittest import mock
 
 from ameesh import land, merge_queue, train, train_ci, train_fire, train_runtime, train_store, work
 from .support import PgTestCase
 from .test_1467_train import MemoryPorts, row
+
+
+class MigrationReconcileTest(unittest.TestCase):
+    def test_landing_bookkeeping_requires_a_confirmed_receipt(self):
+        for receipt in (None, {"state": "landed"}):
+            with self.subTest(receipt=receipt):
+                runtime = object.__new__(train_runtime.Runtime)
+                runtime.repository = mock.Mock(source="github.com/o/r")
+                runtime.target_branch = "main"
+                runtime.ledger = mock.Mock()
+                runtime.ledger.acquire.return_value = 7
+                runtime.fires = mock.Mock()
+                runtime.fires.reconcile.return_value = receipt
+                runtime.migrations = mock.Mock()
+                runtime.migrations.landed.return_value = []
+                runtime.notify = mock.Mock()
+                plan = dict(source="github.com/o/r", target="main",
+                            migrations=[dict(work_item_id=1, reserved=525, landed=517)])
+                self.assertIs(runtime.reconcile(plan, {"id": "fire"}, 7), receipt)
+                if receipt is None:
+                    runtime.migrations.landed.assert_not_called()
+                else:
+                    runtime.migrations.landed.assert_called_once_with(
+                        plan, path=runtime.repository.clone.path)
 
 
 class TrainRuntimeTest(PgTestCase):

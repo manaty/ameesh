@@ -172,7 +172,7 @@ def rewrite(path: str, base: str, head: str, target: Layout, row: dict, *,
     """
     changes = _diff(path, base, head)
     historical = [name for status, name in changes
-                  if status in ("M", "D") and target.under(name)]
+                  if status in ("M", "D", "T") and target.under(name)]
     if historical:
         raise _rename(row, historical[0],
                       "a historical migration cannot be changed by composition")
@@ -294,7 +294,7 @@ def audit(path: str, base: str, head: str, target: Layout) -> None:
     """
     changes = _diff(path, base, head)
     historical = [name for status, name in changes
-                  if status in ("M", "D") and target.under(name)]
+                  if status in ("M", "D", "T") and target.under(name)]
     if historical:
         raise TrainError("train changed a historical migration: %s" % historical[0])
     added = []
@@ -324,7 +324,7 @@ def guard_transport(path: str, base: str, head: str, target: Layout, row: dict) 
     """
     changes = _diff(path, base, head)
     historical = [name for status, name in changes
-                  if status in ("M", "D") and target.under(name)]
+                  if status in ("M", "D", "T") and target.under(name)]
     if historical:
         raise _rename(row, historical[0],
                       "a historical migration cannot be changed by composition")
