@@ -442,8 +442,10 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("coord", out)
         # contrat 1.1 : le fil est indexé depuis la session, auteur `agent:<nom>`
-        self.assertEqual(self.server.ops(), ["leases.state", "agents.resolve_name", "agents.overview",
-                                             "agents.resolve_name", "mailbox.send", "work.get",
+        self.assertEqual(self.server.ops(), ["leases.state", "agents.resolve_name",
+                                             "agents.resolve_name", "agents.overview",
+                                             "agents.resolve_name", "agents.resolve_name",
+                                             "mailbox.send", "work.get", "agents.resolve_name",
                                              "agents.resolve_name", "threads.index",
                                              "threads.recount"])
         index = [r for r in self.session_requests() if r["body"]["op"] == "threads.index"][0]
@@ -491,7 +493,8 @@ class SessionTest(unittest.TestCase):
                                      "--new-lot", "Review", "--estimate", "1h")
         self.assertEqual(code, 2)
         self.assertIn("mediated contract 1.1", err)
-        self.assertEqual(self.server.ops(), ["leases.state", "agents.resolve_name", "agents.overview"])
+        self.assertEqual(self.server.ops(), ["leases.state", "agents.resolve_name",
+                                             "agents.resolve_name", "agents.overview"])
         self.assert_session_only()
 
     def test_hook_remet_par_la_session(self):
@@ -573,7 +576,7 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("pinned to workflow canon/process/site@7", err)
         self.assertIn("process_registry", err)
-        self.assertEqual(self.server.ops(), ["work.get"])
+        self.assertEqual(self.server.ops(), ["agents.resolve_name", "work.get"])
         self.assert_session_only()
 
     def test_work_close_lot_pinne_refuse_sans_sql(self):
@@ -587,7 +590,7 @@ class SessionTest(unittest.TestCase):
                                       "--actor", "inge-front")
         self.assertEqual(code, 1)
         self.assertIn("pinned to workflow canon/process/site@7", err)
-        self.assertEqual(self.server.ops(), ["work.get"])
+        self.assertEqual(self.server.ops(), ["agents.resolve_name", "work.get"])
         self.assert_session_only()
 
     def test_action_propose(self):
