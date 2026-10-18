@@ -479,6 +479,9 @@ la remise du lot diffère du gel enregistré (#2157). `scripts/paquet-compose.py
 compose l'unité et écrit ce message, y compris sur conflit (`.git/MERGE_MSG`
 prêt, `git commit --no-edit` après résolution) ; aucun paquet déjà validé n'est
 réécrit pour ce seul métadonné.
+Le corps du lot porteur nomme ses unités avec leur tête, `#<lot> <tête>`, la
+ligne qu'imprime `scripts/paquet-compose.py --units --base <cible>` (#2360) :
+un `#N` seul n'y déclare aucune unité (#2335).
 
 ## Le lot en cours
 

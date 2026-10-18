@@ -69,6 +69,8 @@ class Rule:
     cls: str
     #: les motifs compilés, dans l'ordre déclaré
     regexes: tuple = field(default=(), compare=False, repr=False)
+    #: SQL, sécurité ou prod : deux familles, même hors motifs de secours.
+    critical: bool = False
 
 
 @dataclass(frozen=True)
@@ -228,6 +230,12 @@ def parse(policies) -> tuple[ReviewPolicy, list[tuple[str, str, str]]]:
                              "%s: unknown class %r (expected: %s)"
                              % (where, cls, ", ".join(CLASSES))))
             continue
+        critical = entry.get("critical", False)
+        if not isinstance(critical, bool) or (critical and cls != "sensitive"):
+            problems.append((BAD_RULE, "error",
+                             "%s: `critical` must be a boolean, and true requires "
+                             "class sensitive" % where))
+            continue
         regexes = []
         failed = False
         for pattern in paths:
@@ -239,7 +247,8 @@ def parse(policies) -> tuple[ReviewPolicy, list[tuple[str, str, str]]]:
                 failed = True
         if failed:
             continue
-        rules.append(Rule(paths=tuple(paths), cls=cls, regexes=tuple(regexes)))
+        rules.append(Rule(paths=tuple(paths), cls=cls, regexes=tuple(regexes),
+                          critical=critical))
     return ReviewPolicy(default=default, rules=tuple(rules)), problems
 
 
@@ -374,6 +383,11 @@ def classify(policy: ReviewPolicy, paths) -> dict:
         cls, rule = policy.class_of(path)
         files.append({"path": path, "class": cls,
                       "rule": list(rule.paths) if rule else None})
+        # Une autre règle de même classe peut porter la criticité : la
+        # première règle gagnante n'a pas seule autorité pour l'abaisser.
+        if any(rule.critical and any(rx.match(path) for rx in rule.regexes)
+               for rule in policy.rules):
+            files[-1]["critical"] = True
     if not files:
         raise ReviewError("no file to classify")
     files.sort(key=lambda item: item["path"])
