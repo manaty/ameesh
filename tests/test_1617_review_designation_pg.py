@@ -74,7 +74,8 @@ class Test1617ReviewDesignationPg(PgTestCase):
 
     def mailbox(self, db=None):
         return (db or self.db).query(
-            "SELECT id, recipient, body, payload FROM agent_mailbox ORDER BY id")
+            "SELECT id, recipient, body, payload, kind, work_item_id"
+            " FROM agent_mailbox ORDER BY id")
 
     def marks(self):
         return [row["note"] for row in self.db.query(
@@ -110,6 +111,9 @@ class Test1617ReviewDesignationPg(PgTestCase):
         for row in sent:
             self.assertIn(SHA_A, row["body"])
             self.assertIn("frozen milestone #%d" % int(freeze["id"]), row["body"])
+            # #2478 : un `request` lié au lot, actif pour le runner du relecteur
+            self.assertEqual(row["kind"], "request")
+            self.assertEqual(row["work_item_id"], str(self.lot))
         marks = self.marks()
         self.assertEqual(len(marks), 1)
         self.assertEqual(pg.designation_of(marks[0])["freeze"],
@@ -226,6 +230,7 @@ class Test1617ReviewDesignationPg(PgTestCase):
         self.assertEqual(out["missing"], 2)
         sent = self.mailbox()
         self.assertEqual([m["recipient"] for m in sent], ["pilot"])
+        self.assertEqual(sent[0]["kind"], "notify")  # pas une demande de relecture
         self.assertIn("No implicit admission", sent[0]["body"])
         self.assertIn("frozen milestone #%d" % int(freeze["id"]), sent[0]["body"])
         # rejoué sans capacité nouvelle : une seule notification

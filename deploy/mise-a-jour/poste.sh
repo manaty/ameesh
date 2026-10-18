@@ -416,11 +416,17 @@ migrer_base() {
   # #2357: a failure no longer stops the update; migrer installs the target
   # code and restarts immediately (the database is already migrated).
   etape "auto-prise du code installé sur la base migrée (lecture seule)"
-  "$VENV/bin/python" -I "$ICI/auto-take-probe.py" || {
-    echo "ancien code incompatible avec le schéma migré (sonde en échec)." >&2
-    echo "La base est DÉJÀ migrée : la mise à jour doit enchaîner tout de suite sur l'installation et le redémarrage du code $court." >&2
-    return 1
-  }
+  # #2359: exit 2 = the probe could not set up the installed runner. Unknown
+  # compatibility is handled like a failure: installing REF is the safe move.
+  local sonde=0
+  "$VENV/bin/python" -I "$ICI/auto-take-probe.py" || sonde=$?
+  case "$sonde" in
+    0) return 0 ;;
+    2) echo "compatibilité de l'ancien code non vérifiée (sonde inutilisable) : traitée comme un échec." >&2 ;;
+    *) echo "ancien code incompatible avec le schéma migré (sonde en échec)." >&2 ;;
+  esac
+  echo "La base est DÉJÀ migrée : la mise à jour doit enchaîner tout de suite sur l'installation et le redémarrage du code $court." >&2
+  return 1
 }
 
 # The remote administrator switches to the actual migration owner so future

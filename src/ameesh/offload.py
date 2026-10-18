@@ -62,6 +62,13 @@ SNAP_ENV = {"GIT_AUTHOR_NAME": "ameesh offload", "GIT_AUTHOR_EMAIL": "offload@am
             "GIT_COMMITTER_NAME": "ameesh offload", "GIT_COMMITTER_EMAIL": "offload@ameesh"}
 
 
+#: `snapshot_with` et le pack envoyé lisent les objets sans `refs/replace`
+#: (#1819) : un remplacement local changerait l'arbre envoyé sans changer le
+#: SHA nommé
+NO_REPLACE = ("--no-replace-objects",)
+NO_REPLACE_ENV = {"GIT_NO_REPLACE_OBJECTS": "1"}
+
+
 class OffloadError(Exception):
     """The offload could not happen (local git, or the VM is unreachable)."""
 
@@ -123,7 +130,8 @@ def snapshot_with(top: str, commit: str, files: dict[str, str]) -> str:
     `run --snapshot`. Rien de l'état local ne peut s'y glisser — ni fichier non
     suivi, ni flag `assume-unchanged`/`skip-worktree` que `git status` masque."""
     with tempfile.TemporaryDirectory(prefix="ameesh-offload-") as tmp:
-        env = dict(os.environ, GIT_INDEX_FILE=os.path.join(tmp, "index"), **SNAP_ENV)
+        env = dict(os.environ, GIT_INDEX_FILE=os.path.join(tmp, "index"), **SNAP_ENV,
+                   **NO_REPLACE_ENV)
         _git(top, "read-tree", commit, env=env)
         for rel, content in files.items():
             blob = _git(top, "hash-object", "-w", "--stdin", env=env, input=content)
@@ -196,7 +204,7 @@ def push(remote: Remote, top: str, repo: str, snap: str) -> None:
     revs = snap + "\n" + "".join("^%s\n" % sha for sha in bases)
     # --shallow: the bases share no history with the snapshot, so git must
     # treat every one of them as an edge to leave out the objects they hold
-    pack = subprocess.Popen(["git", "-C", top, "pack-objects", "--revs", "--thin",
+    pack = subprocess.Popen(["git", "-C", top, *NO_REPLACE, "pack-objects", "--revs", "--thin",
                              "--shallow", "--stdout", "-q", "--delta-base-offset"],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     writer = threading.Thread(target=lambda: (pack.stdin.write(revs.encode()),

@@ -1924,6 +1924,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # est indicatif (canon §2).
             if item.get("reviewer_warning"):
                 print("warning: %s" % item["reviewer_warning"], file=sys.stderr)
+            # #2478 : la désignation est écrite ; un courrier non remis est dit.
+            if item.get("reviewer_request_warning"):
+                print("warning: %s" % item["reviewer_request_warning"], file=sys.stderr)
             return 0
         if args.work_command == "reviewer":
             # #2076 : ajouter ou retirer un relecteur d'un lot DÉJÀ en qa,
@@ -1976,6 +1979,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # famille est indicatif (canon §2).
                 if item.get("reviewer_warning"):
                     print("warning: %s" % item["reviewer_warning"], file=sys.stderr)
+                # #2478 : la désignation est écrite ; un courrier non remis est dit.
+                if item.get("reviewer_request_warning"):
+                    print("warning: %s" % item["reviewer_request_warning"], file=sys.stderr)
             return 0
         if args.work_command == "merged":
             def _declare_constat(constat: dict) -> None:
@@ -2098,6 +2104,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                       % ", ".join(r.get("name") for r in outcome.get("reviewers") or ()))
             elif state == "unavailable":
                 print("review designation unavailable: %s" % (outcome.get("why") or ""))
+            if args.kind == "frozen":
+                # #2442 : un réalignement mécanique sur la cible garde les
+                # verdicts de la tête relue ; sinon l'exécuteur retente.
+                from . import verdict_carry
+                carried = verdict_carry.carry(cfg, db, args.id)
+                if carried["result"] != "idle":
+                    print(verdict_carry.describe(carried))
             return 0
         print(USAGE_HINT % "unknown work subcommand", file=sys.stderr)
         return 2
