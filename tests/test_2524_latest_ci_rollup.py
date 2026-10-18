@@ -16,9 +16,10 @@ def check(conclusion="SUCCESS", *, started=NEW, workflow="tests", status="COMPLE
             "startedAt": started, "status": status, "conclusion": conclusion}
 
 
-def context(state="SUCCESS", *, created=NEW):
+def context(state="SUCCESS", *, created=NEW, field="startedAt"):
+    # `gh pr list --json statusCheckRollup` names a status's date `startedAt`.
     return {"__typename": "StatusContext", "context": "approval/team",
-            "state": state, "createdAt": created}
+            "state": state, field: created}
 
 
 def gh_for(rollup):
@@ -57,16 +58,19 @@ class LatestCiTest(unittest.TestCase):
         self.assert_readers([check("", started=OLD, status="IN_PROGRESS"),
                              check("FAILURE")], "red")
 
-    def test_status_contexts_use_created_at(self):
-        for state, expected in (("SUCCESS", "green"), ("FAILURE", "red"),
-                                ("PENDING", "pending")):
-            rows = [context("FAILURE", created=OLD), context(state)]
-            for rollup in (rows, rows[::-1]):
-                self.assert_readers(rollup, expected)
-                self.assertEqual(radar.ci_green(rollup, required=("approval/",)),
-                                 expected == "green")
-                self.assertEqual(bool(fire._required_gap(("approval/team",), rollup)),
-                                 expected != "green")
+    def test_status_contexts_use_their_date(self):
+        cases = (("SUCCESS", "green"), ("FAILURE", "red"), ("PENDING", "pending"))
+        for field in ("startedAt", "createdAt"):
+            for state, expected in cases:
+                rows = [context("FAILURE", created=OLD, field=field),
+                        context(state, field=field)]
+                for rollup in (rows, rows[::-1]):
+                    with self.subTest(field=field, state=state):
+                        self.assert_readers(rollup, expected)
+                        self.assertEqual(radar.ci_green(rollup, required=("approval/",)),
+                                         expected == "green")
+                        self.assertEqual(bool(fire._required_gap(("approval/team",), rollup)),
+                                         expected != "green")
 
     def test_distinct_workflows_and_contexts_do_not_replace_each_other(self):
         self.assert_readers([check("FAILURE", started=OLD, workflow="security"),

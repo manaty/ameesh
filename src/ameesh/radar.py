@@ -1451,7 +1451,9 @@ def latest_rollup(rollup) -> list:
         name = entry.get("context" if context else "name")
         key = (("context", name) if context else
                ("check", entry.get("workflowName"), name)) if name else ("unknown", index)
-        raw = entry.get("createdAt" if context else "startedAt")
+        # `gh` exporte la date d'un StatusContext sous `startedAt` (son
+        # `createdAt` GraphQL) ; `createdAt` reste lu pour un rollup GraphQL brut.
+        raw = (entry.get("startedAt") or entry.get("createdAt")) if context else entry.get("startedAt")
         try:
             stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
             stamp = stamp.timestamp() if stamp.tzinfo is not None else None
