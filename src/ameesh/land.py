@@ -625,17 +625,23 @@ class _Landing:
                                   "ameesh work queue add %d." % self.lot)
         return None
 
-    def review_after_merge(self, *, merged_sha: str = "", pr=None) -> dict:
+    def review_after_merge(self, *, merged_sha: str = "", pr=None,
+                           base: str | None = None) -> dict:
         """L539 : ouvre le lot de relecture d'un lot **léger** (canon §2), une
         seule fois, après que la fusion est un fait enregistré. La classe est
         relue sur le diff gelé (`merge_queue._class_of`, canon §8) ; un doute
-        ou une classe supérieure n'ouvre rien. Ne lève jamais."""
+        ou une classe supérieure n'ouvre rien. Ne lève jamais.
+
+        `base` est la cible récupérée juste avant la fusion, quand ameesh l'a
+        faite lui-même (#2379) ; sans elle, la borne est la dernière cible
+        connue du clone, et la classe le dit."""
         from . import merge_queue, review_lot
         try:
             item = work.get(self.db, self.lot)
             klass = merge_queue._class_of(
                 self.db, self.lot, item, self.project.repo, self.clone,
-                self.row.get("target"), self.row.get("frozen_sha") or "", cfg=self.cfg)
+                self.row.get("target"), self.row.get("frozen_sha") or "", cfg=self.cfg,
+                base=base)
             return review_lot.open_after_merge(
                 self.db, lot=self.lot, klass=klass, item=item, merged_sha=merged_sha,
                 pr=pr, target=self.row.get("target") or "")
@@ -667,7 +673,11 @@ class _Landing:
         how = self.record(reason, "merge queue of %s: %s, %s%s" % (
             row["target"], "constated GitHub auto-merge" if constated else "landed by ameesh",
             merged["sha"][:12], ", PR #%s" % pr if pr else ""))
-        review = self.review_after_merge(merged_sha=str(merged.get("sha") or ""), pr=pr)
+        # #2379 : seule une fusion faite ici (`clean`, `replayed`) connaît la
+        # cible d'avant la fusion ; « already » la porte déjà avancée.
+        review = self.review_after_merge(
+            merged_sha=str(merged.get("sha") or ""), pr=pr,
+            base=base if merged.get("state") in ("clean", "replayed") else None)
         return dict({"lot": self.lot, "result": "landed", "sha": merged["sha"], "pr": pr,
                      "review_lot": review},
                     **({"warning": "queue entry changed: recorded as history only (a newer entry is "
