@@ -677,6 +677,46 @@ class FiabiliteTest(_Base):
         self.assertEqual([r for r in records if r["event"] in ("raised", "summary")], [])
         self.assertEqual(len(_desktop_log(self.desk)), 1)
 
+    def test_resume_de_debit_legacy_resolu_des_la_premiere_passe(self):
+        # #2395 B2 (relecture 13a963504) : la première passe constate la
+        # résolution ; l'entrée quitte `active` avant `_resolved`, mais le
+        # compte legacy est raccordé à son identité réelle avant le résumé.
+        ncfg = self.ncfg(default_human="human:proprio")
+        alerte = _alert(agent="B", since=900.0, responsible="human:proprio")
+        state = notify.empty_state()
+        key = notify.key_of(alerte)
+        state["active"][key] = {
+            "alert": alerte, "key": key, "human": "human:proprio",
+            "source": "alerte", "status": "resumee", "raised_ts": 900.0,
+            "channels": {}}
+        state["summary"]["human:proprio"] = {
+            "raised": {"stopped_with_mail": 1}, "resolved": 0, "attempts": 0}
+        reel = notify.Sender(env=_sender_env(self.desk))
+
+        class Panne:
+            def send(self, channel, message):
+                raise notify.ChannelError("panne simulee")
+
+        notifier = self.notifier(ncfg, state, sender=Panne())
+        self.now = 3000.0
+        self.passe(notifier, [])
+        identite = notify.Notifier._notified_id(
+            {"key": key, "severity": alert_ack.severity(alerte), "alert": alerte},
+            "human:proprio")
+        bucket = notifier.state["summary"]["human:proprio"]
+        self.assertIn(identite, bucket["raised"])
+        self.assertIn(identite, bucket["resolved"])
+        # résumé retenté canal rétabli, puis le retour de A ne repart pas
+        notifier.sender = reel
+        self.now = 3001.0
+        self.passe(notifier, [])
+        self.assertIn(identite, notifier.state["notified"])
+        self.assertEqual(len(_desktop_log(self.desk)), 1)
+        self.now = 3061.0
+        records = self.passe(notifier, [alerte])
+        self.assertEqual([r for r in records if r["event"] in ("raised", "summary")], [])
+        self.assertEqual(len(_desktop_log(self.desk)), 1)
+
     def test_ancien_membre_sans_severity_marque_la_vraie_identite(self):
         # #2395 B2 (relecture e828508e1) : une entrée active antérieure au lot
         # n'avait pas de `severity` persistée ; le raccord la recalcule pour

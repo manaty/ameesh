@@ -1044,6 +1044,19 @@ def _notification_id(key, severity, human) -> str:
     return json.dumps([key, severity, human], ensure_ascii=False)
 
 
+def _entry_severity(entry: dict):
+    """Sévérité d'une entrée d'état ; les états antérieurs au lot ne la
+    persistaient pas : on la recalcule comme le fait le prochain relevé."""
+    severity = entry.get("severity")
+    if severity is not None:
+        return severity
+    alert = entry.get("alert")
+    if not isinstance(alert, dict):
+        return None
+    from . import alert_ack
+    return alert_ack.severity(alert)
+
+
 def forces_owner(alert: dict) -> bool:
     """#789 t2, restreint par #2395 : une cible `owner` force la livraison à
     l'humain même hors `notify.types`. Un `slo_breach` n'en bénéficie jamais :
@@ -1227,6 +1240,11 @@ class Notifier:
                 # passe ; ni résolution ni acquittement invalidé sur une absence.
                 # L'état antérieur à #1901 ne gardait pas observation_host.
                 continue
+            if entry.get("status") == "resumee":
+                # #2395 : raccorder l'ancien compte de résumé pendant que
+                # l'entrée est encore visible dans `active`, avant qu'elle ne
+                # disparaisse.
+                self._adopt_summary_entry(entry)
             del active[key]
             if self._acknowledged(entry, acknowledgements):
                 self._mute(entry)
@@ -1561,7 +1579,7 @@ class Notifier:
         qui se résout puis revient ne repart pas ; une escalade de niveau a
         une autre identité et part bien."""
         key = entry.get("key") or key_of(entry["alert"])
-        return _notification_id(key, entry.get("severity"), human)
+        return _notification_id(key, _entry_severity(entry), human)
 
     def _already_notified(self, entry: dict, human: str) -> bool:
         return self._notified_id(entry, human) in (self.state.get("notified") or {})
@@ -1842,7 +1860,9 @@ class Notifier:
             self._record("resolved", entry, status, {})
             return
         if status == "resumee":
-            self._summary_add(self._bucket(human), "resolved", entry)
+            bucket = self._bucket(human)
+            self._adopt_summary_entry(entry, bucket)
+            self._summary_add(bucket, "resolved", entry)
             return
         delivered = [name for name, st in entry["channels"].items() if st.get("ok")]
         if not delivered:
@@ -1937,7 +1957,7 @@ class Notifier:
     def _summary_member(entry: dict, human: str) -> dict:
         alert = entry.get("alert") or {}
         return {"key": entry.get("key") or key_of(alert),
-                "severity": entry.get("severity"),
+                "severity": _entry_severity(entry),
                 "type": alert.get("type"),
                 "human": human}
 
@@ -1971,11 +1991,6 @@ class Notifier:
             if (entry.get("alert") or {}).get("type") != kind:
                 continue
             member = self._summary_member(entry, human)
-            if member.get("severity") is None:
-                # Entrée persistée avant le lot : sa sévérité n'était pas
-                # gardée ; on la recalcule comme le fera le prochain passage.
-                from . import alert_ack
-                member["severity"] = alert_ack.severity(entry.get("alert") or {})
             if self._summary_member_id(member) not in excluded:
                 candidates.append(member)
         candidates.sort(key=self._summary_member_id)
@@ -1984,6 +1999,31 @@ class Notifier:
             members.append({"key": "legacy:%s:%s:%d" % (human, kind, index),
                             "severity": None, "type": kind, "human": human})
         return members
+
+    def _adopt_summary_entry(self, entry: dict, bucket: dict | None = None) -> None:
+        """Raccorde un ancien compte de résumé à l'entrée qui se résout.
+
+        L'entrée a déjà quitté `active` au moment de `_resolved` : ce raccord
+        remplace une identité synthétique du même type par la vraie identité
+        (clé, sévérité canonique, humain), pour que le résumé et le retour de
+        l'alerte partagent le registre (#2395 B2, reprise legacy)."""
+        human = entry.get("human")
+        if not human:
+            return
+        if bucket is None:
+            bucket = self._bucket(human)
+        member = self._summary_member(entry, human)
+        identity = self._summary_member_id(member)
+        raised = bucket.get("raised") or {}
+        if identity in raised:
+            return
+        kind = (entry.get("alert") or {}).get("type")
+        for old_id, old in list(raised.items()):
+            if (isinstance(old, dict) and old.get("type") == kind
+                    and str(old.get("key") or "").startswith("legacy:")):
+                del raised[old_id]
+                raised[identity] = member
+                return
 
     def _normalize_summary_raised(self, human, raised) -> dict:
         out = {}
