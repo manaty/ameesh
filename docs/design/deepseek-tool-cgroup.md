@@ -1,6 +1,6 @@
 # DeepSeek tool placement (#490)
 
-DeepSeek Harness 0.2.0-rc.2 uses `dsh-subprocess-local` 0.1.5-rc.2 to
+DeepSeek Harness 0.2.0-rc.2 uses `dsh-subprocess-local` 0.2.0-rc.2 to
 launch ordinary commands and PTYs through `systemd-run --user --scope`.
 These transient `dsh-subprocess-*.scope` units live under `app.slice`, outside
 the runner service. The runner's `MemoryMax` and any future weights therefore
@@ -22,16 +22,23 @@ The checked bytes are the source returned by Node's load chain, not `pkg.main`.
 The reviewed provider entry is:
 
 ```
-@deepseek-ai/dsh-subprocess-local 0.1.5-rc.2
-a3f85e92ce5eddc824348f83cf685d3e417a26c5f1ab602a81fe1bd13315fe2c
+@deepseek-ai/dsh-subprocess-local 0.2.0-rc.2
+e40106ed35a1e1744c016e77f2cf59b07f87969bb7c4b424d26fb08da75e3922
 ```
 
 The entry's imported helper modules are pinned too:
 
 ```
-runner-launch-COYGu0Dl.js 674f0acce6cf7969a5cc9a5c188c7a8d76ff766434634b908d9a4b8a659b1c1a
-runner.js                16719698906a0508aa7163e8a200dd5eb023ba59fe64f451a2b570936e44d47b
+runner-launch-B2zsQ1Dz.js 6df08adc4a27f278878a5f4cde8b551b51e647b922ac7d6591fd62d272ced153
+runner.js                 4e21528dfdb3e92bdce2340945dc4dcb202e4a4af0bbeb8b97585f67735d30c1
+output.js                 4f77ef6da608d36df168c99177e9b527e7145df1418845eba567635e64a4c2a3
 ```
+
+`output.js` is new in 0.2.0-rc.2; the entry imports it, so it is pinned like the
+helper. The 0.2.0 delta adds no Linux `systemd-run` call site: `execFile` still
+runs only `systemctl` queries, and the scope probe and launch keep the reviewed
+`spawnSync`/`spawn` bindings. `node-pty`, `koffi` and `@deepseek-ai/dsh-lazy-require`
+are loaded lazily, without changing the guarded `child_process` bindings.
 
 For the verified entry only, the loader replaces its `child_process` import
 with module-local bindings refusing dsh's native scope probe before any user
@@ -94,7 +101,7 @@ same-process worker threads.
 
 Unavailable protection no longer stops the turn (#1460). A missing dsh package
 or provider, a changed or unreviewed provider (such as `dsh-subprocess-local`
-0.2.0-rc.2 under `/opt/node/lib/node_modules` on the VMs), unavailable source,
+0.2.0-rc.3 under `/opt/node/lib/node_modules` on the VMs), unavailable source,
 an unexpected module format or export, or an unsupported Node module-hook API
 logs `[ameesh] WARNING: DeepSeek cgroup protection unavailable, running dsh
 without it: …` on stderr, and dsh runs as installed. At startup no hook is
@@ -187,7 +194,7 @@ evaluating placement. VM behavior remains to be measured after authorized deploy
 **Title:** Allow supervisor-owned cgroup inheritance instead of user-systemd
 tool scopes
 
-**Provider:** `@deepseek-ai/dsh-subprocess-local` 0.1.5-rc.2, dsh 0.2.0-rc.2,
+**Provider:** `@deepseek-ai/dsh-subprocess-local` 0.2.0-rc.2, dsh 0.2.0-rc.2,
 Linux cgroup v2, reproducible on systemd 255 and 261.
 
 **Reproduction:** Start dsh in a systemd service with `MemoryMax=6G`. Through
