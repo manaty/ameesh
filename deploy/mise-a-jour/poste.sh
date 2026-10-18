@@ -267,10 +267,16 @@ migrer_base() {
   # #2339: run the INSTALLED code, not the migration snapshot, read-only.
   # A failed compatibility check stops before installation on every host.
   etape "auto-prise du code installé sur la base migrée (lecture seule)"
-  "$VENV/bin/python" -I "$ICI/auto-take-probe.py" || {
-    echo "ancien code incompatible : arrêter la mise à jour ; préparer un correctif compatible avant de poursuivre (base déjà migrée)." >&2
-    return 1
-  }
+  # #2359: exit 2 = the probe could not set up the installed runner.
+  local sonde=0
+  "$VENV/bin/python" -I "$ICI/auto-take-probe.py" || sonde=$?
+  case "$sonde" in
+    0) ;;
+    2) echo "compatibilité de l'ancien code non vérifiée (sonde inutilisable) : arrêter la mise à jour ; vérifier l'auto-prise à la main avant de poursuivre (base déjà migrée)." >&2
+       return 1 ;;
+    *) echo "ancien code incompatible : arrêter la mise à jour ; préparer un correctif compatible avant de poursuivre (base déjà migrée)." >&2
+       return 1 ;;
+  esac
 }
 
 # The remote administrator switches to the actual migration owner so future
