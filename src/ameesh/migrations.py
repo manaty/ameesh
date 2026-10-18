@@ -227,14 +227,17 @@ def toplevel(path: str) -> str:
 
 
 def repo_numbers(checkout: str, layout: Layout, *, skip_branch: str | None = None,
-                 also_skip: tuple[str, ...] = (), package: str = MIGRATIONS_DIR) -> dict[int, list[str]]:
+                 also_skip: tuple[str, ...] = (), package: str = MIGRATIONS_DIR,
+                 worktree: bool = True) -> dict[int, list[str]]:
     """Numéro → endroits où il existe dans le dépôt : l'arbre de travail et
     TOUTES les branches locales et distantes du clone (une PR ouverte compte,
     même sans réservation) ; pour ameesh, le paquet installé aussi. Les refs
     de la branche `skip_branch` (celle du lot) et de `also_skip` (les branches
     à ignorer explicitement, p. ex. la branche d'intégration d'un paquet en
     composition, #1603) ne comptent pas, ni l'arbre de travail s'il est sur
-    l'une d'elles. Rien n'est récupéré (pas de fetch)."""
+    l'une d'elles. `worktree=False` ignore l'arbre de travail entier : le train
+    y compose un membre dont la migration n'est pas encore réservée (#2400).
+    Rien n'est récupéré (pas de fetch)."""
     found: dict[int, list[str]] = {}
 
     def add(names, where):
@@ -250,7 +253,7 @@ def repo_numbers(checkout: str, layout: Layout, *, skip_branch: str | None = Non
     skip = {"refs/heads/" + name for name in names}
     head = _git(checkout, "symbolic-ref", "-q", "HEAD").strip()
     directory = os.path.join(checkout, layout.directory)
-    if os.path.isdir(directory) and head not in skip:
+    if worktree and os.path.isdir(directory) and head not in skip:
         add(os.listdir(directory), "worktree")
     refs = _git(checkout, "for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes")
     for ref in refs.split():

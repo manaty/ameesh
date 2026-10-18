@@ -548,6 +548,40 @@ def journal_dir(cfg) -> str:
     return os.path.join(cfg.state_dir, "radar")
 
 
+def pass_lock(cfg, project: str):
+    """Le verrou d'un passage radar sur un projet, pour l'hôte (L160b, #2254) :
+    un descripteur ouvert et verrouillé, ou None quand un autre exécutant de
+    l'hôte fait déjà ce passage.
+
+    Un passage partage des ressources mutables — le clone privé du projet
+    (`scan` y écrit, `Replayer` y fait ses fusions), le dernier rapport, le
+    journal et `.notified` — et les écrit sans autre exclusion. Plusieurs
+    exécuteurs d'un même hôte déclarent `radar.projects` : sans ce verrou,
+    deux passages se marchent dessus (une fusion d'essai de l'un s'exécute
+    pendant le `checkout`/`reset` de l'autre, le rejeu rend un `error`
+    passager) et leurs écritures se succèdent sans ordre. Le noyau libère le
+    verrou à la mort du processus : un passage tué ne bloque pas le suivant.
+
+    `flock` non bloquant : le perdant s'abstient, le gagnant écrit le journal
+    du passage ; le prochain tour reprendra le verrou. Le fichier n'est jamais
+    supprimé (deux processus sur deux inodes différents ne s'excluraient pas).
+    """
+    import errno
+    import fcntl
+    directory = journal_dir(cfg)
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, project + ".pass.lock")
+    fh = open(path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        fh.close()
+        if exc.errno not in (errno.EACCES, errno.EAGAIN):
+            raise
+        return None
+    return fh
+
+
 # --------------------------------------------------------------------------
 # git : lecture seule, objets des fusions d'essai dans un dossier jetable
 # --------------------------------------------------------------------------
@@ -1202,8 +1236,11 @@ def write_journal(cfg, project: str, report: dict) -> dict:
 def run_pass(cfg, db, *, cache: Cache | None = None, settings: Settings | None = None,
              now=time.time, ci="github", owner: str | None = None) -> list[dict]:
     """Un passage du radar sur les projets déclarés par l'hôte ; rend la ligne
-    de journal de chacun, avec ses envois (`mail`, L160c). `ci` : la fonction
-    `branche -> {number, green} | None`, par défaut lue sur GitHub."""
+    de journal de chacun des projets effectivement passés, avec ses envois
+    (`mail`, L160c). Un projet dont un autre exécutant de l'hôte tient déjà le
+    passage est ignoré (#2254, `pass_lock`) : son journal est écrit par ce
+    passage-là. `ci` : la fonction `branche -> {number, green} | None`, par
+    défaut lue sur GitHub."""
     from . import storage
     settings = settings if settings is not None else settings_of(cfg)
     if not settings.projects:
@@ -1212,32 +1249,40 @@ def run_pass(cfg, db, *, cache: Cache | None = None, settings: Settings | None =
             if r.get("branch")]
     lines = []
     for project in settings.projects.values():
-        started = now()
+        lock = pass_lock(cfg, project.name)
+        if lock is None:
+            continue                       # un autre exécutant de l'hôte le passe
         try:
-            from .migration_reservations import probe
-            missing_repo = bool(project.migrations) and not github_slug(project)
-            report = scan(
-                project.repo, lots, default_target=project.target or None,
-                migrations=project.migrations, cache=cache,
-                verify=published_tip if project.migrations else None,
-                reservations=None if missing_repo
-                else (lambda raw: probe(db, project, raw)))
-            if missing_repo:
-                report["reservation_error"] = (
-                    "migration reservations need a GitHub repository identity")
-            error = None
-        except (GitError, plan_git.MergeProbeError, OSError) as exc:
-            report, error = {"repo": project.repo}, "%s : %s" % (type(exc).__name__, exc)
-        if not error:
-            annotate_resolutions(cfg, db, project, report, lots, cache)
-            report["queue"] = run_queue(cfg, db, project, report, cache)
-            if project.land != "off":
-                report["land"] = run_land(cfg, db, project, report, cache, owner)
-        report.update(schema=SCHEMA, project=project.name, ts=started,
-                      duration_s=round(now() - started, 3), error=error)
-        line = write_journal(cfg, project.name, report)
-        sent = [] if error else send_mail(cfg, db, project, report, ci=ci)
-        lines.append(dict(line, project=project.name, mail=sent, land=report.get("land") or []))
+            started = now()
+            try:
+                from .migration_reservations import probe
+                missing_repo = bool(project.migrations) and not github_slug(project)
+                report = scan(
+                    project.repo, lots, default_target=project.target or None,
+                    migrations=project.migrations, cache=cache,
+                    verify=published_tip if project.migrations else None,
+                    reservations=None if missing_repo
+                    else (lambda raw: probe(db, project, raw)))
+                if missing_repo:
+                    report["reservation_error"] = (
+                        "migration reservations need a GitHub repository identity")
+                error = None
+            except (GitError, plan_git.MergeProbeError, OSError) as exc:
+                report, error = ({"repo": project.repo},
+                                 "%s : %s" % (type(exc).__name__, exc))
+            if not error:
+                annotate_resolutions(cfg, db, project, report, lots, cache)
+                report["queue"] = run_queue(cfg, db, project, report, cache)
+                if project.land != "off":
+                    report["land"] = run_land(cfg, db, project, report, cache, owner)
+            report.update(schema=SCHEMA, project=project.name, ts=started,
+                          duration_s=round(now() - started, 3), error=error)
+            line = write_journal(cfg, project.name, report)
+            sent = [] if error else send_mail(cfg, db, project, report, ci=ci)
+            lines.append(dict(line, project=project.name, mail=sent,
+                              land=report.get("land") or []))
+        finally:
+            lock.close()
     return lines
 
 
