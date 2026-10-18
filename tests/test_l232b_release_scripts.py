@@ -280,6 +280,17 @@ class MigrationPinningTest(unittest.TestCase):
         ])
         self.assertIn("--user restart ameesh-notify.service", self.systemctl_calls())
 
+    def test_unusable_probe_is_handled_like_a_failure_with_its_own_message(self):
+        # #2359: exit 2 = probe unusable, not proven incompatible; #2357: like
+        # a failure, it hands over to the install and restart (here deferred
+        # to the staging sequence).
+        done = self.run_script("migrer", self.a, AUTO_TAKE_PROBE_STATUS="2",
+                               MIGRER_SANS_REDEMARRAGE="1")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("sonde inutilisable", done.stderr)
+        self.assertNotIn("ancien code incompatible", done.stderr)
+        self.assertIn("la séquence staging poursuit sans s'arrêter", done.stderr)
+
     def test_missing_ref_takes_clone_head(self):
         # #1245 : sans REF, « migrer » migre le HEAD du dépôt de déploiement,
         # comme « installer » ; le contrôleur L232b migre, lui, son commit épinglé.

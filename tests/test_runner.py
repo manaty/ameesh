@@ -604,30 +604,36 @@ class RunnerTest(PgTestCase):
         self.assertTrue(worker.lease_lost.is_set())
 
     def test_budget_borne_par_le_temps_restant_sans_marge(self):
-        """Le budget d'appel vaut le temps restant, pas un plancher de 0,5 s."""
-        runner = Runner(self.cfg, self.db, once=True)
-        worker = AgentWorker(
-            runner,
-            {"name": "juliette", "harness": "claude"},
-            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.3},
-        )
-        self.assertLessEqual(worker.call_budget(), 0.4)
-        self.assertGreater(worker.call_budget(), 0.0)
-        expire = AgentWorker(
-            runner,
-            {"name": "kilo", "harness": "claude"},
-            {"lease_epoch": 1, "lease_expires_ts": time.time() - 5},
-        )
-        self.assertTrue(expire.deadline_passed())
-        self.assertEqual(expire.call_budget(), 0.0)  # aucun plancher au-delà
+        """Le budget d'appel vaut le temps restant, pas un plancher de 0,5 s.
 
-        # entré juste avant l'échéance : le budget vaut le temps restant exact
-        juste = AgentWorker(
-            runner,
-            {"name": "lima", "harness": "claude"},
-            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.02},
-        )
-        self.assertLessEqual(juste.call_budget(), 0.03)
+        Horloge simulée (#2483) : sous charge CI, 0,3 s de marge s'écoulaient
+        entre la création du worker et les appels, et le budget valait 0.
+        """
+        runner = Runner(self.cfg, self.db, once=True)
+        maintenant = time.time()
+        with mock.patch("ameesh.runner.time.time", return_value=maintenant):
+            worker = AgentWorker(
+                runner,
+                {"name": "juliette", "harness": "claude"},
+                {"lease_epoch": 1, "lease_expires_ts": maintenant + 0.3},
+            )
+            self.assertLessEqual(worker.call_budget(), 0.4)
+            self.assertGreater(worker.call_budget(), 0.0)
+            expire = AgentWorker(
+                runner,
+                {"name": "kilo", "harness": "claude"},
+                {"lease_epoch": 1, "lease_expires_ts": maintenant - 5},
+            )
+            self.assertTrue(expire.deadline_passed())
+            self.assertEqual(expire.call_budget(), 0.0)  # aucun plancher au-delà
+
+            # entré juste avant l'échéance : le budget vaut le temps restant exact
+            juste = AgentWorker(
+                runner,
+                {"name": "lima", "harness": "claude"},
+                {"lease_epoch": 1, "lease_expires_ts": maintenant + 0.02},
+            )
+            self.assertLessEqual(juste.call_budget(), 0.03)
 
     def test_appel_entame_juste_avant_l_echeance_ne_survit_pas(self):
         """Verdict codex3 B5a : entré 20 ms avant l'échéance, l'appel est coupé."""
@@ -665,6 +671,35 @@ class RunnerTest(PgTestCase):
             stop.set()
             thread.join(timeout=5)
         self.assertFalse(thread.is_alive())
+
+    def test_battement_renouvelle_avant_l_echeance_d_un_bail_court(self):
+        """#2483 : un bail de 3 s ne peut pas attendre un battement de 3 s.
+
+        Le plancher de 3 s dormait jusqu'à l'échéance même ; sous charge CI le
+        harnais n'était pas encore publié et le watchdog tuait le tour (run
+        39133881211).
+        """
+        runner = Runner(self.cfg, self.db, once=True)
+        runner.lease_ttl = 3.0  # comme --lease-ttl 3 des témoins de bail perdu
+        maintenant = time.time()
+        worker = AgentWorker(
+            runner,
+            {"name": "romeo", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": maintenant + 3},
+        )
+        stop = mock.Mock()
+        stop.wait.return_value = False  # un tour de boucle, puis renew() coupe
+        with mock.patch.object(AgentWorker, "ensure_watchdog"), \
+                mock.patch.object(AgentWorker, "renew", return_value=False) as renew, \
+                mock.patch("ameesh.runner.time.time", return_value=maintenant):
+            worker._heartbeat(stop)
+        renew.assert_called_once()
+        attente = stop.wait.call_args[0][0]
+        self.assertGreater(attente, 0.0)
+        self.assertLessEqual(
+            attente, 1.1,
+            "un bail de 3 s doit être renouvelé avant son échéance, pas à "
+            "l'échéance même : %ss" % attente)
 
     def test_attente_du_battement_ne_depasse_pas_l_echeance(self):
         """Verdict codex3 B5a : `wait_timeout` n'a aucun plancher positif.
