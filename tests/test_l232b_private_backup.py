@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Canary credentials stay private; failed dumps never get their final name."""
+import gzip
+import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import stat
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -431,3 +437,113 @@ class PrivateBackupTest(unittest.TestCase):
             backup.snapshot_dump(self.config, self.output, inventory)
         connect.assert_not_called()
         self.assertEqual(inventory.read_text(), "old inventory")
+
+    # --- #2261 : cause d'un échec de sauvegarde, sans secret --------------
+    def test_run_reports_timeout_or_exit_status_without_diagnostic(self):
+        with mock.patch.object(backup.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired(["pg_dump"], 1800)):
+            with self.assertRaises(backup.BackupError) as error:
+                backup.run(["pg_dump"], timeout=1800)
+        self.assertIn("pg_dump timed out after 1800", str(error.exception))
+        with mock.patch.object(backup.subprocess, "run",
+                               side_effect=subprocess.CalledProcessError(
+                                   7, ["pg_dump"], stderr=b"CANARY-PASSWORD")):
+            with self.assertRaises(backup.BackupError) as error:
+                backup.run(["pg_dump"])
+        self.assertEqual(str(error.exception), "pg_dump exited with status 7")
+        self.assertNotIn("CANARY", str(error.exception))
+
+    def test_dump_timeout_cause_names_bytes_written(self):
+        def child(args, *, env=None, timeout=1800):
+            self.assertEqual(timeout, 1800)
+            Path(args[-1]).write_bytes(b"p" * 123)
+            raise backup.BackupError("pg_dump timed out after 1800 s")
+        with mock.patch.object(backup, "run", side_effect=child):
+            with self.assertRaises(backup.BackupError) as error:
+                backup.dump(self.config, self.output)
+        message = str(error.exception)
+        self.assertIn("pg_dump timed out after 1800 s", message)
+        self.assertIn("123 bytes written", message)
+        self.assertNotIn("CANARY-PASSWORD", message)
+        self.assertFalse(self.output.exists())
+
+    def test_cli_prints_safe_cause_instead_of_masking_it(self):
+        fakebin = self.root / "fakebin"
+        fakebin.mkdir()
+        fake_dump = fakebin / "pg_dump"
+        fake_dump.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib, sys\n"
+            "args = sys.argv[1:]\n"
+            "pathlib.Path(args[args.index('--file') + 1]).write_bytes(b'p' * 42)\n"
+            "raise SystemExit(3)\n")
+        fake_dump.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": str(fakebin) + os.pathsep + os.environ["PATH"]}):
+            done = subprocess.run([sys.executable, str(PATH), "dump",
+                                   "--config", str(self.config), "--output", str(self.output)],
+                                  capture_output=True, text=True, timeout=30)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn("pg_dump exited with status 3", done.stderr)
+        self.assertIn("42 bytes written", done.stderr)
+        self.assertNotIn("CANARY-PASSWORD", done.stdout + done.stderr)
+        self.assertFalse(self.output.exists())
+
+    # --- #2261 : rapatriement compressé du dump serveur -------------------
+    def test_pull_compressed_dump_is_private_verified_and_atomic(self):
+        payload = b"server-side dump\n" * 1000
+        digest = hashlib.sha256(payload).hexdigest()
+        result = backup.pull(self.output, digest, expected_bytes=len(payload),
+                             source=io.BytesIO(gzip.compress(payload)))
+        self.assertEqual(self.output.read_bytes(), payload)
+        self.assertEqual(stat.S_IMODE(self.output.stat().st_mode), 0o600)
+        self.assertEqual(result, {"artifact_sha256": digest, "bytes": len(payload)})
+
+    def test_pull_wrong_digest_or_size_never_publishes(self):
+        payload = b"server-side dump\n" * 1000
+        digest = hashlib.sha256(payload).hexdigest()
+        for expected_bytes, expected_digest, cause in (
+                (len(payload), "0" * 64, "digest mismatch"),
+                (len(payload) + 1, digest, "incomplete"),
+                (len(payload) - 1, digest, "exceeds the attested size")):
+            with self.subTest(cause=cause):
+                with self.assertRaises(backup.BackupError) as error:
+                    backup.pull(self.output, expected_digest, expected_bytes=expected_bytes,
+                                source=io.BytesIO(gzip.compress(payload)))
+                self.assertIn(cause, str(error.exception))
+                self.assertFalse(self.output.exists())
+                self.assertEqual(list(self.output.parent.iterdir()), [])
+
+    def test_pull_existing_destination_is_never_replaced_or_read(self):
+        self.output.parent.mkdir()
+        self.output.write_bytes(b"old")
+        class NeverRead:
+            def read(self, size=-1):
+                self.fail("the source was read despite the existing destination")
+        with self.assertRaises(backup.BackupError):
+            backup.pull(self.output, "0" * 64, source=NeverRead())
+        self.assertEqual(self.output.read_bytes(), b"old")
+
+    def test_pull_timeout_reports_bytes_written(self):
+        class Slow(io.BytesIO):
+            def read(self, size=-1):
+                time.sleep(2)
+                return super().read(size)
+        payload = b"x" * 100
+        with self.assertRaises(backup.BackupError) as error:
+            backup.pull(self.output, hashlib.sha256(payload).hexdigest(),
+                        expected_bytes=len(payload), timeout=1,
+                        source=Slow(gzip.compress(payload)))
+        message = str(error.exception)
+        self.assertIn("timed out after 1", message)
+        self.assertIn("0 bytes written", message)
+        self.assertFalse(self.output.exists())
+
+    def test_pull_os_error_does_not_echo_the_diagnostic(self):
+        class Broken:
+            def read(self, size=-1):
+                raise OSError("CANARY-PASSWORD")
+        with self.assertRaises(backup.BackupError) as error:
+            backup.pull(self.output, "0" * 64, source=Broken())
+        self.assertIn("dump retrieval failed", str(error.exception))
+        self.assertNotIn("CANARY", str(error.exception))
+        self.assertFalse(self.output.exists())

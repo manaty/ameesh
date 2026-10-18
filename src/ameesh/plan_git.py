@@ -886,6 +886,12 @@ PREFIX_NEGATED_REF_RE = re.compile(r"\b(?:sans|sauf|ni|hors|without|except)\b",
 POSTFIX_NEGATED_REF_RE = re.compile(
     r"\b(?:retir[ée]e?s?|exclue?s?|exclu[ea]nt|reverts?|reverted)\b",
     re.IGNORECASE)
+#: #2262 : un groupe parenthésé qui ouvre sur un contraste porte sa propre
+#: proposition positive et ne subit pas la négation du parent
+#: (« sans #12 (mais #13 livré) » garde 13, « sans (#598) » nie 598).
+POSITIVE_GROUP_RE = re.compile(
+    r"^(?:mais|however|toutefois|cependant|néanmoins|en\s+revanche|but)\b",
+    re.IGNORECASE)
 #: clé de configuration git du dépôt : comment ses commits de fusion citent un
 #: lot en plus de `ameesh-work:` — `hash` : `#<id>` dans le titre
 LOT_REF_GIT_KEY = "ameesh.lotRef"
@@ -1168,7 +1174,10 @@ def negated_hash_positions(title: str) -> set[int]:
     proposition garde une citation positive voisine (« sans #598, #599
     livré » désigne 599). Un titre sans négation ne change rien. Les
     positions (et non les numéros) laissent compter une citation positive du
-    même lot dans une autre proposition.
+    même lot dans une autre proposition. Un groupe parenthésé ouvert par un
+    contraste (« (mais #13 livré) ») porte sa propre proposition positive : la
+    négation du parent ne l'atteint pas (#2262), alors que « sans (#598) »
+    garde 598 nié.
     """
     # R Codex #2259 : une négation vaut aussi pour un groupe qui la suit
     # (« sans (#12) »), tandis que « #14 (sans #12) » garde
@@ -1186,6 +1195,12 @@ def negated_hash_positions(title: str) -> set[int]:
         elif char == ")" and len(stack) > 1:
             stack.pop()["end"] = pos
     negated: set[int] = set()
+    #: #2262 : un groupe qui ouvre sur un contraste (« mais #13 livré ») est
+    #: une proposition positive à part entière : la négation d'un ancêtre ne
+    #: l'atteint pas. Il est jugé à son propre niveau, où ses négations
+    #: internes restent actives.
+    positives = [(level["begin"], level["end"]) for level in levels[1:]
+                 if POSITIVE_GROUP_RE.match(title[level["begin"]:level["end"]].strip())]
     for level in levels:
         begin, end = level["begin"], level["end"]
         text = title[begin:end]
@@ -1199,6 +1214,13 @@ def negated_hash_positions(title: str) -> set[int]:
             if not prefixes and not postfixes:
                 continue
             for match in HASH_REF_RE.finditer(title, begin + left, begin + right):
+                # « (mais #13) retiré » reste nié : un retrait qui suit le
+                # groupe l'emporte sur son ouverture positive.
+                if any(gb >= begin and ge <= end and (gb, ge) != (begin, end)
+                       and gb <= match.start() < ge
+                       and not any(begin + left + p.start() >= ge for p in postfixes)
+                       for gb, ge in positives):
+                    continue
                 position = match.start() - begin - left
                 # « #14 livré sans #12 » livre #14 : une préposition ne nie
                 # que les numéros APRÈS elle. « #12 retiré » et « (#12)

@@ -13,6 +13,11 @@ verdicts requis et la composition de la PR, puis pose sur elle l'étiquette
 (`pull_request` `types: [labeled]`) sur la tête gelée ; `ci cancel` annule les
 runs périmés d'un lot.
 
+#2333 (canon §11 bis, décision owner 18/10/2026 « tout passe par paquet ») :
+`ci run` en mode lot (`ci-lot-<sha>`) est refusé entre deux paquets, sauf
+`--full` (la suite du paquet) ou exception `incident|unblock` motivée et
+journalisée dans la note du lot (`packet_guard`).
+
 Étude L161 (docs/design/etudes/l161-tests-par-impact.md, section 3), voie A :
 pendant les tests, chaque part de la CI publie un check run « tests (flux) »
 (`scripts/ci-flow.py publish`) dont la sortie porte, en JSON lignes, chaque
@@ -108,7 +113,7 @@ import secrets
 import time
 from datetime import datetime
 
-from . import storage
+from . import packet_guard, storage
 
 #: workflows suivis par défaut (nom du fichier), quand le dépôt publie le
 #: workflow des tests L161 : comportement historique, compatible ameesh.
@@ -1985,11 +1990,13 @@ PR_RUN_RE = re.compile(
 #: `seen=<id>` (P2-3) : le plus grand identifiant d'exécution connu avant sa
 #: pose, seule corrélation fiable avec le run qu'elle a produit (les horloges
 #: de la base et de GitHub ne se comparent pas : la seconde contre la fraction).
+#: `avis=<N>` (N2 #2240) garde le nombre d'avis déclaré par l'appelant, y
+#: compris 0 : `--avis 0 --full` reste lisible dans la trace du lot.
 REQUEST_RE = re.compile(
     r"^ci-label (?P<state>reserve|applied|released) pr=(?P<pr>\d+) "
     r"label=(?P<label>ci-(?:lot|full)-[0-9a-f]{40}) sha=(?P<sha>[0-9a-f]{40}) "
     r"base=(?P<base>[0-9a-f]{40}) mode=(?P<mode>lot|full) token=(?P<token>[0-9a-f]{16})"
-    r"(?: seen=(?P<seen>\d+))?\b")
+    r"(?: avis=(?P<avis>\d+))?(?: seen=(?P<seen>\d+))?\b")
 #: l'acteur du `GITHUB_TOKEN` d'Actions : ses étiquettes ne déclenchent rien
 ACTIONS_BOT = "github-actions[bot]"
 
@@ -2204,6 +2211,43 @@ def _carries_freeze_request(api, repo: str, sha: str) -> bool:
     return "types: [labeled]" in text and "ci-(lot|full)-" in text
 
 
+def _reviews_at(api, repo: str, ref: str) -> set[str] | None:
+    """Les fichiers du dossier `reviews/` à `ref`, ou None s'il est illisible."""
+    from . import plan_github
+    try:
+        data = api("repos/%s/contents/reviews?ref=%s" % (repo, _q(ref)))
+    except plan_github.GithubError:
+        return None
+    if not isinstance(data, list):
+        return None
+    return {str(item.get("name") or "") for item in data
+            if isinstance(item, dict) and item.get("type") == "file"}
+
+
+def _manifest_name(head_ref: str) -> str:
+    """`integration/<nom>` → `integration-<nom>.md`, le nom que publient les porteurs."""
+    return "integration-%s.md" % head_ref[len("integration/"):].replace("/", "-")
+
+
+def _carrier_manifest(api, repo: str, head_ref: str, sha: str, base: str) -> str:
+    """Le manifeste de composition que publie le porteur à `sha`, ou "" (N1 #2240).
+
+    Un porteur `integration/<nom>` publie `reviews/integration-<nom>.md` :
+    c'est la revue unitaire du paquet qui tient lieu d'avis sur la tête
+    composée, pour la seule demande de CI (`--avis 0 --full`). Le manifeste
+    doit être le sien et absent de la base de la PR : `main` porte déjà ceux
+    des paquets fusionnés, qu'une branche `integration/**` hériterait sans rien
+    publier (R1 ameesh-dev1). Toute réponse illisible vaut « pas de manifeste » :
+    le refus est nommé, jamais un zéro avis supposé.
+    """
+    name = _manifest_name(head_ref)
+    at_head = _reviews_at(api, repo, sha)
+    at_base = _reviews_at(api, repo, base)
+    if at_head is None or at_base is None or name not in at_head or name in at_base:
+        return ""
+    return name
+
+
 def _short_run(row: dict) -> dict:
     run = {"id": row.get("id"), "status": row.get("status"),
            "conclusion": row.get("conclusion"), "event": row.get("event"),
@@ -2241,9 +2285,13 @@ def _latest_check(api, repo: str, sha: str) -> dict | None:
 
 def _request_note(state: str, number: int, label: str, sha: str, base: str,
                   mode: str, token: str, text: str = "",
-                  seen: int | None = None) -> str:
+                  avis: int | None = None, seen: int | None = None) -> str:
     marker = ("ci-label %s pr=%d label=%s sha=%s base=%s mode=%s token=%s"
               % (state, number, label, sha, base, mode, token))
+    if avis is not None:
+        #: N2 #2240 : le nombre d'avis déclaré par l'appelant reste lisible
+        #: dans la marque, `--avis 0 --full` compris (aucun passage muet).
+        marker += " avis=%d" % avis
     if seen is not None:
         marker += " seen=%d" % seen
     return "%s: %s" % (marker, text.strip()) if text.strip() else marker
@@ -2261,6 +2309,7 @@ def request_events(db, item_id: int, *, limit: int = 200) -> list[dict]:
                     "pr": int(m.group("pr")), "label": m.group("label"),
                     "sha": m.group("sha"), "base": m.group("base"),
                     "mode": m.group("mode"), "token": m.group("token"),
+                    "avis": int(m.group("avis")) if m.group("avis") is not None else None,
                     "seen": int(m.group("seen")) if m.group("seen") is not None else None,
                     "ts": float(ev.get("created_ts") or 0.0)})
     return sorted(out, key=lambda e: e["id"])
@@ -2408,6 +2457,24 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
     if not _sha_ok(pr["base"]):
         raise GelError("pull request #%d: unusable base commit (%r): the composition "
                        "cannot be checked" % (pr["number"], pr["base"]))
+    if full and avis == 0 and not exception:
+        # (b) §12 #2240 (pilote mesh-design, 17/10 13:22) : le zéro avis d'une
+        # suite complète est réservé à un porteur `integration/**` qui publie
+        # son manifeste ; hors de ce cas la relecture reste la règle (#2214).
+        # Cette garde ne touche que la demande de CI : checks requis,
+        # review_gate et porte de fusion du porteur restent inchangés.
+        head_ref = (pr["head_ref"] or "").strip()
+        if not head_ref.startswith("integration/"):
+            raise GelError("pull request #%d: --avis 0 --full is reserved to an "
+                           "integration/** carrier head (source %r); review the head "
+                           "and pass its required verdicts"
+                           % (pr["number"], head_ref or "—"))
+        manifest = _carrier_manifest(api, name, head_ref, frozen_sha, pr["base"])
+        if not manifest:
+            raise GelError("pull request #%d: --avis 0 --full needs the carrier's own "
+                           "manifest (reviews/%s) at %s, absent from the base; without "
+                           "it, review the head and pass its required verdicts"
+                           % (pr["number"], _manifest_name(head_ref), frozen_sha[:12]))
     if release_refs(pr["head_ref"], pr["base_ref"]) and mode == "lot":
         raise GelError("pull request #%d: source %s or target %s is release/** or "
                        "integration/**: request the full suite (--full --reason …); a lot "
@@ -2707,9 +2774,11 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
 
     def critical(tx) -> dict:
         def note(state: str, text: str = "", seen: int | None = None) -> None:
+            #: N2 #2240 : chaque marque porte le nombre d'avis déclaré, y
+            #: compris 0 (`--avis 0 --full` ne passe plus sans trace).
             work.note(tx, int(item_id),
                       _request_note(state, number, label, sha, base, mode, token, text,
-                                    seen=seen))
+                                    avis=int(decision.get("avis") or 0), seen=seen))
 
         note("reserve", "freeze CI requested")
         known = _pr_runs(api, decision["repo"], number, sha, decision["branch"])
@@ -2839,14 +2908,37 @@ def _render_gel(decision: dict) -> list[str]:
 
 
 def cmd_ci_run(cfg, args) -> int:
-    """`ameesh ci run <lot>` : vérifie le gel et pose l'étiquette, une fois."""
-    from . import plan_github
+    """`ameesh ci run <lot>` : vérifie le gel et pose l'étiquette, une fois.
+
+    #2333 (canon §11 bis) : aucune étiquette `ci-lot-<sha>` entre deux paquets.
+    La garde passe avant le plan — un `--dry-run` la montre aussi — et ne
+    laisse partir que `--full` ou une exception `incident|unblock` motivée,
+    journalisée dans la note du lot à la tête réellement testée."""
+    from . import plan_github, work
     from .db import open_db
     db = open_db(cfg)
     gh = plan_github.Gh()
 
     def api(path: str):
         return plan_github._json(gh, ["api", path])
+
+    item = work.get(db, args.id) if args.id else None
+    if item is not None:
+        freeze = frozen_of(db, args.id)
+        declared_sha = ((args.sha or "") or ((freeze or {}).get("sha") or "")).strip().lower()
+        try:
+            packet_guard.check_ci(db, args.id, item.get("branch") or "",
+                                  mode="full" if args.full else "lot",
+                                  sha=declared_sha,
+                                  exception=args.exception or "", reason=args.reason or "")
+        except packet_guard.PacketGuardError as exc:
+            if getattr(args, "json", False):
+                print(json.dumps({"schema": GEL_SCHEMA, "ok": False, "work_item": args.id,
+                                  "action": "refuse", "why": str(exc)},
+                                 ensure_ascii=False, indent=1))
+            else:
+                print("ameesh ci run: %s" % exc)
+            return 1
 
     try:
         decision = gel_plan(db, cfg, args.id, api=api, sha=args.sha or "",
@@ -2870,6 +2962,11 @@ def cmd_ci_run(cfg, args) -> int:
         return 0
     # canon §3 : un run de la branche hors de la composition courante (autre
     # SHA, autre base) est périmé ; jamais celui de la composition demandée.
+    # #2333 : l'exception est journalisée à la tête que le plan a retenue
+    # (celle que la demande va tester), avant la pose de l'étiquette.
+    if decision.get("exception"):
+        packet_guard.declare(db, args.id, decision["exception"], decision["reason"],
+                             decision["sha"], actor=getattr(args, "actor", "") or "")
     stale = cancel_plan(db, cfg, args.id, api=api, repo=args.repo or "",
                         number=decision["pr"], base=decision["base"])["runs"]
     if stale:
