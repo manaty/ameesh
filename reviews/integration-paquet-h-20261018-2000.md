@@ -40,7 +40,7 @@ avec #2497 comme unité) et son run sont abandonnés. #2493 est écarté
 | 6 | #2514 | `e325e91d15e1` (tête gelée) | `df6dc567664e` | Incident CI main : les deux tests rouges (sonde LISTEN réémise, plafond mural 2,5 s) ne mesurent plus l'environnement ; `tests/test_actions.py` + `tests/test_l78_conversations.py`. 2 f. +17/−23. Verdict **dev1** (Claude) ok sur `e325e91d` ; light |
 | 7 | #2524 | `1cf918c41946` (tête gelée) | `934331bb91ad` | Porte de fusion : `ci_green` lit les checks les plus récents de la tête (un run plus ancien rouge ne fige plus la PR), date d'un `StatusContext` lue là où `gh` la met ; `src/ameesh/radar.py` + `tests/test_2524_latest_ci_rollup.py`. 4 f. +157/−6. Verdicts **dev2** (Claude) + **impl-04** (DeepSeek) ok sur `1cf918c4` ; light |
 | 8 | #2526 | `22bd1bbf7291` (tête gelée) | `239acce66a53` | `_orphan_lots` ne signale plus un lot `intake`/`build` retenu par une dépendance bloquante ouverte (même vérité que `lot_sessions.actionable`) ; `src/ameesh/exploitation.py` + `tests/test_2526_orphan_dependance.py`. 2 f. +100/−2. Verdicts **cx1** (Codex) + **dev4** (Claude) ok sur `22bd1bbf` ; sensible (exploitation.py) |
-| 9 | #1349 | `dc7d3c45d8d1` (remise du gel `167b4ffa` sur `main` `7e6e3ed7a`) | `a9a217b8adab` | `ameesh agent peek <nom>` : résumé lisible du travail d'un agent, avertissement une fois par série ; migration **`0436_agent_peek.sql`** additive, rôle superviseur-contenus, `operations.json` doré. 22 f. +1070/−7. Verdicts **dev4** (Claude) + **impl-08** (DeepSeek) ok sur le gel `167b4ffa` ; sensible (droits SQL + serve) ; la remise ne change que la résolution des conflits avec main (`docs/EXPLOITATION.md`, `tests/test_l107_executor_contract.py`), mécanique ; correctif d'attribution CI +4/−2 (voir « Correctif de composition ») |
+| 9 | #1349 | `dc7d3c45d8d1` (remise du gel `167b4ffa` sur `main` `7e6e3ed7a`) | `a9a217b8adab` | `ameesh agent peek <nom>` : résumé lisible du travail d'un agent, avertissement une fois par série ; migration **`0436_agent_peek.sql`** additive, rôle superviseur-contenus, `operations.json` doré. 22 f. +1070/−7. Verdicts **dev4** (Claude) + **impl-08** (DeepSeek) ok sur le gel `167b4ffa` ; sensible (droits SQL + serve) ; la remise ne change que la résolution des conflits avec main (`docs/EXPLOITATION.md`, `tests/test_l107_executor_contract.py`), mécanique ; correctifs d'attribution CI +4/−2 et d'ordre de l'aide +1/−1 (voir « Correctif de composition ») |
 | 10 | #2502 | `25f5dfbb2389` (tête gelée, empilée sur #2497) | `2d1b948f7f8e` | N de la relecture de #2497 : `ARRETS_DE_BAIL` resserré (« database unreachable » ne couvre plus le diagnostic non définitif de `renew`) ; `tests/test_runner.py`. 1 f. +43/−2 après #2497. Verdict **dev4** (Claude) ok sur `25f5dfbb` ; light ; dépendance #2497 satisfaite dans la base |
 
 Chaque commit de composition a le lot en second parent, son sujet nomme le
@@ -58,6 +58,14 @@ composition).
   constante. **+4/−2**, adaptation de test mécanique, aucun avis (§2/§11 bis).
   Rejoué : `test_l161e_map.AttributionContractTest...` + `test_1349_agent_peek`,
   **19 tests OK psql+psycopg**.
+- **Ordre de l'aide** (échec
+  `test_2179_roadmap_cli.RoadmapHelpTest.test_root_help_is_alphabetical_and_keeps_routes_visible`
+  du run 39161059742, psycopg 5/8 et psql 6/16) : `agent peek` (#1349, commit
+  `e6c1118228`, `[skip ci]`) avait été inséré après `agent spawn` dans la liste
+  alphabétique de `src/ameesh/main.py`. Les deux lignes sont remises dans
+  l'ordre (`peek` avant `spawn`). **+1/−1**, correctif mécanique, aucun avis
+  (§2/§11 bis). Rejoué : `tests.test_2179_roadmap_cli.RoadmapHelpTest`,
+  **3 tests OK**.
 
 ## Conflits et résolutions
 
@@ -136,7 +144,8 @@ sous condition par le pilote, est le seul lot attendu écarté.
   --ready-file "$TMPDIR/prets-2000-r3b.txt"
   --expected 2184,2449,2470,2495,2503,2514,2524,2526,1349,2502,2493` — 10
   compositions, 0 retrait, 10 lots attendus (9 contenus « présent », #1349
-  « partiel » attendu : correctif d'attribution +4/−2), 4 lots prêts lus
+  « partiel » attendu : correctifs de composition +5/−3 (attribution +4/−2,
+  ordre de l'aide +1/−1)), 4 lots prêts lus
   (#2514, #2470, #2503, #2502), 1 exclusion consignée (#2493) ; **verdict :
   aucun défaut**.
 
