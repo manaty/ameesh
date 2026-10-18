@@ -626,6 +626,9 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
         "turn": turn,
         "turns": int(row.get("turns") or 0),
         "unread": int(row.get("unread") or 0),
+        # §4 (owner 14/10/2026) : lots en `build` de l'agent, tous projets
+        # confondus (le plafond est global) ; le rendu signale le dépassement
+        "builds": int(row.get("builds") or 0),
         "pending_prompt": bool(row.get("has_pending_prompt")),
         "lease_live": bool(row.get("lease_live")),
         # L37 (0030) : mode et raison d'arrêt structurée
@@ -1135,6 +1138,14 @@ def _duration(seconds) -> str:
     return "%d d %d h" % (seconds // 86400, (seconds % 86400) // 3600)
 
 
+def _wip_label(builds: int) -> str:
+    """§4 : l'en-cours d'un agent, et le dépassement du plafond s'il y en a un."""
+    cap = work_mod.BUILD_LIMIT
+    if builds > cap:
+        return "%d lots in build (above the §4 cap of %d)" % (builds, cap)
+    return "%d lot(s) in build" % builds
+
+
 def _ci_suite_lines(ci: dict, width: int) -> list[str]:
     """#1476 : la durée médiane des suites complètes, par dépôt, face à la
     cible ; la part couverte par le pool prioritaire de #1468 est dite."""
@@ -1224,9 +1235,7 @@ def format_text(snap: dict, width: int | None = None) -> str:
             state = "STALE %s (%s)" % (_duration(stale["idle_s"]), state)
         closed = lot.get("closed")
         if closed:
-            state = ("delivered outside the target" if closed.get("reason") == "delivered"
-                     else "abandoned" if closed.get("reason") == "abandoned"
-                     else "superseded by #%s" % closed.get("superseded_by"))
+            state = work_mod.close_how(closed.get("reason"), closed.get("superseded_by"))
         line("#%s %s — %s%s" % (lot["id"], state, lot["title"],
                                 " [%s]" % lot["epic"] if lot.get("epic") else ""), "  ")
         line("requested %s · frozen %s · verdict %s%s · merged %s%s" % (
@@ -1275,8 +1284,9 @@ def format_text(snap: dict, width: int | None = None) -> str:
         since = agent["since_ts"]
         line("%s — %s%s" % (agent["name"], _FR_AGENT.get(agent["state"], agent["state"]),
                             " for %s" % _duration(now - since) if since else ""), "  ")
-        line("%s · %s · effort %s" % (agent["harness"] or "?", agent["model"] or "default",
-                                      agent["effort"] or "default"), "    ")
+        line("%s · %s · effort %s · %s" % (
+            agent["harness"] or "?", agent["model"] or "default",
+            agent["effort"] or "default", _wip_label(agent.get("builds") or 0)), "    ")
         turn = agent.get("turn")
         if turn:
             line("turn: %s" % (turn["task"] or turn["label"] or "running"), "    ")

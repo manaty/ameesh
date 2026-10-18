@@ -25,10 +25,34 @@ class UnitTest(unittest.TestCase):
                 "prerequisite": {"id": "prerequisite", "present": True}}
 
     def resolve(self, *, dates=None, commitments=(), items=(), rows=None, now=None,
-                landings=(), holds=None):
+                landings=(), holds=None, decisions=()):
         return W.resolve(rows or self.rows, dates or {}, commitments, self.packages,
                          items, now=self.now if now is None else now,
-                         landings=landings, holds=holds)
+                         landings=landings, holds=holds, decisions=decisions)
+
+    def test_decision_request_waits_until_its_deadline(self):
+        # #2378 : demande ouverte non échue → attente prévue jusqu'à l'échéance
+        rows = [{"id": 1, "state": "waiting_human"}]
+        open_ = {"id": 7, "lot": 1, "owner": "human:o", "due_ts": self.now + 3600}
+        wait = self.resolve(rows=rows, decisions=[open_])[1]
+        self.assertEqual((wait["what"], wait["decision"], wait["owner"]),
+                         ("decision", 7, "human:o"))
+        self.assertEqual(wait["due_ts"], round(self.now + 3600, 3))
+        # échue, sans échéance, ou une des deux échue : le signal revient
+        late = dict(open_, id=8, due_ts=self.now - 1)
+        self.assertEqual(self.resolve(rows=rows, decisions=[late]), {})
+        self.assertEqual(self.resolve(rows=rows, decisions=[dict(open_, due_ts=None)]), {})
+        self.assertEqual(self.resolve(rows=rows, decisions=[open_, late]), {})
+        # la plus proche échéance fait la fin de l'attente
+        later = dict(open_, id=9, due_ts=self.now + 7200)
+        self.assertEqual(self.resolve(rows=rows, decisions=[later, open_])[1]["decision"], 7)
+        # seul un lot `waiting_human` attend son décideur ; un autre lot n'en dépend pas
+        self.assertEqual(self.resolve(decisions=[open_]), {})
+        self.assertEqual(self.resolve(rows=rows, decisions=[dict(open_, lot=2)]), {})
+        # un hold du pilote reste prioritaire
+        held = {1: {"what": "hold", "by": "orch", "since": 1.0}}
+        self.assertEqual(self.resolve(rows=rows, decisions=[open_], holds=held)[1]["what"],
+                         "hold")
 
     def test_future_start_ends_at_local_midnight_without_changing_activity(self):
         dates = {1: {"planned_start": "2026-10-13"}}

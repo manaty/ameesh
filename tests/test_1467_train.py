@@ -14,7 +14,7 @@ from unittest import mock
 from ameesh import land, merge_queue, radar, resolutions, train, train_ci, train_git
 
 from .test_l160e2_land import _Land
-from .test_l160b_radar import _git
+from .test_l160b_radar import MIG, _git, _write
 
 
 def row(lot, **kw):
@@ -153,6 +153,31 @@ class TrainTest(unittest.TestCase):
         self.assertEqual([e[0] for e in self.ports.effects], ["publish", "ci", "promote"])
         self.assertEqual(self.ports.base, first["plan"]["head"])
         self.assertFalse(self.ports.held)
+
+    def test_composition_migration_mapping_is_persisted_with_the_plan(self):
+        # #2400: a reconstruction reads the numbers from the plan, so the
+        # engine must carry them exactly like the transport receipts.
+        engine = self.make()
+        compose = self.ports.compose
+        mapping = [dict(work_item_id=1, reserved=525, landed=517, files=[])]
+        self.ports.compose = lambda base, rows, nonce: dict(
+            compose(base, rows, nonce), migrations=mapping)
+        plan = engine.step(3600)["plan"]
+        self.assertEqual(plan["migrations"], mapping)
+        self.assertEqual(self.ports.document["plan"]["migrations"], mapping)
+        self.ports.compose = compose
+
+    def test_malformed_composition_migration_mapping_is_refused(self):
+        for mapping in ([], [dict(work_item_id=99, reserved=1, landed=2)],
+                        [dict(work_item_id=1, reserved="525", landed=517)]):
+            with self.subTest(mapping=mapping):
+                engine = self.make()
+                compose = self.ports.compose
+                self.ports.compose = lambda base, rows, nonce, mapping=mapping: dict(
+                    compose(base, rows, nonce), migrations=mapping)
+                outcome = engine.step(3600)
+                self.assertEqual(outcome["result"], "refused", outcome)
+                self.assertNotIn("publish", [e[0] for e in self.ports.effects])
 
     def test_missing_fire_and_withdrawal_prevent_promotion(self):
         engine = self.make()
@@ -481,3 +506,87 @@ class TrainGitTest(_Land):
         enter.assert_not_called()
         self.assertIn("radar.projects", err.getvalue())
         self.assertIn("local checkout", err.getvalue())
+
+
+class Recorder:
+    def __init__(self, fail=False):
+        self.calls, self.fail = [], fail
+
+    def reserve(self, row, path, old, number, target):
+        self.calls.append((row["work_item_id"], old, number))
+        if self.fail:
+            raise train.MemberDeferred(row, "reservation refused by fixture")
+
+
+class MigrationCompositionTest(_Land):
+    """#2400 : the train composes a member whose migration is stale."""
+
+    def setUp(self):
+        super().setUp()
+        _write(self.repo, MIG + "/0005_base.sql", "-- 5\n")
+        _write(self.repo, "src/ameesh/rollback/0005_restore.sql", "-- 5\n")
+        _git(self.repo, "add", ".")
+        _git(self.repo, "commit", "-qm", "base migration")
+        _git(self.repo, "push", "-q", "origin", "main")
+        _git(self.repo, "checkout", "-q", "-b", "lot/9-migration", "main")
+        _write(self.repo, MIG + "/0009_stale.sql", "-- 9 stale\n")
+        _write(self.repo, "src/ameesh/rollback/0009_restore.sql", "-- 9 restore\n")
+        _git(self.repo, "add", ".")
+        _git(self.repo, "commit", "-qm", "stale migration 9")
+        _git(self.repo, "push", "-q", "origin", "lot/9-migration")
+        self.frozen = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "checkout", "-q", "main")
+        self.clone = resolutions.Replayer(self.repo, os.path.join(self.tmp, "migration.clone"))
+        self.recorder = Recorder()
+        self.repository = train_git.Repository(self.project, self.clone,
+                                               migrations=self.recorder)
+        self.member = dict(work_item_id=9, generation=1, frozen_id=1,
+                           frozen_sha=self.frozen, target="main",
+                           source=self.repository.source, branch="lot/9-migration",
+                           queued_ts=0)
+
+    def compose(self, **kw):
+        base = self.repository.target("main")
+        return self.repository.compose("main", base, [self.member], **kw)
+
+    def test_stale_number_continues_the_target_and_the_plan_is_reconstructible(self):
+        plan = self.compose()
+        self.assertEqual(self.recorder.calls, [(9, 9, 6)])
+        self.assertEqual(plan["migrations"], [{
+            "work_item_id": 9, "reserved": 9, "landed": 6,
+            "files": [
+                {"from": MIG + "/0009_stale.sql", "to": MIG + "/0006_stale.sql"},
+                {"from": "src/ameesh/rollback/0009_restore.sql",
+                 "to": "src/ameesh/rollback/0006_restore.sql"},
+            ]}])
+        self.assertEqual(_git(self.clone.path, "show", plan["head"] + ":" + MIG + "/0006_stale.sql"),
+                         "-- 6 stale")
+        self.assertIn("ameesh-migration: 9 9 6", _git(self.clone.path, "log", "-1",
+                                                      "--format=%B", plan["head"]))
+        with self.assertRaises(AssertionError):
+            _git(self.clone.path, "show", plan["head"] + ":" + MIG + "/0009_stale.sql")
+        again = self.compose(migrations=plan["migrations"])
+        self.assertEqual(again["head"], plan["head"])
+        self.assertEqual(again["tree"], plan["tree"])
+        self.assertEqual(self.recorder.calls, [(9, 9, 6)])
+
+    def test_reservation_refusal_defers_the_member_before_publication(self):
+        self.repository.migrations = Recorder(fail=True)
+        with self.assertRaisesRegex(train.MemberDeferred, "reservation refused"):
+            self.compose()
+        self.assertEqual(_git(self.origin, "rev-parse", "main"),
+                         _git(self.repo, "rev-parse", "main"))
+
+    def test_a_historical_migration_change_defers_the_member(self):
+        _git(self.repo, "checkout", "-q", "-b", "lot/8-history", "main")
+        _write(self.repo, MIG + "/0005_base.sql", "-- changed\n")
+        _git(self.repo, "add", ".")
+        _git(self.repo, "commit", "-qm", "change history")
+        _git(self.repo, "push", "-q", "origin", "lot/8-history")
+        frozen = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "checkout", "-q", "main")
+        member = dict(self.member, work_item_id=8, generation=8, frozen_id=8,
+                      frozen_sha=frozen, branch="lot/8-history", source=self.repository.source)
+        base = self.repository.target("main")
+        with self.assertRaisesRegex(train.MemberDeferred, "historical migration"):
+            self.repository.compose("main", base, [member])

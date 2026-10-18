@@ -22,14 +22,19 @@ l'exécuteur), pour chaque lot ouvert qui porte un feu, **dans cet ordre**
    (familles distinctes, aucune celle de l'auteur) et sans blocage non levé.
    Tant qu'elle n'est pas franchie, aucune PR n'est ouverte, aucune ligne de
    file n'est écrite et aucune CI n'est déclenchée ;
-4. la PR manquante est alors ouverte (mode GitHub) ou le lot entre dans la
+4. la voie du lot (file ou fusion directe) est celle que **le projet déclare**,
+   jamais celle de l'hôte qui a pris le bail (#2256) : un projet `land: local`
+   ou `pr` entre en file ; `land: off` fusionne en direct ; un hôte qui ne
+   déclare ni le projet ni sa file s'abstient (`no-land`) au lieu de fusionner
+   en direct par défaut ;
+5. la PR manquante est alors ouverte (mode GitHub) ou le lot entre dans la
    file de fusion (`merge_queue.enter`, Nexlink), une fois les portes vertes ;
-5. en mode GitHub, la fusion est **faite par ce passage**, sous
+6. en mode GitHub, la fusion est **faite par ce passage**, sous
    `gh pr merge --match-head-commit <sha>` : la tête autorisée est vérifiée au
    geste effectif, et aucune auto-fusion GitHub n'est laissée armée entre deux
    passages — GitHub fusionnerait une tête poussée après le feu (P1-4). Une
    auto-fusion trouvée armée est désarmée avant tout autre geste ;
-6. en mode file, l'atterrissage re-vérifie le feu et les blocages au dernier
+7. en mode file, l'atterrissage re-vérifie le feu et les blocages au dernier
    geste (`fire.land_guard`, sous le bail de `land`).
 
 Toute opération d'un lot — le passage, mais aussi `give` et `withdraw` — est
@@ -62,7 +67,8 @@ QUIET = ("idle", "armed", "queued", "busy", "withdrawn")
 #: anomalie ou geste à faire. `not-ready` et les `would-*` se répètent à chaque
 #: passage tant que la CI n'est pas verte : les dire serait du bruit.
 LOUD = ("merged", "would-merge", "invalidated", "would-invalidate", "disarmed",
-        "would-disarm", "error", "no-pr", "pr-closed", "ejected", "no-repository")
+        "would-disarm", "error", "no-pr", "pr-closed", "ejected", "no-repository",
+        "no-land")
 #: méthodes de fusion admises par `gh pr merge`
 METHODS = ("merge", "squash", "rebase")
 
@@ -313,6 +319,87 @@ def _project(cfg, repo: str | None, slug: str | None):
             if migrations.repo_key(project.github) == key:
                 return project
     return None
+
+
+def _queue_declared(db, repo: str | None, slug: str | None) -> bool | None:
+    """Le dépôt a déjà une file dans l'état partagé (#2256), ou None si illisible.
+
+    Les lignes `merge_queue` portent la source du dépôt (`merge_queue.source_of`)
+    et sont communes à tous les hôtes : peu importe celui qui les a écrites,
+    elles déclarent que ce dépôt se fusionne par la file. Un hôte sans
+    `radar.projects.<projet>` ne peut donc pas prétendre qu'il n'y a pas de
+    file et retomber sur `_merge_direct` — c'est le défaut du paquet Nexlink 54.
+    """
+    from . import migrations
+    sources = set()
+    if repo:
+        try:
+            sources.add(merge_queue.normalize_source(merge_queue.source_of(repo)))
+        except Exception:  # noqa: BLE001 - un dépôt illisible ne prouve rien
+            pass
+    key = migrations.repo_key(slug)
+    if key.count("/") == 1:
+        sources.add("github.com/%s" % key)
+    if not sources:
+        return False
+    try:
+        rows = storage.of(db).work.queue()
+    except Exception:  # noqa: BLE001 - illisible ne signifie pas absent
+        return None
+    for row in rows or ():
+        source = str(row.get("source") or "")
+        if source and merge_queue.normalize_source(source) in sources:
+            return True
+    return False
+
+
+def landing_path(cfg, db, project, repo: str | None, slug: str | None) -> tuple[str, str]:
+    """La voie du feu — `queue`, `direct` ou `unknown` — et sa raison (#2256).
+
+    La décision vient de la **déclaration du projet**, jamais de la config
+    locale de l'hôte qui a pris le bail. Le paquet Nexlink 54 a été fusionné
+    en direct parce que l'hôte qui tenait `fire:<lot>` ne déclarait pas
+    `radar.projects.nexlink` et retombait sur `_merge_direct`, alors qu'un
+    autre hôte déclarait sa file.
+
+    - `project` connu : `queue` pour `local`/`pr` ; `direct` exige `off`
+      explicitement déclaré et l'absence vérifiée de file partagée. Le défaut
+      `off` du parseur ne constitue pas une déclaration.
+    - projet inconnu : `queue` si l'état partagé (`merge_queue`) porte déjà une
+      ligne de ce dépôt ; `unknown` si l'hôte ne peut l'établir. Un hôte qui
+      déclare d'autres projets radar mais aucun pour ce dépôt s'abstient : ses
+      portes d'atterrissage ne sont pas celles du lot (même garde que
+      `ameesh work queue add`, #1467/#2120).
+    - `unknown` interdit la fusion directe : le feu s'abstient et un hôte qui
+      connaît le projet agit (le bail est rendu).
+    """
+    if project is not None and getattr(project, "land", "off") != "off":
+        name = getattr(project, "name", "") or "?"
+        return "queue", "project %s declares land=%s" % (name, project.land)
+    try:
+        declared = merge_queue.declared_projects(cfg)
+    except merge_queue.QueueError as exc:
+        return "unknown", "cannot read repository landing conditions: %s" % exc
+    if declared and project is None:
+        return "unknown", (
+            "the loaded configuration declares radar.projects (%s) but none matches %s: "
+            "select the profile declaring radar.projects for this repository, including its "
+            "land/protected conditions (#1467/#2120); no direct merge from this host (#2256)"
+            % (", ".join(sorted(declared)), slug or repo or "this lot"))
+    queued = _queue_declared(db, repo, slug)
+    if queued:
+        return "queue", (
+            "the shared merge queue already holds %s: its landing path is the queue"
+            % (slug or repo or "this repository"))
+    if project is not None and queued is False:
+        raw = (getattr(cfg, "radar", None) or {}).get("projects", {}).get(project.name, {})
+        if raw.get("land") == "off":
+            return "direct", ("project %s explicitly declares land=off without a shared queue"
+                              % project.name)
+    return "unknown", (
+        "this host has no explicit landing mode for %s or cannot establish the absence of "
+        "a shared queue: refusing a direct merge (#2256); declare radar.projects on the host "
+        "that holds the repository, or queue the lot" % (slug or repo or "this lot"))
 
 
 def _repo_info(slug: str, *, gh, cache: dict) -> dict:
@@ -1098,7 +1185,7 @@ def _reconcile(db, row: dict, marks: list, status: dict, *, slug: str, repo: str
         db, lot, sha=status.get("merge_commit") or "", actor=work.SYSTEM_SENDER,
         source="PR #%s" % status.get("number"),
         pr_ref="%s#%s" % (slug, status.get("number")),
-        frozen_id=int(freeze["id"]) if freeze else None,
+        frozen_id=int(freeze["id"]) if freeze else None, repo=repo,
         extra=("" if covered else "the PR merged %s, not the head the fire covered (%s): "
                "the fire did not cover this merge"
                % ((status.get("head") or "?")[:12], _norm((fire or {}).get("sha"))[:12])))
@@ -1111,17 +1198,10 @@ def _reconcile(db, row: dict, marks: list, status: dict, *, slug: str, repo: str
                "" if covered else ". WARNING: the merged head is not the one the fire covered; "
                "the fire is to be given again on a new freeze")),
             {"project": row.get("app") or "", "pr": status.get("number"), "merged": True})
-        from . import review_lot
-        try:
-            out["review_lot"] = review_lot.open_after_merge(
-                db, lot=lot, item=row, merged_sha=status.get("merge_commit") or "",
-                pr=status.get("number"), target=target,
-                klass=lot_class.of_lot(db, lot, item=row, repo=repo, base=target or None,
-                                       head=merge_queue.pinned(repo, _norm((freeze or {}).get(
-                                           "sha"))) if repo else None))
-        except Exception as exc:  # noqa: BLE001 - la fusion est un fait
-            out["review_lot"] = {"id": None, "created": False,
-                                 "why": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
+        # #2374 : la relecture est ouverte par `close_merged` (une seule fois,
+        # sur le diff que la fusion a fait entrer), pas recalculée ici sur
+        # `cible..gel` — vide après la fusion, donc faussement « light ».
+        out["review_lot"] = done.get("review_lot") or {}
     if not covered:
         _wake(db, row.get("assignee"), lot, (
             "Fire on lot #%d « %s »: PR #%s was merged at %s while the fire covered %s. "
@@ -1370,7 +1450,8 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
 
     info = _repo_info(slug, gh=gh, cache=cache)
     target = _target(row, project, work_repo, info)
-    queue_mode = project is not None and getattr(project, "land", "off") != "off"
+    path, landing_why = landing_path(cfg, db, project, work_repo, slug)
+    out["landing"] = path
 
     # #2333 (canon §11 bis) : aucune fusion de lot directe hors paquet, même
     # pour un feu donné avant la garde ou avec une auto-fusion déjà armée. La
@@ -1397,9 +1478,21 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
                    % status.get("number"))
         return out
 
-    # 5. file de fusion (projet qui déclare `land`) : entrée quand les avis et
+    # 5. la voie du lot (#2256) : décidée par la déclaration du projet ou
+    #    l'état partagé de sa file, jamais par la config de cet hôte. Sans
+    #    déclaration ni file connue, le feu s'abstient — il ne fusionne jamais
+    #    en direct par défaut.
+    if path != "direct" and status is not None and status.get("armed"):
+        return _not_ready(db, row, status, out,
+                          "landing path %s forbids GitHub auto-merge" % path,
+                          gh=gh, slug=slug, dry_run=dry_run, handle=handle)
+    if path == "unknown":
+        out.update(result="no-land", detail=landing_why)
+        return out
+
+    # 6. file de fusion (projet qui déclare `land`) : entrée quand les avis et
     #    la CI sont là ; sinon PR ouverte, CI, puis fusion au geste effectif.
-    if queue_mode:
+    if path == "queue":
         if not dry_run and not _renew(handle):
             return {"lot": lot, "result": "busy"}
         return _queue(db, row, marks, fire, project=project, repo=work_repo, target=target,
