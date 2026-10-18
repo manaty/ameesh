@@ -2024,13 +2024,78 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("lot #%d: %s — %s" % (row["id"], row["status"],
                                            row.get("project") or row.get("reason", "changed concurrently")))
             return 0
+        if args.work_command == "reviewers":
+            from . import review_designation_activation as activation
+            out = activation.reviewers(cfg, db, args.id, apply=args.apply)
+            if args.json:
+                print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
+            else:
+                freeze = out.get("freeze")
+                if not freeze:
+                    print("lot #%d is not frozen: no automatic designation" % args.id)
+                else:
+                    print("lot #%d: freeze #%s %s" % (
+                        args.id, freeze["id"], str(freeze.get("sha") or "")[:12]))
+                    designation = out.get("designation")
+                    if not designation:
+                        print("designation: none recorded")
+                    elif designation.get("state") == "designated":
+                        names = ", ".join("%s (%s)" % (r.get("name"), r.get("family"))
+                                          for r in designation.get("reviewers") or ())
+                        print("designation: %s" % names)
+                        if designation.get("policy_ref"):
+                            print("policy     : %s" % designation["policy_ref"])
+                    else:
+                        print("designation: %s — %s" % (
+                            designation.get("state"), designation.get("why") or ""))
+                    if out.get("manual"):
+                        print("manual     : %s" % ", ".join(out["manual"]))
+                    if out.get("error"):
+                        print("mark       : %s" % out["error"])
+            applied = out.get("applied")
+            if applied is not None and not args.json:
+                state = applied.get("state")
+                if state == "designated":
+                    names = ", ".join("%s (%s)" % (r.get("name"), r.get("family"))
+                                      for r in applied.get("reviewers") or ())
+                    print("designated: %s" % names)
+                elif state == "waiting":
+                    print("waiting    : %s" % (applied.get("why") or ""))
+                elif state == "manual":
+                    print("manual     : %s" % (applied.get("why") or ""))
+                elif state in ("unavailable", "none", "unfrozen"):
+                    print("%-11s: %s" % (state, applied.get("why") or ""))
+                else:
+                    print("designation: %s" % state)
+            return 0
         if args.work_command == "milestone":
+            from . import review_designation_activation as activation
+            threads: list = []
+            outcome: dict = {}
+            on_frozen = None
+            if args.kind == "frozen" and activation.enabled(cfg):
+                on_frozen = activation.hook(cfg, outcome)
             row = work.milestone(
                 db, args.id, args.kind, sha=args.sha or "", actor=args.actor or "",
-                verdict=args.verdict, note=args.note or "")
+                verdict=args.verdict, note=args.note or "",
+                on_frozen=on_frozen, after_commit=threads if on_frozen else None)
+            for record in threads:
+                record(db.cfg, db)
             print("milestone %s added to lot #%d%s" % (
                 row["kind"], args.id,
                 " (%s)" % row["verdict"] if row.get("verdict") else ""))
+            state = str(outcome.get("state") or "")
+            if state == "designated":
+                print("reviewers: %s" % ", ".join(
+                    "%s (%s)" % (r.get("name"), r.get("family"))
+                    for r in outcome.get("reviewers") or ()))
+            elif state == "waiting":
+                print("review pending: %s" % (outcome.get("why") or ""))
+            elif state == "manual":
+                print("reviewers: manual designation kept (%s)"
+                      % ", ".join(r.get("name") for r in outcome.get("reviewers") or ()))
+            elif state == "unavailable":
+                print("review designation unavailable: %s" % (outcome.get("why") or ""))
             if args.kind == "frozen":
                 # #2442 : un réalignement mécanique sur la cible garde les
                 # verdicts de la tête relue ; sinon l'exécuteur retente.
@@ -2960,6 +3025,17 @@ def build_parser() -> argparse.ArgumentParser:
                              help="who designates: the session's bound identity by default; "
                                   "a human or an orchestrator (same authority as --correct)")
     pw_reviewer.set_defaults(func=cmd_work)
+    pw_reviewers = work_sub.add_parser(
+        "reviewers",
+        help="#2447: read the automatic reviewer designation of the latest freeze, "
+             "or retry it outside the freeze hook (recovery)")
+    pw_reviewers.add_argument("id", type=int)
+    pw_reviewers.add_argument("--apply", action="store_true",
+                              help="retry the designation of the latest freeze (same head); "
+                                   "a waiting state yields to the designation when capacity "
+                                   "or the canon policy comes back")
+    pw_reviewers.add_argument("--json", action="store_true")
+    pw_reviewers.set_defaults(func=cmd_work)
     pw_merged = work_sub.add_parser(
         "merged", help="declare a work item merged outside a PR and without freeze (local merge "
                        "on the target): any open state → merged, merged milestone with the commit")

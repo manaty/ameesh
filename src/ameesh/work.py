@@ -2611,6 +2611,14 @@ def milestones(db: Db, item_id: int, limit: int = 100) -> list[dict]:
     return storage.of(db).work.milestones(item_id, limit)
 
 
+def _in_transaction(db: Db) -> bool:
+    """True on an open transaction object (psql) or inside a psycopg block."""
+    depth = getattr(db, "_depth", None)
+    if depth is not None:
+        return bool(depth)
+    return int(getattr(db, "_tx_depth", 0) or 0) > 0
+
+
 def milestone(
     db: Db,
     item_id: int,
@@ -2638,9 +2646,15 @@ def milestone(
     (`mail.send(..., after_commit=…)`) ; c'est **l'appelant** qui vide la liste
     après le COMMIT qu'il tient (celui du `with` interne sur une connexion
     racine, celui de sa propre transaction si l'appel est imbriqué : un `with`
-    imbriqué ne commite pas). Absent (le défaut), le gel ne désigne personne :
-    le raccord de la désignation des relecteurs se branche à l'activation du
-    lot #1617, pas ici.
+    imbriqué ne commite pas).
+
+    Absent (le défaut), le gel **active la désignation automatique des
+    relecteurs** (#2447) quand l'hôte lit un canon et que l'appel tient sa
+    transaction : le hook de `review_designation_activation` est installé, et
+    la liste `after_commit` créée ici est vidée après le COMMIT interne. Sur
+    une transaction déjà ouverte, l'appelant garde la main : il fournit son
+    hook et sa liste, comme le contrat #1617 l'exige. Un callback explicite
+    l'emporte toujours (témoins, reprise hors hook).
 
     Le feu ne s'écrit pas ici sans contrôle : `ameesh.fire.give` vérifie qu'il
     porte sur le gel courant, et `ameesh.fire.withdraw` qu'un feu est actif.
@@ -2661,6 +2675,15 @@ def milestone(
         raise WorkError("a freeze callback only makes sense for the `frozen` milestone")
     if get(db, item_id) is None:
         raise WorkError("lot %s not found" % item_id)
+    drain: list | None = None
+    if kind == "frozen" and on_frozen is None:
+        from . import review_designation_activation as activation
+        cfg = getattr(db, "cfg", None)
+        if activation.enabled(cfg) and not _in_transaction(db):
+            on_frozen = activation.hook(cfg)
+            if after_commit is None:
+                after_commit = []
+                drain = after_commit
     # #1465 : un gel ou un verdict déclaré dans un tour managé emporte la
     # preuve exacte de son origine (acteur, session, tour, harnais, sha
     # complet). Hors tour (orchestrateur, humain), le jalon s'écrit sans
@@ -2669,9 +2692,14 @@ def milestone(
     proof = review_provenance.proof_for_current_turn(db, actor=actor, sha=sha)
     if proof and not actor:
         actor = proof["actor"]
-    return storage.of(db).work.add_milestone(
+    row = storage.of(db).work.add_milestone(
         item_id, kind, sha=sha.strip(), actor=actor, verdict=verdict, note=note.strip(),
         on_frozen=on_frozen, after_commit=after_commit, proof=proof)
+    if drain is not None:
+        # the internal `with` has committed: the readable thread can leave now
+        for record in drain:
+            record(db.cfg, db)
+    return row
 
 
 def delays(db: Db, limit: int = 200, *, ids: Sequence[int] | None = None) -> list[dict]:
