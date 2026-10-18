@@ -152,6 +152,28 @@ class AuditeurLoginRoleTest(PgTestCase):
         self.assertNotEqual(signature.returncode, 0)
         self.assertIn("permission denied", signature.stderr)
 
+    def test_usage_du_schema_relu(self):
+        """N #2355 : sans USAGE effectif, les GRANT de colonne sont illusoires."""
+        q = db_mod.quote_ident
+        self.db.execute("REVOKE USAGE ON SCHEMA %s FROM %s, %s"
+                        % (q(self.schema), q(self.etat), q(self.contenus)))
+        try:
+            # les deux contrats gardent la lecture de colonne : seul l'USAGE
+            # manque, et la lecture réelle échouerait sur le schéma
+            lit = self.db.query(
+                "SELECT has_column_privilege(%s, %s, 'id', 'SELECT') AS lit",
+                (self.login, "%s.agent_mailbox" % q(self.schema)))[0]["lit"]
+            self.assertTrue(lit, "le cas N n'est pas reproduit : la colonne est déjà perdue")
+            proc = self.run_script(AUDITEUR_SQL, role=self.login, etat=self.etat,
+                                   contenus=self.contenus)
+            self.assertNotEqual(proc.returncode, 0, "USAGE absent accepté à tort")
+            self.assertIn("USAGE du schéma absent", proc.stderr)
+        finally:
+            self.apply_script(ROLE_SQL, role=self.etat)
+            self.apply_script(CONTENTS_SQL, role=self.contenus)
+        self.apply_script(AUDITEUR_SQL, role=self.login, etat=self.etat,
+                          contenus=self.contenus)
+
     def test_le_login_ne_peut_pas_creer_de_table(self):
         proc = self.as_auditeur("CREATE TEMP TABLE t(x int)")
         self.assertNotEqual(proc.returncode, 0)

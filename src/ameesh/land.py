@@ -47,6 +47,16 @@ TRAILER = "ameesh-work"
 #: ref of the fresh target in the clone
 FRESH_REF = "refs/ameesh/land/target"
 
+#: #2345 : une lecture passagère est réessayée d'un passage à l'autre, mais
+#: pas sans fin. Le compteur est le nombre de notes `RETRY_NOTE` du journal
+#: depuis l'admission courante (le radar réécrit `reason` à chaque passage :
+#: il ne peut pas le porter). Au-delà, la ligne est éjectée (fail-closed) et
+#: l'assigné réveillé ; 6 réessais ≈ 30 min au rythme de relevé par défaut
+#: (300 s), réglable par `AMEESH_LAND_TRANSIENT_RETRIES`.
+TRANSIENT_RETRY_LIMIT = max(0, int(os.environ.get("AMEESH_LAND_TRANSIENT_RETRIES", "6")))
+#: préfixe des notes de journal qui comptent ces réessais (`events_noted`).
+RETRY_NOTE = "land transient retry"
+
 
 class LandError(RuntimeError):
     """A lot that cannot be landed now: actionable message."""
@@ -98,10 +108,28 @@ def _fire_guard(landing, *, gh=None) -> dict | None:
     déclarés du projet sur le gel : la voie file ne contourne pas la porte des
     checks requis. Rend l'éjection, ou None si la voie est libre.
 
+    #2333 (canon §11 bis) : la file d'équipe ne contourne pas la règle du
+    paquet. La tête de la ligne (`lot/**`, `agent/**`, `review/**`) ne se
+    fusionne sur la cible d'intégration que portée par un paquet
+    (`integration/**`) ou sous une exception déclarée au journal du lot, pour
+    cette tête exacte — et cela **sans dépendre d'un feu** : une ligne déjà en
+    file ou `work queue add` (qui ne passe ni par `give` ni par `_act`) est
+    arrêtée ici, sur les voies `local` et `pr`.
+
     #2306 : une lecture passagère des checks (5xx, délai) ne prouve pas un
     manque ; la ligne reste en file et repart au passage suivant, au lieu
     d'éjecter le lot."""
-    from . import fire
+    from . import fire, packet_guard
+    row = landing.row or {}
+    try:
+        packet_guard.check_merge(landing.db, landing.lot, row.get("branch") or "",
+                                 row.get("target") or "", row.get("frozen_sha") or "")
+    except packet_guard.PacketGuardError as exc:
+        return landing.eject(str(exc), "This queue entry is not a packet (canon §11 bis): "
+                                       "take the lot out of the queue (`ameesh work queue "
+                                       "remove %d`) and let the packet carry it, or declare "
+                                       "the incident/unblock exception in the lot's note."
+                              % landing.lot)
     try:
         ok, why = fire.land_guard(landing.db, landing.lot,
                                   landing.row.get("frozen_sha") or "",
@@ -449,6 +477,20 @@ def take_remote_lease(path: str, url: str, ref: str, key: str, epoch: int,
     return mine
 
 
+def _retry_attempts(ops, lot: int, since_ts) -> int:
+    """#2345 : les réessais passagers déjà consentis depuis l'admission de la
+    ligne, lus dans le journal du lot (`RETRY_NOTE`, né après `queued_ts`).
+
+    Le journal, et non `reason` : le radar réécrit `reason` à chaque passage
+    (ordre, report), ce qui remettrait le compteur à zéro. Un journal
+    illisible ne fait pas éjecter — la fusion reste de toute façon refusée
+    (fail-closed) —, il ne fait que ne pas borner ce passage-ci."""
+    try:
+        return len(ops.events_noted(RETRY_NOTE, float(since_ts or 0), ids=[int(lot)]))
+    except Exception:  # noqa: BLE001 - compteur illisible : on retente sans lui
+        return 0
+
+
 class _Landing:
     """One landing under the lease `(key, owner, epoch)` (#194 r5): every
     queue write is a compare-and-swap on the lease, in the same statement — a
@@ -483,11 +525,27 @@ class _Landing:
     def retry(self, why: str) -> dict:
         """#2306 : un refus passager garde la ligne en file (état `queued`,
         raison datée) et la rend au passage suivant ; le bail est relâché pour
-        ne pas retarder ce passage, contrairement à `busy` qui le garde."""
+        ne pas retarder ce passage, contrairement à `busy` qui le garde.
+
+        #2345 : le nombre de réessais est borné (`TRANSIENT_RETRY_LIMIT`) ;
+        au-delà, la ligne est éjectée en fermé (rien n'a été fusionné) et
+        l'assigné est réveillé au lieu de tourner indéfiniment."""
+        attempts = _retry_attempts(self.ops, self.lot,
+                                   self.row.get("queued_ts")) + 1
+        if attempts > TRANSIENT_RETRY_LIMIT:
+            return self.eject(
+                "%s (still failing after %d retries: giving up)"
+                % (why, TRANSIENT_RETRY_LIMIT),
+                "The forge read kept failing at each pass: the line is ejected "
+                "fail-closed (nothing was merged). Check the forge or the token, then "
+                "requeue the lot (`ameesh work queue add %d`)." % self.lot)
         self.release = True
-        if not self.write(state="queued", reason="%s: retried at the next pass" % why,
-                          note="merge queue of %s: %s, retried" % (self.row["target"], why),
-                          actor=work.SYSTEM_SENDER):
+        if not self.write(
+                state="queued",
+                reason="%s: retried at the next pass (retry %d/%d)"
+                       % (why, attempts, TRANSIENT_RETRY_LIMIT),
+                note="%s %d/%d: %s" % (RETRY_NOTE, attempts, TRANSIENT_RETRY_LIMIT, why),
+                actor=work.SYSTEM_SENDER):
             return self.busy("lease on %s lost: retry not written" % self.key)
         return {"lot": self.lot, "result": "retry", "error": why}
 

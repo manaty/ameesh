@@ -41,6 +41,14 @@ from .db import Db
 #: hôte qui le déclare dans `policy.resources` a un plafond de swap.
 DEFAULT_MIN_MEM_AVAILABLE = 1024 ** 3
 DEFAULT_MAX_SWAP_USED = None
+#: #2354 : le plafond de 0028 reste le repli d'un hôte qui ne peut pas mesurer
+#: PSI et ne déclare pas `max_swap_used`. Sans pression réelle, le stock de
+#: swap est le seul signal mémoire qui reste : la mémoire disponible peut
+#: rester au-dessus de son plancher pendant que les pages partent en swap.
+#: Il ne s'applique qu'à ce cas — un hôte qui mesure PSI n'a pas de plafond de
+#: swap par défaut (#2296), et un plafond déclaré l'emporte toujours
+#: (`swap_ceiling`).
+DEFAULT_MAX_SWAP_USED_WITHOUT_PSI = 8 * 1024 ** 3
 DEFAULT_MAX_LOAD_FACTOR = 2.0
 DEFAULT_MIN_DISK_FREE = 2 * 1024 ** 3
 #: #246: btrfs floors. On 2026-10-11 the host's btrfs was fully allocated
@@ -1142,7 +1150,9 @@ def thresholds(policy=None) -> dict:
     garde le critère d'admission. Seule exception : `max_swap_used` n'a PAS
     de défaut (None) — un stock de swap n'est pas une pression ; seul un hôte
     qui déclare un plafond en a un, et ce plafond ne compte que corroboré par
-    la pression mémoire (`swap_ceiling_applies`).
+    la pression mémoire (`swap_ceiling_applies`). #2354 : un hôte qui ne peut
+    pas mesurer PSI garde le repli de 0028 (`swap_ceiling`), sans quoi il
+    n'aurait plus aucune garde sur le stock.
     """
     raw = None
     if policy is not None:
@@ -1291,23 +1301,43 @@ def host_limits(canons, host: str) -> dict:
             "fiches": [label for label, _f in fiches]}
 
 
+def swap_ceiling(reading: dict, limits: dict) -> int | None:
+    """#2296/#2354 : le plafond de swap utilisé qui s'applique à un relevé.
+
+    Un plafond DÉCLARÉ (`max_swap_used`) l'emporte toujours. Sans plafond
+    déclaré : None quand l'hôte mesure PSI — un stock n'est pas une pression
+    (#2296), et le défaut de 0028 (8 Gio) faisait un faux « critical
+    pressure » au démarrage — mais le repli prudent de 0028
+    (`DEFAULT_MAX_SWAP_USED_WITHOUT_PSI`) quand l'hôte ne mesure pas PSI
+    (#2354) : le stock y est le seul signal mémoire qui reste, la mémoire
+    disponible pouvant rester au-dessus de son plancher pendant que les pages
+    partent en swap. Le repli suit chaque relevé : un hôte qui retrouve PSI
+    retrouve le critère de pression réelle.
+    """
+    declared = limits.get("max_swap_used")
+    if declared is not None:
+        return declared
+    if reading.get("psi_mem_some") is None:
+        return DEFAULT_MAX_SWAP_USED_WITHOUT_PSI
+    return None
+
+
 def swap_ceiling_applies(reading: dict, limits: dict) -> bool:
     """#2296 : le plafond de swap utilisé compte-t-il pour ce relevé ?
 
-    Seulement pour un hôte qui a DÉCLARÉ un plafond (`max_swap_used`), et
-    avec une pression mémoire mesurée au-dessus de `SWAP_PRESSURE_SHARE` de
-    son propre plafond : le swap utilisé est un STOCK, pas une pression (les
-    pages y restent tant qu'on ne les touche pas), donc un relevé où il
-    dépasse le plafond après le retour au calme ne doit plus retenir les
-    tours. Sans plafond déclaré, il n'y a rien à corroborer : le stock ne
-    plafonne pas (le défaut de 0028 à 8 Gio faisait un faux « critical
-    pressure » au démarrage, avant la lecture de la fiche Host). Sans PSI
-    (hôte qui ne sait pas le mesurer), un plafond déclaré garde son sens
-    d'avant : pas de signal de pression réelle, la porte ne s'ouvre pas sur
-    le seul stock. Sans plafond mémoire (appelant qui n'a pas calculé
-    `thresholds`), même repli prudent.
+    Seulement pour un hôte qui a un plafond (`swap_ceiling` : déclaré, ou
+    repli de 0028 quand l'hôte ne mesure pas PSI, #2354), et avec une pression
+    mémoire mesurée au-dessus de `SWAP_PRESSURE_SHARE` de son propre plafond :
+    le swap utilisé est un STOCK, pas une pression (les pages y restent tant
+    qu'on ne les touche pas), donc un relevé où il dépasse le plafond après le
+    retour au calme ne doit plus retenir les tours. Sans PSI (hôte qui ne sait
+    pas le mesurer), le plafond garde son sens d'avant : pas de signal de
+    pression réelle, la porte ne s'ouvre pas sur le seul stock. Sans plafond
+    mémoire (appelant qui n'a pas calculé `thresholds`), même repli prudent.
+    Sans aucun plafond (hôte avec PSI, aucune fiche n'en déclare), il n'y a
+    rien à corroborer : le stock ne plafonne pas.
     """
-    if limits.get("max_swap_used") is None:
+    if swap_ceiling(reading, limits) is None:
         return False
     psi = reading.get("psi_mem_some")
     limit = limits.get("max_mem_pressure")
@@ -1328,7 +1358,8 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
     #2296 : le swap utilisé ne franchit son plafond que corroboré par une
     pression mémoire réelle (`swap_ceiling_applies`) ; la pression mémoire
     elle-même (PSI `memory some` 60 s) est le critère d'admission qui suit la
-    pression réelle.
+    pression réelle. #2354 : sans PSI et sans plafond déclaré, le repli de
+    0028 s'applique (le stock est le seul signal) et le libellé le dit.
     """
     out: list[dict] = []
 
@@ -1368,10 +1399,15 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
     floor("min_mem_available", "available memory", reading.get("mem_available_bytes"),
           limits["min_mem_available"], CRITICAL_MEM_FACTOR)
     # #2296: swap used only counts with a measured memory pressure: a stock is
-    # not a pressure (see `swap_ceiling_applies`)
+    # not a pressure (see `swap_ceiling_applies`). #2354: on a host that cannot
+    # measure PSI and declares no ceiling, the 0028 conservative fallback is
+    # the only memory signal left, and the label says so.
     if swap_ceiling_applies(reading, limits):
-        ceiling("max_swap_used", "swap used", reading.get("swap_used_bytes"),
-                limits["max_swap_used"], CRITICAL_SWAP_FACTOR)
+        fallback = limits.get("max_swap_used") is None
+        ceiling("max_swap_used",
+                "swap used (no PSI: conservative default)" if fallback else "swap used",
+                reading.get("swap_used_bytes"), swap_ceiling(reading, limits),
+                CRITICAL_SWAP_FACTOR)
     ceiling("max_load", "1-min load", reading.get("load1"),
             limits["max_load"], CRITICAL_LOAD_FACTOR)
     volume_floor("min_disk_free", "free disk", "disk_free_bytes",
