@@ -5408,6 +5408,29 @@ class AgentWorker(threading.Thread):
         return texte
 
     def _run_turn(self, spec: dict) -> bool:
+        """Un tour, sous battement de bail **dès la préparation** (#2544).
+
+        Le battement ne démarrait qu'une fois le harnais publié : sous charge
+        CI, la préparation (dossier, harnais, canon, ménage, comptabilité)
+        pouvait dépasser un bail court, le veilleur tuait le worker avant le
+        `Popen` et le tour ne démarrait jamais (run 39158768160, psql 6/16 :
+        « stop requested (lease deadline reached): harness not yet published »
+        puis « lease lost … before the turn »). Le bail protège le tour entier
+        — la préparation en fait partie — donc le battement démarre ici, avant
+        elle, et la couvre jusqu'à la sortie du tour, y compris les retours
+        anticipés.
+        """
+        heartbeat_done = threading.Event()
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat, args=(heartbeat_done,),
+                                                 daemon=True)
+        self.heartbeat_thread.start()
+        try:
+            return self._run_turn_sous_battement(spec, heartbeat_done)
+        finally:
+            heartbeat_done.set()
+
+    def _run_turn_sous_battement(self, spec: dict,
+                                 heartbeat_done: threading.Event) -> bool:
         if spec.get("lot_switch_failed"):
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             return False
@@ -5740,10 +5763,6 @@ class AgentWorker(threading.Thread):
                 self.fail_turn(budget_mod.PAUSE_PREFIX + refus, refus)
                 return False
 
-        heartbeat_done = threading.Event()
-        self.heartbeat_thread = threading.Thread(target=self._heartbeat, args=(heartbeat_done,),
-                                                 daemon=True)
-        self.heartbeat_thread.start()
         preempt_done = threading.Event()
         # Un nouveau tour remet à zéro le latch de publication : il ne concerne
         # que la course du tour précédent, et les autres déclencheurs (bail,
