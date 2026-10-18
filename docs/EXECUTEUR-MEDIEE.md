@@ -153,6 +153,11 @@ Human key registration, owner registration auditing and owner confirmation
 are outside the mediated executor's scope, alongside key registration and
 revocation. The admitted operations and contract version remain unchanged.
 
+`mailbox.review_requests` (#2504 : les demandes de relecture d'un lot, lues
+par destinataire, nature et lot, sans la fenêtre de `mailbox.history`) est
+refusée de même : la déduplication d'une désignation de relecteur est tenue
+par le serveur du mesh, jamais par un appareil.
+
 ## Requête et réponse
 
 ```
