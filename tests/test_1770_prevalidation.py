@@ -429,10 +429,13 @@ class SnapshotIdentityTest(unittest.TestCase):
         self.assertEqual(self._git("show", "%s:plan.json" % construit),
                          self.plan.strip())
 
-    def test_head_d_arbre_absent_refuse(self):
+    def test_arbre_du_sha_absent_refuse_sans_head_moved(self):
+        """Un arbre non constructible est un refus de sélection (#1820) :
+        `head-moved` ne dit que la tête qui a réellement bougé."""
         with self.assertRaises(pv.PrevalidationError) as caught:
             pv.pinned_snapshot(self.repo, B, self.plan_rel, self.plan)
-        self.assertEqual(caught.exception.cause, "head-moved")
+        self.assertEqual(caught.exception.cause, "selection-unsafe")
+        self.assertNotEqual(caught.exception.cause, "head-moved")
 
 
 class HostTest(unittest.TestCase):
