@@ -32,10 +32,11 @@ ratée ne prouvent rien : pas de report.
 **Report** — pour chaque relecteur, son **dernier** verdict, s'il porte sur une
 tête réalignée, est recopié en jalon `verdict` sur la tête gelée : au nom du
 relecteur (sa famille compte à la porte, #1374), sans preuve de tour (#1465 :
-ce n'est pas un tour du relecteur), **daté de son original plus une
-milliseconde** — tout geste réel ultérieur du même relecteur reste plus récent,
-même si sa transaction a commencé avant l'écriture du report (`now()` date le
-début de transaction) —, avec la note `verdict carried: alignment …`, et une
+ce n'est pas un tour du relecteur), **daté exactement de son original**.
+Tout geste réel ultérieur du même relecteur reste plus récent, même si sa
+transaction a commencé avant l'écriture du report (`now()` date le début de
+transaction). L'identifiant départage la copie de l'original à date égale.
+La copie porte la note `verdict carried: alignment …`, avec une
 ligne au journal du lot. Un **blocage se reporte** comme un avis
 favorable : un réalignement ne lave jamais un blocage. Un relecteur qui a déjà
 un verdict sur la tête gelée n'en reçoit pas ; le dernier verdict d'un
@@ -402,10 +403,6 @@ def _entry(mark: dict, reviewed: str) -> dict:
             "from": reviewed}
 
 
-#: la copie d'un verdict est datée de son original plus ce délai : après lui,
-#: avant tout geste réel ultérieur du même relecteur (R1 cx1, P1-1)
-CARRY_DELAY = "1 millisecond"
-
 _MARKS_SQL = ("SELECT id, kind, sha, actor, verdict,"
               "       extract(epoch from at)::float8 AS at_ts"
               "  FROM work_item_milestones"
@@ -413,7 +410,7 @@ _MARKS_SQL = ("SELECT id, kind, sha, actor, verdict,"
 
 _COPY_SQL = ("INSERT INTO work_item_milestones (work_item_id, kind, sha, actor, verdict, note, at)"
              " SELECT work_item_id, 'verdict', %s, actor, verdict, %s,"
-             "        at + interval '" + CARRY_DELAY + "'"
+             "        at"
              "   FROM work_item_milestones"
              "  WHERE id = %s AND work_item_id = %s AND kind = 'verdict'"
              " RETURNING id")

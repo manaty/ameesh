@@ -469,7 +469,8 @@ class CarryTest(PgTestCase):
     def test_the_copy_is_dated_from_its_original(self):
         # R1 cx1, P1-1 : `now()` date le début de transaction. Un verdict réel
         # dont la transaction a commencé avant l'écriture du report doit rester
-        # plus récent que la copie : elle est datée de l'original + 1 ms.
+        # plus récent que la copie : elle garde la date exacte de l'original
+        # (l'id départage), même à moins de 1 ms du verdict réel.
         self.verdict("rev1", self.repo.reviewed)
         self.verdict("rev2", self.repo.reviewed)
         frozen = self.repo.merge_target()
@@ -479,12 +480,13 @@ class CarryTest(PgTestCase):
         original = [m for m in marks if m["kind"] == "verdict" and m["actor"] == "rev1"
                     and m["sha"] == self.repo.reviewed][0]
         copy = [m for m in self.on(frozen) if m["actor"] == "rev1"][0]
-        self.assertAlmostEqual(copy["at_ts"] - original["at_ts"], 0.001, places=4)
+        self.assertEqual(copy["at_ts"], original["at_ts"])
+        self.assertGreater(copy["id"], original["id"])
         self.db.execute("INSERT INTO work_item_milestones (work_item_id, kind, sha, actor,"
                       " verdict, note, at) VALUES (%s, 'verdict', %s, 'rev1', 'blocked',"
                       " 'réel, transaction ouverte avant le report',"
                       " to_timestamp(%s))",
-                      (self.lot, frozen, original["at_ts"] + 0.5))
+                      (self.lot, frozen, original["at_ts"] + 0.0005))
         gate = self.gate(frozen)
         self.assertFalse(gate["ok"])
         self.assertEqual([b["actor"] for b in gate["blocked"]], ["rev1"])
