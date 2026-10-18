@@ -430,7 +430,11 @@ if [ "$SAUVER" = 1 ]; then
 fi
 
 etape "migrations de $SHA_TRAVE (additives seulement, base partagee)"
-"$POSTE_SH" migrer --additif-seulement "$SHA" || { echo "migrations en echec : aucune installation" >&2; exit 1; }
+# #2357 : une sonde d'auto-prise en echec ne doit pas arreter la sequence. La
+# suite par hote installe et redemarre les VM d'abord, le poste en dernier
+# (canon §14) ; sans ce drapeau, poste.sh redemarrerait le poste tout de suite
+# et interromprait l'operateur avant les VM, sur une base deja migree.
+MIGRER_SANS_REDEMARRAGE=1 "$POSTE_SH" migrer --additif-seulement "$SHA" || { echo "migrations en echec : aucune installation" >&2; exit 1; }
 trace poste migrations ok "migrations de $SHA_TRAVE passees avant toute installation"
 
 # --- sequence par hote ----------------------------------------------------

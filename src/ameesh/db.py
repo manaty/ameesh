@@ -975,7 +975,11 @@ class PsycopgDriver:
         self.conn = self._connect()
 
     def _connect(self):
-        kwargs: dict = dict(autocommit=True,
+        # #2339: additive migrations change SELECT * result shapes while old
+        # runners remain connected. Cached plans then fail with SQLSTATE
+        # 0A000 until restart. Keep parameter binding, without named plans.
+        # https://www.psycopg.org/psycopg3/docs/advanced/prepare.html
+        kwargs: dict = dict(autocommit=True, prepare_threshold=None,
                             connect_timeout=max(1, int(self.cfg.connect_timeout)),
                             row_factory=self._dict_row)
         try:
