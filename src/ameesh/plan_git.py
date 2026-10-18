@@ -659,8 +659,13 @@ def _packet_delivery(repo: str, lot: int, members: list[dict], refs: list[tuple]
     try:
         candidate = freeze_candidate(marks, repo=repo, target=target_ref)
     except (MergeProbeError, GitError):
-        candidate = {"sha": ""}
+        return None                       # gel courant illisible : jamais de preuve
     current = commit_id(candidate.get("sha"))
+    # Sans gel effectif, seule l'absence de tout gel/avis (`no-verdict`) laisse
+    # la composition conclure : un avis bloqué, un gel postérieur à l'avis ou
+    # un avis sans commit déclarent une tête que la composition ne couvre pas.
+    undecided = not current and bool(
+        set(candidate.get("causes") or ()) - {"no-verdict"})
     for member in members:
         unit = commit_id(member.get("unit_sha"))
         if not unit:
@@ -672,6 +677,8 @@ def _packet_delivery(repo: str, lot: int, members: list[dict], refs: list[tuple]
                 continue                 # un nouveau gel : la composition est périmée
         elif recorded:
             continue                     # le gel enregistré a disparu : ne pas conclure
+        elif undecided:
+            continue                     # une déclaration existe, sans gel lisible
         for ref, off, closes in refs:
             if not closes:
                 continue

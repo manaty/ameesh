@@ -162,21 +162,21 @@ def record(db, package_id: int, *, repo: str | None = None, base: str | None = N
     head_sha = _commit(top, head)
     if head_sha is None:
         raise PacketLinkError("head %r not found in %s" % (head, top))
-    # La tête enregistrée doit appartenir à la branche du porteur (locale ou
-    # publiée) : lier la composition d'une autre branche au mauvais paquet ne
-    # se rattrape pas. Une tête en avance sur la ref est admise (le composeur
-    # peut enregistrer avant de pousser) ; une tête en retard ne l'est pas.
-    for ref in ("refs/heads/" + package_branch,
-                "refs/remotes/origin/" + package_branch):
-        tip = _commit(top, ref)
-        if tip is None:
-            continue
-        if plan_git._git(top, "merge-base", "--is-ancestor", tip,
-                         head_sha).returncode != 0:
-            raise PacketLinkError(
-                "head %s is not on the carrier's branch %s (tip %s): run the "
-                "record from the package worktree, or pass --head/--branch"
-                % (head_sha[:12], package_branch, tip[:12]))
+    # La tête enregistrée doit appartenir à la branche du porteur : lier la
+    # composition d'une autre branche au mauvais paquet ne se rattrape pas.
+    # La ref LOCALE d'abord (une ref distante peut être périmée après un
+    # rebasage ou une publication partielle) ; une tête en avance sur la ref
+    # est admise (le composeur peut enregistrer avant de pousser), une tête en
+    # retard ne l'est pas.
+    tip = _commit(top, "refs/heads/" + package_branch)
+    if tip is None:
+        tip = _commit(top, "refs/remotes/origin/" + package_branch)
+    if tip is not None and plan_git._git(
+            top, "merge-base", "--is-ancestor", tip, head_sha).returncode != 0:
+        raise PacketLinkError(
+            "head %s is not on the carrier's branch %s (tip %s): run the "
+            "record from the package worktree, or pass --head/--branch"
+            % (head_sha[:12], package_branch, tip[:12]))
     if base is None:
         # Une recomposition garde la base de la composition précédente : si la
         # cible a été fusionnée dans le paquet entre-temps, `merge-base` aurait
