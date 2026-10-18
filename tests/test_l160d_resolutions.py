@@ -122,6 +122,38 @@ class _Base(unittest.TestCase):
         return bare
 
 
+class RepoRootTest(unittest.TestCase):
+    """#2349 : `--repo` désigne un dossier ; un `owner/name` n'est pas un cwd."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-reporoot-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.repo = make_repo(self.tmp)
+        _git(self.repo, "remote", "add", "origin",
+             "https://github.com/manaty/ameesh.git")
+
+    def test_owner_name_of_the_current_checkout(self):
+        with mock.patch.object(resolutions.os, "getcwd", return_value=self.repo):
+            self.assertEqual(resolutions.repo_root("manaty/ameesh"), self.repo)
+
+    def test_owner_name_of_another_repository_is_refused(self):
+        with mock.patch.object(resolutions.os, "getcwd", return_value=self.repo):
+            with self.assertRaises(resolutions.ResolveError) as caught:
+                resolutions.repo_root("manaty/nexlink")
+        text = str(caught.exception)
+        self.assertIn("manaty/nexlink", text)
+        self.assertIn("manaty/ameesh", text)
+        self.assertNotIn("git not found", text)
+
+    def test_missing_directory_is_not_git_not_found(self):
+        missing = os.path.join(self.tmp, "absent")
+        with self.assertRaises(resolutions.ResolveError) as caught:
+            resolutions.repo_root(missing)
+        text = str(caught.exception)
+        self.assertIn(missing, text)
+        self.assertNotIn("git not found", text)
+
+
 class ResolverTest(unittest.TestCase):
     def lot(self, n, **kw):
         return dict({"work_item": n, "base": "b%d" % n, "tip": "t%d" % n}, **kw)

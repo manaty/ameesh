@@ -66,11 +66,14 @@ import threading
 import time
 from contextlib import contextmanager
 
-from . import plan_git, storage, work
+from . import migrations, plan_git, storage, work
 from .canon import (FETCH_TIMEOUT, GIT_TIMEOUT, NO_LAZY_FETCH, GitError, _git,
                     _git_env)
 
 REF_PREFIX = "refs/ameesh/resolutions/"
+#: un `owner/name` GitHub : une option `--repo` peut le porter, mais ce n'est
+#: jamais un dossier de travail (#2349).
+_GITHUB_KEY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 #: fallback for hosts that refuse refs outside `refs/heads`
 BRANCH_PREFIX = "ameesh/resolve/"
 TRAILER = "ameesh-resolution"
@@ -405,10 +408,35 @@ def choose_resolver(a: dict, b: dict, files, *, repo: str | None = None,
 # --------------------------------------------------------------------------
 
 def repo_root(repo: str | None) -> str:
-    root = plan_git._out(repo or os.getcwd(), "rev-parse", "--show-toplevel")
+    """La racine du dépôt désigné par `--repo` (ou le dossier courant).
+
+    `--repo` désigne un **dossier** de travail ; un `owner/name` GitHub n'est
+    pas un chemin. Il est accepté quand il nomme l'`origin` du dossier courant
+    (on travaille alors dans ce dépôt), sinon refusé avec un message
+    explicite : un dossier absent faisait répondre « git not found » (#2349).
+    """
+    wanted = str(repo or "").strip()
+    if wanted:
+        path = os.path.expanduser(wanted)
+        if os.path.isdir(path):
+            wanted = path
+        else:
+            origin = migrations.origin_repo(os.getcwd())
+            if _GITHUB_KEY.fullmatch(wanted) and migrations.repo_key(wanted) == origin:
+                wanted = os.getcwd()
+            else:
+                raise ResolveError(
+                    "--repo %s is not a local directory: pass the checkout's path, or run "
+                    "from its repository (a GitHub owner/name is accepted only for the "
+                    "current checkout, whose origin is %s)" % (wanted, origin or "none"))
+    else:
+        wanted = os.getcwd()
+    try:
+        root = plan_git._out(wanted, "rev-parse", "--show-toplevel")
+    except GitError as exc:
+        raise ResolveError("cannot read the repository at %s: %s" % (wanted, exc)) from exc
     if not root:
-        raise ResolveError("%s is not inside a git repository: pass --repo"
-                           % (repo or os.getcwd()))
+        raise ResolveError("%s is not inside a git repository: pass --repo" % wanted)
     return root
 
 

@@ -1300,11 +1300,17 @@ class AgentWorker(threading.Thread):
 
     def _heartbeat(self, stop_event: threading.Event) -> None:
         self.ensure_watchdog()
-        interval = max(3.0, self.runner.lease_ttl / 3.0)
+        # #2483 : le battement doit renouveler AVANT l'échéance. Un plancher de
+        # 3 s faisait dormir un bail de 3 s jusqu'à l'échéance même : le
+        # watchdog tuait alors un harnais pas encore publié sous charge CI
+        # (run 39133881211). Le plancher ne sert plus qu'à éviter un pas nul.
+        interval = max(0.05, self.runner.lease_ttl / 3.0)
         # L72 : après un échec, nouvel essai rapide (2 s, 4 s… jusqu'à
         # l'intervalle normal) — une base revenue doit prolonger le bail avant
-        # son échéance, pas un tiers de bail plus tard.
-        reprise = Reprise(maximum=interval)
+        # son échéance, pas un tiers de bail plus tard. Pour un bail court, la
+        # reprise ne peut pas attendre le minimum de 2 s : elle serait après
+        # l'échéance (#2483).
+        reprise = Reprise(maximum=interval, minimum=min(Reprise.MINIMUM, interval))
         attente = interval
         while not stop_event.wait(self.wait_timeout(attente)):
             if not self.renew():
@@ -6809,6 +6815,7 @@ class Runner:
         take_interval: float = TAKE_INTERVAL_S,
         take_balance: dict | None = None,
         train_passages=(),
+        train_service_lease=None,
         cfg_overrides: dict | None = None,
     ):
         from .host_gate import gate_choice
@@ -6849,11 +6856,18 @@ class Runner:
         self._take_next = 0.0
         # #1467: explicit qualified passages only; no live policy selected here.
         self.train_passages = tuple(train_passages)
+        # #2446: the exclusive service lease assembled from `train.host`.
+        self.train_service_lease = train_service_lease
         self.train_service = None
         self.lease_ttl = cfg.lease_ttl
         self.idle_nudge = cfg.idle_nudge
         self.poll = max(1.0, cfg.poll)
         self._runner_seen_next = 0.0
+        #: #2389 : dernier `no-land` journalisé, par lot et par feu (`fire_sha`).
+        #: Un projet sans voie d'atterrissage déclarée reste `no-land` à chaque
+        #: passage : le répéter à chaque tour noierait le journal, alors que
+        #: l'abstention ne change pas tant que le feu est le même.
+        self._fire_no_land: dict[int, str] = {}
         self.event_coalesce = max(0.0, cfg.event_coalesce)
         #: L125 : fenêtre de regroupement du courrier, défaut de l'hôte
         self.mail_batch = max(0.0, cfg.mail_batch)
@@ -8602,6 +8616,7 @@ class Runner:
                         entry["work_item"], entry["detail"],
                         " [dry-run]" if entry["result"] == "would-merge" else ""))
             self.carry_once(db)
+            self.packet_sweep_once(db)
             self.fire_once(db)
             if not self.dry_run:
                 self.measure_once(db)
@@ -8645,6 +8660,50 @@ class Runner:
                     continue
             log_async(line)
         self._carry_errors = errors
+    def packet_sweep_once(self, db) -> None:
+        """#2426 : ferme les lots unitaires des paquets fusionnés.
+
+        Les manifestes `reviews/**paquet**.md` sont lus sur la pointe fraîche
+        de la cible de chaque projet `radar` (clone privé, `land.fresh_target`),
+        sous le verrou de passage du projet : seuls les lots du manifeste sont
+        examinés, chacun par son dernier gel. Un clone que personne ne fetch
+        ne fermait jamais les unités d'un paquet fusionné (#2302). Ne lève
+        jamais : le prochain passage réessaie."""
+        from . import packet_close, radar
+        try:
+            cfg = fresh_radar(self.cfg)
+            settings = radar.settings_of(cfg)
+        except Exception as exc:            # configuration illisible : jamais fatal
+            log_async("packet sweep failed (%s: %s)" % (type(exc).__name__, exc))
+            return
+        errors = getattr(self, "_packet_sweep_errors", None)
+        if errors is None:
+            errors = self._packet_sweep_errors = {}
+        for project in settings.projects.values():
+            lock = None
+            try:
+                lock = radar.pass_lock(cfg, project.name)
+                if lock is None:
+                    continue                # un autre exécutant de l'hôte le passe
+                report = packet_close.sync_project(
+                    cfg, db, project, dry_run=self.dry_run,
+                    actor="runner %s" % self.runner_id)
+            except Exception as exc:        # jamais fatal pour l'exécuteur
+                message = "packet sweep %s failed (%s: %s)" % (
+                    project.name, type(exc).__name__, exc)
+                if errors.get(project.name) != message:
+                    errors[project.name] = message
+                    log_async(message)
+                continue
+            finally:
+                if lock is not None:
+                    lock.close()
+            errors.pop(project.name, None)
+            for entry in report["results"]:
+                if entry["result"] in ("merged", "would-merge"):
+                    log_async("packet %s: work item #%s delivered: %s%s" % (
+                        project.name, entry["work_item"], entry["detail"],
+                        " [dry-run]" if entry["result"] == "would-merge" else ""))
 
     def fire_once(self, db) -> None:
         """#1374 : le passage du feu du pilote — arme l'auto-fusion des lots
@@ -8652,14 +8711,32 @@ class Runner:
         feu dont la tête a bougé, réconcilie une PR fusionnée. Ne lève jamais :
         un feu raté est retenté au passage suivant. #2212 : `radar` est relu à
         chaque passage, le mode du feu (file ou fusion directe) suit la
-        configuration de l'hôte, pas celle du démarrage."""
+        configuration de l'hôte, pas celle du démarrage.
+
+        #2389 : `no-land` n'est journalisé qu'une fois par lot et par feu.
+        L'abstention d'un hôte qui ne connaît pas la voie d'atterrissage est un
+        état stable, pas un événement : la redire à chaque passage ne dit rien
+        de neuf. Un feu invalidé, retiré ou fusionné oublie la marque, pour
+        qu'un nouveau feu parle de nouveau s'il retombe en `no-land`."""
         from . import fire
         try:
+            seen = getattr(self, "_fire_no_land", None)
+            if seen is None:
+                seen = self._fire_no_land = {}
             report = fire.run_pass(fresh_radar(self.cfg), db, dry_run=self.dry_run)
             for entry in report:
-                if entry.get("result") in fire.LOUD:
+                lot = entry.get("lot")
+                result = entry.get("result")
+                if result == "no-land":
+                    sha = str(entry.get("fire_sha") or "")
+                    if seen.get(lot) == sha:
+                        continue
+                    seen[lot] = sha
+                elif result in ("invalidated", "withdrawn", "merged"):
+                    seen.pop(lot, None)
+                if result in fire.LOUD:
                     log_async("fire: lot #%s %s%s" % (
-                        entry["lot"], entry["result"],
+                        lot, result,
                         " — %s" % (entry.get("detail") or entry.get("error"))
                         if entry.get("detail") or entry.get("error") else ""))
         except Exception as exc:  # jamais fatal pour l'exécuteur
@@ -8765,11 +8842,16 @@ class Runner:
         passages = tuple(p for p in getattr(self, "train_passages", ()) if p.policy.enabled)
         if not passages:
             return
-        if any(getattr(p, "reservation", None) is None for p in passages):
+        # #2446: a shadow passage is read-only and needs no packet reservation;
+        # the active passage keeps the #1467 requirement.
+        if any(getattr(p, "reservation", None) is None
+               for p in passages if not getattr(p, "shadow", False)):
             log_async("train service requires an explicit qualified packet reservation and deadline")
             return
         from .train_runner import Service
-        self.train_service = Service(self.cfg, passages, stop=self.stop, report=log_async)
+        self.train_service = Service(
+            self.cfg, passages, stop=self.stop, report=log_async,
+            lease=getattr(self, "train_service_lease", None))
         self.train_service.start()
 
     def start_branch_sweep_poll(self) -> None:
@@ -10850,12 +10932,26 @@ def main(argv: list[str] | None = None) -> int:
             print("agent-runner: %s" % exc, file=sys.stderr)
             return 1
         agents = [a for a in (parsed.agents or "").split(",") if a] or None
+        # #2446 : assemble the train service from the host configuration
+        # before the runner starts. A missing or malformed piece is a named
+        # refusal, never a fallback passage; the agent service keeps working.
+        train_passages, train_lease = (), None
+        if not (parsed.once or parsed.dry_run or mediated):
+            try:
+                from . import train as train_mod, train_assembly
+                assembly = train_assembly.assemble(cfg, notify=log_async)
+                train_passages, train_lease = assembly.passages, assembly.lease
+                log_async("train service: %s" % assembly.reason)
+            except train_mod.TrainError as exc:
+                log_async("train service disabled: %s" % exc)
         try:
             runner = Runner(
                 cfg, db, agents=agents, once=parsed.once, wait=parsed.wait,
                 dry_run=parsed.dry_run, max_turns=parsed.max_turns,
                 take=_take_settings(parsed), take_interval=parsed.take_interval,
                 take_balance=_take_balance(parsed),
+                train_passages=train_passages,
+                train_service_lease=train_lease,
                 cfg_overrides=overrides,
             )
         except db_mod.DbError as exc:

@@ -67,9 +67,10 @@ class StackedMigrationTest(unittest.TestCase):
             self.commit(path, text, date)
         return _git(self.repo, "rev-parse", "HEAD")
 
-    def scan(self, lots, *, reservations=None):
+    def scan(self, lots, *, reservations=None, reservation_holder=None):
         return radar.scan(self.repo, lots, default_target="main", migrations=MIG,
-                          reservations=reservations)
+                          reservations=reservations,
+                          reservation_holder=reservation_holder)
 
     def test_stacked_lot_inherits_the_migration_of_its_parent(self):
         """#2388: the parent moved after the fork; the file is still inherited."""
@@ -138,6 +139,59 @@ class StackedMigrationTest(unittest.TestCase):
         self.assertNotIn(INHERITED, seen[STACKED["id"]])
         self.assertIn(own, seen[STACKED["id"]])
         self.assertEqual(self.scan([STACKED, PARENT])["migrations"], [])
+
+    def test_reservation_holder_survives_the_diverged_group(self):
+        """#2396: the parent holds 516 and the stacked tip advanced last.
+
+        The default ranking keeps the latest tip (the stacked lot), so the
+        reservation probe sees its inherited copy and reports another holder's
+        copy as unreserved. With the registry, the holder is the survivor.
+        """
+        self.branch("main", PARENT["branch"], {INHERITED: CONTENT},
+                    date=DATES["A"])
+        self.branch(PARENT["branch"], STACKED["branch"], {"stacked.py": "b\n"},
+                    date=DATES["B"])
+        self.branch(PARENT["branch"], PARENT["branch"], {"parent.py": "a\n"},
+                    date=DATES["C"])
+        seen = {}
+
+        def reservations(branches):
+            seen.update({b["work_item"]: list(b.get("added") or ()) for b in branches})
+            return []
+
+        def holder(number):
+            return PARENT["id"] if number == 516 else None
+
+        report = self.scan([PARENT, STACKED], reservations=reservations,
+                           reservation_holder=holder)
+
+        self.assertEqual(report["migrations"], [])
+        self.assertIn(INHERITED, seen[PARENT["id"]])
+        self.assertNotIn(INHERITED, seen[STACKED["id"]])
+
+    def test_without_the_registry_the_latest_tip_still_survives(self):
+        """#2396 control: no holder (or none in the group) keeps #2388's
+        ranking; only a registry answer changes the survivor."""
+        self.branch("main", PARENT["branch"], {INHERITED: CONTENT},
+                    date=DATES["A"])
+        self.branch(PARENT["branch"], STACKED["branch"], {"stacked.py": "b\n"},
+                    date=DATES["B"])
+        self.branch(PARENT["branch"], PARENT["branch"], {"parent.py": "a\n"},
+                    date=DATES["C"])
+        seen = {}
+
+        def reservations(branches):
+            seen.update({b["work_item"]: list(b.get("added") or ()) for b in branches})
+            return []
+
+        def no_holder(number):
+            return None
+
+        self.scan([PARENT, STACKED], reservations=reservations,
+                  reservation_holder=no_holder)
+
+        self.assertIn(INHERITED, seen[STACKED["id"]])
+        self.assertNotIn(INHERITED, seen[PARENT["id"]])
 
     def test_inherited_copy_still_collides_with_a_third_party(self):
         """Review #2388: hiding both copies hid a real collision.

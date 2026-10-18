@@ -60,6 +60,10 @@ REPORT_SCHEMA = "ameesh-prevalidation/1"
 #: du plan L161f, chemin dépôt, contrat CLI `run --plan --part --driver --flow`.
 #: Un projet qui a son propre outil le déclare (`parts_script` du bloc, #1770).
 DEFAULT_PARTS_SCRIPT = "scripts/test-parts.py"
+#: lectures d'objets au SHA candidat sans `refs/replace` (#1819) : un
+#: remplacement local réécrit le contenu lu sans changer le SHA, la preuve
+#: divergerait de la référence publiée
+NO_REPLACE = offload.NO_REPLACE
 
 #: causes de refus d'une prévalidation ; le gel n'est pas écrit, la cause est dite
 CAUSES = (
@@ -482,7 +486,7 @@ def _tree_entries(root: str, head: str, paths: Sequence[str], *,
     de supposer un chemin sûr."""
     if not paths:
         return []
-    proc = runner(["git", "-C", root, "--literal-pathspecs", "ls-tree", "-z",
+    proc = runner(["git", "-C", root, *NO_REPLACE, "--literal-pathspecs", "ls-tree", "-z",
                    head, "--", *paths], capture_output=True, text=True)
     if getattr(proc, "returncode", 1):
         raise PrevalidationError("selection-unsafe",
@@ -676,7 +680,8 @@ def contract_modules(paths, repo: str = "", *, head: str = "",
         if head:
             # `cat-file blob` : contenu brut d'un fichier, un répertoire refuse
             # (`show` listerait l'arbre et en ferait des modules)
-            proc = runner(["git", "-C", repo or ".", "cat-file", "blob", "%s:%s" % (head, path)],
+            proc = runner(["git", "-C", repo or ".", *NO_REPLACE, "cat-file", "blob",
+                           "%s:%s" % (head, path)],
                           capture_output=True, text=True)
             if getattr(proc, "returncode", 1):
                 return (), "contrat déclaré illisible au SHA candidat: %s" % path

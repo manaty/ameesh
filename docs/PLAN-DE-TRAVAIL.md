@@ -184,7 +184,18 @@ all idempotent, which set the lot to `merged` with its `merged` milestone
    or an ancestry proof without `--verbatim`, still closes a reverted lot
    wrongly. `sync-branches` and `sync-merges` carry the same guard. Closing is
    conditioned in the database on the examined freeze: a new
-   freeze declared in the meantime prevents it (`refrozen`);
+   freeze declared in the meantime prevents it (`refrozen`).
+
+   A package's units are closed by its manifest, without a card or
+   `package_id`: on the target, `reviews/**paquet**.md` lists the composed
+   units. `ameesh work sync-packets --git-dir D [--target T]` (read-only)
+   examines only those units' last freeze, the targeted sweep that
+   `sync-merges` cannot be (all open lots, more than 120 s on ameesh); the
+   runner does the same after each branch sweep on the fresh target of each
+   `radar` project (#2426). A unit without a freeze is closed by the
+   `ameesh-work: <id>` trailer of its composition commit when that commit is
+   an ancestor of the target; a withdrawn line or a re-freeze declared after
+   the composition closes nothing;
 3. **the linked PR** (as a fallback, or alone):
 
    ```

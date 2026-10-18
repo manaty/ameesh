@@ -360,7 +360,8 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def state(self, name: str) -> dict | None:
-        """Détenteur, epoch, statut et vie du bail (`live`), ou None."""
+        """Nom primaire résolu, détenteur, epoch, statut et vie du bail
+        (`live`), ou None."""
 
     @abc.abstractmethod
     def renew(self, name: str, owner: str, epoch: int, ttl_seconds: float) -> float | None:
