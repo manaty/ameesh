@@ -19,7 +19,16 @@ courrier :
 * verdicts requis acquis **sur cette tête**, par la même porte que la fusion
   (`merge_queue.review_gate`, #1374) : comptés par classe, indépendants, sans
   blocage courant ;
-* `git merge-tree` propre contre la cible (le commit de base du paquet).
+* `git merge-tree` propre contre la cible (le commit de base du paquet) ;
+  #2496 : sinon, une **remise** propre sur la cible
+  (`refs/ameesh/resolutions/<lot>/<cible>-*` ou `union-<cible>-*`) rend le
+  lot prêt comme unité, la remise servant de source (`source`), si ses
+  parents sont le gel relu et un commit de la cible, si elle fusionne
+  proprement dans la base, et si un verdict la couvre (même porte que le
+  gel) ou si c'est une union mécanique — ajouts purs des deux côtés dans
+  chaque conflit, arbre égal à la fusion `merge=union` (§2 : conflit
+  mécanique, aucun avis). Un blocage sur la remise la refuse toujours.
+  Sinon le lot reste `conflict`, avec le motif du refus de chaque remise.
 
 Chaque refus porte un **code** stable (`freeze-not-head`, `verdicts-missing`,
 `conflict`, …) et un détail lisible : la composition peut donc écrire une
@@ -36,12 +45,17 @@ import os
 import re
 import subprocess
 
-from . import lot_class, merge_queue, packet_guard, plan_git, storage, work
+from . import lot_class, merge_queue, packet_guard, plan_git, resolutions, storage, work
+from .canon import FETCH_TIMEOUT
 
 SCHEMA = "ameesh-packet-candidates/1"
 
 #: un identifiant de commit complet
 _SHA = re.compile(r"[0-9a-f]{40}")
+#: #2496 : où les remises lues de `origin` sont copiées dans le clone du radar
+REMISE_LOCAL = "refs/ameesh/candidates/remise/"
+#: #2496 : l'attribut qui rejoue une union mécanique (`merge=union`)
+_UNION_ATTRIBUTES = b"* merge=union\n"
 
 
 class CandidateError(RuntimeError):
@@ -100,6 +114,215 @@ def _ancestor(repo: str, tip: str, base: str) -> bool:
                              % (proc.returncode,
                                 proc.stderr.decode("utf-8", "replace").strip()[:300]))
     return proc.returncode == 0
+
+
+def _git_out(repo: str, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", repo, *args], capture_output=True)
+
+
+def _text(proc: subprocess.CompletedProcess) -> str:
+    return proc.stdout.decode("utf-8", "replace").strip()
+
+
+def is_remise(ref: str, lot: int, target: str) -> bool:
+    """#2496 : `ref` est-elle une remise du lot `lot` sur la cible `target`
+    (`refs/ameesh/resolutions/<lot>/<cible>-…` ou `…/union-<cible>-…`) ? Une
+    résolution avec un autre lot (`…/<lot>/<autre>`) n'en est pas une."""
+    prefix = "%s%d/" % (resolutions.REF_PREFIX, int(lot))
+    if not ref.startswith(prefix):
+        return False
+    tail = ref[len(prefix):]
+    return tail.startswith(target + "-") or tail.startswith("union-%s-" % target)
+
+
+def list_remises(repo: str, where: str, lots, target: str) -> tuple[dict, str]:
+    """({lot: [(ref, commit)]}, erreur) des remises de `lots` sur `target`,
+    lues **fraîches** de `origin` et copiées sous `REMISE_LOCAL` dans `where`
+    (le clone du radar ; jamais le dépôt des agents). Sans `origin`, les refs
+    de `repo` font foi. Une lecture impossible rend l'erreur : aucune remise,
+    le lot reste `conflict` avec ce motif."""
+    lots = {int(lot) for lot in lots}
+    if not lots:
+        return {}, ""
+    url = plan_git._out(repo, "remote", "get-url", "origin")
+    if url:
+        try:
+            listing = resolutions._run(where, "ls-remote", url, resolutions.REF_PREFIX + "*",
+                                       timeout=FETCH_TIMEOUT)
+        except (resolutions.GitError, OSError) as exc:
+            return {}, "cannot list the remises on origin: %s" % exc
+        if listing.returncode:
+            return {}, "cannot list the remises on origin: %s" % resolutions._err(listing)[:300]
+        text = resolutions._text(listing)
+    else:
+        proc = _git_out(repo, "for-each-ref", "--format=%(objectname)\t%(refname)",
+                        resolutions.REF_PREFIX)
+        if proc.returncode:
+            return {}, "cannot list the remises: %s" % proc.stderr.decode(
+                "utf-8", "replace").strip()[:300]
+        text = _text(proc)
+    found: dict = {}
+    for line in text.splitlines():
+        sha, _tab, ref = line.partition("\t")
+        sha, ref = sha.strip().lower(), ref.strip()
+        if not _SHA.fullmatch(sha):
+            continue
+        for lot in lots:
+            if is_remise(ref, lot, target):
+                found.setdefault(lot, []).append((ref, sha))
+    if not url or not found:
+        return found, ""
+    specs = ["+%s:%s%s" % (ref, REMISE_LOCAL, ref[len(resolutions.REF_PREFIX):])
+             for refs in found.values() for ref, _sha in refs]
+    try:
+        proc = resolutions._run(where, "fetch", "--quiet", url, *specs, timeout=FETCH_TIMEOUT)
+    except (resolutions.GitError, OSError) as exc:
+        return {}, "cannot fetch the remises from origin: %s" % exc
+    if proc.returncode:
+        return {}, "cannot fetch the remises from origin: %s" % resolutions._err(proc)[:300]
+    return found, ""
+
+
+def mechanical_union(repo: str, ours: str, theirs: str, remise: str) -> str:
+    """#2496 : pourquoi la remise `remise` (parents `ours`, `theirs`) n'est
+    pas une remise mécanique ; vide si elle l'est.
+
+    Mécanique veut dire sans jugement, vérifiable par tous : soit la remise
+    est exactement la fusion propre de ses parents, soit chaque conflit est
+    un **ajout pur des deux côtés** (section de base vide en diff3, même
+    chemin des trois côtés, une seule base de fusion) et l'arbre de la
+    remise est exactement celui de la fusion `merge=union`. Deux
+    modifications d'une même ligne ne sont jamais une union mécanique."""
+    tree = _text(_git_out(repo, "rev-parse", remise + "^{tree}"))
+    if not _SHA.fullmatch(tree):
+        return "tree of %s unreadable" % remise[:12]
+    plain = merge_tree(repo, ours, theirs)
+    if plain["state"] == "error":
+        return "merge of the parents unreadable: %s" % plain["detail"]
+    if plain["state"] == "clean":
+        return "" if plain["tree"] == tree else \
+            "content beyond the clean merge of its parents"
+    bases = _text(_git_out(repo, "merge-base", "--all", ours, theirs)).split()
+    if len(bases) != 1:
+        return "%d merge bases between the parents" % len(bases)
+    for path in plain["files"]:
+        blobs = []
+        for commit in (ours, bases[0], theirs):
+            blob = _text(_git_out(repo, "rev-parse", "--verify", "-q",
+                                  "%s:%s" % (commit, path)))
+            if not _SHA.fullmatch(blob):
+                return "%s: not on the three sides (added, deleted or renamed)" % path
+            blobs.append(blob)
+        proc = _git_out(repo, "merge-file", "-p", "--diff3", "--object-id",
+                        "-L", "ours", "-L", "base", "-L", "theirs", *blobs)
+        if proc.returncode < 0 or proc.returncode > 127:
+            return "%s: git merge-file failed (binary file?)" % path
+        why = _base_sections_empty(proc.stdout.decode("utf-8", "replace"))
+        if why:
+            return "%s: %s" % (path, why)
+    blob = subprocess.run(["git", "-C", repo, "hash-object", "-w", "--stdin"],
+                          input=_UNION_ATTRIBUTES, capture_output=True)
+    attr_blob = _text(blob)
+    if blob.returncode or not _SHA.fullmatch(attr_blob):
+        return "union attributes cannot be written"
+    made = subprocess.run(["git", "-C", repo, "mktree"],
+                          input=("100644 blob %s\t.gitattributes\n" % attr_blob).encode(),
+                          capture_output=True)
+    attr_tree = _text(made)
+    if made.returncode or not _SHA.fullmatch(attr_tree):
+        return "union attributes cannot be written"
+    union = _git_out(repo, "-c", "attr.tree=%s" % attr_tree, "merge-tree", "--write-tree",
+                     ours, theirs)
+    lines = _text(union).splitlines()
+    if union.returncode != 0 or not lines:
+        return "the union merge of the parents does not resolve every conflict"
+    if lines[0].strip() != tree:
+        return "content beyond the union of both sides"
+    return ""
+
+
+def _base_sections_empty(text: str) -> str:
+    """Les conflits diff3 de `text` n'ont-ils que des sections de base vides ?
+    Vide si oui ; la raison sinon (marqueurs incohérents compris)."""
+    section = None
+    base_lines = 0
+    conflicts = 0
+    for line in text.splitlines():
+        if line == "<<<<<<< ours":
+            if section is not None:
+                return "conflict markers unreadable"
+            section, base_lines = "ours", 0
+            conflicts += 1
+        elif line == "||||||| base":
+            if section != "ours":
+                return "conflict markers unreadable"
+            section = "base"
+        elif line == "=======" and section is not None:
+            if section != "base":
+                return "conflict markers unreadable"
+            if base_lines:
+                return "both sides change the same lines (not a pure addition)"
+            section = "theirs"
+        elif line == ">>>>>>> theirs":
+            if section != "theirs":
+                return "conflict markers unreadable"
+            section = None
+        elif section == "base":
+            base_lines += 1
+    if section is not None or not conflicts:
+        return "conflict markers unreadable"
+    return ""
+
+
+def evaluate_remise(db, row: dict, marks, *, repo: str, package_base: str,
+                    frozen: str, ref: str, sha: str, klass) -> dict:
+    """#2496 : une remise du lot peut-elle être sa source dans le paquet ?
+
+    Rend `{ref, sha, ok, why, cover, target_parent}` ; `cover` dit ce qui
+    couvre la remise : `verdict` (porte des avis sur la remise, mêmes règles
+    que le gel), `waiver` (dispense du pilote, #1979) ou `mechanical`
+    (`mechanical_union`). Ne lève jamais : un doute refuse."""
+    out = {"ref": ref, "sha": sha, "ok": False, "why": "", "cover": "",
+           "target_parent": ""}
+    parents = _text(_git_out(repo, "rev-parse", sha + "^@")).split()
+    if len(parents) != 2 or parents.count(frozen) != 1:
+        out["why"] = ("parents are not the reviewed freeze %s and one target commit"
+                      % frozen[:12])
+        return out
+    other = parents[0] if parents[1] == frozen else parents[1]
+    out["target_parent"] = other
+    try:
+        if not _ancestor(repo, other, package_base):
+            out["why"] = "parent %s is not a commit of the target" % other[:12]
+            return out
+    except CandidateError as exc:
+        out["why"] = str(exc)
+        return out
+    merged = merge_tree(repo, package_base, sha)
+    if merged["state"] != "clean":
+        out["why"] = ("conflict with the base: %s" % ", ".join(merged["files"])
+                      if merged["state"] == "conflict" else merged["detail"]
+                      or "merge with the base unreadable")
+        return out
+    try:
+        gate = merge_queue.review_gate(db, marks, sha, repo=repo, klass=klass, item=row)
+    except Exception as exc:  # noqa: BLE001 - porte illisible : on refuse
+        out["why"] = "review gate of the remise unreadable: %s" % exc
+        return out
+    if gate.get("blocked"):
+        # un blocage sur la remise n'est jamais levé par l'union mécanique
+        out["why"] = gate.get("why") or "blocked verdict on the remise"
+        return out
+    if gate.get("ok"):
+        out["ok"], out["cover"] = True, "waiver" if gate.get("waived") else "verdict"
+        return out
+    union = mechanical_union(repo, parents[0], parents[1], sha)
+    if not union:
+        out["ok"], out["cover"] = True, "mechanical"
+        return out
+    out["why"] = "%s; not mechanical: %s" % (
+        gate.get("why") or "no verdict on the remise", union)
+    return out
 
 
 def _row_target(row: dict, target: str) -> str:
@@ -182,12 +405,28 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     canons = work.configured_canons(cfg)
     candidates: list[dict] = []
     errors: list[str] = []
+    # #2496 : les remises sur la cible, lues avant les gels — un verdict rendu
+    # sur une remise couvre la remise, il n'est pas un nouveau gel de la
+    # branche (sinon `freeze_candidate` y verrait un rebase de la tête).
+    found, remise_error = list_remises(repo, where, ids, target_branch)
+    remises = {lot: [(ref, listed, plan_git._commit(
+                   where, ref if where == repo
+                   else REMISE_LOCAL + ref[len(resolutions.REF_PREFIX):]) or "")
+                   for ref, listed in sorted(refs)]
+               for lot, refs in found.items()}
     for row in rows:
+        lot = int(row["id"])
+        shas = {sha for _ref, _listed, sha in remises.get(lot, []) if sha}
         candidates.append(_candidate(
             db, row, target_branch=target_branch, tips=tips, where=where,
-            package_base=package_base, marks=marks.get(int(row["id"]), []),
+            package_base=package_base,
+            marks=[m for m in marks.get(lot, []) if not _names_remise(m, shas)],
             cfg=cfg, canons=canons))
+    _apply_remises(db, candidates, {int(row["id"]): row for row in rows}, marks,
+                   remises, remise_error, where=where, package_base=package_base)
     for entry in candidates:
+        if entry["ready"] and not entry["source"]:
+            entry["source"] = entry["published_head"]
         if entry["error"]:
             errors.append("#%d : %s" % (entry["work_item"], entry["error"]))
     by_id = {entry["work_item"]: entry for entry in candidates}
@@ -208,6 +447,57 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
                           if not entry["ready"] and not entry["error"]),
         "errors": errors,
     }
+
+
+def _names_remise(mark: dict, shas: set) -> bool:
+    """Un verdict qui nomme une remise du lot (SHA complet ou abrégé)."""
+    sha = str(mark.get("sha") or "").strip().lower()
+    return (mark.get("kind") == "verdict" and len(sha) >= 7
+            and any(full.startswith(sha) for full in shas))
+
+
+def _apply_remises(db, candidates: list[dict], rows: dict, marks: dict, remises: dict,
+                   error: str, *, where: str, package_base: str) -> None:
+    """#2496 : un lot dont `conflict` est le seul motif devient prêt comme
+    unité quand une de ses remises sur la cible passe `evaluate_remise` ; la
+    remise est alors sa `source`. Sinon le motif `conflict` garde la raison du
+    refus de chaque remise."""
+    waiting = [entry for entry in candidates if not entry["error"]
+               and [cause["code"] for cause in entry["causes"]] == ["conflict"]
+               and entry["frozen_sha"] and entry["frozen_sha"] == entry["published_head"]]
+    for entry in waiting:
+        lot = entry["work_item"]
+        cause = entry["causes"][0]
+        if error:
+            cause["detail"] += " (remises unreadable: %s)" % error
+            continue
+        evaluated = []
+        for ref, listed, sha in remises.get(lot, []):
+            if sha != listed:
+                evaluated.append({"ref": ref, "sha": listed, "ok": False, "cover": "",
+                                  "target_parent": "",
+                                  "why": "remise not fetched as listed on origin"})
+                continue
+            evaluated.append(evaluate_remise(
+                db, rows[lot], marks.get(lot, []), repo=where, package_base=package_base,
+                frozen=entry["frozen_sha"], ref=ref, sha=sha, klass=entry["review_class"]))
+        entry["remises"] = evaluated
+        good = [e for e in evaluated if e["ok"]]
+        if not good:
+            if evaluated:
+                cause["detail"] += "; remise(s) refused: " + "; ".join(
+                    "%s: %s" % (e["ref"].rsplit("/", 1)[-1], e["why"]) for e in evaluated)
+            continue
+        # la remise la plus récente sur la cible : parent de cible le plus
+        # proche de la base, puis le nom de la ref (un ordre, jamais un tirage)
+        def freshness(e: dict) -> tuple:
+            stamp = _text(_git_out(where, "log", "-1", "--format=%ct", e["target_parent"]))
+            return (int(stamp) if stamp.isdigit() else 0, e["ref"])
+        chosen = max(good, key=freshness)
+        entry["remise"] = chosen
+        entry["source"] = chosen["sha"]
+        entry["causes"] = []
+        entry["ready"] = True
 
 
 def _ready_order(entry: dict) -> tuple:
@@ -241,6 +531,10 @@ def _candidate(db, row: dict, *, target_branch: str, tips: dict, where: str,
         "ready": False,
         "causes": [],
         "error": "",
+        # #2496 : le commit à composer (tête publiée, ou remise sur la cible)
+        "source": "",
+        "remise": None,
+        "remises": [],
     }
     if not branch:
         entry["causes"].append(_cause("missing-branch",
