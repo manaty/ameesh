@@ -499,8 +499,9 @@ class LoginUniquenessTest(LoginApiMixin, ApproveBase):
         status, _headers, payload = self.login_api("POST", "/login-requests", body)
         return status, payload
 
-    def close_login(self, login_id):
-        status, _headers, payload = self.login_api("POST", "/login-close/" + login_id, {})
+    def close_login(self, login_id, close_token=None):
+        body = {} if close_token is None else {"close_token": close_token}
+        status, _headers, payload = self.login_api("POST", "/login-close/" + login_id, body)
         return status, payload
 
     def test_un_seul_defi_vivant_par_tuple(self):
@@ -513,9 +514,27 @@ class LoginUniquenessTest(LoginApiMixin, ApproveBase):
         # un autre compte est un autre tuple
         self.assertEqual(self.create_login(account="other")[0], 201)
         # la clôture technique libère la place
-        status, closed = self.close_login(first["login_id"])
+        status, closed = self.close_login(first["login_id"], first["close_token"])
         self.assertEqual((status, json.loads(closed)["closed"]), (200, True))
         self.assertEqual(self.create_login()[0], 201)
+
+    def test_cloture_exige_la_capacite_du_defi(self):
+        """N3 : le jeton global ne ferme pas le défi d'un autre gardien."""
+        _status, payload = self.create_login()
+        first = json.loads(payload)
+        self.assertRegex(first["close_token"], r"^[A-Za-z0-9_-]{43}$")
+        _status, other = self.create_login(account="other")
+        second = json.loads(other)
+        for body in ({}, {"close_token": second["close_token"]},
+                     {"close_token": "x" * 43}):
+            status, _headers, refused = self.login_api(
+                "POST", "/login-close/" + first["login_id"], body)
+            self.assertEqual(status, 403, refused)
+            self.assertEqual(json.loads(refused)["error"], "close_token")
+            # la capacité d'un AUTRE défi ne ferme ni n'efface celui-ci
+            self.assertIsNotNone(self.service.store.login_private(first["login_id"]))
+        status, closed = self.close_login(first["login_id"], first["close_token"])
+        self.assertEqual((status, json.loads(closed)["closed"]), (200, True))
 
     def test_le_recu_humain_libere_la_place(self):
         _status, payload = self.create_login()
@@ -539,7 +558,7 @@ class LoginUniquenessTest(LoginApiMixin, ApproveBase):
         data = json.loads(payload)
         login_id, path = data["login_id"], urlsplit(data["link"]).path
         self.assertIsNotNone(self.service.store.login_private(login_id))
-        status, closed = self.close_login(login_id)
+        status, closed = self.close_login(login_id, data["close_token"])
         self.assertEqual((status, json.loads(closed)["closed"]), (200, True))
         # charge privée effacée, aucun reçu forgé
         self.assertIsNone(self.service.store.login_private(login_id))
@@ -563,7 +582,7 @@ class LoginUniquenessTest(LoginApiMixin, ApproveBase):
         _page, opened = self.open_view(path)
         self.submit(path, self.sign(
             self.alice, {"challenge-done": opened["challenge_done"]}, decision="done"))
-        self.assertEqual(self.close_login(data["login_id"])[0], 200)
+        self.assertEqual(self.close_login(data["login_id"], data["close_token"])[0], 200)
         status, _headers, _payload = self.login_api("GET", "/login-receipts/" + data["login_id"])
         self.assertEqual(status, 200)  # le reçu humain reste la preuve
 
@@ -620,10 +639,11 @@ class LoginClosureRaceTest(unittest.TestCase):
             SimpleNamespace(ok=True, approver=ALICE))
         live = service._live_login
         successor = []
+        close_token = first["close_token"]
 
         def close_after_read(value):
             record = live(value)
-            service.close_login(login_id)
+            service.close_login(login_id, close_token)
             successor.append(service.create_login_request(self.body))
             service._live_login = live
             return record
@@ -639,9 +659,9 @@ class LoginClosureRaceTest(unittest.TestCase):
     def test_cloture_tardive_ancienne_ne_libere_pas_le_successeur(self):
         service = self.service
         first = service.create_login_request(self.body)
-        service.close_login(first["login_id"])
+        service.close_login(first["login_id"], first["close_token"])
         successor = service.create_login_request(self.body)
-        service.close_login(first["login_id"])
+        service.close_login(first["login_id"], first["close_token"])
         with self.assertRaises(ApproveError) as caught:
             service.create_login_request(self.body)
         self.assertEqual((caught.exception.status, caught.exception.code),

@@ -2267,25 +2267,37 @@ def _parse_events(lines: Iterable[str], start: int, end: int | None = None) -> l
 def _lines_reverse(path: str, bloc: int = 1 << 20) -> Iterator[bytes]:
     """Les lignes d'un fichier, de la dernière à la première (#2096).
 
-    Lit par blocs depuis la fin et recolle la ligne à cheval sur deux blocs :
-    la mémoire reste bornée par le bloc et la plus longue ligne, jamais par le
+    Lit par blocs depuis la fin et recolle la ligne à cheval sur deux blocs.
+    Les morceaux de cette ligne s'accumulent dans une liste et ne sont joints
+    qu'une fois, quand elle est complète : une ligne géante (un événement de
+    plusieurs Mo) coûte alors O(n), au lieu de la concaténation quadratique
+    d'un `bloc + reste` qui recopiait toute la ligne à chaque tour (#2125).
+    La mémoire reste bornée par le bloc et la plus longue ligne, jamais par le
     fichier. Les lignes sont rendues en octets, décodées par l'appelant."""
     try:
         with open(path, "rb") as flux:
             flux.seek(0, os.SEEK_END)
             pos = flux.tell()
-            reste = b""
+            morceaux: list[bytes] = []  # la ligne en cours, de sa fin vers son début
             while pos > 0:
                 debut = max(0, pos - bloc)
                 flux.seek(debut)
-                donnees = flux.read(pos - debut) + reste
+                donnees = flux.read(pos - debut)
                 pos = debut
                 parties = donnees.split(b"\n")
-                reste = parties[0]  # peut-être la fin d'une ligne antérieure
-                for ligne in reversed(parties[1:]):
+                if len(parties) == 1:
+                    # aucun saut de ligne : tout le bloc prolonge la ligne en cours
+                    morceaux.append(parties[0])
+                    continue
+                morceaux.append(parties[-1])
+                yield b"".join(reversed(morceaux))
+                morceaux = [parties[0]]  # peut-être la fin d'une ligne antérieure
+                for ligne in reversed(parties[1:-1]):
                     yield ligne
-            if reste:
-                yield reste
+            if morceaux:
+                ligne = b"".join(reversed(morceaux))
+                if ligne:                # même contrat que l'ancien `if reste`
+                    yield ligne
     except OSError:
         return
 

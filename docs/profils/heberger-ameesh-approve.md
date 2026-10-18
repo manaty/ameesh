@@ -258,6 +258,11 @@ widen the RP ID to a parent to recycle the old passkeys.
       token is a `0600` file of the user concerned;
 - [ ] the login API is closed, or opened with the dedicated `login_token_file`
       (0600, distinct from the service token) held outside the agents' reach;
+- [ ] the service JSON (`~/.config/ameesh-approve/config.json`) and its
+      directory are held by the guardian/service account, outside the agents'
+      write scope: a JSON the agents can rewrite would let them open
+      `login_api` or point `login_token_file` at a token they control, so the
+      token's custody alone is not enough;
 - [ ] in passthrough: certificate of `H` only, `0600` files of the service
       user, renewal by atomic rename;
 - [ ] the team's Postgres role applied without discrepancy; the service's

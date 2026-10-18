@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import dataclasses
 import json
+import os
 import threading
 from types import SimpleNamespace
 import unittest
@@ -353,6 +354,24 @@ class AcknowledgementTest(PostMixin, PgTestCase):
         self.assertIsNone(self.history()[0]["invalidation_reason"])
         n.run_pass(self.db, [], thresholds={"stale_lot_s": 3600.0})
         self.assertEqual(self.history()[0]["invalidation_reason"], "resolved")
+
+    def test_notify_without_thresholds_declares_the_perimeter_it_observed(self):
+        observed = []
+        exploitation.alerts.side_effect = (
+            lambda _cfg, _db, **kw: observed.append(kw) or [self.a])
+        with mock.patch.dict(os.environ, {"AMEESH_ALERT_LONG_TURN": "999"}), \
+                mock.patch.object(alert_ack, "reconcile",
+                                  wraps=alert_ack.reconcile) as reconcile:
+            self.notifier().run_pass(self.db)
+        self.assertEqual(len(observed), 1)
+        thresholds = {k: v for k, v in observed[0].items()
+                  if k not in ("now", "local_pool", "unreadable")}
+        # #2105 : the pass observes with the perimeter it declares to
+        # reconcile — without thresholds, the parser's defaults, environment
+        # included.
+        self.assertEqual(reconcile.call_args.kwargs["perimeter"],
+                         alert_ack.canonical(thresholds))
+        self.assertEqual(thresholds.get("long_turn_s"), 999.0)
 
     def test_ack_between_last_raise_and_resolution_silences_resolution(self):
         n = self.notifier()

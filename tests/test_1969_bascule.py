@@ -29,7 +29,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 from unittest import mock
 
@@ -185,6 +185,68 @@ class BasculeTest(unittest.TestCase):
             if valeur == "v2":
                 self.assertEqual(0, retour(self.venv))
 
+    def test_script_console_ajoute_par_une_version_ulterieure_est_expose(self):
+        """#2155 : un point d'entrée pip de la v2 apparaît dans le venv stable."""
+        vrai_venv(self.base, "v1", "v1", "old_only")
+        os.rename(self.base / "venv-v1", self.venv)
+        vrai_venv(self.base, "v2", "v2", "new_only")
+        (self.base / "venv-v2" / bascule.MARKER).write_text(json.dumps({"version": "v2"}))
+        # pip n'écrit ce script que dans venv-v2/bin : le venv stable ne l'a
+        # jamais vu à l'adoption.
+        outil = self.base / "venv-v2" / "bin" / "futur-outil"
+        outil.write_text("#!%s/bin/python\nimport pkg1969\nprint(pkg1969.VALUE)\n"
+                         % (self.base / "venv-v2"))
+        outil.chmod(0o755)
+
+        self.assertEqual(0, activer(self.venv, "v2", precedent="v1"))
+
+        lanceur = self.venv / "bin" / "futur-outil"
+        self.assertTrue(lanceur.is_file(),
+                        "le script console de la version active n'est pas exposé")
+        resultat = subprocess.run([str(lanceur)], capture_output=True, text=True)
+        self.assertEqual(0, resultat.returncode, resultat.stderr)
+        self.assertEqual("v2", resultat.stdout.strip())
+        # Le python et l'ameesh stables restent des lanceurs de la version vive.
+        self.assertEqual((0, "v2"), lire(self.venv))
+
+        self.assertEqual(0, retour(self.venv))
+        # Le lanceur créé pour la v2 disparaît quand la version de retour ne
+        # porte pas ce script ; les scripts adoptés de la v1 restent.
+        self.assertFalse(lanceur.exists(), "lanceur d'une version quittée laissé")
+        self.assertEqual((0, "v1"), lire(self.venv))
+
+    def test_activation_echouee_apres_lanceurs_ne_laisse_pas_d_orphelin(self):
+        """#2230 N1 : le ménage se recalcule depuis bin/, pas depuis le marqueur."""
+        vrai_venv(self.base, "v1", "v1", "v1")
+        os.rename(self.base / "venv-v1", self.venv)
+        vrai_venv(self.base, "v2", "v2", "v2")
+        (self.base / "venv-v2" / bascule.MARKER).write_text(json.dumps({"version": "v2"}))
+        outil = self.base / "venv-v2" / "bin" / "outil-v2"
+        outil.write_text("#!%s/bin/python\nimport pkg1969\nprint(pkg1969.VALUE)\n"
+                         % (self.base / "venv-v2"))
+        outil.chmod(0o755)
+        vrai_venv(self.base, "v3", "v3", "v3")
+        (self.base / "venv-v3" / bascule.MARKER).write_text(json.dumps({"version": "v3"}))
+
+        self.assertEqual(0, activer(self.venv, "v2", precedent="v1"))
+        lanceur = self.venv / "bin" / "outil-v2"
+        self.assertTrue(lanceur.is_file())
+
+        # L'activation de v3 écrit ses lanceurs et son marqueur, puis échoue
+        # avant la bascule (écriture de la précédente impossible) : le
+        # marqueur nomme déjà v3, donc les noms de v2 en sortent.
+        with mock.patch.object(bascule, "_write_report", side_effect=OSError("disque plein")):
+            with self.assertRaises(OSError):
+                activer(self.venv, "v3")
+        self.assertEqual((0, "v2"), lire(self.venv))
+        self.assertTrue(lanceur.is_file(), "l'échec ne doit rien retirer")
+
+        # La reprise aboutit et retire le lanceur que la version vivante ne
+        # porte plus : un orphelin ne survit pas à une activation interrompue.
+        self.assertEqual(0, activer(self.venv, "v3"))
+        self.assertEqual((0, "v3"), lire(self.venv))
+        self.assertFalse(lanceur.exists(), "lanceur orphelin laissé hors du suivi")
+
     # -- B2 : le retour réutilise le venv réel, sans pip --------------------
 
     def test_retour_reutilise_le_venv_reel_sans_pip(self):
@@ -239,6 +301,65 @@ class BasculeTest(unittest.TestCase):
         self.assertEqual((0, "v2"), lire(self.venv))
         self.assertEqual(0, retour(self.venv))
         self.assertEqual((0, "v1"), lire(self.venv))
+
+    def test_retour_bascule_meme_si_les_lanceurs_ne_peuvent_pas_etre_ecrits(self):
+        """#2230 N3 : le retour utile est le rename ; les lanceurs sont best-effort."""
+        vrai_venv(self.base, "v1", "v1", "v1")
+        os.rename(self.base / "venv-v1", self.venv)
+        vrai_venv(self.base, "v2", "v2", "v2")
+        (self.base / "venv-v2" / bascule.MARKER).write_text(json.dumps({"version": "v2"}))
+        self.assertEqual(0, activer(self.venv, "v2", precedent="v1"))
+        with mock.patch.object(bascule, "_installer_lanceurs",
+                               side_effect=OSError("disque plein")):
+            with redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(0, retour(self.venv))
+        self.assertEqual((0, "v1"), lire(self.venv))
+        self.assertIn("lanceurs non réécrits", err.getvalue())
+
+    def test_ecriture_echouee_retire_le_temporaire_et_preserve_la_cible(self):
+        cible = self.base / "bin" / "ameesh"
+        cible.parent.mkdir()
+        cible.write_text("ancien")
+        vrai_open = open
+        erreur = OSError("disque plein")
+
+        class FichierPlein:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.handle.close()
+
+            def write(self, data):
+                self.handle.write(data[:2])
+                self.handle.flush()
+                raise erreur
+
+        for etape in ("write", "chmod", "replace"):
+            with self.subTest(etape=etape):
+                if etape == "write":
+                    patch = mock.patch.object(
+                        bascule, "open", create=True,
+                        side_effect=lambda path, mode: FichierPlein(vrai_open(path, mode)))
+                else:
+                    patch = mock.patch.object(bascule.os, etape, side_effect=erreur)
+                with patch, self.assertRaises(OSError) as levee:
+                    bascule._write(str(cible), "nouveau")
+                self.assertIs(erreur, levee.exception)
+                self.assertEqual("ancien", cible.read_text())
+                self.assertEqual([], list(cible.parent.glob("*.tmp.*")))
+
+    def test_echec_du_nettoyage_ne_masque_pas_lechec_decriture(self):
+        cible = self.base / "ameesh"
+        erreur = OSError("rename impossible")
+        with mock.patch.object(bascule.os, "replace", side_effect=erreur), \
+             mock.patch.object(bascule.os, "remove", side_effect=PermissionError("nettoyage")), \
+             self.assertRaises(OSError) as levee:
+            bascule._write(str(cible), "nouveau")
+        self.assertIs(erreur, levee.exception)
 
     def test_bascule_concurrente_voit_ancien_ou_nouveau_entier(self):
         faux_venv(self.base, "v1")
@@ -321,6 +442,104 @@ class BasculeTest(unittest.TestCase):
                      "#!%s" % (cible / "bin" / "pythonx")):
             with self.assertRaises(RuntimeError):
                 controler(faux)
+
+    def test_controles_acceptent_le_wrapper_bin_sh_de_pip_chemin_long(self):
+        """#2156 : au-delà de 127 octets, pip préfixe le script d'un /bin/sh."""
+        cible = self.base / "venv-v2"
+        (cible / "bin").mkdir(parents=True)
+        ameesh = cible / "bin" / "ameesh"
+
+        def controler(executable, fermeture="' '''"):
+            # Forme écrite par pip 24 (distlib) quand le shebang dépasse 127
+            # octets, reproduite avec un interpréteur de 148 caractères.
+            preambule = ("#!/bin/sh\n"
+                         "'''exec' %s \"$0\" \"$@\"\n"
+                         "%s\n" % (executable, fermeture))
+            ameesh.write_text(preambule + "import sys\n")
+            with mock.patch.object(bascule, "_run"):
+                bascule._controles(str(cible))
+
+        for nom in ("python", "python3", "python3.14"):
+            controler(cible / "bin" / nom)
+        # chemin contenant une espace : distlib met l'exécutable entre guillemets
+        controler('"%s"' % (cible / "bin" / "python3"))
+        for faux in (self.venv / "bin" / "python3",
+                     "/usr/bin/python3",
+                     cible / "bin" / "pythonx"):
+            with self.assertRaises(RuntimeError):
+                controler(faux)
+        # la troisième ligne ferme la chaîne qui rend le script valide en Python
+        with self.assertRaises(RuntimeError):
+            controler(cible / "bin" / "python3", fermeture="'''")
+
+    def test_controles_diagnostiquent_lexec_fautif_avant_de_lexecuter(self):
+        cible = self.base / "venv-v2"
+        (cible / "bin").mkdir(parents=True)
+        (cible / "bin" / "ameesh").write_text(
+            '#!/bin/sh\n\'\'\'exec\' /autre/venv/bin/python3 "$0" "$@"\n\' \'\'\'\n')
+        with mock.patch.object(bascule, "_run") as run, \
+             self.assertRaises(RuntimeError) as levee:
+            bascule._controles(str(cible))
+        message = str(levee.exception)
+        self.assertIn("ligne 2", message)
+        self.assertIn("/autre/venv/bin/python3", message)
+        self.assertIn("interpréteur attendu", message)
+        self.assertIn(str(cible / "bin" / "python"), message)
+        run.assert_not_called()
+
+    def test_controles_bornent_chacune_des_trois_lignes_du_preambule(self):
+        cible = self.base / "venv-v2"
+        python = cible / "bin" / "python3"
+        prefixe = [b"#!/bin/sh\n", ("'''exec' %s \"$0\" \"$@\"\n" % python).encode()]
+
+        class LectureBornee(io.BytesIO):
+            def readline(handle, size=-1):
+                self.assertGreater(size, 0, "lecture sans borne")
+                self.assertLessEqual(size, 8193)
+                return super().readline(size)
+
+        for ligne in (1, 2, 3):
+            with self.subTest(ligne=ligne):
+                source = LectureBornee(b"".join(prefixe[:ligne - 1]) + b"x" * 65536 + b"\n")
+                with mock.patch.object(bascule, "open", create=True, return_value=source), \
+                     mock.patch.object(bascule, "_run") as run, \
+                     self.assertRaisesRegex(RuntimeError, "ligne %d.*8192" % ligne):
+                    bascule._controles(str(cible))
+                run.assert_not_called()
+
+    def test_shebang_direct_ne_lit_pas_le_corps_python(self):
+        cible = self.base / "venv-v2"
+        (cible / "bin").mkdir(parents=True)
+        (cible / "bin" / "ameesh").write_text(
+            "#!%s\n#%s\n" % (cible / "bin" / "python3", "x" * 65536))
+        with mock.patch.object(bascule, "_run"):
+            bascule._controles(str(cible))
+
+    def test_apostrophe_acceptee_en_shebang_direct_ou_wrapper_quote(self):
+        court = vrai_venv(self.base / "l'owner", "v2", "v2", "new_only")
+        long = vrai_venv(self.base / ("l'owner avec espace " + "x" * 120),
+                         "v2", "v2", "new_only")
+        for cible in (court, long):
+            with self.subTest(cible=cible):
+                python = cible / "bin" / "python3"
+                preambule = ("#!%s\n" % python if cible == court else
+                             '#!/bin/sh\n\'\'\'exec\' "%s" "$0" "$@"\n\' \'\'\'\n' % python)
+                (cible / "bin" / "ameesh").write_text(
+                    preambule + "import pkg1969\nprint(pkg1969.VALUE)\n")
+                with mock.patch.object(bascule, "_run"):
+                    bascule._controles(str(cible))
+                self.assertEqual((0, "v2"), lire(cible))
+
+    def test_wrapper_avec_apostrophe_non_quotee_est_refuse_explicitement(self):
+        cible = self.base / "l'owner" / "venv-v2"
+        (cible / "bin").mkdir(parents=True)
+        (cible / "bin" / "ameesh").write_text(
+            '#!/bin/sh\n\'\'\'exec\' %s "$0" "$@"\n\' \'\'\'\n' %
+            (cible / "bin" / "python3"))
+        with mock.patch.object(bascule, "_run") as run, \
+             self.assertRaisesRegex(RuntimeError, "ligne 2.*quotage shell invalide"):
+            bascule._controles(str(cible))
+        run.assert_not_called()
 
     def test_activer_refuse_un_venv_non_prepare(self):
         faux_venv(self.base, "v1")

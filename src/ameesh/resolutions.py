@@ -38,9 +38,12 @@ merge of the two current tips with an `rr-cache` holding the pair's own
 resolution only (trained once per resolution commit with git's
 `rerere-train.sh`, contrib, or a port of the same loop when the script is
 not installed, then kept aside: another pair's resolution, or a replaced
-one, never resolves this pair). If `rerere` resolves every
-conflicted path, the pair is `prepared`; otherwise it is `stale`, and the
-lot that prepared it is told (passive mail, L160c). A rebase or a new push
+one, never resolves this pair). The replay reads `.gitattributes` from the
+target's tree (`attr.tree`), like the radar's trial merge and the landing
+merge, so a `merge=union` carried by a single branch does not decide it
+(#2189). If `rerere` resolves every conflicted path, the pair is
+`prepared`; otherwise it is `stale`, and the lot that prepared it is told
+(passive mail, L160c). A rebase or a new push
 that leaves the conflicting hunks as they were keeps the pair `prepared`:
 `rerere` recognises content, not commits.
 
@@ -70,6 +73,11 @@ TRAILER = "ameesh-resolution"
 # v3 keeps both merge directions and retrains the checkout -m preimages that
 # v2 (#2136) could cache before #2165 fixed the Python trainer.
 TRAINING_CACHE = "ameesh-rr-v3"
+# v4 is trained with the target's attributes (`attr.tree`), like
+# `radar.trial_merge` and a landing merge: a cache trained from a branch that
+# carries `merge=union` alone does not cover the conflicts the target sees, and
+# the other way round (#2189). Land and the merge queue keep TRAINING_CACHE.
+TRAINING_CACHE_TARGET = "ameesh-rr-v4"
 #: worktrees of open resolutions, under the repository's common directory
 WORKTREE_DIR = "ameesh-resolve"
 #: where git ships `rerere-train.sh`, relative to `git --exec-path` or absolute
@@ -205,7 +213,23 @@ def _parents(cwd: str, commit: str) -> list[str]:
     return _text(_run(cwd, "rev-parse", commit + "^@")).split()
 
 
-def _learn(cwd: str, commit: str, first: str, others) -> bool:
+def _attr_args(attributes_tree: str | None) -> list[str]:
+    """The git arguments that read `.gitattributes` from `attributes_tree`
+    instead of the checked-out tree (`git merge-tree` and `git merge` honour
+    the same `attr.tree`, git >= 2.40)."""
+    return ["-c", "attr.tree=%s" % attributes_tree] if attributes_tree else []
+
+
+def _attr_env(env: dict, attributes_tree: str | None) -> dict:
+    """`_attr_args` for a child process (rerere-train.sh runs its own git)."""
+    if attributes_tree:
+        env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="attr.tree",
+                   GIT_CONFIG_VALUE_0=attributes_tree)
+    return env
+
+
+def _learn(cwd: str, commit: str, first: str, others, *,
+           attributes_tree: str | None = None) -> bool:
     """Plays the merge of `others` into `first` and records, in `rr-cache`, the
     resolution the tree of `commit` carries when that merge conflicts. Returns
     whether it learnt from a conflict (a clean merge has none to record).
@@ -226,6 +250,7 @@ def _learn(cwd: str, commit: str, first: str, others) -> bool:
         os.rename(cache, stash)
     try:
         merge = _run(cwd, "-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=false",
+                     *_attr_args(attributes_tree),
                      "merge", "-q", "--no-ff", "--no-commit", *others)
     finally:
         if hidden and os.path.isdir(stash):
@@ -250,7 +275,8 @@ def _learn(cwd: str, commit: str, first: str, others) -> bool:
     return True
 
 
-def train(cwd: str, commits, *, script: str | None = "auto") -> list[str]:
+def train(cwd: str, commits, *, script: str | None = "auto",
+          attributes_tree: str | None = None) -> list[str]:
     """Primes the `rr-cache` of the repository of worktree `cwd` from the
     merge commits `commits` (`--overwrite`: a replaced resolution wins),
     with `rerere-train.sh`, or the same loop in Python when the script is
@@ -267,7 +293,13 @@ def train(cwd: str, commits, *, script: str | None = "auto") -> list[str]:
     #2165 : the Python port hides the cache during the trial merge, so
     `--overwrite` really replaces a resolution the merge would have replayed
     from the cache; it records the preimage the merge rendered, never one
-    re-rendered by `checkout -m`."""
+    re-rendered by `checkout -m`.
+
+    #2189 : `attributes_tree` makes the trial merges read `.gitattributes`
+    from the target, exactly like the replay and `radar.trial_merge`, so a
+    conflict that only the target's attributes create is learnt too. The
+    first-parent direction of rerere-train.sh gets it through the git
+    environment (`GIT_CONFIG_*`), its reverse through `_learn`."""
     commits = [c for c in commits if c]
     if not commits:
         return []
@@ -280,8 +312,9 @@ def train(cwd: str, commits, *, script: str | None = "auto") -> list[str]:
     learnt = []
     try:
         if script:
+            env = _attr_env(_git_env(), attributes_tree)
             proc = subprocess.run(["sh", script, "--overwrite", "--no-walk", *commits],
-                                  cwd=cwd, capture_output=True, env=_git_env(),
+                                  cwd=cwd, capture_output=True, env=env,
                                   timeout=FETCH_TIMEOUT, check=False)
             out = proc.stdout.decode("utf-8", "replace")
             found = re.findall(r"^Learning from ([0-9a-f]+)", out, re.M)
@@ -291,11 +324,13 @@ def train(cwd: str, commits, *, script: str | None = "auto") -> list[str]:
                 parents = _parents(cwd, commit)
                 if len(parents) < 2:
                     continue
-                if _learn(cwd, commit, parents[0], parents[1:]):
+                if _learn(cwd, commit, parents[0], parents[1:],
+                          attributes_tree=attributes_tree):
                     learnt.append(commit)
         for commit in commits:
             parents = _parents(cwd, commit)
-            if len(parents) == 2 and _learn(cwd, commit, parents[1], [parents[0]]):
+            if len(parents) == 2 and _learn(cwd, commit, parents[1], [parents[0]],
+                                            attributes_tree=attributes_tree):
                 learnt.append(commit)
     finally:
         _run(cwd, "reset", "-q", "--hard")
@@ -404,6 +439,16 @@ def pair(db, lot: int, other: int, repo: str, *, fetch: bool = True) -> dict:
         raise ResolveError("lots #%d and #%d do not share a target (%s, %s): their branches "
                            "never merge together" % (lot, other, targets[lot], targets[other]))
     target = default or targets[lot]
+    # #2189 : the landing merge and the radar's trial merge read the target's
+    # `.gitattributes`; preparation and replay must use the same tree, else a
+    # resolution is prepared against attributes no merge will use.
+    target_head = None
+    if target:
+        try:
+            from .radar import target_commit
+            target_head, _ref, _branch, _remote = target_commit(repo, target)
+        except (GitError, OSError):
+            target_head = None
     tips = {}
     for n, row in rows.items():
         tips[n] = _branch_tip(repo, row["branch"], fetch=fetch and n == other)
@@ -411,6 +456,7 @@ def pair(db, lot: int, other: int, repo: str, *, fetch: bool = True) -> dict:
             raise ResolveError("branch %s of lot #%d is neither local nor on origin"
                                % (row["branch"], n))
     return {"lot": rows[lot], "other": rows[other], "target": target,
+            "target_head": target_head,
             "lot_tip": tips[lot], "other_tip": tips[other]}
 
 
@@ -549,6 +595,7 @@ def open_resolution(db, lot: int, other: int, *, repo: str | None = None) -> dic
              "ameesh work resolve %d --with %d" % (lot, other), path)
         # rerere off: neither the agents' rr-cache nor rerere.autoUpdate decide
         merge = _run(path, "-c", "rerere.enabled=false", "-c", "merge.conflictStyle=zdiff3",
+                     *_attr_args(ctx.get("target_head")),
                      "merge", "--no-ff", "--no-commit", "--quiet", ctx["other_tip"])
         files = unmerged(path)
         if merge.returncode == 0 or not files:
@@ -562,9 +609,11 @@ def open_resolution(db, lot: int, other: int, *, repo: str | None = None) -> dic
         primed = [r["commit_sha"] for r in _recorded(db, lot, other)
                   if _ensure_commit(repo, r)][:1]
         replayed = _replay_into(repo, path, primed[0], ctx["lot_tip"], ctx["other_tip"],
-                                files) if primed else []
+                                files, attributes_tree=ctx.get("target_head")) \
+            if primed else []
         meta = {"lot": lot, "other": other, "lot_branch": ctx["lot"]["branch"],
                 "other_branch": ctx["other"]["branch"], "target": ctx["target"],
+                "target_head": ctx.get("target_head"),
                 "lot_tip": ctx["lot_tip"], "other_tip": ctx["other_tip"], "files": files,
                 "replayed": replayed, "primed": primed}
         with open(_meta_path(path), "w", encoding="utf-8") as fh:
@@ -578,15 +627,16 @@ def open_resolution(db, lot: int, other: int, *, repo: str | None = None) -> dic
 
 
 def _replay_into(repo: str, path: str, commit: str, lot_tip: str, other_tip: str,
-                 files) -> list[str]:
+                 files, *, attributes_tree: str | None = None) -> list[str]:
     """Replays the merge in a scratch clone primed with `commit` only, and
     copies into the worktree `path` the files `rerere` resolved there (left
-    unmerged in its index, for the agent to check). Returns them."""
+    unmerged in its index, for the agent to check). Returns them.
+    `attributes_tree`: the target's, as `open_resolution` merges (#2189)."""
     scratch = tempfile.mkdtemp(prefix="ameesh-resolve-")
     try:
         replayer = Replayer(repo, os.path.join(scratch, "clone"))
         replayer.ensure()
-        if replayer.prime([commit]):
+        if replayer.prime([commit], attributes_tree=attributes_tree):
             return []
         resolved = []
 
@@ -595,7 +645,8 @@ def _replay_into(repo: str, path: str, commit: str, lot_tip: str, other_tip: str
                 if f in files and os.path.isfile(os.path.join(clone, f)):
                     shutil.copyfile(os.path.join(clone, f), os.path.join(path, f))
                     resolved.append(f)
-        replayer.replay(lot_tip, other_tip, commit, export=export)
+        replayer.replay(lot_tip, other_tip, commit, attributes_tree=attributes_tree,
+                        export=export)
         return sorted(resolved)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
@@ -795,11 +846,14 @@ class Replayer:
     """The radar's private clone of a project. Objects come from the agents'
     repository (`--shared`); merges are replayed in the clone's worktree.
     Each resolution commit gets its own `rr-cache`, trained once and kept
-    under `.git/ameesh-rr-v3/<commit>`: a replay sees the pair's resolution
-    only, never another pair's nor a replaced one."""
+    under `.git/ameesh-rr-v3/<commit>` (branches' attributes) or
+    `.git/ameesh-rr-v4/<commit>` (the target's, `attributes_tree`): a replay
+    sees the pair's resolution only, never another pair's nor a replaced one."""
 
     def __init__(self, repo: str, path: str, *, script: str | None = "auto") -> None:
         self.repo, self.path, self.script = repo, path, script
+        #: attribute keys already read, per target tree (`attributes_key`)
+        self._attr_keys: dict = {}
 
     def ensure(self) -> None:
         if not os.path.isdir(os.path.join(self.path, ".git")):
@@ -822,14 +876,50 @@ class Replayer:
     def _rr_cache(self) -> str:
         return os.path.join(self.path, ".git", "rr-cache")
 
-    def _store(self, sha: str = "") -> str:
+    def _store(self, sha: str = "", attributes_tree: str | None = None) -> str:
         # Retrain legacy first-parent caches and v2 checkout -m preimages.
-        return os.path.join(self.path, ".git", TRAINING_CACHE, sha)
+        root = TRAINING_CACHE_TARGET if attributes_tree else TRAINING_CACHE
+        return os.path.join(self.path, ".git", root, sha)
 
-    def trained(self) -> list[str]:
+    def attributes_key(self, attributes_tree: str) -> str:
+        """The `.gitattributes` paths and entries of `attributes_tree`: two target trees
+        with the same key drive the same merges, so a cache trained for one
+        serves the other; a different key retrains it (#2189)."""
+        if attributes_tree not in self._attr_keys:
+            proc = _run(self.repo, "ls-tree", "-r", "-z", "--full-tree",
+                        attributes_tree)
+            blobs = []
+            if proc.returncode == 0:
+                for entry in proc.stdout.decode("utf-8", "replace").split("\0"):
+                    _info, _, more = entry.partition("\t")
+                    if more and more.rsplit("/", 1)[-1] == ".gitattributes":
+                        # The directory determines a rule's scope; the mode
+                        # also matters (Git does not follow attribute symlinks).
+                        blobs.append(entry)
+            # unreadable tree: fall back on its name, never reuse a wrong cache
+            self._attr_keys[attributes_tree] = json.dumps(blobs) if proc.returncode == 0 \
+                else attributes_tree
+        return self._attr_keys[attributes_tree]
+
+    def trained(self, attributes_tree: str | None = None) -> list[str]:
         try:
-            return sorted(n for n in os.listdir(self._store())
-                          if os.path.isdir(self._store(n)) and not n.startswith("."))
+            root = self._store(attributes_tree=attributes_tree)
+            key = self.attributes_key(attributes_tree) if attributes_tree else None
+            names = []
+            for name in os.listdir(root):
+                store = self._store(name, attributes_tree)
+                if name.startswith(".") or not os.path.isdir(store):
+                    continue
+                if key is not None:
+                    try:
+                        with open(os.path.join(store, ".attr-tree"), encoding="utf-8") as fh:
+                            trained_key = fh.read().strip()
+                    except OSError:
+                        continue
+                    if trained_key != key:
+                        continue
+                names.append(name)
+            return sorted(names)
         except FileNotFoundError:
             return []
 
@@ -850,43 +940,55 @@ class Replayer:
         shutil.rmtree(self._rr_cache(), ignore_errors=True)
         os.makedirs(self._rr_cache())
 
-    def prime(self, commits) -> list[str]:
+    def prime(self, commits, *, attributes_tree: str | None = None) -> list[str]:
         """Trains a cache of its own for each commit not learnt yet; returns
-        the commits still missing, or whose training failed."""
+        the commits still missing, or whose training failed. With
+        `attributes_tree`, the trial merges read the target's attributes
+        (#2189) and the cache lives apart from the branches' one."""
         commits = list(dict.fromkeys(commits))
         missing = [c for c in commits if not self.has(c)]
         if missing:
             self.fetch()
             missing = [c for c in commits if not self.has(c)]
-        done = set(self.trained())
+        done = set(self.trained(attributes_tree))
         for commit in commits:
             if commit in done or commit in missing:
                 continue
             self._empty_cache()
             try:
-                train(self.path, [commit], script=self.script)
+                train(self.path, [commit], script=self.script,
+                      attributes_tree=attributes_tree)
             except (GitError, OSError, subprocess.SubprocessError):
                 # this pair only: the others are still primed and replayed
                 missing.append(commit)
                 continue
-            tmp = self._store("." + commit)
+            tmp = self._store("." + commit, attributes_tree)
             shutil.rmtree(tmp, ignore_errors=True)
             shutil.copytree(self._rr_cache(), tmp)
-            os.replace(tmp, self._store(commit))
+            if attributes_tree:
+                with open(os.path.join(tmp, ".attr-tree"), "w", encoding="utf-8") as fh:
+                    fh.write(self.attributes_key(attributes_tree) + "\n")
+            store = self._store(commit, attributes_tree)
+            shutil.rmtree(store, ignore_errors=True)  # another target key, or a retrain
+            os.replace(tmp, store)
         return missing
 
-    def replay(self, a: str, b: str, commit: str, *, export=None, generated=()) -> dict:
+    def replay(self, a: str, b: str, commit: str, *, attributes_tree: str | None = None,
+               export=None, generated=()) -> dict:
         """Merges `b` into `a` with `rerere` and the cache of `commit` only:
         `{state: prepared|stale|clean|error, remaining, files}`. `export(clone,
         resolved paths)` runs before the clone is reset. `generated` (L160g):
-        paths that `land` regenerates — never left to rerere, never remaining."""
+        paths that `land` regenerates — never left to rerere, never remaining.
+        `attributes_tree`: read `.gitattributes` from that tree, as the radar's
+        trial merge does (#2189), whichever tip is checked out."""
         self._empty_cache()
-        if commit in self.trained():
+        if commit in self.trained(attributes_tree):
             shutil.rmtree(self._rr_cache())
-            shutil.copytree(self._store(commit), self._rr_cache())
+            shutil.copytree(self._store(commit, attributes_tree), self._rr_cache())
         try:
             _check(_run(self.path, "checkout", "-q", "-f", "--detach", a), "checkout")
             merge = _run(self.path, "-c", "rerere.enabled=false", "-c", "rerere.autoUpdate=false",
+                         *_attr_args(attributes_tree),
                          "merge", "--no-ff", "--no-commit", "--quiet", b)
             if merge.returncode == 0:
                 return {"state": "clean", "files": [], "remaining": []}
@@ -925,12 +1027,30 @@ def annotate(report: dict, rows: list[dict], lots: dict, *, replayer: Replayer |
     replays = {} if replays is None else replays
     conflicted = [p for p in report.get("pairs") or ()
                   if p["state"] in ("conflict", "target-conflict", "unclassified", "superseded")]
-    found = [latest[frozenset(p["lots"])] for p in conflicted if frozenset(p["lots"]) in latest]
-    missing: list[str] = []
-    if found and replayer is not None:
+
+    def target_tree(p: dict) -> str | None:
+        """The target's tree, whose `.gitattributes` decide the pair's merge
+        (#2189), like `radar.trial_merge`'s `attributes_tree`."""
+        if p.get("target_head"):
+            return p["target_head"]
+        for n in p["lots"]:
+            head = (branches.get(n) or {}).get("target_head")
+            if head:
+                return head
+        return None
+
+    wanted: dict = {}
+    for p in conflicted:
+        row = latest.get(frozenset(p["lots"]))
+        if row is not None:
+            wanted.setdefault(target_tree(p), []).append(row["commit_sha"])
+    missing: set = set()
+    if wanted and replayer is not None:
         try:
             replayer.ensure()
-            missing = replayer.prime([r["commit_sha"] for r in reversed(found)])
+            for tree, commits in wanted.items():
+                missing.update((c, tree) for c in
+                               replayer.prime(commits, attributes_tree=tree))
         except (GitError, OSError) as exc:
             report["resolution_error"] = "%s: %s" % (type(exc).__name__, exc)
             replayer = None
@@ -947,14 +1067,19 @@ def annotate(report: dict, rows: list[dict], lots: dict, *, replayer: Replayer |
                       "ref": row.get("ref"), "created_by": row.get("created_by"),
                       "created_ts": row.get("created_ts")}
         p["resolution"] = resolution
-        if replayer is None or row["commit_sha"] in missing:
+        tree = target_tree(p)
+        if replayer is None or (row["commit_sha"], tree) in missing:
             resolution["replay"] = "unavailable"
             continue
-        key = (p["tips"][0], p["tips"][1], row["commit_sha"], tuple(sorted(generated)))
+        # only the target's `.gitattributes` can change the replay: a target
+        # move that leaves them alone reuses the cached result (#2189)
+        attrs = replayer.attributes_key(tree) if tree else None
+        key = (p["tips"][0], p["tips"][1], row["commit_sha"], attrs,
+               tuple(sorted(generated)))
         if key not in replays:
             try:
                 replays[key] = replayer.replay(*p["tips"], row["commit_sha"],
-                                               generated=generated)
+                                               attributes_tree=tree, generated=generated)
             except (GitError, OSError) as exc:
                 replays[key] = {"state": "error", "error": str(exc)[:300]}
         result = replays[key]

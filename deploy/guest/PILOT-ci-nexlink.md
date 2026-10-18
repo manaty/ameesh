@@ -103,6 +103,15 @@ job is root-equivalent.
   without it, `busy_units` counts four idle persistent listeners as four
   jobs (R1 #1256).
 
+### Offline runner archive
+
+`ci-runners.sh --prepare --tarball FILE` uses an archive supplied by the
+operator instead of downloading it. `FILE` must be a regular file, and
+neither it nor any parent directory may be a symbolic link. A path through
+a linked directory is refused even if it leads to a regular archive; the
+error says `without following a link`. Place the archive under directories
+whose path contains no symbolic link and pass that path to `--tarball`.
+
 ### Single-use registration (option A)
 
 No registration token reaches the lending host. For each job slot the

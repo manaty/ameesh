@@ -104,13 +104,36 @@ class CiResults(interface.CiResults):
             """ % RUN_COLUMNS, (json.dumps(sorted(branches)),))
 
     def conclude(self, repo, run_id, status) -> bool:
-        rows = self.db.query(
-            """
-            UPDATE ci_runs SET status = %s, concluded_at = now()
-             WHERE repo = %s AND run_id = %s AND status = 'running'
-            RETURNING run_id
-            """, (status, repo, int(run_id)))
-        return bool(rows)
+        from ... import merge_queue, train_events
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                """
+                UPDATE ci_runs SET status = %s, concluded_at = now()
+                 WHERE repo = %s AND run_id = %s AND status = 'running'
+                RETURNING run_id, head_sha, branch
+                """, (status, repo, int(run_id)))
+            if rows and status in ("success", "failure", "cancelled"):
+                # The GitHub integration branch does not encode its target.
+                # Route only through the persisted exact source/head/branch;
+                # neither a lot recipient nor GitHub's default PR base is used.
+                subjects = tx.query(
+                    "SELECT target_key, document->'plan'->>'target' AS target"
+                    " FROM integration_trains"
+                    " WHERE document->'plan'->>'source' = %s"
+                    " AND document->'plan'->>'head' = %s"
+                    " AND document->'plan'->>'branch' = %s",
+                    (merge_queue.normalize_source("github.com/" + repo),
+                     rows[0]["head_sha"], rows[0]["branch"]))
+                for subject in subjects:
+                    project, _, target = subject["target_key"].partition(":")
+                    if target != subject["target"]:
+                        continue
+                    try:
+                        train_events.emit(tx, kind="ci-terminal", project=project, target=target)
+                    except ValueError:
+                        # A legacy/malformed namespace is not a train subject.
+                        pass
+            return bool(rows)
 
     def supersede(self, repo, branch, head_sha, run_id) -> list[dict]:
         # une exécution annulée avant que la suivante soit vue l'est aussi :
@@ -184,18 +207,23 @@ class CiResults(interface.CiResults):
         # tête plus ancienne ne redevient pas la base. Pour chaque tête, sa
         # première observation, annulations comprises (un réessai ne la
         # rajeunit pas), mais le résultat de sa dernière exécution conclue.
+        # #2064 : `created_at` de GitHub est à la seconde ; à observation
+        # égale, le premier run_id de chaque tête départage les poussées.
+        # Une nouvelle exécution d'une ancienne tête ne la rajeunit pas.
         rows = self.db.query(
             """
             WITH runs AS (
                 SELECT run_id, head_sha, run_attempt, status, concluded_at,
                        min(coalesce(created_at, first_seen_at))
-                           OVER (PARTITION BY head_sha) AS seen_at
+                           OVER (PARTITION BY head_sha) AS seen_at,
+                       min(run_id) OVER (PARTITION BY head_sha) AS head_run
                   FROM ci_runs
                  WHERE repo = %s AND branch = %s AND workflow = %s
             ), last AS (
                 SELECT run_id, head_sha, run_attempt FROM runs
                  WHERE status IN ('success', 'failure')
-                 ORDER BY seen_at DESC, concluded_at DESC NULLS LAST, run_id DESC LIMIT 1
+                 ORDER BY seen_at DESC, head_run DESC,
+                          concluded_at DESC NULLS LAST, run_id DESC LIMIT 1
             )
             SELECT last.run_id, last.head_sha, f.test
               FROM last LEFT JOIN ci_test_failures f

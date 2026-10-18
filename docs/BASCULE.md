@@ -1036,9 +1036,11 @@ The `installer` step follows the same practice.
    exists**. On the server, as local superuser, over SSH. A missing
    role is not created: that is a separate decision.
 6. `poste.sh redemarrer`: each active `ameesh-runner-agent@<p>` is
-   restarted **one by one**, as soon as `ameesh show <p>` no longer says `running`.
-   A persona in a long turn does not block the others: the script goes back
-   over the list (at most `ATTENTE_MAX`, 2 h). Then `ameesh-notify`, then the
+   restarted **one by one**: the unit is stopped first (SIGTERM closes
+   admission; the turn in progress drains, bounded by `TimeoutStopSec`), the
+   safe point is proven (`ActiveState=inactive` and `MainPID=0`), then it is
+   started. No idle window is awaited: a persona in a long turn no longer
+   blocks or starves the update. Then `ameesh-notify`, then the
    runners of the old database (`UNITES_RESTE`), read with its configuration.
    A unit that does not stay active stops the script. So does a runner that
    held its persona's lease before the restart and does not take it again
@@ -1302,8 +1304,15 @@ runner's import) therefore sees either the whole old code or the whole new
 code — never the incomplete state of the 16/10 incident
 (`ModuleNotFoundError ameesh.platform.process`, missing `ameesh`/code 127).
 Controls run **before** the switch: imports (`psycopg`, `ameesh`),
-`ameesh --version`, and the console script's shebang pointing at the
+`ameesh --version`, and the console script's shebang (direct, or pip's
+`/bin/sh` preamble when the venv path exceeds 127 bytes) pointing at the
 versioned venv's Python.
+The shebang is checked before executing the script, with a limit of 8192
+bytes per preamble line. A refusal identifies the offending line and cause,
+including an unexpected interpreter in the `exec` line. Apostrophes work in
+direct shebangs and quoted shell executables. If pip emits a shell preamble
+with an unquoted apostrophe (a long path without spaces), preparation refuses
+it with a quoting diagnostic; use a venv path without apostrophes in that case.
 
 The live `venv` is **not** a venv that a switch rewrites under running
 processes: it holds stable **launchers** (`bin/python`, `bin/ameesh`, and a
@@ -1328,6 +1337,22 @@ partial directory and leaves the active version untouched. `src-current` and
 `deploy/mise-a-jour/bascule.py` (`preparer`, `activer --precedent`, `retour`,
 `etat`), copied to the VM (server and agents) so that install and rollback use
 the same version whatever commit is deployed.
+When writing a launcher fails, its temporary file is removed on a best effort
+basis and the previous destination stays intact; a cleanup error preserves the
+original write error.
+
+Launcher bookkeeping follows `bin/` itself (#2230). An activation that writes
+the new launchers and then fails before the switch (full disk, read-only
+`bin/`) leaves the marker naming the new version; the next successful
+activation still removes every launcher of ours that the live version no longer
+provides, so an orphan does not survive an interrupted switch. A script that
+exists only in the new version may still be absent for the moment between the
+launcher writes and the symlink rename (accepted window: it exits 127 with a
+clear message). `retour` renames the symlink **first** and rewrites the
+launchers best-effort, so a full disk or a read-only `bin/` cannot block a
+manual rollback. A script adopted from the previous version becomes a launcher
+when returning, and disappears at the next activation of a version that does
+not provide it — by design.
 
 ## Update to 1.10.0 (path B, mediated executor)
 

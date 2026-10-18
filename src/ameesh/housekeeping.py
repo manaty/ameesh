@@ -76,8 +76,9 @@ l'humain. Cinq familles, cinq règles :
   copie git dedans n'a de travail non commité ou non poussé
   (`orphan_cleanup: false` : jamais, par hôte).
 
-Ce qu'ameesh n'a pas créé ni vu apparaître pendant un tour n'est JAMAIS
-supprimé automatiquement. Toute suppression dans un dossier géré passe par
+Les worktrees liés découverts dans les dépôts des agents locaux rejoignent
+le même suivi, avec un âge neuf (#2180). Les clones et dossiers sans Git
+sont seulement signalés. Toute suppression dans un dossier géré passe par
 [`_safe_rmtree`], qui refuse un chemin hors des dossiers gérés, un lien
 symbolique, ou une racine sans marqueur `.ameesh-menage` ; dans `/tmp`, par
 [`_remove_tmp_entry`], qui revérifie l'entrée juste avant.
@@ -268,6 +269,9 @@ class Policy:
     #: artifacts of an idle worktree AND the holder check of an abandoned /tmp
     #: entry; empty by default, set per host in its Host card
     unreadable_ok: tuple = ()
+    #: #2180: discovery roots derived from Host work_root/work_roots, never
+    #: deletion roots. Not a separate housekeeping setting.
+    worktree_roots: tuple = ()
     #: provenance de chaque clé déclarée (identifiant du canon)
     origin: dict = field(default_factory=dict, compare=False)
 
@@ -379,9 +383,21 @@ def effective(canons, host: str) -> Policy:
     longest."""
     values: dict = {}
     origin: dict = {}
+    roots: set[str] = set()
     for canon in canons or ():
         fiche = canon.host(host) if hasattr(canon, "host") else None
-        declared = getattr(getattr(fiche, "policy", None), "housekeeping", None) or {}
+        host_policy = getattr(fiche, "policy", None)
+        declared = getattr(host_policy, "housekeeping", None) or {}
+        for template in [getattr(host_policy, "work_root", None),
+                         *(getattr(host_policy, "work_roots", None) or {}).values()]:
+            if not template:
+                continue
+            path = os.path.expanduser(template)
+            if "{agent}" in path:
+                path = os.path.dirname(path.split("{agent}", 1)[0] + "x")
+            path = os.path.abspath(path)
+            if path not in (*FORBIDDEN_ROOTS, os.path.expanduser("~")):
+                roots.add(path)
         label = getattr(canon, "id", "") or "?"
         for key, value in declared.items():
             if key not in POLICY_KEYS:
@@ -397,7 +413,7 @@ def effective(canons, host: str) -> Policy:
                     (key in ("orphan_cleanup", "deps", "docker_volumes") and value is False
                      and values[key] is not False):
                 values[key], origin[key] = value, label
-    return Policy(origin=origin, **values)
+    return Policy(origin=origin, worktree_roots=tuple(sorted(roots)), **values)
 
 
 def disabled(env=None) -> bool:
@@ -2741,6 +2757,13 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             plan.append(dict(base, action="attend",
                              detail="%s; a process is working in it" % why))
             continue
+        # #2180: a reused tracked path may now be a clone, a symlink or a
+        # worktree of another repository. Old metadata never authorises it.
+        from .housekeeping_discovery import _marker
+        if _marker(path) != "linked" or common_dir(path) != _real(row.get("repo") or ""):
+            plan.append(dict(base, action="garde",
+                             detail="linked worktree no longer matches its tracked repository"))
+            continue
         st = worktree_state(path)
         if not st["exists"]:
             plan.append(dict(base, action="disparu", detail=why))
@@ -3280,8 +3303,12 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     from .platform import session_lock
 
     def skipped(reason):
-        return {"host": host, "dry_run": dry_run, "entries": [], "plan": [],
-                "skipped": [reason], "orphans": [], "measure": None}
+        # #2173: a pass that did not run must not read as executed. The
+        # dedicated `status` lets the report (and `--json`) tell a skipped
+        # pass from an empty one, without touching the lock itself.
+        return {"host": host, "dry_run": dry_run, "status": "skipped",
+                "entries": [], "plan": [], "skipped": [reason], "orphans": [],
+                "measure": None}
 
     lock = session_lock.try_lock(os.path.join(cfg.state_dir, MANAGED_DIR), "host-pass")
     if lock is None:
@@ -3360,9 +3387,11 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     registered: set[str] = set()
     protected: set[str] = set()
     cwd_of: dict[str, str] = {}
+    agent_rows: list[dict] = []
     running: set[str] = set(agents_in_turn)
     try:
-        for row in storage.of(db).operations.listing():
+        agent_rows = list(storage.of(db).operations.listing())
+        for row in agent_rows:
             registered.add(row["name"])
             if row.get("cwd"):
                 protected.add(os.path.abspath(os.path.expanduser(row["cwd"])))
@@ -3521,6 +3550,15 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
         # sans registre, ni dossiers d'agents ni tours en cours connus
         skipped.append("worktrees: registry unreadable, no removal")
     elif policy.worktrees:
+        if artifact_scan:
+            from . import housekeeping_discovery
+            local = {row["name"]: row["cwd"] for row in agent_rows
+                     if row.get("host") == host and row.get("cwd")}
+            found = housekeeping_discovery.discover(
+                db, host, local, policy.worktree_roots, dry_run=dry_run)
+            entries += found["entries"]
+            plan += found["plan"]
+            skipped += found["skipped"]
         wt_entries, wt_plan = _worktree_pass(db, host, dry_run=dry_run,
                                              protected=protected, now=now, running=running,
                                              artifacts=policy.artifacts,
@@ -3633,8 +3671,15 @@ def _fmt(value) -> str:
 
 
 def print_report(report: dict) -> None:
-    mode = "DRY RUN (nothing is deleted; --apply to execute)" if report["dry_run"] \
-        else "executed"
+    # #2173: a pass skipped by the host lock ran nothing; it must not print
+    # "executed" (nor "nothing to do": the concurrent pass is doing the work).
+    skipped_pass = report.get("status") == "skipped"
+    if skipped_pass:
+        reason = next(iter(report.get("skipped") or ()), "")
+        mode = "skipped" + (" — %s" % reason if reason else "")
+    else:
+        mode = "DRY RUN (nothing is deleted; --apply to execute)" if report["dry_run"] \
+            else "executed"
     print("housekeeping of %s — %s" % (report["host"] or "?", mode))
     m = report.get("measure") or {}
     if m:
@@ -3652,15 +3697,16 @@ def print_report(report: dict) -> None:
     # en essai, les entrées de /tmp ont leur propre section (avec la commande)
     rows = [p for p in report["plan"] if p.get("kind") != "orphan"] if report["dry_run"] \
         else [e for e in report["entries"] if e["kind"] != "mesure"]
-    if not rows:
+    if not rows and not skipped_pass:
         print("  nothing to do")
     for row in rows:
         print("  %-9s %-12s %-10s %s%s" % (
             row.get("kind", ""), action_label(row.get("action", "")),
             _fmt(row["bytes"]) if row.get("bytes") is not None else "",
             row.get("path", ""), " — %s" % row["detail"] if row.get("detail") else ""))
-    for note in report.get("skipped") or ():
-        print("  skipped   %s" % note)
+    if not skipped_pass:  # #2173: the reason is already in the banner, once
+        for note in report.get("skipped") or ():
+            print("  skipped   %s" % note)
     conteneurs = report.get("containers") or {}
     volumes = report.get("volumes") or {}
     docker = (report.get("measure") or {}).get("docker_storage")

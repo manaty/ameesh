@@ -45,10 +45,12 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 import sys
+import tempfile
 import textwrap
 import time
 
@@ -1112,13 +1114,38 @@ def _read_plan_text(filename: str) -> str:
         if filename == "-":
             text = sys.stdin.read(MAX_BYTES + 1)
         else:
-            with Path(filename).open(encoding="utf-8") as stream:
+            # Universal newlines would rewrite CRLF notes to LF: a note is data.
+            with Path(filename).open(encoding="utf-8", newline="") as stream:
                 text = stream.read(MAX_BYTES + 1)
         if len(text.encode("utf-8")) > MAX_BYTES:
             raise RoadmapError("file exceeds 10 MiB")
         return text
     except (OSError, UnicodeError) as exc:
         raise RoadmapError("cannot read %s: %s" % (filename, exc)) from None
+
+
+def _write_atomic(filename: str, text: str) -> None:
+    """Write the export beside its target, then replace it in one step."""
+    target = Path(filename)
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp",
+                                   dir=str(target.parent))
+    except OSError as exc:
+        raise RoadmapError("cannot write %s: %s" % (filename, exc)) from None
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if target.exists():
+            shutil.copymode(target, tmp)
+        os.replace(tmp, target)
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise RoadmapError("cannot write %s: %s" % (filename, exc)) from None
 
 
 def run(db, args, *, cfg=None, now: float | None = None) -> int:
@@ -1164,7 +1191,11 @@ def run(db, args, *, cfg=None, now: float | None = None) -> int:
                 fields["depends_on"] = []
             if args.note_file:
                 fields["note"] = _read_plan_text(args.note_file)
-            row = edit.update(db, args.id, fields, if_match=args.if_match, now=now)
+            warnings = []
+            row = edit.update(db, args.id, fields, if_match=args.if_match, now=now,
+                              warnings=warnings)
+            for warning in warnings:
+                print("warning: " + json.dumps(warning, ensure_ascii=False), file=sys.stderr)
         if args.json:
             print(json.dumps(row, ensure_ascii=False, indent=2))
         else:
@@ -1179,10 +1210,7 @@ def run(db, args, *, cfg=None, now: float | None = None) -> int:
         if args.output == "-":
             print(text, end="")
         else:
-            try:
-                Path(args.output).write_text(text, encoding="utf-8")
-            except OSError as exc:
-                raise RoadmapError("cannot write %s: %s" % (args.output, exc)) from None
+            _write_atomic(args.output, text)
         return 0
     if command in ("import", "validate"):
         if command == "validate" and not args.file:

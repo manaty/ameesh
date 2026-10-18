@@ -20,8 +20,10 @@ Rien n'est jamais bloquant : une erreur de mesure est avalée.
 """
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import signal
 import sys
 
 # Noms hors des préfixes AMEESH_ et AGENT_MESH_, que des tests retirent de
@@ -160,6 +162,22 @@ class Logbook:
             self.record("d", relatif)
 
 
+def _save_uninterrupted() -> None:
+    """Ignore SIGTERM pendant la sortie : la sauvegarde coverage va jusqu'au bout.
+
+    Un parent qui ferme l'entrée de son enfant puis le termine aussitôt (le
+    pont ACP et son agent, `AgentWorker`) frappe l'enfant déjà en train de
+    sortir : son gestionnaire SIGTERM (`SystemExit` du faux agent, #2177) ou
+    la terminaison par défaut coupe la sauvegarde atexit, et le fichier de
+    couverture reste à 0 octet ou tronqué ; la carte entière devient partielle
+    (#2225, #1770). Le processus sort déjà : ignorer SIGTERM ne retarde rien,
+    et SIGKILL reste le recours du parent après sa grâce."""
+    try:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    except (ValueError, OSError):  # hors du fil principal : rien à faire
+        pass
+
+
 def start(couverture: bool = True) -> Logbook | None:
     """Démarre la mesure dans ce processus, une seule fois, si `CARTE_MESURE`
     est posé. `couverture=False` : le processus de la suite démarre sa
@@ -171,6 +189,9 @@ def start(couverture: bool = True) -> Logbook | None:
         try:
             import coverage
             coverage.process_startup()
+            # après le démarrage de coverage : atexit est LIFO, ce rappel
+            # passe juste avant sa sauvegarde
+            atexit.register(_save_uninterrupted)
         except Exception:
             pass
     releve = Logbook(dossier)

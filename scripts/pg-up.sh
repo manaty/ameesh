@@ -8,6 +8,7 @@
 # le ménage d'ameesh après `docker_volume_idle` (24 h) sans conteneur.
 # Aucun mot de passe n'est codé ici : AMEESH_PG_PASSWORD le fixe à la création
 # du conteneur ; ensuite les clients le lisent dans PGPASSWORD ou ~/.pgpass.
+# scripts/test.sh dérive de ce profil l'entrée de ses bases jetables (#2170).
 set -euo pipefail
 
 # AMEESH_PG_* est le nom courant ; AGENT_MESH_PG_* reste accepté (alias).
