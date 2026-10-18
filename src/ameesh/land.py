@@ -33,6 +33,7 @@ import re
 import shutil
 import subprocess
 import time
+import warnings
 
 from . import merge_queue, plan_git, storage, work
 from .canon import FETCH_TIMEOUT, GitError
@@ -53,7 +54,31 @@ FRESH_REF = "refs/ameesh/land/target"
 #: il ne peut pas le porter). Au-delà, la ligne est éjectée (fail-closed) et
 #: l'assigné réveillé ; 6 réessais ≈ 30 min au rythme de relevé par défaut
 #: (300 s), réglable par `AMEESH_LAND_TRANSIENT_RETRIES`.
-TRANSIENT_RETRY_LIMIT = max(0, int(os.environ.get("AMEESH_LAND_TRANSIENT_RETRIES", "6")))
+DEFAULT_TRANSIENT_RETRY_LIMIT = 6
+
+
+def _retry_limit(environ=None) -> int:
+    """#2371 : lire la borne sans faire échouer l'import de `land` (#2345).
+
+    Une valeur absente ou vide garde le défaut ; une valeur non entière le
+    garde aussi, avec un avertissement (l'import d'un module ne doit pas
+    dépendre d'une variable d'environnement mal formée). Une valeur négative
+    vaut 0 : la borne s'applique alors dès le premier réessai.
+    """
+    raw = (os.environ if environ is None else environ).get(
+        "AMEESH_LAND_TRANSIENT_RETRIES")
+    if raw is None or not str(raw).strip():
+        return DEFAULT_TRANSIENT_RETRY_LIMIT
+    try:
+        return max(0, int(str(raw).strip()))
+    except ValueError:
+        warnings.warn(
+            "AMEESH_LAND_TRANSIENT_RETRIES=%r is not an integer: using %d"
+            % (raw, DEFAULT_TRANSIENT_RETRY_LIMIT), RuntimeWarning, stacklevel=2)
+        return DEFAULT_TRANSIENT_RETRY_LIMIT
+
+
+TRANSIENT_RETRY_LIMIT = _retry_limit()
 #: préfixe des notes de journal qui comptent ces réessais (`events_noted`).
 RETRY_NOTE = "land transient retry"
 
@@ -64,10 +89,19 @@ class LandError(RuntimeError):
 
 class TransientLandError(LandError):
     """#2306 : une lecture distante a échoué pour une raison passagère (HTTP
-    5xx, délai, coupure réseau). Le refus tient (fail-closed), mais la même
-    demande peut aboutir au passage suivant : la file garde sa ligne au lieu
-    de l'éjecter. Une réponse malformée, un 4xx ou un manque prouvé restent des
-    `LandError` ordinaires, qui éjectent."""
+    5xx, délai, coupure réseau, DNS, GOAWAY, sortie vide). Le refus tient
+    (fail-closed), mais la même demande peut aboutir au passage suivant : la
+    file garde sa ligne au lieu de l'éjecter. Une réponse malformée, un 4xx ou
+    un manque prouvé restent des `LandError` ordinaires, qui éjectent."""
+
+
+class ForbiddenLandError(LandError):
+    """#2344 : la forge a **prouvé** un refus de droits (HTTP 403) sur une
+    source de checks requis. Seule cette preuve autorise `fire.required_checks`
+    à remplacer la source par la déclaration du projet (jeton sans
+    administration, voie prévue pour Nexlink) ; tout autre échec — 404, DNS,
+    GOAWAY, sortie vide, réponse malformée — reste un `LandError` (ou un
+    `TransientLandError`) qui refuse, jamais un repli."""
 
 
 def lock_key(project, target: str) -> str:
@@ -318,7 +352,7 @@ def _json(proc, what: str, kind):
     return data
 
 
-def pr_status(slug: str, branch: str, gh=_gh) -> dict | None:
+def pr_status(slug: str, branch: str, gh=_gh, *, project=None) -> dict | None:
     """The open PR of `branch`: `{number, head, base, ci: green|red|pending,
     auto}`. `auto` (#1656) says GitHub auto-merge is armed: its
     `--match-head-commit` is checked when it is armed, never again, so a head
@@ -332,9 +366,13 @@ def pr_status(slug: str, branch: str, gh=_gh) -> dict | None:
     if not rows:
         return None
     rollup = rows[0].get("statusCheckRollup") or []
+    required = radar.required_statuses(project, branch)
     pending = any((c.get("status") or "COMPLETED") != "COMPLETED"
                   or (c.get("state") or "") == "PENDING" for c in rollup)
-    ci = "green" if radar.ci_green(rollup) else "pending" if pending or not rollup else "red"
+    # #1748 (a): all green but a required status not yet published: the
+    # package validation is still to come, never a green
+    ci = "green" if radar.ci_green(rollup, required) else "pending" \
+        if pending or not rollup or radar.ci_green(rollup) else "red"
     return {"number": rows[0]["number"], "head": rows[0].get("headRefOid"),
             "base": rows[0].get("baseRefName"), "ci": ci,
             "auto": bool(rows[0].get("autoMergeRequest"))}
@@ -619,7 +657,8 @@ class _Landing:
                     parts = merge_queue._parts_reader(
                         self.project, self.project.repo, self.row.get("target") or "",
                         self.row["frozen_sha"], self.replayer, cfg=self.cfg)
-                merge_queue._required_ci(self.project, self.row["frozen_sha"], parts=parts)
+                merge_queue._required_ci(self.project, self.row["frozen_sha"], parts=parts,
+                                         branch=self.row.get("branch"))
             except merge_queue.QueueError as exc:
                 return self.eject(str(exc), "Restore green CI on the frozen commit, then "
                                   "ameesh work queue add %d." % self.lot)
@@ -726,7 +765,12 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
             return landing.eject("%s is a protected target (%s)" % (row["target"], glob),
                                  "Merging into %s is the orchestrator's gesture: ask it."
                                  % row["target"])
-        return _land(landing, replayer, slug, gh)
+        # #2428: the merge, the gates and the push read and write the radar
+        # clone's worktree. Another pass, a stacked trial or a turn's command
+        # may share that clone: the lock keeps one tree per operation. A busy
+        # clone surfaces as CloneBusy (a GitError), and the line is retried.
+        with replayer.locked():
+            return _land(landing, replayer, slug, gh)
     except (GitError, LandError, OSError, ValueError) as exc:
         error = {"lot": lot, "result": "error", "error": "%s: %s" % (type(exc).__name__, exc)}
         if row["state"] == "landing" and project.land == "pr":
@@ -790,7 +834,7 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
         return landing.busy("lease on %s lost before landing" % landing.key)
     if project.land == "pr":
         found = None
-        status = pr_status(slug, row["branch"], gh=gh) if slug else None
+        status = pr_status(slug, row["branch"], gh=gh, project=project) if slug else None
         if status is None:
             # #1682: an armed auto-merge can merge the PR between two passes,
             # at the exact frozen head. That merge is a fact like any other:
@@ -979,7 +1023,7 @@ def pr_view(slug: str, number, gh=_gh) -> dict:
 def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
     project, row, lot = landing.project, landing.row, landing.lot
     branch = _branch_of(row["target"])
-    status = pr_status(slug, row["branch"], gh=gh) if slug else None
+    status = pr_status(slug, row["branch"], gh=gh, project=project) if slug else None
     if status is None and slug and row.get("landing_sha"):
         # #194 r8: merged since (a merge call that timed out, or between two
         # passes): checked like any merge of ameesh's, never ejected

@@ -266,6 +266,9 @@ class Codex:
         self.active: dict | None = None
         self.next_id = 1000
         self.held_steer = None
+        #: L80a: the thread's cumulative usage, as `tokenUsage.total` reports
+        #: it (the fake is otherwise stateless across turns)
+        self.tokens = {"inputTokens": 0, "cachedInputTokens": 0, "outputTokens": 0}
 
     def reply(self, mid, result=None, error=None) -> None:
         out({"id": mid, "error": error} if error else {"id": mid, "result": result})
@@ -299,11 +302,14 @@ class Codex:
                 "type": "commandExecution", "id": "i1"}})
             self.notify("item/completed", {"turnId": turn["id"], "item": {
                 "type": "agentMessage", "id": "i2", "text": answer}})
+        last = {"inputTokens": 300, "cachedInputTokens": 200, "outputTokens": 9,
+                "reasoningOutputTokens": 0, "totalTokens": 309}
+        for key in self.tokens:
+            self.tokens[key] += last[key]
         self.notify("thread/tokenUsage/updated", {"turnId": turn["id"], "tokenUsage": {
-            "last": {"inputTokens": 300, "cachedInputTokens": 200, "outputTokens": 9,
-                     "reasoningOutputTokens": 0, "totalTokens": 309},
-            "total": {"inputTokens": 900, "cachedInputTokens": 600, "outputTokens": 27,
-                      "reasoningOutputTokens": 0, "totalTokens": 927},
+            "last": last,
+            "total": dict(self.tokens, reasoningOutputTokens=0,
+                          totalTokens=self.tokens["inputTokens"] + self.tokens["outputTokens"]),
             "modelContextWindow": 258400}})
         error = {"message": "boom"} if status == "failed" else None
         self.notify("turn/completed", {"turn": {"id": turn["id"], "status": status,

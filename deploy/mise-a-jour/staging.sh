@@ -61,6 +61,8 @@
 # retour, arret de la sequence et courrier urgent au pilote. Rien n'est
 # repris apres un echec ; relancer la commande est sur : un hote deja au
 # commit vise ne le reinstallle pas (le previous-sha reste le bon).
+# Un seul operateur a la fois : un second passage sort en 75 (verrou
+# ~/.local/state/ameesh/mise-a-jour/staging.lock) sans rien modifier.
 #
 # Traces : une ligne JSON par evenement (date, hote, etape, verdict, sha,
 # precedent, detail) dans ~/.local/state/ameesh/mise-a-jour/staging-<date>.jsonl ;
@@ -245,6 +247,19 @@ fi
 
 mkdir -p "$TRAVAIL"; chmod 700 "$TRAVAIL"
 touch "$JOURNAL"; chmod 600 "$JOURNAL"
+
+# Operateur unique (#2448) : le staging est une sequence d'hotes, jamais deux a
+# la fois, qu'il soit lance a la main ou par la release automatique. Le verrou
+# tombe avec le processus ; un second passage sort en 75 sans rien modifier
+# (un `--a-blanc` reste possible, il ne modifie rien).
+if [ "$A_BLANC" != 1 ]; then
+  VERROU="$TRAVAIL/staging.lock"
+  exec 9>"$VERROU"
+  if ! flock -n 9; then
+    echo "staging deja en cours (verrou $VERROU) : rien n'est modifie" >&2
+    exit 75
+  fi
+fi
 
 # Un BASCULE_ENV temporaire par hote : vm.sh relit le fichier qu'on lui donne,
 # et la topologie doit primer sur d'eventuels AGENTS_SSH/HOTE_AGENTS restes

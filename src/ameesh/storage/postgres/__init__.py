@@ -34,6 +34,7 @@ from .menage import Housekeeping
 from .operations import Operations
 from .packages import WorkPackages
 from .placement import Placements
+from .prevalidation import PrevalidationReports
 from .progress import Progress
 from .projects import Projects
 from .provenance import Provenance
@@ -45,6 +46,7 @@ from .wakeups import Wakeups
 from .watches import Watches
 from .work import WorkItems
 from .work_dependencies import WorkDependencies
+from .migration_reservations import MigrationReservations
 from .lot_sessions import LotSessions
 
 
@@ -75,6 +77,7 @@ class PostgresStorage(interface.Storage):
         self.work = WorkItems(db)
         self.work_dependencies = WorkDependencies(db)
         self.provenance = Provenance(db)
+        self.migration_reservations = MigrationReservations(db)
         self.lot_sessions = LotSessions(db)
         self.packages = WorkPackages(db)
         self.actions = Actions(db)
@@ -98,4 +101,5 @@ class PostgresStorage(interface.Storage):
         self.housekeeping = Housekeeping(db)
         self.session_bindings = SessionBindings(db)
         self.ci = CiResults(db)
+        self.prevalidation = PrevalidationReports(db)
         self.conversations = Conversations(db)

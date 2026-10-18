@@ -19,6 +19,10 @@ au lieu d'éjecter ; seuls un manque prouvé, un refus de droits (4xx) ou une
 réponse malformée éjectent. La cible vide, qui sautait la garde, est refusée,
 et les statuts sont paginés jusqu'au `total_count` annoncé (un total de 100
 n'est plus pris pour une troncature).
+
+#2344 : seule une lecture **prouvée** comme refusée (HTTP 403) laisse la
+déclaration remplacer la protection ou les rulesets ; un 404, un DNS, un
+GOAWAY ou une sortie vide restent fail-closed (refus ou nouveau réessai).
 """
 from __future__ import annotations
 
@@ -42,7 +46,7 @@ class FakeHeadGh:
 
     def __init__(self, *, runs=(), statuses=(), protection=PROTECTED,
                  runs_error="", statuses_error="", protection_error="",
-                 runs_body=None, statuses_total=None):
+                 runs_body=None, statuses_total=None, rules=(), rules_error=""):
         self.runs = list(runs)
         self.statuses = list(statuses)
         self.protection = protection
@@ -51,6 +55,8 @@ class FakeHeadGh:
         self.protection_error = protection_error
         self.runs_body = runs_body
         self.statuses_total = statuses_total
+        self.rules = list(rules)
+        self.rules_error = rules_error
         self.calls = []
 
     def __call__(self, argv, **kwargs):
@@ -59,6 +65,12 @@ class FakeHeadGh:
             if self.protection_error:
                 return subprocess.CompletedProcess(argv, 1, "", self.protection_error)
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.protection), "")
+        if any("/rules/branches/" in arg for arg in argv):
+            if self.rules_error:
+                return subprocess.CompletedProcess(argv, 1, "", self.rules_error)
+            # #2285 : les rulesets sont lus en plus de la protection ; ce banc
+            # n'en déclare aucun.
+            return subprocess.CompletedProcess(argv, 0, json.dumps([self.rules]), "")
         path = next((arg for arg in argv if "/check-runs" in arg), "")
         if path:
             if self.runs_error:
@@ -174,6 +186,36 @@ class RequiredOnHeadTest(unittest.TestCase):
                         runs=[_run()])
         with self.assertRaises(land.TransientLandError):
             self._gaps(gh)
+
+    def test_a_404_does_not_fall_back_to_the_declaration(self):
+        # #2344 N1 : seul un 403 prouvé autorise la déclaration à remplacer
+        # la protection ; un 404 ne prouve pas un refus de droits.
+        gh = FakeHeadGh(protection_error="gh: Not Found (HTTP 404)", runs=[_run()])
+        with self.assertRaises(land.LandError) as raised:
+            self._gaps(gh)
+        self.assertNotIsInstance(raised.exception, land.TransientLandError)
+
+    def test_dns_goaway_and_a_silent_failure_do_not_fall_back(self):
+        # #2344 N1 : ces échecs ne prouvent pas un 403 ; ils sont passagers
+        # (la file réessaiera, bornée par #2345), jamais un repli.
+        for detail in (
+                "dial tcp: lookup api.github.com on 127.0.0.53:53: server misbehaving",
+                "http2: server sent GOAWAY and closed the connection",
+                " "):  # sortie vide : le gh échoue sans rien dire
+            with self.subTest(detail=detail), self.assertRaises(land.TransientLandError):
+                self._gaps(FakeHeadGh(protection_error=detail, runs=[_run()]))
+
+    def test_a_non_403_ruleset_error_does_not_fall_back(self):
+        # #2344 : le repli par source de #2285 obéit à la même règle.
+        gh = FakeHeadGh(rules_error="gh: Not Found (HTTP 404)", runs=[_run()])
+        with self.assertRaises(land.LandError):
+            self._gaps(gh)
+
+    def test_a_proven_403_ruleset_error_still_falls_back(self):
+        gh = FakeHeadGh(
+            rules_error="gh: Resource not accessible by integration (HTTP 403)",
+            runs=[_run()])
+        self.assertEqual(self._gaps(gh), [])
 
     def test_a_full_status_page_proves_the_context(self):
         # #2306 N3 : un total_count de 100 n'est plus pris pour une troncature

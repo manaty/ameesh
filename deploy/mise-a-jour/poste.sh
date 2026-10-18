@@ -168,6 +168,8 @@ verifier() {
 # Démarre la sauvegarde serveur (copie gardée sur la VM) et atteste le dump
 # qu'elle vient de produire : chemin, taille et SHA-256, sur trois lignes.
 # Le service publie son fichier par lien dur : un dump visible est complet.
+# Un script serveur antérieur réécrit le dump du jour sous le même nom : un
+# dump est donc reconnu nouveau à son nom, son inode, sa taille ou sa date (#2424).
 # Aucun DSN ni secret ne traverse cette commande distante.
 sauvegarde_serveur() {
   printf '%s\n' "$SAUVEGARDES_VM" | ssh_vm 'set -eu
@@ -176,12 +178,12 @@ sauvegarde_serveur() {
     before=$(mktemp "$d/.liste-avant.XXXXXX")
     after=$(mktemp "$d/.liste-apres.XXXXXX")
     trap "rm -f -- \"$before\" \"$after\"" EXIT HUP INT TERM
-    find "$d" -maxdepth 1 -type f -name "ameesh-*.dump" -printf "%f\n" | sort > "$before"
+    find "$d" -maxdepth 1 -type f -name "ameesh-*.dump" -printf "%f %i %s %T@\n" | sort > "$before"
     systemctl start ameesh-sauvegarde.service
     test "$(systemctl show ameesh-sauvegarde.service -p Result --value)" = success
     test "$(systemctl show ameesh-sauvegarde.service -p ExecMainStatus --value)" = 0
-    find "$d" -maxdepth 1 -type f -name "ameesh-*.dump" -printf "%f\n" | sort > "$after"
-    new=$(comm -13 "$before" "$after" | tail -1)
+    find "$d" -maxdepth 1 -type f -name "ameesh-*.dump" -printf "%f %i %s %T@\n" | sort > "$after"
+    new=$(comm -13 "$before" "$after" | tail -1 | cut -d" " -f1)
     if [ -z "$new" ]; then
       echo "ameesh-sauvegarde : aucun nouveau dump dans $d" >&2
       exit 1
@@ -414,11 +416,17 @@ migrer_base() {
   # #2357: a failure no longer stops the update; migrer installs the target
   # code and restarts immediately (the database is already migrated).
   etape "auto-prise du code installé sur la base migrée (lecture seule)"
-  "$VENV/bin/python" -I "$ICI/auto-take-probe.py" || {
-    echo "ancien code incompatible avec le schéma migré (sonde en échec)." >&2
-    echo "La base est DÉJÀ migrée : la mise à jour doit enchaîner tout de suite sur l'installation et le redémarrage du code $court." >&2
-    return 1
-  }
+  # #2359: exit 2 = the probe could not set up the installed runner. Unknown
+  # compatibility is handled like a failure: installing REF is the safe move.
+  local sonde=0
+  "$VENV/bin/python" -I "$ICI/auto-take-probe.py" || sonde=$?
+  case "$sonde" in
+    0) return 0 ;;
+    2) echo "compatibilité de l'ancien code non vérifiée (sonde inutilisable) : traitée comme un échec." >&2 ;;
+    *) echo "ancien code incompatible avec le schéma migré (sonde en échec)." >&2 ;;
+  esac
+  echo "La base est DÉJÀ migrée : la mise à jour doit enchaîner tout de suite sur l'installation et le redémarrage du code $court." >&2
+  return 1
 }
 
 # The remote administrator switches to the actual migration owner so future
@@ -509,7 +517,8 @@ proprietaire_de() {  # unit → the lease owner its runner takes: --runner-id, e
 # failure BEFORE stop (#1907), so a new failure during drainage stays visible.
 redemarrer_hors_tour() {  # unité — 0 quand l'arrêt est prouvé puis l'unité démarrée
   local u=$1 etat pid
-  etat=$(systemctl --user show -p ActiveState --value "$u") || return 1
+  etat=$(systemctl --user show -p ActiveState --value "$u") \
+    || { echo "$u : lecture d'ActiveState impossible — aucun démarrage" >&2; return 1; }
   if [ "$etat" = failed ]; then
     systemctl --user reset-failed "$u" \
       || { echo "$u : reset-failed échoue — aucun démarrage" >&2; return 1; }

@@ -158,7 +158,8 @@ def resolve_actor(cfg, db, explicit: str | None = None) -> tuple[str, str | None
 
     text = (explicit or "").strip()
     if text:
-        return text, None
+        from .agent_names import resolve
+        return resolve(text, db=db, operation="work.actor"), None
     binding = identity.resolve_binding(cfg, db)
     if binding.name:
         if binding.ok:
@@ -188,6 +189,8 @@ def corrector(cfg, db, explicit: str | None = None, *, what: str = "correction",
     from . import assignments, identity, registry
 
     text = (explicit or "").strip()
+    from .agent_names import resolve
+    text = resolve(text, db=db, operation="work.corrector")
     binding = identity.resolve_binding(cfg, db)
     # A rejected runner/session identity must never fall back to the human
     # terminal path, including a malformed AGENT_MAIL_NAME (no returned name).
@@ -374,6 +377,8 @@ def add(
     route to the backlog, to be shown by the caller. Nothing is ever refused:
     a human request, a blocking defect and the review-after-merge lot pass
     unchanged."""
+    from .agent_names import resolve as resolve_agent_name
+    assignee = resolve_agent_name(assignee, db=db, operation="work.add")
     return _create(db, title=title, type=type, source=source, app=app, body=body,
                    issue_ref=issue_ref, workstream=workstream, assignee=assignee,
                    budget_usd=budget_usd, actor=actor, package=package, externe=externe,
@@ -836,6 +841,8 @@ def set_issue_ref(db: Db, item_id: int, ref: str | None, *, actor: str = "", cfg
 
 def open_lots(db: Db, assignee: str) -> list[dict]:
     """L118 : les lots ouverts d'un assigné (ni livrés, ni fermés)."""
+    from .agent_names import resolve as resolve_agent_name
+    assignee = resolve_agent_name(assignee, db=db, operation="work.open_lots")
     return storage.of(db).work.open_for(assignee)
 
 
@@ -981,7 +988,14 @@ def check_reviewer(db: Db, reviewer: str, *, cfg=None) -> str:
         raise WorkError("empty reviewer")
     if name.startswith(HUMAN_PREFIX):
         return name
-    if registry.get(db, name) is not None:
+    # #423 : un alias se résout au nom primaire, comme l'assigné — sinon la
+    # règle « le relecteur n'est pas l'assigné » compare deux orthographes.
+    row = registry.get(db, name)
+    if row is not None:
+        if isinstance(row, dict):
+            return row.get("name") or name
+        # Doublure de registre (tests #705 r2 N2) : pas un mapping, on garde
+        # l'orthographe demandée, comme avant #423.
         return name
     cfg = cfg if cfg is not None else getattr(db, "cfg", None)
     human = known_human(db, name, cfg)
@@ -1164,7 +1178,8 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
     """
     from . import registry
 
-    name = (assignee or "").strip()
+    from .agent_names import resolve
+    name = resolve((assignee or "").strip(), db=db, operation="work.assignee")
     if not name:
         raise WorkError("empty assignee")
     if name.startswith(HUMAN_PREFIX):
@@ -1292,6 +1307,8 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     assigné : c'est le geste qui la réécrit), et le balayage (`ameesh work
     wip`) laisse alors le lot au-delà du plafond. Elle s'efface à l'attribution
     suivante sans marqueur."""
+    from .agent_names import resolve as resolve_agent_name
+    assignee = resolve_agent_name(assignee, db=db, operation="work.assign")
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -1521,6 +1538,8 @@ def delegate(db: Db, item_id: int, agent: str, *, within, actor: str = "",
 
     Rend `{item, delegation, replaced, check, previous, message_id, warning}`.
     """
+    from .agent_names import resolve as resolve_agent_name
+    agent = resolve_agent_name(agent, db=db, operation="work.delegate")
     within_s = parse_within(within)
     item = get(db, item_id)
     if item is None:
@@ -1644,6 +1663,8 @@ def mark_delegate_turn(db: Db, agent: str, lots) -> list[int]:
     """L40 : un tour de `agent` commence sur ces lots (lot du tour, lots des
     messages du tour). Ceux qui lui sont délégués reçoivent leur premier tour,
     une seule fois : la délégation ne reviendra pas au délégant."""
+    from .agent_names import resolve as resolve_agent_name
+    agent = resolve_agent_name(agent, db=db, operation="work.mark_delegate_turn")
     ids = sorted({int(str(lot).strip()) for lot in lots or ()
                   if str(lot or "").strip().isdigit()})
     if not ids:
@@ -1787,7 +1808,7 @@ def _resume_review_after_merge(db, item_id, *, sha: str = "", pr_ref=None,
 def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source: str = "",
                  pr_ref: str | None = None, frozen_id: int | None = None,
                  declared: bool = False, extra: str = "", repo: str | None = None,
-                 landed: tuple[int, str] | None = None) -> dict:
+                 landed: tuple[int, str] | None = None, unfrozen: bool = False) -> dict:
     """Fusion constatée : le lot passe `merged` et son jalon `merged` est posé.
 
     Idempotent : un lot déjà fusionné reste tel quel (`already`). Jamais de
@@ -1797,7 +1818,9 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
 
     `frozen_id` (preuve par le contenu) : le jalon `frozen` examiné ; si ce
     n'est plus le dernier gel du lot au moment d'écrire, rien n'est fermé
-    (`refrozen`) — le nouveau gel n'a pas été examiné.
+    (`refrozen`) — le nouveau gel n'a pas été examiné. `unfrozen` (#2444,
+    gel d'origine verdict) : aucun gel n'a été examiné ; un gel déclaré
+    depuis rend aussi `refrozen`.
 
     `landed` (#1567) : `(numéro, dépôt)` du numéro réellement atterri, écrit
     dans la transaction de la fusion ; l'appelant l'a validé et réservé.
@@ -1865,7 +1888,7 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
                 work_dependencies.lock(tx)
                 row = storage.of(tx).work.close_merged(
                     item_id, current=state, sha=sha, actor=actor, note=note, pr_ref=pr_ref,
-                    frozen_id=frozen_id, landed=landed)
+                    frozen_id=frozen_id, landed=landed, unfrozen=unfrozen)
                 if row is not None:
                     _notify_released(tx, item_id, blocker_state="merged",
                                      after_commit=threads)
@@ -1891,9 +1914,10 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
                 detail += " — relecture non ouverte : %s" % (review.get("why") or "?")
             return {"id": int(item_id), "result": "merged", "item": row,
                     "detail": detail, "review_lot": review}
-        if frozen_id is not None:
+        if frozen_id is not None or unfrozen:
             freezes = [m for m in milestones(db, item_id) if m["kind"] == "frozen"]
-            if not freezes or int(freezes[0]["id"]) != int(frozen_id):
+            if (bool(freezes) if frozen_id is None
+                    else not freezes or int(freezes[0]["id"]) != int(frozen_id)):
                 return {"id": int(item_id), "result": "refrozen", "item": get(db, item_id),
                         "detail": "new freeze declared in the meantime: not closed, review again"}
     raise WorkError("lot %s moved in the meantime: retry" % item_id)
@@ -2380,6 +2404,8 @@ def get(db: Db, item_id: int) -> dict | None:
 
 def list_items(db: Db, *, state: str | None = None, assignee: str | None = None,
                limit: int = 50) -> list[dict]:
+    from .agent_names import resolve as resolve_agent_name
+    assignee = resolve_agent_name(assignee, db=db, operation="work.list_items")
     if state and state not in STATES:
         raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
     return storage.of(db).work.items(state=state, assignee=assignee, limit=limit)
@@ -2611,6 +2637,14 @@ def milestones(db: Db, item_id: int, limit: int = 100) -> list[dict]:
     return storage.of(db).work.milestones(item_id, limit)
 
 
+def _in_transaction(db: Db) -> bool:
+    """True on an open transaction object (psql) or inside a psycopg block."""
+    depth = getattr(db, "_depth", None)
+    if depth is not None:
+        return bool(depth)
+    return int(getattr(db, "_tx_depth", 0) or 0) > 0
+
+
 def milestone(
     db: Db,
     item_id: int,
@@ -2638,9 +2672,15 @@ def milestone(
     (`mail.send(..., after_commit=…)`) ; c'est **l'appelant** qui vide la liste
     après le COMMIT qu'il tient (celui du `with` interne sur une connexion
     racine, celui de sa propre transaction si l'appel est imbriqué : un `with`
-    imbriqué ne commite pas). Absent (le défaut), le gel ne désigne personne :
-    le raccord de la désignation des relecteurs se branche à l'activation du
-    lot #1617, pas ici.
+    imbriqué ne commite pas).
+
+    Absent (le défaut), le gel **active la désignation automatique des
+    relecteurs** (#2447) quand l'hôte lit un canon et que l'appel tient sa
+    transaction : le hook de `review_designation_activation` est installé, et
+    la liste `after_commit` créée ici est vidée après le COMMIT interne. Sur
+    une transaction déjà ouverte, l'appelant garde la main : il fournit son
+    hook et sa liste, comme le contrat #1617 l'exige. Un callback explicite
+    l'emporte toujours (témoins, reprise hors hook).
 
     Le feu ne s'écrit pas ici sans contrôle : `ameesh.fire.give` vérifie qu'il
     porte sur le gel courant, et `ameesh.fire.withdraw` qu'un feu est actif.
@@ -2661,6 +2701,15 @@ def milestone(
         raise WorkError("a freeze callback only makes sense for the `frozen` milestone")
     if get(db, item_id) is None:
         raise WorkError("lot %s not found" % item_id)
+    drain: list | None = None
+    if kind == "frozen" and on_frozen is None:
+        from . import review_designation_activation as activation
+        cfg = getattr(db, "cfg", None)
+        if activation.enabled(cfg) and not _in_transaction(db):
+            on_frozen = activation.hook(cfg)
+            if after_commit is None:
+                after_commit = []
+                drain = after_commit
     # #1465 : un gel ou un verdict déclaré dans un tour managé emporte la
     # preuve exacte de son origine (acteur, session, tour, harnais, sha
     # complet). Hors tour (orchestrateur, humain), le jalon s'écrit sans
@@ -2669,9 +2718,14 @@ def milestone(
     proof = review_provenance.proof_for_current_turn(db, actor=actor, sha=sha)
     if proof and not actor:
         actor = proof["actor"]
-    return storage.of(db).work.add_milestone(
+    row = storage.of(db).work.add_milestone(
         item_id, kind, sha=sha.strip(), actor=actor, verdict=verdict, note=note.strip(),
         on_frozen=on_frozen, after_commit=after_commit, proof=proof)
+    if drain is not None:
+        # the internal `with` has committed: the readable thread can leave now
+        for record in drain:
+            record(db.cfg, db)
+    return row
 
 
 def delays(db: Db, limit: int = 200, *, ids: Sequence[int] | None = None) -> list[dict]:

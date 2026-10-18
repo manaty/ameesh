@@ -161,6 +161,7 @@ from __future__ import annotations
 from .conversations import Conversations
 from .provenance import Provenance
 from .work_dependencies import WorkDependencies
+from .migration_reservations import MigrationReservations
 
 import abc
 import re
@@ -237,7 +238,11 @@ class Agents(Domain):
 
     @abc.abstractmethod
     def get(self, name: str) -> dict | None:
-        """La ligne de l'agent, ou None."""
+        """Agent by primary or alias; alias resolutions are durably audited."""
+
+    @abc.abstractmethod
+    def resolve_name(self, name: str, *, operation: str = "lookup") -> str:
+        """Resolve a spelling and audit aliases; unknown names stay unchanged."""
 
     @abc.abstractmethod
     def operator_pause(self, name: str, *, paused: bool, reason: str,
@@ -355,7 +360,8 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def state(self, name: str) -> dict | None:
-        """Détenteur, epoch, statut et vie du bail (`live`), ou None."""
+        """Nom primaire résolu, détenteur, epoch, statut et vie du bail
+        (`live`), ou None."""
 
     @abc.abstractmethod
     def renew(self, name: str, owner: str, epoch: int, ttl_seconds: float) -> float | None:
@@ -528,9 +534,17 @@ class PendingSpend(Domain):
         """Remplace le modèle du marqueur ; faux s'il n'y a pas de marqueur."""
 
     @abc.abstractmethod
+    def set_resident_usage(self, name: str, usage: dict | None,
+                           created_ts: float | None = None) -> bool:
+        """Pose (ou efface avec None) l'événement `resident.turn` du marqueur
+        (L80a) ; faux s'il n'y a pas de marqueur, ou si `created_ts` désigne
+        un autre marqueur. Cet état durable permet à un worker de remplacement
+        de réparer un tour résident dont l'événement n'a pas été écrit."""
+
+    @abc.abstractmethod
     def get(self, name: str) -> dict | None:
         """Le marqueur (agent, start_index, turn, model, created_ts,
-        work_item_id, turn_id), ou None."""
+        work_item_id, turn_id, resident_usage), ou None."""
 
     @abc.abstractmethod
     def clear(self, name: str) -> bool:
@@ -1995,10 +2009,12 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def close_merged(self, item_id: int, *, current: str, sha: str, actor: str, note: str,
                      pr_ref: str | None, frozen_id: int | None = None,
-                     landed: tuple[int, str] | None = None) -> dict | None:
+                     landed: tuple[int, str] | None = None,
+                     unfrozen: bool = False) -> dict | None:
         """Fusion constatée (L29) : `current` → `merged` si le lot y est encore
         et, si `frozen_id` est donné, si ce jalon `frozen` est toujours le
-        dernier gel du lot (sinon None, rien d'écrit) ; journal et jalon
+        dernier gel du lot — `unfrozen` (#2444) : si le lot n'a toujours aucun
+        gel (sinon None, rien d'écrit) ; journal et jalon
         `merged` (commit, auteur de la fusion) dans la même transaction.
         `landed` (#1567) : `(numéro, dépôt)` du numéro réellement atterri,
         écrit dans la même transaction."""
@@ -3985,6 +4001,26 @@ class Handoffs(Domain):
     def unfence(self, operation: str, expected: str, state: str) -> dict | None: ...
 
 
+class PrevalidationReports(Domain):
+    """Rapports de prévalidation au gel (#1770, 0450) : une ligne par (lot, tête).
+
+    Le rapport `ameesh-prevalidation/1` est une preuve, pas un verdict : il ne
+    remplace ni la désignation au gel (#1617) ni le gel dérivé (#1756)."""
+
+    @abc.abstractmethod
+    def record(self, report: dict) -> None:
+        """Écrit le rapport de sa clé (lot, tête), après le run distant ;
+        réécrire la même clé remplace le rapport courant."""
+
+    @abc.abstractmethod
+    def report(self, work_item_id: int, head_sha: str) -> dict | None:
+        """Le rapport enregistré pour cette tête exacte, ou None."""
+
+    @abc.abstractmethod
+    def latest(self, work_item_id: int) -> dict | None:
+        """Le rapport le plus récent du lot (toute tête), ou None."""
+
+
 # --------------------------------------------------------------------------
 # le stockage d'une connexion
 # --------------------------------------------------------------------------
@@ -4018,6 +4054,7 @@ class Storage(abc.ABC):
     work: WorkItems
     work_dependencies: WorkDependencies
     provenance: Provenance
+    migration_reservations: MigrationReservations
     lot_sessions: LotSessions
     packages: WorkPackages
     actions: Actions
@@ -4042,3 +4079,4 @@ class Storage(abc.ABC):
     ci: CiResults
     conversations: Conversations
     handoffs: Handoffs
+    prevalidation: PrevalidationReports
