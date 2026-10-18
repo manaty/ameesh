@@ -560,6 +560,22 @@ class RoadmapPgTest(PgTestCase):
         self.assertEqual([(a["reason"], a["lot"]) for a in alerts],
                          [("date_prevue", manual["id"])])
 
+    def test_livraison_manuelle_sur_dates_p80_reste_alertee(self):
+        lot = self._lot("Livraison manuelle après planification p80")
+        work.move(self.db, lot["id"], "build")
+        storage.of(self.db).roadmap.plan_item(
+            lot["id"], {"start": "2026-10-11", "end": "2026-10-12"},
+            source="reference p80 (table #6)", actor="auditeur")
+        # Le planificateur ne touche pas à delivery ; poser seulement cette
+        # date à la main conserve donc la source p80 de start/end.
+        planned = roadmap.plan(self.db, lot["id"], delivery="2026-10-12",
+                               actor="human:o")
+        self.assertEqual(planned["plan"]["planned_source"], "reference p80 (table #6)")
+        rows = [r for r in roadmap.overdue(self.db, now=ts("2026-10-14"))
+                if r["lot"] == lot["id"]]
+        self.assertEqual([(r["reason"], r["due"]) for r in rows],
+                         [("date_prevue", "2026-10-12")])
+
     def test_engagement_overdue_une_alerte_par_lot(self):
         """#2342 : deux dates puis un engagement ne font qu'une alerte par lot."""
         lot = self._lot("Deux dates et une promesse")

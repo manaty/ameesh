@@ -22,6 +22,9 @@ l'exécuteur fait un passage du radar juste après chaque relevé des branches
    cible ramenée par une fusion dans la branche n'est à personne (#1333).
    Une copie identique héritée d'un autre lot suivi reste attribuée à ce
    constituant, sans doublon ni réservation supplémentaire pour le paquet (#2279).
+   Un lot empilé sur une base qui porte déjà la migration (paquet, lot parent)
+   ne l'ajoute pas, même quand la pointe du parent a avancé depuis
+   l'empilement : la preuve est le merge-base des deux branches (#2388).
 
 Les fusions d'essai n'écrivent rien dans le dépôt des agents : leurs objets
 vont dans un dossier jetable (`GIT_OBJECT_DIRECTORY`, objets du dépôt en
@@ -933,12 +936,19 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
 
 
 def _native_migration_additions(repo: str, branches: list[dict], directory: str) -> list[dict]:
-    """#2279: attribute an unchanged inherited migration to its constituent.
+    """#2279/#2388: attribute unchanged inherited migrations to their base.
 
-    Only a strict ancestor with the same path, blob and certified target
-    proves inheritance. Equal tips, independent additions, modified SQL and
-    unreadable evidence keep their warnings. Both probes use this view;
-    branch diffs in the report keep their full scope.
+    Inheritance is proved by history, never by a branch name: either a strict
+    ancestor with the same path and blob (#2279), or — when neither holder
+    descends from the other — a common merge-base that already carries the
+    same path and blob (#2388: a lot stacked on a package whose tip has moved
+    since the fork). One survivor is kept for the whole diverged group, not
+    pair by pair: a pairwise choice can cycle between ancestry and date and
+    hide every copy. The survivor (the tip that advanced last) keeps the
+    attribution, so a third holder, the duplicate probe and the reservation
+    probe still see the number. Equal tips, independent additions, modified
+    SQL and unreadable evidence keep their warnings. Both probes use this
+    view; branch diffs in the report keep their full scope.
     """
     groups: dict = {}
     for one in branches:
@@ -948,27 +958,143 @@ def _native_migration_additions(repo: str, branches: list[dict], directory: str)
             if (os.path.dirname(path) == directory
                     and MIGRATION_RE.fullmatch(os.path.basename(path))):
                 groups.setdefault((one["target"], one["target_head"], path), []).append(one)
-    inherited, ancestors, blobs = {}, {}, {}
+    inherited, ancestors, bases, blobs, first_parents = {}, {}, {}, {}, {}
+
+    def ancestor(a: str, b: str) -> bool | None:
+        """True/False, or None when Git could not answer (warning kept)."""
+        pair = (a, b)
+        if pair not in ancestors:
+            proc = _git(repo, "merge-base", "--is-ancestor", a, b,
+                        env_extra=NO_LAZY_FETCH)
+            ancestors[pair] = (True if proc.returncode == 0
+                               else False if proc.returncode == 1 else None)
+        return ancestors[pair]
+
+    def common_base(a: str, b: str) -> str | None:
+        pair = tuple(sorted((a, b)))
+        if pair not in bases:
+            proc = _git(repo, "merge-base", pair[0], pair[1],
+                        env_extra=NO_LAZY_FETCH)
+            bases[pair] = (proc.stdout.strip().decode("ascii", "replace")
+                           if proc.returncode == 0 else None)
+        return bases[pair]
+
+    def on_first_parent(base: str, tip: str) -> bool:
+        """`base` is on the first-parent chain of `tip`: the branch was born
+        on it (stacked), rather than merging it in from the target (#1333
+        stays visible for a merge: the inherited migration is not attributed
+        without a certified target)."""
+        key = (base, tip)
+        if key not in first_parents:
+            count = _git(repo, "rev-list", "--count", base + ".." + tip,
+                         env_extra=NO_LAZY_FETCH)
+            try:
+                steps = int(count.stdout.strip() or b"0")
+            except ValueError:
+                steps = 0
+            if steps <= 0:
+                first_parents[key] = False
+            else:
+                chain = _git(repo, "rev-list", "--first-parent",
+                             "--max-count=%d" % (steps + 1), tip,
+                             env_extra=NO_LAZY_FETCH)
+                first_parents[key] = (chain.returncode == 0
+                                      and base.encode("ascii") in chain.stdout.split())
+        return first_parents[key]
+
+    def blob(commit: str, path: str) -> str | None:
+        key = (commit, path)
+        if key not in blobs:
+            proc = _git(repo, "rev-parse", "--verify", commit + ":" + path,
+                        env_extra=NO_LAZY_FETCH)
+            blobs[key] = proc.stdout.strip() if proc.returncode == 0 else None
+        return blobs[key]
+
+    tip_dates: dict = {}
+
+    def tip_date(tip: str) -> int:
+        if tip not in tip_dates:
+            proc = _git(repo, "log", "-1", "--format=%ct", tip,
+                        env_extra=NO_LAZY_FETCH)
+            try:
+                tip_dates[tip] = int(proc.stdout.strip() or b"0")
+            except ValueError:
+                tip_dates[tip] = 0
+        return tip_dates[tip]
+
+    def rank(one: dict):
+        """Pick the survivor of a diverged group: the tip that advanced last,
+        then the oldest work item. Git cannot tell which of several diverged
+        branches was the base (they carry the same file at their merge-base);
+        the ranking only keeps one attribution, so a third holder and the
+        reservation probe still see the number (#2388 review)."""
+        return (tip_date(one["tip"]), -int(one["work_item"]), one["branch"])
+
     for (_, _, path), holders in groups.items():
         if len(holders) < 2:
             continue
-        for one in holders:
-            for other in holders:
-                pair = (other["tip"], one["tip"])
-                if pair[0] == pair[1]:
+        inherited_indices, diverged = set(), []
+        for index, one in enumerate(holders):
+            for other_index in range(index + 1, len(holders)):
+                other = holders[other_index]
+                a, b = one["tip"], other["tip"]
+                if a == b:
                     continue
-                if pair not in ancestors:
-                    ancestors[pair] = _git(repo, "merge-base", "--is-ancestor", *pair,
-                                            env_extra=NO_LAZY_FETCH).returncode == 0
-                if not ancestors[pair]:
+                ab = ancestor(a, b)
+                ba = ancestor(b, a)
+                if ab is None or ba is None:
+                    continue              # unreadable history: keep the warning
+                if ab or ba:
+                    # One tip descends from the other: the descendant's copy
+                    # is inherited when the file is identical (#2279). A
+                    # holder explained by an ancestor holder is not a root of
+                    # the lineage and never needs its own representative.
+                    parent, child = (a, b) if ab else (b, a)
+                    child_index = other_index if ab else index
+                    if blob(parent, path) and blob(parent, path) == blob(child, path):
+                        inherited_indices.add(child_index)
                     continue
-                for tip in pair:
-                    if (tip, path) not in blobs:
-                        proc = _git(repo, "rev-parse", "--verify", tip + ":" + path,
-                                    env_extra=NO_LAZY_FETCH)
-                        blobs[tip, path] = proc.stdout.strip() if proc.returncode == 0 else None
-                if blobs[pair[0], path] and blobs[pair[0], path] == blobs[pair[1], path]:
-                    inherited.setdefault(one["work_item"], set()).add(path)
+                # #2388: diverged holders (a lot stacked on a base that moved
+                # since the fork). A common ancestor carrying the identical
+                # file proves that neither of them added it; each is an
+                # inherited copy of the same lineage. Keep an edge, the
+                # survivor is chosen once for the whole connected group.
+                base = common_base(a, b)
+                value = blob(base, path) if base else None
+                if (value and value == blob(a, path) == blob(b, path)
+                        and on_first_parent(base, a)
+                        and on_first_parent(base, b)):
+                    diverged.append((index, other_index))
+        # Relecture #2388: a pairwise choice cycles (A ancestor B, A/C and B/C
+        # diverged): each pair drops one copy, and A, B, C all lose the
+        # migration. Ancestry is settled first; then each connected group of
+        # diverged roots keeps exactly one survivor, so the duplicate and
+        # reservation probes always see the number (#2388).
+        roots = {index: index for index in range(len(holders))
+                 if index not in inherited_indices}
+
+        def find(index):
+            while roots[index] != index:
+                roots[index] = roots[roots[index]]
+                index = roots[index]
+            return index
+
+        for index, other_index in diverged:
+            if index not in roots or other_index not in roots:
+                continue
+            left, right = find(index), find(other_index)
+            if left != right:
+                roots[right] = left
+        groups_by_root: dict = {}
+        for index in list(roots):
+            groups_by_root.setdefault(find(index), []).append(index)
+        for members in groups_by_root.values():
+            if len(members) < 2:
+                continue
+            keep = max(members, key=lambda index: rank(holders[index]))
+            inherited_indices.update(index for index in members if index != keep)
+        for index in inherited_indices:
+            inherited.setdefault(holders[index]["work_item"], set()).add(path)
     return [dict(one, added=[path for path in one.get("added") or ()
                             if path not in inherited.get(one["work_item"], ())])
             for one in branches]

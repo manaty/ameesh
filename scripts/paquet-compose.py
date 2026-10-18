@@ -24,13 +24,16 @@ Le sujet par défaut nomme chaque lot avec la tête composée, `#<lot> <tête>`
 
     scripts/paquet-compose.py --units --base origin/main [--head <réf>]
 
-relit les unités déjà composées sur la branche du paquet (commits de fusion
-de la première parente depuis `--base` qui portent `ameesh-work:`) et imprime
-une ligne `N unités : #<lot> <tête>, …` (tête = second parent, 12 caractères)
-à reprendre telle quelle dans le corps du lot porteur et dans le manifeste
-(#2360) : le porteur déclare ainsi ses unités sans rien recopier à la main.
-Une fusion sans trailer (mise à jour depuis la cible) n'est pas une unité ;
-un lot recomposé garde sa place et prend la tête la plus récente.
+relit les unités de fusion déjà composées sur la branche du paquet (commits de
+fusion de la première parente depuis `--base` qui portent `ameesh-work:`) et
+imprime une ligne `N unités de fusion, M lots portés : #<lot> <tête>, …`
+(tête = second parent, 12 caractères) à reprendre telle quelle dans le corps du
+lot porteur et dans le manifeste (#2360) : le porteur déclare ainsi ses unités
+sans rien recopier à la main. Une unité peut porter plusieurs lots, tous listés
+avec leur tête. Une fusion sans trailer (mise à jour depuis la cible) n'est pas
+une unité ; un lot recomposé garde sa place, prend la tête la plus récente et
+son unité est le commit de composition le plus récent. Le compteur distingue
+donc les unités de fusion encore rattachées à un lot des lots portés (#2387).
 
 Ne réécrit aucun commit existant : la convention vaut pour les unités
 composées à partir de maintenant (un paquet déjà validé n'est pas refait pour
@@ -122,38 +125,46 @@ def check_repo(repo: Path) -> Path:
     return Path(out(repo, "rev-parse", "--show-toplevel"))
 
 
-def packet_units(repo: Path, base: str, head: str = "HEAD") -> dict[int, str]:
-    """`{lot: tête}` des unités composées de `base` à `head`, dans l'ordre de
-    composition (#2360).
+def packet_units(repo: Path, base: str, head: str = "HEAD"
+                 ) -> tuple[dict[int, str], int]:
+    """`({lot: tête}, unités de fusion)` des compositions de `base` à `head`,
+    dans l'ordre de composition (#2360, #2387).
 
-    Une unité est un commit de fusion de la première parente qui porte
-    `ameesh-work:` ; sa tête est le second parent (la source composée). Un
-    lot recomposé garde sa place et prend la tête la plus récente.
+    Une unité de fusion est un commit de fusion de la première parente qui
+    porte `ameesh-work:` ; sa tête est le second parent (la source composée).
+    Une unité peut porter plusieurs lots. Un lot recomposé garde sa place,
+    prend la tête la plus récente, et son unité est le commit de composition le
+    plus récent : seules les unités encore rattachées à au moins un lot sont
+    comptées.
     """
     if rev(repo, base) is None:
         raise InputError("base %r introuvable (SHA ou réf)" % base)
     if rev(repo, head) is None:
         raise InputError("tête %r introuvable (SHA ou réf)" % head)
     log = out(repo, "log", "--first-parent", "--merges", "--reverse",
-              "--format=%P%x1f%B%x1e", "%s..%s" % (base, head))
+              "--format=%H%x1f%P%x1f%B%x1e", "%s..%s" % (base, head))
     units: dict[int, str] = {}
+    unit_of: dict[int, str] = {}
     for record in log.split("\x1e"):
-        parents, _, body = record.strip().partition("\x1f")
+        commit, _, rest = record.strip().partition("\x1f")
+        parents, _, body = rest.partition("\x1f")
         parents = parents.split()
         if len(parents) < 2:
             continue
-        head = out(repo, "rev-parse", "--short=12", parents[1])
+        source_head = out(repo, "rev-parse", "--short=12", parents[1])
         for match in TRAILER_RE.finditer(body):
-            units[int(match.group(1))] = head
-    return units
+            lot = int(match.group(1))
+            units[lot] = source_head
+            unit_of[lot] = commit
+    return units, len(set(unit_of.values()))
 
 
 def list_units(args: argparse.Namespace) -> int:
     repo = check_repo(Path(args.repo).resolve())
-    units = packet_units(repo, args.base, args.head)
+    units, merges = packet_units(repo, args.base, args.head)
     if not units:
         raise InputError("aucune unité `ameesh-work:` depuis %s" % args.base)
-    print("%d unités : %s" % (len(units), ", ".join(
+    print("%d unités de fusion, %d lots portés : %s" % (merges, len(units), ", ".join(
         "#%d %s" % (lot, head) for lot, head in units.items())))
     return 0
 
@@ -234,8 +245,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source", default=None,
                         help="tête, remise ou résolution à composer (SHA ou réf)")
     parser.add_argument("--units", action="store_true",
-                        help="imprimer les unités « #<lot> <tête> » composées "
-                             "depuis --base, pour le porteur (#2360)")
+                        help="imprimer les unités de fusion et les lots "
+                             "« #<lot> <tête> » composés depuis --base, pour "
+                             "le porteur (#2360, #2387)")
     parser.add_argument("--base", default=None,
                         help="avec --units : la cible dont part le paquet")
     parser.add_argument("--head", default="HEAD",

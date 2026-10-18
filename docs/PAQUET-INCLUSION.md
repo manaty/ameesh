@@ -89,16 +89,19 @@ lot porteur** et le manifeste reprennent la ligne que le script imprime :
 
 ```sh
 scripts/paquet-compose.py --units --base origin/main [--head <réf>]
-# 2 unités : #2131 ef22692ba6a3, #2140 0a1b2c3d4e5f
+# 2 unités de fusion, 3 lots portés : #2131 ef22692ba6a3, #2140 0a1b2c3d4e5f, #2157 112233445566
 ```
 
-Les unités sont les fusions de première parente depuis `--base` qui portent
-`ameesh-work:` (tête = second parent) ; une mise à jour depuis la cible n'en
-est pas une, un lot recomposé prend sa tête la plus récente. C'est cette forme
-`#<lot> <tête>` que le moniteur lit dans le corps d'un porteur `integration/**`
-pour reconnaître qu'un lot attend la fusion du paquet (#2335) ; un porteur qui
-ne liste ses lots que par `#N` ne déclare aucune unité et leurs alertes
-restent.
+Les unités de fusion sont les commits de fusion de première parente depuis
+`--base` qui portent `ameesh-work:` (tête = second parent) ; une mise à jour
+depuis la cible n'en est pas une. Une unité peut porter plusieurs lots, listés
+chacun avec sa tête ; un lot recomposé garde sa place, prend sa tête la plus
+récente et son unité est le commit de composition le plus récent. Le compteur
+annonce donc séparément les unités de fusion encore rattachées à un lot et les
+lots portés (#2387). C'est cette forme `#<lot> <tête>` que le moniteur lit dans
+le corps d'un porteur `integration/**` pour reconnaître qu'un lot attend la
+fusion du paquet (#2335) ; un porteur qui ne liste ses lots que par `#N` ne
+déclare aucune unité et leurs alertes restent.
 
 La convention vaut pour les unités composées à partir de maintenant : un paquet
 déjà validé n'est pas réécrit pour ce seul métadonné, son manifeste et son run
