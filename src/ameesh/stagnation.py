@@ -48,10 +48,10 @@ STALE_ENV = "AMEESH_STALE_AFTER"
 WAITING_FOR = ("verdict", "correction", "fusion", "decision_humaine")
 #: ce qu'un lot peut attendre, forme détaillée (`waiting.what`)
 WHATS = ("start", "build", "verdict", "fix", "merge-approval", "merge", "merge-outcome",
-         "decision", "unblock")
+         "decision", "unblock", "packet")
 _LEGACY = {"verdict": "verdict", "fix": "correction", "merge": "fusion",
            "decision": "decision_humaine", "merge-approval": "decision_humaine",
-           "merge-outcome": "decision_humaine"}
+           "merge-outcome": "decision_humaine", "packet": "fusion"}
 #: états d'un lot qui n'attend plus rien
 DONE_STATES = ("merged", "promoted", "closed")
 #: états d'action qui attendent un humain
@@ -127,6 +127,9 @@ _LABELS = {
                       "merge outcome unknown: reconciliation"),
     "decision": ("human decision by %s", "human decision"),
     "unblock": ("unblocking by %s", "unblocking"),
+    # #2335 : le lot est déclaré dans un paquet ouvert ; il attend sa fusion,
+    # pas un exécuteur de lot (le composeur/pilote porte le paquet).
+    "packet": ("packet merge of %s", "packet merge"),
 }
 #: display labels of the `who_state` values (the values stay as stored/emitted)
 _STATE_LABELS = {"inconnu": "unknown", "arrêté": "stopped", "externe": "external session"}
@@ -433,12 +436,19 @@ def describe(db, rows: list[dict], *, now: float | None = None,
                                      responsible=package.get("responsible"),
                                      review_class=cls)
             detail = with_availability(detail, states, externals)
-            hold = waits.get(rid)
-            if hold and hold.get("what") == "landing" and detail and detail.get("what") == "merge":
+            wait = waits.get(rid)
+            if wait is not None and wait.get("what") == "packet":
+                # #2335/A1 : le lot est transporté par un paquet ouvert ; il
+                # n'attend pas un exécuteur de lot. Le libellé « merge
+                # (executor not designated) » était faux et l'escalade sans
+                # objet.
+                detail = _waiting("packet", "#%s" % wait.get("vehicle"))
+            elif (wait and wait.get("what") == "landing"
+                  and detail and detail.get("what") == "merge"):
                 # #1945 : un atterrissage déclaré est plus précis que le libellé
                 # générique « merge (executor not designated) » ; le registre
                 # nomme le véhicule, son étape, sa tête et l'échéance.
-                detail = dict(detail, who=None, label=work_dependencies.wait_label(hold))
+                detail = dict(detail, who=None, label=work_dependencies.wait_label(wait))
             last = last_activity(row, events.get(rid, []), milestones.get(rid, []), acts,
                                  messages.get(rid), events_ts=last_events.get(rid))
             project = projects.lot_project(row, agent_projects,
