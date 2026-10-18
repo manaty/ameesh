@@ -455,10 +455,10 @@ def _pr_status(slug: str, branch: str, *, gh) -> dict | None:
     row = (opened or merged or rows or [None])[0]
     if row is None:
         return None
-    rollup = row.get("statusCheckRollup") or []
+    from . import radar
+    rollup = radar.latest_rollup(row.get("statusCheckRollup"))
     pending = any((c.get("status") or "COMPLETED") != "COMPLETED"
                   or (c.get("state") or "") == "PENDING" for c in rollup)
-    from . import radar
     ci = "green" if radar.ci_green(rollup) else "pending" if pending or not rollup else "red"
     commit = row.get("mergeCommit") or {}
     return {
@@ -693,8 +693,11 @@ def _required_gap(required, rollup, provenance=None) -> list:
     ce nom **et de cette application** est `SUCCESS` ; une entrée sans source
     (statut de commit) ou d'une autre application ne prouve rien. Sans
     application imposée (`app_id` à `None`), tout check ou statut du nom exigé
-    compte, et un même nom porté par plusieurs entrées n'est vert que si
-    toutes le sont : le doute ne verdit pas la porte."""
+    compte après sélection des derniers checks du rollup (#2524). Un même
+    nom encore porté par plusieurs workflows ou sources n'est vert que si
+    tous le sont : le doute ne verdit pas la porte."""
+    from . import radar
+    rollup = radar.latest_rollup(rollup)
     gaps = []
     for name, app_id in _required_pairs(required):
         if app_id is None:
