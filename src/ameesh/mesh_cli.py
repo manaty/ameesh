@@ -2031,6 +2031,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             print("milestone %s added to lot #%d%s" % (
                 row["kind"], args.id,
                 " (%s)" % row["verdict"] if row.get("verdict") else ""))
+            if args.kind == "frozen":
+                # #2442 : un réalignement mécanique sur la cible garde les
+                # verdicts de la tête relue ; sinon l'exécuteur retente.
+                from . import verdict_carry
+                carried = verdict_carry.carry(cfg, db, args.id)
+                if carried["result"] != "idle":
+                    print(verdict_carry.describe(carried))
             return 0
         print(USAGE_HINT % "unknown work subcommand", file=sys.stderr)
         return 2
