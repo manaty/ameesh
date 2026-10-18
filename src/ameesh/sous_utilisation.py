@@ -256,27 +256,14 @@ def _declared_profiles(cfg) -> dict:
         return {}
 
 
-def _declared_pace(items: list, account: str | None) -> tuple[float, float]:
-    """(multiplicateur, plafond de rythme) du compte déclaré (#1227 N3).
-
-    Le relevé de `latest_account_gauges` nomme son compte : on lit le réglage
-    du profil correspondant (`pace_ceiling`, `pace_multiplier`) au lieu des
-    90 % et du ×1 en dur, qui contredisaient `limits` (#1075, #1176). Un
-    compte non déclaré, ou un relevé sans compte sur un harnais à plusieurs
-    comptes, garde les défauts : jamais un plafond inventé. Le relèvement de
-    fin de fenêtre n'est pas reproduit ici — il exige la preuve fraîche
-    d'overage impossible, que lit `accounts.evaluate` — le diagnostic reste
-    donc conservateur (jamais au-dessus du plafond de `limits`).
-    """
-    profile = None
+def _declared_profile(items: list, account: str | None) -> accounts_mod.Profile | None:
+    """Le profil du relevé (#1227, #2233), None si inconnu ou ambigu."""
     if items:
         if account:
-            profile = accounts_mod.by_name(items, account)
+            return accounts_mod.by_name(items, account)
         elif len(items) == 1:
-            profile = items[0]
-    if profile is None:
-        return 1.0, cost_mod.PACE_CEILING
-    return profile.pace_multiplier, profile.pace_ceiling
+            return items[0]
+    return None
 
 
 def plan_underused(db, listing: list, now: float, *,
@@ -286,7 +273,9 @@ def plan_underused(db, listing: list, now: float, *,
                    paid=None, held=(), cfg=None) -> list:
     """`cfg` (#1227 N3) : la configuration des comptes déclarés — le rythme et
     le plafond du compte nommé par le relevé remplacent les 90 % et le ×1 en
-    dur ; un compte absent, inconnu ou ambigu garde les défauts."""
+    dur ; un compte absent, inconnu ou ambigu garde les défauts. #2233 : les
+    plafonds fixes et courts de `accounts.limits` bloquent aussi une fausse
+    promesse de capacité sur une autre fenêtre du même compte."""
     used_max = max(0.0, float(used_pct)) / 100.0
     gap_min = max(0.0, float(pace_gap_pct)) / 100.0
     if (tail_s <= 0 or used_max <= 0) and gap_min <= 0:
@@ -294,20 +283,47 @@ def plan_underused(db, listing: list, now: float, *,
     out: list = []
     spend = None
     spend_read = False
+    book = None
     declared = _declared_profiles(cfg)
     for (harness, account), gauges in sorted(latest_account_gauges(db, now).items(),
                                               key=lambda kv: (kv[0][0], kv[0][1] or "")):
-        multiplier, ceiling = _declared_pace(declared.get(harness) or [], account)
+        items = declared.get(harness) or []
+        profile = _declared_profile(items, account)
+        multiplier = profile.pace_multiplier if profile else 1.0
+        ceiling = profile.pace_ceiling if profile else cost_mod.PACE_CEILING
         # une autre fenêtre du compte au seuil : sa capacité n'est pas
         # utilisable d'ici là, rien n'est « perdu » par négligence
         live = [(g, seen) for g, seen in gauges if expiring(g, now) is not None]
         # #1789/N6 : un seau propre à un modèle (#1580 tranche 3) ne rend pas
         # la capacité générale du compte inutilisable — seules les fenêtres
         # générales se taisent entre elles ; un seau de modèle reste alerte.
-        blocking = [(g, seen) for g, seen in live if not getattr(g, "scope", "")]
+        blocking = [(g, seen) for g, seen in gauges
+                    if not g.scope and not g.reset_passed(now)]
+        caps = {}
+        if profile is not None:
+            measured = cost_mod.Gauges(g for g, _ in gauges)
+            # #2233 : l'historique ne porte pas la capacité d'overage. Ne
+            # lire le journal du compte que si son plafond pourrait bloquer.
+            if profile.overage == "auto" and any(
+                    g.used_at(now) >= profile.overage_cap for g, _ in blocking):
+                try:
+                    if book is None:
+                        book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
+                    current = accounts_mod.gauges_of(book, profile, items, now=now)
+                    measured.overage = getattr(current, "overage", None)
+                except Exception:  # compte illisible : aucune capacité promise
+                    continue
+            # Comme avant #2233, aucun relèvement de fin de fenêtre sans
+            # preuve fraîche ; les plafonds fixes et courts viennent de limits.
+            caps = accounts_mod.limits(profile, measured, now, ceilings={
+                g.key: accounts_mod.Ceiling(ceiling) for g in measured})
+            if any(g.used_at(now) >= caps[g.key][0] for g, _ in blocking):
+                continue
         for gauge, seen in live:
-            if any(other.exceeded(now, 0.0, multiplier, ceiling)
-                   for other, _ in blocking if other is not gauge):
+            if caps and gauge.used_at(now) >= caps[gauge.key][0]:
+                continue
+            if profile is None and any(other.exceeded(now, 0.0, multiplier, ceiling)
+                                       for other, _ in blocking if other is not gauge):
                 continue
             resets_at, unused = expiring(gauge, now)
             remaining = resets_at - now
@@ -758,7 +774,12 @@ def orchestrators(cfg, db, listing: list, *, declared=(), canons=None,
     propriétaire de l'agent (#424 r1), ou agent qui a confié des lots
     (délégation ou `work assign`) dans les 30 derniers jours — tant que son
     organisation ne déclare aucun rôle (L242c, `deduces`) — sauf avec
-    `history=False` (#740). Seulement des agents du registre."""
+    `history=False` (#740). Seulement des agents du registre.
+
+    Modèle de rôle (autorité : correction, plan, analyse) : il inclut
+    l'historique. Pour les **destinataires d'alerte**, l'historique ne confère
+    pas le rôle : `alert_orchestrators` (#1114), qui exclut les assigneurs
+    récents non déclarés."""
     names = {row["name"] for row in listing}
     found = {_bare(n) for n in declared or () if n}
     if canons is None:
@@ -781,6 +802,22 @@ def orchestrators(cfg, db, listing: list, *, declared=(), canons=None,
     from .chat import is_chat_agent
     chats = {row["name"] for row in listing if is_chat_agent(row)}
     return sorted(n for n in found if n in names and n not in chats)
+
+
+def alert_orchestrators(cfg, db, listing: list, *, declared=(), canons=None) -> list:
+    """Les orchestrateurs qui peuvent recevoir une alerte : déclarés
+    (`--orchestrators`, `AMEESH_ALERT_ORCHESTRATORS`) ou rôle `orchestrateur`
+    d'une fiche Agent du canon. L'historique des lots confiés (30 jours) ne
+    confère pas ce rôle (#1114) : un agent qui a seulement assigné récemment
+    n'est pas un destinataire, et ne peut donc pas entrer dans la boucle
+    « recevoir l'alerte pousse à assigner, ce qui entretient la liste ».
+
+    Le repli « sans équipe » d'`alert_briefs._of_teams` ne s'applique plus
+    qu'aux agents présents ici : un hub sans équipe (bureau) est donc admis
+    seulement par déclaration explicite — rôle au canon ou
+    `AMEESH_ALERT_ORCHESTRATORS` —, jamais par le seul historique."""
+    return orchestrators(cfg, db, listing, declared=declared, canons=canons,
+                         history=False)
 
 
 def orchestrator_held(listing: list, now: float, orchestras: list, *,
@@ -850,13 +887,13 @@ def idle_agents(listing: list, now: float, idle_s: float, *,
 
     #1677 : `actionable_idle` lit le repos sur les lots **actionnables**
     (`actionable_lots`, lu par `operations.listing` : rien qui l'occupe,
-    aucune correction attendue d'un verdict bloquant) au lieu du temps depuis
-    le dernier tour — un agent sans lot prend des tours de courrier toutes les
-    quelques minutes et ne serait donc jamais « au repos » (N9). La **prise**
-    de lots et les alertes de sous-utilisation s'en servent ; la remise
-    (`handoff.hand`, L233b) garde son contrat d'origine, « au repos depuis au
-    moins `idle_s` », qu'un relevé sans `actionable_lots` (bancs, appels
-    anciens) impose de toute façon."""
+    aucune correction attendue d'un verdict bloquant, aucune relecture
+    désignée due — #1726) au lieu du temps depuis le dernier tour — un agent
+    sans lot prend des tours de courrier toutes les quelques minutes et ne
+    serait donc jamais « au repos » (N9). La **prise** de lots et les alertes
+    de sous-utilisation s'en servent ; la remise (`handoff.hand`, L233b) garde
+    son contrat d'origine, « au repos depuis au moins `idle_s` », qu'un relevé
+    sans `actionable_lots` (bancs, appels anciens) impose de toute façon."""
     idle = []
     for row in listing:
         # un agent `externe` n'est jamais compté — dont le chat du
@@ -1370,8 +1407,8 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
     paid = paid_harnesses(getattr(cfg, "host", None))
     out = plan_underused(db, listing, now, tail_s=plan_tail_s, used_pct=plan_used_pct,
                          pace_gap_pct=plan_pace_gap_pct, paid=paid, held=held, cfg=cfg)
-    orchestras = orchestrators(cfg, db, listing, declared=orchestrators_declared,
-                               canons=canons)
+    orchestras = alert_orchestrators(cfg, db, listing, declared=orchestrators_declared,
+                                     canons=canons)
     for alert in out:
         # L132 : `plan_underused` part aussi aux orchestrateurs (alert_briefs)
         alert["orchestrators"] = list(orchestras)

@@ -89,6 +89,16 @@ class Operations(interface.Operations):
     def listing(self, *, today: str | None = None) -> list[dict]:
         import datetime as _dt
         today = today or _dt.date.today().isoformat()
+        # #1726 : une relecture désignée (#705) sans verdict courant occupe son
+        # relecteur — sans quoi, sans lot à lui, il passerait pour « au repos »
+        # et la prise lui donnerait un lot ou une autre relecture. La colonne
+        # `reviewer` n'existe qu'après la migration 0421.
+        review_due = ""
+        if has_reviewer(self.db):
+            review_due = ("""
+                     + (SELECT count(*) FROM work_items w
+                         WHERE w.state = 'qa' AND w.reviewer = r.name
+                           AND """ + _current_verdict("w") + """ IS NULL)""")
         return self.db.query(
             """
             SELECT r.name, r.chantier, r.team, r.projects, r.harness, r.host, r.model,
@@ -99,6 +109,11 @@ class Operations(interface.Operations):
                    r.session_id, r.session_work_item,
                    r.status, r.status_text, r.current_prompt, r.lease_owner,
                    r.mode, r.stop_reason, r.responsible,
+                   -- #2200 : la pause opérateur, portée par la lecture partagée
+                   -- des alertes (état « paused », jamais « idle »)
+                   r.operator_paused, r.operator_pause_reason, r.operator_pause_by,
+                   r.operator_pause_for,
+                   extract(epoch from r.operator_pause_at)::float8 AS operator_pause_ts,
                    r.canon,  -- L242c : le canon propriétaire (rôles de sa fiche)
                    extract(epoch from r.lease_wait_since)::float8 AS lease_wait_since_ts,
                    r.admitted_hosts,  -- #254 : hôtes en pause
@@ -166,7 +181,10 @@ class Operations(interface.Operations):
                   -- regelée depuis n'attend plus de correction). Aucun lot
                   -- actionnable = au repos, quel que soit le temps depuis le
                   -- dernier tour.
-                  SELECT count(*) AS n FROM work_items w
+                  -- #1726 : une relecture désignée sans verdict courant
+                  -- (relecteur #705, lot en qa) compte aussi : l'agent doit
+                  -- son verdict avant de prendre autre chose.
+                  SELECT count(*)""" + review_due + """ AS n FROM work_items w
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
                      AND (w.state NOT IN """ + _WAITING_ON_OTHERS + """
                           OR (w.state = 'qa' AND """ + _current_verdict("w") + """ = 'blocked'))
@@ -368,6 +386,7 @@ class Operations(interface.Operations):
     _LOTS_ACTIVITY = """
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
                    w.priority, w.app, w.workstream, w.branch_target, __REVIEWER__,
+                   to_jsonb(w)->'reviewers' AS reviewers,
                    coalesce(to_jsonb(w)->>'workflow_ref', '') AS workflow_ref,
                    coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),
                             nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,

@@ -171,7 +171,7 @@ class LoginEndToEndTest(ApproveBase):
         des défis), efface URL/code et refuse lien et assertion tardifs."""
         supervisor = self.supervisor()
         supervisor.invalidate = lambda request: approve_client.close_login_request(
-            self.cfg, request.login_id)
+            self.cfg, request.login_id, request.close_token)
         request = supervisor.begin(host=self.HOST, harness="codex", account="default",
                                    home=self.home, version="0.159.3", approver=ALICE,
                                    requested_by=AGENT, environ=self.environ)

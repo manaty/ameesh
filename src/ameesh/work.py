@@ -187,6 +187,46 @@ def corrector(cfg, db, explicit: str | None = None, *, what: str = "correction",
     raise WorkError(refus % text)
 
 
+def claims_pilot(cfg, db, who: str) -> bool:
+    """#1664 : `who` se présente comme pilote — un humain (`human:<id>`) ou un
+    agent orchestrateur/conception, la même autorité que `corrector`
+    (`history=False` : seul un rôle déclaré compte, pas l'historique des lots
+    confiés)."""
+    from . import assignments
+
+    who = (who or "").strip()
+    if not who:
+        return False
+    if who.startswith(HUMAN_PREFIX):
+        return True
+    return assignments.is_orchestrator(cfg, db, who, roles=CORRECTOR_ROLES,
+                                       history=False)
+
+
+def check_wait_note(cfg, db, actor: str, text: str) -> str:
+    """#1664 r2 (B1) : un hold de pilote s'authentifie au chemin d'écriture.
+
+    `hold: <raison>` sert deux conventions : la retenue du réveil (règle 1),
+    que tout assigné pose, et le hold de pilote (#1664), qui éteint la
+    stagnation. Le journal ne garde que le texte et l'acteur : sans cette
+    garde, une session ordinaire écrivait `--actor human:<pilote>` (ou le nom
+    d'un pilote) et la relecture la croyait pilote. Un acteur qui se dit
+    pilote doit donc le prouver ici (`corrector`, `history=False`) ; une levée
+    (`unhold:`…) est toujours un geste de pilote. La note `hold:` d'un acteur
+    ordinaire reste permise : c'est la règle 1, et elle ne compte pas pour la
+    stagnation (`planned_waits.pilot_holds`)."""
+    text = (text or "").strip()
+    if not text:
+        return actor
+    from . import planned_waits
+
+    if planned_waits.is_lift_note(text):
+        return corrector(cfg, db, actor, what="hold lift", history=False)
+    if planned_waits.is_hold_note(text) and claims_pilot(cfg, db, actor):
+        return corrector(cfg, db, actor, what="hold", history=False)
+    return actor
+
+
 def forcer(cfg, db, explicit: str | None = None) -> str:
     """#540 : l'auteur d'un `--force "<raison>"`, écrit au journal du lot ;
     WorkError si la session ne peut pas le prouver. Une session qui porte une
@@ -923,6 +963,42 @@ def check_reviewer_choice(db: Db, item: dict, reviewer: str, *, cfg=None) -> str
     return name
 
 
+def _declared_harness(db: Db, name: str) -> str:
+    """Le harnais **déclaré au registre** d'un agent (`""` si absent)."""
+    from . import registry
+
+    try:
+        row = registry.get(db, name)
+    except Exception:
+        return ""
+    return ((row or {}).get("harness") or "").strip().lower()
+
+
+def reviewer_family_warning(db: Db, item: dict, reviewer: str) -> str:
+    """#800 : avertit (sans refuser) un relecteur de la famille de l'auteur.
+
+    Le canon §2 demande une relecture par une autre famille de modèle ; la
+    désignation (#705) ne le vérifiait pas. « Même famille » se lit au harnais
+    **déclaré au registre** (claude, codex et deepseek sont distincts :
+    consigne mesh-design du 13/10) ; c'est un avertissement indicatif — la
+    famille réelle se juge au tour de relecture (décision 18855a). Un humain,
+    un agent hors registre ou un harnais inconnu n'avertissent pas, et la
+    désignation est conservée dans tous les cas.
+    """
+    name = (reviewer or "").strip()
+    author = (item.get("assignee") or "").strip()
+    if not name or not author:
+        return ""
+    if name.startswith(HUMAN_PREFIX) or author.startswith(HUMAN_PREFIX):
+        return ""
+    author_harness = _declared_harness(db, author)
+    if not author_harness or author_harness != _declared_harness(db, name):
+        return ""
+    return ("reviewer %s and the lot's author %s share the harness %r: canon §2 "
+            "asks for a review by another model family (indicative warning, the "
+            "designation is kept, #800)" % (name, author, author_harness))
+
+
 def _review_item(cfg, db: Db, item_id: int, actor: str | None):
     """#705/#1979 : l'autorité du geste de relecture, et le lot, qui doit être
     en `qa` (comme pour `designate_reviewer`)."""
@@ -939,10 +1015,12 @@ def _review_item(cfg, db: Db, item_id: int, actor: str | None):
     return who, item
 
 
-def _write_reviewer(db: Db, item_id: int, value: str, who: str, event: str) -> dict:
+def _write_reviewer(db: Db, item_id: int, value: str, who: str, event: str, *,
+                    remove: bool = False) -> dict:
     """Écrit la colonne du relecteur (nom, vide, ou `REVIEWER_NONE`) et sa
     ligne de journal, ou dit pourquoi l'écriture n'a pas eu lieu."""
-    row = storage.of(db).work.designate_reviewer(item_id, value, actor=who, event=event)
+    row = storage.of(db).work.designate_reviewer(item_id, value, actor=who,
+                                                event=event, remove=remove)
     if row is None:
         # #705 r2 (B1) : la règle est relue dans l'écriture ; entre la lecture
         # et elle, le lot a pu quitter qa ou recevoir `value` comme assigné.
@@ -955,16 +1033,27 @@ def _write_reviewer(db: Db, item_id: int, value: str, who: str, event: str) -> d
 
 
 def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
-                       actor: str | None = None) -> dict:
-    """#705 : désigne (ou change) le relecteur d'un lot **déjà en `qa`**.
+                       actor: str | None = None, remove: bool = False) -> dict:
+    """#2076 : ajoute ou retire un relecteur d'un lot **déjà en `qa`**.
 
     Geste de pilote : mêmes autorités que la correction (`corrector`) — un
     humain, un orchestrateur ou un agent de conception. Le relecteur doit être
     joignable et différent de l'assigné (`check_reviewer_choice`). L'entrée en
-    `qa` peut aussi le désigner d'un coup : `work move <id> qa --reviewer`."""
+    `qa` peut aussi le désigner d'un coup : `work move <id> qa --reviewer`.
+    Même harnais déclaré que l'auteur : avertissement indicatif (#800), posé
+    sur la ligne rendue (`reviewer_warning`), la désignation est conservée."""
     who, item = _review_item(cfg, db, item_id, actor)
-    name = check_reviewer_choice(db, item, reviewer, cfg=cfg)
-    return _write_reviewer(db, item_id, name, who, "reviewer %s designated" % name)
+    # A former reviewer can still be withdrawn after leaving the registry.
+    name = (reviewer or "").strip() if remove else check_reviewer_choice(
+        db, item, reviewer, cfg=cfg)
+    if not name:
+        raise WorkError("empty reviewer")
+    warning = "" if remove else reviewer_family_warning(db, item, name)
+    row = _write_reviewer(db, item_id, name, who, "reviewer %s %s" % (
+        name, "removed" if remove else "designated"), remove=remove)
+    if warning:
+        row["reviewer_warning"] = warning
+    return row
 
 
 def clear_reviewer(cfg, db: Db, item_id: int, *, actor: str | None = None) -> dict:
@@ -1063,6 +1152,12 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
         if mode == "externe":
             hint = (" — its owner can force it with --externe" if responsible
                     else " — set its human owner first, then --externe")
+        elif row.get("operator_paused"):
+            # #2200 : ce n'est pas une inscription à réparer — la pause
+            # humaine se lève nommément, ou le lot va à un autre agent.
+            hint = (" — lift the operator pause (ameesh resume %s --operator "
+                    "--reason <reason>), or assign another agent (the team queue "
+                    "takes an unassigned lot)" % name)
         else:
             hint = (" — fix its registration or admission (agent-runner register "
                     "…, canon sync), or assign to a human (human:<id>)")
@@ -1496,9 +1591,64 @@ def _notify_released(db: Db, item_id: int, *, blocker_state: str,
         blocker_reason=blocker_reason, after_commit=after_commit)
 
 
+def _pr_number(pr_ref) -> "int | None":
+    """Le numéro de PR d'une référence `owner/repo#N`, ou None."""
+    text = str(pr_ref or "")
+    head, _, tail = text.rpartition("#")
+    return int(tail) if head and tail.isdigit() else None
+
+
+def _review_after_merge(db, item_id, *, sha: str = "", pr_ref=None, repo=None) -> dict:
+    """L539 : toute fusion **enregistrée** ouvre le lot de relecture du canon §2.
+
+    La file de fusion l'ouvre à l'atterrissage (`land`) ; ici passent les
+    autres voies — relevé des branches (L118), `sync-merges`, `sync-github`,
+    porte `git-merge`, `ameesh work merged` — et l'ouverture y est idempotente
+    (`review_lot.open_for_merge`). `repo` porte le dépôt où la fusion a été
+    constatée quand l'appelant le connaît (indice de classe).
+
+    Rend le constat de `review_lot.open_for_merge` (`id`, `created`, `why`),
+    jamais une exception : la fusion est un fait **déjà écrit**, rien ici ne
+    doit remonter jusqu'à l'appelant et transformer un fait acquis en échec.
+    Un `id` nul signale une relecture encore manquante — le diagnostic que
+    `catch_up` reprend."""
+    try:
+        from . import review_lot
+        return review_lot.open_for_merge(db, int(item_id), merged_sha=sha or "",
+                                         pr=_pr_number(pr_ref), repo=repo) or {}
+    except Exception as exc:  # noqa: BLE001 - la fusion reste un fait
+        return {"id": None, "created": False,
+                "why": "lot de relecture non ouvert : %s: %s" % (
+                    type(exc).__name__, str(exc)[:160])}
+
+
+def _resume_review_after_merge(db, item_id, *, sha: str = "", pr_ref=None,
+                               repo=None) -> dict:
+    """L539 (#1104) : reprendre la relecture manquante d'un lot **déjà** fusionné.
+
+    B1 de la R1 : ce chemin est rappelé par `sync-github` pour des lots
+    fusionnés avant l'activation (`review_catch_up_bound`, migration 0438) —
+    sans borne, chacun recevrait sa relecture avec l'échéance du jour, le
+    rattrapage historique que l'arbitrage pilote du 15/10 exclut. Le prédicat
+    partagé (`review_lot.catch_up_eligible`) dit la même vérité que `catch_up`
+    (borne, relecture manquante, marque terminale, tentatives) ; hors bornes,
+    rien n'est tenté et le lot reste au seul rattrapage borné."""
+    try:
+        from . import review_lot
+        if not review_lot.catch_up_eligible(db, int(item_id)):
+            return {"id": None, "created": False,
+                    "why": "hors bornes du rattrapage (fusion antérieure à l'activation"
+                           " ou marque terminale) : laissé à review_lot.catch_up"}
+        return _review_after_merge(db, item_id, sha=sha, pr_ref=pr_ref, repo=repo)
+    except Exception as exc:  # noqa: BLE001 - la fusion reste un fait
+        return {"id": None, "created": False,
+                "why": "reprise de relecture impossible : %s: %s" % (
+                    type(exc).__name__, str(exc)[:160])}
+
+
 def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source: str = "",
                  pr_ref: str | None = None, frozen_id: int | None = None,
-                 declared: bool = False, extra: str = "",
+                 declared: bool = False, extra: str = "", repo: str | None = None,
                  landed: tuple[int, str] | None = None) -> dict:
     """Fusion constatée : le lot passe `merged` et son jalon `merged` est posé.
 
@@ -1524,6 +1674,18 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
     le réveil ne peut être ni perdu (un échec annule la fusion, la reprise
     refait les deux) ni doublé (le verrou de graphe sérialise les fermetures,
     une seule voit la dernière attente tomber).
+
+    L539 (#1104) : une fusion enregistrée, par quelque voie que ce soit, ouvre
+    aussi le lot de relecture du canon §2 (`_review_after_merge`), y compris
+    hors file de fusion. `repo` est le dépôt où la fusion a été constatée
+    (le relevé le connaît) ; sans lui, la classe se lit sur le dossier de
+    travail de l'assigné, puis sur le dépôt du projet, et un doute n'ouvre
+    rien. Le lot de la file l'ouvre à l'atterrissage : l'ouverture est
+    idempotente. Un lot déjà fusionné (`already`) reprend lui aussi l'ouverture
+    manquante — la fusion reste acquise, et seulement dans les bornes du
+    rattrapage (`review_lot.catch_up_eligible`, B1 de la R1 #1104) ;
+    `review_lot.catch_up` reprend les lots fusionnés que les relevés ne
+    sélectionnent plus.
     """
     for _attempt in range(3):
         item = get(db, item_id)
@@ -1539,8 +1701,17 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
                     "detail": "lot pinned to workflow %s: transitions go through "
                               "process_registry" % pinned}
         if state in MERGED_STATES:
+            # L539 (#1104) : la fusion est acquise, mais sa relecture peut
+            # manquer (l'ouverture avait échoué). Ce chemin idempotent la
+            # reprend sans jamais rouvrir ni défaire la fusion (R1 #1104 P2-2),
+            # et seulement dans les bornes du rattrapage (B1 de la R1) : un lot
+            # fusionné avant l'activation n'est pas relu rétroactivement.
+            review = _resume_review_after_merge(db, item_id, sha=sha, pr_ref=pr_ref, repo=repo)
+            detail = "already %s" % state
+            if not review.get("id"):
+                detail += " — relecture non ouverte : %s" % (review.get("why") or "?")
             return {"id": int(item_id), "result": "already", "item": item,
-                    "detail": "already %s" % state}
+                    "detail": detail, "review_lot": review}
         if state == "closed":
             return {"id": int(item_id), "result": "refused", "item": item,
                     "detail": "lot closed (%s): merge seen%s, not reopened"
@@ -1573,8 +1744,15 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
         for record in threads:
             record(db.cfg, db)
         if row is not None:
+            # L539 (#1104) : la fusion est écrite ; le lot de relecture suit,
+            # sans jamais pouvoir la défaire. Un échec d'ouverture est rendu
+            # dans le constat (`review_lot`), pour être repris (`review_lot.catch_up`).
+            review = _review_after_merge(db, item_id, sha=sha, pr_ref=pr_ref, repo=repo)
+            detail = "%s → merged" % state
+            if not review.get("id"):
+                detail += " — relecture non ouverte : %s" % (review.get("why") or "?")
             return {"id": int(item_id), "result": "merged", "item": row,
-                    "detail": "%s → merged" % state}
+                    "detail": detail, "review_lot": review}
         if frozen_id is not None:
             freezes = [m for m in milestones(db, item_id) if m["kind"] == "frozen"]
             if not freezes or int(freezes[0]["id"]) != int(frozen_id):
@@ -1584,14 +1762,21 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
 
 
 def _declared_merge_commit(item: dict, sha: str, *, repo: str | None = None,
-                           cfg=None) -> str:
-    """#1286 : preuve locale, dans le dépôt du lot, avant toute fermeture."""
+                           cfg=None, announce=None) -> str:
+    """#1286 : preuve locale, dans le dépôt du lot, avant toute fermeture.
+
+    `announce` (facultatif, #1400) : appelé avec le constat `{id, app, title,
+    sha, subject, how}` une fois la preuve lue et acceptée, AVANT que
+    l'appelant n'écrive quoi que ce soit ; un refus de preuve ne l'appelle
+    pas.
+    """
     from . import plan_git
     from .canon import GitError
 
     label = "lot #%s (%s: %s)" % (item["id"], item.get("app") or "?", item["title"])
     try:
-        checkout = _checkout(lot_repository(item, cfg), repo, cfg)
+        slug = lot_repository(item, cfg)
+        checkout = _checkout(slug, repo, cfg)
         commit = plan_git._commit(checkout, sha)
         if not commit:
             raise WorkError("commit %s not found in the lot's repository" % sha)
@@ -1615,22 +1800,32 @@ def _declared_merge_commit(item: dict, sha: str, *, repo: str | None = None,
             if cited.group("branch") != item["branch"]:
                 how = None
         if not how and item.get("branch"):
-            # A recorded agent/feature branch may also be named in a real
-            # merge title; a mere mention in a review body proves nothing.
+            # #1400 : une branche enregistrée du lot (agent/…) est reconnue
+            # dans un VRAI commit de fusion — forme GitHub « from
+            # <propriétaire>/<branche> » comprise —, à condition que le
+            # propriétaire soit celui du dépôt canonique du lot (une branche
+            # homonyme d'un fork ne prouve rien) ; une simple mention dans un
+            # corps de revue ou un commit ordinaire ne prouve rien.
             parents = plan_git._out(checkout, "show", "-s", "--format=%P", commit)
             if (parents and len(parents.split()) >= 2
-                    and plan_git._mentions(title, item["branch"])):
+                    and plan_git.recorded_branch_merge(
+                        title, item["branch"], owner=slug.split("/", 1)[0])):
                 how = "recorded branch"
         if not how:
             raise WorkError("commit does not designate this lot: use ameesh-work: %s "
                             "in the commit message (a PR number alone is not a lot)" % lot)
+        if announce is not None:
+            announce({"id": lot, "app": item.get("app") or "",
+                      "title": item.get("title") or "", "sha": commit,
+                      "subject": title, "how": how})
         return commit
     except (WorkError, GitError, plan_git.MergeProbeError) as exc:
         raise WorkError("%s: merge declaration refused: %s" % (label, exc)) from exc
 
 
 def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
-           repo: str | None = None, migration_landed: int | None = None, cfg=None) -> dict:
+           repo: str | None = None, migration_landed: int | None = None, cfg=None,
+           announce=None) -> dict:
     """`ameesh work merged <id> --sha S` : une fusion faite hors PR et sans gel
     (fusion locale sur la branche cible) se déclare en une fois.
 
@@ -1641,6 +1836,13 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
     remplacé) n'est jamais rouvert : WorkError. Rend le constat de
     `close_merged`. Le commit doit être lisible dans le dépôt du lot, désigner
     ce lot et être entré dans sa cible ; aucune lecture réseau ni force.
+
+    `announce` (facultatif, #1400) : le callback du constat, appelé avec
+    `{id, app, title, sha, subject, how}` après la lecture de la preuve (une
+    branche enregistrée est reconnue dans un vrai commit de fusion, GitHub
+    comprise) et AVANT toute écriture ; un refus de preuve ne l'appelle pas, un
+    refus d'écriture (gel déclaré entre-temps) l'a déjà appelé et laisse
+    l'état inchangé.
 
     `migration_landed` (#1567) : le numéro de migration réellement atterri,
     quand la renumérotation du paquet a changé celui de la réservation (452 au
@@ -1657,7 +1859,7 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
     # Preserve idempotency and the closed-lot diagnostic without requiring
     # that an old clone or object still be available.
     if item["state"] not in (*MERGED_STATES, "closed"):
-        text = _declared_merge_commit(item, text, repo=repo, cfg=cfg)
+        text = _declared_merge_commit(item, text, repo=repo, cfg=cfg, announce=announce)
     landed = None
     if migration_landed is not None:
         number = _landed_number(migration_landed)
@@ -1902,13 +2104,16 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     il doit être joignable et différent de l'assigné (`check_reviewer_choice`),
     et seul un humain ou un orchestrateur le désigne (`corrector`). La
     désignation est journalisée ; `waiting()`, la vue de progrès et l'alerte
-    `stale_lot` le nomment avant tout verdict."""
+    `stale_lot` le nomment avant tout verdict. Un relecteur du **même harnais
+    déclaré** que l'auteur rend un avertissement indicatif (#800), jamais un
+    refus : il est posé sur la ligne rendue (`reviewer_warning`)."""
     if state not in STATES:
         raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
     if state == "closed":
         raise WorkError("to close a lot: ameesh work close <id> --abandoned | "
                         "--superseded-by <id> | --delivered --sha <reviewed head>")
     reviewer = (reviewer or "").strip() or None
+    reviewer_warning = ""
     if reviewer is not None:
         if state != "qa":
             raise WorkError(
@@ -1922,6 +2127,9 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
             raise WorkError(
                 "--reviewer: work_items.reviewer is missing (migration 0421): "
                 "run \"ameesh migrate\", then move the lot to qa with its reviewer")
+        if not _pg.has_reviewers(db):
+            raise WorkError("--reviewer: work_items.reviewers is missing (migration 0456): "
+                            "run \"ameesh migrate\", then move the lot to qa with its reviewers")
         actor = corrector(getattr(db, "cfg", None), db, actor, what="designation")
     item = get(db, item_id)
     if item is None:
@@ -1938,6 +2146,10 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     if reviewer is not None:
         reviewer = check_reviewer_choice(db, item, reviewer,
                                          cfg=getattr(db, "cfg", None))
+        # #800 : l'avertissement est calculé sur l'assigné d'avant le move (il
+        # ne change pas), et posé sur la ligne rendue quand la désignation
+        # aboutit — le CLI l'imprime, les appelants peuvent l'ignorer.
+        reviewer_warning = reviewer_family_warning(db, item, reviewer)
     if correct is not None:
         reason = (correct or "").strip()
         if not reason:
@@ -1975,6 +2187,12 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
             % (MAX_QA_LOOPS, item_id))
 
     held = state == "waiting_human"
+    # #1664 r2 (B1) : la note de transition peut poser ou lever une retenue ;
+    # elle s'authentifie au même titre que `work note`. Elle se stocke nette,
+    # comme `work note` : la lecture groupée ciblée (`lot_hold_events`) lit le
+    # motif des retenues sans dépendre des blancs Unicode du texte écrit.
+    note = (note or "").strip()
+    actor = check_wait_note(getattr(db, "cfg", None), db, actor, note)
     text = note or ("%s → %s" % (current, state))
     if reviewer:
         text = "%s — reviewer %s" % (text, reviewer)
@@ -2003,21 +2221,27 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
                 "qa, or %s now holds it): the move is written; check the lot "
                 "(ameesh work show %s) and designate the reviewer once it is in qa"
                 % (item_id, state, reviewer, reviewer, item_id))
-        row["reviewer"] = reviewer      # le CLI et les appelants le lisent
+        row["reviewer"] = designated["reviewer"]
+        row["reviewers"] = designated.get("reviewers")
+        if reviewer_warning:
+            row["reviewer_warning"] = reviewer_warning
     return row
 
 
-def note(db: Db, item_id: int, text: str, *, actor: str = "") -> bool:
+def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False) -> bool:
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
     if not (text or "").strip():
         raise WorkError("empty note")
-    storage.of(db).work.note(item_id, item["state"], text.strip(), actor)
+    text = text.strip()
+    actor = check_wait_note(getattr(db, "cfg", None), db, actor, text)
+    options = {"once": True} if once else {}
+    storage.of(db).work.note(item_id, item["state"], text, actor, **options)
     return True
 
 
-def events(db: Db, item_id: int, limit: int = 100) -> list[dict]:
+def events(db: Db, item_id: int, limit: int | None = 100) -> list[dict]:
     return storage.of(db).work.events(item_id, limit)
 
 
@@ -2105,9 +2329,17 @@ def milestone(
         raise WorkError("a freeze callback only makes sense for the `frozen` milestone")
     if get(db, item_id) is None:
         raise WorkError("lot %s not found" % item_id)
+    # #1465 : un gel ou un verdict déclaré dans un tour managé emporte la
+    # preuve exacte de son origine (acteur, session, tour, harnais, sha
+    # complet). Hors tour (orchestrateur, humain), le jalon s'écrit sans
+    # preuve : l'origine reste inconnue, jamais devinée par proximité.
+    from . import review_provenance
+    proof = review_provenance.proof_for_current_turn(db, actor=actor, sha=sha)
+    if proof and not actor:
+        actor = proof["actor"]
     return storage.of(db).work.add_milestone(
         item_id, kind, sha=sha.strip(), actor=actor, verdict=verdict, note=note.strip(),
-        on_frozen=on_frozen, after_commit=after_commit)
+        on_frozen=on_frozen, after_commit=after_commit, proof=proof)
 
 
 def delays(db: Db, limit: int = 200, *, ids: Sequence[int] | None = None) -> list[dict]:

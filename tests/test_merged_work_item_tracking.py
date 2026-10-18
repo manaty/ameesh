@@ -143,6 +143,35 @@ class MergedCommandTest(_Base):
         proc = self.mesh("work", "merged", str(lot["id"]))          # --sha obligatoire
         self.assertEqual(proc.returncode, 2)
 
+    def test_le_constat_est_affiche_avant_l_ecriture(self):
+        # #1400 : lot/app/titre et sujet du commit sont montrés avant que le
+        # lot ne change d'état ; la branche ENREGISTRÉE du lot est reconnue
+        # dans un vrai commit de fusion GitHub (propriétaire canonique).
+        lot = work.add(self.db, title="déclaration de fusion", app="nexlink",
+                       issue_ref="acme/web#12")
+        self.db.execute("UPDATE work_items SET branch = %s WHERE id = %s",
+                        ("agent/cx3-declaration", lot["id"]))
+        _git(self.repo, "commit", "--allow-empty", "-qm", "Base")
+        _git(self.repo, "checkout", "-qb", "agent/cx3-declaration")
+        with open(os.path.join(self.repo, "livre.txt"), "w") as fh:
+            fh.write("work\n")
+        _git(self.repo, "add", "livre.txt")
+        _git(self.repo, "commit", "-qm", "Work")
+        _git(self.repo, "checkout", "-q", "main")
+        _git(self.repo, "merge", "--no-ff", "agent/cx3-declaration", "-qm",
+             "Merge pull request #12 from acme/agent/cx3-declaration")
+        sha = _git(self.repo, "rev-parse", "HEAD")
+        proc = self.mesh("work", "merged", str(lot["id"]), "--sha", sha, "--repo", self.repo,
+                         env=self.env(AGENT_MAIL_NAME="claude1"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("declaring merge: lot #%d (nexlink: déclaration de fusion)" % lot["id"],
+                      proc.stdout)
+        self.assertIn("commit %s (recorded branch): Merge pull request #12 from "
+                      "acme/agent/cx3-declaration" % sha[:12], proc.stdout)
+        self.assertLess(proc.stdout.index("declaring merge"),
+                        proc.stdout.index("→ merged"))
+        self.assertEqual(self.merged_milestone(lot["id"])["sha"], sha)
+
     def test_commit_d_un_autre_lot_ne_modifie_ni_etat_ni_jalon(self):
         mine = work.add(self.db, title="redemption", app="nexlink", issue_ref="acme/web#9")
         other = work.add(self.db, title="git identity")
@@ -389,6 +418,59 @@ class MergeSweepTest(_Base):
         self.merge("feature/c", "Merge feature/c\n\n* suite de #%d" % n)
         self.sync()
         self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+
+    def test_diese_nie_dans_un_titre_ne_ferme_pas_le_lot(self):
+        # #2259, cas Nexlink #598 (commit 84c68e9d4) : un montage de paquet
+        # cite « sans #598 » dans son titre ; la branche du lot reste en
+        # avance, sa tête n'est pas dans la cible, le lot reste ouvert.
+        _git(self.repo, "config", plan_git.LOT_REF_GIT_KEY, "hash")
+        lot = self.lot()
+        n = lot["id"]
+        branch = "lot/%d-ouvert" % n
+        _git(self.repo, "checkout", "-q", "-b", branch, "develop")
+        self.commit("travail-du-lot")
+        _git(self.repo, "checkout", "-q", "develop")
+        work.set_branch(self.db, n, branch, "develop", actor="orch")
+        self.merge("feature/paquet-52-v2",
+                   "paquet 52 v2 : montage #2221 sur develop — recomposition sans "
+                   "#%d ni correctif .github (décision pilote (c), courrier #97932) "
+                   "[skip ci]" % n)
+        report = {r["work_item"]: r for r in self.sync()["results"]}
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        self.assertEqual(report[n]["result"], "open")
+        self.assertFalse([m for m in work.milestones(self.db, n) if m["kind"] == "merged"])
+
+    def test_diese_parenthese_nie_ne_ferme_pas_le_lot(self):
+        # R Codex #2259 : la parenthèse ne sépare pas « sans » du lot exclu.
+        _git(self.repo, "config", plan_git.LOT_REF_GIT_KEY, "hash")
+        lot = self.lot()
+        n = lot["id"]
+        self.merge("feature/paquet-sans-parenthese", "Merge sans (#%d)" % n)
+        self.sync()
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        self.assertFalse([m for m in work.milestones(self.db, n) if m["kind"] == "merged"])
+
+    def test_lot_livre_avant_sans_reste_cite(self):
+        # Précision impl-08 : « #N livré sans (#M) » livre N, jamais M.
+        _git(self.repo, "config", plan_git.LOT_REF_GIT_KEY, "hash")
+        livre, exclu = self.lot(), self.lot()
+        self.merge("feature/paquet-positif-avant-sans", "paquet : #%d livré sans (#%d)"
+                   % (livre["id"], exclu["id"]))
+        self.sync()
+        self.assertEqual(work.get(self.db, livre["id"])["state"], "merged")
+        self.assertEqual(work.get(self.db, exclu["id"])["state"], "intake")
+
+    def test_diese_retire_apres_le_numero_ne_ferme_pas_le_lot(self):
+        # #2259 : « Merge #N retiré » cite un retrait, pas une livraison.
+        # Restreindre la négation aux numéros d'après le mot fermait encore
+        # le lot (régression du 17/10) ; le participe nie aussi ce qui précède.
+        _git(self.repo, "config", plan_git.LOT_REF_GIT_KEY, "hash")
+        lot = self.lot()
+        n = lot["id"]
+        self.merge("feature/retrait", "Merge #%d retiré" % n)
+        self.sync()
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        self.assertFalse([m for m in work.milestones(self.db, n) if m["kind"] == "merged"])
 
     # --- L118b : la fusion d'une branche lot/<id>-… ferme le lot -----------
 
@@ -730,6 +812,46 @@ class MergeSweepTest(_Base):
             "Merge pull request #45 from org/branche": {45: "#id"},
             "Merge #7.": {7: "#id"},
             "Merge PR#9, depot#9, ##9, #9a, &#93;": {},
+            # #2259 : une mention niée ne désigne pas le lot. Le titre du
+            # commit 84c68e9d4 (Nexlink, paquet 52 v2) fermait #598 alors que
+            # sa PR restait ouverte et sa tête hors de develop. Le courrier
+            # cité dans la parenthèse du retrait ne prouve pas une livraison.
+            "paquet 52 v2 : montage #2221 (cd8b0483a) sur develop e5b4f300a — "
+            "recomposition sans #598 ni correctif .github (décision pilote (c), "
+            "courrier #97932) [skip ci]": {2221: "#id"},
+            "Merge sans #12": {},
+            "Merge retiré #12": {},
+            "Merge hors #12": {},
+            "Merge without #12": {},
+            "Revert #12": {},
+            "Merge sans #12 / #13 livré": {13: "#id"},
+            "Merge sans #12, puis #12 livré": {12: "#id"},
+            "Merge sans (#12)": {},
+            "Merge without (#12, (#13)), #14 livré": {14: "#id"},
+            "Merge #14 (sans #12)": {14: "#id"},
+            "paquet : #2221 sans #598": {2221: "#id"},
+            "#598 livré sans #601": {598: "#id"},
+            "Merge #14 sans (#12 ni (#13))": {14: "#id"},
+            "Merge sans #12 ni #13": {},
+            "Merge exclues #12": {},
+            "Merge #12 retiré": {},
+            "Merge (#12) retiré": {},
+            "Merge #12 reverted": {},
+            "Merge #12 sans #13": {12: "#id"},
+            # #2262 : un groupe ouvert sur un contraste est une proposition
+            # positive ; la négation du parent ne l'atteint pas.
+            "Merge sans #12 (mais #13 livré)": {13: "#id"},
+            "Merge sans (#12) (mais #13 livré)": {13: "#id"},
+            "Merge sans #12 (mais #13 livré sans #14)": {13: "#id"},
+            "Merge #12 retiré (mais #13 livré)": {13: "#id"},
+            # Un retrait après le groupe porte encore sur ce groupe.
+            "Merge (mais #13) retiré": {},
+            "Merge #12 (mais #13 aussi) reverted": {},
+            "Merge (mais #13) retiré (mais #14 livré)": {14: "#id"},
+            "Merge #12 without #13": {12: "#id"},
+            "Merge #12 hors #13": {12: "#id"},
+            "paquet : tout sauf #12": {},
+            "Merge #12 except #13": {12: "#id"},
             "Merge x\n\nameesh-work: #12\n  ameesh-work: 13": {12: "ameesh-work",
                                                                13: "ameesh-work"},
             "Merge x\n\nvoir ameesh-work: 14 plus tard": {},

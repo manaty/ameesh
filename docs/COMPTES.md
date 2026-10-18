@@ -171,8 +171,23 @@ dans le canon :
   seulement celles du compte choisi. Le profil est revalidé à chaque
   lancement, garde de budget active ou non : un profil invalide refuse le
   tour (consigne remise en attente, diagnostic dans `ameesh show`).
-* La bascule demande `ameesh migrate` (migration 0028) et un redémarrage de
-  l'exécuteur pour relire la configuration.
+* La bascule demande `ameesh migrate` (migration 0028). La configuration de
+  l'hôte est relue à chaud (#1466) : un compte ajouté, retiré ou corrigé dans
+  `config.json` prend effet au tour suivant, sans redémarrage de l'exécuteur.
+  Seuls les comptes, les plafonds, les rôles critiques et les binaires de
+  harnais suivent la relecture : la base, le schéma, le dossier d'état et les
+  cadences sont ceux du démarrage.
+* Profils (#1466) : un exécuteur peut être lancé sur un fichier nommé
+  (`AMEESH_CONFIG`) rangé sous `~/.config/ameesh/runner-profiles/`. Ce
+  **profil** est une superposition : les clés qu'il ne déclare pas — les
+  comptes, notamment — viennent de `config.json`. Une clé déclarée par le
+  profil l'emporte (une isolation voulue se déclare), et l'écart est affiché
+  par `ameesh doctor`, `ameesh accounts list` et le journal de l'exécuteur ;
+  un profil qui écrase `accounts` est signalé en clair. `"inherit": false`
+  rend un profil autonome ; `"inherit": true` force l'héritage ; une chaîne
+  nomme une autre base. Un fichier hors du dossier des profils reste autonome :
+  le banc de tests, et la configuration d'une autre base rangée à côté de
+  `config.json`, ne lisent jamais la configuration du poste.
 
 ## 3. Suivre et forcer
 
@@ -244,7 +259,14 @@ commencé est un **rejeu** du harnais : il reste lisible (la fenêtre échue vau
 0 %, L71) mais n'est pas daté et ne remplace jamais une mesure datée. Les
 lecteurs départagent par instant de production, jamais par l'heure
 d'insertion ; l'historique partagé (0434) complète la lecture locale d'un
-exécuteur, fenêtre par fenêtre, quand un autre état a publié plus frais.
+exécuteur, fenêtre par fenêtre, quand un autre état a publié plus frais. Une
+fenêtre reprise de l'historique n'est jamais réécrite dans l'historique (pas
+d'écho d'un hôte à l'autre) et `accounts list` indique son âge (« read … ago »)
+quand elle n'a pas de lecture locale. Sur un exécuteur `backend=mediated`,
+`operations.gauge_latest` n'est **pas** admise au contrat médié : la
+réconciliation d'historique y est inerte et la lecture locale est rendue
+silencieusement. C'est un choix documenté, pas une panne : admettre cette
+lecture toucherait le contrat d'autorisation et demanderait deux avis.
 
 Chaque choix de compte est journalisé avec sa raison dans le journal de
 l'exécuteur (`[agent] compte claude : secondaire — sans relevé : non vérifié,

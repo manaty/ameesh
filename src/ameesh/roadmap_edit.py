@@ -131,8 +131,9 @@ def document(text: str) -> dict:
     return body
 
 
-def _normalize(db, fields, *, base=None, now=None, literal_dates=False):
-    value = dict(payload(base) if base else {"kind": "commitment", "status": "proposed",
+def _normalize(db, fields, *, base=None, now=None, literal_dates=False, warnings=None):
+    before = payload(base) if base else None
+    value = dict(before or {"kind": "commitment", "status": "proposed",
         "owner": None, "project": None, "lot": None, "card": None,
         "source_type": "conversation", "source": None, "note": "", "depends_on": [], "due": None})
     unknown = set(fields) - set(_FIELDS) - {"key"}
@@ -167,16 +168,32 @@ def _normalize(db, fields, *, base=None, now=None, literal_dates=False):
             raise roadmap.RoadmapError("lot must be a positive task number or null")
         value["lot"] = int(text)
         item = work.get(db, value["lot"])
+        # A stored lot/project pair that has since gone stale must not lock an
+        # edit of an unrelated field: only a newly introduced pair raises.
+        stale_lot = before is not None and value["lot"] == before.get("lot")
         if item is None:
-            raise roadmap.RoadmapError("task %s not found" % lot)
-        item_project = item.get("app") or item.get("workstream")
-        if value["project"] and item_project and value["project"] != item_project:
-            raise roadmap.RoadmapError("project conflicts with attached task %s (%s)" % (lot, item_project))
-        value["project"] = value["project"] or item_project or None
-        if base is None or ("lot" in fields and "owner" not in fields):
-            value["owner"] = value["owner"] or item.get("assignee") or None
+            if warnings is not None and stale_lot:
+                warnings.append({"code": "stale_task", "reference": "task #%s" % value["lot"]})
+            else:
+                raise roadmap.RoadmapError("task %s not found" % lot)
+        else:
+            item_project = item.get("app") or item.get("workstream")
+            if value["project"] and item_project and value["project"] != item_project:
+                if warnings is not None and stale_lot and value["project"] == before.get("project"):
+                    warnings.append({"code": "stale_project_conflict",
+                                     "reference": "task #%s" % value["lot"],
+                                     "message": "project %s conflicts with attached task %s (%s)"
+                                                % (value["project"], value["lot"], item_project)})
+                else:
+                    raise roadmap.RoadmapError("project conflicts with attached task %s (%s)" % (lot, item_project))
+            value["project"] = value["project"] or item_project or None
+            if base is None or ("lot" in fields and "owner" not in fields):
+                value["owner"] = value["owner"] or item.get("assignee") or None
     if value["card"] and storage.of(db).packages.get(value["card"]) is None:
-        raise roadmap.RoadmapError("unknown WorkPackage: %s" % value["card"])
+        if warnings is not None and before is not None and value["card"] == before.get("card"):
+            warnings.append({"code": "stale_package", "reference": value["card"]})
+        else:
+            raise roadmap.RoadmapError("unknown WorkPackage: %s" % value["card"])
     refs = value["depends_on"]
     if not isinstance(refs, list) or any(not isinstance(r, str) or not r.strip() for r in refs):
         raise roadmap.RoadmapError("depends_on must be a list of nonempty references")
@@ -186,9 +203,25 @@ def _normalize(db, fields, *, base=None, now=None, literal_dates=False):
     return value
 
 
-def _references(db, rows, *, roots=None, validate_fields=False):
-    """Validate references and cycles in the reachable commitment graph."""
+def _references(db, rows, *, roots=None, validate_fields=False, introduced=None):
+    """Validate references and cycles in the reachable commitment graph.
+
+    ``introduced`` is the set of ``(node, reference)`` edges the current edit
+    adds or changes. When given, an invalid or cyclic edge that already existed
+    is reported as a warning (``"stale": True``) instead of an error: a legacy
+    reference must not lock the editing of an unrelated field. When it is None
+    (``plan validate``), every edge is checked strictly.
+    """
     errors, warnings, edges = [], [], {}
+    touched = {node for node, _ref in introduced} if introduced is not None else None
+
+    def bad(node, issue, ref=None):
+        if introduced is not None and (
+                (node, _reference(ref)) not in introduced if ref is not None else node not in touched):
+            warnings.append(dict(issue, stale=True))
+        else:
+            errors.append(issue)
+
     packages = {p["id"] for p in storage.of(db).packages.all() if p.get("present", True)}
     tasks = {}
     todo = list(rows if roots is None else roots)
@@ -208,7 +241,7 @@ def _references(db, rows, *, roots=None, validate_fields=False):
                 continue
         refs = row.get("depends_on") or []
         if not isinstance(refs, list) or any(not isinstance(ref, str) for ref in refs):
-            errors.append({"id": node, "code": "invalid_dependencies"})
+            bad(node, {"id": node, "code": "invalid_dependencies"})
             continue
         for ref in refs:
             target = ref if ref.startswith("@") else None
@@ -217,7 +250,7 @@ def _references(db, rows, *, roots=None, validate_fields=False):
                 target = "e"+str(int(match[1]))
             if target is not None:
                 if target not in rows:
-                    errors.append({"id": node, "code": "unknown_dependency", "reference": ref})
+                    bad(node, {"id": node, "code": "unknown_dependency", "reference": ref}, ref)
                     continue
                 edges[node].append(target)
                 todo.append(target)
@@ -235,13 +268,13 @@ def _references(db, rows, *, roots=None, validate_fields=False):
                 if task not in tasks:
                     tasks[task] = work.get(db, task)
                 if tasks[task] is None:
-                    errors.append({"id": node, "code": "unknown_task", "reference": ref})
+                    bad(node, {"id": node, "code": "unknown_task", "reference": ref}, ref)
                 elif row.get("lot") == task:
-                    errors.append({"id": node, "code": "self_dependency", "reference": ref})
+                    bad(node, {"id": node, "code": "self_dependency", "reference": ref}, ref)
                 continue
             package_ref = planned_waits._PACKAGE.fullmatch(ref)
             if (package_ref[1] if package_ref else ref) not in packages:
-                errors.append({"id": node, "code": "unknown_package", "reference": ref})
+                bad(node, {"id": node, "code": "unknown_package", "reference": ref}, ref)
     # Kahn's algorithm avoids recursion limits on long, valid imported chains.
     degree = {node: 0 for node in edges}
     for children in edges.values():
@@ -257,7 +290,14 @@ def _references(db, rows, *, roots=None, validate_fields=False):
                 ready.append(child)
         del degree[node]
     if degree:
-        errors.append({"code": "dependency_cycle", "ids": sorted(degree)})
+        issue = {"code": "dependency_cycle", "ids": sorted(degree)}
+        fresh = introduced is not None and any(
+            source in degree and child in degree and (source, child) in introduced
+            for source, children in edges.items() for child in children)
+        if introduced is not None and not fresh:
+            warnings.append(dict(issue, stale=True))
+        else:
+            errors.append(issue)
     return {"valid": not errors, "errors": errors, "warnings": warnings}
 
 
@@ -300,7 +340,8 @@ def create(db, fields, *, actor="", now=None):
         return st.roadmap.add_commitment(_database_row(value, actor=actor))
 
 
-def update(db, value, fields, *, if_match=None, now=None):
+def update(db, value, fields, *, if_match=None, now=None, warnings=None):
+    collected = [] if warnings is None else warnings
     with db.transaction() as tx:
         st = storage.of(tx)
         st.work_dependencies.lock()
@@ -313,10 +354,15 @@ def update(db, value, fields, *, if_match=None, now=None):
             raise roadmap.RoadmapError("nothing to update")
         if "key" in fields or "status" in fields:
             raise roadmap.RoadmapError("keys are immutable; use accept/done/cancel to change status")
-        prepared = _normalize(tx, fields, base=current, now=now)
+        prepared = _normalize(tx, fields, base=current, now=now, warnings=collected)
+        node = "e"+str(current["id"])
+        previous = set(payload(current)["depends_on"])
+        introduced = {(node, ref) for ref in prepared["depends_on"] if ref not in previous}
         graph = {"e"+str(r["id"]): payload(r) for r in st.roadmap.commitments()}
-        graph["e"+str(current["id"])] = prepared
-        _require_valid(_references(tx, graph, roots=["e"+str(current["id"])]))
+        graph[node] = prepared
+        report = _references(tx, graph, roots=[node], introduced=introduced)
+        _require_valid(report)
+        collected.extend(report["warnings"])
         if prepared == payload(current):
             return dict(current, unchanged=True)
         changes = {column: prepared[field] for field, column in _FIELDS.items()
@@ -333,14 +379,16 @@ def _prepare_import(db, body, existing, *, update_existing):
     aliases = {entry["key"]: ("e"+str(keyed[entry["key"]]["id"]) if entry["key"] in keyed else "@"+entry["key"])
                for entry in body["commitments"]}
     graph = {"e"+str(r["id"]): payload(r) for r in existing}
-    plan = []
+    plan, introduced, warnings = [], set(), []
     for entry in body["commitments"]:
         current = keyed.get(entry["key"])
-        normalized = _normalize(db, entry, base=current, literal_dates=True)
+        normalized = _normalize(db, entry, base=current, literal_dates=True, warnings=warnings)
         normalized["depends_on"] = list(dict.fromkeys(aliases.get(ref[1:], ref) if ref.startswith("@") else ref
                                                        for ref in normalized["depends_on"]))
         node = aliases[entry["key"]]
         graph[node] = normalized
+        previous = set(payload(current)["depends_on"]) if current else set()
+        introduced.update((node, ref) for ref in normalized["depends_on"] if ref not in previous)
         action = "create"
         if current:
             if normalized == payload(current):
@@ -354,9 +402,9 @@ def _prepare_import(db, body, existing, *, update_existing):
             else:
                 action = "update"
         plan.append({"node": node, "action": action, "value": normalized, "current": current})
-    validation = _references(db, graph, roots=[p["node"] for p in plan])
+    validation = _references(db, graph, roots=[p["node"] for p in plan], introduced=introduced)
     _require_valid(validation)
-    return plan, validation["warnings"]
+    return plan, warnings + validation["warnings"]
 
 
 def import_plan(db, body, *, apply=False, update_existing=False, actor=""):
