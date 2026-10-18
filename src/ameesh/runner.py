@@ -3522,20 +3522,50 @@ class AgentWorker(threading.Thread):
         except OSError:
             return ""
 
-    def _resident_usage_flush(self) -> bool:
-        """Écrit l'événement `resident.turn` encore en attente (L80a).
+    def _resident_usage_marker(self, usage: dict | None,
+                               travail: dict | None) -> bool:
+        """Pose (ou efface) la mesure résidente dans le marqueur (L80a).
 
-        Vrai quand il n'y a rien à écrire, ou quand l'écriture réussit. Un
-        échec garde l'événement **et** le marqueur comptable : la réparation
-        réessaie, et aucun tour suivant n'est autorisé tant que l'usage du
-        tour n'est pas lisible par le grand livre. Un flux Codex JSON-RPC ne
-        porte pas de `turn.completed` : sans cet événement, la ligne serait
-        réglée à zéro et la dépense perdue en silence."""
+        Le marqueur est l'état **durable** : un worker de remplacement y
+        retrouve l'événement et peut réparer le tour avant de le régler.
+        `created_ts` borne l'écriture au marqueur de CE tour, jamais celui
+        d'un remplaçant."""
+        try:
+            return registry.pending_spend_set_resident_usage(
+                self.db, self.name, usage,
+                None if travail is None else travail.get("created_ts"))
+        except db_mod.DbError as exc:
+            log_async("[%s] resident usage marker not written (%s)"
+                      % (self.name, db_mod.explain(exc)))
+            return False
+
+    def _resident_usage_durable(self, travail: dict | None) -> bool:
+        """Met la mesure du tour résident à l'abri avant comptabilité (L80a).
+
+        Elle vit d'abord dans le marqueur comptable (`resident_usage`), puis
+        dans le flux (`resident.turn`) que lit le grand livre. Vrai seulement
+        quand les deux sont faits : un worker de remplacement retrouve la
+        mesure et ne règle jamais zéro. Un échec laisse le marqueur en place
+        (fail-closed)."""
         from . import resident_runner
+        path = self._path("events.jsonl")
+        marker = travail
+        usage = marker.get("resident_usage") if isinstance(marker, dict) else None
+        if isinstance(usage, dict):
+            if not resident_runner.write_usage_event(path, usage):
+                return False
+            # le flux porte la mesure : le marqueur n'a plus à la garder
+            self._resident_usage_marker(None, marker)
+            marker = dict(marker, resident_usage=None)
         while self._resident_usage_pending:
             event = self._resident_usage_pending[0]
-            if not resident_runner.write_usage_event(self._path("events.jsonl"), event):
+            if not isinstance(marker, dict):
+                return False       # pas de marqueur : rien de durable à réparer
+            if not self._resident_usage_marker(event, marker):
                 return False
+            if not resident_runner.write_usage_event(path, event):
+                return False
+            self._resident_usage_marker(None, marker)
             self._resident_usage_pending.pop(0)
         return True
 
@@ -3661,11 +3691,6 @@ class AgentWorker(threading.Thread):
 
     def _compta_repare(self) -> None:
         """Avant un tour : rejoue le travail en attente ; `{}` suspend."""
-        if not self._resident_usage_flush():
-            self._compta_en_echec = True
-            log_async("[%s] resident usage event still not written: "
-                      "turn accounting stays suspended" % self.name)
-            return
         travail = self._compta_en_attente()
         if travail is None and self._compta_doute:
             # L72 : la suspension venait d'une base injoignable à la création
@@ -3673,6 +3698,11 @@ class AgentWorker(threading.Thread):
             self._compta_doute = False
             self._compta_en_echec = False
         if travail:
+            if not self._resident_usage_durable(travail):
+                self._compta_en_echec = True
+                log_async("[%s] resident usage still not durable: "
+                          "turn accounting stays suspended" % self.name)
+                return
             if self._annonce_ram:
                 # Ce worker a vu l'annonce du flux ; si la base ne l'a pas gardée,
                 # la mémoire fait foi (jamais le modèle du lancement).
@@ -3738,14 +3768,6 @@ class AgentWorker(threading.Thread):
         Le modèle **annoncé par le flux** du harnais prime sur celui figé au
         lancement : c'est la source du tour (mesh-design, 0019 §3).
         """
-        # L80a : sans l'événement d'usage du tour résident, la ligne serait
-        # écrite à zéro (le flux Codex JSON-RPC n'a pas de `turn.completed`) et
-        # le marqueur soldé. On garde les deux : la réparation réessaiera.
-        if not self._resident_usage_flush():
-            self._compta_en_echec = True
-            log_async("[%s] resident usage event not persisted: turn accounting "
-                      "left pending" % self.name)
-            return
         # L72 : le tour a eu lieu ; sa ligne de grand livre attend la base
         # plutôt que d'être remise à une réparation ultérieure.
         travail = self._avec_reprise("turn accounting", self._compta_en_attente)
@@ -3757,6 +3779,13 @@ class AgentWorker(threading.Thread):
             # marqueur d'un autre
             travail = dict(propre, model=self._annonce_ram or propre.get("model"))
         if travail:
+            # L80a : la mesure résidente doit être durable (marqueur puis flux)
+            # avant la ligne ; sinon on laisse le marqueur et le tour suspendu.
+            if not self._resident_usage_durable(travail):
+                self._compta_en_echec = True
+                log_async("[%s] resident usage not durable: turn accounting "
+                          "left pending" % self.name)
+                return
             if model_annonce:
                 travail = dict(travail, model=model_annonce)
             self._compta_ecrit(travail, incertain=incertain)
@@ -5155,8 +5184,10 @@ class AgentWorker(threading.Thread):
 
         Le `TurnResult` est aussi la seule source d'usage du tour pour le grand
         livre quand le flux brut ne la porte pas (Codex app-server, ACP) : il
-        est écrit une fois dans `events.jsonl` (L80a), avant la comptabilité,
-        pour que la réparation après panne retrouve la même mesure."""
+        est écrit une fois dans `events.jsonl` (L80a), avant la comptabilité.
+        Si le flux refuse l'écriture, l'événement est d'abord confié au
+        marqueur comptable : un worker de remplacement pourra réparer le tour
+        sans dépendre de la mémoire de celui-ci."""
         from . import resident, resident_runner
         if tour is None:
             return 1, None, rp.session  # pas lancé : l'erreur est déjà notée
@@ -5172,10 +5203,17 @@ class AgentWorker(threading.Thread):
         session = fin.session or rp.session
         if evenement is not None and not resident_runner.write_usage_event(
                 self._path("events.jsonl"), evenement):
-            # L80a B2 : la mesure est gardée pour la réparation, le tour n'est
-            # pas comptablement complet et le marqueur comptable reste en base
-            # (`_compta_termine` ne le solde pas).
-            self._resident_usage_pending.append(evenement)
+            # L80a B2 : la mesure passe d'abord dans le marqueur comptable
+            # (durable) ; à défaut elle reste en mémoire pour ce worker. Le
+            # tour n'est pas comptablement complet et le marqueur ne sera pas
+            # soldé tant que le flux ne porte pas la mesure.
+            travail = getattr(self, "_compta_travail", None)
+            if self._resident_usage_marker(evenement, travail):
+                if travail is not None:
+                    self._compta_travail = dict(travail, resident_usage=evenement)
+            else:
+                self._resident_usage_pending.append(evenement)
+                self._compta_en_echec = True
             return 1, "resident usage event not written", session
         if fin.status == resident.COMPLETED:
             self._resident_failures = 0     # T2 : la série d'échecs est close

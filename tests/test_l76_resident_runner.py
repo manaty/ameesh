@@ -437,23 +437,25 @@ class ResidentRunnerTest(PgTestCase):
     def test_a_lost_resident_usage_event_is_repaired_not_settled_at_zero(self):
         # L80a B2: the Codex JSON-RPC stream carries no `turn.completed`; if the
         # `resident.turn` event cannot be written, settling the marker would
-        # book 0. The turn is not settled, the measurement and the marker stay,
-        # and the repair writes the event then the ledger line before the next
-        # turn is authorised.
+        # book 0. The measurement goes to the durable marker first, the turn is
+        # not settled, and the repair writes the event then the ledger line
+        # before the next turn is authorised.
         _runner, worker = self._worker(doc=codex_doc(), harness="codex")
         with mock.patch.object(resident_runner, "write_usage_event",
                                return_value=False):
             self.assertFalse(self._turn(worker, "perdu"))
+            marker = registry.pending_spend_get(self.db, "res1")
+            self.assertIsNotNone(marker)
+            self.assertIsInstance(marker["resident_usage"], dict)
+            self.assertEqual(marker["resident_usage"]["usage"]["input_tokens"], 100)
             # no next turn before the measurement is durable
             self.assertFalse(worker.budget_ok())
             self.assertIsNotNone(registry.pending_spend_get(self.db, "res1"))
         self.assertTrue(worker._compta_en_echec)
-        self.assertIsNotNone(registry.pending_spend_get(self.db, "res1"))
-        self.assertEqual(len(worker._resident_usage_pending), 1)
+        self.assertEqual(worker._resident_usage_pending, [])
         self.assertEqual(self.db.query(
             "SELECT count(*)::int AS n FROM turn_costs")[0]["n"], 0)
-        # repair: the kept event is written, then the accounting marker replays
-        self.assertTrue(worker._resident_usage_flush())
+        # repair: the marker's event is written, then the accounting marker replays
         self.assertTrue(worker.budget_ok())
         self.assertIsNone(registry.pending_spend_get(self.db, "res1"))
         self.assertEqual(worker._resident_usage_pending, [])
@@ -469,6 +471,54 @@ class ResidentRunnerTest(PgTestCase):
                           rows[0]["output_tokens"], rows[0]["cum_input_tokens"]),
                          (300, 200, 9, 300))
         self.assertEqual(len(self._usage_events(worker)), 1)
+
+    def test_a_new_worker_repairs_the_resident_usage_left_in_the_marker(self):
+        # L80a B2: the durable state must survive the worker that served the
+        # turn. A replacement worker has no `_resident_usage_pending`; it finds
+        # the event in the accounting marker, refuses to settle while the event
+        # cannot be written, then repairs it and books the real usage.
+        runner, worker = self._worker(doc=codex_doc(), harness="codex")
+        with mock.patch.object(resident_runner, "write_usage_event",
+                               return_value=False):
+            self.assertFalse(self._turn(worker, "perdu"))
+        marker = registry.pending_spend_get(self.db, "res1")
+        self.assertIsNotNone(marker)
+        self.assertIsInstance(marker["resident_usage"], dict)
+        worker2 = AgentWorker(runner, registry.get(self.db, "res1"), {
+            "lease_epoch": worker.epoch,
+            "lease_expires_ts": time.time() + 3600,
+        })
+        self.addCleanup(worker2.watchdog_stop.set)
+        self.assertEqual(worker2._resident_usage_pending, [])
+        with mock.patch.object(resident_runner, "write_usage_event",
+                               return_value=False):
+            self.assertFalse(worker2.budget_ok())
+            self.assertIsNotNone(registry.pending_spend_get(self.db, "res1"))
+        self.assertTrue(worker2.budget_ok())
+        self.assertIsNone(registry.pending_spend_get(self.db, "res1"))
+        self.assertEqual(worker2._resident_usage_pending, [])
+        rows = self.db.query(
+            "SELECT usd::float8 AS usd, input_tokens, cached_input_tokens, "
+            "output_tokens FROM turn_costs WHERE agent = 'res1' ORDER BY id")
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["usd"],
+                               (100 * 1.25 + 200 * 0.125 + 9 * 10.0) / 1e6,
+                               places=9)
+        self.assertEqual((rows[0]["input_tokens"], rows[0]["cached_input_tokens"],
+                          rows[0]["output_tokens"]), (300, 200, 9))
+
+    def test_a_new_turn_marker_drops_the_previous_resident_usage(self):
+        # L80a: the marker is replaced before each turn; a payload left by a
+        # failed repair must never attach to the next turn.
+        self.assertTrue(registry.pending_spend_put(self.db, "res1", 0, "un", "m"))
+        self.assertTrue(registry.pending_spend_set_resident_usage(
+            self.db, "res1", {"type": resident.USAGE_EVENT,
+                              "usage": {"input_tokens": 1}}))
+        self.assertIsInstance(
+            registry.pending_spend_get(self.db, "res1")["resident_usage"], dict)
+        self.assertTrue(registry.pending_spend_put(self.db, "res1", 1, "deux", "m"))
+        self.assertIsNone(
+            registry.pending_spend_get(self.db, "res1")["resident_usage"])
 
     def test_changed_settings_restart_on_the_session(self):
         _runner, worker = self._worker()

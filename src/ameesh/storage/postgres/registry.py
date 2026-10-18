@@ -20,6 +20,7 @@ garanties, inchangées :
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Sequence
 
@@ -1081,8 +1082,10 @@ class PendingSpend(interface.PendingSpend):
                 model        = excluded.model,
                 work_item_id = excluded.work_item_id,
                 turn_id      = excluded.turn_id,
+                resident_usage = null,
                 created_at   = now()
             RETURNING agent, start_index, turn, model, work_item_id, turn_id,
+                      resident_usage,
                       extract(epoch from created_at)::float8 as created_ts
             """,
             (name, int(start_index), turn, model,
@@ -1098,10 +1101,27 @@ class PendingSpend(interface.PendingSpend):
         )
         return bool(rows)
 
+    def set_resident_usage(self, name, usage, created_ts=None) -> bool:
+        """L80a : l'événement `resident.turn` d'un tour non réglé, dans le
+        marqueur ; `created_ts` borne l'écriture au marqueur de ce tour."""
+        value = None if usage is None else json.dumps(usage, ensure_ascii=False)
+        if created_ts is None:
+            rows = self.db.query(
+                "UPDATE spend_pending SET resident_usage = %s::jsonb"
+                " WHERE agent = %s RETURNING agent", (value, name))
+        else:
+            rows = self.db.query(
+                "UPDATE spend_pending SET resident_usage = %s::jsonb"
+                " WHERE agent = %s"
+                " AND abs(extract(epoch from created_at)::float8 - %s) < 0.0000005"
+                " RETURNING agent", (value, name, float(created_ts)))
+        return bool(rows)
+
     def get(self, name) -> dict | None:
         rows = self.db.query(
             """
             SELECT agent, start_index, turn, model, work_item_id, turn_id,
+                   resident_usage,
                    extract(epoch from created_at)::float8 as created_ts
               FROM spend_pending WHERE agent = %s
             """,
