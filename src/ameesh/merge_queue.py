@@ -1411,7 +1411,6 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
                     # so no lot is ejected and nothing is cached: the next
                     # pass retries the trial.
                     busy = "%s: %s" % (type(exc).__name__, exc)
-                    out["error"] = busy
                 except (GitError, OSError) as exc:
                     stacks[key] = {"error": "%s: %s" % (type(exc).__name__, exc)}
                 result = {"error": busy} if busy is not None else stacks[key]
