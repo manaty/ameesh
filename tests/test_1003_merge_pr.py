@@ -549,8 +549,11 @@ class AdmissionGuardTest(_Base):
 
     def test_a_target_the_lot_is_not_queued_for_is_refused(self):
         # la cible du lot doit exister pour que la porte des avis puisse lire
-        # le delta (la provenance refuse une cible introuvable, #1515 B2)
+        # le delta (la provenance refuse une cible introuvable, #1515 B2) ;
+        # #2278 : elle doit aussi exister dans origin pour que l'admission
+        # passe, puis c'est le garde « queued for » qui refuse le lot.
         _git(self.repo, "branch", "develop", self.base)
+        _git(self.repo, "push", "-q", "origin", "main:develop")
         self.lot_target = "develop"
         with self.assertRaisesRegex(merge_pr.MergePrError, "queued for"):
             self.merge(self.gh())

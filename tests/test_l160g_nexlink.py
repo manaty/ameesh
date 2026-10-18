@@ -136,6 +136,8 @@ class ProtectedQueueTest(_Land):
         # gelé (#1515 B2)
         _git(self.repo, "branch", "-f", "develop", "main")
         self.project = dataclasses.replace(self.project, target="develop", protected=("main",))
+        # #2278 : la cible d'admission existe sur origin
+        _git(self.origin, "branch", "develop", "main")
         clone = resolutions.Replayer(self.repo, radar.clone_dir(self.cfg, "p"))
         # admission requires an explicit green CI (revue #544 r1); this test
         # only carries the target choice

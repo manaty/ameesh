@@ -771,6 +771,42 @@ def branch_tip(repo: str, branch: str, clone=None) -> tuple[str | None, str]:
     return tips[branch], where
 
 
+def admission_tips(repo: str, branch: str, target: str,
+                   clone=None) -> tuple[str | None, str, str]:
+    """(branch tip, target tip, repository holding them) of an admission, read
+    **once** fresh (`fetch_fresh`): a single listing and a single fetch for the
+    branch and the target together (#2318), never one fetch per name.
+
+    A target that origin no longer has raises QueueError at admission: without
+    it, the class was read from the clone's cached `QUEUE_REF` ref and a light
+    lot entered, only to be deferred at every pass (`run_pass`: target not
+    found) — no merge ever happened, but the queue said otherwise (#2278).
+    The target tip returned here is the exact commit admission validated; the
+    class is computed from it (`_class_of`), never from a `QUEUE_REF` ref that
+    a concurrent fetch of the queue can move between the check and the class.
+    Without an `origin`, the repository's local branches are the only copy: a
+    missing local branch is a missing target too.
+
+    A lot branch that origin no longer has raises QueueError, like
+    `branch_tip`; without an `origin`, the caller reads the `None` tip as
+    "neither local nor on origin"."""
+    if not target:
+        raise QueueError("no target branch known: the merge queue cannot admit a lot "
+                         "without a target (set the lot's target or the project's)")
+    tips, where = fetch_fresh(repo, [branch, target], clone)
+    tip, head = tips.get(branch), tips.get(target)
+    if tip is None and where != repo:
+        raise QueueError("cannot fetch branch %s from origin (no such branch there): push "
+                         "it again" % branch)
+    if head is None:
+        place = "origin" if where != repo else "the repository"
+        raise QueueError("target %s not found on %s: the merge queue refuses a lot whose "
+                         "target no longer exists (deleted or renamed). Push the target, point "
+                         "the lot at an existing branch, then ameesh work queue add the lot "
+                         "again" % (_remote_branch(target), place))
+    return tip, head, where
+
+
 def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
               commit_ci=None, full_ci=None, cfg=None, parts=None) -> dict:
     """Checks that `lot` may enter its queue. Returns `{target, frozen_sha,
@@ -788,7 +824,12 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     absent) leaves the verdict requirement in place; the class and its reason
     are traced in the queue note. The target resolved here (`branch_target`,
     then the project's, then the repository's default) carries through the
-    classification and the admission (revue #544 r2).
+    classification and the admission (revue #544 r2), and must exist **fresh**
+    on origin: an absent target is refused here, not deferred at every pass
+    (#2278). The branch and the target are read by **one** fresh fetch, and
+    the target commit it returns is the one the class is computed against
+    (#2318): no extra round trip, and no `QUEUE_REF` ref re-read that a
+    concurrent fetch of the queue could move.
 
     #2281 : un lot dont le pilote a marqué « verdict non requis » (#1979,
     `reviewer = -none`) entre sans avis, comme le veut la marque ; le gel
@@ -846,7 +887,10 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     if not freeze or not freeze.get("sha"):
         raise QueueError("lot #%d is not frozen: ameesh work milestone %d frozen --sha <commit>"
                          % (lot, lot))
-    tip, where = branch_tip(repo, row["branch"], clone)
+    # #2318 : un seul fetch pour la branche et la cible ; la cible doit exister
+    # (refus dès l'admission, #2278) et la tête qu'il rend est celle de la
+    # classe — jamais une ref `QUEUE_REF` relue après coup.
+    tip, target_sha, where = admission_tips(repo, row["branch"], target, clone)
     if not tip:
         raise QueueError("branch %s of lot #%d is neither local nor on origin"
                          % (row["branch"], lot))
@@ -860,7 +904,11 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
                          "(ameesh work milestone %d frozen --sha %s), then have it reviewed"
                          % (row["branch"], tip[:12], freeze["sha"][:12],
                             "" if frozen else " (not a commit of this repository)", lot, tip))
-    klass = _class_of(db, lot, row, repo, where, target, tip, cfg=cfg)
+    # #2278 : la cible doit exister fraîchement, sinon `_class_of` relit la
+    # ref gardée dans le clone et admet le lot pour un report éternel.
+    # #2318 : sa tête est celle du fetch unique d'admission, pas une ref relue.
+    klass = _class_of(db, lot, row, repo, where, target, tip, cfg=cfg,
+                      target_sha=target_sha)
     # #1374 : la même porte que le feu — avis comptés par classe, indépendants
     # (familles), et aucun blocage non levé ; un `ok` récent ne masque plus le
     # `blocked` d'un autre relecteur (P1-1). #2281 : la dispense de re-verdict
@@ -915,13 +963,19 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
 
 
 def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str | None,
-              tip: str, *, cfg=None) -> dict:
+              tip: str, *, cfg=None, target_sha: str | None = None) -> dict:
     """La classe du lot pour la file (L539) : lue là où la tête gelée vit.
 
     Le clone de la file range les branches sous `QUEUE_REF` ; à défaut la
     référence de la cible y est tentée, puis le dépôt du projet. `cfg` absent
     ou dépôt illisible : `lot_class.of_lot` rend un doute (`sensitive`, drapeau
     `doubt`), et la file garde l'exigence de verdict.
+
+    `target_sha` est la tête de cible exacte que l'admission vient de lire
+    (`admission_tips`, #2318) : la lecture dans le clone se fait depuis ce
+    commit, jamais depuis une ref `QUEUE_REF` qu'un fetch concurrent du radar
+    peut déplacer entre le contrôle de la cible et la classification. Absent
+    (atterrissage, relecture après fusion), la ref est relue comme avant.
 
     Les lectures sont **toutes** comparées : la plus haute l'emporte, une
     lecture calculée ne se rétrograde jamais devant une autre, et à classe
@@ -932,18 +986,21 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
     paths = []
     if target:
         base_repo = where or repo
-        for candidate in (QUEUE_REF + target, target):
-            if plan_git._commit(base_repo, candidate):
-                paths.append((base_repo, candidate))
-                break
+        if target_sha and plan_git._commit(base_repo, target_sha):
+            paths.append((base_repo, target, target_sha))
+        else:
+            for candidate in (QUEUE_REF + target, target):
+                if plan_git._commit(base_repo, candidate):
+                    paths.append((base_repo, candidate, None))
+                    break
         if where and where != repo:
-            paths.append((repo, target))
+            paths.append((repo, target, None))
     if not paths:
-        paths.append((repo, target))
+        paths.append((repo, target, None))
     best = None
-    for path, base in paths:
+    for path, base, base_sha in paths:
         current = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=path, base=base,
-                                   head=tip)
+                                   head=tip, base_sha=base_sha)
         if best is None or _class_worse(current, best):
             best = current
     return best
