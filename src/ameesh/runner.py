@@ -7376,7 +7376,7 @@ class Runner:
                 self.take_pass()
             except Exception as exc:
                 log_async("auto-take pass failed (%s): %s; runner continues"
-                          % (type(exc).__name__, " ".join(str(exc).split())[:300]))
+                          % (type(exc).__name__, db_mod.brief(exc)))
         for agent in registry.claimable(self.db, self.host, self.agents_filter):
             with self.lock:
                 if not self.once and agent["name"] in self.workers:
