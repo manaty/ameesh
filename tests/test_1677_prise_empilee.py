@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#1677 : la prise voit le travail réel (cas du 15/10).
 
-(a) Un lot dont tous les bloqueurs sont en `qa` avec un dernier verdict
-favorable est prenable : il s'empile sur leur tête gelée (branche et gel cités
-dans le courrier de prise). Un verdict bloquant, ou l'absence de verdict,
-bloque encore.
+(a) #2252 remplace #1677(a) : un bloqueur en `qa` n'est jamais satisfait, même
+à verdict courant favorable ; seul un bloqueur fusionné libère le dépendant
+(section `DependanceNonFusionneeTest`). La règle est celle de `work show` et de
+« planned: waiting on lots ».
 (b) L'inactivité d'un agent se lit sur ses lots actionnables — rien qui
 l'occupe, aucune correction attendue — et non sur le temps depuis son dernier
 tour, sinon un agent sans lot n'est jamais « au repos ».
@@ -23,7 +23,7 @@ from .test_l119_backlog import HEURE, _Base
 SHA = "a" * 40
 
 
-class _Empile(_Base):
+class _Prise(_Base):
     def lot(self, title, *, app="nexlink", age_s=HEURE, **kw):
         item = work.add(self.db, title=title, app=app, **kw)
         self.db.execute("UPDATE work_items SET created_at = created_at - make_interval("
@@ -74,62 +74,67 @@ class _Empile(_Base):
         return work.milestone(self.db, item_id, "frozen", sha=sha, actor="test")
 
 
-class EmpilementTest(_Empile):
-    def test_bloqueur_en_qa_a_verdict_favorable_est_prenable(self):
+class DependanceNonFusionneeTest(_Prise):
+    """(a) #2252 : une dépendance n'est satisfaite que FUSIONNÉE.
+
+    #1677 admettait un bloqueur en `qa` à verdict courant favorable, le
+    dépendant s'empilant sur sa tête gelée. Le 17/10, #661 a reçu un `ok` à
+    13:45:52, #667 a été pris à 13:45:57, puis #661 a reçu un `blocked` à
+    13:46:07 : la base venait de changer sous l'agent. La règle de #2252 est
+    celle de `work show` et de « planned: waiting on lots » — seule une fusion
+    libère le dépendant."""
+
+    def test_bloqueur_en_qa_a_verdict_favorable_ne_rend_pas_prenable(self):
         self.agent("claude1", team="nexlink")
         amont = self.amont("ok")
         empile = self.bloque(amont)
 
-        rows = storage.of(self.db).work.unassigned_lots(5)
-        self.assertEqual([r["id"] for r in rows], [empile["id"]])
-        # le courrier de prise nomme le bloqueur, sa branche et sa tête gelée
-        self.assertIn("#%d" % amont["id"], rows[0]["stack_on"])
-        self.assertIn("lot/amont", rows[0]["stack_on"])
-        self.assertIn(SHA, rows[0]["stack_on"])
 
-        out = self.take()
-        self.assertEqual([t["item"]["id"] for t in out], [empile["id"]])
-        courrier = self.courrier(empile["id"])
-        self.assertIn("Stacked on blocker(s)", courrier)
-        self.assertIn("lot/amont", courrier)
-        # #1738 (N8) : le texte dit ce que fait le produit — la file de fusion
-        # rejoue la pile sur le nouveau main (L160e), pas un rebase manuel.
-        self.assertIn("merge queue replays", courrier)
-        self.assertNotIn("rebase on the new main", courrier)
-
-    def test_assignation_directe_accepte_le_meme_bloqueur(self):
-        self.agent("claude1", team="nexlink")
-        amont = self.amont("ok")
-        empile = self.bloque(amont, title="empile direct", priority=2)
-        self.assertIsNotNone(self.pret(empile["id"]))
-
-    def test_verdict_bloque_ou_absent_ne_rend_pas_prenable(self):
-        self.agent("claude1", team="nexlink")
-        sans = self.amont(None, branch="lot/sans-verdict")
-        empile = self.bloque(sans)
         self.assertEqual(storage.of(self.db).work.unassigned_lots(5), [])
         self.assertIsNone(self.pret(empile["id"]))
         self.assertEqual(self.take(), [])
+        self.assertEqual(self.courrier(empile["id"]), "")
+        edge = storage.of(self.db).work_dependencies.for_items([empile["id"]])[0]
+        self.assertTrue(edge["blocking"], "un bloqueur en qa est bloquant")
+        self.assertEqual(edge["blocker_branch"], "lot/amont")
+        self.assertEqual(edge["blocker_frozen_sha"], SHA)
 
-        bloque = self.amont("blocked", branch="lot/bloque")
-        autre = self.bloque(bloque, title="empile bloque")
-        self.assertEqual(storage.of(self.db).work.unassigned_lots(5), [])
-        self.assertIsNone(self.pret(autre["id"]))
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s",
+                        (amont["id"],))
+        self.assertEqual([r["id"] for r in storage.of(self.db).work.unassigned_lots(5)],
+                         [empile["id"]])
+        out = self.take()
+        self.assertEqual([t["item"]["id"] for t in out], [empile["id"]])
+        # plus d'empilement : le courrier ne cite plus de tête en qa
+        self.assertNotIn("Stacked on", self.courrier(empile["id"]))
 
-    def test_le_dernier_verdict_fait_foi(self):
-        """Un `ok` ancien ne survit pas à un `blocked` plus récent : la
-        correction attendue referme la prise."""
+    def test_verdict_et_gel_ne_changent_plus_la_prise(self):
+        """Toutes les formes de `qa` bloquent : sans verdict, à verdict ok ou
+        bloqué, avec ou sans tête relue. Le dernier bloqueur fusionné libère."""
         self.agent("claude1", team="nexlink")
-        amont = self.amont("ok")
-        work.milestone(self.db, amont["id"], "verdict", verdict="blocked", sha=SHA,
-                       actor="test")
-        empile = self.bloque(amont)
+        sans = self.amont(None, branch="lot/sans-verdict")
+        juge = self.lot("amont juge", assignee="human:proprio")
+        self.db.execute("UPDATE work_items SET state = 'qa', branch = 'lot/juge'"
+                        " WHERE id = %s", (juge["id"],))
+        self.juge(juge["id"], sha="")           # ok qui ne nomme aucune tête (B2)
+        bloque = self.amont("blocked", branch="lot/bloque")
+        empile = self.bloque(sans, title="empile trois qa", priority=3)
+        for amont in (juge, bloque):
+            storage.of(self.db).work_dependencies.add(empile["id"], amont["id"],
+                                                      actor="test")
+
         self.assertEqual(storage.of(self.db).work.unassigned_lots(5), [])
-        self.assertIsNone(self.pret(empile["id"]))
+        self.assertEqual(self.take(), [])
+        for amont in (sans, juge):
+            self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s",
+                            (amont["id"],))
+            self.assertEqual(storage.of(self.db).work.unassigned_lots(5), [])
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s",
+                        (bloque["id"],))
+        self.assertEqual([t["item"]["id"] for t in self.take()], [empile["id"]])
 
     def test_un_bloqueur_encore_ouvert_suffit_a_bloquer(self):
-        """Deux bloqueurs : un fermé, un en qa à verdict favorable -> prenable ;
-        il suffit qu'un troisième soit en build pour que la prise attende."""
+        """Les autres dépendances closes ne rachètent pas un bloqueur en qa."""
         self.agent("claude1", team="nexlink")
         ferme = self.lot("ferme", assignee="human:proprio")
         self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s",
@@ -139,89 +144,18 @@ class EmpilementTest(_Empile):
         empile = self.bloque(juge, title="empile mixte", priority=3)
         storage.of(self.db).work_dependencies.add(empile["id"], ferme["id"], actor="test")
         storage.of(self.db).work_dependencies.add(empile["id"], encours["id"], actor="test")
+
         self.assertEqual(storage.of(self.db).work.unassigned_lots(5), [])
         work.close(self.db, encours["id"], abandoned=True, actor="test")
+        self.assertEqual(storage.of(self.db).work.unassigned_lots(5), [],
+                         "le bloqueur en qa tient encore")
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s",
+                        (juge["id"],))
         self.assertEqual([r["id"] for r in storage.of(self.db).work.unassigned_lots(5)],
                          [empile["id"]])
 
-    def test_for_items_dit_la_meme_verite(self):
-        amont = self.amont("ok")
-        empile = self.bloque(amont)
-        edge = storage.of(self.db).work_dependencies.for_items([empile["id"]])[0]
-        self.assertFalse(edge["blocking"])
-        self.assertEqual(edge["blocker_branch"], "lot/amont")
-        self.assertEqual(edge["blocker_frozen_sha"], SHA)
 
-        work.milestone(self.db, amont["id"], "verdict", verdict="blocked", sha=SHA,
-                       actor="test")
-        edge = storage.of(self.db).work_dependencies.for_items([empile["id"]])[0]
-        self.assertTrue(edge["blocking"])
-
-    # -- B1 : le verdict ne vaut que sur le dernier gel ---------------------
-
-    def test_un_regel_apres_un_ok_perime_le_verdict(self):
-        """B1 : regelé sur une autre tête, le lot n'est plus pris sur un `ok`
-        qui ne nomme pas son dernier gel — c'est la règle de la file de
-        fusion, et elle vaut aussi pour la prise."""
-        self.agent("claude1", team="nexlink")
-        amont = self.amont("ok")
-        empile = self.bloque(amont)
-        self.assertEqual([r["id"] for r in storage.of(self.db).work.unassigned_lots(5)],
-                         [empile["id"]])
-
-        self.regeler(amont["id"], "b" * 40)
-        self.assertEqual(storage.of(self.db).work.unassigned_lots(5), [])
-        self.assertIsNone(self.pret(empile["id"]))
-        self.assertEqual(self.take(), [])
-        edge = storage.of(self.db).work_dependencies.for_items([empile["id"]])[0]
-        self.assertTrue(edge["blocking"])
-
-    def test_un_regel_sur_la_meme_tete_garde_le_verdict(self):
-        """B1 : le préfixe admis — regeler le MÊME commit (sha court) ne périme
-        pas le verdict, et la tête rendue est celle qui a été relue."""
-        self.agent("claude1", team="nexlink")
-        amont = self.amont("ok", sha=SHA)
-        self.regeler(amont["id"], SHA[:12])
-        empile = self.bloque(amont)
-        rows = storage.of(self.db).work.unassigned_lots(5)
-        self.assertEqual([r["id"] for r in rows], [empile["id"]])
-        # la tête rendue est celle que le verdict nomme (le sha complet relu)
-        self.assertIn(SHA, rows[0]["stack_on"])
-
-    # -- B2 : la base d'empilement -----------------------------------------
-
-    def test_un_bloqueur_juge_sans_gel_empile_sur_le_sha_du_verdict(self):
-        """B2 : un `ok` sans jalon de gel offre la tête que le verdict nomme."""
-        self.agent("claude1", team="nexlink")
-        amont = self.lot("amont juge", assignee="human:proprio")
-        self.db.execute("UPDATE work_items SET state = 'qa', branch = 'lot/juge'"
-                        " WHERE id = %s", (amont["id"],))
-        self.juge(amont["id"])
-        empile = self.bloque(amont)
-
-        rows = storage.of(self.db).work.unassigned_lots(5)
-        self.assertEqual([r["id"] for r in rows], [empile["id"]])
-        self.assertIn(SHA, rows[0]["stack_on"])
-        self.assertEqual([t["item"]["id"] for t in self.take()], [empile["id"]])
-
-    def test_un_bloqueur_sans_tete_relue_reste_bloquant(self):
-        """B2 : un `ok` qui ne nomme aucune tête (ni gel) n'offre aucune base :
-        le dépendant n'est pas pris."""
-        self.agent("claude1", team="nexlink")
-        amont = self.lot("amont sans tete", assignee="human:proprio")
-        self.db.execute("UPDATE work_items SET state = 'qa', branch = 'lot/sans-tete'"
-                        " WHERE id = %s", (amont["id"],))
-        self.juge(amont["id"], sha="")
-        empile = self.bloque(amont)
-
-        self.assertEqual(storage.of(self.db).work.unassigned_lots(5), [])
-        self.assertIsNone(self.pret(empile["id"]))
-        self.assertEqual(self.take(), [])
-        edge = storage.of(self.db).work_dependencies.for_items([empile["id"]])[0]
-        self.assertTrue(edge["blocking"])
-
-
-class PropositionTest(_Empile):
+class PropositionTest(_Prise):
     """(c) : quand aucun lot n'est prenable, la prise propose une relecture
     (lot en qa sans verdict, autre famille que l'auteur) puis une correction
     (dernier verdict bloquant, auteur occupé)."""
@@ -605,7 +539,7 @@ class PropositionTest(_Empile):
         self.assertIsNone(work.get(self.db, item["id"])["assignee"])
 
 
-class InactiviteTest(_Empile):
+class InactiviteTest(_Prise):
     def ligne(self, name):
         return next(r for r in storage.of(self.db).operations.listing()
                     if r["name"] == name)
@@ -640,7 +574,7 @@ class InactiviteTest(_Empile):
         self.assertEqual(self.repos(time.time()), [])
 
 
-class RelecteurOccupeTest(_Empile):
+class RelecteurOccupeTest(_Prise):
     """#1726 : une relecture désignée (#705) sans verdict courant occupe son
     relecteur — la prise ne lui donne ni lot ni autre relecture, et l'alerte de
     sous-emploi ne le liste pas."""

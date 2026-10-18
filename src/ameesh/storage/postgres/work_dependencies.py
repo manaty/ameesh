@@ -24,17 +24,6 @@ def _last_milestone(alias: str, kind: str, column: str) -> str:
             "  ORDER BY m.at DESC, m.id DESC LIMIT 1)" % (column, alias, kind))
 
 
-def last_verdict(alias: str) -> str:
-    """#1677 : le DERNIER verdict d'un lot (`ok`/`blocked`/NULL), quel que soit
-    le gel qu'il nomme. Pour la règle de relecture, voir `current_verdict`."""
-    return _last_milestone(alias, "verdict", "verdict")
-
-
-def last_verdict_sha(alias: str) -> str:
-    """Le sha nommé par le dernier verdict (`''` quand il n'en nomme aucun)."""
-    return _last_milestone(alias, "verdict", "sha")
-
-
 def last_freeze_sha(alias: str) -> str:
     """Le sha nommé par le dernier gel (`''` quand il n'en nomme aucun)."""
     return _last_milestone(alias, "frozen", "sha")
@@ -51,10 +40,10 @@ def current_verdict(alias: str) -> str:
     correction. NULL quand le verdict ne porte pas sur le dernier gel (ou
     qu'il n'y en a pas).
 
-    Seul point de lecture de cette règle : `not_blocking`, `reviewed_head`, la
-    prise (`assign`, `unassigned_lots`), les lots actionnables du relevé et les
-    propositions de relecture s'y appuient, pour qu'un lot ne soit jamais pris
-    sur un verdict périmé (#1677 B1)."""
+    Seul point de lecture de cette règle : les lots actionnables du relevé et
+    les propositions de relecture s'y appuient, pour qu'un lot ne soit jamais
+    relu sur un verdict périmé (#1677 B1). La prise (L165) ne s'en sert plus :
+    depuis #2252, seule une fusion satisfait une dépendance."""
     return (
         "(SELECT CASE"
         "   WHEN v.verdict IS NULL THEN NULL"
@@ -74,29 +63,21 @@ def current_verdict(alias: str) -> str:
         % (alias, alias))
 
 
-def reviewed_head(alias: str) -> str:
-    """SQL : la tête relue d'un lot — le sha nommé par son verdict courant, à
-    défaut celui de son dernier gel ; NULL quand aucun ne nomme de commit.
-
-    #1677 B2 : c'est la base d'empilement d'un dépendant. Un bloqueur en `qa`
-    dont le verdict favorable ne nomme aucune tête (ni gel) n'offre aucune base
-    et reste donc bloquant : `not_blocking` exige une tête relue."""
-    return ("coalesce(nullif(btrim(%s), ''), nullif(btrim(%s), ''))"
-            % (last_verdict_sha(alias), last_freeze_sha(alias)))
-
-
 def not_blocking(alias: str) -> str:
-    """#1677 : prédicat SQL « ce lot ne bloque plus » — terminé, ou en `qa`
-    avec un verdict courant favorable ET une tête relue sur laquelle le
-    dépendant s'empile (B2). L'inverse exact du `blocking` rendu par
-    `for_items` et lu par la prise (`unassigned_lots`, `assign ready_only`)."""
-    # coalesce : sans verdict, `current_verdict` vaut NULL et la comparaison
-    # vaudrait NULL — un `NOT NULL` en SQL ne rend ni vrai ni faux, et la
-    # sous-requête `EXISTS` laisserait alors passer le dépendant (#1677).
-    return ("(%s.state IN %s OR (%s.state = 'qa' AND coalesce(%s, '') = 'ok'"
-            " AND %s IS NOT NULL))"
-            % (alias, _DONE_SQL, alias, current_verdict(alias),
-               reviewed_head(alias)))
+    """#2252 : prédicat SQL « ce lot ne bloque plus » — il est FUSIONNÉ
+    (`merged`/`promoted`/`closed`). Un lot en `qa`, même à verdict courant
+    favorable et à tête relue, ne libère plus ses dépendants.
+
+    #1677 avait admis le `qa` à verdict courant favorable comme satisfait, le
+    dépendant s'empilant sur la tête gelée. Le 17/10, #661 a reçu un `ok` à
+    13:45:52, #667 a été pris à 13:45:57, puis #661 a reçu un `blocked` à
+    13:46:07 : l'agent s'est retrouvé sur une base qui venait de changer. La
+    règle voulue par #2252 est celle de `work show` et de « planned: waiting
+    on lots » — une dépendance n'est satisfaite que fusionnée —, pour qu'aucun
+    lot ne soit pris sur une base instable. L'inverse exact du `blocking` rendu
+    par `for_items` et lu par la prise (`unassigned_lots`, `assign ready_only`).
+    """
+    return "(%s.state IN %s)" % (alias, _DONE_SQL)
 
 
 class WorkDependencies(Contract):
