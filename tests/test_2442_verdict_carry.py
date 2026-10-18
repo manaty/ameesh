@@ -16,11 +16,13 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import types
 import unittest
 from unittest import mock
 
-from ameesh import lot_class, merge_queue, registry, verdict_carry, work
+from ameesh import db as db_mod
+from ameesh import lot_class, merge_queue, plan_git, registry, verdict_carry, work
 
 from .support import PgTestCase
 
@@ -86,7 +88,8 @@ class CriterionTest(unittest.TestCase):
 
     def test_a_merge_of_the_target_is_a_realignment(self):
         frozen = self.repo.merge_target()
-        self.assertEqual(self.check(frozen), (True, "same merge result"))
+        self.assertEqual(self.check(frozen),
+                         (True, "same merge result, mechanical history and same lot delta"))
 
     def test_the_target_may_have_moved_since(self):
         frozen = self.repo.merge_target()
@@ -140,6 +143,67 @@ class CriterionTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("resolves a conflict", why)
 
+    def test_content_masked_by_the_target_is_not_a_realignment(self):
+        # R1 cx1, P1-2 : l'auteur ajoute à l'identique un fichier de la cible,
+        # sans en descendre. Le même arbre sur T le masque ; le delta du lot le
+        # montre — sinon il réapparaîtrait le jour où la cible le retire.
+        _git(self.repo.root, "switch", "-q", "lot/9-x")
+        frozen = _commit(self.repo.root, "other.txt", "other\n", "copie de la cible")
+        self.assertEqual(verdict_carry.merged_tree(self.repo.root, self.repo.t1, frozen),
+                         verdict_carry.merged_tree(self.repo.root, self.repo.t1,
+                                                   self.repo.reviewed))
+        ok, why = self.check(frozen)
+        self.assertFalse(ok)
+        self.assertIn("not a replay of a reviewed commit", why)
+        # la preuve du delta, seule, le refuse aussi
+        same = plan_git.rebase_identity(self.repo.root, self.repo.reviewed, frozen,
+                                        self.repo.t1)
+        self.assertFalse(same["mechanical"])
+        _git(self.repo.root, "switch", "-q", "main")
+        t2 = _commit(self.repo.root, "other.txt", "reverted\n", "la cible change d'avis")
+        self.assertNotEqual(verdict_carry.merged_tree(self.repo.root, t2, frozen),
+                            verdict_carry.merged_tree(self.repo.root, t2, self.repo.reviewed))
+
+    def test_an_added_then_removed_secret_is_not_a_realignment(self):
+        # R1 qa-01 : fusion de la cible, puis un secret ajouté et retiré. Arbre
+        # et delta net sont les mêmes ; l'historique porterait le secret.
+        self.repo.merge_target()
+        _commit(self.repo.root, "secret.txt", "s3cr3t\n", "oups")
+        _git(self.repo.root, "rm", "-q", "secret.txt")
+        _git(self.repo.root, "commit", "-q", "-m", "retiré")
+        frozen = _git(self.repo.root, "rev-parse", "HEAD")
+        ok, why = self.check(frozen)
+        self.assertFalse(ok)
+        self.assertIn("not a replay of a reviewed commit", why)
+
+    def test_a_merge_retouched_in_history_only_is_not_a_realignment(self):
+        # Une fusion qui ajoute un fichier, retiré au commit suivant : même
+        # atterrissage, mais la fusion n'est pas la fusion propre de ses parents.
+        _git(self.repo.root, "switch", "-q", "lot/9-x")
+        _git(self.repo.root, "merge", "-q", "--no-commit", "main")
+        with open(os.path.join(self.repo.root, "hidden.txt"), "w", encoding="utf-8") as fh:
+            fh.write("hidden\n")
+        _git(self.repo.root, "add", "hidden.txt")
+        _git(self.repo.root, "commit", "-q", "--no-edit")
+        _git(self.repo.root, "rm", "-q", "hidden.txt")
+        _git(self.repo.root, "commit", "-q", "-m", "retiré")
+        ok, why = verdict_carry.mechanical_history(
+            self.repo.root, self.repo.reviewed, _git(self.repo.root, "rev-parse", "HEAD"),
+            self.repo.t1)
+        self.assertFalse(ok)
+        self.assertIn("not the clean, unmodified merge", why)
+
+    def test_merges_and_replays_are_mechanical_history(self):
+        frozen = self.repo.merge_target()
+        self.assertEqual(verdict_carry.mechanical_history(
+            self.repo.root, self.repo.reviewed, frozen, self.repo.t1),
+            (True, "1 mechanical commit(s)"))
+        _git(self.repo.root, "switch", "-q", "-c", "rebased", "main")
+        _git(self.repo.root, "cherry-pick", self.repo.reviewed)
+        self.assertTrue(verdict_carry.mechanical_history(
+            self.repo.root, self.repo.reviewed, _git(self.repo.root, "rev-parse", "HEAD"),
+            self.repo.t1)[0])
+
     def test_the_same_head_carries_nothing(self):
         self.assertEqual(self.check(self.repo.reviewed), (False, "same head"))
 
@@ -168,6 +232,14 @@ class PendingTest(unittest.TestCase):
         self.assertEqual(verdict_carry.pending(rows, C), {})
         later = self.marks({"actor": "rev1", "sha": C}, {"actor": "rev1", "sha": A})
         self.assertEqual(verdict_carry.pending(later, C), {})
+
+    def test_an_outcome_is_found_from_an_abbreviated_sha(self):
+        # N1 qa-01 : la note porte des SHA à 12 caractères ; un verdict qui cite
+        # 7 caractères ou le SHA complet retrouve la même issue.
+        notes = ["verdict not carried: %s → %s on main@%s: x" % (A[:12], C[:12], B[:12])]
+        self.assertTrue(verdict_carry._decided(notes, A[:7], C))
+        self.assertTrue(verdict_carry._decided(notes, A, C[:8]))
+        self.assertFalse(verdict_carry._decided(notes, B[:7], C))
 
     def test_no_freeze_and_no_sha_carry_nothing(self):
         rows = self.marks({"actor": "rev1", "sha": A}, {"actor": "rev2", "sha": ""})
@@ -328,6 +400,94 @@ class CarryTest(PgTestCase):
         with mock.patch.object(verdict_carry, "realigned", side_effect=refreeze):
             self.assertEqual(self.carry()["result"], "moved")
         self.assertEqual(self.on(frozen), [])
+
+    def test_a_verdict_given_during_the_computation_is_kept(self):
+        # R1 cx1, P1-1 : un verdict réel déposé entre le calcul et l'écriture
+        # est relu sous le verrou du lot : le sien vaut, pas la copie.
+        self.verdict("rev1", self.repo.reviewed)
+        self.verdict("rev2", self.repo.reviewed)
+        frozen = self.repo.merge_target()
+        self.freeze(frozen)
+        real = verdict_carry.realigned
+
+        def meanwhile(*args):
+            result = real(*args)
+            self.verdict("rev1", frozen, "blocked")
+            return result
+
+        with mock.patch.object(verdict_carry, "realigned", side_effect=meanwhile):
+            result = self.carry()
+        self.assertEqual([e["actor"] for e in result["carried"]], ["rev2"])
+        rev1 = [m["verdict"] for m in self.on(frozen) if m["actor"] == "rev1"]
+        self.assertEqual(rev1, ["blocked"])
+        gate = self.gate(frozen)
+        self.assertFalse(gate["ok"])
+        self.assertEqual([b["actor"] for b in gate["blocked"]], ["rev1"])
+
+    def test_a_concurrent_verdict_waits_for_the_carry_and_wins(self):
+        # R1 cx1, P1-1 : la relecture des jalons et la copie tiennent le verrou
+        # de ligne du lot. Un verdict réel déposé par une autre connexion
+        # pendant l'écriture attend le COMMIT, puis l'emporte à la porte.
+        self.verdict("rev1", self.repo.reviewed)
+        self.verdict("rev2", self.repo.reviewed)
+        frozen = self.repo.merge_target()
+        self.freeze(frozen)
+        other = db_mod.connect(self.cfg)
+        self.addCleanup(other.close)
+        done = threading.Event()
+        errors: list = []
+
+        def genuine():
+            try:
+                work.milestone(other, self.lot, "verdict", sha=frozen, actor="rev1",
+                               verdict="blocked")
+            except Exception as exc:  # noqa: BLE001 - remonté par l'assertion
+                errors.append(exc)
+            finally:
+                done.set()
+
+        real, calls, waited = verdict_carry.pending, [], []
+
+        def inside(marks, declared):
+            calls.append(1)
+            if len(calls) == 2:       # la relecture sous le verrou, dans `_write`
+                worker = threading.Thread(target=genuine, daemon=True)
+                worker.start()
+                waited.append(done.wait(1.0))
+            return real(marks, declared)
+
+        with mock.patch.object(verdict_carry, "pending", side_effect=inside):
+            result = self.carry()
+        self.assertTrue(done.wait(30.0))
+        self.assertEqual(errors, [])
+        self.assertEqual(waited, [False], "le verdict concurrent a dû attendre le COMMIT")
+        self.assertEqual(result["result"], "carried")
+        gate = self.gate(frozen)
+        self.assertFalse(gate["ok"])
+        self.assertEqual([b["actor"] for b in gate["blocked"]], ["rev1"])
+
+    def test_the_copy_is_dated_from_its_original(self):
+        # R1 cx1, P1-1 : `now()` date le début de transaction. Un verdict réel
+        # dont la transaction a commencé avant l'écriture du report doit rester
+        # plus récent que la copie : elle est datée de l'original + 1 ms.
+        self.verdict("rev1", self.repo.reviewed)
+        self.verdict("rev2", self.repo.reviewed)
+        frozen = self.repo.merge_target()
+        self.freeze(frozen)
+        self.assertEqual(self.carry()["result"], "carried")
+        marks = work.milestones(self.db, self.lot)
+        original = [m for m in marks if m["kind"] == "verdict" and m["actor"] == "rev1"
+                    and m["sha"] == self.repo.reviewed][0]
+        copy = [m for m in self.on(frozen) if m["actor"] == "rev1"][0]
+        self.assertAlmostEqual(copy["at_ts"] - original["at_ts"], 0.001, places=4)
+        self.db.execute("INSERT INTO work_item_milestones (work_item_id, kind, sha, actor,"
+                      " verdict, note, at) VALUES (%s, 'verdict', %s, 'rev1', 'blocked',"
+                      " 'réel, transaction ouverte avant le report',"
+                      " to_timestamp(%s))",
+                      (self.lot, frozen, original["at_ts"] + 0.5))
+        gate = self.gate(frozen)
+        self.assertFalse(gate["ok"])
+        self.assertEqual([b["actor"] for b in gate["blocked"]], ["rev1"])
 
     def test_without_repository_nothing_is_proven(self):
         self.verdict("rev1", self.repo.reviewed)

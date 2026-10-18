@@ -8,22 +8,35 @@ verdicts rendus **sur la tête gelée**) redemande deux verdicts, sans rien de
 nouveau à relire. Le canon le dit déjà (§11 bis : « verdicts acquis : ni gel
 répété, ni second avis sur delta ») ; ce module le fait sans jugement (§7).
 
-**Critère** — déterministe et vérifiable : sur la pointe **fraîche** de la
-cible `T`, la fusion d'essai de la tête relue `R` et celle de la nouvelle tête
-gelée `F` sont toutes deux propres et donnent **le même arbre**. Atterrir `F`,
-c'est alors atterrir `R` : rien de ce qui entre dans la cible n'a changé. Tout
-autre écart laisse la porte exiger ses verdicts : un commit de l'auteur, une
-fusion « maligne », le contenu d'une branche qui n'est pas dans la cible, et
+**Critère** — déterministe et vérifiable, deux preuves sur la pointe
+**fraîche** de la cible `T` :
+
+1. *même atterrissage* : la fusion d'essai de la tête relue `R` et celle de la
+   nouvelle tête gelée `F` sont toutes deux propres et donnent **le même
+   arbre** — atterrir `F`, c'est atterrir `R` aujourd'hui ;
+2. *même delta de lot* (R1 cx1, P1-2) : le diff de chaque tête depuis sa base
+   de fusion avec `T` a **le même patch-id verbatim** (`plan_git.
+   rebase_identity`, #1905, la preuve des candidats de paquet). C'est la preuve
+   structurelle qui rend le report durable : un contenu que l'auteur ajoute à
+   l'identique de la cible, sans en descendre, est masqué par `T` dans la
+   preuve 1 mais change le delta — et réapparaîtrait si la cible le retirait.
+
+Tout autre écart laisse la porte exiger ses verdicts : un commit de l'auteur,
+une fusion « maligne », le contenu d'une branche qui n'est pas dans la cible,
 une résolution de conflit (la tête relue ne fusionne plus proprement : la
-résolution est un jugement, que seule la dispense du pilote couvre, #1979).
-Une cible illisible, un commit absent ou une fusion d'essai ratée ne prouvent
-rien : pas de report.
+résolution est un jugement, que seule la dispense du pilote couvre, #1979), et
+par prudence un réalignement dont les lignes de contexte ont bougé près des
+morceaux du lot. Une cible illisible, un commit absent ou une fusion d'essai
+ratée ne prouvent rien : pas de report.
 
 **Report** — pour chaque relecteur, son **dernier** verdict, s'il porte sur une
 tête réalignée, est recopié en jalon `verdict` sur la tête gelée : au nom du
 relecteur (sa famille compte à la porte, #1374), sans preuve de tour (#1465 :
-ce n'est pas un tour du relecteur), avec la note `verdict carried: alignment
-…`, et une ligne au journal du lot. Un **blocage se reporte** comme un avis
+ce n'est pas un tour du relecteur), **daté de son original plus une
+milliseconde** — tout geste réel ultérieur du même relecteur reste plus récent,
+même si sa transaction a commencé avant l'écriture du report (`now()` date le
+début de transaction) —, avec la note `verdict carried: alignment …`, et une
+ligne au journal du lot. Un **blocage se reporte** comme un avis
 favorable : un réalignement ne lave jamais un blocage. Un relecteur qui a déjà
 un verdict sur la tête gelée n'en reçoit pas ; le dernier verdict d'un
 relecteur rendu sur une autre tête (non réalignée) n'est pas remplacé par un
@@ -31,13 +44,17 @@ plus ancien.
 
 Le report se fait au gel (`ameesh work milestone <lot> frozen`, `carry`) et à
 chaque relevé des branches de l'exécuteur (`run_pass`), sous le bail du feu du
-lot (`fire:<lot>`) : jalons relus sous le bail, gel revérifié avant
-l'écriture. Une issue définitive (reporté ou non) est journalisée une fois par
+lot (`fire:<lot>`, un seul calcul git à la fois). L'écriture (R1 cx1, P1-1)
+tient **le verrou de ligne du lot** — celui que prend `add_milestone` pour
+tout gel et tout verdict — dans une seule transaction : gel et verdicts y sont
+relus, et un gel ou un verdict concurrent passe entièrement avant ou après.
+Une issue définitive (reporté ou non) est journalisée une fois par
 couple (tête relue, tête gelée) ; le passage suivant ne la recalcule pas.
 """
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import tempfile
 
@@ -83,27 +100,33 @@ def pending(marks, frozen) -> dict:
         key = _key(mark.get("actor"))
         if _same(mark.get("sha"), frozen):
             current.add(key)
-        if key not in latest or merge_queue._mark_order(mark) > merge_queue._mark_order(latest[key]):
+        order = merge_queue._mark_order
+        if key not in latest or order(mark) > order(latest[key]):
             latest[key] = mark
     return {key: mark for key, mark in latest.items()
             if key not in current and not _same(mark.get("sha"), frozen)}
 
 
-def merged_tree(repo: str, target: str, head: str) -> str | None:
+def merged_tree(repo: str, target: str, head: str, *, base: str | None = None,
+                attributes: str | None = None) -> str | None:
     """L'arbre de la fusion d'essai **propre** de `head` dans `target`, ou None
-    (conflit, commit inconnu, git en échec). Les objets écrits vont dans un
-    dossier jetable (le dépôt en alternates) : rien n'entre dans `.git` (L230).
-    Les attributs de fusion se lisent dans l'arbre de la cible (#1517)."""
+    (conflit, commit inconnu, git en échec). `base` impose la base de fusion
+    (un cherry-pick : `base` = parent du commit repris). Les objets écrits vont
+    dans un dossier jetable (le dépôt en alternates) : rien n'entre dans `.git`
+    (L230). Les attributs de fusion se lisent dans l'arbre de `attributes`, la
+    cible par défaut (#1517)."""
     from . import radar
     objects = plan_git._out(repo, "rev-parse", "--path-format=absolute",
                             "--git-path", "objects")
     if not objects:
         return None
+    extra = ["--merge-base", base] if base else []
     scratch = tempfile.mkdtemp(prefix="ameesh-carry-")
     try:
-        proc = radar._scratch_git(repo, objects, scratch, "-c", "attr.tree=%s" % target,
+        proc = radar._scratch_git(repo, objects, scratch,
+                                  "-c", "attr.tree=%s" % (attributes or target),
                                   "merge-tree", "--write-tree", "-z", "--name-only",
-                                  "--no-messages", target, head)
+                                  "--no-messages", *extra, target, head)
     except radar.GitError:
         return None
     finally:
@@ -114,9 +137,76 @@ def merged_tree(repo: str, target: str, head: str) -> str | None:
     return lines[0].strip() if lines else None
 
 
+#: commits nouveaux examinés au plus pour une preuve d'historique (borne de coût)
+MAX_NEW_COMMITS = 200
+
+
+def _lines_of(repo: str, *args: str) -> list[str] | None:
+    proc = plan_git._git(repo, *args)
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.decode("utf-8", "replace").split()
+
+
+def mechanical_history(repo: str, reviewed: str, frozen: str, tip: str) -> tuple:
+    """R1 cx1/qa-01 : chaque commit atteignable depuis `frozen` mais ni depuis
+    `reviewed` ni depuis la cible `tip` est **mécanique** — rien de ce que la
+    nouvelle tête apporte à l'historique n'est un contenu neuf :
+
+    * une fusion à deux parents dont l'arbre est **exactement** la fusion
+      d'essai propre de ses parents (ni conflit résolu, ni retouche) ;
+    * un commit à un parent qui reprend proprement (cherry-pick, rebase) un
+      commit de l'historique relu de même patch-id : son arbre est la fusion
+      d'essai du commit repris sur son parent, avec pour base le parent repris.
+
+    Une copie à la main d'un fichier de la cible, un ajout suivi d'un retrait
+    (un secret resterait dans l'historique), une fusion « maligne » ou le
+    contenu d'une autre branche sont refusés. Rend `(oui, raison)`."""
+    new = _lines_of(repo, "rev-list", "--topo-order", "--reverse", frozen, "--not",
+                   reviewed, tip)
+    if new is None:
+        return False, "the new commits cannot be listed"
+    if len(new) > MAX_NEW_COMMITS:
+        return False, "too many new commits to prove (%d)" % len(new)
+    sources = None
+    for commit in new:
+        parents = _lines_of(repo, "rev-list", "--parents", "-n", "1", commit)
+        tree = plan_git._out(repo, "rev-parse", commit + "^{tree}")
+        if not parents or not tree:
+            return False, "commit %s cannot be read" % commit[:12]
+        parents = parents[1:]
+        if len(parents) == 2:
+            if merged_tree(repo, parents[0], parents[1], attributes=parents[0]) != tree:
+                return False, ("merge %s is not the clean, unmodified merge of its parents "
+                               "(conflict resolved or content added)" % commit[:12])
+            continue
+        if len(parents) != 1:
+            return False, "commit %s has %d parents" % (commit[:12], len(parents))
+        if sources is None:
+            try:
+                sources = plan_git._patch_ids(repo, reviewed, "--not", tip)
+            except Exception:  # noqa: BLE001 - patch-id illisible : rien de prouvé
+                return False, "the reviewed commits' patch-ids cannot be read"
+        try:
+            pid = plan_git._diff_patch_id(repo, parents[0], commit)
+        except Exception:  # noqa: BLE001 - idem
+            pid = None
+        source = sources.get(pid) if pid else None
+        origin = _lines_of(repo, "rev-list", "--parents", "-n", "1", source) if source else None
+        if not origin or len(origin) != 2:
+            return False, ("commit %s is not a replay of a reviewed commit: new content "
+                           "in the history" % commit[:12])
+        if merged_tree(repo, parents[0], source, base=origin[1],
+                       attributes=parents[0]) != tree:
+            return False, ("commit %s is not the clean replay of reviewed commit %s"
+                           % (commit[:12], source[:12]))
+    return True, "%d mechanical commit(s)" % len(new)
+
+
 def realigned(repo: str, reviewed: str, frozen: str, tip: str) -> tuple:
     """`frozen` est-elle un réalignement mécanique de `reviewed` sur la cible
-    de pointe `tip` ? Rend `(oui, raison)` ; la raison dit pourquoi non."""
+    de pointe `tip` ? Trois preuves : même atterrissage, historique mécanique,
+    même delta de lot. Rend `(oui, raison)` ; la raison dit pourquoi non."""
     if _same(reviewed, frozen):
         return False, "same head"
     theirs = merged_tree(repo, tip, frozen)
@@ -129,7 +219,18 @@ def realigned(repo: str, reviewed: str, frozen: str, tip: str) -> tuple:
     if ours != theirs:
         return False, ("landing the frozen head would not land the reviewed content: "
                        "the merge results differ")
-    return True, "same merge result"
+    history, why = mechanical_history(repo, reviewed, frozen, tip)
+    if not history:
+        return False, why
+    # R1 cx1, P1-2 : le delta propre du lot est le même des deux côtés
+    # (`plan_git.rebase_identity`, #1905 : patch-id verbatim du diff écrasé
+    # depuis la base de chaque tête avec la cible).
+    same = plan_git.rebase_identity(repo, reviewed, frozen, tip)
+    if not same.get("mechanical"):
+        return False, ("the lot's own delta differs from the reviewed one (%s): content "
+                       "not inherited from the target, or context moved near the lot's "
+                       "hunks" % (same.get("detail") or "?"))
+    return True, "same merge result, mechanical history and same lot delta"
 
 
 def _outcomes(db, lots) -> dict:
@@ -150,9 +251,18 @@ def _arrow(reviewed: str, frozen: str) -> str:
     return "%s → %s" % (_norm(reviewed)[:12], _norm(frozen)[:12])
 
 
+_ARROW_RE = re.compile(r"\b([0-9a-f]{4,64}) → ([0-9a-f]{4,64})\b")
+
+
 def _decided(notes, reviewed: str, frozen: str) -> bool:
-    arrow = _arrow(reviewed, frozen)
-    return any(arrow in note for note in notes)
+    """Une issue est-elle déjà journalisée pour ce couple de têtes ? Les têtes
+    se comparent au préfixe (N1 qa-01) : un verdict qui cite un SHA abrégé
+    retrouve l'issue écrite avec le SHA résolu, sans nouveau calcul."""
+    for note in notes or ():
+        for left, right in _ARROW_RE.findall(note):
+            if _same(left, reviewed) and _same(right, frozen):
+                return True
+    return False
 
 
 def _clone(cfg, row: dict, repo: str):
@@ -174,7 +284,8 @@ def _passive(db, to, lot: int, text: str, data: dict) -> None:
 
 
 def carry(cfg, db, lot: int, *, repo: str | None = None, clone=None,
-          dry_run: bool = False, lock: bool = True, notes=None) -> dict:
+          dry_run: bool = False, lock: bool = True, notes=None,
+          fetched: dict | None = None) -> dict:
     """Reporte sur la tête gelée du lot les verdicts rendus sur une tête dont
     elle n'est qu'un réalignement mécanique (critère du module).
 
@@ -182,21 +293,23 @@ def carry(cfg, db, lot: int, *, repo: str | None = None, clone=None,
     `result` : `idle` (rien à reporter), `carried`, `not-carried`,
     `no-repository`, `busy` (bail tenu ailleurs), `moved` (gel changé
     pendant le calcul), `error` (cible illisible…). `would-carry` en essai.
-    `notes` : les issues déjà journalisées du lot, lues par l'appelant.
+    `notes` : les issues déjà journalisées du lot, lues par l'appelant ;
+    `fetched` : les pointes de cible déjà récupérées pendant ce passage, par
+    `(dépôt, cible)` (N2 qa-01 : une récupération par projet, pas par lot).
     Ne lève jamais."""
     lot = int(lot)
     out: dict = {"lot": lot, "result": "idle", "frozen": "", "target": "", "tip": "",
                  "carried": [], "refused": [], "detail": ""}
     try:
         return _carry(cfg, db, lot, out, repo=repo, clone=clone, dry_run=dry_run, lock=lock,
-                      notes=notes)
+                      notes=notes, fetched={} if fetched is None else fetched)
     except Exception as exc:  # noqa: BLE001 - jamais fatal : retenté au passage suivant
         out.update(result="error", detail="%s: %s" % (type(exc).__name__, str(exc)[:300]))
         return out
 
 
 def _carry(cfg, db, lot: int, out: dict, *, repo, clone, dry_run: bool, lock: bool,
-           notes) -> dict:
+           notes, fetched: dict) -> dict:
     from . import fire, lot_class
     row = work.get(db, lot)
     if row is None or row.get("state") in tuple(work.MERGED_STATES) + ("closed",):
@@ -228,13 +341,18 @@ def _carry(cfg, db, lot: int, out: dict, *, repo, clone, dry_run: bool, lock: bo
         out.update(result="error", detail="no target branch known for the lot")
         return out
     out["target"] = merge_queue._remote_branch(target)
-    names = [target] + ([row["branch"]] if row.get("branch") else [])
-    tips, where = merge_queue.fetch_fresh(repo, names, clone or _clone(cfg, row, repo))
-    tip = tips.get(target)
+    clone = clone or _clone(cfg, row, repo)
+    key = (repo, out["target"])
+    if key not in fetched:
+        tips, where = merge_queue.fetch_fresh(repo, [target], clone)
+        fetched[key] = (tips.get(target), where)
+    tip, where = fetched[key]
     if not tip:
         out.update(result="error", detail="target %s not found on origin" % out["target"])
         return out
     out["tip"] = tip
+    if merge_queue.pinned(where, declared) is None and row.get("branch"):
+        merge_queue.fetch_fresh(repo, [row["branch"]], clone)   # objets de la tête gelée
     frozen = merge_queue.pinned(where, declared)
     if not frozen:
         out.update(result="error", detail="the freeze %s is not a commit of %s"
@@ -284,31 +402,59 @@ def _entry(mark: dict, reviewed: str) -> dict:
             "from": reviewed}
 
 
+#: la copie d'un verdict est datée de son original plus ce délai : après lui,
+#: avant tout geste réel ultérieur du même relecteur (R1 cx1, P1-1)
+CARRY_DELAY = "1 millisecond"
+
+_MARKS_SQL = ("SELECT id, kind, sha, actor, verdict,"
+              "       extract(epoch from at)::float8 AS at_ts"
+              "  FROM work_item_milestones"
+              " WHERE work_item_id = %s AND kind IN ('frozen', 'verdict')")
+
+_COPY_SQL = ("INSERT INTO work_item_milestones (work_item_id, kind, sha, actor, verdict, note, at)"
+             " SELECT work_item_id, 'verdict', %s, actor, verdict, %s,"
+             "        at + interval '" + CARRY_DELAY + "'"
+             "   FROM work_item_milestones"
+             "  WHERE id = %s AND work_item_id = %s AND kind = 'verdict'"
+             " RETURNING id")
+
+
 def _write(db, lot: int, out: dict, declared: str, plan: list, refused: list,
            where: str) -> dict:
-    """Écrit les jalons reportés et les issues, sous le bail : jalons relus,
-    gel revérifié — un gel plus récent ou un verdict rendu entre-temps gagnent."""
-    row = work.get(db, lot)
-    marks = work.milestones(db, lot)
-    freeze = plan_git.latest_freeze(marks)
+    """Écrit les jalons reportés dans **une** transaction qui tient le verrou de
+    ligne du lot — celui de `add_milestone` (R1 cx1, P1-1) : gel et verdicts y
+    sont relus, un gel plus récent annule tout (`moved`), et un relecteur dont
+    le dernier verdict a changé entre-temps garde le sien. Un gel ou un verdict
+    concurrent attend le COMMIT, ou est vu s'il l'a précédé. Les lignes de
+    journal et les mots suivent le COMMIT."""
+    from . import train_events
     frozen, tip, target = out["frozen"], out["tip"], out["target"]
-    if row is None or not freeze or not merge_queue._same_sha(freeze.get("sha"), frozen, where):
-        out.update(result="moved", detail="the freeze changed meanwhile: retried next pass")
-        return out
-    still = pending(marks, declared)
-    st = storage.of(db).work
     carried = []
-    for mark, reviewed in plan:
-        key = _key(mark.get("actor"))
-        now = still.get(key)
-        if now is None or now.get("id") != mark.get("id"):
-            continue                  # verdict rendu ou reporté entre-temps
-        verdict = mark.get("verdict") or "ok"
-        st.add_milestone(
-            lot, "verdict", sha=frozen, actor=str(mark.get("actor") or ""), verdict=verdict,
-            note="%s %s on %s@%s, same merge result as the reviewed head (#2442)"
-                 % (CARRIED, _arrow(reviewed, frozen), target, tip[:12]))
-        carried.append(_entry(mark, reviewed))
+    with db.transaction() as tx:
+        rows = tx.query("SELECT id, state, title, app, assignee, branch_target"
+                        "  FROM work_items WHERE id = %s FOR NO KEY UPDATE", (int(lot),))
+        marks = tx.query(_MARKS_SQL, (int(lot),)) if rows else []
+        freeze = plan_git.latest_freeze(marks)
+        if not rows or not freeze or not merge_queue._same_sha(freeze.get("sha"), frozen, where):
+            out.update(result="moved", detail="the freeze changed meanwhile: retried next pass")
+            return out
+        row = rows[0]
+        still = pending(marks, declared)
+        for mark, reviewed in plan:
+            now = still.get(_key(mark.get("actor")))
+            if now is None or int(now.get("id") or 0) != int(mark.get("id") or 0):
+                continue              # verdict rendu ou reporté entre-temps : le sien vaut
+            note = ("%s %s on %s@%s, same merge result and same lot delta as the reviewed "
+                    "head (#2442)" % (CARRIED, _arrow(reviewed, frozen), target, tip[:12]))
+            if tx.query(_COPY_SQL, (frozen, note, int(mark["id"]), int(lot))):
+                carried.append(_entry(mark, reviewed))
+        if carried:
+            try:
+                train_events.emit(tx, kind="verdict", project=row.get("app") or "",
+                                  target=merge_queue._remote_branch(row.get("branch_target") or ""))
+            except ValueError:
+                pass                  # lot sans sujet de train : le jalon reste valide
+    st = storage.of(db).work
     state = row.get("state") or ""
     by_head: dict = {}
     for entry in carried:
@@ -326,8 +472,8 @@ def _write(db, lot: int, out: dict, declared: str, plan: list, refused: list,
                result="carried" if carried else "not-carried" if refused else "idle")
     if carried:
         text = ("Lot #%d « %s »: the new freeze %s is a mechanical realignment on %s "
-                "(same merge result as the reviewed head); verdicts carried: %s. "
-                "No re-review is due (#2442)."
+                "(same merge result and same lot delta as the reviewed head); verdicts "
+                "carried: %s. No re-review is due (#2442)."
                 % (lot, row.get("title") or "", frozen[:12], target,
                    ", ".join("%s %s from %s" % (e["verdict"], e["actor"], e["from"][:12])
                              for e in carried)))
@@ -374,9 +520,10 @@ def run_pass(cfg, db, *, dry_run: bool = False, limit: int = MAX_LOTS) -> list[d
     if not wanted:
         return []
     notes = _outcomes(db, wanted)
+    fetched: dict = {}
     out = []
     for lot in wanted:
-        result = carry(cfg, db, lot, dry_run=dry_run, notes=notes.get(lot))
+        result = carry(cfg, db, lot, dry_run=dry_run, notes=notes.get(lot), fetched=fetched)
         if result.get("result") != "idle":
             out.append(result)
     return out
