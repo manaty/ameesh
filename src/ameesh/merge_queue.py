@@ -44,7 +44,7 @@ import shutil
 import tempfile
 from types import SimpleNamespace
 
-from . import plan_git, storage, work
+from . import packet_guard, plan_git, storage, work
 from .canon import FETCH_TIMEOUT, GitError
 
 STATES = ("queued", "landing", "landed", "ejected")
@@ -512,7 +512,8 @@ def branch_tip(repo: str, branch: str, clone=None) -> tuple[str | None, str]:
 
 
 def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
-              commit_ci=None, full_ci=None, cfg=None, parts=None) -> dict:
+              commit_ci=None, full_ci=None, cfg=None, parts=None,
+              packet_exception=None) -> dict:
     """Checks that `lot` may enter its queue. Returns `{target, frozen_sha,
     pr, class, class_why, waived}`; QueueError says what is missing. Commit ids
     are resolved to full ones before being compared; `ci` (`radar.github_ci(...,
@@ -600,6 +601,23 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
                          "(ameesh work milestone %d frozen --sha %s), then have it reviewed"
                          % (row["branch"], tip[:12], freeze["sha"][:12],
                             "" if frozen else " (not a commit of this repository)", lot, tip))
+    # #2333 (canon §11 bis) : une tête de travail (`lot/**`, `agent/**`,
+    # `review/**`) n'entre pas dans la file d'une cible d'intégration hors
+    # paquet. L'admission refuse tôt, avec le message §11 bis ; `land` la
+    # re-vérifie au dernier geste pour les lignes déjà en file. Une exception
+    # déclarée au journal du lot pour cette tête exacte passe, comme une tête
+    # `integration/**` (le paquet). `packet_exception` porte l'exception déjà
+    # validée par un appelant en simulation (`merge-pr --dry-run`) : elle
+    # autorise sans être journalisée (relecture #2333 N1 : un dry-run n'écrit
+    # rien), la lecture du journal restant la règle par défaut.
+    guard_db, kind, reason = db, "", ""
+    if packet_exception:
+        guard_db, (kind, reason) = None, packet_exception
+    try:
+        packet_guard.check_merge(guard_db, lot, row["branch"], target, tip,
+                                 exception=kind, reason=reason)
+    except packet_guard.PacketGuardError as exc:
+        raise QueueError(str(exc)) from exc
     klass = _class_of(db, lot, row, repo, where, target, tip, cfg=cfg)
     # #1374 : la même porte que le feu — avis comptés par classe, indépendants
     # (familles), et aucun blocage non levé ; un `ok` récent ne masque plus le

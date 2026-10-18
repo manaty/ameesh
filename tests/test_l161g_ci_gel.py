@@ -1009,14 +1009,27 @@ class RequestTest(GelTestCase):
             self.on_note(text)
         return True
 
-    def run_cmd(self, api, gh, *, args=None):
-        """`cmd_ci_run` avec le `gh`, la base et la note remplacés."""
+    def run_cmd(self, api, gh, *, args=None, packet=True):
+        """`cmd_ci_run` avec le `gh`, la base et la note remplacés.
+
+        #2333 : la garde du paquet refuse tout `ci-lot` sans exception
+        déclarée entre deux paquets ; les témoins de mécanique de la demande
+        déclarent donc une exception `unblock` sur le gel, au journal du faux
+        `work`. Les témoins de refus passent `packet=False`."""
+        args = args or self.args
+        if packet and not args.exception and not any(
+                (e.get("note") or "").startswith("packet-exception")
+                for e in self.events):
+            frozen = (ci.frozen_of(self.db, self.item["id"]) or {}).get("sha") or GEL
+            self.events.append({"id": next(self.seq), "created_ts": time.time(),
+                                "note": "packet-exception unblock sha=%s reason=test"
+                                        % frozen})
         with mock.patch("ameesh.db.open_db", lambda cfg: self.db), \
                 mock.patch.object(plan_github, "Gh", lambda *a, **k: gh), \
                 mock.patch.object(plan_github, "_json",
                                   lambda g, argv, *a, **k: api(argv[-1])), \
                 contextlib.redirect_stdout(io.StringIO()):
-            code = ci.cmd_ci_run(None, args or self.args)
+            code = ci.cmd_ci_run(None, args)
         return code, self.notes
 
     def marques(self, state: str) -> list[str]:
@@ -1090,6 +1103,59 @@ class RequestTest(GelTestCase):
         code, notes = self.run_cmd(api, gh, args=argparse.Namespace(
             **{**vars(self.args), "dry_run": True}))
         self.assertEqual((code, gh.calls, notes), (0, [], []))
+
+    def test_la_garde_du_paquet_refuse_une_ci_lot_sans_exception(self):
+        """#2333 : aucune étiquette `ci-lot` entre deux paquets, même en dry-run."""
+        self.gele()
+        api = Github()
+        gh = Gh()
+        code, notes = self.run_cmd(api, gh, packet=False)
+        self.assertEqual(code, 1)
+        self.assertEqual(gh.calls, [], "ni annulation, ni étiquette, ni lecture GitHub")
+        self.assertEqual(notes, [], "un refus n'écrit rien")
+        self.assertEqual(api.paths, [])
+
+    def test_la_garde_du_paquet_refuse_aussi_en_dry_run(self):
+        self.gele()
+        gh = Gh()
+        code, _notes = self.run_cmd(Github(), gh, packet=False, args=argparse.Namespace(
+            **{**vars(self.args), "dry_run": True}))
+        self.assertEqual((code, gh.calls), (1, []))
+
+    def test_la_garde_du_paquet_accepte_et_journalise_l_exception(self):
+        """#2333 : l'exception motivée passe et laisse sa marque à la tête testée."""
+        self.gele()
+        gh = Gh()
+        code, notes = self.run_cmd(Github(), gh, args=argparse.Namespace(
+            **{**vars(self.args), "exception": "incident", "reason": "cible rouge 18/10"}))
+        self.assertEqual(code, 0)
+        self.assertIn(LABEL, gh.poses())
+        packet = [n for n in notes if n.startswith("packet-exception")]
+        self.assertEqual(packet, ["packet-exception incident sha=%s reason=cible rouge 18/10"
+                                  % GEL])
+
+    def test_la_garde_du_paquet_laisse_passer_la_suite_complete(self):
+        """#2333 : `--full --reason` est la suite du paquet, pas une CI de lot."""
+        self.gele()
+        gh = Gh()
+        code, _notes = self.run_cmd(Github(), gh, packet=False, args=argparse.Namespace(
+            **{**vars(self.args), "full": True, "reason": "suite du paquet"}))
+        self.assertEqual(code, 0)
+        self.assertIn("ci-full-%s" % GEL, gh.poses())
+
+    def test_la_garde_du_paquet_accepte_une_exception_sans_gel_ni_sha(self):
+        """#2333 : sans gel ni `--sha`, nature et motif passent avant le plan,
+        et la note d'exception porte la tête que le plan a réellement testée."""
+        gh = Gh()
+        api = Github(head=TETE, pulls=[pull(head=TETE)])
+        code, notes = self.run_cmd(api, gh, args=argparse.Namespace(
+            **{**vars(self.args), "exception": "incident",
+               "reason": "CI cassée sur main"}))
+        self.assertEqual(code, 0)
+        self.assertIn("ci-lot-%s" % TETE, gh.poses())
+        packet = [n for n in notes if n.startswith("packet-exception")]
+        self.assertEqual(packet, ["packet-exception incident sha=%s reason=CI cassée sur main"
+                                  % TETE])
 
     def test_un_jeton_actions_est_refuse_avant_toute_pose(self):
         # #1343 : l'événement d'un GITHUB_TOKEN d'Actions ne déclenche rien.
