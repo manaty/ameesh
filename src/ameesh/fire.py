@@ -131,7 +131,10 @@ def same_commit(a, b, repo=None) -> bool:
 
 def state(db, lot: int) -> dict:
     """L'état du feu d'un lot, sans lecture GitHub : le feu actif, le gel
-    qu'il couvre, et le dernier jalon écrit."""
+    qu'il couvre, et le dernier jalon écrit.
+
+    La couverture compare les identifiants par préfixe (`_same_head`) : un
+    gel peut citer `352ba651` quand le feu cite la tête complète."""
     item = work.get(db, lot)
     if item is None:
         raise FireError("lot #%d not found" % lot)
@@ -144,7 +147,7 @@ def state(db, lot: int) -> dict:
         "branch": item.get("branch") or "", "freeze_sha": frozen,
         "active": bool(fire), "sha": _norm((fire or last or {}).get("sha")),
         "actor": (fire or last or {}).get("actor") or "",
-        "covered": bool(fire and frozen and same_commit(fire.get("sha"), frozen)),
+        "covered": bool(fire and frozen and _same_head(fire.get("sha"), frozen)),
         "withdrawn": bool(last and last.get("kind") == UNFIRE),
         "at_ts": (fire or last or {}).get("at_ts"),
     }
@@ -1225,9 +1228,9 @@ def _reconcile(db, row: dict, marks: list, status: dict, *, slug: str, repo: str
     lot = int(row["id"])
     freeze = freeze_of(marks)
     fire = given(marks)
-    covered = bool(fire) and same_commit(status.get("head"), (fire or {}).get("sha"))
+    covered = bool(fire) and same_commit(status.get("head"), (fire or {}).get("sha"), repo)
     covered = covered or (bool(freeze) and same_commit(status.get("head"),
-                                                       (freeze or {}).get("sha")))
+                                                       (freeze or {}).get("sha"), repo))
     out = {"lot": lot, "result": "merged", "pr": status.get("number"),
            "sha": status.get("merge_commit") or "", "covered": covered}
     if dry_run:
