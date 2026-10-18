@@ -260,6 +260,29 @@ class ReviewGateRepositoryTest(_Base):
             self.cfg, self.db, row, marks, {"verdict_required": True}))
         self.assertEqual(self.slo(), [])
 
+    def test_main_local_en_retard_ne_rajoute_pas_un_avis(self):
+        """Un changement SQL déjà sur origin/main n'appartient plus au lot."""
+        repo, merged = self._frozen_repo()
+        subprocess.run(["git", "-C", repo, "update-ref", "refs/remotes/origin/main",
+                        merged], check=True)
+        subprocess.run(["git", "-C", repo, "checkout", "-q", "lot"], check=True)
+        with open(os.path.join(repo, "docs", "notes.md"), "a") as fh:
+            fh.write("suite\n")
+        subprocess.run(["git", "-C", repo, "commit", "-qam", "notes"], check=True)
+        sha = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
+                             check=True, capture_output=True, text=True).stdout.strip()
+        registry.upsert(self.db, "orch", harness="claude", host=self.cfg.host,
+                        cwd=repo)
+        registry.upsert(self.db, "cx", harness="codex", host=self.cfg.host)
+        row = dict(work.get(self.db, self.lot["id"]), branch_target="main")
+        marks = [{"kind": "frozen", "sha": sha, "actor": "dev1", "at_ts": 1},
+                 {"kind": "verdict", "sha": sha, "actor": "cx", "verdict": "ok",
+                  "at_ts": 2}]
+        gate = merge_queue.review_gate_for_item(self.db, self.cfg, row, marks)
+        self.assertIsNotNone(gate)
+        self.assertEqual(gate["required"], 1)
+        self.assertTrue(gate["ok"], gate["why"])
+
 
 class PaquetTest(_Base):
     """#2335 : un paquet en cours est une attente planifiée, et l'horloge

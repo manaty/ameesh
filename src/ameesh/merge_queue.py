@@ -439,9 +439,15 @@ def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None) -> dict | No
     frozen = str((freeze or {}).get("sha") or "").strip()
     repo = lot_class.repo_for_freeze(db, cfg, item, frozen) if frozen else ""
     try:
+        # Comme la file : origin/<cible> avant la branche locale, qui peut
+        # encore contenir dans le diff des changements déjà fusionnés (#2207).
+        target = lot_class.default_base(cfg, item, repo) if repo else None
+        base = _class_base(repo, target) if target else None
+        base_sha = plan_git._commit(repo, base) if base else None
         klass = klass or lot_class.of_lot(
             db, int((item or {}).get("id") or 0), cfg=cfg, item=item,
-            repo=repo or None, head=frozen or None, milestones=marks or None)
+            repo=repo or None, head=frozen or None, milestones=marks or None,
+            base=base, base_sha=base_sha)
     except Exception:  # noqa: BLE001 - une lecture ratée ne conclut pas
         return None
     if not klass:
