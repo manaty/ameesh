@@ -140,6 +140,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'created_at', 'delivered_at', 'signature_key', 'slack_ts', 'host',
         'signature_expires_at'
     ]),
+    -- L243b (0418): identity resolution metadata, without keys or signed content.
+    ('agent_name_resolutions', ARRAY[
+        'id', 'at', 'supplied_name', 'primary_name', 'operation', 'db_user'
+    ]),
     ('agent_mesh_overview', ARRAY[
         'name', 'chantier', 'harness', 'host', 'cwd', 'session_id',
         'status', 'status_text', 'model', 'budget_usd', 'spent_usd',
@@ -191,7 +195,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'runner_seen_at', 'runner_seen_host', 'runner_seen_owner'
     ]),
     ('agent_registry', ARRAY[
-        'name', 'chantier', 'harness', 'host', 'cwd', 'session_id',
+        'name', 'aliases', 'chantier', 'harness', 'host', 'cwd', 'session_id',
         'status', 'status_text', 'model', 'budget_usd', 'spent_usd',
         'turns', 'last_error', 'lease_owner', 'lease_expires_at',
         'lease_epoch', 'lease_wait_since', 'last_turn_at', 'last_seen', 'created_at',
@@ -640,6 +644,12 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     -- (des nombres par type, taille, hôte, harnais et estimateur : de l'ÉTAT)
     ('estimate_references', ARRAY[
         'id', 'published_at', 'published_by', 'body'
+    ]),
+    -- L122 (#711, 0419): migration reservation identities, target and lifecycle
+    -- metadata (STATE, no content or credentials).
+    ('work_migration_reservations', ARRAY[
+        'id', 'work_item_id', 'slot', 'number', 'project', 'target_repo',
+        'target_branch', 'target_sha', 'status', 'updated_at'
     ]),
     -- L160d (0057): prepared conflict resolutions between two lots (commits,
     -- ref, conflicting paths: STATE, no content)

@@ -1369,6 +1369,26 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
     return out
 
 
+def _overhead(card: dict | None, driver: str) -> float:
+    """#2397 : rapport carte / table statique pour un pilote (`measure.surcout`).
+
+    La carte mesure la suite sous couverture, la table statique la mesure sans
+    couverture : leurs durées ne sont pas comparables. `scripts/map.py` relève
+    le rapport des deux sur les modules que la carte connaît ; appliqué à la
+    table quand elle comble un trou, il ramène les deux sources à la même
+    échelle. Sans relevé (carte antérieure à `measure`), 1.0.
+    """
+    if not card:
+        return 1.0
+    mesure = card.get("measure") or card.get("mesure") or {}
+    surcout = mesure.get("surcout") if isinstance(mesure, dict) else None
+    try:
+        facteur = float((surcout or {}).get(driver))
+    except (AttributeError, TypeError, ValueError):
+        return 1.0
+    return facteur if facteur > 0 else 1.0
+
+
 def weights(modules: list[str], driver: str, card: dict | None) -> dict[str, float]:
     table = None
     if card:
@@ -1388,13 +1408,18 @@ def weights(modules: list[str], driver: str, card: dict | None) -> dict[str, flo
     # stage 6, `test_plan_weights_read_the_english_key`). L'ordre inverse
     # (statique prioritaire) écrasait la mesure de la carte par un chiffre plus
     # ancien et cassait ce contrat.
+    # #2397 : la table ne comble ces trous qu'à l'échelle de la carte (sous
+    # couverture) : son `surcout` la convertit, au lieu de mélanger une durée
+    # pleine suite et une durée sous couverture dans le même découpage.
     if table is not None and parts.TABLE.exists():
         mesurees = json.loads(parts.TABLE.read_text(encoding="utf-8"))
         complete = {}
         for d, valeurs in mesurees.items():
             if not isinstance(valeurs, dict):
                 continue  # `_source` et autres métadonnées de la table
-            complete[d] = dict(valeurs)
+            facteur = _overhead(card, d)
+            complete[d] = {m: (float(v) * facteur if isinstance(v, (int, float)) else v)
+                           for m, v in valeurs.items()}
         for d, valeurs in table.items():
             complete.setdefault(d, {}).update(valeurs)
         table = complete

@@ -234,6 +234,17 @@ class ProofTest(unittest.TestCase):
         self.assertFalse(rapport["ok"])
         self.assertIn("run-red", rapport["causes"])
 
+    def test_preemption_par_la_porte_nest_pas_no_vm(self):
+        """#2298 : un run coupé par la porte (exit 75) dit gate-preempted."""
+        rapport = self.sel.proof(lot=7, host="vm",
+                                 run={"outcome": "gate-preempted", "exit": 75,
+                                      "seconds": 2103.9},
+                                 flow=self.flow)
+        self.assertFalse(rapport["ok"])
+        self.assertEqual(rapport["outcome"], "gate-preempted")
+        self.assertIn("gate-preempted", rapport["causes"])
+        self.assertNotIn("no-vm", rapport["causes"])
+
     def test_tete_changee_invalide(self):
         rapport = self.sel.proof(lot=7, host="vm",
                                  run={"outcome": "green", "exit": 0},
@@ -321,6 +332,13 @@ class RunTest(unittest.TestCase):
         self.assertEqual(pv.classify(75), "no-vm")
         self.assertEqual(pv.classify(75, "lost the connection to vm (ssh exit 255)"),
                          "transport-lost")
+        # #2298 : une préemption par la porte n'est pas une VM absente
+        self.assertEqual(pv.classify(75, "ameesh offload: stopped on vm-agents-1: host "
+                                         "stopped: maintenance; no fallback (--fallback none)"),
+                         "gate-preempted")
+        self.assertEqual(pv.classify(75, "ameesh offload: stopped on vm-agents-1: host "
+                                         "draining: over deadline; no fallback (--fallback none)"),
+                         "gate-preempted")
         self.assertEqual(pv.classify(124), "run-incomplete")
         self.assertEqual(pv.classify(130), "run-incomplete")
         self.assertEqual(pv.classify(70), "run-incomplete")
@@ -356,6 +374,31 @@ class RunTest(unittest.TestCase):
 
         result = pv.run_offload("vm-agents-1", "echo ko", runner=lambda *a, **k: Fake())
         self.assertEqual(result["outcome"], "run-red")
+
+    def test_run_offload_preempte_par_la_porte(self):
+        """#2298 : la note « stopped on … host draining » sort en gate-preempted."""
+        class Fake:
+            returncode = 75
+            stdout = "%s2103\n" % pv.SECONDS_MARK
+            stderr = ("ameesh offload: stopped on vm-agents-1: host draining: over "
+                      "deadline; no fallback (--fallback none)\n")
+
+        result = pv.run_offload("vm-agents-1", "echo coupe", runner=lambda *a, **k: Fake())
+        self.assertEqual(result["outcome"], "gate-preempted")
+        self.assertEqual(result["exit"], 75)
+        self.assertEqual(result["seconds"], 2103.0)
+
+    def test_run_offload_preempte_sans_saut_final_stdout(self):
+        """La note stderr garde sa ligne après un stdout sans saut final."""
+        class Fake:
+            returncode = 75
+            stdout = flux()
+            stderr = ("ameesh offload: stopped on vm-agents-1: host draining: over "
+                      "deadline; no fallback (--fallback none)\n")
+
+        result = pv.run_offload("vm-agents-1", "echo coupe", runner=lambda *a, **k: Fake())
+        self.assertEqual(result["outcome"], "gate-preempted")
+        self.assertEqual(result["flow"]["fins"], ("succes",))
 
 
 class SnapshotIdentityTest(unittest.TestCase):
@@ -429,10 +472,13 @@ class SnapshotIdentityTest(unittest.TestCase):
         self.assertEqual(self._git("show", "%s:plan.json" % construit),
                          self.plan.strip())
 
-    def test_head_d_arbre_absent_refuse(self):
+    def test_arbre_du_sha_absent_refuse_sans_head_moved(self):
+        """Un arbre non constructible est un refus de sélection (#1820) :
+        `head-moved` ne dit que la tête qui a réellement bougé."""
         with self.assertRaises(pv.PrevalidationError) as caught:
             pv.pinned_snapshot(self.repo, B, self.plan_rel, self.plan)
-        self.assertEqual(caught.exception.cause, "head-moved")
+        self.assertEqual(caught.exception.cause, "selection-unsafe")
+        self.assertNotEqual(caught.exception.cause, "head-moved")
 
 
 class HostTest(unittest.TestCase):
