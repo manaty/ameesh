@@ -739,7 +739,12 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
                                                queue=cloned and path == source)))
         if not paths:
             # aucune cible fraîche lisible : repli explicite sur les refs de
-            # cible disponibles ; `of_lot` rendra un doute, jamais un `light`.
+            # cible disponibles. Ce repli ne prouve pas la fraîcheur : un
+            # `QUEUE_REF/<cible>` laissé par un fetch antérieur survit à la
+            # disparition de la cible sur origin (le fetch ne le supprime pas),
+            # et `of_lot` peut alors rendre une classe calculée, `light`
+            # comprise, au lieu d'un doute. L'admission doit refuser une cible
+            # absente (#2278) ; ce repli ne le garantit pas (#2284).
             paths.append((source, _class_base(source, target, queue=cloned) or target))
             if cloned:
                 paths.append((repo, _class_base(repo, target) or target))
