@@ -1069,7 +1069,15 @@ def _targets_of_pr(db, st, pr: dict, repo: str, idents: Iterable[str],
     """Les lots qu'une PR désigne : lignes `ameesh-work:`, `Closes #n` (via
     `issue_ref`), fiches (`packages_of_pr`), et branche `lot/<id>-…` d'un
     dépôt même sans fiche. Rend `(targets, by_issue)` — `by_issue` n'est
-    construit qu'à la demande (une fois par relevé)."""
+    construit qu'à la demande (une fois par relevé).
+
+    #2317 (N7) : un lot explicitement nommé (`ameesh-work:`) l'emporte sur la
+    fiche — la rétention d'une PR ouverte est la SYMÉTRIE de sa fermeture :
+    elle retient exactement les lots qu'elle fermerait si on la fusionnait
+    maintenant. Sans ligne explicite, une PR de fiche (`lot/<fiche>…` ou
+    `ameesh-lot:`) désigne tous les lots de la fiche. Unir les deux faisait
+    qu'une PR de fiche oubliée, portant `ameesh-work: X`, retenait Y et Z de
+    la fiche alors que leurs propres PR étaient fusionnées."""
     explicit = work_items_of_pr(pr)
     closes = issues_of_pr(pr, repo)
     if closes:
@@ -1097,13 +1105,42 @@ def _targets_of_pr(db, st, pr: dict, repo: str, idents: Iterable[str],
              for item in st.work.by_package(pid)], by_issue)
 
 
-def _stage_reason(item: dict, pr: dict, open_refs: list[str] | None) -> str | None:
+#: #1693 (N3) : profondeur de journal relue avant de reposer un constat
+#: `stage merged` — une note intercalée ne doit pas faire réécrire le même
+#: constat, sans relire tout le journal d'un lot à chaque relevé.
+_STAGE_DEDUP_EVENTS = 50
+
+#: #1693 (N1) : une fusion est annulée par une correction `merged → build`
+#: du journal (vue `WorkItems.corrections`, qui lit la transition, pas la note).
+
+
+def _stage_reason(item: dict, pr: dict, open_refs: list[str] | None,
+                  ref: str = "", *, annulled_ts: float | None = None,
+                  merged_ts: float | None = None) -> str | None:
     """#759 : pourquoi une PR fusionnée NE ferme PAS ce lot (None : elle ferme).
 
     Une PR qui se déclare finale pour le lot (`ameesh-work: <id> final`) ferme
     toujours. Sinon le lot reste ouvert si une PR ouverte le désigne encore,
     ou si sa branche déclarée n'est pas celle de la PR fusionnée (autre étape,
-    gel en attente) : son journal porte alors `stage merged`."""
+    gel en attente) : son journal porte alors `stage merged`.
+
+    #1693 (N1) : une PR fusionnée avant la DERNIÈRE correction `merged → build`
+    du lot (`annulled_ts`, vue cx2) ne le referme pas, même déclarée finale :
+    sa fusion a été annulée, et le lot attend un transport fusionné APRÈS la
+    correction. Le critère d'instant couvre les corrections répétées, qu'un
+    simple `pr_ref` laisserait passer (il ne porte que la dernière PR fermante,
+    pas l'historique).
+
+    #2317 (N3) : l'égalité `pr_ref == ref` n'est qu'un REPLI quand la date de
+    fusion manque (`merged_ts is None`). Avec `mergedAt`, l'instant décide : un
+    repli joué en plus affichait « rouvert depuis » sur une PR pourtant
+    postérieure à la correction, et la fermait à tort."""
+    if annulled_ts is not None and merged_ts is not None and merged_ts <= annulled_ts:
+        return ("stage merged: PR %s — fusion antérieure à la dernière correction "
+                "merged → build, transport suivant attendu" % ref)
+    if ref and merged_ts is None and (item.get("pr_ref") or "") == ref:
+        return ("stage merged: PR %s a déjà fermé ce lot (rouvert depuis), "
+                "transport suivant attendu" % ref)
     if int(item["id"]) in final_lots(pr.get("body")):
         return None
     reasons = []
@@ -1147,7 +1184,16 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
     #759 : une PR fusionnée ne ferme un lot que si aucune autre PR ouverte ni
     branche déclarée du lot n'y reste liée, sauf si elle se déclare finale
     pour ce lot (`ameesh-work: <id> final`) ; sinon le lot reste ouvert et son
-    journal porte `stage merged`."""
+    journal porte `stage merged`. #1693 (N1) : la PR qui a déjà fermé le lot
+    (rouvert par correction `merged → build`) ne le referme pas.
+
+    #1693 (N2)/#2317 (N7) : une PR OUVERTE retient exactement les lots
+    # qu'elle fermerait si on la fusionnait maintenant — la symétrie de
+    # `_targets_of_pr` : ligne `ameesh-work:` d'abord, sinon tous les lots de
+    # la fiche (`lot/<fiche>-…`, `ameesh-lot:`). Une ligne explicite ne fait
+    # donc pas retenir le reste de la fiche : une PR de fiche oubliée ne
+    # bloque plus les lots dont la propre PR est déjà fusionnée.
+    """
     check_repo(repo)
     prs = _json(gh, ["pr", "list", "--repo", repo, "--state", "merged", "--limit", str(int(limit)),
                      "--json", "number,headRefName,isCrossRepository,body,state,mergeCommit,mergedBy,"
@@ -1157,8 +1203,25 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
     open_prs = open_prs_of_repo(gh, repo)
     st = storage.of(db)
     idents = [p["id"] for p in st.packages.all() if p.get("kind") in work_mod.LINKABLE_KINDS]
-    results: list[dict] = []
+    # #2317 (N4) : la lecture des corrections est bornée aux lots qu'une PR
+    # fusionnée peut fermer. Collecter ces lots d'abord évite un LIKE sur tout
+    # `work_item_events` à chaque relevé (l'ancien `events_noted(…, 0.0)`).
+    targets_by_pr: dict[int, list] = {}
+    candidates: set[int] = set()
     by_issue: dict | None = None
+    for pr in prs:
+        if (pr.get("state") or "MERGED") != "MERGED":
+            continue
+        targets, by_issue = _targets_of_pr(db, st, pr, repo, idents, by_issue)
+        targets_by_pr[int(pr.get("number") or 0)] = targets
+        candidates.update(int(item_id) for item_id, _pid in targets)
+    # #1693 (N1, cx2) : une PR fusionnée AVANT la dernière correction
+    # `merged → build` d'un lot ne peut plus le fermer — sa fusion a été
+    # annulée, quel que soit le nombre de corrections et de transports depuis
+    # (le seul `pr_ref` ne porte que la dernière PR, pas l'historique). La
+    # correction se lit à la TRANSITION du journal (#2317/N2), pas à sa note.
+    annulled: dict[int, float] = st.work.corrections(candidates)
+    results: list[dict] = []
     # #759 : les lots encore désignés par une PR ouverte ne se ferment pas
     open_lots: dict[int, list[str]] = {}
     for pr in sorted(open_prs, key=lambda p: int(p.get("number") or 0)):
@@ -1179,7 +1242,7 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
                  else None)
         actor = "github:%s" % login if login else "github"
         merged_ts = _iso_ts(pr.get("mergedAt"))
-        targets, by_issue = _targets_of_pr(db, st, pr, repo, idents, by_issue)
+        targets = targets_by_pr.get(int(pr.get("number") or 0), [])
         # L118b : une PR qui ne livre qu'une partie d'un lot ne le ferme pas
         partial = partial_lots(pr.get("body"))
         targets = [(i, pid) for i, pid in targets if i not in partial]
@@ -1194,15 +1257,22 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
                 entry.update(result="later", detail="work item created after the merge: not closed")
             else:
                 # #759 : un lot encore lié (PR ouverte, autre branche déclarée)
-                # n'est pas fermé par cette PR ; un lot déjà fermé suit son sort
-                text = (_stage_reason(item, pr, open_lots.get(item_id))
+                # n'est pas fermé par cette PR ; un lot déjà fermé suit son sort.
+                # #1693 (N1) : pas non plus par une fusion antérieure à la
+                # dernière correction merged → build (voir `_stage_reason`).
+                text = (_stage_reason(item, pr, open_lots.get(item_id), ref,
+                                      annulled_ts=annulled.get(item_id),
+                                      merged_ts=merged_ts)
                         if item["state"] not in work_mod.MERGED_STATES
                         and item["state"] != "closed" else None)
                 if text:
                     if not dry_run:
-                        # un relevé répété ne remplit pas le journal du même constat
-                        previous = work_mod.events(db, item_id, 1)
-                        if not previous or previous[0].get("note") != text:
+                        # #1693 (N3) : un relevé répété ne répète pas le même
+                        # constat, même si une autre note s'est intercalée depuis
+                        # (relance, correction) — la dédup lit le journal récent,
+                        # pas seulement sa dernière ligne.
+                        recent = work_mod.events(db, item_id, _STAGE_DEDUP_EVENTS)
+                        if not any((e.get("note") or "") == text for e in recent):
                             work_mod.note(db, item_id, text, actor=actor)
                     entry.update(result="stage-merged",
                                  detail=text + (" (dry run)" if dry_run else ""))

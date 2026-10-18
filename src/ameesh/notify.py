@@ -210,6 +210,7 @@ TYPE_LABELS = {
     "tmpfs_full": "tmpfs almost full",
     "worktree_kept": "worktree kept at end of lot",
     "tmp_orphan": "/tmp entry left by a turn",
+    "tmp_unowned": "temporary directory without owner file (kept)",
     "tmp_unremovable": "temporary directory over quota with files it cannot remove",
     "tmp_unscanned": "temporary directory too large to scan; nothing evicted",
     "plan_underused": "underused plan",

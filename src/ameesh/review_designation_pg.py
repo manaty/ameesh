@@ -4,9 +4,13 @@
 `review_designation` does the **selection** without any I/O; this module is the
 real `Port`: it reads the lot's milestones, re-reads the idempotent mark of the
 freeze and writes the designation in **one** transaction (lock of the lot row,
-mark in the journal, mails in the mailbox). The readable thread is written only
-after the commit (`mail.send(..., after_commit=…)`, pattern #315 of
-`deep_analysis`): a cancelled send leaves no trace in the external thread.
+mark in the journal, mails in the mailbox). A reviewer mail is a `request`
+linked to the lot (#2478): the reviewer's runner opens a turn on it, once
+per head (#2495: a reviewer already holding a request for this head, or an
+unread one naming none, gets no second mail); the capacity notification to the
+pilot stays a `notify`. The readable thread is
+written only after the commit (`mail.send(..., after_commit=…)`, pattern #315
+of `deep_analysis`): a cancelled send leaves no trace in the external thread.
 
 Two uses, depending on who holds the transaction:
 
@@ -23,7 +27,10 @@ number, the reviewers, the exact SHA and the authors of the frozen content;
 `recorded` re-reads it as-is, so the same freeze replayed returns the recorded
 designation without a second mail. A new freeze is another mark: the old one no
 longer counts, and the port refuses to write for a freeze that is no longer the
-latest (`StaleFreeze`) — no return to an old head.
+latest (`StaleFreeze`) — no return to an old head. A **forced** replay (#2487)
+writes a newer mark over a reported one, but still checks the mailbox: a review
+request or waiting notice already deposited for the same freeze is not sent
+again (#2541).
 """
 from __future__ import annotations
 
@@ -31,7 +38,8 @@ import json
 from typing import Mapping, Optional, Sequence
 
 from . import mail, plan_git, registry, storage
-from .review_designation import DESIGNATED, WAITING, DesignationError, StaleFreeze
+from .review_designation import (DESIGNATED, REQUEST_HISTORY, REQUEST_KIND, WAITING,
+                                 DesignationError, StaleFreeze, covering_request)
 
 #: prefix of the journal marks: `<prefix><lot>:<milestone>: <json>`
 MARK_PREFIX = "review-designation:"
@@ -106,6 +114,56 @@ def _designation(lot: int, freeze_id: int, *, state: str, required: int, reviewe
     }
 
 
+def _sent_review_mails(db, lot: int, freeze_id: int) -> tuple:
+    """Les courriels de désignation déjà déposés pour CE gel (#2541).
+
+    Rend `(destinataires des demandes de relecture, destinataires de l'avis
+    d'attente)`. La boîte est la preuve de l'envoi : la marque du gel ne la
+    donne pas (un destinataire inconnu au gel laisse une marque `waiting` sans
+    courrier, et une marque `carried` ne nomme que des relecteurs déjà
+    sollicités pour un **autre** gel). Le rejeu forcé écrit une marque plus
+    récente, mais un second réveil du même relecteur ou une seconde alerte de
+    capacité ne sont pas des faits nouveaux.
+    """
+    rows = db.query(
+        "SELECT recipient, kind, payload FROM agent_mailbox"
+        " WHERE work_item_id = %s"
+        "   AND payload->'review_designation'->>'freeze' = %s"
+        " ORDER BY id",
+        (str(int(lot)), str(int(freeze_id))))
+    requests: set = set()
+    waiting: set = set()
+    for row in rows or ():
+        recipient = str((row or {}).get("recipient") or "").strip()
+        if not recipient:
+            continue
+        payload = (row or {}).get("payload")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except ValueError:
+                continue
+        designation = (payload or {}).get("review_designation") or {}
+        if str(designation.get("freeze")) != str(int(freeze_id)):
+            continue
+        if str((row or {}).get("kind") or "") == "request":
+            requests.add(recipient)
+        elif str(designation.get("state") or "") == WAITING:
+            waiting.add(recipient)
+    return requests, waiting
+
+
+def _already_sent(message: Mapping, sent: tuple) -> bool:
+    """Ce courrier du rejeu est-il déjà parti pour le même gel (#2541) ?"""
+    recipient = str((message or {}).get("to") or "").strip()
+    if not recipient:
+        return False
+    requests, waiting = sent
+    if str((message or {}).get("kind") or "") == "request":
+        return recipient in requests
+    return bool((message or {}).get("capacity")) and recipient in waiting
+
+
 def _nested_transaction(db) -> bool:
     """True if the `transaction()` block just opened is nested.
 
@@ -132,12 +190,22 @@ class PgPort:
     (no nesting in the `frozen` milestone's one). Built without `after_commit`
     on an open transaction, the port refuses to write (`DesignationError`,
     nothing written): a nested `with` does not commit, so draining the thread
-    there would publish it before the caller's commit (#1775, N2)."""
+    there would publish it before the caller's commit (#1775, N2).
 
-    def __init__(self, db, *, sender: str = SENDER, after_commit: Optional[list] = None):
+    `at_freeze` says whether the write happens inside the `frozen` milestone:
+    an unknown recipient is then a waiting designation instead of a refusal
+    (#1634), because raising would cancel the acquired freeze. It defaults to
+    True when `after_commit` is given (the hook's transaction), False when the
+    port owns the transaction (a recovery outside the hook keeps the refusal).
+    """
+
+    def __init__(self, db, *, sender: str = SENDER, after_commit: Optional[list] = None,
+                 at_freeze: Optional[bool] = None):
         self.db = db
         self.sender = sender or SENDER
         self.after_commit = after_commit
+        self.at_freeze = ((after_commit is not None) if at_freeze is None
+                          else bool(at_freeze))
 
     # -- reads ------------------------------------------------------------
     def latest_freeze(self, lot: int) -> Optional[dict]:
@@ -192,7 +260,8 @@ class PgPort:
     def commit(self, lot: int, *, freeze: Mapping, required: int, state: str,
                reviewers: Sequence[Mapping], missing: int, why: str,
                authors: Sequence[Mapping] = (), policy_ref: str = "",
-               notify: str = "", messages: Sequence[Mapping] = ()) -> dict:
+               notify: str = "", messages: Sequence[Mapping] = (),
+               force: bool = False) -> dict:
         """Writes the freeze's designation in one transaction and returns its shape.
 
         Under the lock of the lot row: rechecks that `freeze` is still the
@@ -201,13 +270,18 @@ class PgPort:
         designation, without a second mail), deposits the mails then the mark —
         all in the same transaction. A designation is final for its freeze; a
         waiting state is retryable and its notification leaves only once per
-        freeze."""
+        freeze. `force` (#2487) writes a new mark even when the freeze already
+        has one (a forced selection after a refused carry must supersede the
+        reported mark); the caller uses it only for an explicit replay. That
+        replay does not send a request or a waiting notice already deposited
+        for the same freeze (#2541): the port filters them on the mailbox."""
         lot = int(lot)
         if self.after_commit is not None:
             return self._write(self.db, lot, freeze=freeze, required=required,
                                state=state, reviewers=reviewers, missing=missing,
                                why=why, authors=authors, policy_ref=policy_ref,
-                               notify=notify, messages=messages, hook=True)
+                               notify=notify, messages=messages,
+                               hook=self.at_freeze, force=force)
         threads: list = []
         inner = PgPort(self.db, sender=self.sender, after_commit=threads)
         with self.db.transaction() as tx:
@@ -224,7 +298,7 @@ class PgPort:
             out = inner._write(tx, lot, freeze=freeze, required=required, state=state,
                                reviewers=reviewers, missing=missing, why=why,
                                authors=authors, policy_ref=policy_ref, notify=notify,
-                               messages=messages, hook=False)
+                               messages=messages, hook=False, force=force)
         # the external thread only after the commit: a cancelled send leaves nothing
         for record in threads:
             record(self.db.cfg, self.db)
@@ -232,7 +306,8 @@ class PgPort:
 
     def _write(self, db, lot: int, *, freeze: Mapping, required: int, state: str,
                reviewers: Sequence[Mapping], missing: int, why: str, authors,
-               policy_ref: str, notify: str, messages, hook: bool) -> dict:
+               policy_ref: str, notify: str, messages, hook: bool,
+               force: bool = False) -> dict:
         freeze = dict(freeze or {})
         sha = str(freeze.get("sha") or "").strip().lower()
         try:
@@ -259,6 +334,14 @@ class PgPort:
         if state == WAITING and reviewers:
             raise DesignationError("a waiting designation designates no reviewer")
         messages = [dict(message or {}) for message in messages or ()]
+        if force:
+            # #2541 : le rejeu forcé écrit une marque plus récente, mais ne
+            # renvoie pas les demandes de relecture ni l'avis d'attente déjà
+            # partis pour ce gel. Le filtre précède le contrôle des
+            # destinataires : un courrier déjà déposé n'a plus à être validé.
+            sent = _sent_review_mails(db, lot, freeze_id)
+            messages = [message for message in messages
+                        if not _already_sent(message, sent)]
         undelivered = []
         for row in messages:
             recipient = str(row.get("to") or "").strip()
@@ -289,12 +372,13 @@ class PgPort:
             if state == DESIGNATED:
                 state, reviewers, missing = WAITING, [], int(required)
             messages = []
-        existing = self._recorded_in(db, lot, freeze_id,
-                                     since_ts=float(last.get("at_ts") or 0.0))
+        existing = None if force else self._recorded_in(
+            db, lot, freeze_id, since_ts=float(last.get("at_ts") or 0.0))
         # A designation is final; a waiting state is not rewritten (a single
         # notification per freeze) but **yields** to the designation when
         # capacity comes back: it is the same freeze, the following mark
-        # prevails.
+        # prevails. A forced replay writes a newer mark even over a final one:
+        # the caller is an explicit recovery after a refused carry (#2487).
         if existing is not None and (existing.get("state") == DESIGNATED
                                      or state == WAITING):
             return existing
@@ -306,7 +390,15 @@ class PgPort:
         threads = self.after_commit if self.after_commit is not None else []
         for row in messages:
             recipient = str(row.get("to") or "").strip()
+            if (str(row.get("kind") or "") == REQUEST_KIND
+                    and covering_request(mail.history(db, recipient, REQUEST_HISTORY),
+                                         lot=lot, reviewer=recipient, sha=sha)):
+                # #2495 : this reviewer already holds a request for this head
+                # (or an unread one naming none): the designation is written,
+                # no second mail.
+                continue
             mail.send(db, self.sender, recipient, str(row.get("body") or ""),
+                      kind=str(row.get("kind") or "notify"),
                       work_item_id=str(lot),
                       payload={"review_designation": {
                           "lot": lot, "freeze": freeze_id, "sha": sha,

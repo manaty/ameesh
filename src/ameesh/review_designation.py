@@ -35,6 +35,7 @@ for a freeze that is no longer the latest: no return to an old head.
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping, Optional, Protocol, Sequence
@@ -45,6 +46,9 @@ from . import review
 DESIGNATED = "designated"
 WAITING = "waiting"
 NONE = "none"
+#: the kind of a designation mail: a request linked to the lot wakes the
+#: reviewer's runner (#2478). The capacity notification stays a `notify`.
+REQUEST_KIND = "request"
 #: a harness that is not a model family (registry without a session)
 PLACEHOLDER_FAMILIES = frozenset(("", "none", "other", "unknown", "inconnu"))
 #: fallback families as long as the compiled canon (#1616) does not declare
@@ -417,6 +421,124 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
     return "\n".join(lines)
 
 
+def manual_reviewer_message(lot: Mapping, *, freeze: Optional[Mapping] = None,
+                            actor: str = "") -> str:
+    """The request mail of a manual designation (#705, #2478).
+
+    Unlike the automatic mail, this designation can happen as soon as the lot
+    enters `qa`: the head may not be frozen yet. The mail names the latest
+    frozen head when one exists and says what to watch otherwise. It is sent as
+    a `request` linked to the lot, so the reviewer's runner opens a turn (#2478).
+    """
+    row = dict(lot or {})
+    freeze = dict(freeze or {})
+    sha = str(freeze.get("sha") or "")
+    fid = freeze.get("id")
+    lines = [
+        "Review request (#2076): you are the designated reviewer of lot #%s."
+        % row.get("id"),
+        "",
+        "Lot: #%s \"%s\"" % (row.get("id"), " ".join(str(row.get("title") or "").split())),
+    ]
+    if row.get("app"):
+        lines.append("- Project: %s." % row["app"])
+    if sha:
+        lines += [
+            "- Latest frozen head: %s (frozen milestone #%s)."
+            % (sha, fid if fid is not None else "?"),
+            "- Review exactly this head and render your verdict:",
+            "  ameesh work milestone %s verdict ok|blocked --sha %s" % (row.get("id"), sha),
+        ]
+    else:
+        lines += [
+            "- No frozen head is recorded yet: the author declares it with",
+            "  ameesh work milestone %s frozen --sha <commit>." % row.get("id"),
+            "- Review exactly the frozen head and render your verdict:",
+            "  ameesh work milestone %s verdict ok|blocked --sha <frozen sha>"
+            % row.get("id"),
+        ]
+    lines.append("- This request is linked to lot #%s: your runner opens a turn on it."
+                 % row.get("id"))
+    if actor:
+        lines.append("- Designated by: %s." % actor)
+    lines += [
+        "",
+        "To do:",
+        "- read the diff of the frozen head and check the edge cases;",
+        "- a blocking defect: fix it yourself and push to the lot branch "
+        "(canon §2); a fix longer than ~50 lines, or a design change, goes back "
+        "to the author;",
+        "- a non-blocking defect goes to the backlog, it does not block the merge;",
+        "- do not rerun the suites: targeted tests are the author's job, CI runs "
+        "on the frozen head once the required opinions are acquired.",
+    ]
+    # #2495 : nothing cancels a manual request; a new freeze does not hand a
+    # new head to this reviewer either. Say what to review if the branch moves.
+    lines += ["", "A new freeze does not cancel this request: if the branch moves, "
+              "review the latest frozen head (`ameesh work show %s`) and render your "
+              "verdict on it." % row.get("id")]
+    return "\n".join(lines)
+
+
+#: how many recent mails of a reviewer are read to find an earlier request
+#: (#2495): a designation reads the reviewer's history, not the whole mailbox.
+REQUEST_HISTORY = 200
+
+
+def _request_sha(row: Mapping) -> Optional[str]:
+    """Review request head, empty before freeze, None for another mail."""
+    payload = row.get("payload") or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            return None
+    if not isinstance(payload, Mapping):
+        return None
+    auto = payload.get("review_designation")
+    if isinstance(auto, Mapping):
+        return str(auto.get("sha") or "").strip().lower()
+    manual = payload.get("review_request")
+    if isinstance(manual, Mapping):
+        freeze = manual.get("freeze")
+        if isinstance(freeze, Mapping):
+            return str(freeze.get("sha") or "").strip().lower()
+        return ""
+    return None
+
+
+def covering_request(rows: Iterable[Mapping], *, lot, reviewer: str,
+                     sha: str = "") -> Optional[dict]:
+    """The earlier request that already covers (lot, reviewer, head), if any (#2495).
+
+    One request per reviewer and head: a re-designation, or a manual
+    designation followed by the automatic one at the freeze, sends no second
+    mail. `rows` are the reviewer's mails (`mail.history`). A request covers
+    the new one when it names the same frozen head, or when it names no head
+    (manual designation before the freeze) and is either still unread — the
+    reviewer will read it and review the frozen head — or the new one names no
+    head either. A delivered request without a head does not cover a freeze:
+    the reviewer already took that turn, the freeze must wake them again.
+    """
+    name = str(reviewer or "").strip()
+    target = str(sha or "").strip().lower()
+    for row in rows or ():
+        if str(row.get("kind") or "") != REQUEST_KIND:
+            continue
+        if str(row.get("work_item_id") or "").strip() != str(lot).strip():
+            continue
+        if str(row.get("recipient") or "").strip() != name:
+            continue
+        prior = _request_sha(row)
+        if prior is None:
+            continue
+        if prior and target and _same_freeze(prior, target):
+            return dict(row)
+        if not prior and (not target or not row.get("delivered_ts")):
+            return dict(row)
+    return None
+
+
 def capacity_message(lot: dict, *, freeze: Mapping, required: int, missing: int,
                      why: str, families: str = "") -> str:
     """The waiting notification: no independent reviewer can be designated.
@@ -571,6 +693,7 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
             messages.append({
                 "to": reviewer["name"],
                 "family": reviewer["family"],
+                "kind": REQUEST_KIND,
                 "body": reviewer_message(item, freeze=freeze, required=required,
                                          rank=rank, reviewer=reviewer, authors=authors,
                                          base=base, risk=risk, policy_ref=policy_ref),
@@ -579,6 +702,7 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         messages.append({
             "to": notify,
             "family": "",
+            "kind": "notify",
             "body": capacity_message(item, freeze=freeze, required=required,
                                      missing=selection["missing"], why=selection["why"]),
             "capacity": True,

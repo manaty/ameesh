@@ -1,6 +1,6 @@
 {
  "schema": "ameesh-exec-contract/1",
- "version": "1.2.0",
+ "version": "1.3.0",
  "prefix": "/api/exec/v1",
  "description": "Contrat de l'API d'exécuteur médiée (L107) : la liste FERMÉE des opérations de storage.interface qu'un exécuteur d'appareil peut appeler, leur portée et leur fencing. Référence : docs/EXECUTEUR-MEDIEE.md.",
  "scopes": {
@@ -4061,6 +4061,65 @@
    "rules": [
     "proposer seulement : execute reste au serveur (0012)"
    ]
+  },
+  {
+   "name": "operations.publish_peek",
+   "write": true,
+   "transport": "op",
+   "scope": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forced": {
+    "owner": "envelope_owner",
+    "epoch": "envelope_epoch"
+   },
+   "params": [
+    {
+     "name": "name",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "owner",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "epoch",
+     "kind": "positional",
+     "schema": {
+      "type": "integer"
+     },
+     "required": true
+    },
+    {
+     "name": "payload",
+     "kind": "positional",
+     "schema": {
+      "type": "object"
+     },
+     "required": true
+    }
+   ],
+   "result": {
+    "type": "boolean"
+   },
+   "refusal": false,
+   "idempotency": {
+    "key": "required",
+    "natural": true
+   },
+   "rules": [
+    "Bounded sanitised snapshot of this agent only; no raw thoughts, prompts, arguments or tool output."
+   ]
   }
  ],
  "refused": {
@@ -4355,6 +4414,7 @@
     "latest_gauges",
     "listing",
     "open_lots_activity",
+    "read_peek",
     "recent_balance",
     "record_balance",
     "request_restart",
@@ -4469,6 +4529,7 @@
     "claim_review_proposal",
     "close",
     "close_merged",
+    "corrections",
     "count_builds",
     "creator",
     "current_delegation",

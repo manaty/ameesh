@@ -12,11 +12,73 @@ import os
 import math
 import threading
 import time
-from dataclasses import asdict, replace
+import uuid
+from dataclasses import replace
 
-from . import (merge_queue, radar, resolutions, train, train_admissions,
+from . import (merge_queue, radar, resolutions, storage, train, train_admissions,
                train_candidates, train_ci, train_fire, train_git, train_history,
                train_migrations, train_policy, train_runtime, train_store)
+
+#: #2446: one host executes the train service. The lease is independent of the
+#: per-target packet reservation; it is renewed while the service runs and
+#: released on a clean stop. A host that loses it stops scheduling passages
+#: until it can acquire it again.
+SERVICE_LEASE_KEY = "train-service"
+SERVICE_LEASE_TTL_S = 900.0
+SERVICE_LEASE_RETRY_S = 60.0
+
+
+class HostLease:
+    """The exclusive service lease of one host, under the existing lock table."""
+
+    def __init__(self, cfg, *, key=SERVICE_LEASE_KEY, ttl=SERVICE_LEASE_TTL_S,
+                 retry=SERVICE_LEASE_RETRY_S, clock=time.time):
+        if not isinstance(key, str) or not key.strip():
+            raise train.TrainError("explicit train service lease key required")
+        if isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or ttl <= 0 \
+                or isinstance(retry, bool) or not isinstance(retry, (int, float)) \
+                or retry <= 0:
+            raise train.TrainError("positive train service lease duration required")
+        self.key = key
+        # #2446/Codex B2: `land_lock` lets the SAME owner take a new epoch
+        # immediately. One owner per service incarnation is therefore
+        # mandatory: two processes configured with the same runner id must
+        # contend instead of both considering themselves the holder.
+        self.owner = "train-service:%s:%s" % (
+            cfg.runner or cfg.host or "unknown", uuid.uuid4().hex)
+        self.ttl, self.retry, self.clock = float(ttl), float(retry), clock
+        self.epoch = None
+        self.next_at = 0.0
+
+    def acquire(self, db, now=None):
+        """Take the service lease; False when another host holds it."""
+        now = self.clock() if now is None else float(now)
+        epoch = storage.of(db).work.land_lock(self.key, self.owner, self.ttl)
+        if epoch is None:
+            self.epoch, self.next_at = None, now + self.retry
+            return False
+        self.epoch, self.next_at = int(epoch), now + self.ttl / 3.0
+        return True
+
+    def renew(self, db, now=None):
+        """Keep the same epoch; False when the lease is gone."""
+        now = self.clock() if now is None else float(now)
+        if self.epoch is None:
+            return False
+        epoch = storage.of(db).work.land_lock(self.key, self.owner, self.ttl,
+                                              epoch=self.epoch)
+        if epoch != self.epoch:
+            self.epoch, self.next_at = None, now + self.retry
+            return False
+        self.next_at = now + self.ttl / 3.0
+        return True
+
+    def release(self, db):
+        """Release this service's lease; never touch another holder's."""
+        if self.epoch is None:
+            return False
+        epoch, self.epoch = self.epoch, None
+        return bool(storage.of(db).work.land_unlock(self.key, self.owner, epoch))
 
 
 class Passage:
@@ -47,7 +109,7 @@ class Passage:
             raise train.TrainError("explicit qualified packet reservation required")
         return self.reservation.bind(db, self.project,
             merge_queue._remote_branch(self.project.target), self.owner,
-            train.digest([asdict(workflow) for workflow in self.workflows]))
+            train_ci.contract_digest(self.workflows))
 
     def maintain(self, db, now):
         self.maintenance_at = self.reservation_ledger(db).maintain(now)
@@ -107,10 +169,14 @@ class Passage:
             raise train.TrainError("explicit compiled packet merge policy required") from exc
         policy = replace(self.policy, schedule=rules)
         requirement = train_policy.Compiled(rules)
-        ci = train_ci.GitHub(radar.github_slug(self.project), self.workflows)
+        # #2503: a dynamic contract resolves the due parts in the private
+        # clone, against the plan's base and head; a static contract ignores
+        # the path and the proof cache.
+        directory = self.repository_path()
+        ci = train_ci.GitHub(radar.github_slug(self.project), self.workflows,
+                             repo=directory, cache=train_ci.parts_cache(self.cfg))
         # The radar, another target, and another runner may all replay merges
         # concurrently. They must never reset this passage's worktree.
-        directory = self.repository_path()
         clone = resolutions.Replayer(self.project.repo, directory, script=None)
         transports = (None if self.transports is None else
                       lambda **context: self.transports(db, **context))
@@ -176,9 +242,10 @@ class Service:
     a failed passage waits for a new event rather than retrying by itself.
     Connections and runtime ports never survive a passage.
     """
-    def __init__(self, cfg, passages, *, stop, report, clock=time.time):
+    def __init__(self, cfg, passages, *, stop, report, clock=time.time, lease=None):
         self.cfg, self.passages = cfg, tuple(passages)
         self.stop, self.report, self.clock = stop, report, clock
+        self.lease = lease
         self.condition = threading.Condition()
         self.pending = set(range(len(self.passages)))
         self.deadlines = {}
@@ -235,40 +302,92 @@ class Service:
         finally:
             db.close()
 
+    def _lease_ready(self, now=None):
+        """Acquire or renew the exclusive service lease; False means wait."""
+        if self.lease is None:
+            return True
+        from .scoped_db import ScopedDb
+        now = self.clock() if now is None else float(now)
+        db = ScopedDb(self.cfg)
+        try:
+            if self.lease.epoch is None:
+                if not self.lease.acquire(db, now):
+                    return False
+                with self.condition:
+                    self.pending.update(range(len(self.passages)))
+                self.report("train service lease acquired (%s)" % self.lease.owner)
+                return True
+            if now >= self.lease.next_at:
+                if self.lease.renew(db, now):
+                    return True
+                self.report("train service lease lost; waiting to acquire it again")
+                return False
+            return True
+        except Exception as exc:
+            self.report("train service lease unreadable (%s: %s)"
+                        % (type(exc).__name__, exc))
+            return False
+        finally:
+            db.close()
+
+    def _release_lease(self):
+        if self.lease is None or self.lease.epoch is None:
+            return
+        from .scoped_db import ScopedDb
+        db = ScopedDb(self.cfg)
+        try:
+            self.lease.release(db)
+        except Exception as exc:
+            self.report("train service lease release failed (%s: %s)"
+                        % (type(exc).__name__, exc))
+        finally:
+            db.close()
+
     def run(self):
-        while not self.stop.is_set():
-            with self.condition:
-                if self.stop.is_set():
-                    return
-                now = self.clock()
-                ready = self.pending | {i for i, at in self.deadlines.items() if at <= now}
-                renew = {i for i, at in self.maintenance.items() if at <= now} - ready
-                if not ready and not renew:
-                    times = list(self.deadlines.values()) + list(self.maintenance.values())
-                    delay = min(times) - now if times else None
-                    self.condition.wait(timeout=delay)
+        try:
+            while not self.stop.is_set():
+                if not self._lease_ready():
+                    with self.condition:
+                        if self.stop.is_set():
+                            return
+                        self.condition.wait(timeout=self.lease.retry)
                     continue
-                self.pending.difference_update(ready)
-            for index in sorted(renew):
-                if self.stop.is_set():
-                    return
-                deadline = self.maintain_once(index, self.clock())
                 with self.condition:
-                    self.maintenance.pop(index, None)
-                    if deadline is not None:
-                        self.maintenance[index] = deadline
-            for index in sorted(ready):
-                if self.stop.is_set():
-                    return
-                deadline = self.pass_once(index, self.clock())
-                with self.condition:
-                    self.deadlines.pop(index, None)
-                    if deadline is not None:
-                        self.deadlines[index] = deadline
-                    self.maintenance.pop(index, None)
-                    at = getattr(self.passages[index], "maintenance_at", None)
-                    if isinstance(at, (int, float)) and math.isfinite(at):
-                        self.maintenance[index] = at
+                    if self.stop.is_set():
+                        return
+                    now = self.clock()
+                    ready = self.pending | {i for i, at in self.deadlines.items() if at <= now}
+                    renew = {i for i, at in self.maintenance.items() if at <= now} - ready
+                    if not ready and not renew:
+                        times = list(self.deadlines.values()) + list(self.maintenance.values())
+                        if self.lease is not None:
+                            times.append(self.lease.next_at)
+                        delay = min(times) - now if times else None
+                        self.condition.wait(timeout=delay)
+                        continue
+                    self.pending.difference_update(ready)
+                for index in sorted(renew):
+                    if self.stop.is_set():
+                        return
+                    deadline = self.maintain_once(index, self.clock())
+                    with self.condition:
+                        self.maintenance.pop(index, None)
+                        if deadline is not None:
+                            self.maintenance[index] = deadline
+                for index in sorted(ready):
+                    if self.stop.is_set():
+                        return
+                    deadline = self.pass_once(index, self.clock())
+                    with self.condition:
+                        self.deadlines.pop(index, None)
+                        if deadline is not None:
+                            self.deadlines[index] = deadline
+                        self.maintenance.pop(index, None)
+                        at = getattr(self.passages[index], "maintenance_at", None)
+                        if isinstance(at, (int, float)) and math.isfinite(at):
+                            self.maintenance[index] = at
+        finally:
+            self._release_lease()
 
     def start(self):
         self.thread = threading.Thread(target=self.run, daemon=True, name="integration-trains")

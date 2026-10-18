@@ -247,7 +247,8 @@ class Agents(Domain):
     @abc.abstractmethod
     def operator_pause(self, name: str, *, paused: bool, reason: str,
                        actor: str, principal: str,
-                       expect_reason: str | None = None) -> dict | None:
+                       expect_reason: str | None = None,
+                       not_after: float | None = None) -> dict | None:
         """Native human hold: row lock, state and audit in one atomic statement.
 
         No status/prompt/lease changes; repeated state has no new event.
@@ -258,6 +259,11 @@ class Agents(Domain):
         instruction, sous le verrou de ligne : une pause étrangère posée entre
         la lecture et la reprise n'est jamais levée. Refusé pour POSER une
         pause (`paused=True`).
+
+        `not_after` (#2184/R3) : échéance absolue (epoch) pour une POSE ; la
+        base la compare à son horloge sous le verrou de ligne et refuse la
+        pose au-delà (`changed=false`, `refusal='not_after'`). Une pose
+        distante retardée ne peut donc pas committer après le nettoyage.
         """
 
     @abc.abstractmethod
@@ -360,7 +366,8 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def state(self, name: str) -> dict | None:
-        """Détenteur, epoch, statut et vie du bail (`live`), ou None."""
+        """Nom primaire résolu, détenteur, epoch, statut et vie du bail
+        (`live`), ou None."""
 
     @abc.abstractmethod
     def renew(self, name: str, owner: str, epoch: int, ttl_seconds: float) -> float | None:
@@ -1965,9 +1972,22 @@ class WorkItems(Domain):
         dédupliquée exactement."""
 
     @abc.abstractmethod
+    def corrections(self, ids: Sequence[int] | None = None) -> dict[int, float]:
+        """#2317 (N2/N4) : instant de la dernière correction `merged → build`
+        par lot, `{}` sans correction.
+
+        Une correction se reconnaît à la **transition** du journal (un
+        événement `build` dont l'état précédent est `merged`), jamais au texte
+        de sa note — une note libre du même préfixe n'annule rien. `ids` borne
+        la lecture aux lots candidats au lieu de relire tout le journal à
+        chaque relevé."""
+
+    @abc.abstractmethod
     def milestones(self, item_id: int, limit: int | None) -> list[dict]:
         """Les jalons d'un lot (0013), du plus récent au plus ancien.
-        `None` lit tout l'historique, notamment les anciens blocages du train."""
+        `None` lit tout l'historique, notamment les anciens blocages du train.
+        Chaque ligne porte `annulled` : vrai pour un jalon `merged` qu'une
+        correction `merged → build` postérieure a annulé (#2317)."""
 
     @abc.abstractmethod
     def add_milestone(self, item_id: int, kind: str, *, sha: str, actor: str,
@@ -2023,10 +2043,12 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def close_merged(self, item_id: int, *, current: str, sha: str, actor: str, note: str,
                      pr_ref: str | None, frozen_id: int | None = None,
-                     landed: tuple[int, str] | None = None) -> dict | None:
+                     landed: tuple[int, str] | None = None,
+                     unfrozen: bool = False) -> dict | None:
         """Fusion constatée (L29) : `current` → `merged` si le lot y est encore
         et, si `frozen_id` est donné, si ce jalon `frozen` est toujours le
-        dernier gel du lot (sinon None, rien d'écrit) ; journal et jalon
+        dernier gel du lot — `unfrozen` (#2444) : si le lot n'a toujours aucun
+        gel (sinon None, rien d'écrit) ; journal et jalon
         `merged` (commit, auteur de la fusion) dans la même transaction.
         `landed` (#1567) : `(numéro, dépôt)` du numéro réellement atterri,
         écrit dans la même transaction."""
@@ -3112,6 +3134,14 @@ class Operations(Domain):
     #: réglages entiers (colonne `bigint`) : la valeur texte est convertie
     INTEGER_SETTINGS = ("context_max_tokens", "turn_max_seconds", "turn_mail_max",
                         "turn_grace_seconds")
+
+    @abc.abstractmethod
+    def publish_peek(self, name: str, owner: str, epoch: int, payload: dict) -> bool:
+        """Replace a sanitised observation under the live agent lease; false if fenced."""
+
+    @abc.abstractmethod
+    def read_peek(self, name: str, human: str) -> dict | None:
+        """Responsible human only; no snapshot data selected on a refused read."""
 
     @abc.abstractmethod
     def set_settings(self, name: str, values: dict) -> bool:

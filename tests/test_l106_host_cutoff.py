@@ -303,6 +303,7 @@ class HoteNonPretTest(PgTestCase):
         self.assertIsNotNone(lease)
         worker = AgentWorker(runner, registry.get(self.db, name), lease)
         self.addCleanup(worker.watchdog_stop.set)
+        self.addCleanup(worker._close_peek)  # #1349 : aucun fil d'aperçu après le test
         return runner, worker
 
     def _env(self, **extra):

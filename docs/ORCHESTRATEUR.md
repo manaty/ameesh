@@ -434,7 +434,7 @@ Un lot prêt entre dans la file de sa cible, au lieu d'un « feu de fusion »
 donné à la main :
 
 ```
-ameesh work milestone <id> frozen --sha <commit>               le gel
+ameesh work milestone <id> frozen --sha <commit>               le gel (contrôles statiques d'abord, #2542)
 ameesh work milestone <id> verdict --verdict ok --sha <commit>  le GO de revue, sur ce commit
 ameesh work queue add <id>                                      dans la file
 ```
@@ -525,6 +525,16 @@ réécrit pour ce seul métadonné.
 Le corps du lot porteur nomme ses unités avec leur tête, `#<lot> <tête>`, la
 ligne qu'imprime `scripts/paquet-compose.py --units --base <cible>` (#2360) :
 un `#N` seul n'y déclare aucune unité (#2335).
+
+À la fusion du paquet, ses unités se ferment **sans geste manuel** : le relevé
+de l'exécuteur lit les manifestes `reviews/**paquet**.md` de la cible et, pour
+chaque lot de leur table de composition encore ouvert, examine son dernier gel
+par le contenu — ancêtre, patch-id, squash, revert (#1825) — puis le passe
+`merged` (`packet_close`, #2426). Une ligne de retrait ne ferme rien ; un lot
+re-gelé après la composition reste ouvert. `ameesh work sync-packets --git-dir
+D --target T [--dry-run]` fait le même constat à la main, sur les seules
+unités des manifestes : c'est le balayage ciblé qui manquait à `sync-merges`
+(tous les lots ouverts, plus de 120 s sur ameesh).
 
 ## Le lot en cours
 
