@@ -29,7 +29,7 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import account_claims, accounts, config as config_mod, exploitation, notify
+from ameesh import account_claims, account_turn, accounts, config as config_mod, exploitation, notify
 from ameesh import runner as runner_mod
 
 from .test_l30_accounts import _dossier
@@ -173,6 +173,22 @@ class PolitiqueTest(_Base):
         # le lancement le refuse aussi
         with self.assertRaises(accounts.AccountError):
             accounts.launch_env({}, {"claude": [profil]}, profil)
+
+    def test_report_affiche_le_refus_strict(self):
+        cfg = self.cfg(AUTRE, self.secondaire(), sharing="strict")
+        (row,) = accounts.report(cfg, None, None, now=self.now, record=False)
+        self.assertFalse(row["ok"])
+        self.assertIn("another mesh", row["problems"][0])
+
+    def test_lancement_relit_le_refus_apres_choix(self):
+        cfg = self.cfg(AUTRE, self.secondaire(), sharing="strict")
+        cached = accounts.parse(cfg.accounts)["claude"][0]
+        worker = types.SimpleNamespace(cfg=cfg, agent={"harness": "claude"},
+                                       _account_override=None, _account=cached)
+        fresh = account_turn.for_turn(worker)
+        self.assertTrue(fresh.refused)
+        with self.assertRaises(accounts.AccountError):
+            accounts.launch_env({}, {"claude": [fresh]}, fresh)
 
     def test_strict_sans_partage_ne_refuse_rien(self):
         propre = _dossier(os.path.join(self.tmp, "autre-claude"), creds=".credentials.json")

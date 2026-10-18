@@ -2195,7 +2195,9 @@ def report(cfg, db, book, *, now: float | None = None,
     fin de fenêtre s'y lit, comme dans la raison du compte.
     """
     now = time.time() if now is None else now
-    declared = parse(getattr(cfg, "accounts", None) or {})
+    from . import account_claims
+    declared = {harness: account_claims.mark_refused(cfg, items, now=now)
+                for harness, items in parse(getattr(cfg, "accounts", None) or {}).items()}
     store = storage.of(db).accounts if db is not None else None
     rows: list[dict] = []
     for harness, items in declared.items():
