@@ -66,12 +66,15 @@ couple (tête relue, tête gelée) ; le passage suivant ne la recalcule pas.
 dans la transaction du gel, donc **avant** le report. Quand le report couvre la
 tête, elle s'abstient : `would_carry` donne le plan du report avant le gel,
 `work.milestone` le passe au hook, qui garde les relecteurs reportés dans la
-colonne `work_items.reviewers` et n'envoie aucun courrier. Le report écrit la
-même marque (`review-designation-carried:…`) et resynchronise la colonne sur
-tous les chemins, y compris le relevé de l'exécuteur ; une désignation de
-repli (`force`) reste possible quand le report refuse. Les marques reportées
-sont des désignations automatiques pour `_previous_reviewers` : un vrai gel
-ultérieur les remplace.
+colonne `work_items.reviewers` et n'envoie aucun courrier. Les sièges du gel
+précédent qui n'ont pas encore voté restent désignés : le report ne reporte que
+des verdicts, pas une attente (B/P1 de dev1). Par gel, **la dernière marque du
+journal fait foi** (`review-designation:` pour une sélection,
+`review-designation-carried:` pour un report) : un report tardif qui aboutit
+retire la sélection qu'il supplante, une désignation de repli (`force`) plus
+récente reprend la main, et un report après elle réécrit sa marque. Les marques
+reportées sont des désignations automatiques pour `_previous_reviewers` : un
+vrai gel ultérieur les remplace.
 """
 from __future__ import annotations
 
@@ -102,12 +105,17 @@ def carried_mark_prefix(lot: int) -> str:
     return "%s%d:" % (CARRIED_MARK_PREFIX, int(lot))
 
 
-def carried_mark_note(lot: int, freeze: Mapping, plan: Mapping) -> str:
+def carried_mark_note(lot: int, freeze: Mapping, plan: Mapping,
+                      extra_reviewers=()) -> str:
     """La marque du gel dont les relecteurs sont gardés par un report.
 
     Elle a la forme des marques de désignation (lot + gel dans le préfixe, JSON
     après) pour que `_previous_reviewers` la lise comme une désignation
     automatique : un vrai gel ultérieur retire ces noms de la colonne.
+
+    `extra_reviewers` (#2487, B/P1 de dev1) : les sièges du gel précédent qui
+    n'ont pas encore voté restent désignés par le gel réaligné ; le report ne
+    reporte que des verdicts, pas une attente.
     """
     freeze = dict(freeze or {})
     plan = dict(plan or {})
@@ -116,6 +124,11 @@ def carried_mark_note(lot: int, freeze: Mapping, plan: Mapping) -> str:
         name = str((entry or {}).get("actor") or "").strip()
         if name and name not in [r["name"] for r in reviewers]:
             reviewers.append({"name": name, "family": ""})
+    for entry in extra_reviewers or ():
+        name = str((entry or {}).get("name") or "").strip()
+        if name and name not in [r["name"] for r in reviewers]:
+            reviewers.append({"name": name,
+                              "family": str((entry or {}).get("family") or "")})
     payload = {
         "state": "carried",
         "reviewers": reviewers,
@@ -716,8 +729,10 @@ def _keep_reviewers(tx, lot: int, row: dict, freeze: dict, plan: list, out: dict
     (#2487) ; ce chemin couvre le report tardif (relevé de l'exécuteur, ou gel
     fait par un autre appelant) : sans lui, une désignation du nouveau gel
     resterait dans la colonne et `progress` attendrait un verdict qui n'a pas
-    lieu d'être. La marque `review-designation-carried` rend la reprise et la
-    lecture (`ameesh work reviewers`) idempotentes."""
+    lieu d'être. Une marque `review-designation-carried` est écrite quand la
+    dernière marque du gel n'en est pas déjà une (report après une désignation
+    `force`) : elle devient l'effective et la colonne la suit. La marque rend
+    la reprise et la lecture (`ameesh work reviewers`) idempotentes."""
     from . import review_designation_activation as activation
     freeze_id = int(freeze.get("id") or 0)
     names = []
@@ -728,7 +743,12 @@ def _keep_reviewers(tx, lot: int, row: dict, freeze: dict, plan: list, out: dict
     if not names:
         return
     payload = {"state": "carried", "carried": out.get("carried") or []}
-    if activation._carried_mark(tx, int(lot), freeze_id) is None:
+    effective = activation._effective_mark(
+        tx, int(lot), freeze_id, since_ts=float(freeze.get("at_ts") or 0.0))
+    if effective is None or effective[1] != "carried":
+        # #2487 : un report tardif qui aboutit après une vraie désignation
+        # (repli `force`) écrit une marque plus récente ; la colonne et la
+        # lecture suivent alors le report, pas la sélection supplantée.
         note = carried_mark_note(int(lot), freeze, payload)
         storage.of(tx).work.note(int(lot), str(row.get("state") or ""), note,
                                  work.SYSTEM_SENDER)
@@ -757,19 +777,26 @@ def _carried_pending(db, lot: int, freeze: dict) -> bool:
 
     La désignation au gel s'est abstenue sur le plan du report (#2487) et a
     laissé la marque `review-designation-carried` ; si le report refuse ensuite
-    (cible déplacée, dépôt absent), personne n'est désigné. Vrai quand la
-    marque du gel existe, qu'aucune désignation réelle ne la remplace et
-    qu'aucun échec de désignation n'a déjà été constaté pour ce gel (sinon la
-    passe suivante répéterait la même lecture sans rien changer)."""
+    (cible déplacée, dépôt absent), personne n'est désigné. Vrai quand cette
+    marque est **effective** (la dernière du gel, aucune sélection réelle ne la
+    remplace), que ses verdicts ne sont pas déjà sur la tête gelée, et qu'aucun
+    échec de désignation n'a déjà été constaté pour ce gel (sinon la passe
+    suivante répéterait la même lecture sans rien changer)."""
     from . import review_designation_activation as activation
-    from . import review_designation_pg as pg
     lot = int(lot)
     freeze_id = int(freeze.get("id") or 0)
     try:
-        if activation._carried_mark(db, lot, freeze_id) is None:
+        effective = activation._effective_mark(
+            db, lot, freeze_id, since_ts=float(freeze.get("at_ts") or 0.0))
+        if effective is None or effective[1] != "carried":
             return False
-        if pg.PgPort(db).recorded(lot, freeze_id) is not None:
-            return False
+        carried = effective[2].get("carried") or ()
+        if carried:
+            on_head = {_key(mark.get("actor")) for mark in work.milestones(db, lot, None)
+                       if mark.get("kind") == "verdict"
+                       and _same(mark.get("sha"), freeze.get("sha"))}
+            if all(_key(entry.get("actor")) in on_head for entry in carried):
+                return False
         prefix = "%s%d:%d:" % (activation.UNAVAILABLE_PREFIX, lot, freeze_id)
         if storage.of(db).work.events_noted(prefix, 0.0, ids=[lot]):
             return False

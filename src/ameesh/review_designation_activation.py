@@ -513,55 +513,81 @@ def _note_unavailable(db, item: Mapping, freeze: Mapping, why: str,
               after_commit=threads)
 
 
+def _marks(db, lot: int, *, freeze_id: Optional[int] = None,
+           since_ts: Optional[float] = None) -> Optional[list]:
+    """Les marques automatiques du lot, dans l'ordre du journal (#2487).
+
+    Rend `[(row_id, kind, payload, created_ts)]`, `kind` valant
+    `"designation"` (une sélection, y compris `waiting`) ou `"carried"` (une
+    marque gardée par un report). `freeze_id` restreint à un gel. None quand le
+    journal est illisible : l'appelant ne retire alors aucun nom et ne devine
+    pas la marque effective.
+    """
+    from . import verdict_carry
+    lot = int(lot)
+    if freeze_id is None:
+        prefixes = (("%s%d:" % (pg.MARK_PREFIX, lot), "designation"),
+                    (verdict_carry.carried_mark_prefix(lot), "carried"))
+    else:
+        prefixes = ((pg.mark_prefix(lot, int(freeze_id)), "designation"),
+                    ("%s%d:" % (verdict_carry.carried_mark_prefix(lot), int(freeze_id)),
+                     "carried"))
+    since = 0.0 if since_ts is None else float(since_ts or 0.0)
+    found = []
+    for prefix, kind in prefixes:
+        try:
+            rows = storage.of(db).work.events_noted(prefix, since, ids=[lot])
+        except Exception:  # noqa: BLE001 - journal illisible : rien n'est retiré
+            return None
+        for row in rows or ():
+            note = str(row.get("note") or "")
+            if kind == "designation":
+                try:
+                    payload = pg.designation_of(note)
+                except rd.DesignationError:
+                    continue
+            else:
+                payload = verdict_carry.carried_mark_of(note)
+            if payload is None:
+                continue
+            try:
+                noted_freeze = int((payload.get("freeze") or {}).get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if freeze_id is not None and noted_freeze != int(freeze_id):
+                continue
+            found.append((int(row.get("id") or 0), kind, payload,
+                          float(row.get("created_ts") or 0.0)))
+    return sorted(found, key=lambda entry: entry[0])
+
+
+def _effective_mark(db, lot: int, freeze_id: int, *,
+                    since_ts: Optional[float] = None) -> Optional[tuple]:
+    """La dernière marque automatique de CE gel (ordre du journal), ou None.
+
+    Sélection ou report : la plus récente décrit seule l'état du gel (#2487,
+    arbitrage du pilote). Une marque illisible ou d'un autre gel est ignorée.
+    """
+    marks = _marks(db, lot, freeze_id=int(freeze_id), since_ts=since_ts)
+    return marks[-1] if marks else None
+
+
 def _previous_reviewers(db, lot: int, freeze_id: int) -> list:
-    """The reviewers of the lot's PREVIOUS automatic designations.
+    """The reviewers of the lot's automatic designations outside `freeze_id`.
 
     Only the journal marks are read: a name that never appeared in a mark is a
-    manual designation and must survive a new freeze. The current freeze is
-    excluded (its mark may already be written when this runs on a replay).
-
-    A carried mark (#2487) is an automatic designation too: the reviewers kept
-    by a verdict carry are removed by a real designation of a later freeze,
-    exactly like the ones a selection wrote.
+    manual designation and must survive a new freeze. A `waiting` designation
+    names no reviewer. A carried mark (#2487) is an automatic designation too.
     """
     names: list[str] = []
-    try:
-        rows = storage.of(db).work.events_noted(
-            "%s%d:" % (pg.MARK_PREFIX, int(lot)), 0, ids=[int(lot)])
-    except Exception:  # noqa: BLE001 - unreadable journal: keep the manual list
-        rows = []
-    for row in rows or ():
-        try:
-            noted = pg.designation_of(row.get("note"))
-        except rd.DesignationError:
-            continue
-        if not noted or noted.get("state") != rd.DESIGNATED:
-            continue
+    for _row_id, kind, noted, _ts in _marks(db, lot) or ():
         try:
             noted_freeze = int((noted.get("freeze") or {}).get("id") or 0)
         except (TypeError, ValueError):
             continue
         if noted_freeze == int(freeze_id):
             continue
-        for reviewer in noted.get("reviewers") or ():
-            name = str((reviewer or {}).get("name") or "").strip()
-            if name and name not in names:
-                names.append(name)
-    from . import verdict_carry
-    try:
-        rows = storage.of(db).work.events_noted(
-            verdict_carry.carried_mark_prefix(int(lot)), 0, ids=[int(lot)])
-    except Exception:  # noqa: BLE001 - unreadable journal: keep the manual list
-        rows = []
-    for row in rows or ():
-        noted = verdict_carry.carried_mark_of(row.get("note"))
-        if not noted:
-            continue
-        try:
-            noted_freeze = int((noted.get("freeze") or {}).get("id") or 0)
-        except (TypeError, ValueError):
-            continue
-        if noted_freeze == int(freeze_id):
+        if kind == "designation" and noted.get("state") != rd.DESIGNATED:
             continue
         for reviewer in noted.get("reviewers") or ():
             name = str((reviewer or {}).get("name") or "").strip()
@@ -578,25 +604,10 @@ def _carried_mark(db, lot: int, freeze_id: int, *, since_ts: Optional[float] = N
     désignation (#1775, N3). Une marque illisible est ignorée : la reprise
     repasse par la désignation normale, jamais par une devinette.
     """
-    from . import verdict_carry
-    since = 0.0 if since_ts is None else float(since_ts or 0.0)
-    try:
-        rows = storage.of(db).work.events_noted(
-            verdict_carry.carried_mark_prefix(int(lot)), since, ids=[int(lot)])
-    except Exception:  # noqa: BLE001 - journal illisible : aucune marque
-        return None
-    found = None
-    for row in rows or ():
-        noted = verdict_carry.carried_mark_of(row.get("note"))
-        if not noted:
-            continue
-        try:
-            if int((noted.get("freeze") or {}).get("id") or 0) != int(freeze_id):
-                continue
-        except (TypeError, ValueError):
-            continue
-        found = noted                # ordre du journal : la dernière gagne
-    return found
+    carried = [payload for _row_id, kind, payload, _ts in
+               _marks(db, lot, freeze_id=int(freeze_id), since_ts=since_ts) or ()
+               if kind == "carried"]
+    return carried[-1] if carried else None
 
 
 def _carried_shape(mark: Mapping) -> dict:
@@ -653,11 +664,12 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
 
     The journal mark is the authoritative record, but the reviewers read by
     the merge gate, `progress` and the stale-reviewer alert are the
-    `work_items.reviewers` column (`work_reviewers.designated`). A new freeze
-    invalidates the previous automatic designation: the names of the previous
-    marks are removed first, then the new names appended; a name that never
-    appeared in a mark is a manual designation and is preserved. A manual
-    waiver (`-none`) is never overridden.
+    `work_items.reviewers` column (`work_reviewers.designated`). Every
+    automatic name is retired except the ones of the **effective** mark of the
+    freeze — the last one in journal order, selection or carried (#2487): a
+    late carry therefore removes the selection it supersedes, even in the same
+    freeze. A name that never appeared in a mark is a manual designation and is
+    preserved. A manual waiver (`-none`) is never overridden.
 
     `text`, when given, is the journal line of this sync (a verdict carry keeps
     the reported reviewers instead of designating, #2487)."""
@@ -679,10 +691,26 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
     current = [str(name) for name in (rows[0].get("reviewers") or []) if name]
     if "-none" in current:
         return
-    previous = _previous_reviewers(db, lot, freeze_id)
-    keep = [name for name in current if name not in previous]
-    for name in names or ():
-        name = str(name or "").strip()
+    names = [str(name or "").strip() for name in names or ()]
+    names = [name for name in names if name]
+    marks = _marks(db, lot)
+    if marks is None:
+        return                    # journal illisible : aucun nom retiré
+    effective = _effective_mark(db, lot, freeze_id) if names else None
+    keep_marks = {effective[0]} if effective else set()
+    retired = set()
+    for row_id, _kind, noted, _ts in marks:
+        if row_id in keep_marks:
+            continue
+        for reviewer in noted.get("reviewers") or ():
+            name = str((reviewer or {}).get("name") or "").strip()
+            if name:
+                retired.add(name)
+    keep = [name for name in current if name not in retired]
+    wanted = [str((reviewer or {}).get("name") or "").strip()
+              for reviewer in (effective[2].get("reviewers") or () if effective else ())]
+    wanted.extend(names)
+    for name in wanted:
         if name and name not in keep:
             keep.append(name)
     if keep == current:
@@ -694,12 +722,12 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
         (json.dumps(keep), lot))
     if names:
         text = text or "reviewers designated automatically at freeze #%d: %s" % (
-            freeze_id, ", ".join(str(name) for name in names))
+            freeze_id, ", ".join(names))
     elif text:
         pass
-    elif previous:
+    elif retired:
         text = ("automatic reviewer designation of freeze #%d cleared"
-                " (previous head): %s" % (freeze_id, ", ".join(previous)))
+                " (previous head): %s" % (freeze_id, ", ".join(sorted(retired))))
     else:
         return
     storage.of(db).work.note(lot, str((item or {}).get("state") or ""), text, SENDER)
@@ -773,28 +801,67 @@ def carried_plan(cfg, db, lot: int, sha: str) -> Optional[dict]:
     return plan
 
 
+def _previous_freeze(db, lot: int, freeze_id: int) -> Optional[dict]:
+    """Le gel qui précède `freeze_id` dans la frise du lot, ou None."""
+    rows = storage.of(db).work.milestones(int(lot), pg.MILESTONES)
+    earlier = [row for row in rows or ()
+               if row.get("kind") == "frozen"
+               and int(row.get("id") or 0) < int(freeze_id)]
+    return plan_git.latest_freeze(earlier)
+
+
+def _previous_designees(db, lot: int, freeze_id: int, current=None) -> list:
+    """Les relecteurs désignés au gel précédent, voté ou non (#2487).
+
+    Sur un gel réaligné, le report ne connaît que les verdicts rendus
+    (`pending`) : un siège désigné au gel précédent dont le verdict n'est pas
+    encore rendu doit rester dans la colonne, sinon `progress` ne l'attend plus
+    et il n'est plus relancé (B/P1 de dev1). La marque **effective** du gel
+    précédent seule fait foi, sélection ou report. `current` (la colonne avant
+    le gel) écarte un siège que le pilote a retiré à la main.
+    """
+    prior = _previous_freeze(db, lot, freeze_id)
+    if not prior:
+        return []
+    mark = _effective_mark(db, lot, int(prior["id"]),
+                           since_ts=float(prior.get("at_ts") or 0.0))
+    if not mark:
+        return []
+    kept = (None if current is None
+            else {str(name or "").strip() for name in current or () if name})
+    return [dict(reviewer) for reviewer in (mark[2].get("reviewers") or ())
+            if str((reviewer or {}).get("name") or "").strip()
+            and (kept is None
+                 or str((reviewer or {}).get("name") or "").strip() in kept)]
+
+
 def _carried_in_transaction(tx, item: Mapping, freeze: Mapping,
                             carried: Mapping) -> dict:
     """Garde les relecteurs reportés au gel, sans sélection ni courrier (#2487).
 
     Le report n'est pas encore écrit (il suit le COMMIT du gel) : la marque
     `review-designation-carried` dit dès le gel quels relecteurs sont gardés et
-    la colonne `reviewers` les rend visibles à `progress` et à l'alerte. Le
-    report lui-même, quand il aboutit, recopie les verdicts et retrouve la même
-    marque (idempotente). Aucune exception attendue ici : un échec d'écriture
-    annule le gel avec sa marque, comme la désignation.
+    la colonne `reviewers` les rend visibles à `progress` et à l'alerte. Les
+    sièges du gel précédent qui n'ont pas encore voté restent désignés (B/P1 de
+    dev1) : le report ne reporte que des verdicts, pas une attente. Le report
+    lui-même, quand il aboutit, recopie les verdicts et retrouve la même marque
+    (idempotente). Aucune exception attendue ici : un échec d'écriture annule le
+    gel avec sa marque, comme la désignation.
     """
     from . import verdict_carry
     lot = int((item or {}).get("id") or 0)
     freeze = dict(freeze or {})
     freeze_id = int(freeze.get("id") or 0)
-    existing = _carried_mark(tx, lot, freeze_id,
-                             since_ts=float(freeze.get("at_ts") or 0.0))
-    if existing is not None:
-        return _carried_shape(existing)
+    effective = _effective_mark(tx, lot, freeze_id,
+                                since_ts=float(freeze.get("at_ts") or 0.0))
+    if effective is not None and effective[1] == "carried":
+        return _carried_shape(effective[2])
     plan = dict(carried or {})
     plan.setdefault("detail", "verdicts carried: the reported reviewers are kept")
-    note = verdict_carry.carried_mark_note(lot, freeze, plan)
+    note = verdict_carry.carried_mark_note(
+        lot, freeze, plan,
+        extra_reviewers=_previous_designees(tx, lot, freeze_id,
+                                            (item or {}).get("reviewers")))
     storage.of(tx).work.note(lot, str((item or {}).get("state") or ""), note, SENDER)
     mark = verdict_carry.carried_mark_of(note) or {}
     out = _carried_shape(mark)
@@ -967,21 +1034,22 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         return {"state": "manual", "reviewers": [], "freeze": freeze,
                 "why": "manual reviewer(s) designated: %s" % ", ".join(manual)}
     if not force:
-        try:
-            recorded = pg.PgPort(db).recorded(int(lot), int(freeze.get("id") or 0))
-        except rd.DesignationError:
-            recorded = None
-        if recorded is None:
-            existing = _carried_mark(db, int(lot), int(freeze.get("id") or 0),
-                                     since_ts=float(freeze.get("at_ts") or 0.0))
-            if existing is not None:
-                return _carried_shape(existing)
-            plan = carried_plan(cfg, db, int(lot), str(freeze.get("sha") or ""))
-            if plan:
-                with db.transaction() as tx:
-                    if not _lock_current_freeze(tx, int(lot), freeze):
-                        return _stale(freeze)
-                    return _carried_in_transaction(tx, item, freeze, plan)
+        effective = _effective_mark(db, int(lot), int(freeze.get("id") or 0),
+                                    since_ts=float(freeze.get("at_ts") or 0.0))
+        if effective is not None:
+            # #2487 : la dernière marque du gel fait foi, sélection ou report.
+            # Une sélection `waiting` est retentée : la capacité peut être
+            # revenue, et la même marque devient `designated`.
+            if effective[1] == "carried":
+                return _carried_shape(effective[2])
+            if effective[2].get("state") == rd.DESIGNATED:
+                return dict(effective[2])
+        plan = carried_plan(cfg, db, int(lot), str(freeze.get("sha") or ""))
+        if plan:
+            with db.transaction() as tx:
+                if not _lock_current_freeze(tx, int(lot), freeze):
+                    return _stale(freeze)
+                return _carried_in_transaction(tx, item, freeze, plan)
     threads = _threads()
     checkpoint = len(threads)
     try:
@@ -1051,15 +1119,16 @@ def reviewers(cfg, db, lot: int, *, apply: bool = False) -> dict:
     freeze = {"id": int(row["id"]), "sha": str(row.get("sha") or "").strip(),
               "at_ts": row.get("at_ts"), "actor": row.get("actor") or ""}
     out["freeze"] = freeze
-    try:
-        out["designation"] = pg.PgPort(db).recorded(int(lot), int(freeze["id"]))
-    except rd.DesignationError as exc:
-        out["error"] = str(exc)
-    if out["designation"] is None:
-        # #2487 : un gel réaligné n'a pas de sélection ; sa marque de report dit
-        # quels relecteurs sont gardés. Une vraie désignation reste prioritaire.
-        out["designation"] = _carried_mark(db, int(lot), int(freeze["id"]),
-                                           since_ts=float(freeze.get("at_ts") or 0.0))
+    marks = _marks(db, int(lot), freeze_id=int(freeze["id"]),
+                   since_ts=float(freeze.get("at_ts") or 0.0))
+    if marks is None:
+        out["error"] = "the review designation journal cannot be read"
+    elif marks:
+        # #2487 : la dernière marque du gel fait foi, sélection ou report.
+        effective = marks[-1]
+        out["designation"] = (_carried_shape(effective[2])
+                              if effective[1] == "carried"
+                              else dict(effective[2]))
     if apply:
         out["applied"] = designate(cfg, db, int(lot), freeze=freeze)
     return out

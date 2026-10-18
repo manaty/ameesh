@@ -235,6 +235,21 @@ class _Fixture(PgTestCase):
     def designated(self) -> list:
         return designated(work.get(self.db, self.lot))
 
+    def alternate_reviewers(self) -> None:
+        """Rev1/rev2 sont indisponibles ; rev3 (claude) et rev4 (codex) sont
+        les seuls relecteurs indépendants disponibles. Leurs familles restent
+        celles du registre : la porte comptera les verdicts reportés."""
+        for name, harness in (("rev1", "claude"), ("rev2", "codex")):
+            registry.upsert(self.db, name, harness=harness,
+                            host=self.cfg.host, cwd=self.repo.root, status="stopped")
+            self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
+                            (name,))
+        for name, harness in (("rev3", "claude"), ("rev4", "codex")):
+            registry.upsert(self.db, name, harness=harness, host=self.cfg.host,
+                            cwd=self.repo.root, status="idle")
+            self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
+                            (name,))
+
     def config_file(self) -> str:
         path = os.path.join(self.tmp, "config-2487.json")
         with open(path, "w", encoding="utf-8") as handle:
@@ -314,6 +329,34 @@ class CarriedFreezeTest(_Fixture):
         self.assertEqual(shown.returncode, 0, shown.stdout + shown.stderr)
         self.assertIn("designation: kept from carried verdicts (rev1, rev2)",
                       shown.stdout)
+
+    def test_a_pending_reviewer_of_the_previous_freeze_stays_designated(self):
+        # B/P1 de dev1 : rev2 n'a pas encore voté au gel précédent. Le gel
+        # réaligné ne reporte que des verdicts ; sans garder son siège,
+        # `progress` ne l'attend plus et il n'est plus relancé.
+        _, outcome = self.freeze(self.repo.reviewed)
+        self.assertEqual(outcome["state"], "designated", outcome)
+        self.verdict("rev1", self.repo.reviewed)
+        self.db.execute("DELETE FROM agent_mailbox")
+        frozen = self.repo.merge_target()
+        _, outcome = self.freeze(frozen)
+        self.assertEqual(outcome["state"], "carried", outcome)
+        self.assertEqual([r["name"] for r in outcome["reviewers"]], ["rev1", "rev2"])
+        self.assertEqual(self.designated(), ["rev1", "rev2"])
+        self.assertEqual(self.review_mail(), [])
+        carried = verdict_carry.carry(self.cfg, self.db, self.lot,
+                                      repo=self.repo.root)
+        self.assertEqual(carried["result"], "carried", carried)
+        self.assertEqual([e["actor"] for e in carried["carried"]], ["rev1"])
+        # rev1 est reporté, rev2 reste attendu sur la tête gelée
+        gate = self.gate(frozen)
+        self.assertFalse(gate["ok"], gate)
+        self.assertEqual(gate["on_freeze"], 1, gate)
+        self.verdict("rev2", frozen)
+        self.assertTrue(self.gate(frozen)["ok"], self.gate(frozen)["why"])
+        shown = act.reviewers(self.cfg, self.db, self.lot)
+        self.assertEqual([r["name"] for r in shown["designation"]["reviewers"]],
+                         ["rev1", "rev2"])
 
     def test_a_carried_mark_is_replaced_by_a_later_real_designation(self):
         # Un vrai gel ultérieur re-désigne : les noms gardés par le report sont
@@ -397,6 +440,82 @@ class NotCarriedTest(_Fixture):
         # la marque réelle est prioritaire à la lecture
         shown = act.reviewers(self.cfg, self.db, self.lot)
         self.assertEqual(shown["designation"]["state"], "designated")
+
+
+class LateCarryTest(_Fixture):
+    """Marques du même gel : la dernière du journal fait foi (#2487)."""
+
+    def _old_reviewers(self):
+        _, outcome = self.freeze(self.repo.reviewed)
+        self.assertEqual(outcome["state"], "designated", outcome)
+        self.verdict("rev1", self.repo.reviewed)
+        self.verdict("rev2", self.repo.reviewed)
+        self.db.execute("DELETE FROM agent_mailbox")
+
+    def test_a_late_carry_after_a_selection_replaces_its_reviewers(self):
+        # B/P1 de cx1 : le gel a désigné rev3/rev4 faute de plan ; le report
+        # tardif réussit et doit retirer ces noms, pas les ajouter.
+        self._old_reviewers()
+        self.alternate_reviewers()
+        frozen = self.repo.merge_target()
+        with mock.patch.object(act, "carried_plan", return_value=None):
+            _, outcome = self.freeze(frozen)
+        self.assertEqual(outcome["state"], "designated", outcome)
+        self.assertEqual([r["name"] for r in outcome["reviewers"]], ["rev3", "rev4"])
+        self.assertEqual(self.designated(), ["rev3", "rev4"])
+        self.db.execute("DELETE FROM agent_mailbox")
+        carried = verdict_carry.carry(self.cfg, self.db, self.lot,
+                                      repo=self.repo.root)
+        self.assertEqual(carried["result"], "carried", carried)
+        self.assertEqual(self.designated(), ["rev1", "rev2"])
+        self.assertTrue(self.gate(frozen)["ok"], self.gate(frozen)["why"])
+        self.assertEqual(self.review_mail(), [])
+        # la lecture et la reprise ne rétablissent pas la sélection supplantée
+        shown = act.reviewers(self.cfg, self.db, self.lot)
+        self.assertEqual(shown["designation"]["state"], "carried")
+        self.assertEqual([r["name"] for r in shown["designation"]["reviewers"]],
+                         ["rev1", "rev2"])
+        again = act.designate(self.cfg, self.db, self.lot)
+        self.assertEqual(again["state"], "carried", again)
+        self.assertEqual(self.designated(), ["rev1", "rev2"])
+        self.assertEqual(self.review_mail(), [])
+
+    def test_a_force_designation_after_a_carried_mark_wins(self):
+        self._old_reviewers()
+        frozen = self.repo.merge_target()
+        _, outcome = self.freeze(frozen)
+        self.assertEqual(outcome["state"], "carried", outcome)
+        self.alternate_reviewers()
+        applied = act.designate(self.cfg, self.db, self.lot, force=True)
+        self.assertEqual(applied["state"], "designated", applied)
+        self.assertEqual([r["name"] for r in applied["reviewers"]], ["rev3", "rev4"])
+        self.assertEqual(self.designated(), ["rev3", "rev4"])
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["rev3", "rev4"])
+        shown = act.reviewers(self.cfg, self.db, self.lot)
+        self.assertEqual(shown["designation"]["state"], "designated")
+        self.assertEqual([r["name"] for r in shown["designation"]["reviewers"]],
+                         ["rev3", "rev4"])
+
+    def test_a_carry_after_a_force_designation_takes_the_column_back(self):
+        # Le report réussit après une désignation de repli : il écrit une
+        # marque plus récente, la colonne revient aux relecteurs reportés.
+        self._old_reviewers()
+        frozen = self.repo.merge_target()
+        _, outcome = self.freeze(frozen)
+        self.assertEqual(outcome["state"], "carried", outcome)
+        self.alternate_reviewers()
+        applied = act.designate(self.cfg, self.db, self.lot, force=True)
+        self.assertEqual(applied["state"], "designated", applied)
+        self.assertEqual(self.designated(), ["rev3", "rev4"])
+        carried = verdict_carry.carry(self.cfg, self.db, self.lot,
+                                      repo=self.repo.root)
+        self.assertEqual(carried["result"], "carried", carried)
+        self.assertEqual(self.designated(), ["rev1", "rev2"])
+        self.assertTrue(self.gate(frozen)["ok"], self.gate(frozen)["why"])
+        shown = act.reviewers(self.cfg, self.db, self.lot)
+        self.assertEqual(shown["designation"]["state"], "carried")
+        self.assertEqual([r["name"] for r in shown["designation"]["reviewers"]],
+                         ["rev1", "rev2"])
 
 
 if __name__ == "__main__":
