@@ -453,6 +453,11 @@ class Config:
     #: de l'hôte opérateur : `host` et `projects` — dépôt, cible, staging,
     #: rapport). Validée par `ameesh.release_cutoff` ; absente = aucune.
     release: dict = field(default_factory=dict)
+    #: #2446 : clé `train` du fichier de configuration de l'HÔTE désigné pour
+    #: le service de train (`host`, `mode`, `projects`). Lue telle quelle et
+    #: validée par `ameesh.train_assembly`, qui refuse nommément une pièce
+    #: manquante : aucun passage n'est assemblé sans elle.
+    train: dict = field(default_factory=dict)
     #: #2212 : fichier de configuration lu par `load` ("" sans fichier), pour
     #: relire `radar` à chaque passage du feu (`fresh_radar`) ; calculé, jamais
     #: lu tel quel
