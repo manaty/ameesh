@@ -39,10 +39,12 @@ test_1467_train_storage  # stockage : intentions CAS et bail cible partagé (#14
 test_2446_train_initial  # stockage : frontière d'activation et reçus de file réels (#2446)
 test_2446_train_service_lease  # stockage : bail de service, même runner/incarnations distinctes (#2446)
 test_2446_train_shadow  # stockage : plan ombre sur file, historique et préparation réels (#2446)
+test_423_agent_aliases  # storage: alias namespace guards, audit, same fenced lease/session and canon sync (#423)
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
 test_508_runner_liveness  # #508 : preuve de vie groupée à l’heure DB, sans bail
 test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)
 test_705_reviewer_designated  # stockage : relecteur désigné (colonne 0421, lectures avant migration, alerte stale_lot) (#705)
+test_711_migration_reservations  # storage: atomic scoped migration batches, legacy projection, SHA fencing and lifecycle (#711)
 test_789_slo_alerts  # storage: niveaux d'alerte SLO, priorité SQL, attentes planifiées et livraison Notifier (#789 t2)
 test_800_reviewer_family_warning  # stockage : avertissement (indicatif) quand le relecteur désigné partage le harnais de l'auteur (#800)
 test_802_canon_sync_concurrency  # storage/driver : N syncs concurrents d'un même canon, statement_timeout réel des deux pilotes (#802)

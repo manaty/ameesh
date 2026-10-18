@@ -722,16 +722,42 @@ class RunnerTest(PgTestCase):
                        AMEESH_HOST_GATE_ACK=os.path.join(self.tmp, "gate-ack", "ack.json"),
                        AMEESH_HOST_GATE_FALLBACK="available")
         proc = self.runner_popen("--agents", "perdu", "--lease-ttl", "3", "--poll", "2", env=env)
+        # Le tuyau est lu en continu : un tampon plein ne bloque plus
+        # l'exécuteur, et le témoin peut nommer sa sortie au refus.
+        sortie_lignes: list[str] = []
+        lecteur = threading.Thread(target=lambda: sortie_lignes.extend(proc.stdout or ()),
+                                   daemon=True)
+        lecteur.start()
+
+        def arreter() -> None:
+            if proc.poll() is None:
+                proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            lecteur.join(timeout=5)
+            if proc.stdout is not None:
+                proc.stdout.close()
+
         try:
-            self.wait_for(lambda: len(self.turns()) == 1, timeout=20)
+            self.wait_for(lambda: len(self.turns()) == 1, timeout=30)
             self.db.execute(
                 "UPDATE agent_registry SET lease_expires_at = now() - interval '1 second' "
                 "WHERE name = 'perdu'")
+            # Le harnais dort 120 s : un arrêt manqué à la perte du bail échoue
+            # donc encore dans cette borne. Sous charge CI, l'ordonnancement
+            # peut retarder le battement : 90 s, et la sortie nomme la cause.
             self.wait_for(
-                lambda: registry.get(self.db, "perdu")["pending_prompt"] is not None, timeout=60)
+                lambda: registry.get(self.db, "perdu")["pending_prompt"] is not None, timeout=90)
+        except AssertionError as exc:
+            arreter()
+            self.fail("%s\nsortie de l'exécuteur :\n%s"
+                      % (exc, "".join(sortie_lignes[-60:])))
         finally:
-            proc.terminate()
-            sortie, _ = proc.communicate(timeout=10)
+            arreter()
+        sortie = "".join(sortie_lignes)
         # pas de mort par signal à l'arrêt (SIGABRT du fil `journal`, 2026-10-05)
         self.assertGreaterEqual(proc.returncode, 0, "code %r\n%s" % (proc.returncode, sortie))
         self.assertNotIn("exiting immediately", sortie)
@@ -1073,7 +1099,7 @@ class RunnerTest(PgTestCase):
         worker = AgentWorker(
             runner,
             {"name": "yankee", "harness": "claude"},
-            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.25},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.6},
         )
         worker.proc = proc
         worker.pgid = proc.pid
@@ -1081,7 +1107,7 @@ class RunnerTest(PgTestCase):
             worker.ensure_watchdog()
             time.sleep(0.1)
             worker.lease_deadline = time.time() + 1.5  # renouvellement réussi
-            time.sleep(0.4)  # bien au-delà de l'ancienne échéance
+            time.sleep(0.6)  # bien au-delà de l'ancienne échéance
             self.assertFalse(worker.lease_lost.is_set(), "un bail renouvelé a été tué")
             self.assertIsNone(proc.poll(), "le harnais doit rester vivant")
         finally:

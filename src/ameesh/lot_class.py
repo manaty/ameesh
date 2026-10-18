@@ -111,6 +111,15 @@ def default_base(cfg, item: dict, repo: str) -> Optional[str]:
         return None
 
 
+def _doubtful_files(paths) -> list:
+    """Les chemins d'un diff lu mais inclassable, tous sensibles (doute) : la
+    politique manque, pas le diff, et les motifs de secours de la porte
+    (`merge_queue.CRITICAL_SCOPE`) doivent encore y voir SQL, la sécurité ou la
+    prod (revue #2394 : un doute à un avis ne tait pas un chemin critique)."""
+    return [{"path": str(path), "class": SENSITIVE, "rule": None}
+            for path in paths or () if str(path or "")]
+
+
 def class_of_paths(canons, project: Optional[str], paths) -> dict:
     """La classe des `paths` pour `project`, lue dans tous les canons.
 
@@ -133,7 +142,8 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
             # Ce canon ne couvre pas ce projet : sa politique n'en parle pas.
             continue
         if errors:
-            return {"class": SENSITIVE, "files": [], "policy_ref": _ref(canon),
+            return {"class": SENSITIVE, "files": _doubtful_files(paths),
+                    "policy_ref": _ref(canon),
                     "doubt": True,
                     "why": "review policy unreadable (%s): %s"
                            % (root or "canon", errors[0][2])}
@@ -141,8 +151,9 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
         try:
             result = review_mod.classify(policy, paths)
         except review_mod.ReviewError as exc:
-            return {"class": SENSITIVE, "files": [], "policy_ref": _ref(canon),
-                    "doubt": True, "why": "cannot classify the change: %s" % exc}
+            return {"class": SENSITIVE, "files": _doubtful_files(paths),
+                    "policy_ref": _ref(canon), "doubt": True,
+                    "why": "cannot classify the change: %s" % exc}
         if not ref:
             ref = _ref(canon)
         critical_paths.update(entry["path"] for entry in result["files"]
@@ -158,7 +169,8 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
             worst, files = result["class"], result["files"]
             why = "policy of %s" % (root or "canon")
     if not covered:
-        return {"class": SENSITIVE, "files": [], "policy_ref": "", "doubt": True,
+        return {"class": SENSITIVE, "files": _doubtful_files(paths), "policy_ref": "",
+                "doubt": True,
                 "why": "project %r is not declared by any canon (no fallback policy)"
                        % (project,)}
     # Le maximum du lot ne suffit pas : une exception de la porte (Markdown
@@ -246,6 +258,7 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     elif callable(canons):
         canons = canons()
     if not canons:
+        out["files"] = _doubtful_files(paths)
         out["why"] = "no readable canon: review policy unknown"
         return out
     result = class_of_paths(canons, row.get("app"), paths)
