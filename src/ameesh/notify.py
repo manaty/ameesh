@@ -116,6 +116,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # #1883 : deux configurations de l'hôte déclarent le même nom de
                  # compte vers deux dossiers — lecture ambiguë, compte refusé
                  "account_identity",
+                 # #313 : un autre mesh de l'hôte déclare le même identifiant de
+                 # compte — quota et sessions partagés, contraire à 0033
+                 "account_shared",
                  "host_not_ready", "host_power_low",
                  "host_unavailable", "host_drain_overdue", "lease_not_taken", "backlog_empty", "mail_undeliverable",
                  # #2341 : un hôte dont l'échantillonneur s'est tu n'alimente plus
