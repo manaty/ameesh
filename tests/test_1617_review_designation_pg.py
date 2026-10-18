@@ -118,6 +118,37 @@ class Test1617ReviewDesignationPg(PgTestCase):
         self.run_apply(pg.PgPort(self.db), candidates=self.two_families())
         self.assertEqual([m["recipient"] for m in self.mailbox()], ["r1", "r2", "r1", "r2"])
 
+    def test_a_request_is_found_beyond_the_mail_history_window(self):
+        """#2504 : la demande est lue par (destinataire, nature, lot) en base.
+
+        Plus de 200 messages plus récents ne la cachent plus : l'ancien
+        `mail.history(..., 200)` bornait AVANT de filtrer et renvoyait un
+        second request au même relecteur."""
+        from ameesh import mail
+        manual = mail.send(self.db, "chef", "r1", "Review request: lot", kind="request",
+                           work_item_id=str(self.lot),
+                           payload={"review_request": {"lot": self.lot, "reviewer": "r1",
+                                                       "manual": True}})
+        self.db.execute(
+            "INSERT INTO agent_mailbox (sender, recipient, body, kind, work_item_id)"
+            " SELECT 'chef', 'r1', 'other lot mail', 'notify', '9999'"
+            " FROM generate_series(1, 250)")
+        # la demande du lot est retrouvée malgré le volume ; un autre lot ou
+        # une autre nature ne compte pas
+        self.assertEqual([r["id"] for r in
+                          mail.review_requests(self.db, "r1", self.lot)], [manual])
+        self.assertEqual(mail.review_requests(self.db, "r1", 9999), [])
+
+        self.freeze()
+        out = self.run_apply(pg.PgPort(self.db), candidates=self.two_families())
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1", "r2"])
+        requests = self.db.query(
+            "SELECT id, recipient FROM agent_mailbox"
+            " WHERE payload ? 'review_request' OR payload ? 'review_designation'"
+            " ORDER BY id")
+        self.assertEqual([(r["recipient"], r["id"] == manual) for r in requests],
+                         [("r1", True), ("r2", False)])
+
     def test_designated_records_and_mails_once(self):
         freeze = self.freeze()
         out = self.run_apply(pg.PgPort(self.db), candidates=self.two_families())

@@ -4395,6 +4395,7 @@
     "lock_recipient",
     "pending_recipients",
     "pending_recipients_sorted",
+    "review_requests",
     "unread_active",
     "unread_counts",
     "unread_mid_turn",

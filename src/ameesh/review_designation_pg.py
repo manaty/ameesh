@@ -35,7 +35,7 @@ import json
 from typing import Mapping, Optional, Sequence
 
 from . import mail, plan_git, registry, storage
-from .review_designation import (DESIGNATED, REQUEST_HISTORY, REQUEST_KIND, WAITING,
+from .review_designation import (DESIGNATED, REQUEST_KIND, WAITING,
                                  DesignationError, StaleFreeze, covering_request)
 
 #: prefix of the journal marks: `<prefix><lot>:<milestone>: <json>`
@@ -323,11 +323,12 @@ class PgPort:
         for row in messages:
             recipient = str(row.get("to") or "").strip()
             if (str(row.get("kind") or "") == REQUEST_KIND
-                    and covering_request(mail.history(db, recipient, REQUEST_HISTORY),
+                    and covering_request(mail.review_requests(db, recipient, lot),
                                          lot=lot, reviewer=recipient, sha=sha)):
-                # #2495 : this reviewer already holds a request for this head
-                # (or an unread one naming none): the designation is written,
-                # no second mail.
+                # #2495/#2504 : this reviewer already holds a request for this
+                # head (or an unread one naming none): the designation is
+                # written, no second mail. The requests are selected per lot in
+                # storage, so an old one cannot fall out of a history window.
                 continue
             mail.send(db, self.sender, recipient, str(row.get("body") or ""),
                       kind=str(row.get("kind") or "notify"),
