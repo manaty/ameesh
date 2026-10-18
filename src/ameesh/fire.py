@@ -604,8 +604,11 @@ _TRANSIENT_CODE = re.compile(r"(?i)(?:\bhttp[ /]?|\(\s*)(?:408|429|5\d\d)\b")
 _TRANSIENT_TEXT = (
     "timed out", "timeout", "deadline exceeded", "connection reset",
     "connection refused", "connection aborted", "broken pipe",
-    "network is unreachable", "temporary failure in name resolution",
-    "no such host", "tls handshake", "unexpected eof", "server error",
+    "network is unreachable", "network is down", "network error",
+    "no route to host", "dial tcp", "i/o timeout",
+    "temporary failure in name resolution", "no such host",
+    "name or service not known", "server misbehaving", "lookup ", "goaway",
+    "tls handshake", "unexpected eof", "server error",
     "bad gateway", "service unavailable", "gateway timeout",
     "rate limit", "too many requests", "abuse detection",
 )
@@ -613,12 +616,43 @@ _TRANSIENT_TEXT = (
 
 def _transient_read(detail: str) -> bool:
     """#2306 : la lecture de la forge a-t-elle échoué pour une raison
-    passagère ? Seuls ces échecs (HTTP 408/429/5xx, délai, coupure réseau)
-    gardent la ligne en file ; un 4xx, un refus de droits ou une réponse
-    malformée restent des échecs prouvés, qui éjectent."""
+    passagère ? Seuls ces échecs (HTTP 408/429/5xx, délai, coupure réseau,
+    DNS, GOAWAY) gardent la ligne en file ; un 4xx, un refus de droits ou une
+    réponse malformée restent des échecs prouvés, qui éjectent. #2344 : une
+    sortie vide ne prouve rien non plus — elle est traitée en passagère."""
     low = str(detail or "").lower()
+    if not low.strip():
+        return True
     return bool(_TRANSIENT_CODE.search(low) or re.search(r"(?:^|:\s*)eof\s*$", low)
                 or any(word in low for word in _TRANSIENT_TEXT))
+
+
+#: #2344 : le seul refus que la déclaration du projet peut remplacer.
+_FORBIDDEN_CODE = re.compile(r"(?i)(?:\bhttp[ /]?|\(\s*)403\b")
+
+
+def _forbidden_read(detail: str) -> bool:
+    """#2344 : la forge a-t-elle **prouvé** un refus de droits (HTTP 403) ?
+
+    Un 403 dit que le jeton ne peut pas lire cette source : la déclaration du
+    projet peut alors en tenir lieu. Aucun autre échec — DNS, GOAWAY, sortie
+    vide, 404, réponse malformée — ne vaut cette preuve, sans quoi un gel
+    atterrirait sur la seule déclaration alors que la forge n'a rien refusé."""
+    return bool(_FORBIDDEN_CODE.search(str(detail or "").lower()))
+
+
+def _read_error(detail: str):
+    """#2344 : la classe d'erreur d'une lecture forge échouée.
+
+    Un 403 prouvé lève `land.ForbiddenLandError` (seul cas où la déclaration
+    peut remplacer la source) ; un échec passager (5xx, délai, DNS, GOAWAY,
+    sortie vide) lève `land.TransientLandError` ; tout le reste reste un
+    `land.LandError` ordinaire, fail-closed."""
+    if _forbidden_read(detail):
+        return land.ForbiddenLandError
+    if _transient_read(detail):
+        return land.TransientLandError
+    return land.LandError
 
 
 def _json_pages(stdout: str, what: str) -> list:
@@ -663,13 +697,11 @@ def _api_pages(gh, path: str, what: str) -> list:
                                  % (what, (proc.stdout or "")[:100]))
         return pages
     if "unknown flag: --slurp" not in detail:
-        error = land.TransientLandError if _transient_read(detail) else land.LandError
-        raise error("%s: %s" % (what, detail or "exit %d" % proc.returncode))
+        raise _read_error(detail)("%s: %s" % (what, detail or "exit %d" % proc.returncode))
     proc = gh(["api", "--paginate", path])
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()[:300]
-        error = land.TransientLandError if _transient_read(detail) else land.LandError
-        raise error("%s: %s" % (what, detail or "exit %d" % proc.returncode))
+        raise _read_error(detail)("%s: %s" % (what, detail or "exit %d" % proc.returncode))
     return _json_pages(proc.stdout, what)
 
 
@@ -742,7 +774,9 @@ def _protection_required(slug: str | None, target: str, *, gh) -> tuple:
 
     Un 404 « Branch not protected » est une réponse (aucun check requis) ;
     toute autre lecture — droits, branche absente, réponse malformée — lève
-    `land.LandError` : l'absence de garde ne se suppose jamais."""
+    `land.LandError` : l'absence de garde ne se suppose jamais. #2344 : un
+    refus de droits **prouvé** (403) lève `land.ForbiddenLandError`, seule
+    erreur que `required_checks` peut remplacer par la déclaration."""
     if not slug:
         raise land.LandError("no GitHub repository known: the required checks of %s "
                              "cannot be read" % (target or "the target"))
@@ -755,8 +789,8 @@ def _protection_required(slug: str | None, target: str, *, gh) -> tuple:
         detail = (proc.stderr or proc.stdout or "").strip()[:300]
         if "Branch not protected" in detail:
             return ()
-        error = land.TransientLandError if _transient_read(detail) else land.LandError
-        raise error("gh api %s: %s" % (path, detail or "exit %d" % proc.returncode))
+        raise _read_error(detail)("gh api %s: %s"
+                                  % (path, detail or "exit %d" % proc.returncode))
     data = land._json(proc, "gh api %s" % path, dict)
     required = data.get("required_status_checks")
     if required is None:
@@ -797,7 +831,9 @@ def _ruleset_required(slug: str | None, target: str, *, gh) -> tuple:
     impose une, l'application (`integration_id`, `-1` valant « toute
     application »). Les autres règles ne concernent pas les checks. Un dépôt
     sans ruleset rend une liste vide ; une lecture impossible ou malformée
-    lève `land.LandError` : l'absence de règle ne se suppose jamais (#2285)."""
+    lève `land.LandError` : l'absence de règle ne se suppose jamais (#2285).
+    #2344 : un 403 prouvé lève `land.ForbiddenLandError`, que la déclaration
+    peut remplacer ; les autres échecs restent fail-closed."""
     if not slug:
         raise land.LandError("no GitHub repository known: the rulesets of %s "
                              "cannot be read" % (target or "the target"))
@@ -837,13 +873,15 @@ def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
     complétés par la déclaration `radar.projects.<p>.required_checks` (des
     noms, sans application imposée).
 
-    Quand une lecture de la forge échoue durablement (jeton sans droits, forge
-    muette), la déclaration du projet la remplace **sans retirer l'autre
-    lecture** ; sans déclaration, la lecture refuse. Un échec passager, lui,
-    lève `land.TransientLandError` : la lecture sera réessayée, la déclaration
-    ne tient pas lieu de preuve (#2306). La déclaration ne peut jamais retirer
-    un check que la forge exige : elle s'ajoute. Les noms sont exacts de bout
-    en bout : la déclaration `tests ` ne vaut pas le contexte `tests`."""
+    Quand la forge **refuse** une lecture (403 prouvé : jeton sans droits), la
+    déclaration du projet la remplace **sans retirer l'autre lecture** ; sans
+    déclaration, la lecture refuse. Tout autre échec (404, DNS, GOAWAY, sortie
+    vide, réponse malformée) ne se suppose jamais un refus de droits : il
+    refuse ou lève `land.TransientLandError` quand il est passager — la
+    déclaration ne tient pas lieu de preuve (#2344). La déclaration ne peut
+    jamais retirer un check que la forge exige : elle s'ajoute. Les noms sont
+    exacts de bout en bout : la déclaration `tests ` ne vaut pas le contexte
+    `tests`."""
     declared = tuple((str(name), None) for name in
                      (getattr(project, "required_checks", ()) or ())
                      if str(name).strip())
@@ -856,16 +894,21 @@ def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
                  lambda: _ruleset_required(slug, target, gh=gh)):
         try:
             forged.extend(read())
+        except land.ForbiddenLandError:
+            # #2344 : seul un 403 prouvé autorise la déclaration à tenir lieu
+            # de cette source ; sans déclaration, la lecture refuse.
+            if not declared:
+                raise
         except land.TransientLandError:
             # #2306 : un échec passager n'est pas une source absente ; la
             # file réessaiera au passage suivant, jamais un atterrissage avec
             # la seule déclaration.
             raise
         except land.LandError:
-            # Une source illisible n'efface pas l'autre : la déclaration
-            # remplace la seule lecture manquante (#2285).
-            if not declared:
-                raise
+            # #2344 : 404, DNS, GOAWAY, sortie vide, réponse malformée : la
+            # forge n'a pas prouvé de refus, la déclaration ne remplace rien ;
+            # la lecture partielle est écartée (fail-closed).
+            raise
     return tuple(dict.fromkeys(tuple(forged) + declared))
 
 

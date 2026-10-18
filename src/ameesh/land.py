@@ -54,10 +54,19 @@ class LandError(RuntimeError):
 
 class TransientLandError(LandError):
     """#2306 : une lecture distante a échoué pour une raison passagère (HTTP
-    5xx, délai, coupure réseau). Le refus tient (fail-closed), mais la même
-    demande peut aboutir au passage suivant : la file garde sa ligne au lieu
-    de l'éjecter. Une réponse malformée, un 4xx ou un manque prouvé restent des
-    `LandError` ordinaires, qui éjectent."""
+    5xx, délai, coupure réseau, DNS, GOAWAY, sortie vide). Le refus tient
+    (fail-closed), mais la même demande peut aboutir au passage suivant : la
+    file garde sa ligne au lieu de l'éjecter. Une réponse malformée, un 4xx ou
+    un manque prouvé restent des `LandError` ordinaires, qui éjectent."""
+
+
+class ForbiddenLandError(LandError):
+    """#2344 : la forge a **prouvé** un refus de droits (HTTP 403) sur une
+    source de checks requis. Seule cette preuve autorise `fire.required_checks`
+    à remplacer la source par la déclaration du projet (jeton sans
+    administration, voie prévue pour Nexlink) ; tout autre échec — 404, DNS,
+    GOAWAY, sortie vide, réponse malformée — reste un `LandError` (ou un
+    `TransientLandError`) qui refuse, jamais un repli."""
 
 
 def lock_key(project, target: str) -> str:
