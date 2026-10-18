@@ -186,14 +186,17 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
 def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
            repo: Optional[str] = None, base: Optional[str] = None,
            head: Optional[str] = None, milestones: Optional[list] = None,
-           canons=None) -> dict:
+           canons=None, base_sha: Optional[str] = None) -> dict:
     """La classe du lot `lot` ; ne lève jamais (tout doute rend `sensitive`).
 
     `item` évite une lecture de la base ; `repo`, `base` et `head` sont ceux
     que l'appelant a déjà résolus (la file de fusion connaît la tête gelée et
-    le dépôt du clone). `milestones` et `canons` (liste ou lecteur différé)
-    réutilisent les lectures groupées de l'appelant. Rend aussi `files`,
-    `policy_ref`, `target`, `frozen_sha`,
+    le dépôt du clone). `base_sha` est la révision exacte de la cible quand
+    l'appelant l'a déjà lue (la file de fusion à l'admission, #2318) : `base`
+    reste son nom dans la trace, et le diff se lit depuis ce commit — une ref
+    peut bouger entre la lecture et la classification. `milestones` et
+    `canons` (liste ou lecteur différé) réutilisent les lectures groupées de
+    l'appelant. Rend aussi `files`, `policy_ref`, `target`, `frozen_sha`,
     `why` et `doubt` (vrai quand la classe vient d'une lecture impossible, pas
     d'une politique) pour la trace.
     """
@@ -241,16 +244,17 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     if reason:
         out.update({"class": RELEASE, "why": reason, "doubt": False})
         return out
-    if not base:
+    revision = base_sha or base
+    if not revision:
         out["why"] = "no target branch: freeze the lot or name its target"
         return out
     try:
-        paths = canon_mod.git_range_paths(repo, base, head)
+        paths = canon_mod.git_range_paths(repo, revision, head)
     except canon_mod.GitError as exc:
-        out["why"] = "cannot read the diff %s..%s: %s" % (base, head[:12], exc)
+        out["why"] = "cannot read the diff %s..%s: %s" % (revision, head[:12], exc)
         return out
     if not paths:
-        out.update({"class": LIGHT, "why": "no file changed since %s" % base,
+        out.update({"class": LIGHT, "why": "no file changed since %s" % revision,
                     "doubt": False})
         return out
     if canons is None:
@@ -264,5 +268,5 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     result = class_of_paths(canons, row.get("app"), paths)
     out.update(result)
     out["why"] = "%s; %d file(s) since %s" % (result.get("why") or "policy",
-                                              len(paths), base)
+                                              len(paths), revision)
     return out

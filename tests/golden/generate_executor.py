@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Génère les jeux d'essai dorés de l'exécuteur médié (contrat 1.1).
+"""Génère les jeux d'essai dorés de l'exécuteur médié (contrat courant).
 
     python3 tests/golden/generate_executor.py tests/golden/mediated_executor
 

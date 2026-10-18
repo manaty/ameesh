@@ -103,8 +103,9 @@ class TableTest(unittest.TestCase):
     def test_comptes(self):
         ops = self.c.operations.values()
         # contrat 1.2 : expiration médiée des fils (#499, threads.recount) ;
-        # #508 ajoute agents.runner_seen, #423 ajoute agents.resolve_name
-        # (septième ligne servie par session/op), #1349 ajoute operations.publish_peek.
+        # #508 ajoute agents.runner_seen ; contrat 1.3 : #423 ajoute
+        # agents.resolve_name (septième ligne servie par session/op),
+        # #1349 ajoute operations.publish_peek.
         self.assertEqual(len(self.c.operations), 67)
         self.assertEqual(sum(o.write for o in ops), 41)
         self.assertEqual(sum(not o.write for o in ops), 26)
@@ -113,7 +114,7 @@ class TableTest(unittest.TestCase):
         self.assertEqual(sorted(o.name for o in ops if o.session),
                          ["agents.resolve_name", "mailbox.deliver", "mailbox.release", "mailbox.reserve",
                           "mailbox.unread", "threads.index", "threads.recount"])
-        self.assertEqual(self.c.version, "1.2.0")
+        self.assertEqual(self.c.version, "1.3.0")
         self.assertEqual([o.name for o in ops if o.transport == "events"], ["wakeups.subscribe"])
         self.assertEqual(self.c.prefix, C.PREFIX)
 
@@ -213,8 +214,14 @@ class EnveloppesTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(set(os.listdir(generated)), set(os.listdir(GOLDEN_DIR)))
             for name in sorted(os.listdir(GOLDEN_DIR)):
-                with self.subTest(family=name), open(os.path.join(generated, name), encoding="utf-8") as fh:
-                    self.assertEqual(json.load(fh), _golden(name))
+                with self.subTest(family=name):
+                    # #1955 (N3 de la relecture de #423) : le doré est le
+                    # fichier du générateur, octet pour octet ; comparer le
+                    # JSON parsé laissait passer un saut de ligne final.
+                    with open(os.path.join(generated, name), "rb") as fh:
+                        produit = fh.read()
+                    with open(os.path.join(GOLDEN_DIR, name), "rb") as fh:
+                        self.assertEqual(fh.read(), produit)
 
     def test_dores_couvrent_chaque_operation(self):
         covered = {case["op"] for case in _op_cases()}

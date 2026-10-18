@@ -1344,6 +1344,19 @@ class ReviewPolicyTest(_TmpMixin, unittest.TestCase):
             canon.git_range_paths(clone, "main", "ref-qui-n-existe-pas")
 
 
+class GitReadTest(_TmpMixin, unittest.TestCase):
+    """#2349 : un dossier de dépôt absent n'est pas « git not found »."""
+
+    def test_dossier_de_depot_absent(self):
+        missing = os.path.join(self.make_tmp(), "absent")
+        with self.assertRaises(canon.GitError) as caught:
+            canon._git(missing, "rev-parse", "HEAD")
+        text = str(caught.exception)
+        self.assertIn("does not exist", text)
+        self.assertIn(missing, text)
+        self.assertNotIn("git not found", text)
+
+
 class CanonCliTest(_CanonDbCase):
     def cli_env(self, **extra) -> dict:
         return self.env(AMEESH_CANON=self.root, AMEESH_CANON_UNTRUSTED="1", **extra)
