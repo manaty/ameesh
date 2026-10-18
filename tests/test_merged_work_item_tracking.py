@@ -384,6 +384,20 @@ class CorrectionTest(_Base):
                 " WHERE work_item_id = %s AND kind = 'merged'", (lot["id"],))[0]
             self.assertGreater(row["ts"], debut)
 
+    def test_2317_correction_apres_fusion_dans_transaction_englobante(self):
+        # Both operations may share an outer transaction. Its start precedes
+        # the merge milestone; the later correction must still annul it.
+        lot = work.add(self.db, title="correction transactionnelle", actor="orch")
+        with self.db.transaction() as tx:
+            work.close_merged(tx, lot["id"], sha=SHA, actor="orch")
+            work.move(tx, lot["id"], "build", actor="orch", correct="trop tôt")
+            merged = [m for m in work.milestones(tx, lot["id"])
+                      if m["kind"] == "merged"]
+            self.assertTrue(merged[0]["annulled"])
+            self.assertIsNone(work.timeline(tx, lot["id"])["merged_ts"])
+            work.close_merged(tx, lot["id"], sha="f" * 40, actor="orch")
+            self.assertEqual(review_lot.merged_sha(tx, lot["id"]), "f" * 40)
+
     def test_2317_les_lecteurs_de_fusion_ignorent_le_jalon_annule(self):
         # #2317 (N5) : land, review_lot et le registre Process ne retiennent
         # pas le sha d'une fusion annulée.
