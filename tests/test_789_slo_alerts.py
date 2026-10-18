@@ -326,6 +326,38 @@ class AttentePorteurTest(_Base):
             self.assertIn("push the pilot/composer", text)
             self.assertNotIn("reassign it now", text)
 
+    def test_fusion_canon_vise_le_bureau(self):
+        """#2511 : une branche `canon/…` cible manaty/home, qu'un paquet ameesh
+        ne porte pas ; l'alerte va au bureau qui fusionne, pas au pilote."""
+        self.qa(verdict_s=50 * 60)
+        work.set_branch(self.db, self.lot["id"], "canon/2511-test")
+        alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"], a["targets"]) for a in alerts],
+                         [("verdict_merge", 1, ["bureau"])])
+        alert = alerts[0]
+        self.assertEqual((alert["waiting"] or {}).get("what"), "merge")
+        self.assertTrue((alert["waiting"] or {}).get("canon"))
+        out = self.briefs(alert)
+        self.assertEqual(sorted(out), ["bureau"])
+        self.assertIn("merge it directly", out["bureau"])
+        self.assertIn("manaty/home", out["bureau"])
+        self.assertNotIn("push the pilot/composer", out["bureau"])
+        self.assertNotIn("include it in the next package", out["bureau"])
+
+    def test_fusion_canon_niveau_3_bureau_et_auditeur(self):
+        """#2511 : au triple, le bureau fusionne (l'auditeur veille) ; le
+        composeur de paquets ameesh n'est plus nommé."""
+        self.qa(verdict_s=100 * 60)
+        work.set_branch(self.db, self.lot["id"], "canon/2511-test")
+        alerts = self.slo()
+        self.assertEqual([(a["level"], a["targets"]) for a in alerts],
+                         [(3, ["bureau", "auditeur"])])
+        out = self.briefs(alerts[0])
+        self.assertEqual(sorted(out), ["auditeur", "bureau"])
+        for text in out.values():
+            self.assertIn("merge it directly", text)
+            self.assertNotIn("push the pilot/composer", text)
+
     def test_lot_bloque_vise_le_pilote(self):
         self.qa(verdict_s=50 * 60)
         work.move(self.db, self.lot["id"], "blocked",
