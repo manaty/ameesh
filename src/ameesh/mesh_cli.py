@@ -550,14 +550,18 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
             def tag(key: str) -> str:
                 return " [%s]" % origin.get(key, res.DEFAULT_ORIGIN) if fiches else ""
 
-            print("  thresholds memory ≥ %s%s; swap ≤ %s%s; load ≤ %.2f%s; disk ≥ %s%s"
-                  "; tmpfs ≤ %s%s"
+            print("  thresholds memory ≥ %s%s; swap ≤ %s%s (counts only under memory"
+                  " pressure); load ≤ %.2f%s; disk ≥ %s%s; tmpfs ≤ %s%s"
                   % (_fmt_bytes(limits["min_mem_available"]), tag("min_mem_available"),
                      _fmt_bytes(limits["max_swap_used"]), tag("max_swap_used"),
                      limits["max_load"], tag("max_load"),
                      _fmt_bytes(limits["min_disk_free"]), tag("min_disk_free"),
                      res.fmt_value("max_tmpfs_used", limits.get("max_tmpfs_used")),
                      tag("max_tmpfs_used")))
+            # #2296: the admission signal that follows the real pressure
+            print("  thresholds memory pressure ≤ %s%s"
+                  % (res.fmt_value("max_mem_pressure", limits["max_mem_pressure"]),
+                     tag("max_mem_pressure")))
             if limits.get("max_cpu_pressure") is not None:
                 print("  thresholds CPU pressure ≤ %s%s"
                       % (res.fmt_value("max_cpu_pressure", limits["max_cpu_pressure"]),
