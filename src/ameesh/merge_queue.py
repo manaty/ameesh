@@ -548,6 +548,29 @@ def branch_tip(repo: str, branch: str, clone=None) -> tuple[str | None, str]:
     return tips[branch], where
 
 
+def target_tip(repo: str, target: str, clone=None) -> tuple[str | None, str]:
+    """(tip, repository holding it) of the target branch, read fresh
+    (`fetch_fresh`).
+
+    A target that origin no longer has raises QueueError at admission: without
+    it, the class was read from the clone's cached `QUEUE_REF` ref and a light
+    lot entered, only to be deferred at every pass (`run_pass`: target not
+    found) — no merge ever happened, but the queue said otherwise (#2278).
+    Without an `origin`, the repository's local branches are the only copy: a
+    missing local branch is a missing target too."""
+    if not target:
+        raise QueueError("no target branch known: the merge queue cannot admit a lot "
+                         "without a target (set the lot's target or the project's)")
+    tips, where = fetch_fresh(repo, [target], clone)
+    if tips[target] is None:
+        place = "origin" if where != repo else "the repository"
+        raise QueueError("target %s not found on %s: the merge queue refuses a lot whose "
+                         "target no longer exists (deleted or renamed). Push the target, point "
+                         "the lot at an existing branch, then ameesh work queue add the lot "
+                         "again" % (_remote_branch(target), place))
+    return tips[target], where
+
+
 def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
               commit_ci=None, full_ci=None, cfg=None, parts=None,
               packet_exception=None) -> dict:
@@ -566,7 +589,9 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     absent) leaves the verdict requirement in place; the class and its reason
     are traced in the queue note. The target resolved here (`branch_target`,
     then the project's, then the repository's default) carries through the
-    classification and the admission (revue #544 r2).
+    classification and the admission (revue #544 r2), and must exist **fresh**
+    on origin: an absent target is refused here, not deferred at every pass
+    (#2278, `target_tip`).
 
     #2207 : la branche **et la cible** sont récupérées fraîches dans le clone
     du radar ; la classe, comme toutes les lectures comparées, se lit contre
@@ -657,6 +682,18 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
                          "(ameesh work milestone %d frozen --sha %s), then have it reviewed"
                          % (row["branch"], tip[:12], freeze["sha"][:12],
                             "" if frozen else " (not a commit of this repository)", lot, tip))
+    # #2278 : la cible doit exister fraîchement, sinon `_class_of` relit la
+    # ref gardée dans le clone et admet le lot pour un report éternel. #2207
+    # l'a récupérée avec la branche : c'est `fresh_target` qui fait foi.
+    if not target:
+        raise QueueError("no target branch known: the merge queue cannot admit a lot "
+                         "without a target (set the lot's target or the project's)")
+    if fresh_target is None:
+        place = "origin" if where != repo else "the repository"
+        raise QueueError("target %s not found on %s: the merge queue refuses a lot whose "
+                         "target no longer exists (deleted or renamed). Push the target, point "
+                         "the lot at an existing branch, then ameesh work queue add the lot "
+                         "again" % (_remote_branch(target), place))
     # #2333 (canon §11 bis) : une tête de travail (`lot/**`, `agent/**`,
     # `review/**`) n'entre pas dans la file d'une cible d'intégration hors
     # paquet. L'admission refuse tôt, avec le message §11 bis ; `land` la
