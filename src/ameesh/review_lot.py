@@ -173,6 +173,19 @@ def _open(ops, ref: str) -> Optional[dict]:
     return None
 
 
+def _noted(ops, lot: int, prefix: str) -> list:
+    """Les notes du journal du lot `lot` qui commencent par `prefix`.
+
+    #1448 N2 : la lecture est bornée par le préfixe et le lot, jamais par les
+    200 derniers événements — une marque ancienne d'un lot très bavard reste
+    lue. Best effort : un journal illisible ne rend aucune trace."""
+    try:
+        rows = ops.events_noted(prefix, 0.0, ids=[int(lot)])
+        return list(rows or [])
+    except Exception:  # noqa: BLE001 - journal illisible : pas de trace
+        return []
+
+
 def _marked(ops, lot: int, ref: str) -> bool:
     """Vrai si le journal du lot `lot` porte déjà la marque `ref`."""
     try:
@@ -634,13 +647,13 @@ def catch_up(db, *, repo: str = "", target: str = "",
             pass
 
     def attempts(lot):
-        """Le nombre de tentatives déjà marquées au journal du lot."""
-        try:
-            events = ops.events(int(lot), 200) or []
-        except Exception:  # noqa: BLE001 - journal illisible : compteur à zéro
-            return 0
+        """Le nombre de tentatives déjà marquées au journal du lot.
+
+        #1448 N2 : compté sur les seules notes de tentative du lot
+        (`_noted`), pas sur les 200 derniers événements — un lot bavard ne
+        remet pas son compteur à zéro et ne retente pas sans fin."""
         token = "%s%d" % (ATTEMPT_PREFIX, int(lot))
-        return sum(1 for e in events
+        return sum(1 for e in _noted(ops, lot, ATTEMPT_PREFIX)
                    if str(e.get("note") or "").split(" ")[0] == token)
 
     for row in rows:

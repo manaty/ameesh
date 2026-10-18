@@ -23,7 +23,6 @@ from .work_dependencies import (_DONE as _DEPENDENCIES_DONE, _LOCK as _DEPENDENC
 from .work_dependencies import current_verdict as _current_verdict
 from .work_dependencies import last_freeze_sha as _last_freeze_sha
 from .work_dependencies import not_blocking as _not_blocking
-from .work_dependencies import reviewed_head as _reviewed_head
 
 #: #705 : `__REVIEWER__` est remplacé par `item_columns` — la colonne
 #: `reviewer` n'existe qu'après la migration 0421, et la base de prod peut
@@ -708,14 +707,15 @@ class WorkItems(interface.WorkItems):
                 if item is None or item["state"] != "intake" \
                         or item["assignee"] is not None:
                     return None
-                # #1677 : un bloqueur en `qa` à verdict COURANT favorable (et à
-                # tête relue) n'empêche plus la prise — il attend sa fusion, le
-                # lot pris s'empile sur cette tête. Le verdict est relu par une
-                # requête POSTÉRIEURE au verrou (N4) : en READ COMMITTED, la
-                # sous-requête d'un `SELECT … FOR UPDATE` lit l'instantané pris
-                # avant l'attente du verrou, donc un verdict `blocked` validé
-                # pendant cette attente y serait invisible. Le prédicat est le
-                # même que celui de `unassigned_lots` (une seule règle).
+                # #2252 : toutes les dépendances doivent être FUSIONNÉES
+                # (merged/promoted/closed) — un lot en `qa`, même à verdict
+                # favorable, garde une tête qui peut encore changer (cas #667 :
+                # un `blocked` est arrivé 10 s après la prise). Le contrôle est
+                # refait par une requête POSTÉRIEURE au verrou (N4) : en READ
+                # COMMITTED, un SELECT … FOR UPDATE lit l'instantané pris avant
+                # l'attente du verrou, donc une fusion ou une arête ajoutée
+                # pendant cette attente y serait invisible. Même prédicat que
+                # `unassigned_lots` (une seule règle).
                 if tx.query("SELECT 1 FROM work_item_dependencies d"
                             " JOIN work_items b ON b.id = d.blocker_id"
                             " WHERE d.work_item_id = %s AND NOT " + _not_blocking("b") +
@@ -2120,21 +2120,10 @@ class WorkItems(interface.WorkItems):
         return int(rows[0]["n"]) if rows else 0
 
     def unassigned_lots(self, limit) -> list[dict]:
-        # #1677 : les lots dont tous les bloqueurs sont terminés **ou** en `qa`
-        # à verdict courant favorable sont prenables ; `stack_on` décrit ces
-        # bloqueurs (lot, branche, tête relue) pour le courrier de prise. La
-        # tête est celle que le verdict nomme, sinon celle du dernier gel (B2) :
-        # un bloqueur sans tête relue reste bloquant.
-        stack_on = (
-            "(SELECT string_agg('#' || b.id::text || ' ('"
-            "                    || coalesce(nullif(btrim(b.branch), ''), '—')"
-            "                    || ', gel ' || coalesce(" + _reviewed_head("b") + ", '—') || ')',"
-            "                  ', ' ORDER BY b.id)"
-            "   FROM work_item_dependencies d"
-            "   JOIN work_items b ON b.id = d.blocker_id"
-            "  WHERE d.work_item_id = work_items.id AND b.state = 'qa'"
-            "    AND " + _current_verdict("b") + " = 'ok'"
-            "    AND " + _reviewed_head("b") + " IS NOT NULL)")
+        # #2252 : seuls les lots dont TOUTES les dépendances sont fusionnées
+        # (`merged`/`promoted`/`closed`) sont prenables. La règle est celle de
+        # `work show` (`depends … blocking`) et de « planned: waiting on lots » :
+        # une dépendance en `qa`, même jugée, n'offre pas de base stable.
         return self.db.query(
             ("SELECT w.*,"
             "       coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),"
@@ -2149,8 +2138,7 @@ class WorkItems(interface.WorkItems):
             "  FROM (SELECT %s,"
             "               to_char(planned_start, 'YYYY-MM-DD') AS planned_start,"
             "               to_char(planned_end, 'YYYY-MM-DD') AS planned_end,"
-            "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery,"
-            "               " + stack_on + " AS stack_on"
+            "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery"
             "          FROM work_items"
             "         WHERE state = 'intake' AND assignee IS NULL"
             "           AND type <> 'improvement'"

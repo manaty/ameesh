@@ -247,7 +247,23 @@ FAKE_TOOL = r'''#!/bin/sh
 name=${0##*/}
 { printf '%s\037' "$name" "${PGPASSWORD-<unset>}" "${PGPASSFILE-<unset>}" "$@"; printf '\036'; } >> "$FAKE_STATE/calls.log"
 case $name in
-  ssh) cat > /dev/null ;;
+  ssh)
+    case "$*" in
+      *"systemctl start ameesh-sauvegarde.service"*)
+        cat > /dev/null
+        d=$FAKE_STATE/server.dump
+        [ -f "$d" ] || printf 'server dump\n' > "$d"
+        printf '%s\n%s\n%s\n' \
+          "/home/ameesh/sauvegardes/ameesh-test-20261017-150000.dump" \
+          "$(wc -c < "$d")" \
+          "$(sha256sum "$d" | cut -d' ' -f1)"
+        ;;
+      *"gzip -1 -c"*)
+        cat > /dev/null
+        gzip -1 -c "$FAKE_STATE/server.dump"
+        ;;
+      *) cat > /dev/null ;;
+    esac ;;
   pg_restore) : ;;
   pg_dump) prev=; for a; do
       if [ "$prev" = -f ] || [ "$prev" = --file ]; then printf 'dump' > "$a"; fi
@@ -292,7 +308,7 @@ class PosteDsnTest(unittest.TestCase):
         # bench's PGPASSFILE (scripts/test.sh, #2170) would otherwise reach
         # the fake tools even when the DSN itself carries no password
         for name in ("PGPASSWORD", "PGPASSFILE", "PGSERVICE", "BASCULE_ENV",
-                     "UNITES_RESTE"):
+                     "UNITES_RESTE", "SAUVEGARDES_VM", "RECUPERATION_TIMEOUT"):
             self.env.pop(name, None)
 
     def configure(self, mesh, old=None):
@@ -316,6 +332,9 @@ class PosteDsnTest(unittest.TestCase):
                               env=self.env, capture_output=True, text=True, timeout=300,
                               stdin=subprocess.DEVNULL)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return proc, self.calls()
+
+    def calls(self):
         calls = []
         path = os.path.join(self.state, "calls.log")
         if os.path.exists(path):
@@ -325,7 +344,7 @@ class PosteDsnTest(unittest.TestCase):
                     calls.append({"tool": name, "argv": argv,
                                   "pgpassword": None if password == "<unset>" else password,
                                   "pgpassfile": None if passfile == "<unset>" else passfile})
-        return proc, calls
+        return calls
 
     def assert_secret_absent(self, text):
         # every password of the table, and nothing else, contains "Pw": a
@@ -340,23 +359,37 @@ class PosteDsnTest(unittest.TestCase):
         return dumps[0], argv[argv.index("--dbname") + 1]
 
     @unittest.skipUnless(psycopg, "the private backup channel needs psycopg")
+    def test_mesh_dump_is_server_side_and_hands_no_dsn_to_a_tool(self):
+        # #2261: the mesh dump is produced by ameesh-sauvegarde on the VM; the
+        # poste must not run pg_dump with the mesh DSN at all.
+        mesh = case("postgresql://ameesh:")
+        self.configure(mesh[0])
+        proc, calls = self.run_step("sauvegarder")
+        self.assertFalse([c for c in calls if c["tool"] == "pg_dump"], calls)
+        self.assert_secret_absent(json.dumps([c["argv"] for c in calls]))
+        self.assert_secret_absent(proc.stdout + proc.stderr)
+
+    @unittest.skipUnless(psycopg, "the private backup channel needs psycopg")
     def test_backups_follow_the_shared_table(self):
         from psycopg import pq
         from psycopg.conninfo import conninfo_to_dict
-        for case in CASES:
-            if case[0] == "ameesh":
+        mesh = case("postgresql://ameesh:")
+        for entry in CASES:
+            if entry[0] == "ameesh":
                 continue
-            if blanks_in_uri(case[0]) and pq.version() < 160000:
+            if blanks_in_uri(entry[0]) and pq.version() < 160000:
                 continue
-            with self.subTest(dsn=case[0]):
-                password, rest = expected(case)
-                self.configure(case[0])
+            with self.subTest(dsn=entry[0]):
+                password, rest = expected(entry)
+                # the case is the old database: the mesh one is now dumped on
+                # the VM, so the private channel's pg_dump is the old base's.
+                self.configure(mesh[0], entry[0])
                 if any(c in password for c in "\r\n\x00"):
                     # a private pgpass file cannot carry such a password: the
                     # backup stops instead of falling back to PGPASSWORD (#518)
-                    self.assert_stops(self.env)
+                    self.assert_stops(self.env, database_tools_only=True)
                     continue
-                carries = "password" in conninfo_to_dict(case[0])
+                carries = "password" in conninfo_to_dict(entry[0])
                 proc, calls = self.run_step("sauvegarder")
                 dump, public = self.public_dsn(calls)
                 # the channel hands pg_dump the same connection without its
@@ -369,19 +402,20 @@ class PosteDsnTest(unittest.TestCase):
                 self.assert_secret_absent(proc.stdout + proc.stderr)
 
     @unittest.skipUnless(psycopg, "the private backup channel needs psycopg")
-    def test_trailing_newlines_reach_the_tools(self):
+    def test_trailing_newlines_reach_the_old_base_tools(self):
         from psycopg import pq
         from psycopg.conninfo import conninfo_to_dict
-        for case in (c for c in CASES if c[0].endswith("\n") or c[1].endswith("\n")):
-            if blanks_in_uri(case[0]) and pq.version() < 160000:
+        mesh = case("postgresql://ameesh:")
+        for entry in (c for c in CASES if c[0].endswith("\n") or c[1].endswith("\n")):
+            if blanks_in_uri(entry[0]) and pq.version() < 160000:
                 continue
-            password, rest = expected(case)
-            with self.subTest(dsn=case[0]):
-                self.configure(case[0])
+            password, rest = expected(entry)
+            with self.subTest(dsn=entry[0]):
+                self.configure(mesh[0], entry[0])
                 if any(c in password for c in "\r\n\x00"):
                     # a private pgpass file cannot carry it: the backup stops
                     # instead of falling back to PGPASSWORD (#518, fail closed)
-                    self.assert_stops(self.env)
+                    self.assert_stops(self.env, database_tools_only=True)
                     continue
                 proc, calls = self.run_step("sauvegarder")
                 dump, public = self.public_dsn(calls)
@@ -416,13 +450,19 @@ class PosteDsnTest(unittest.TestCase):
                     self.assertIn("mesh     : %s" % expected(mesh)[1], proc.stdout)
                     self.assertIn("ancienne : %s" % expected(old)[1], proc.stdout)
 
-    def assert_stops(self, env):
+    def assert_stops(self, env, *, database_tools_only=False):
         proc = subprocess.run(["bash", SCRIPT, "sauvegarder"], env=env,
                               capture_output=True, text=True, timeout=300,
                               stdin=subprocess.DEVNULL)
         self.assertNotEqual(proc.returncode, 0)
         self.assert_secret_absent(proc.stdout + proc.stderr)
-        self.assertFalse(os.path.exists(os.path.join(self.state, "calls.log")))
+        calls = self.calls()
+        if database_tools_only:
+            # the server-side mesh dump needs no database tool; the refused
+            # old-base channel must not start pg_dump or psql at all.
+            self.assertFalse([c for c in calls if c["tool"] in ("pg_dump", "psql")], calls)
+        else:
+            self.assertFalse(calls)
 
     def test_invalid_dsn_stops_without_quoting_it(self):
         for dsn in DELIBERATE[:2] + DELIBERATE[3:]:
