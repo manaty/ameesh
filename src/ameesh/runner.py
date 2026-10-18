@@ -8601,6 +8601,7 @@ class Runner:
                     log_async("work item #%s delivered: %s%s" % (
                         entry["work_item"], entry["detail"],
                         " [dry-run]" if entry["result"] == "would-merge" else ""))
+            self.packet_sweep_once(db)
             self.carry_once(db)
             self.fire_once(db)
             if not self.dry_run:
@@ -8645,6 +8646,51 @@ class Runner:
                     continue
             log_async(line)
         self._carry_errors = errors
+
+    def packet_sweep_once(self, db) -> None:
+        """#2426 : ferme les lots unitaires des paquets fusionnés.
+
+        Les manifestes `reviews/**paquet**.md` sont lus sur la pointe fraîche
+        de la cible de chaque projet `radar` (clone privé, `land.fresh_target`),
+        sous le verrou de passage du projet : seuls les lots du manifeste sont
+        examinés, chacun par son dernier gel. Un clone que personne ne fetch
+        ne fermait jamais les unités d'un paquet fusionné (#2302). Ne lève
+        jamais : le prochain passage réessaie."""
+        from . import packet_close, radar
+        try:
+            cfg = fresh_radar(self.cfg)
+            settings = radar.settings_of(cfg)
+        except Exception as exc:            # configuration illisible : jamais fatal
+            log_async("packet sweep failed (%s: %s)" % (type(exc).__name__, exc))
+            return
+        errors = getattr(self, "_packet_sweep_errors", None)
+        if errors is None:
+            errors = self._packet_sweep_errors = {}
+        for project in settings.projects.values():
+            lock = None
+            try:
+                lock = radar.pass_lock(cfg, project.name)
+                if lock is None:
+                    continue                # un autre exécutant de l'hôte le passe
+                report = packet_close.sync_project(
+                    cfg, db, project, dry_run=self.dry_run,
+                    actor="runner %s" % self.runner_id)
+            except Exception as exc:        # jamais fatal pour l'exécuteur
+                message = "packet sweep %s failed (%s: %s)" % (
+                    project.name, type(exc).__name__, exc)
+                if errors.get(project.name) != message:
+                    errors[project.name] = message
+                    log_async(message)
+                continue
+            finally:
+                if lock is not None:
+                    lock.close()
+            errors.pop(project.name, None)
+            for entry in report["results"]:
+                if entry["result"] in ("merged", "would-merge"):
+                    log_async("packet %s: work item #%s delivered: %s%s" % (
+                        project.name, entry["work_item"], entry["detail"],
+                        " [dry-run]" if entry["result"] == "would-merge" else ""))
 
     def fire_once(self, db) -> None:
         """#1374 : le passage du feu du pilote — arme l'auto-fusion des lots
