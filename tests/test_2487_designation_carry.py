@@ -546,8 +546,10 @@ class LateCarryTest(_Fixture):
                          ["rev3", "rev4"])
         self.assertFalse(applied.get("replayed"))
         self.assertEqual(self.designated(), ["rev3", "rev4"])
-        self.assertEqual([m["recipient"] for m in self.review_mail()],
-                         ["rev3", "rev4"])
+        # #2541/#2557 : les demandes de rev3/rev4 sont déjà parties pour CE
+        # gel ; le rejeu forcé écrit la marque plus récente sans les redéposer,
+        # même si la boîte a été purgée (la marque du gel en est la preuve).
+        self.assertEqual([m["recipient"] for m in self.review_mail()], [])
         shown = act.reviewers(self.cfg, self.db, self.lot)
         self.assertEqual(shown["designation"]["state"], "designated")
         self.assertEqual([r["name"] for r in shown["designation"]["reviewers"]],
