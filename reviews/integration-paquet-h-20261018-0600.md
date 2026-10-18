@@ -57,3 +57,19 @@ Chaque commit de composition a le(s) lot(s) en second(s) parent(s), son sujet no
 - `git diff --check 30a1fb97..HEAD` : rc 0, aucun marqueur de conflit.
 - Têtes sources : têtes gelées (ou résolutions documentées) ; #2354 utilise bien `228fd8ac` et non la tête de branche `f97ab6c`.
 - `scripts/paquet-inclusion.py` : rc 0 (voir sortie de composition).
+
+## Adaptations de test après la CI rouge (04:31Z)
+
+La suite `39096950211` a rougi sur un seul test, dans les deux parts qui le
+portent (`psql 1/9`, `psycopg 4/6`) :
+`tests.test_2273_merge_pr_required.AdmissionTest.test_a_green_required_check_goes_through_and_the_queue_sees_it`.
+Le faux `fake_readiness` d'`AdmissionTest` a une signature stricte ; l'unité
+#2333 ajoute `packet_exception` à `merge_queue.readiness` et
+`merge_pr._admission` le transmet désormais. Le faux accepte le paramètre
+(ignoré : ce test porte sur l'admission d'une tête verte, pas sur l'exception
+de paquet) ; aucun code de production n'est modifié et aucun avis n'est requis
+(§11 bis, même régime que les adaptations `01435d13a4` et `a57f8c5e3` de
+h-0500).
+
+La composition des 11 unités, leurs têtes et leurs verdicts ne changent pas ;
+la tête de la branche après ce commit est celle de l'unique suite complète.
