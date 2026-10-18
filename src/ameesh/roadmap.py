@@ -704,7 +704,9 @@ def overdue(db, *, now: float | None = None) -> list[dict]:
         # has no gesture on its date, so it is not a date-driven alert
         if not dev.active(item.get("state")):
             continue
-        if str(item.get("planned_source") or "").startswith(SOURCE):
+        # The scheduler only writes start/end; delivery remains a manual
+        # date even when those fields still carry the scheduler's source.
+        if key != "planned_delivery" and str(item.get("planned_source") or "").startswith(SOURCE):
             continue
         dated.append((item, key, due))
     waits = {}
