@@ -1037,11 +1037,23 @@ def key_of(alert: dict) -> str:
     return json.dumps(key, ensure_ascii=False)
 
 
-def _notification_id(key, severity, human) -> str:
-    """Identité du registre `notified` : clé, sévérité, humain. Les résumés de
-    débit s'en servent aussi pour leurs membres (#2395 B2), d'où la fonction
-    partagée : les deux chemins doivent produire exactement la même clé."""
-    return json.dumps([key, severity, human], ensure_ascii=False)
+def _notification_id(key, severity, human, since=None) -> str:
+    """Identité du registre `notified` : clé, sévérité, humain, `since`. Les
+    résumés de débit s'en servent aussi pour leurs membres (#2395 B2), d'où la
+    fonction partagée : les deux chemins doivent produire exactement la même
+    clé. Le `since` y entre car certaines clés n'en ont pas (`ci_runner_stuck`,
+    #845) : un nouvel épisode reste une nouvelle notification."""
+    return json.dumps([key, severity, human, since], ensure_ascii=False)
+
+
+def _since_of(alert: dict):
+    """`since` de l'épisode, arrondi comme dans `exploitation.alert_key` ; None
+    si l'alerte n'en a pas (elle n'entre alors pas au registre `notified`)."""
+    since = (alert or {}).get("since")
+    try:
+        return round(float(since)) if since is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _entry_severity(entry: dict):
@@ -1574,19 +1586,23 @@ class Notifier:
     # -- registre des notifications (#2395) ------------------------------------
     @staticmethod
     def _notified_id(entry: dict, human: str) -> str:
-        """Identité du registre : la clé de l'alerte (elle porte le `since` et
-        la raison, donc le niveau), la sévérité et l'humain. Une même alerte
+        """Identité du registre : la clé de l'alerte (elle porte la raison,
+        donc le niveau), la sévérité, l'humain et le `since` de l'épisode (pas
+        toujours dans la clé, #845). Une même alerte
         qui se résout puis revient ne repart pas ; une escalade de niveau a
         une autre identité et part bien."""
         key = entry.get("key") or key_of(entry["alert"])
-        return _notification_id(key, _entry_severity(entry), human)
+        return _notification_id(key, _entry_severity(entry), human,
+                                _since_of(entry["alert"]))
 
     def _already_notified(self, entry: dict, human: str) -> bool:
         return self._notified_id(entry, human) in (self.state.get("notified") or {})
 
     def _mark_notified(self, entry: dict, now: float) -> None:
         human = entry.get("human")
-        if not human:
+        if not human or _since_of(entry["alert"]) is None:
+            # sans `since`, l'épisode n'a pas d'identité : un retour après
+            # résolution repart, comme avant #2395
             return
         self.state.setdefault("notified", {})[
             self._notified_id(entry, human)] = round(float(now), 3)
@@ -1959,13 +1975,14 @@ class Notifier:
         return {"key": entry.get("key") or key_of(alert),
                 "severity": _entry_severity(entry),
                 "type": alert.get("type"),
+                "since": _since_of(alert),
                 "human": human}
 
     @staticmethod
     def _summary_member_id(member: dict) -> str:
         """Même identité que le registre `notified` : clé, sévérité, humain."""
         return _notification_id(member.get("key"), member.get("severity"),
-                                member.get("human"))
+                                member.get("human"), member.get("since"))
 
     def _owner_human(self, human) -> bool:
         owner = normalize_human(self.ncfg.default_human)
@@ -2035,6 +2052,7 @@ class Notifier:
                 normalized = {"key": member.get("key") or str(identity),
                               "severity": member.get("severity"),
                               "type": member.get("type"),
+                              "since": member.get("since"),
                               "human": human}
                 if self._summary_forbidden(human, normalized["type"]):
                     self.log("owner rate summary: slo_breach member filtered (#2395)")
@@ -2067,6 +2085,7 @@ class Notifier:
                 normalized = {"key": member.get("key") or str(identity),
                               "severity": member.get("severity"),
                               "type": member.get("type"),
+                              "since": member.get("since"),
                               "human": human}
                 if self._summary_forbidden(human, normalized["type"]):
                     continue
@@ -2117,7 +2136,7 @@ class Notifier:
 
     def _mark_member_notified(self, member: dict, now: float) -> None:
         human = member.get("human")
-        if not human:
+        if not human or member.get("since") is None:
             return
         self.state.setdefault("notified", {})[
             self._summary_member_id(member)] = round(float(now), 3)
@@ -2139,7 +2158,8 @@ class Notifier:
             alert = entry.get("alert") or {}
             member = {"key": entry.get("key") or key_of(alert),
                       "severity": entry.get("severity"),
-                      "type": alert.get("type"), "human": human}
+                      "type": alert.get("type"), "since": _since_of(alert),
+                      "human": human}
             ids.add(self._summary_member_id(member))
         return ids
 

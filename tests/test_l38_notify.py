@@ -514,6 +514,34 @@ class FiabiliteTest(_Base):
         self.assertEqual([(r["event"], r["human"]) for r in records],
                          [("raised", "human:autre")])
 
+    def test_nouvel_episode_sans_since_dans_la_cle_renotifie(self):
+        # #2395 (relecture b861fba4) : la clé de `ci_runner_stuck` n'a pas de
+        # `since` (une alerte par cause et par dépôt, #845). Un nouvel épisode,
+        # après résolution, est une nouvelle alerte : le registre ne la tait pas.
+        ncfg = self.ncfg(default_human="human:proprio")
+        notifier = self.notifier(ncfg)
+        episode = _alert("ci_runner_stuck", agent=None, since=1000.0,
+                         reason="manaty/ameesh", repo="manaty/ameesh")
+        self.assertEqual(len(self.passe(notifier, [episode])), 1)
+        self.assertEqual([r["event"] for r in self.passe(notifier, [])], ["resolved"])
+        retour = dict(episode, since=9000.0)
+        self.assertEqual(notify.key_of(retour), notify.key_of(episode))
+        records = self.passe(notifier, [retour])
+        self.assertEqual([r["event"] for r in records], ["raised"])
+        # le même épisode qui revient (même `since`) reste dédoublonné
+        self.passe(notifier, [])
+        self.assertEqual([r for r in self.passe(notifier, [retour])
+                          if r["event"] == "raised"], [])
+        # sans `since`, l'épisode n'a pas d'identité : la résolution libère
+        # le registre, le retour repart comme avant #2395
+        self.passe(notifier, [])
+        sans_date = _alert("orphan_lot", agent="coord", since=None, lot=8)
+        self.assertEqual([r["event"] for r in self.passe(notifier, [sans_date])],
+                         ["raised"])
+        self.assertEqual([r["event"] for r in self.passe(notifier, [])], ["resolved"])
+        self.assertEqual([r["event"] for r in self.passe(notifier, [sans_date])],
+                         ["raised"])
+
     def test_etat_illisible_mis_de_cote(self):
         path = os.path.join(self.tmp, "notify", "state.json")
         os.makedirs(os.path.dirname(path))
