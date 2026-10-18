@@ -942,12 +942,13 @@ def _native_migration_additions(repo: str, branches: list[dict], directory: str)
     ancestor with the same path and blob (#2279), or — when neither holder
     descends from the other — a common merge-base that already carries the
     same path and blob (#2388: a lot stacked on a package whose tip has moved
-    since the fork). Of the two diverged copies, one keeps the attribution
-    (the tip that advanced last); the other is the inherited one, so a third
-    holder, the duplicate probe and the reservation probe still see the
-    number. Equal tips, independent additions, modified SQL and unreadable
-    evidence keep their warnings. Both probes use this view; branch diffs in
-    the report keep their full scope.
+    since the fork). One survivor is kept for the whole diverged group, not
+    pair by pair: a pairwise choice can cycle between ancestry and date and
+    hide every copy. The survivor (the tip that advanced last) keeps the
+    attribution, so a third holder, the duplicate probe and the reservation
+    probe still see the number. Equal tips, independent additions, modified
+    SQL and unreadable evidence keep their warnings. Both probes use this
+    view; branch diffs in the report keep their full scope.
     """
     groups: dict = {}
     for one in branches:
@@ -1022,18 +1023,20 @@ def _native_migration_additions(repo: str, branches: list[dict], directory: str)
         return tip_dates[tip]
 
     def rank(one: dict):
-        """Pick the representative of two diverged holders: the tip that
-        advanced last, then the oldest work item. Git cannot tell which of two
-        diverged branches was the base (both carry the same file at their
-        merge-base); the ranking only keeps one attribution, so a third holder
-        and the reservation probe still see the number (#2388 review)."""
+        """Pick the survivor of a diverged group: the tip that advanced last,
+        then the oldest work item. Git cannot tell which of several diverged
+        branches was the base (they carry the same file at their merge-base);
+        the ranking only keeps one attribution, so a third holder and the
+        reservation probe still see the number (#2388 review)."""
         return (tip_date(one["tip"]), -int(one["work_item"]), one["branch"])
 
     for (_, _, path), holders in groups.items():
         if len(holders) < 2:
             continue
+        inherited_indices, diverged = set(), []
         for index, one in enumerate(holders):
-            for other in holders[index + 1:]:
+            for other_index in range(index + 1, len(holders)):
+                other = holders[other_index]
                 a, b = one["tip"], other["tip"]
                 if a == b:
                     continue
@@ -1041,28 +1044,57 @@ def _native_migration_additions(repo: str, branches: list[dict], directory: str)
                 ba = ancestor(b, a)
                 if ab is None or ba is None:
                     continue              # unreadable history: keep the warning
-                if ab:
-                    parent, child, child_tip = a, other, b
-                elif ba:
-                    parent, child, child_tip = b, one, a
-                else:
-                    # #2388: diverged holders (a lot stacked on a base that
-                    # moved since the fork). A common ancestor carrying the
-                    # identical file proves that neither of them added it;
-                    # keeping both copies would hide a real collision with a
-                    # third holder, dropping both would hide the migration
-                    # from the duplicate and reservation probes. Keep one
-                    # representative, inherited from the other (#2388 review).
-                    base = common_base(a, b)
-                    value = blob(base, path) if base else None
-                    if (value and value == blob(a, path) == blob(b, path)
-                            and on_first_parent(base, a)
-                            and on_first_parent(base, b)):
-                        drop = min(one, other, key=rank)
-                        inherited.setdefault(drop["work_item"], set()).add(path)
+                if ab or ba:
+                    # One tip descends from the other: the descendant's copy
+                    # is inherited when the file is identical (#2279). A
+                    # holder explained by an ancestor holder is not a root of
+                    # the lineage and never needs its own representative.
+                    parent, child = (a, b) if ab else (b, a)
+                    child_index = other_index if ab else index
+                    if blob(parent, path) and blob(parent, path) == blob(child, path):
+                        inherited_indices.add(child_index)
                     continue
-                if blob(parent, path) and blob(parent, path) == blob(child_tip, path):
-                    inherited.setdefault(child["work_item"], set()).add(path)
+                # #2388: diverged holders (a lot stacked on a base that moved
+                # since the fork). A common ancestor carrying the identical
+                # file proves that neither of them added it; each is an
+                # inherited copy of the same lineage. Keep an edge, the
+                # survivor is chosen once for the whole connected group.
+                base = common_base(a, b)
+                value = blob(base, path) if base else None
+                if (value and value == blob(a, path) == blob(b, path)
+                        and on_first_parent(base, a)
+                        and on_first_parent(base, b)):
+                    diverged.append((index, other_index))
+        # Relecture #2388: a pairwise choice cycles (A ancestor B, A/C and B/C
+        # diverged): each pair drops one copy, and A, B, C all lose the
+        # migration. Ancestry is settled first; then each connected group of
+        # diverged roots keeps exactly one survivor, so the duplicate and
+        # reservation probes always see the number (#2388).
+        roots = {index: index for index in range(len(holders))
+                 if index not in inherited_indices}
+
+        def find(index):
+            while roots[index] != index:
+                roots[index] = roots[roots[index]]
+                index = roots[index]
+            return index
+
+        for index, other_index in diverged:
+            if index not in roots or other_index not in roots:
+                continue
+            left, right = find(index), find(other_index)
+            if left != right:
+                roots[right] = left
+        groups_by_root: dict = {}
+        for index in list(roots):
+            groups_by_root.setdefault(find(index), []).append(index)
+        for members in groups_by_root.values():
+            if len(members) < 2:
+                continue
+            keep = max(members, key=lambda index: rank(holders[index]))
+            inherited_indices.update(index for index in members if index != keep)
+        for index in inherited_indices:
+            inherited.setdefault(holders[index]["work_item"], set()).add(path)
     return [dict(one, added=[path for path in one.get("added") or ()
                             if path not in inherited.get(one["work_item"], ())])
             for one in branches]

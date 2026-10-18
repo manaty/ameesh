@@ -10,22 +10,39 @@ recognises them and a false duplicate is reported.
 """
 from __future__ import annotations
 
+import subprocess
 import tempfile
 import unittest
 
 from ameesh import radar
 
-from .test_l160b_radar import _git, _write
+from .test_l160b_radar import _git, _write, git_env
 
 MIG = "src/ameesh/migrations"
 INHERITED = MIG + "/516_stacked.sql"
 CONTENT = "-- stacked\nSELECT 1;\n"
+
+
+def _git_at(repo, date, *args):
+    """`_git` with fixed author/committer dates, so the survivor ranking has a
+    deterministic order (#2388 review)."""
+    proc = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
+                          env=dict(git_env(), GIT_AUTHOR_DATE=date,
+                                   GIT_COMMITTER_DATE=date))
+    if proc.returncode != 0:
+        raise AssertionError("git %s : %s" % (" ".join(args), proc.stderr))
+    return proc.stdout.strip()
+
 
 PARENT = {"id": 2350, "branch": "lot/2350-parent"}
 STACKED = {"id": 2351, "branch": "lot/2351-stacked"}
 PACKAGE = {"id": 2363, "branch": "integration/paquet-63"}
 SIBLING = {"id": 2352, "branch": "lot/2352-sibling"}
 OTHER = {"id": 2400, "branch": "lot/2400-other"}
+
+#: A < C < B, fixed so the survivor ranking is deterministic (#2388 review).
+DATES = {"A": "2026-01-01T02:00:00+0000", "B": "2026-01-01T05:00:00+0000",
+         "C": "2026-01-01T03:00:00+0000", "D": "2026-01-01T04:00:00+0000"}
 
 
 class StackedMigrationTest(unittest.TestCase):
@@ -36,15 +53,18 @@ class StackedMigrationTest(unittest.TestCase):
         _git(self.repo, "init", "-q", "-b", "main")
         self.commit("README.md", "Base\n")
 
-    def commit(self, path, text):
+    def commit(self, path, text, date=None):
         _write(self.repo, path, text)
         _git(self.repo, "add", "-A")
-        _git(self.repo, "commit", "-qm", path)
+        if date is None:
+            _git(self.repo, "commit", "-qm", path)
+        else:
+            _git_at(self.repo, date, "commit", "-qm", path)
 
-    def branch(self, base, name, edits):
+    def branch(self, base, name, edits, date=None):
         _git(self.repo, "checkout", "-q", "-B", name, base)
         for path, text in edits.items():
-            self.commit(path, text)
+            self.commit(path, text, date)
         return _git(self.repo, "rev-parse", "HEAD")
 
     def scan(self, lots, *, reservations=None):
@@ -160,6 +180,42 @@ class StackedMigrationTest(unittest.TestCase):
         holders = [h["work_item"] for h in report["migrations"][0]["lots"]]
         self.assertEqual(len(holders), 2)
         self.assertIn(OTHER["id"], holders)
+
+    def test_mixed_ancestor_and_diverged_holders_keep_one_survivor(self):
+        """Review #2388: M→A→B and M→C, with dates A<C<B, plus an independent
+        holder D. Pair by pair, A/B drops B (strict ancestor), A/C drops A and
+        B/C drops C (older tip first): no branch carries 516 any more. One
+        survivor is chosen for the whole group, and it still collides with D."""
+        anchor = "lot/2349-anchor"
+        self.branch("main", anchor, {INHERITED: CONTENT})
+        self.branch(anchor, PARENT["branch"], {"a.py": "a\n"}, date=DATES["A"])
+        self.branch(PARENT["branch"], STACKED["branch"], {"b.py": "b\n"},
+                    date=DATES["B"])
+        self.branch(anchor, SIBLING["branch"], {"c.py": "c\n"}, date=DATES["C"])
+        self.branch("main", OTHER["branch"],
+                    {MIG + "/516_independent.sql": "-- third\n"}, date=DATES["D"])
+        seen = {}
+
+        def reservations(branches):
+            seen.update({b["work_item"]: list(b.get("added") or ()) for b in branches})
+            return []
+
+        report = self.scan([PARENT, STACKED, SIBLING, OTHER],
+                           reservations=reservations)
+
+        self.assertEqual([m["number"] for m in report["migrations"]], ["516"])
+        self.assertEqual([h["work_item"] for h in report["migrations"][0]["lots"]],
+                         [SIBLING["id"], OTHER["id"]])
+        # C (dated between A and B) is the single survivor of the inherited
+        # group: A and B no longer carry 516, C still does.
+        self.assertIn(INHERITED, seen[SIBLING["id"]])
+        self.assertNotIn(INHERITED, seen[PARENT["id"]])
+        self.assertNotIn(INHERITED, seen[STACKED["id"]])
+        self.assertIn(MIG + "/516_independent.sql", seen[OTHER["id"]])
+        # The same collision is seen without the intermediate stacked lot.
+        self.assertEqual(
+            [m["number"] for m in self.scan([PARENT, SIBLING, OTHER])["migrations"]],
+            ["516"])
 
 
 if __name__ == "__main__":
