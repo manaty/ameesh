@@ -87,6 +87,53 @@ class MovingPort(FakePort):
         return super().commit(lot, **kw)
 
 
+class CoveringRequestTest(unittest.TestCase):
+    """#2495 : un seul request par (lot, relecteur, tête)."""
+
+    SHA = "a" * 40
+
+    def row(self, *, sha="", delivered=False, lot="7", to="r1", kind="request", auto=False):
+        if auto:
+            payload = {"review_designation": {"lot": 7, "sha": sha}}
+        else:
+            payload = {"review_request": {"lot": 7, "reviewer": to, "manual": True}}
+            if sha:
+                payload["review_request"]["freeze"] = {"id": 3, "sha": sha}
+        return {"id": 1, "kind": kind, "work_item_id": lot, "recipient": to,
+                "payload": payload, "delivered_ts": 1.0 if delivered else None}
+
+    def covered(self, row, sha=""):
+        return rd.covering_request([row], lot=7, reviewer="r1", sha=sha) is not None
+
+    def test_same_head_is_covered_delivered_or_not(self):
+        for auto in (False, True):
+            for delivered in (False, True):
+                self.assertTrue(self.covered(self.row(sha=self.SHA, auto=auto,
+                                                      delivered=delivered), self.SHA))
+        # SHA abrégé du jalon : même gel
+        self.assertTrue(self.covered(self.row(sha=self.SHA[:9]), self.SHA))
+
+    def test_another_head_is_not_covered(self):
+        self.assertFalse(self.covered(self.row(sha="b" * 40, auto=True), self.SHA))
+
+    def test_a_manual_request_without_head_covers_the_freeze_while_unread(self):
+        self.assertTrue(self.covered(self.row(), self.SHA))
+        self.assertFalse(self.covered(self.row(delivered=True), self.SHA))
+        # re-désignation avant le gel : déjà prévenu, lu ou non
+        self.assertTrue(self.covered(self.row(delivered=True)))
+
+    def test_other_lot_reviewer_or_kind_does_not_count(self):
+        self.assertFalse(self.covered(self.row(sha=self.SHA, lot="8"), self.SHA))
+        self.assertFalse(self.covered(self.row(sha=self.SHA, to="r2"), self.SHA))
+        self.assertFalse(self.covered(self.row(sha=self.SHA, kind="notify"), self.SHA))
+
+    def test_manual_message_does_not_promise_a_new_freeze_cancels_it(self):
+        for freeze in (None, {"id": 3, "sha": self.SHA}):
+            body = rd.manual_reviewer_message({"id": 7, "title": "t"}, freeze=freeze)
+            self.assertNotIn("cancels this request", body)
+            self.assertIn("A new freeze does not cancel this request", body)
+
+
 class PolicyTest(unittest.TestCase):
     """Le nombre requis : le maximum des règles par chemin, zéro pour un léger."""
 

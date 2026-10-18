@@ -5,8 +5,10 @@
 real `Port`: it reads the lot's milestones, re-reads the idempotent mark of the
 freeze and writes the designation in **one** transaction (lock of the lot row,
 mark in the journal, mails in the mailbox). A reviewer mail is a `request`
-linked to the lot (#2478): the reviewer's runner opens a turn on it; the
-capacity notification to the pilot stays a `notify`. The readable thread is
+linked to the lot (#2478): the reviewer's runner opens a turn on it, once
+per head (#2495: a reviewer already holding a request for this head, or an
+unread one naming none, gets no second mail); the capacity notification to the
+pilot stays a `notify`. The readable thread is
 written only after the commit (`mail.send(..., after_commit=…)`, pattern #315
 of `deep_analysis`): a cancelled send leaves no trace in the external thread.
 
@@ -33,7 +35,8 @@ import json
 from typing import Mapping, Optional, Sequence
 
 from . import mail, plan_git, registry, storage
-from .review_designation import DESIGNATED, WAITING, DesignationError, StaleFreeze
+from .review_designation import (DESIGNATED, REQUEST_HISTORY, REQUEST_KIND, WAITING,
+                                 DesignationError, StaleFreeze, covering_request)
 
 #: prefix of the journal marks: `<prefix><lot>:<milestone>: <json>`
 MARK_PREFIX = "review-designation:"
@@ -319,6 +322,13 @@ class PgPort:
         threads = self.after_commit if self.after_commit is not None else []
         for row in messages:
             recipient = str(row.get("to") or "").strip()
+            if (str(row.get("kind") or "") == REQUEST_KIND
+                    and covering_request(mail.history(db, recipient, REQUEST_HISTORY),
+                                         lot=lot, reviewer=recipient, sha=sha)):
+                # #2495 : this reviewer already holds a request for this head
+                # (or an unread one naming none): the designation is written,
+                # no second mail.
+                continue
             mail.send(db, self.sender, recipient, str(row.get("body") or ""),
                       kind=str(row.get("kind") or "notify"),
                       work_item_id=str(lot),
