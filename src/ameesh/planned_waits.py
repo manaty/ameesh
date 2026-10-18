@@ -8,7 +8,11 @@ window, human decision). The hold stops the stale reminders and the SLO
 breaches, like any other planned wait, until the lot changes state or the hold
 is explicitly lifted. Only a pilot's hold counts here (`pilot_holds`), and the
 write path authenticates that claim (`work.check_wait_note`); the runner wake
-keeps its own, older convention (`LotSessions.HOLD_PREFIX`)."""
+keeps its own, older convention (`LotSessions.HOLD_PREFIX`).
+
+#2378: a lot in `waiting_human` with an open decision request (`ameesh decide
+ask`) waits for its decider until the request's deadline; past the deadline,
+the ordinary alerts come back."""
 from __future__ import annotations
 
 import datetime
@@ -165,6 +169,32 @@ def ancestors(package_id, packages):
         package_id = package.get("parent")
 
 
+def decision_waits(requests, *, now) -> dict[int, dict]:
+    """#2378 : les lots qui attendent une décision ouverte et non échue.
+
+    `requests` : les demandes en attente (`decisions.pending`). Le lot attend
+    son décideur jusqu'à l'échéance la plus proche de ses demandes ouvertes ;
+    une seule demande échue (ou sans échéance) rend le signal : l'humain est
+    en retard, ce n'est plus une attente prévue."""
+    by_lot: dict[int, list] = {}
+    for request in requests or ():
+        lot = request.get("lot")
+        if isinstance(lot, int) and not isinstance(lot, bool):
+            by_lot.setdefault(lot, []).append(request)
+    out = {}
+    for lot, pending in by_lot.items():
+        dues = [request.get("due_ts") for request in pending]
+        if any(due is None or now >= float(due) for due in dues):
+            continue
+        first = min(pending, key=lambda r: (float(r["due_ts"]), int(r["id"])))
+        out[lot] = {"what": "decision", "decision": int(first["id"]),
+                    "owner": first.get("owner"),
+                    "due_ts": round(float(first["due_ts"]), 3),
+                    "until": time.strftime("%Y-%m-%d %H:%M",
+                                           time.localtime(float(first["due_ts"])))}
+    return out
+
+
 def packet_carriers(rows):
     """#2335 : les porteurs de paquet ouverts, indexés par lot.
 
@@ -239,7 +269,7 @@ def packet_waits(rows, open_items=None):
 
 
 def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies=(),
-            landings=(), holds=None, packets=None):
+            landings=(), holds=None, decisions=(), packets=None):
     """Pure resolver. Only an open execution lot can block another lot.
 
     Commitments apply to their explicit work item or to their plan package
@@ -263,6 +293,11 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
 
     `holds` (#1664, `pilot_holds`) est un hold déclaré, prioritaire sur une
     dépendance : le lot est parqué, pas en attente d'un lot.
+
+    `decisions` (#2378) : les demandes de décision en attente
+    (`decisions.pending`). Un lot `waiting_human` dont les demandes ouvertes
+    ne sont pas échues attend son décideur (`decision_waits`), après un hold
+    du pilote et avant une dépendance ; échue, la demande ne tait plus rien.
 
     `packets` (#2335, `packet_waits`) est l'appartenance à un paquet ouvert :
     le lot attend la fusion du porteur, pas un exécuteur ; cette attente passe
@@ -318,6 +353,7 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
     # #1664 : les holds du pilote (dict lot -> hold), distincts du `held` de
     # porte par lot utilisé plus bas (collision de noms à l'union avec main).
     pilot = holds or {}
+    asked = decision_waits(decisions, now=now)
     packet = packets or {}
     for row in rows:
         ident = int(row["id"])
@@ -339,6 +375,9 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
             continue
         if ident in pilot:
             waits[ident] = dict(pilot[ident])
+            continue
+        if row.get("state") == "waiting_human" and ident in asked:
+            waits[ident] = dict(asked[ident])
             continue
         if ident in packet:
             waits[ident] = dict(packet[ident])
@@ -466,8 +505,11 @@ def _with_heads(st, landings):
 
 
 def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=None,
-         holds=None, packets=None):
+         holds=None, decisions=None, packets=None):
     """Grouped, unbounded truth reads; no query per candidate or dependency.
+
+    `decisions` (#2378) : les demandes en attente, lues ici en une lecture
+    groupée seulement quand un lot est en `waiting_human` ; `()` les ignore.
 
     `holds` peut être fourni par un appelant qui a déjà lu le flux ciblé
     (`pilot_holds`) : sinon il est lu ici, en une lecture groupée (#1664) qui
@@ -504,6 +546,11 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
     packet = packet_waits(rows, open_items) if want_packets else {}
     landings = _with_heads(st, _admitted(
         st, rows, st.work_dependencies.landings_for([int(r["id"]) for r in rows])))
+    if decisions is None:
+        decisions = ()
+        if any(r.get("state") == "waiting_human" for r in rows):
+            from . import decisions as decisions_mod  # import tardif : decisions importe work
+            decisions = decisions_mod.pending(db, now)
     return resolve(rows, dates, commitments, packages, open_items, now=now,
                    dependencies=dependencies, landings=landings, holds=holds,
-                   packets=packet)
+                   decisions=decisions, packets=packet)

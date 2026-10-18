@@ -22,14 +22,19 @@ l'exécuteur), pour chaque lot ouvert qui porte un feu, **dans cet ordre**
    (familles distinctes, aucune celle de l'auteur) et sans blocage non levé.
    Tant qu'elle n'est pas franchie, aucune PR n'est ouverte, aucune ligne de
    file n'est écrite et aucune CI n'est déclenchée ;
-4. la PR manquante est alors ouverte (mode GitHub) ou le lot entre dans la
+4. la voie du lot (file ou fusion directe) est celle que **le projet déclare**,
+   jamais celle de l'hôte qui a pris le bail (#2256) : un projet `land: local`
+   ou `pr` entre en file ; `land: off` fusionne en direct ; un hôte qui ne
+   déclare ni le projet ni sa file s'abstient (`no-land`) au lieu de fusionner
+   en direct par défaut ;
+5. la PR manquante est alors ouverte (mode GitHub) ou le lot entre dans la
    file de fusion (`merge_queue.enter`, Nexlink), une fois les portes vertes ;
-5. en mode GitHub, la fusion est **faite par ce passage**, sous
+6. en mode GitHub, la fusion est **faite par ce passage**, sous
    `gh pr merge --match-head-commit <sha>` : la tête autorisée est vérifiée au
    geste effectif, et aucune auto-fusion GitHub n'est laissée armée entre deux
    passages — GitHub fusionnerait une tête poussée après le feu (P1-4). Une
    auto-fusion trouvée armée est désarmée avant tout autre geste ;
-6. en mode file, l'atterrissage re-vérifie le feu et les blocages au dernier
+7. en mode file, l'atterrissage re-vérifie le feu et les blocages au dernier
    geste (`fire.land_guard`, sous le bail de `land`).
 
 Toute opération d'un lot — le passage, mais aussi `give` et `withdraw` — est
@@ -62,7 +67,8 @@ QUIET = ("idle", "armed", "queued", "busy", "withdrawn")
 #: anomalie ou geste à faire. `not-ready` et les `would-*` se répètent à chaque
 #: passage tant que la CI n'est pas verte : les dire serait du bruit.
 LOUD = ("merged", "would-merge", "invalidated", "would-invalidate", "disarmed",
-        "would-disarm", "error", "no-pr", "pr-closed", "ejected", "no-repository")
+        "would-disarm", "error", "no-pr", "pr-closed", "ejected", "no-repository",
+        "no-land")
 #: méthodes de fusion admises par `gh pr merge`
 METHODS = ("merge", "squash", "rebase")
 
@@ -125,7 +131,10 @@ def same_commit(a, b, repo=None) -> bool:
 
 def state(db, lot: int) -> dict:
     """L'état du feu d'un lot, sans lecture GitHub : le feu actif, le gel
-    qu'il couvre, et le dernier jalon écrit."""
+    qu'il couvre, et le dernier jalon écrit.
+
+    La couverture compare les identifiants par préfixe (`_same_head`) : un
+    gel peut citer `352ba651` quand le feu cite la tête complète."""
     item = work.get(db, lot)
     if item is None:
         raise FireError("lot #%d not found" % lot)
@@ -138,7 +147,7 @@ def state(db, lot: int) -> dict:
         "branch": item.get("branch") or "", "freeze_sha": frozen,
         "active": bool(fire), "sha": _norm((fire or last or {}).get("sha")),
         "actor": (fire or last or {}).get("actor") or "",
-        "covered": bool(fire and frozen and same_commit(fire.get("sha"), frozen)),
+        "covered": bool(fire and frozen and _same_head(fire.get("sha"), frozen)),
         "withdrawn": bool(last and last.get("kind") == UNFIRE),
         "at_ts": (fire or last or {}).get("at_ts"),
     }
@@ -315,6 +324,87 @@ def _project(cfg, repo: str | None, slug: str | None):
     return None
 
 
+def _queue_declared(db, repo: str | None, slug: str | None) -> bool | None:
+    """Le dépôt a déjà une file dans l'état partagé (#2256), ou None si illisible.
+
+    Les lignes `merge_queue` portent la source du dépôt (`merge_queue.source_of`)
+    et sont communes à tous les hôtes : peu importe celui qui les a écrites,
+    elles déclarent que ce dépôt se fusionne par la file. Un hôte sans
+    `radar.projects.<projet>` ne peut donc pas prétendre qu'il n'y a pas de
+    file et retomber sur `_merge_direct` — c'est le défaut du paquet Nexlink 54.
+    """
+    from . import migrations
+    sources = set()
+    if repo:
+        try:
+            sources.add(merge_queue.normalize_source(merge_queue.source_of(repo)))
+        except Exception:  # noqa: BLE001 - un dépôt illisible ne prouve rien
+            pass
+    key = migrations.repo_key(slug)
+    if key.count("/") == 1:
+        sources.add("github.com/%s" % key)
+    if not sources:
+        return False
+    try:
+        rows = storage.of(db).work.queue()
+    except Exception:  # noqa: BLE001 - illisible ne signifie pas absent
+        return None
+    for row in rows or ():
+        source = str(row.get("source") or "")
+        if source and merge_queue.normalize_source(source) in sources:
+            return True
+    return False
+
+
+def landing_path(cfg, db, project, repo: str | None, slug: str | None) -> tuple[str, str]:
+    """La voie du feu — `queue`, `direct` ou `unknown` — et sa raison (#2256).
+
+    La décision vient de la **déclaration du projet**, jamais de la config
+    locale de l'hôte qui a pris le bail. Le paquet Nexlink 54 a été fusionné
+    en direct parce que l'hôte qui tenait `fire:<lot>` ne déclarait pas
+    `radar.projects.nexlink` et retombait sur `_merge_direct`, alors qu'un
+    autre hôte déclarait sa file.
+
+    - `project` connu : `queue` pour `local`/`pr` ; `direct` exige `off`
+      explicitement déclaré et l'absence vérifiée de file partagée. Le défaut
+      `off` du parseur ne constitue pas une déclaration.
+    - projet inconnu : `queue` si l'état partagé (`merge_queue`) porte déjà une
+      ligne de ce dépôt ; `unknown` si l'hôte ne peut l'établir. Un hôte qui
+      déclare d'autres projets radar mais aucun pour ce dépôt s'abstient : ses
+      portes d'atterrissage ne sont pas celles du lot (même garde que
+      `ameesh work queue add`, #1467/#2120).
+    - `unknown` interdit la fusion directe : le feu s'abstient et un hôte qui
+      connaît le projet agit (le bail est rendu).
+    """
+    if project is not None and getattr(project, "land", "off") != "off":
+        name = getattr(project, "name", "") or "?"
+        return "queue", "project %s declares land=%s" % (name, project.land)
+    try:
+        declared = merge_queue.declared_projects(cfg)
+    except merge_queue.QueueError as exc:
+        return "unknown", "cannot read repository landing conditions: %s" % exc
+    if declared and project is None:
+        return "unknown", (
+            "the loaded configuration declares radar.projects (%s) but none matches %s: "
+            "select the profile declaring radar.projects for this repository, including its "
+            "land/protected conditions (#1467/#2120); no direct merge from this host (#2256)"
+            % (", ".join(sorted(declared)), slug or repo or "this lot"))
+    queued = _queue_declared(db, repo, slug)
+    if queued:
+        return "queue", (
+            "the shared merge queue already holds %s: its landing path is the queue"
+            % (slug or repo or "this repository"))
+    if project is not None and queued is False:
+        raw = (getattr(cfg, "radar", None) or {}).get("projects", {}).get(project.name, {})
+        if raw.get("land") == "off":
+            return "direct", ("project %s explicitly declares land=off without a shared queue"
+                              % project.name)
+    return "unknown", (
+        "this host has no explicit landing mode for %s or cannot establish the absence of "
+        "a shared queue: refusing a direct merge (#2256); declare radar.projects on the host "
+        "that holds the repository, or queue the lot" % (slug or repo or "this lot"))
+
+
 def _repo_info(slug: str, *, gh, cache: dict) -> dict:
     """`gh api repos/<slug>` : `allow_auto_merge`, branche par défaut, visibilité."""
     if slug in cache:
@@ -364,9 +454,10 @@ def _pr_status(slug: str, branch: str, *, gh) -> dict | None:
         "merged": str(row.get("state") or "").upper() == "MERGED",
         "merge_commit": _norm(commit.get("oid") if isinstance(commit, dict) else ""),
         "armed": row.get("autoMergeRequest") is not None, "url": row.get("url") or "",
+        # #1748 (a): what `ready_pr` needs to require the declared statuses;
         # #2271 : `ready_pr` lit les checks requis dans ce rollup, pas dans
         # `ci` seul (qui compte `SKIPPED` comme vert).
-        "rollup": rollup,
+        "branch": branch, "rollup": rollup,
     }
 
 
@@ -629,8 +720,11 @@ _TRANSIENT_CODE = re.compile(r"(?i)(?:\bhttp[ /]?|\(\s*)(?:408|429|5\d\d)\b")
 _TRANSIENT_TEXT = (
     "timed out", "timeout", "deadline exceeded", "connection reset",
     "connection refused", "connection aborted", "broken pipe",
-    "network is unreachable", "temporary failure in name resolution",
-    "no such host", "tls handshake", "unexpected eof", "server error",
+    "network is unreachable", "network is down", "network error",
+    "no route to host", "dial tcp", "i/o timeout",
+    "temporary failure in name resolution", "no such host",
+    "name or service not known", "server misbehaving", "lookup ", "goaway",
+    "tls handshake", "unexpected eof", "server error",
     "bad gateway", "service unavailable", "gateway timeout",
     "rate limit", "too many requests", "abuse detection",
 )
@@ -638,12 +732,43 @@ _TRANSIENT_TEXT = (
 
 def _transient_read(detail: str) -> bool:
     """#2306 : la lecture de la forge a-t-elle échoué pour une raison
-    passagère ? Seuls ces échecs (HTTP 408/429/5xx, délai, coupure réseau)
-    gardent la ligne en file ; un 4xx, un refus de droits ou une réponse
-    malformée restent des échecs prouvés, qui éjectent."""
+    passagère ? Seuls ces échecs (HTTP 408/429/5xx, délai, coupure réseau,
+    DNS, GOAWAY) gardent la ligne en file ; un 4xx, un refus de droits ou une
+    réponse malformée restent des échecs prouvés, qui éjectent. #2344 : une
+    sortie vide ne prouve rien non plus — elle est traitée en passagère."""
     low = str(detail or "").lower()
+    if not low.strip():
+        return True
     return bool(_TRANSIENT_CODE.search(low) or re.search(r"(?:^|:\s*)eof\s*$", low)
                 or any(word in low for word in _TRANSIENT_TEXT))
+
+
+#: #2344 : le seul refus que la déclaration du projet peut remplacer.
+_FORBIDDEN_CODE = re.compile(r"(?i)(?:\bhttp[ /]?|\(\s*)403\b")
+
+
+def _forbidden_read(detail: str) -> bool:
+    """#2344 : la forge a-t-elle **prouvé** un refus de droits (HTTP 403) ?
+
+    Un 403 dit que le jeton ne peut pas lire cette source : la déclaration du
+    projet peut alors en tenir lieu. Aucun autre échec — DNS, GOAWAY, sortie
+    vide, 404, réponse malformée — ne vaut cette preuve, sans quoi un gel
+    atterrirait sur la seule déclaration alors que la forge n'a rien refusé."""
+    return bool(_FORBIDDEN_CODE.search(str(detail or "").lower()))
+
+
+def _read_error(detail: str):
+    """#2344 : la classe d'erreur d'une lecture forge échouée.
+
+    Un 403 prouvé lève `land.ForbiddenLandError` (seul cas où la déclaration
+    peut remplacer la source) ; un échec passager (5xx, délai, DNS, GOAWAY,
+    sortie vide) lève `land.TransientLandError` ; tout le reste reste un
+    `land.LandError` ordinaire, fail-closed."""
+    if _forbidden_read(detail):
+        return land.ForbiddenLandError
+    if _transient_read(detail):
+        return land.TransientLandError
+    return land.LandError
 
 
 def _json_pages(stdout: str, what: str) -> list:
@@ -688,13 +813,11 @@ def _api_pages(gh, path: str, what: str) -> list:
                                  % (what, (proc.stdout or "")[:100]))
         return pages
     if "unknown flag: --slurp" not in detail:
-        error = land.TransientLandError if _transient_read(detail) else land.LandError
-        raise error("%s: %s" % (what, detail or "exit %d" % proc.returncode))
+        raise _read_error(detail)("%s: %s" % (what, detail or "exit %d" % proc.returncode))
     proc = gh(["api", "--paginate", path])
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()[:300]
-        error = land.TransientLandError if _transient_read(detail) else land.LandError
-        raise error("%s: %s" % (what, detail or "exit %d" % proc.returncode))
+        raise _read_error(detail)("%s: %s" % (what, detail or "exit %d" % proc.returncode))
     return _json_pages(proc.stdout, what)
 
 
@@ -767,7 +890,9 @@ def _protection_required(slug: str | None, target: str, *, gh) -> tuple:
 
     Un 404 « Branch not protected » est une réponse (aucun check requis) ;
     toute autre lecture — droits, branche absente, réponse malformée — lève
-    `land.LandError` : l'absence de garde ne se suppose jamais."""
+    `land.LandError` : l'absence de garde ne se suppose jamais. #2344 : un
+    refus de droits **prouvé** (403) lève `land.ForbiddenLandError`, seule
+    erreur que `required_checks` peut remplacer par la déclaration."""
     if not slug:
         raise land.LandError("no GitHub repository known: the required checks of %s "
                              "cannot be read" % (target or "the target"))
@@ -780,8 +905,8 @@ def _protection_required(slug: str | None, target: str, *, gh) -> tuple:
         detail = (proc.stderr or proc.stdout or "").strip()[:300]
         if "Branch not protected" in detail:
             return ()
-        error = land.TransientLandError if _transient_read(detail) else land.LandError
-        raise error("gh api %s: %s" % (path, detail or "exit %d" % proc.returncode))
+        raise _read_error(detail)("gh api %s: %s"
+                                  % (path, detail or "exit %d" % proc.returncode))
     data = land._json(proc, "gh api %s" % path, dict)
     required = data.get("required_status_checks")
     if required is None:
@@ -822,7 +947,9 @@ def _ruleset_required(slug: str | None, target: str, *, gh) -> tuple:
     impose une, l'application (`integration_id`, `-1` valant « toute
     application »). Les autres règles ne concernent pas les checks. Un dépôt
     sans ruleset rend une liste vide ; une lecture impossible ou malformée
-    lève `land.LandError` : l'absence de règle ne se suppose jamais (#2285)."""
+    lève `land.LandError` : l'absence de règle ne se suppose jamais (#2285).
+    #2344 : un 403 prouvé lève `land.ForbiddenLandError`, que la déclaration
+    peut remplacer ; les autres échecs restent fail-closed."""
     if not slug:
         raise land.LandError("no GitHub repository known: the rulesets of %s "
                              "cannot be read" % (target or "the target"))
@@ -862,13 +989,15 @@ def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
     complétés par la déclaration `radar.projects.<p>.required_checks` (des
     noms, sans application imposée).
 
-    Quand une lecture de la forge échoue durablement (jeton sans droits, forge
-    muette), la déclaration du projet la remplace **sans retirer l'autre
-    lecture** ; sans déclaration, la lecture refuse. Un échec passager, lui,
-    lève `land.TransientLandError` : la lecture sera réessayée, la déclaration
-    ne tient pas lieu de preuve (#2306). La déclaration ne peut jamais retirer
-    un check que la forge exige : elle s'ajoute. Les noms sont exacts de bout
-    en bout : la déclaration `tests ` ne vaut pas le contexte `tests`."""
+    Quand la forge **refuse** une lecture (403 prouvé : jeton sans droits), la
+    déclaration du projet la remplace **sans retirer l'autre lecture** ; sans
+    déclaration, la lecture refuse. Tout autre échec (404, DNS, GOAWAY, sortie
+    vide, réponse malformée) ne se suppose jamais un refus de droits : il
+    refuse ou lève `land.TransientLandError` quand il est passager — la
+    déclaration ne tient pas lieu de preuve (#2344). La déclaration ne peut
+    jamais retirer un check que la forge exige : elle s'ajoute. Les noms sont
+    exacts de bout en bout : la déclaration `tests ` ne vaut pas le contexte
+    `tests`."""
     declared = tuple((str(name), None) for name in
                      (getattr(project, "required_checks", ()) or ())
                      if str(name).strip())
@@ -881,16 +1010,21 @@ def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
                  lambda: _ruleset_required(slug, target, gh=gh)):
         try:
             forged.extend(read())
+        except land.ForbiddenLandError:
+            # #2344 : seul un 403 prouvé autorise la déclaration à tenir lieu
+            # de cette source ; sans déclaration, la lecture refuse.
+            if not declared:
+                raise
         except land.TransientLandError:
             # #2306 : un échec passager n'est pas une source absente ; la
             # file réessaiera au passage suivant, jamais un atterrissage avec
             # la seule déclaration.
             raise
         except land.LandError:
-            # Une source illisible n'efface pas l'autre : la déclaration
-            # remplace la seule lecture manquante (#2285).
-            if not declared:
-                raise
+            # #2344 : 404, DNS, GOAWAY, sortie vide, réponse malformée : la
+            # forge n'a pas prouvé de refus, la déclaration ne remplace rien ;
+            # la lecture partielle est écartée (fail-closed).
+            raise
     return tuple(dict.fromkeys(tuple(forged) + declared))
 
 
@@ -1018,9 +1152,17 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
         return False, ("PR #%s does not prove the required checks of %s on the freeze %s: %s"
                        % (status.get("number"), target or "the target", frozen[:12],
                           ", ".join(gaps)))
+    from . import radar
+    # #1748 (a): a head of a declared branch is green only with a `success`
+    # status of each required prefix; an unknown branch gets them all
+    statuses = radar.required_statuses(project, status.get("branch"))
+    if statuses and not radar.ci_green(status.get("rollup") or [], statuses):
+        return False, "PR #%s carries no successful %s status on the freeze %s " \
+            "(required_statuses)" % (status.get("number"),
+                                     " / ".join("%s*" % p for p in statuses), frozen[:12])
     if project is not None and getattr(project, "ci_required", False):
         try:
-            merge_queue._required_ci(project, frozen)
+            merge_queue._required_ci(project, frozen, branch=status.get("branch"))
         except merge_queue.QueueError as exc:
             return False, str(exc)
     return True, ""
@@ -1086,9 +1228,9 @@ def _reconcile(db, row: dict, marks: list, status: dict, *, slug: str, repo: str
     lot = int(row["id"])
     freeze = freeze_of(marks)
     fire = given(marks)
-    covered = bool(fire) and same_commit(status.get("head"), (fire or {}).get("sha"))
+    covered = bool(fire) and same_commit(status.get("head"), (fire or {}).get("sha"), repo)
     covered = covered or (bool(freeze) and same_commit(status.get("head"),
-                                                       (freeze or {}).get("sha")))
+                                                       (freeze or {}).get("sha"), repo))
     out = {"lot": lot, "result": "merged", "pr": status.get("number"),
            "sha": status.get("merge_commit") or "", "covered": covered}
     if dry_run:
@@ -1098,7 +1240,7 @@ def _reconcile(db, row: dict, marks: list, status: dict, *, slug: str, repo: str
         db, lot, sha=status.get("merge_commit") or "", actor=work.SYSTEM_SENDER,
         source="PR #%s" % status.get("number"),
         pr_ref="%s#%s" % (slug, status.get("number")),
-        frozen_id=int(freeze["id"]) if freeze else None,
+        frozen_id=int(freeze["id"]) if freeze else None, repo=repo,
         extra=("" if covered else "the PR merged %s, not the head the fire covered (%s): "
                "the fire did not cover this merge"
                % ((status.get("head") or "?")[:12], _norm((fire or {}).get("sha"))[:12])))
@@ -1111,17 +1253,10 @@ def _reconcile(db, row: dict, marks: list, status: dict, *, slug: str, repo: str
                "" if covered else ". WARNING: the merged head is not the one the fire covered; "
                "the fire is to be given again on a new freeze")),
             {"project": row.get("app") or "", "pr": status.get("number"), "merged": True})
-        from . import review_lot
-        try:
-            out["review_lot"] = review_lot.open_after_merge(
-                db, lot=lot, item=row, merged_sha=status.get("merge_commit") or "",
-                pr=status.get("number"), target=target,
-                klass=lot_class.of_lot(db, lot, item=row, repo=repo, base=target or None,
-                                       head=merge_queue.pinned(repo, _norm((freeze or {}).get(
-                                           "sha"))) if repo else None))
-        except Exception as exc:  # noqa: BLE001 - la fusion est un fait
-            out["review_lot"] = {"id": None, "created": False,
-                                 "why": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
+        # #2374 : la relecture est ouverte par `close_merged` (une seule fois,
+        # sur le diff que la fusion a fait entrer), pas recalculée ici sur
+        # `cible..gel` — vide après la fusion, donc faussement « light ».
+        out["review_lot"] = done.get("review_lot") or {}
     if not covered:
         _wake(db, row.get("assignee"), lot, (
             "Fire on lot #%d « %s »: PR #%s was merged at %s while the fire covered %s. "
@@ -1370,7 +1505,8 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
 
     info = _repo_info(slug, gh=gh, cache=cache)
     target = _target(row, project, work_repo, info)
-    queue_mode = project is not None and getattr(project, "land", "off") != "off"
+    path, landing_why = landing_path(cfg, db, project, work_repo, slug)
+    out["landing"] = path
 
     # #2333 (canon §11 bis) : aucune fusion de lot directe hors paquet, même
     # pour un feu donné avant la garde ou avec une auto-fusion déjà armée. La
@@ -1397,9 +1533,21 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
                    % status.get("number"))
         return out
 
-    # 5. file de fusion (projet qui déclare `land`) : entrée quand les avis et
+    # 5. la voie du lot (#2256) : décidée par la déclaration du projet ou
+    #    l'état partagé de sa file, jamais par la config de cet hôte. Sans
+    #    déclaration ni file connue, le feu s'abstient — il ne fusionne jamais
+    #    en direct par défaut.
+    if path != "direct" and status is not None and status.get("armed"):
+        return _not_ready(db, row, status, out,
+                          "landing path %s forbids GitHub auto-merge" % path,
+                          gh=gh, slug=slug, dry_run=dry_run, handle=handle)
+    if path == "unknown":
+        out.update(result="no-land", detail=landing_why)
+        return out
+
+    # 6. file de fusion (projet qui déclare `land`) : entrée quand les avis et
     #    la CI sont là ; sinon PR ouverte, CI, puis fusion au geste effectif.
-    if queue_mode:
+    if path == "queue":
         if not dry_run and not _renew(handle):
             return {"lot": lot, "result": "busy"}
         return _queue(db, row, marks, fire, project=project, repo=work_repo, target=target,

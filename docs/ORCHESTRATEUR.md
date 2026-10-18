@@ -75,6 +75,11 @@ l'orchestrateur de l'équipe en reçoit un courrier (`event`, lié au lot).
   un lot faute d'autre preneur, la note d'attribution porte la trace du repli
   (#1739) ; en prise locale (#804, `agents` fourni, même vide), aucun repli :
   son orchestrateur reste exclu (L804).
+* En-cours : un agent ne détient pas plus de 2 lots en `build`, tous projets
+  confondus (canon §4). La prise refuse le troisième, `ameesh work wip
+  --apply` rend le surplus à la file (le lot garde sa branche), et une
+  exception pilote est explicite : `ameesh work assign <id> <agent>
+  --wip-exception "raison"`.
 * Réassigner : `ameesh work assign <id> <agent>`, puis le message `--lot <id>`.
 * Réglages : `ameesh notify --take-lot-idle S` (`AMEESH_TAKE_LOT_IDLE`,
   défaut 900, `0` coupe), `--take-lot-max-per-hour N` (défaut 6 pour tout le
@@ -418,7 +423,8 @@ si nécessaire. Un commit sans rattachement ne ferme pas le lot.
 L'alerte `stale_lot` rappelle cette commande pour un lot inactif.
 
 Autres fermetures : `ameesh work close <id> --abandoned | --superseded-by
-<id>`. Un lot passé `promoted` par erreur : `ameesh work move <id> merged
+<id> | --done` (`--done` : lot livré sans fusion, sans branche). Un lot passé
+`promoted` par erreur : `ameesh work move <id> merged
 --correct "raison"` (humains, orchestrateurs et agents de conception
 seulement ; tracé au journal).
 
@@ -451,26 +457,63 @@ l'alerte `merge_blocked` dit qu'une tête de file n'avance plus depuis
 30 min. Sans `land` (réglage par défaut), on fusionne soi-même le lot de
 rang 1.
 
+Le feu choisit cette voie d'après la **déclaration du projet**, jamais
+d'après la configuration locale de l'hôte qui a pris le bail `fire:<lot>`
+(#2256) : `land: local` ou `pr` entre en file ; une file partagée connue
+prime sur une déclaration locale `off`. La fusion directe exige `land: off`
+explicite et l'absence vérifiée de file partagée. Un hôte qui ne déclare pas
+le mode d'atterrissage s'abstient (`no-land`) s'il ne trouve pas non plus de
+ligne de file pour ce dépôt ; il ne fusionne jamais en direct par défaut.
+Une auto-fusion GitHub résiduelle est désarmée avant l'abstention ou l'entrée
+en file. Le bail est rendu, et un hôte qui connaît le projet agit au passage
+suivant.
+
 ## Intégration par paquets §12 : contrôle d'inclusion avant le feu
 
-Aux coupures de 11:00 et 23:00, le pilote compose un paquet avec **tous** les
-lots à verdicts complets (canon `processus/lots.md` §12). Avant la CI complète
-et le feu, le contrôle d'inclusion confronte la liste des lots admis ou routés
-à la coupure aux lignes du manifeste **et** au contenu réel de l'arbre :
+**Chaque heure**, le pilote compose un petit paquet avec les lots prêts, sans
+conflit et aux verdicts complets, sur la tête de la cible (canon
+`processus/lots.md` §§11 bis et 12) ; un nouveau paquet attend le précédent.
+Aux coupures de 11:00 et 23:00, la release prend la tête de la cible (ou le
+dernier commit vert), taguée et déployée en staging : elle ne compose plus de
+paquet.
+
+La composition **part d'une liste calculée**, jamais des seuls courriers
+(#2404) : `scripts/paquet-candidats.py` lit tous les lots `qa` du projet (sans
+filtre d'assigné), leur gel effectif confronté à la tête **publiée**, les
+verdicts requis sur cette tête et un essai de fusion propre contre la cible. Un
+lot prêt absent du paquet doit figurer dans la table « Écartés (ce véhicule) »
+du manifeste avec un motif ; sinon il n'est ni composé ni visible. Si le calcul
+est incomplet (une lecture impossible), `--ready-out` est retiré, y compris un
+export précédent : le contrôle s'arrête plutôt que de lire une liste partielle.
+
+Avant la CI complète et le feu, le contrôle d'inclusion confronte cette liste
+calculée, les admissions ou routages du paquet, les lignes du manifeste **et**
+le contenu réel de l'arbre :
 
 ```sh
+scripts/paquet-candidats.py --repo . --ready-out "$TMPDIR/prets-0800.txt"
 scripts/paquet-inclusion.py --manifest reviews/2026-10-15-paquet-23h.md \
     --head origin/integration/paquet-23h-20261015 \
+    --ready-file "$TMPDIR/prets-0800.txt" \
     --expected-file "$TMPDIR/admissions-23h.txt"
 ```
 
-Il sort `1` si un lot attendu manque au manifeste, ou si le contenu d'un lot
-composé a disparu de la tête (revert non consigné) — l'ascendance d'une tête
-ne suffit pas après un revert (#1638). Sans liste attendue, il sort `2`, sauf
-`--no-expected` qui assume le contrôle partiel. Un contenu *partiel* ou *vide*
-est listé « à lire » (union, adaptation, remise fraîche) ; `--strict` le rend
-bloquant. Détail, format de la liste attendue et validation sur le paquet 11h :
+Il sort `1` si un lot attendu **ou prêt** manque au manifeste (ni composition
+ni « écarté » motivé), ou si le contenu d'un lot composé a disparu de la tête
+(revert non consigné) — l'ascendance d'une tête ne suffit pas après un revert
+(#1638). Sans source de liste attendue ni de liste prête, il sort `2`, sauf
+`--no-expected` qui assume le contrôle partiel ; un fichier de lots prêts
+fourni mais vide est valide. Un contenu *partiel* ou *vide* est listé « à
+lire » (union, adaptation, remise fraîche) ; `--strict` le rend bloquant.
+Détail, format de la liste attendue et validation sur le paquet 11h :
 `docs/PAQUET-INCLUSION.md`.
+
+Un lot prêt que le paquet n'emporte pas ne disparaît pas : le manifeste
+l'écrit sous « Écartés (ce véhicule) » avec son motif (second avis dû, conflit
+à préparer, paquet complet, procédure de release…). Le contrôle d'inclusion
+lit cette table comme une explication forte, et refuse une ligne sans motif.
+Seul le lot **en tête de ligne** est le sujet d'une exclusion : un id cité
+dans le motif (« `#500` dépend de `#600` ») reste une référence faible.
 
 Chaque commit de composition (une unité du paquet) porte un trailer
 `ameesh-work: <id>` par lot qu'il porte : il devient déclarable nativement
@@ -750,7 +793,21 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    En confiant un lot qui touche au schéma, l'orchestrateur réserve le
    numéro ou demande à l'agent de le faire en premier. Deux fichiers de même numéro dans
    `src/ameesh/migrations` sont refusés par la suite unitaire
-   (`tests/test_l122_numeros_de_migration.py`, sans base).
+   (`tests/test_l122_numeros_de_migration.py`, sans base). À la composition
+   d'un paquet par le train (#2400), une migration ajoutée par un lot est
+   renumérotée au maximum de la cible + 1, jamais une migration historique :
+   le lot qui en modifie une est écarté avec un motif. Les fichiers compagnons
+   du même préfixe (rollback, test, banc) sont renommés avec elle, les
+   références par nom de fichier et les numéros en commentaire suivent ; les
+   littéraux de code ne changent pas. Un transport qualifié qui porterait une
+   migration ajoutée ou modifiée est refusé et le lot écarté : sa qualification
+   fige l'arbre et le delta, la renumérotation doit donc précéder la
+   qualification. La réservation L122 est déplacée avant
+   la publication (journal « before: … »), le plan porte la correspondance
+   (`reserved`/`landed`) et le commit final la ligne
+   `ameesh-migration: <lot> <ancien> <nouveau>`. Après promotion confirmée,
+   le numéro atterri est enregistré (`migration_landed`) et la réservation
+   libérée. Le train reste inactif : ce raccord ne l'active pas.
 6. **Geler le périmètre d'une release à son ouverture** (L750/L756, #561/#566).
    Quand le lot de release est ouvert, son périmètre se fige à un commit
    **nommé** de sa cible : `ameesh release open <lot> --base <commit>`. Les

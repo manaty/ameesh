@@ -4049,6 +4049,7 @@
    "operations": "hors du sous-ensemble de l'exécuteur médié",
    "packages": "canon et paquets : serveur seulement",
    "placements": "placement : serveur seulement",
+   "prevalidation": "hors du sous-ensemble de l'exécuteur médié",
    "progress": "vue des humains (/api/v1)",
    "projects": "vue des humains (/api/v1)",
    "roadmap": "feuille de route (L96) : serveur seulement",
@@ -4305,6 +4306,7 @@
    "operations": [
     "adopt",
     "assigners",
+    "build_lots_activity",
     "gauge_history",
     "gauge_latest",
     "latest_gauges",
@@ -4328,6 +4330,11 @@
    ],
    "placements": [
     "recorded"
+   ],
+   "prevalidation": [
+    "latest",
+    "record",
+    "report"
    ],
    "progress": [
     "actions",
@@ -4405,6 +4412,7 @@
     "add",
     "add_milestone",
     "assign",
+    "assign_capped",
     "assignment_events",
     "attach_implicit_branch",
     "auto_takes_since",
@@ -4412,8 +4420,10 @@
     "backlog_add",
     "by_issue_ref",
     "by_package",
+    "claim_review_proposal",
     "close",
     "close_merged",
+    "count_builds",
     "creator",
     "current_delegation",
     "delays",
@@ -4458,6 +4468,7 @@
     "recent_or_cited",
     "record_landed_migration",
     "record_resolution",
+    "rectify_close",
     "reference",
     "refresh_package_parents",
     "release_agent",
@@ -4476,8 +4487,11 @@
     "set_partial_seen",
     "timeline",
     "turn_spans",
+    "unassign",
+    "unassign_surplus",
     "unassigned_lots",
     "waiting_episodes",
+    "wip_exceptions",
     "without_project"
    ],
    "watches": [

@@ -16,6 +16,9 @@ et autorité pilote déclarée. Tests sans base (routage, jalons, GitHub simulé
 puis sur Postgres (règles de `give`/`withdraw`, bail, CLI, garde de `land`)."""
 from __future__ import annotations
 
+import os
+import subprocess
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -41,6 +44,17 @@ def _mark(kind, sha="", **extra):
 
 def _marks(*rows):
     return [dict(row, at_ts=float(i), id=i) for i, row in enumerate(rows, start=1)]
+
+
+def _git_repo(root: str) -> str:
+    """Un dépôt git d'un commit vide : rend le SHA complet."""
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+    subprocess.run(["git", "init", "-q", "-b", "main", root], check=True, env=env)
+    subprocess.run(["git", "-C", root, "commit", "-q", "--allow-empty", "-m", "t"],
+                   check=True, env=env)
+    return subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], check=True,
+                          capture_output=True, text=True).stdout.strip()
 
 
 def _verdict(actor, sha=A, verdict="ok", **extra):
@@ -105,6 +119,42 @@ class MarkersTest(unittest.TestCase):
             now = fire.state(None, 3)
         self.assertFalse(now["active"])
         self.assertTrue(now["withdrawn"])
+
+    def test_state_covers_an_abbreviated_freeze(self):
+        # #2370 : un gel en abrégé (352ba651) et un feu à la tête complète.
+        item = {"id": 3, "title": "t", "state": "build", "branch": "lot/3-x"}
+        marks = _marks(_mark("frozen", A[:8]), _mark("fire", A))
+        with mock.patch.object(fire.work, "get", return_value=item), \
+                mock.patch.object(fire.work, "milestones", return_value=marks):
+            now = fire.state(None, 3)
+        self.assertTrue(now["active"])
+        self.assertTrue(now["covered"])
+
+
+class ReconcileTest(unittest.TestCase):
+    """#2370 : la réconciliation d'une PR fusionnée résout un gel abrégé."""
+
+    ROW = {"id": 42, "title": "un lot", "assignee": "author", "app": "ameesh"}
+
+    def test_an_abbreviated_freeze_covers_the_full_merged_head(self):
+        with tempfile.TemporaryDirectory() as repo:
+            full = _git_repo(repo)
+            marks = _marks(_mark("frozen", full[:8]), _mark("fire", full[:8]))
+            status = _status(state="MERGED", merged=True, head=full, merge_commit=full)
+            with mock.patch.object(
+                    fire.work, "close_merged",
+                    return_value={"result": "merged", "detail": ""}) as close, \
+                    mock.patch.object(fire, "_passive"), \
+                    mock.patch.object(fire, "_wake") as wake, \
+                    mock.patch.object(fire.lot_class, "of_lot",
+                                      return_value={"class": "light"}), \
+                    mock.patch("ameesh.review_lot.open_after_merge",
+                               return_value={"id": None, "created": False}):
+                out = fire._reconcile(None, self.ROW, marks, status, slug="manaty/ameesh",
+                                      repo=repo, target="main", dry_run=False)
+        self.assertTrue(out["covered"])
+        wake.assert_not_called()
+        self.assertEqual(close.call_args.kwargs.get("extra"), "")
 
 
 class ReviewGateTest(unittest.TestCase):
@@ -198,13 +248,17 @@ class ReviewGateTest(unittest.TestCase):
                                        _verdict("rev2")), klass=klass)
                 self.assertTrue(two["ok"], two["why"])
 
-    def test_sensitive_without_changed_paths_keeps_two_reviews(self):
+    def test_sensitive_without_changed_paths_keeps_one_review(self):
+        # #2394 : le canon réserve les deux avis aux catégories critiques
+        # (SQL, secrets, paiement, prod réelle, porte de fusion) ; une liste de
+        # chemins vide ne prouve aucune de ces catégories. La classe reste
+        # sensible : un avis d'une autre famille, et rien de plus.
         for files in ([], [{"class": "sensitive", "rule": ["src/ameesh/runner.py"]}]):
             with self.subTest(files=files):
                 klass = {"class": "sensitive", "doubt": False, "files": files}
                 one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
-                self.assertEqual(one["required"], 2)
-                self.assertFalse(one["ok"])
+                self.assertEqual(one["required"], 1)
+                self.assertTrue(one["ok"], one["why"])
 
     def test_sql_and_merge_gate_need_two_distinct_families(self):
         for entry in (self.SQL, self.GATE):
@@ -264,6 +318,10 @@ class ReviewGateTest(unittest.TestCase):
             klass = lot_class.class_of_paths([canon], "ameesh", [path])
             self.assertEqual(klass["class"], "sensitive", (path, klass))
             self.assertFalse(klass["doubt"], (path, klass))
+            # #2374 : ces trois chemins comptent pour la porte, même quand le
+            # canon les classe par une règle groupée (le motif de secours les
+            # reconnaît et exige les deux familles).
+            self.assertEqual(merge_queue.required_verdicts(klass), 2, (path, klass))
         critical = lot_class.class_of_paths(
             [canon], "ameesh", [self.CRITICAL_CANON_PATH])
         self.assertEqual(critical["class"], "sensitive", critical)
@@ -291,22 +349,20 @@ class ReviewGateTest(unittest.TestCase):
         self.assertFalse(out["ok"], "l'avis de la famille de l'auteur ne compte pas")
         self.assertEqual([a["actor"] for a in out["accepted"]], ["rev1"])
 
-    def test_a_doubt_never_supposes_a_family_and_needs_two(self):
-        # B/P1 cx1 (57812f9b..979f2e2b) : un doute (politique ou diff illisible)
-        # peut cacher SQL/la sécurité/la prod ; il garde donc les deux avis des
-        # domaines critiques et l'indépendance ne s'y suppose jamais.
+    def test_a_doubt_never_supposes_a_family_and_needs_one(self):
+        # #2394 : le doute de classe reste sensible (canon §8) : un avis d'une
+        # autre famille suffit (owner 15/10), mais l'indépendance ne s'y
+        # suppose jamais — famille du relecteur connue et autre que l'auteur.
         klass = {"class": "sensitive", "doubt": True, "files": []}
         out = self.gate(_marks(_mark("frozen", A)), klass=klass)
         self.assertFalse(out["ok"])
-        self.assertEqual(out["required"], 2)
+        self.assertEqual(out["required"], 1)
         one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
-        self.assertFalse(one["ok"], "un avis ne suffit pas sur un doute")
-        ghost = self.gate(_marks(_mark("frozen", A), _verdict("ghost"), _verdict("rev1")),
-                          klass=klass)
+        self.assertTrue(one["ok"], one["why"])
+        ghost = self.gate(_marks(_mark("frozen", A), _verdict("ghost")), klass=klass)
         self.assertFalse(ghost["ok"], "une famille inconnue ne prouve pas l'indépendance")
-        two = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev2")),
-                        klass=klass)
-        self.assertTrue(two["ok"], two["why"])
+        same = self.gate(_marks(_mark("frozen", A), _verdict("other")), klass=klass)
+        self.assertFalse(same["ok"], "la famille de l'auteur ne compte pas")
         out = self.gate(_marks(_mark("frozen", A), _verdict("author")), klass=klass)
         self.assertFalse(out["ok"], "l'auteur ne relit pas son propre travail")
 
@@ -540,7 +596,8 @@ class ActTest(unittest.TestCase):
         names = ("_repo_of", "_slug", "_project", "_pr_status", "_repo_info", "_target",
                  "ready_verdicts", "ready_pr", "_merge_pr", "_disarm_auto", "_reconcile",
                  "_invalidate", "_disarm", "_open_pr", "_queue", "_passive", "_wake",
-                 "_leave_queue", "_fresh", "_renew", "_target_lock", "_unlock")
+                 "_leave_queue", "_fresh", "_renew", "_target_lock", "_unlock",
+                 "landing_path")
         packet_patch = (
             mock.patch.object(fire.packet_guard, "check_merge",
                               side_effect=packet_guard.PacketGuardError(packet_refusal))
@@ -552,6 +609,11 @@ class ActTest(unittest.TestCase):
             patched["_repo_of"].return_value = None
             patched["_slug"].return_value = "manaty/ameesh"
             patched["_project"].return_value = project
+            # #2256 : le routage est testé ici ; la décision de voie a son
+            # propre témoin (tests/test_2256_fire_landing_path.py).
+            land = getattr(project, "land", "off") if project is not None else "off"
+            patched["landing_path"].return_value = (
+                "queue" if land != "off" else "direct", "test")
             if statuses is not None:
                 patched["_pr_status"].side_effect = list(statuses)
             else:

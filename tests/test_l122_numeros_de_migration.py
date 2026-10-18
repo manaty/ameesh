@@ -115,6 +115,18 @@ class NumerosDuDepotTest(unittest.TestCase):
                                               also_skip=("integration/paquet-5",))
             self.assertEqual(sorted(skipped), [375])
 
+    def test_l_arbre_de_travail_peut_etre_ignore(self):
+        """#2400 : le train compose la migration qu'il réserve ; le scan de
+        réservation ignore alors l'arbre de travail, jamais les branches."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _depot(os.path.join(tmp, "nexlink"), "manaty/nexlink", NEXLINK.directory,
+                          ["375_a.sql"], {"agent/y-417": ["377_c.sql"]})
+            with open(os.path.join(repo, NEXLINK.directory, "378_wt.sql"), "w") as fh:
+                fh.write("--")
+            self.assertEqual(sorted(migrations.repo_numbers(repo, NEXLINK)), [375, 377, 378])
+            self.assertEqual(sorted(migrations.repo_numbers(repo, NEXLINK, worktree=False)),
+                             [375, 377])
+
     def test_le_paquet_ameesh_ne_compte_que_pour_ameesh(self):
         with tempfile.TemporaryDirectory() as tmp:
             package = os.path.join(tmp, "paquet")
@@ -326,12 +338,14 @@ class ReservationTest(PgTestCase):
     def _rejoue_0390(self, *rows):
         """Les réservations `rows` (migration, dépôt, issue) posées avant 0390,
         puis 0390 rejouée : son déclencheur, sa contrainte et son index sont
-        retirés d'abord, la colonne reste (un dépôt déjà donné). Le schéma de la
+        retirés d'abord, ainsi que le trigger de projection #711 qui
+        n'existait pas avant 0390 ; la colonne reste (un dépôt déjà donné). Le schéma de la
         classe est rendu tel quel ensuite, réservations libérées."""
         path = os.path.join(migrations.MIGRATIONS_DIR, "0390_work_item_migration_repo.sql")
         with open(path, encoding="utf-8") as fh:
             sql = fh.read()
-        undo = ("DROP TRIGGER IF EXISTS work_items_migration_repo_fill ON work_items;"
+        undo = ("DROP TRIGGER IF EXISTS work_items_migration_slot_sync ON work_items;"
+                " DROP TRIGGER IF EXISTS work_items_migration_repo_fill ON work_items;"
                 " ALTER TABLE work_items DROP CONSTRAINT IF EXISTS work_items_migration_repo_check;"
                 " DROP INDEX IF EXISTS work_items_migration_repo_idx;")
         ids = []
@@ -342,6 +356,10 @@ class ReservationTest(PgTestCase):
                 self.db.execute("UPDATE work_items SET migration = NULL, migration_repo = NULL"
                                 " WHERE id = %s", (i,))
             self.db.script(sql)
+            self.db.script("CREATE TRIGGER work_items_migration_slot_sync"
+                           " AFTER INSERT OR UPDATE OF migration, migration_repo, app, branch_target, state"
+                           " ON work_items FOR EACH ROW"
+                           " EXECUTE FUNCTION work_items_migration_slot_sync();")
 
         self.addCleanup(restore)
         self.db.script(undo)
@@ -738,15 +756,16 @@ class ReservationsSimultaneesTest(PgTestCase):
             rows = self.db.query(
                 "SELECT count(*) AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock'"
                 " AND datname = current_database()"
-                " AND query LIKE '%UPDATE work_items SET migration = greatest(%'")
+                " AND (query LIKE '%UPDATE work_items SET migration = greatest(%'"
+                " OR query LIKE '%:migration-repo:%')")
             if rows[0]["n"]:
                 return True
             time.sleep(0.05)
         return False
 
     def test_la_perdante_recalcule(self):
-        """A tient 377 sans avoir validé ; B lit le même maximum, tente 377,
-        attend sur l'index, échoue au commit de A et prend 378."""
+        """A tient 377 sans avoir validé ; B attend sur la réservation
+        (verrou dépôt #711, ou index), puis recalcule et prend 378."""
         for holder, other in [(h, o) for h in _drivers() for o in _drivers()]:
             with self.subTest(holder=holder, other=other):
                 self.db.execute("UPDATE work_items SET migration = NULL, migration_repo = NULL")
@@ -779,7 +798,7 @@ class ReservationsSimultaneesTest(PgTestCase):
                 self.assertTrue(held.wait(30))
                 tb = threading.Thread(target=reserve)
                 tb.start()
-                # B est réellement bloquée sur l'index avant que A ne valide
+                # B attend réellement la réservation de A avant son commit
                 self.assertTrue(self._blocked(), "B never waited on A's reservation")
                 done.set()
                 ta.join(30)

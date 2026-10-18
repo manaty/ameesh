@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -32,7 +33,24 @@ class FakeQueue(FakeWork):
     def __init__(self, lots):
         super().__init__(lots)
         self.queue_rows: dict = {}
-        self.clock = 0.0
+        #: horloge réaliste : `uncertain` compare `created_ts` à `time.time()`
+        #: moins la fenêtre d'historique ; un compteur logique 1, 2, … serait
+        #: toujours hors fenêtre (#2371 N2).
+        self.clock = time.time()
+        #: #2371 N2 : l'instant de chaque note, en parallèle de `notes` ; le
+        #: faux `events_noted` honore ainsi `since_ts` comme le vrai journal.
+        self.note_ts: list = []
+
+    def _append_note(self, item_id, note, actor):
+        """Ajoute une note datée du faux horloge (#2371 N2).
+
+        Les notes écrites par le parent (`record_resolution`) n'ont pas
+        d'instant : on les aligne sur l'horloge courante avant d'ajouter.
+        """
+        while len(self.note_ts) < len(self.notes):
+            self.note_ts.append(self.clock)
+        self.notes.append((item_id, note, actor))
+        self.note_ts.append(self.clock)
 
     def _row(self, lot):
         q = self.queue_rows.get(lot)
@@ -52,7 +70,7 @@ class FakeQueue(FakeWork):
                                     "landing_sha": None,
                                     "reason": "", "queued_by": actor, "queued_ts": self.clock,
                                     "source": source, "generation": self.clock, "frozen_id": frozen_id}
-        self.notes.append((item_id, note, actor))
+        self._append_note(item_id, note, actor)
         return self._row(item_id)
 
     def queue_update(self, item_id, *, state=None, rank=None, reason=None, landing_sha=None,
@@ -79,19 +97,24 @@ class FakeQueue(FakeWork):
         if reason is not None:
             q["reason"] = reason
         if note:
-            self.notes.append((item_id, note, actor))
+            self._append_note(item_id, note, actor)
         return self._row(item_id)
 
     def note(self, item_id, state, text, actor):
-        self.notes.append((item_id, text, actor))
+        self._append_note(item_id, text, actor)
 
     def events_noted(self, prefix, since_ts, *, ids=None):
-        return [{"work_item_id": i, "note": n, "actor": a, "created_ts": self.clock, "assignee": self.lots[i].get("assignee")}
-                for i, n, a in self.notes if n.startswith(prefix)
+        times = list(self.note_ts)
+        while len(times) < len(self.notes):
+            times.append(self.clock)
+        return [{"work_item_id": i, "note": n, "actor": a, "created_ts": t,
+                 "assignee": self.lots[i].get("assignee")}
+                for (i, n, a), t in zip(self.notes, times)
+                if n.startswith(prefix) and t >= since_ts
                 and (ids is None or i in ids)]
 
     def queue_remove(self, item_id, *, note, actor):
-        self.notes.append((item_id, note, actor))
+        self._append_note(item_id, note, actor)
         return self.queue_rows.pop(item_id, None) is not None
 
     def queue(self, target=None):
@@ -388,6 +411,42 @@ class EntryTest(_Base):
                                       ci=lambda branch: status, clone=clone)
                 self.assertEqual(self.fake.queue_rows, {})
 
+    def test_a_target_deleted_on_origin_is_refused_at_admission(self):
+        # #2278 : le premier passage garde la cible sous QUEUE_REF dans le
+        # clone ; quand origin ne la porte plus, `_class_of` la relit là et
+        # admet un lot light, que `run_pass` diffère ensuite à chaque passage
+        # (« target not found »). L'admission doit refuser, avec la cible nommée.
+        agents = os.path.join(self.tmp, "agents")
+        _git(self.tmp, "clone", "-q", self.repo, agents)
+        clone = resolutions.Replayer(agents, os.path.join(self.tmp, "state", "p.clone"))
+        self.ready(1)
+        status = {"number": 7, "green": True, "head": self.tip(1)}
+        merge_queue.enter(None, 1, repo=agents, actor="orch", ci=lambda branch: status,
+                          clone=clone)
+        self.fake.queue_rows.clear()
+        _git(self.repo, "checkout", "-q", "lot/1-a")
+        _git(self.repo, "branch", "-q", "-D", "main")
+        with self.assertRaisesRegex(merge_queue.QueueError,
+                                    "target main not found on origin"):
+            merge_queue.enter(None, 1, repo=agents, actor="orch",
+                              ci=lambda branch: status, clone=clone)
+        self.assertEqual(self.fake.queue_rows, {})
+
+    def test_a_target_missing_without_origin_is_refused_too(self):
+        # Le repli hors admission (pas d'origin : les branches locales sont la
+        # seule copie) refuse la cible absente de la même façon (#2278).
+        self.fake.lots[1]["branch_target"] = "main"
+        self.ready(1)
+        _git(self.repo, "checkout", "-q", "lot/1-a")
+        _git(self.repo, "branch", "-q", "-D", "main")
+        with self.assertRaisesRegex(merge_queue.QueueError,
+                                    "target main not found on the repository"):
+            self.enter(1)
+
+    def test_no_target_is_refused(self):
+        with self.assertRaisesRegex(merge_queue.QueueError, "no target branch known"):
+            merge_queue.target_tip(self.repo, "", None)
+
     def test_merged_lot_is_refused(self):
         self.ready(1)
         self.fake.lots[1]["state"] = "merged"
@@ -560,6 +619,11 @@ class TargetResolutionTest(_Base):
     porte la classification et l'admission ; le défaut du dépôt ne l'écrase
     plus."""
 
+    def setUp(self):
+        super().setUp()
+        # #2278 : une cible d'admission existe pour de vrai.
+        _git(self.repo, "branch", "develop", "main")
+
     def project(self):
         return radar.Project(name="p", repo=self.repo, target="develop", github="o/r")
 
@@ -608,7 +672,7 @@ class ClassOfSourcesTest(unittest.TestCase):
         with mock.patch.object(plan_git, "_commit", return_value="c" * 40), \
                 mock.patch.object(lot_class, "of_lot", side_effect=fake):
             out = merge_queue._class_of(None, 1, {"app": "ameesh"}, "depot", "clone",
-                                        "main", "f" * 40)
+                                        "main", "f" * 40, base="c" * 40)
         return out, calls
 
     def test_la_plus_haute_des_lectures_l_emporte(self):
@@ -803,6 +867,31 @@ class ClassOfFreshTargetGitTest(unittest.TestCase):
                                             target, c, cfg=None)
                 self.assertEqual(out["class"], "light")
                 self.assertFalse(out["doubt"])
+
+    def test_a_queue_ref_left_by_an_earlier_fetch_is_not_called_fresh(self):
+        """#2379 : sans `base`, la borne est le `QUEUE_REF` du dernier fetch,
+        ici antérieur à B ; la lecture garde sa classe mais ne se dit pas
+        fraîche. Avec la cible récupérée par l'appelant, rien n'est signalé."""
+        for target in ("main", "develop"):
+            with self.subTest(target=target):
+                _up, agents, a, b, c = self.witness(target)
+                clone = self.clone(agents, target)
+                merge_queue.fetch_fresh(agents, ["lot/light", target], clone)
+                # un fetch antérieur : le clone garde A sous QUEUE_REF
+                _git(clone.path, "update-ref", merge_queue.QUEUE_REF + target, a)
+                self.lot(target)
+                stale = merge_queue._class_of(None, 1, self.row, agents, clone.path,
+                                              target, c, cfg=None)
+                self.assertIn("non prouvée fraîche", stale["why"])
+                self.assertIn(merge_queue.QUEUE_REF + target, stale["why"])
+                fresh = merge_queue._class_of(None, 1, self.row, agents, clone.path,
+                                              target, c, cfg=None, base=b)
+                self.assertEqual(fresh["class"], "light")
+                self.assertNotIn("non prouvée fraîche", fresh["why"])
+                # une borne déjà nommée par un commit n'est pas une ref périmée
+                exact = merge_queue._class_of(None, 1, self.row, agents, clone.path,
+                                              b, c, cfg=None)
+                self.assertNotIn("non prouvée fraîche", exact["why"])
 
 
 class OrderTest(unittest.TestCase):

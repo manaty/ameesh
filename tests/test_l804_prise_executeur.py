@@ -273,7 +273,14 @@ class ReglagesTest(unittest.TestCase):
                          {"idle_s": backlog.DEFAULT_TAKE_IDLE_S,
                           "max_per_hour": backlog.DEFAULT_TAKE_MAX_PER_HOUR,
                           "lot_idle_s": backlog.DEFAULT_LOT_IDLE_S,
-                          "lot_max_per_hour": backlog.DEFAULT_LOT_MAX_PER_HOUR})
+                          "lot_max_per_hour": backlog.DEFAULT_LOT_MAX_PER_HOUR,
+                          # #1738 (N3) : l'exécuteur relaie aussi l'interrupteur
+                          # des propositions de relecture/correction.
+                          "review_max_per_hour": backlog.REVIEW_PROPOSAL_MAX_PER_HOUR})
+        # #1738 (N3) : l'interrupteur de l'exécuteur est celui du produit.
+        self.assertEqual(runner._take_settings(
+            parser.parse_args(["--take-review-max-per-hour", "0"]))
+            ["review_max_per_hour"], 0)
         # #754 : la prise au token est acquise, `allow_paid` n'a plus d'objet
         self.assertNotIn("allow_paid", runner._take_settings(args))
         # les deux prises coupées : aucune prise à déclencher
