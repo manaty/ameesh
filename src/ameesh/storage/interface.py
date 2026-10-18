@@ -1775,6 +1775,21 @@ class WorkItems(Domain):
         """
 
     @abc.abstractmethod
+    def note_with_wake(self, item_id: int, state: str, text: str, actor: str,
+                       wake_ts: float, *, once: bool = False) -> None:
+        """#2466 : journalise une note et pose, dans la même transaction, le
+        réveil programmé du lot (epoch) : une note `hold: …` ne laisse jamais
+        la retenue sans son échéance si l'écriture s'interrompt."""
+
+    @abc.abstractmethod
+    def schedule_wake(self, item_id: int, wake_ts: float | None, *, text: str,
+                      actor: str) -> dict | None:
+        """#2466 : pose (ou efface avec `wake_ts=None`) le réveil programmé du
+        lot et journalise le geste, en une transaction ; rend le lot relu, ou
+        None s'il n'existe pas ou n'est plus ouvert. Un seul réveil par lot :
+        le dernier posé remplace le précédent."""
+
+    @abc.abstractmethod
     def log_review_attempt(self, item_id: int, state: str, text: str, actor: str) -> None:
         """L539 (#1104) : journalise une tentative de rattrapage sans création.
 
@@ -3700,6 +3715,9 @@ class LotSessions(Domain):
     ACTIONABLE_STATES = ("intake", "build")
     #: note de lot qui retient le réveil (`ameesh work note N "hold: …"`)
     HOLD_PREFIX = "hold:"
+    #: notes du réveil programmé (#2466 : pose, annulation, déclenchement) :
+    #: elles ne changent pas la retenue d'un lot tenu par une note `hold:`
+    WAKE_PREFIX = "wake:"
 
     @abc.abstractmethod
     def switch(self, name: str, owner: str, epoch: int, *, to_lot: str | None,
@@ -3733,10 +3751,11 @@ class LotSessions(Domain):
         puis ancienneté : assignés à lui, en `intake`/`build`, ni prévus après
         `today`, ni en attente d'une décision (demande non lue, jalon de
         décision ouvert), d'un lot bloquant ouvert ou d'une note `hold:`
-        (la dernière note du lot). Chaque ligne : `id`, `title`, `state`,
-        `priority`, `activity_ts` (dernier signe de vie du lot : lot, journal,
-        pointe de branche, courrier sur le lot), `wakes`, `last_wake_ts`,
-        `wake_activity_ts`."""
+        (la dernière note du lot). Une note `wake:` (#2466 : pose ou
+        déclenchement d'un réveil programmé) ne lève pas la retenue. Chaque
+        ligne : `id`, `title`, `state`, `priority`, `activity_ts` (dernier
+        signe de vie du lot : lot, journal, pointe de branche, courrier sur
+        le lot), `wakes`, `last_wake_ts`, `wake_activity_ts`."""
 
     @abc.abstractmethod
     def note_wake(self, name: str, lot: int, activity_ts: float | None) -> dict:
@@ -3744,6 +3763,23 @@ class LotSessions(Domain):
         compte repart à 1 si le lot a vécu depuis le réveil précédent
         (`activity_ts` plus récent que `wake_activity_at`), sinon il croît.
         Rend la ligne."""
+
+    @abc.abstractmethod
+    def due_wakes(self, name: str, now: float) -> list[dict]:
+        """#2466 : les réveils programmés échus des lots encore ouverts de
+        `name`, par échéance puis priorité : `id`, `title`, `state`,
+        `priority`, `wake_ts`. Un réveil programmé est un rendez-vous
+        explicite : il ne dépend ni de l'état `intake`/`build`, ni d'une note
+        `hold:`, ni d'une décision ouverte — seulement de l'assignation et de
+        l'échéance. Une base d'avant 0466 rend une liste vide."""
+
+    @abc.abstractmethod
+    def take_wake(self, name: str, lot: int, now: float) -> dict | None:
+        """#2466 : consomme le réveil programmé échu du lot, dans une
+        transaction : l'échéance est effacée (une seule fois), le journal du
+        lot reçoit une ligne `wake:` de l'acteur `ameesh` (témoin du
+        déclenchement). Rend `{id, state, title, wake_ts}` ou None si le lot
+        n'a plus de réveil échu, n'est plus assigné à `name` ou est fini."""
 
     @abc.abstractmethod
     def purge(self, name: str | None = None) -> list[dict]:

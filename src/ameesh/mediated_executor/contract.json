@@ -4538,7 +4538,9 @@
     "unassigned_lots",
     "waiting_episodes",
     "wip_exceptions",
-    "without_project"
+    "without_project",
+    "schedule_wake",
+    "note_with_wake"
    ],
    "watches": [
     "delete",
@@ -4572,7 +4574,9 @@
     "listing",
     "note_wake",
     "purge",
-    "switch"
+    "switch",
+    "due_wakes",
+    "take_wake"
    ],
    "host_lifecycle": [
     "agents",
