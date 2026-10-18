@@ -1435,12 +1435,49 @@ def _status_success(contexts, required) -> list:
     return [p for p in required if not any((c or "").startswith(p) for c in won)]
 
 
+def latest_rollup(rollup) -> list:
+    """#2524 : les derniers checks par (workflow, nom), statuts par contexte.
+
+    Seule une date strictement plus récente remplace une entrée. Dates
+    absentes, invalides ou ex aequo : garder les entrées ambiguës afin de ne
+    jamais masquer un échec ou un check en cours sur la foi de l'ordre reçu.
+    """
+    from datetime import datetime
+
+    groups = {}
+    for index, entry in enumerate(rollup or ()):
+        context = (entry.get("__typename") == "StatusContext"
+                   or "state" in entry and "conclusion" not in entry)
+        name = entry.get("context" if context else "name")
+        key = (("context", name) if context else
+               ("check", entry.get("workflowName"), name)) if name else ("unknown", index)
+        # `gh` exporte la date d'un StatusContext sous `startedAt` (son
+        # `createdAt` GraphQL) ; `createdAt` reste lu pour un rollup GraphQL brut.
+        raw = (entry.get("startedAt") or entry.get("createdAt")) if context else entry.get("startedAt")
+        try:
+            stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            stamp = stamp.timestamp() if stamp.tzinfo is not None else None
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            stamp = None
+        groups.setdefault(key, []).append((entry, stamp))
+    latest = []
+    for entries in groups.values():
+        if any(stamp is None for _, stamp in entries):
+            latest.extend(entry for entry, _ in entries)
+        else:
+            newest = max(stamp for _, stamp in entries)
+            latest.extend(entry for entry, stamp in entries if stamp == newest)
+    return latest
+
+
 def ci_green(rollup, required=()) -> bool:
     """`statusCheckRollup` d'une PR : vert si au moins un check, et tous
-    terminés sans échec. #1748 (a) : chaque préfixe de `required`
+    terminés sans échec, après sélection des derniers checks (#2524).
+    #1748 (a) : chaque préfixe de `required`
     (`required_statuses`) doit en outre être porté par un statut de commit
     (`StatusContext`, jamais un check run, dont le nom est libre) en
     `success` — des checks `skipped` ou `success` seuls ne suffisent plus."""
+    rollup = latest_rollup(rollup)
     if not rollup:
         return False
     statuses = [(c.get("context"), c.get("state")) for c in rollup

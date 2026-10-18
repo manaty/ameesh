@@ -76,6 +76,15 @@ if action == 'resume' and sys.argv[2:] == ['--help']:
     else:
         print('usage: ameesh resume ... --operator --reason R --expect-reason TEXT')
     sys.exit(0)
+if action == 'pause' and sys.argv[2:] == ['--help']:
+    # #2184/R3 : sans --not-after, la pose ne porte pas de barrière ; le
+    # script doit refuser de drainer. Le drapeau simule un CLI antérieur.
+    if (state / 'sans-not-after').exists():
+        print('usage: ameesh pause AGENT --reason R [--human H] [--json]')
+    else:
+        print('usage: ameesh pause AGENT --reason R [--human H] '
+              '[--not-after EPOCH] [--json]')
+    sys.exit(0)
 if action == 'show':
     paused = pause.exists()
     # #2152 : l'agent enchaîne les tours tant qu'il n'est pas drainé ; drainé,
@@ -159,7 +168,7 @@ class RedemarrageServeurDrainTest(unittest.TestCase):
         # #2152 / R1 B1 : la levée est conditionnée au motif exact de la pose.
         pose = [l for l in journal.splitlines() if l.startswith('pause dev9')][0]
         reprise = [l for l in journal.splitlines() if l.startswith('resume dev9')][0]
-        motif = pose.split('--reason ', 1)[1]
+        motif = pose.split('--reason ', 1)[1].split(' --human ', 1)[0]
         self.assertIn('--expect-reason ' + motif, reprise)
         self.assertIn('drain posé', p.stdout)
         self.assertIn('drain levé (redémarrage hors tour)', p.stdout)
@@ -183,6 +192,31 @@ class RedemarrageServeurDrainTest(unittest.TestCase):
         journal = self.poste()
         self.assertNotIn('pause dev9', journal)
         self.assertNotIn('resume dev9 --operator', journal)
+        self.assertFalse((self.state / 'pause-dev9').exists())
+        journal_ssh = (self.state / 'ssh.log').read_text()
+        self.assertIn('systemctl stop ameesh-runner@dev9', journal_ssh)
+        self.assertIn('systemctl start ameesh-runner@dev9', journal_ssh)
+
+    def test_drain_carries_a_deadline_and_the_operator_actor(self):
+        """#2184/R3 et N6 : la pose porte une échéance absolue et l'acteur
+        humain du poste, jamais le compte `ameesh` de la VM."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        p = self.run_vm()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        pose = [l for l in self.poste().splitlines() if l.startswith('pause dev9')][0]
+        self.assertIn('--not-after ', pose)
+        self.assertIn('--human human:', pose)
+        self.assertIn('--reason drain de déploiement #2152', pose)
+
+    def test_cli_without_not_after_never_poses_a_pause(self):
+        """#2184/R3 : un CLI sans --not-after ne peut pas porter la barrière ;
+        le script arrête sans drain plutôt que de risquer une pause tardive."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        (self.state / 'sans-not-after').touch()
+        p = self.run_vm()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('drain #2152 indisponible', p.stderr)
+        self.assertNotIn('pause dev9', self.poste())
         self.assertFalse((self.state / 'pause-dev9').exists())
         journal_ssh = (self.state / 'ssh.log').read_text()
         self.assertIn('systemctl stop ameesh-runner@dev9', journal_ssh)

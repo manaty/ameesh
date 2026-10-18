@@ -496,9 +496,10 @@ gh variable set AMEESH_LENT_RUNS_ON \
 # option is omitted (R1 delta B5)
 sudo deploy/guest/ci-runners.sh --enable 1
 sudo deploy/guest/ci-runners.sh --check
-# a dispatched run on main (or a PR touching ui/**) carries `bilan`; during
-# the job, prove the container is in the slice, and that the runner is gone
-# afterwards:
+# a dispatched run on main carries `bilan`; a push touching ui/** on the
+# package, a release branch or main carries `ui` (#2449: no lot PR run);
+# during the job, prove the container is in the slice, and that the runner is
+# gone afterwards:
 systemd-cgls ameesh-guest.slice | grep -E 'Runner.Worker|postgres'
 docker ps                       # no guest container here (host daemon)
 gh api "repos/manaty/ameesh/actions/runners?per_page=100" --paginate \

@@ -1100,10 +1100,12 @@ def _reviewer_request(db: Db, item: dict, reviewer: str, who: str) -> dict:
     The designation is already written when this runs: a delivery failure is
     returned as a warning (same pattern as `delegate`), never raised, so the
     caller can surface it without losing the designation. A human reviewer has
-    no runner to wake and gets no mailbox request.
+    no runner to wake and gets no mailbox request. An earlier request that
+    already covers this reviewer and head is reused, not sent again (#2495).
     """
     from . import mail, plan_git
-    from .review_designation import REQUEST_KIND, manual_reviewer_message
+    from .review_designation import (REQUEST_HISTORY, REQUEST_KIND, covering_request,
+                                     manual_reviewer_message)
 
     name = (reviewer or "").strip()
     if not name or name.startswith(HUMAN_PREFIX) or name == REVIEWER_NONE:
@@ -1114,6 +1116,17 @@ def _reviewer_request(db: Db, item: dict, reviewer: str, who: str) -> dict:
         latest = None
     freeze = ({"id": int(latest["id"]), "sha": str(latest.get("sha") or "")}
               if latest is not None else None)
+    # #2495 : one request per (lot, reviewer, head). A re-designation, or a
+    # designation after the freeze already woke this reviewer, sends nothing.
+    try:
+        prior = covering_request(mail.history(db, name, REQUEST_HISTORY),
+                                 lot=int(item["id"]), reviewer=name,
+                                 sha=freeze["sha"] if freeze else "")
+    except Exception:  # noqa: BLE001 - unreadable history: send, as before #2495
+        prior = None
+    if prior is not None:
+        return {"reviewer_request_message_id": int(prior["id"]),
+                "reviewer_request_reused": True}
     payload = {"review_request": {"lot": int(item["id"]), "reviewer": name,
                                   "manual": True}}
     if freeze:
