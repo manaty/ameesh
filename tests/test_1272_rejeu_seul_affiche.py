@@ -20,7 +20,8 @@ from unittest import mock
 
 from ameesh import accounts, cost, widget_usage
 
-from .test_1580_widget_forfait import WidgetUsageTest, _profil
+from . import test_1580_widget_forfait as _widgets
+from .test_1580_widget_forfait import _profil
 from .test_cost import Sandbox
 from .test_l30_accounts import _dossier
 
@@ -98,10 +99,10 @@ class RejeuSeulAfficheTest(Sandbox, unittest.TestCase):
 class WidgetNonMentionneTest(unittest.TestCase):
     """Le widget omarchy (#1580) date lui-même son relevé : pas de mention."""
 
-    setUp = WidgetUsageTest.setUp
-    tearDown = WidgetUsageTest.tearDown
-    _ecrit = WidgetUsageTest._ecrit
-    _instantane = WidgetUsageTest._instantane
+    setUp = _widgets.WidgetUsageTest.setUp
+    tearDown = _widgets.WidgetUsageTest.tearDown
+    _ecrit = _widgets.WidgetUsageTest._ecrit
+    _instantane = _widgets.WidgetUsageTest._instantane
 
     def test_un_releve_du_widget_ne_porte_pas_la_mention(self):
         self._ecrit("claude-secondary.json", self._instantane())
