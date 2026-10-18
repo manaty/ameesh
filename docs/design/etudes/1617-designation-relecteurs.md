@@ -300,10 +300,14 @@ supersedes, and restores the previous freeze's pending seats that the selection
 had removed. A forced replay (`designate(force=True)`) when the carry refuses
 goes through the port with `force`: the old selection is not replayed and a
 newer selection mark is written, so it supersedes the carried mark; a carry
-that succeeds afterwards writes a newer carried mark again. Carried marks are
-automatic designations for the column: a later real freeze removes their names
-before writing the new selection. `ameesh work reviewers` shows the carried
-state, not "no designation".
+that succeeds afterwards writes a newer carried mark again. A forced replay
+does not deposit a mail already sent for that freeze: review requests and the
+waiting notice are filtered on the mailbox (key: lot + freeze), not on the
+mark — a carried mark names reviewers requested for **another** freeze, and an
+undeliverable waiting notice leaves a mark without any mail (#2541). Carried
+marks are automatic designations for the column: a later real freeze removes
+their names before writing the new selection. `ameesh work reviewers` shows the
+carried state, not "no designation".
 
 ## Remaining after activation (#2447)
 
