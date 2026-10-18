@@ -174,6 +174,8 @@ def unb64(text: str) -> bytes:
 # --------------------------------------------------------------------------
 
 def key_info(db: Db, agent: str) -> dict | None:
+    from .agent_names import resolve as resolve_agent_name
+    agent = resolve_agent_name(agent, db=db, operation="authority.key_info")
     return storage.of(db).keys.info(agent)
 
 
@@ -202,6 +204,8 @@ def register_key(db: Db, agent: str, public: bytes, *, role: str = DEFAULT_KEY_R
     C'est le geste du propriétaire (#326 r2) : la base (0364) le refuse hors
     de son rôle de base, comme toute pose, tout changement ou tout retour
     d'une clé owner sur un agent ; une clé `agent` reste libre."""
+    from .agent_names import resolve as resolve_agent_name
+    agent = resolve_agent_name(agent, db=db, operation="authority.register_key")
     if len(public) != 32:
         raise AuthorityError("Ed25519 public key: 32 bytes expected")
     if role not in KEY_ROLES:
@@ -268,6 +272,8 @@ def register_human_key(db: Db, human: str, public: bytes, *,
 
 
 def revoke_key(db: Db, agent: str) -> bool:
+    from .agent_names import resolve as resolve_agent_name
+    agent = resolve_agent_name(agent, db=db, operation="authority.revoke_key")
     return storage.of(db).keys.revoke(agent)
 
 
@@ -290,6 +296,8 @@ def confirm_key(db: Db, name: str) -> int:
 
 
 def _valid_key(db: Db, agent: str, expected_fingerprint: str | None) -> tuple[dict | None, Verdict]:
+    from .agent_names import resolve as resolve_agent_name
+    agent = resolve_agent_name(agent, db=db, operation="authority._valid_key")
     info = key_info(db, agent)
     if not info or not info.get("public_key"):
         return None, Verdict(False, "no public key registered for %s" % agent)
@@ -322,9 +330,29 @@ def verify_message(db: Db, row: dict) -> Verdict:
         return verdict
 
     expires_ts = row.get("signature_expires_ts") or 0.0
+    # Alias input may have been signed before transport normalized it. Keep
+    # the signed spellings byte-for-byte, but accept them only if both still
+    # resolve to the identities stored on this message. All other fields are
+    # rebuilt from the row as before; a changed body/date/nonce still fails.
+    signed_sender = sender
+    signed_recipient = row.get("to") or row.get("recipient") or ""
+    try:
+        prefix, kind, fields_text = payload_text.split("|", 2)
+        fields = json.loads(fields_text)
+        from .agent_names import resolve
+        if (prefix == DOMAIN and kind == "message" and isinstance(fields, dict)
+                and isinstance(fields.get("from"), str) and isinstance(fields.get("to"), str)
+                and resolve(fields["from"], db=db, operation="authority.signature.sender")
+                    == resolve(sender, db=db, operation="authority.signature.row_sender")
+                and resolve(fields["to"], db=db, operation="authority.signature.recipient")
+                    == resolve(signed_recipient, db=db, operation="authority.signature.row_recipient")):
+            signed_sender = fields["from"]
+            signed_recipient = fields["to"]
+    except (ValueError, TypeError):
+        pass
     expected = canonical("message", message_fields(
-        sender=sender,
-        recipient=row.get("to") or row.get("recipient") or "",
+        sender=signed_sender,
+        recipient=signed_recipient,
         body=row.get("text") or row.get("body") or "",
         ts_us=_us(row.get("ts")),
         expires_us=_us(expires_ts),

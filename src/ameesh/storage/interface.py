@@ -238,7 +238,11 @@ class Agents(Domain):
 
     @abc.abstractmethod
     def get(self, name: str) -> dict | None:
-        """La ligne de l'agent, ou None."""
+        """Agent by primary or alias; alias resolutions are durably audited."""
+
+    @abc.abstractmethod
+    def resolve_name(self, name: str, *, operation: str = "lookup") -> str:
+        """Resolve a spelling and audit aliases; unknown names stay unchanged."""
 
     @abc.abstractmethod
     def operator_pause(self, name: str, *, paused: bool, reason: str,
@@ -529,9 +533,17 @@ class PendingSpend(Domain):
         """Remplace le modèle du marqueur ; faux s'il n'y a pas de marqueur."""
 
     @abc.abstractmethod
+    def set_resident_usage(self, name: str, usage: dict | None,
+                           created_ts: float | None = None) -> bool:
+        """Pose (ou efface avec None) l'événement `resident.turn` du marqueur
+        (L80a) ; faux s'il n'y a pas de marqueur, ou si `created_ts` désigne
+        un autre marqueur. Cet état durable permet à un worker de remplacement
+        de réparer un tour résident dont l'événement n'a pas été écrit."""
+
+    @abc.abstractmethod
     def get(self, name: str) -> dict | None:
         """Le marqueur (agent, start_index, turn, model, created_ts,
-        work_item_id, turn_id), ou None."""
+        work_item_id, turn_id, resident_usage), ou None."""
 
     @abc.abstractmethod
     def clear(self, name: str) -> bool:
