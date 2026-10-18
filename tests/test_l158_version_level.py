@@ -163,13 +163,18 @@ class VersionLevelTest(unittest.TestCase):
                  "alter table a alter x set data type bigint;",
                  "alter table a drop if exists x;", "drop sequence s;", "DROP SCHEMA s CASCADE;",
                  "alter table a alter column x set not null;", "alter table a rename to b;",
-                 "truncate a;", "delete from a where x = 1;")
+                 "truncate a;", "delete from a where x = 1;",
+                 "create temp table t (x int) on commit drop;\ndrop table a;")
         minor = ("drop view if exists v;\ncreate view v as select 1;",
                  "drop trigger if exists t on a;", "drop index if exists i;",
                  "alter table a drop constraint if exists c;",
                  "alter table a alter column x set default 0;",
                  "alter table a alter column x drop not null;",
-                 "drop function if exists f();", "alter type t add value 'v';")
+                 "drop function if exists f();", "alter type t add value 'v';",
+                 # 0460 (#2470): a temporary table dropped at commit holds no data
+                 "create temp table t on commit drop as select 1 as x;\n"
+                 "drop view if exists v;\ncreate view v as select x from t;",
+                 "CREATE TEMPORARY TABLE t (x int) ON  COMMIT\n  DROP;")
         for sql, expected in [(s, "major") for s in major] + [(s, "minor") for s in minor]:
             with self.subTest(sql):
                 self._git("checkout", "-q", "-B", "case", "v1.2.3")
