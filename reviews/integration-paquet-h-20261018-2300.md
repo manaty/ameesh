@@ -63,7 +63,8 @@ lot et son SHA, et il porte un trailer `ameesh-work: <lot>`.
 
 ## Contenu et contrôles
 
-- 49 fichiers, **+4333/−254** hors manifeste, sur `main 9a0b4f1ce`.
+- 51 fichiers, **+4336/−256** hors manifeste, sur `main 9a0b4f1ce` (après le
+  correctif CI ci-dessous).
 - Une migration additive : `0463_work_milestones_effective_merge.sql`
   (#2317, table interne, déclencheur, aucune rupture) — à appliquer en staging
   **avant** de relancer les exécuteurs (`deploy/mise-a-jour/`, §11 bis). #2443
@@ -80,6 +81,20 @@ lot et son SHA, et il porte un trailer `ameesh-work: <lot>`.
 - #2452 est une PR du canon `manaty/home#111` (branche
   `canon/2452-mecanique-train-reviews`), hors de `main` ameesh : elle reste
   hors paquet, fusion bureau.
+
+## Correctif CI (première suite complète)
+
+- **`work.corrections` (#2317)** : l'unité ajoute la lecture
+  `WorkItems.corrections` (N2/N4) sans la classer dans
+  `src/ameesh/mediated_executor/contract.json` ;
+  `tests.test_l107_executor_contract.TableTest.test_l_interface_entiere_est_classee`
+  échoue sur les deux familles (psycopg 8/8 et psql 7/16) : `'work.corrections'`
+  manque à `admises | refusées`. Correctif de composition : la lecture rejoint
+  les refusées du domaine `work` (hors du sous-ensemble de l'exécuteur médié,
+  comme `work.milestones`), et les deux compteurs du doc suivent (395 refusées,
+  interface 462). Aucune opération admise ni schéma modifié : adaptation
+  mécanique, sans avis nouveau (§2/§11 bis). `tests.test_l107_executor_contract`
+  : 22 tests OK en local.
 
 ## Écartés (ce véhicule)
 

@@ -4529,6 +4529,7 @@
     "claim_review_proposal",
     "close",
     "close_merged",
+    "corrections",
     "count_builds",
     "creator",
     "current_delegation",
