@@ -580,10 +580,17 @@ class ActionsCycleTest(ActionsBase):
         # La preuve est cet état, pas une durée murale : sous charge CI, les
         # allers-retours base dépassaient l'ancien plafond de 2,5 s alors que
         # le délai du connecteur (0,5 s) était bien respecté.
+        # #2522 : `finished` est posé par le connecteur lui-même, après son
+        # attente — le témoin n'est plus un drapeau que seul le test pose. Le
+        # relâchement est en addCleanup : un échec ne laisse pas le fil bloqué
+        # 30 s.
         release = threading.Event()
+        finished = threading.Event()
+        self.addCleanup(release.set)
 
         def slow():
             release.wait(30)
+            finished.set()
             return Outcome.confirmed("trop tard")
 
         cases = {"exception": boom, "connexion": lost, "délai": slow,
@@ -594,18 +601,16 @@ class ActionsCycleTest(ActionsBase):
                 action = self.propose("send", connector=connector)
                 self.approve(action)
                 result = self.execute(action, connector)
-                self.assertEqual(result["state"], "unknown", result)
                 if label == "délai":
-                    self.assertFalse(release.is_set(),
+                    self.assertFalse(finished.is_set(),
                                      "l'exécution a attendu la réponse du connecteur")
+                self.assertEqual(result["state"], "unknown", result)
                 self.assertEqual(connector.calls, 1)
                 row = self.get(action)
                 self.assertEqual(row["state"], "unknown")
                 self.assertTrue(row["last_error"])
                 self.refused(actions.STATE, self.execute, action, connector)
                 self.assertEqual(connector.calls, 1)
-                if label == "délai":
-                    release.set()
         # un échec n'est « certain » que si le connecteur le dit
         connector = Scripted(lambda: Outcome.failed("refus du système externe"))
         action = self.propose("send", connector=connector)
