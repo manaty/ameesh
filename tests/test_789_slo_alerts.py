@@ -12,12 +12,15 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import subprocess
+import tempfile
 import time
 import unittest
 from unittest import mock
 
-from ameesh import (alert_briefs, decisions, exploitation, notify, planned_waits,
-                    registry, stagnation, storage, work, work_dependencies)
+from ameesh import (alert_briefs, decisions, exploitation, lot_class, merge_queue,
+                    notify, planned_waits, registry, stagnation, storage, work,
+                    work_dependencies)
 from ameesh.storage.postgres.operations import Operations
 
 from .support import FAKEBIN, PgTestCase
@@ -182,6 +185,103 @@ class AlerteTest(_Base):
             " VALUES (%s, 'verdict', now() - interval '5 minutes', 'rel', 'ok')",
             (self.lot["id"],))
         self.assertEqual(self.slo(), [])
+
+
+class ReviewGateRepositoryTest(_Base):
+    """#2559 : la porte des avis se lit avec le dépôt du gel retrouvé sur
+    l'hôte qui lit le lot (pas seulement par ses réglages radar). Un premier
+    avis sur un chemin critique ne fait pas le GO, et l'alerte GO → merge ne
+    part pas."""
+
+    def _frozen_repo(self) -> tuple[str, str]:
+        """Un dépôt avec un commit de base puis la tête gelée qui touche
+        `src/ameesh/db.py` (SQL, deux avis). Rend `(repo, sha)`, lecture Git
+        réelle sans réseau."""
+        base = tempfile.mkdtemp(prefix="ameesh-slo-2559-")
+        self.addCleanup(subprocess.run, ["rm", "-rf", base])
+        repo = os.path.join(base, "repo")
+        subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True)
+        for key, value in (("user.email", "t@t"), ("user.name", "t")):
+            subprocess.run(["git", "-C", repo, "config", key, value], check=True)
+        os.makedirs(os.path.join(repo, "docs"))
+        with open(os.path.join(repo, "docs", "notes.md"), "w") as fh:
+            fh.write("base\n")
+        subprocess.run(["git", "-C", repo, "add", "."], check=True)
+        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "base"], check=True)
+        subprocess.run(["git", "-C", repo, "checkout", "-q", "-b", "lot"], check=True)
+        os.makedirs(os.path.join(repo, "src", "ameesh"))
+        with open(os.path.join(repo, "src", "ameesh", "db.py"), "w") as fh:
+            fh.write("# critique\n")
+        subprocess.run(["git", "-C", repo, "add", "."], check=True)
+        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "gel"], check=True)
+        sha = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
+                             check=True, capture_output=True, text=True).stdout.strip()
+        subprocess.run(["git", "-C", repo, "checkout", "-q", "main"], check=True)
+        return repo, sha
+
+    def test_depot_du_gel_retrouve_par_un_autre_agent_local(self):
+        """Le dépôt n'est pas dans le radar de l'hôte : le dossier de travail
+        d'un agent du registre qui contient le commit suffit (#2559)."""
+        repo, sha = self._frozen_repo()
+        registry.upsert(self.db, "orch", harness="claude", host=self.cfg.host,
+                        cwd=repo)
+        item = work.get(self.db, self.lot["id"])
+        self.assertFalse((registry.get(self.db, "dev1") or {}).get("cwd"))
+        self.assertEqual(lot_class.repo_for_freeze(self.db, self.cfg, item, sha),
+                         os.path.realpath(repo))
+
+    def test_un_avis_sur_chemin_critique_ne_fait_pas_le_go(self):
+        """Un avis indépendant sur `db.py` ne suffit pas : la porte exige deux
+        familles, la ligne GO → merge ne part pas, et le doute n'est pas
+        nécessaire (dépôt du gel lisible)."""
+        repo, sha = self._frozen_repo()
+        registry.upsert(self.db, "orch", harness="claude", host=self.cfg.host,
+                        cwd=repo)
+        registry.upsert(self.db, "cx", harness="codex", host=self.cfg.host)
+        self.age(2 * HEURE)
+        self.start(1.5 * HEURE)
+        work.move(self.db, self.lot["id"], "qa")
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, at, sha, actor)"
+            " VALUES (%s, 'frozen', now() - make_interval(secs => 4000), %s, 'dev1')",
+            (self.lot["id"], sha))
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, at, sha, actor, verdict)"
+            " VALUES (%s, 'verdict', now() - make_interval(secs => 3000), %s, 'cx', 'ok')",
+            (self.lot["id"], sha))
+        self.now = time.time()
+        marks = storage.of(self.db).progress.lot_milestones([self.lot["id"]])
+        row = work.get(self.db, self.lot["id"])
+        gate = merge_queue.review_gate_for_item(self.db, self.cfg, row, marks)
+        self.assertIsNotNone(gate, "le dépôt du gel doit être retrouvé")
+        self.assertFalse(gate["ok"])
+        self.assertEqual(gate["required"], 2)
+        self.assertFalse(exploitation._review_gate_open(
+            self.cfg, self.db, row, marks, {"verdict_required": True}))
+        self.assertEqual(self.slo(), [])
+
+    def test_main_local_en_retard_ne_rajoute_pas_un_avis(self):
+        """Un changement SQL déjà sur origin/main n'appartient plus au lot."""
+        repo, merged = self._frozen_repo()
+        subprocess.run(["git", "-C", repo, "update-ref", "refs/remotes/origin/main",
+                        merged], check=True)
+        subprocess.run(["git", "-C", repo, "checkout", "-q", "lot"], check=True)
+        with open(os.path.join(repo, "docs", "notes.md"), "a") as fh:
+            fh.write("suite\n")
+        subprocess.run(["git", "-C", repo, "commit", "-qam", "notes"], check=True)
+        sha = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
+                             check=True, capture_output=True, text=True).stdout.strip()
+        registry.upsert(self.db, "orch", harness="claude", host=self.cfg.host,
+                        cwd=repo)
+        registry.upsert(self.db, "cx", harness="codex", host=self.cfg.host)
+        row = dict(work.get(self.db, self.lot["id"]), branch_target="main")
+        marks = [{"kind": "frozen", "sha": sha, "actor": "dev1", "at_ts": 1},
+                 {"kind": "verdict", "sha": sha, "actor": "cx", "verdict": "ok",
+                  "at_ts": 2}]
+        gate = merge_queue.review_gate_for_item(self.db, self.cfg, row, marks)
+        self.assertIsNotNone(gate)
+        self.assertEqual(gate["required"], 1)
+        self.assertTrue(gate["ok"], gate["why"])
 
 
 class PaquetTest(_Base):
