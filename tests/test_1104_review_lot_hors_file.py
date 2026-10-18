@@ -17,9 +17,10 @@ import dataclasses
 import os
 import subprocess
 import unittest
+import uuid
 from unittest import mock
 
-from ameesh import plan_git, registry, review_lot, storage, work
+from ameesh import plan_git, process_registry, registry, review_lot, storage, work
 
 from .support import PgTestCase
 
@@ -902,3 +903,68 @@ class CloseGuardWitnessTest(_Witness):
         self.verdict(lot, sha, "codex1")
         row = work.close(self.db, review, delivered=True, sha=sha, actor="codex1")
         self.assertEqual(row["state"], "closed")
+
+    # #2385 : la même garde quand le lot de relecture est pinné sur un
+    # workflow — `work.close` le refuse, la clôture passe par le registre.
+
+    def pin(self, review):
+        self.db.execute(
+            "UPDATE work_items SET workflow_ref = %s, workflow_stage = 'draft',"
+            " workflow_version = 1 WHERE id = %s", (_PinnedSpec.workflow_ref, review))
+
+    def registry_close(self, review, sha, actor):
+        version = int(self.db.query(
+            "SELECT coalesce(max(id), 0) AS v FROM work_item_events"
+            " WHERE work_item_id = %s", (review,))[0]["v"])
+        command = process_registry.Command(
+            work_item_id=review, command_id=str(uuid.uuid4()),
+            expected_version=version,
+            authority=process_registry.Authority(actor=actor, source="explicit"),
+            workflow_ref=_PinnedSpec.workflow_ref,
+            workflow_version=_PinnedSpec.workflow_version,
+            action="advance", from_stage="draft", to_stage="stopped",
+            guard="stop_work", evidence={"close_reason": "delivered", "sha": sha})
+        return process_registry._apply(
+            self.db, command, spec=_PinnedSpec(),
+            verifiers={"stop_work": lambda context: process_registry.Verification(
+                ok=True, reason="témoin")})
+
+    def test_une_relecture_pinnee_ne_se_clot_pas_sans_ses_avis(self):
+        sha = "3" * 40
+        lot, review = self.critical_review(sha)
+        self.pin(review)
+        with self.assertRaises(work.WorkError):
+            work.close(self.db, review, delivered=True, sha=sha, actor="codex1")
+        self.verdict(lot, sha, "codex1")
+        with self.assertRaises(process_registry.RegistryRefusal) as ctx:
+            self.registry_close(review, sha, "codex1")
+        self.assertEqual(ctx.exception.code, "review-undelivered", str(ctx.exception))
+        self.assertIn("2 avis", str(ctx.exception))
+        self.assertEqual(work.get(self.db, review)["state"], "intake")
+        self.verdict(lot, sha, "claude2")
+        receipt = self.registry_close(review, sha, "claude2")
+        self.assertEqual(receipt.state, "closed")
+        self.assertEqual(work.get(self.db, review)["close_reason"], "delivered")
+
+    def test_un_lot_pinne_ordinaire_se_clot_sans_avis(self):
+        review = self.lot("rapport pinné")
+        self.pin(review)
+        receipt = self.registry_close(review, "f" * 40, "claude2")
+        self.assertEqual(receipt.state, "closed")
+
+
+class _PinnedSpec:
+    """Artefact minimal du protocole `WorkflowSpec` : brouillon → arrêté."""
+
+    workflow_ref = "acme/process-workflow@2385"
+    workflow_version = 1
+    initial = "draft"
+
+    def statuses(self):
+        return ("draft", "stopped")
+
+    def core_of(self, status):
+        return {"draft": "intake", "stopped": "closed"}[status]
+
+    def transitions_from(self, source):
+        return (("stopped", "stop_work"),) if source == "draft" else ()
