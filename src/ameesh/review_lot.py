@@ -603,7 +603,10 @@ def requirement_of(db, item: dict) -> Optional[dict]:
         return None
     rows = storage.of(db).work.events_noted(
         ref_of(source_lot), 0.0, ids=[source_lot])
-    for row in reversed(rows):
+    # La première marque fait foi : elle est écrite dans la transaction qui
+    # crée le lot de relecture (créé une seule fois) ; une note postérieure
+    # ne peut pas abaisser le nombre d'avis dus.
+    for row in rows:
         text = str(row.get("note") or "")
         at = text.find(MARK_PREFIX)
         if at < 0:
@@ -685,9 +688,9 @@ def guard_delivery(db, item: dict) -> dict:
             continue
         actor = str(mark.get("actor") or "").strip()
         latest.setdefault(actor.lower() or "?", mark)
-    accepted, families = [], set()
+    accepted, families, blocked = [], set(), []
     for mark in latest.values():
-        if (mark.get("verdict") or "") != "ok":
+        if (mark.get("verdict") or "") not in ("ok", "blocked"):
             continue
         if sha:
             try:
@@ -699,6 +702,11 @@ def guard_delivery(db, item: dict) -> dict:
         elif float(mark.get("at_ts") or 0.0) < created:
             continue                  # fusion sans sha : seuls les avis d'après
         actor = str(mark.get("actor") or "").strip()
+        if (mark.get("verdict") or "") == "blocked":
+            # un blocage courant n'est jamais masqué par l'avis d'un autre
+            # relecteur, comme à la porte des avis (`blocked_verdicts`)
+            blocked.append(actor or "?")
+            continue
         if author and actor and actor.lower() == author.lower():
             continue                  # on ne relit pas son propre travail
         family = merge_queue.actor_family(db, actor)
@@ -709,8 +717,12 @@ def guard_delivery(db, item: dict) -> dict:
                 continue              # famille inconnue ou déjà comptée
             families.add(family)
         accepted.append(actor or "?")
-        if len(accepted) >= required:
-            break
+    if blocked:
+        raise work.WorkError(
+            "lot #%s: relecture après fusion du lot #%s non livrable — verdict "
+            "bloquant en vigueur sur %s (%s) : la correction puis un verdict ok du "
+            "même relecteur restent dus"
+            % (item["id"], source_lot, sha[:12] or "<sha>", ", ".join(sorted(blocked))))
     if len(accepted) >= required:
         return {"required": required, "accepted": accepted, "sha": sha}
     need = ("deux avis de familles distinctes" if required >= 2
@@ -718,7 +730,7 @@ def guard_delivery(db, item: dict) -> dict:
     raise work.WorkError(
         "lot #%s: relecture après fusion du lot #%s non livrable — %d avis "
         "indépendant%s requis sur %s, %d rendu(s) (%s). Livrez le(s) verdict(s) : "
-        "ameesh work milestone %d verdict ok --sha %s --actor <relecteur>"
+        "ameesh work milestone %d verdict ok --sha %s"
         % (item["id"], source_lot, required, "" if required == 1 else "s",
            sha[:12] or "<sha>", len(accepted), need, source_lot, sha or "<sha>"))
 

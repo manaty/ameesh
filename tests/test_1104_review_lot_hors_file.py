@@ -842,6 +842,38 @@ class CloseGuardWitnessTest(_Witness):
         row = work.close(self.db, review, delivered=True, sha=sha, actor="claude2")
         self.assertEqual(row["state"], "closed")
 
+    def test_un_blocage_n_est_pas_masque_par_l_avis_d_un_autre(self):
+        """R2 dev1 : le `blocked` courant de codex1 refuse la clôture même
+        quand un autre relecteur a rendu `ok` (relecture légère, un avis)."""
+        sha = "a" * 40
+        lot = self.merged_lot("docs bloquée", sha=sha)
+        out = review_lot.open_after_merge(
+            self.db, lot=lot, klass={"class": "light", "why": "policy"},
+            merged_sha=sha)
+        work.milestone(self.db, lot, "verdict", sha=sha, actor="codex1",
+                       verdict="blocked")
+        self.verdict(lot, sha, "deepseek2")
+        with self.assertRaises(work.WorkError) as ctx:
+            work.close(self.db, out["id"], delivered=True, sha=sha, actor="deepseek2")
+        self.assertIn("bloquant", str(ctx.exception))
+        self.verdict(lot, sha, "codex1")
+        row = work.close(self.db, out["id"], delivered=True, sha=sha, actor="codex1")
+        self.assertEqual(row["state"], "closed")
+
+    def test_une_marque_posterieure_n_abaisse_pas_les_avis(self):
+        """R2 dev1 : la marque écrite à la création fait foi ; une note
+        ultérieure qui porte `required: 1` ne réduit pas l'exigence."""
+        sha = "2" * 40
+        lot, review = self.critical_review(sha)
+        forged = review_lot.requirement_mark(lot, required=1, merged_sha=sha,
+                                             author="claude1", author_family="claude")
+        work.note(self.db, lot, "%s %s" % (review_lot.ref_of(lot), forged), actor="codex1")
+        found = review_lot.requirement_of(self.db, work.get(self.db, review))
+        self.assertEqual(found["required"], 2, found)
+        self.verdict(lot, sha, "codex1")
+        with self.assertRaises(work.WorkError):
+            work.close(self.db, review, delivered=True, sha=sha, actor="codex1")
+
     def test_un_avis_suffit_pour_une_relecture_legere(self):
         sha = "d" * 40
         lot = self.merged_lot("docs", sha=sha)
