@@ -63,8 +63,8 @@ lot et son SHA, et il porte un trailer `ameesh-work: <lot>`.
 
 ## Contenu et contrôles
 
-- 51 fichiers, **+4336/−256** hors manifeste, sur `main 9a0b4f1ce` (après le
-  correctif CI ci-dessous).
+- 52 fichiers, **+4337/−256** hors manifeste, sur `main 9a0b4f1ce` (après les
+  correctifs CI ci-dessous).
 - Une migration additive : `0463_work_milestones_effective_merge.sql`
   (#2317, table interne, déclencheur, aucune rupture) — à appliquer en staging
   **avant** de relancer les exécuteurs (`deploy/mise-a-jour/`, §11 bis). #2443
@@ -82,7 +82,7 @@ lot et son SHA, et il porte un trailer `ameesh-work: <lot>`.
   `canon/2452-mecanique-train-reviews`), hors de `main` ameesh : elle reste
   hors paquet, fusion bureau.
 
-## Correctif CI (première suite complète)
+## Correctifs CI (suite complète)
 
 - **`work.corrections` (#2317)** : l'unité ajoute la lecture
   `WorkItems.corrections` (N2/N4) sans la classer dans
@@ -95,6 +95,13 @@ lot et son SHA, et il porte un trailer `ameesh-work: <lot>`.
   interface 462). Aucune opération admise ni schéma modifié : adaptation
   mécanique, sans avis nouveau (§2/§11 bis). `tests.test_l107_executor_contract`
   : 22 tests OK en local.
+- **`test_2457_garde_non_python` (#2457)** : l'unité ajoute le module à
+  `tests/parts/toujours.txt` sans l'ajouter à la liste attendue de
+  `tests.test_l161f_plan.MapTest.test_always_list_sorted_and_known` ; la suite
+  complète échoue sur les deux familles (psycopg 5/8 et psql 13/16). Correctif
+  de composition : le module rejoint la liste attendue, à sa place triée.
+  `tests.test_l161f_plan` : 160 tests OK (2 sautés) en local, dont le témoin
+  #2457.
 
 ## Écartés (ce véhicule)
 
