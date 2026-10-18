@@ -677,6 +677,29 @@ class FiabiliteTest(_Base):
         self.assertEqual([r for r in records if r["event"] in ("raised", "summary")], [])
         self.assertEqual(len(_desktop_log(self.desk)), 1)
 
+    def test_ancien_membre_sans_severity_marque_la_vraie_identite(self):
+        # #2395 B2 (relecture e828508e1) : une entrée active antérieure au lot
+        # n'avait pas de `severity` persistée ; le raccord la recalcule pour
+        # marquer la vraie identité, même sans passer par un relevé.
+        ncfg = self.ncfg(default_human="human:proprio")
+        alerte = _alert(agent="B", since=900.0, responsible="human:proprio")
+        state = notify.empty_state()
+        key = notify.key_of(alerte)
+        state["active"][key] = {
+            "alert": alerte, "key": key, "human": "human:proprio",
+            "source": "alerte", "status": "resumee", "raised_ts": 900.0,
+            "channels": {}}
+        state["summary"]["human:proprio"] = {
+            "raised": {"stopped_with_mail": 1}, "resolved": 0, "attempts": 0}
+        notifier = self.notifier(ncfg, state)
+        notifier._records = []
+        notifier._summaries(3000.0)
+        identite = notify.Notifier._notified_id(
+            {"key": key, "severity": alert_ack.severity(alerte), "alert": alerte},
+            "human:proprio")
+        self.assertIn(identite, notifier.state["notified"])
+        self.assertEqual(len(_desktop_log(self.desk)), 1)
+
     def test_ancien_resume_de_debit_est_rendu_une_fois(self):
         # état persisté avant #2395 : le compte par type reste rendu par le
         # résumé, puis le registre n'a plus de membre à retenir. Bucket d'un

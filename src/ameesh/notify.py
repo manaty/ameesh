@@ -1971,6 +1971,11 @@ class Notifier:
             if (entry.get("alert") or {}).get("type") != kind:
                 continue
             member = self._summary_member(entry, human)
+            if member.get("severity") is None:
+                # Entrée persistée avant le lot : sa sévérité n'était pas
+                # gardée ; on la recalcule comme le fera le prochain passage.
+                from . import alert_ack
+                member["severity"] = alert_ack.severity(entry.get("alert") or {})
             if self._summary_member_id(member) not in excluded:
                 candidates.append(member)
         candidates.sort(key=self._summary_member_id)
