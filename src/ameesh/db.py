@@ -88,6 +88,8 @@ _CONNECT_HINTS = (
 
 #: code SQLSTATE de PostgreSQL pour une violation d'unicité
 UNIQUE_VIOLATION = "23505"
+#: code SQLSTATE de PostgreSQL pour un interblocage détecté (#1496)
+DEADLOCK_DETECTED = "40P01"
 #: une ligne de sévérité psql en verbosité `verbose` : « ERROR:  23505: … ».
 #: Le libellé de sévérité est traduit par le client (`ERREUR` en français) :
 #: on ne le reconnaît pas à son nom, mais à la forme « <mot>: <code>: » — le
@@ -159,6 +161,13 @@ def is_unique_violation(exc: BaseException, constraint: str | None = None) -> bo
     if constraint is None:
         return True
     return exc.constraint == constraint
+
+
+def is_deadlock(exc: BaseException) -> bool:
+    """`exc` est-elle l'interblocage détecté par le serveur (#1496) ? La
+    transaction victime est annulée en entier ; seul le code SQLSTATE
+    tranche, jamais le texte (traduit selon `lc_messages`)."""
+    return isinstance(exc, DbError) and exc.sqlstate == DEADLOCK_DETECTED
 
 
 class Unavailable(DbError):
@@ -688,6 +697,13 @@ class _PsqlTransaction:
             if proc.stdout is not None:
                 proc.stdout.close()
         finally:
+            # ON_ERROR_STOP can exit before _close() observes the process;
+            # its already-dead child's input pipe still needs closing.
+            if proc.stdin is not None:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
             if self._err is not None:
                 self._err.close()
                 self._err = None
@@ -746,6 +762,14 @@ class _PsqlTransaction:
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
         self._run(bind(sql, params))
         return 0
+
+    def script(self, sql: str) -> None:
+        """Run raw multi-statement SQL on this transaction's backend.
+
+        Unlike execute(), scripts contain literal %s (SQL format strings),
+        and must not pass through parameter binding or open another session.
+        """
+        self._run(sql)
 
 
 class _PsqlListener:
@@ -951,7 +975,11 @@ class PsycopgDriver:
         self.conn = self._connect()
 
     def _connect(self):
-        kwargs: dict = dict(autocommit=True,
+        # #2339: additive migrations change SELECT * result shapes while old
+        # runners remain connected. Cached plans then fail with SQLSTATE
+        # 0A000 until restart. Keep parameter binding, without named plans.
+        # https://www.psycopg.org/psycopg3/docs/advanced/prepare.html
+        kwargs: dict = dict(autocommit=True, prepare_threshold=None,
                             connect_timeout=max(1, int(self.cfg.connect_timeout)),
                             row_factory=self._dict_row)
         try:
@@ -1193,6 +1221,13 @@ class PsycopgDriver:
                 conn.execute("LISTEN %s" % quote_ident(channel))
         except AttributeError as exc:  # psycopg trop ancien
             raise Unavailable("psycopg without LISTEN support: %s" % exc) from exc
+        except DbError:
+            raise
+        except Exception as exc:
+            # R2 auditeur P2-3 : une base qui refuse LISTEN (veille chaude,
+            # coupure entre connexion et LISTEN) doit rendre l'écouteur
+            # indisponible, pas tuer le fil du hub.
+            raise _map_error(exc) from exc
         return _PsycopgListener(conn, list(channels))
 
     def close(self) -> None:
@@ -1247,8 +1282,38 @@ class _PsycopgListener:
             pass
 
 
+#: champs structurés qui suivent le message principal d'un rapport
+#: PostgreSQL : DETAIL, HINT et CONTEXT recopient des valeurs de ligne
+#: (#2358). Un journal ne garde que le message principal et le SQLSTATE.
+_DIAGNOSTIC_FIELD_RE = re.compile(
+    r"^\s*(?:DETAIL|DÉTAIL|HINT|INDICE|CONTEXT|CONTEXTE|QUERY|REQUÊTE|"
+    r"STATEMENT|INSTRUCTION)\s*:",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def _primary(exc: BaseException) -> str:
+    """Le message principal d'une erreur de pilote, sans ses champs DETAIL,
+    HINT ni CONTEXT : psycopg les sépare dans `diag.message_primary`, sinon le
+    rapport est coupé avant son premier champ structuré (#2358)."""
+    diag = getattr(exc, "diag", None)
+    primary = getattr(diag, "message_primary", None) if diag is not None else None
+    if isinstance(primary, str) and primary.strip():
+        return primary
+    text = str(exc)
+    match = _DIAGNOSTIC_FIELD_RE.search(text)
+    return text[:match.start()] if match else text
+
+
 def _one_line(exc: BaseException) -> str:
-    return " ".join(str(exc).split())[:300]
+    return " ".join(_primary(exc).split())[:300]
+
+
+def brief(exc: BaseException, limit: int = 300) -> str:
+    """Diagnostic borné pour un journal : message principal et code SQLSTATE,
+    jamais les valeurs de ligne d'un DETAIL/HINT (#2358)."""
+    text = " ".join(_primary(exc).split())[:limit]
+    state = _sqlstate(exc) if isinstance(exc, Exception) else None
+    return "%s (SQLSTATE %s)" % (text, state) if state else text
 
 
 def _sqlstate(exc: Exception) -> str | None:

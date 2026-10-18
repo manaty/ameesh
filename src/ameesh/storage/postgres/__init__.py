@@ -11,6 +11,7 @@ from typing import Any
 from .. import interface
 from .action_source import ActionSource
 from .api_requests import ApiRequests
+from .alert_acknowledgements import AlertAcknowledgements
 from .accounts import Accounts
 from .actions import Actions
 from .budgets import Budgets
@@ -23,6 +24,7 @@ from .decisions import Decisions
 from .costs import TurnCosts
 from .conversations import Conversations
 from .credentials import Credentials
+from .events import Events
 from .grants import Grants
 from .host_lifecycle import HostLifecycle
 from .handoffs import Handoffs
@@ -32,8 +34,10 @@ from .menage import Housekeeping
 from .operations import Operations
 from .packages import WorkPackages
 from .placement import Placements
+from .prevalidation import PrevalidationReports
 from .progress import Progress
 from .projects import Projects
+from .provenance import Provenance
 from .roadmap import Roadmap
 from .registry import Agents, Leases, PendingSpend
 from .session_bindings import SessionBindings
@@ -60,7 +64,9 @@ class PostgresStorage(interface.Storage):
         self.credentials = Credentials(db)
         self.budgets = Budgets(db)
         self.api_requests = ApiRequests(db)
+        self.alert_acknowledgements = AlertAcknowledgements(db)
         self.watches = Watches(db)
+        self.events = Events(db)
         self.catalog = Catalog(db)
         self.mailbox = Mailbox(db)
         self.wakeups = Wakeups(db)
@@ -69,6 +75,7 @@ class PostgresStorage(interface.Storage):
         self.nonces = Nonces(db)
         self.work = WorkItems(db)
         self.work_dependencies = WorkDependencies(db)
+        self.provenance = Provenance(db)
         self.lot_sessions = LotSessions(db)
         self.packages = WorkPackages(db)
         self.actions = Actions(db)
@@ -92,4 +99,5 @@ class PostgresStorage(interface.Storage):
         self.housekeeping = Housekeeping(db)
         self.session_bindings = SessionBindings(db)
         self.ci = CiResults(db)
+        self.prevalidation = PrevalidationReports(db)
         self.conversations = Conversations(db)

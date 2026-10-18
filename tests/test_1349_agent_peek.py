@@ -234,4 +234,3 @@ class ExecutorTest(ServeurExecTest):
         self.assertEqual(stale.status, 200)
         self.assertFalse(stale.body["value"])
         self.assertEqual(self.db.query("SELECT lease_epoch FROM agent_peek")[0]["lease_epoch"], 42)
-

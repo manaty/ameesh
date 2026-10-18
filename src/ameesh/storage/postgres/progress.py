@@ -60,6 +60,59 @@ class Progress(interface.Progress):
             "  FROM work_item_events WHERE work_item_id IN (%s)"
             " ORDER BY id" % _marks(ids), tuple(ids))
 
+    def lot_transitions(self, item_ids) -> list[dict]:
+        ids = [int(i) for i in item_ids]
+        if not ids:
+            return []
+        # Seules les lignes où l'état change sortent : le texte des notes
+        # (des mégaoctets sur une liste de lots) n'est ni lu ni transféré.
+        return self.db.query(
+            "SELECT id, work_item_id, state, actor,"
+            "       extract(epoch from created_at)::float8 AS created_ts"
+            "  FROM (SELECT id, work_item_id, state, actor, created_at,"
+            "               lag(state) OVER (PARTITION BY work_item_id"
+            "                               ORDER BY id) AS prev"
+            "          FROM work_item_events WHERE work_item_id IN (%s)) marked"
+            " WHERE prev IS DISTINCT FROM state"
+            " ORDER BY id" % _marks(ids), tuple(ids))
+
+    def lot_event_last(self, item_ids) -> list[dict]:
+        ids = [int(i) for i in item_ids]
+        if not ids:
+            return []
+        return self.db.query(
+            "SELECT work_item_id,"
+            "       extract(epoch from max(created_at))::float8 AS last_ts"
+            "  FROM work_item_events WHERE work_item_id IN (%s)"
+            " GROUP BY work_item_id" % _marks(ids), tuple(ids))
+
+    def lot_hold_events(self, item_ids, patterns) -> list[dict]:
+        ids = [int(i) for i in item_ids]
+        if not ids:
+            return []
+        wanted = [str(pattern) for pattern in patterns]
+        if any(not pattern for pattern in wanted):
+            raise ValueError("empty hold pattern")
+        merged: dict[tuple[int, int], dict] = {}
+        for ev in self.lot_transitions(ids):
+            merged[(int(ev["work_item_id"]), int(ev["id"]))] = ev
+        if wanted:
+            # #1664 : seules les notes hold/levée sortent (motifs de
+            # planned_waits, ARE) : le texte des notes ordinaires (des
+            # mégaoctets sur une liste de lots) n'est ni lu ni transféré. La
+            # ligne à note l'emporte sur la transition de même id.
+            where = " OR ".join(["btrim(note, %s) ~* %s"] * len(wanted))
+            for ev in self.db.query(
+                    "SELECT id, work_item_id, state, note, actor,"
+                    "       extract(epoch from created_at)::float8 AS created_ts"
+                    "  FROM work_item_events"
+                    " WHERE work_item_id IN (%s) AND note IS NOT NULL AND (%s)"
+                    " ORDER BY id" % (_marks(ids), where),
+                    tuple(ids) + tuple(value for pattern in wanted
+                                       for value in (interface.HOLD_NOTE_WHITESPACE, pattern))):
+                merged[(int(ev["work_item_id"]), int(ev["id"]))] = ev
+        return sorted(merged.values(), key=lambda e: int(e["id"]))
+
     def lot_milestones(self, item_ids) -> list[dict]:
         ids = [int(i) for i in item_ids]
         if not ids:
@@ -125,6 +178,9 @@ class Progress(interface.Progress):
             SELECT r.name, r.workstream, r.workstream AS chantier,
                    r.team, r.harness, r.host, r.model, r.provider,
                    r.credential_mode, r.status, r.status_text, r.current_prompt,
+                   r.operator_paused, r.operator_pause_reason, r.operator_pause_by,
+                   r.operator_pause_for,
+                   extract(epoch from r.operator_pause_at)::float8 AS operator_pause_ts,
                    (r.pending_prompt IS NOT NULL) AS has_pending_prompt,
                    r.turns, r.lease_owner, r.mode, r.stop_reason, r.responsible,
                    (r.lease_owner IS NOT NULL AND r.lease_expires_at > now()) AS lease_live,
@@ -135,14 +191,24 @@ class Progress(interface.Progress):
                    p.turn  AS turn_label,
                    p.model AS turn_model,
                    (SELECT count(*) FROM agent_mailbox m
-                     WHERE m.recipient = r.name AND m.delivered_at IS NULL)::bigint AS unread
+                     WHERE m.recipient = r.name AND m.delivered_at IS NULL)::bigint AS unread,
+                   -- §4 (owner 14/10/2026) : l'en-cours de l'agent, tous
+                   -- projets confondus (le plafond est global)
+                   (SELECT count(*) FROM work_items w
+                     WHERE w.assignee = r.name AND w.state = 'build')::int AS builds
               FROM agent_registry r
               LEFT JOIN spend_pending p ON p.agent = r.name
         """
         params: tuple = ()
         if project:
-            sql += " WHERE r.workstream = %s OR r.team = %s"
-            params = (project, project)
+            # L243 : l'agent appartient à tous ses projets — `projects` déclaré
+            # (0388), sinon son équipe, sinon son `workstream`
+            sql += (" WHERE %s = any(coalesce(r.projects,"
+                    " case when coalesce(btrim(r.team), '') <> '' then array[btrim(r.team)]"
+                    "      when coalesce(btrim(r.workstream), '') <> ''"
+                    "           then array[btrim(r.workstream)]"
+                    "      else array[]::text[] end))")
+            params = (project,)
         sql += " ORDER BY r.name"
         return self.db.query(sql, params)
 
@@ -181,3 +247,34 @@ class Progress(interface.Progress):
              ORDER BY agent, harness, 3
             """ % (win, win, win, win, win, win, " AND ".join(clauses)),
             tuple([float(since_ts)] * 6 + params))
+
+    def ci_suite(self, *, since_ts, limit) -> list[dict]:
+        # #1476 : seuls les contextes qui GARANTISSENT la suite complète
+        # comptent — poussée ou PR `release/**`|`integration/**` (source ou
+        # cible) et exécution manuelle (`workflow_dispatch`, toujours
+        # complète). Une poussée sur `main` est écartée : une plage poussée
+        # entièrement documentaire y prend la voie rapide L161a (make_plan
+        # laisse les deux matrices vides) et `ci_runs` ne garde ni le mode du
+        # plan ni les jobs, donc la compter tirerait la médiane vers le bas.
+        # Une exécution annulée ou remplacée n'a pas de durée de suite. La
+        # borne est PAR DÉPÔT : un dépôt très actif ne chasse pas les autres
+        # de la lecture (row_number, pas un LIMIT global).
+        return self.db.query(
+            """
+            SELECT repo, run_id, branch, base, event, duration_s, concluded_ts FROM (
+                SELECT repo, run_id, branch, base, event,
+                       extract(epoch from (concluded_at - first_seen_at))::float8
+                           AS duration_s,
+                       extract(epoch from concluded_at)::float8 AS concluded_ts,
+                       row_number() OVER (PARTITION BY repo
+                                          ORDER BY concluded_at DESC, run_id DESC) AS rn
+                  FROM ci_runs
+                 WHERE status IN ('success', 'failure') AND concluded_at IS NOT NULL
+                   AND concluded_at >= to_timestamp(%s)
+                   AND (branch LIKE 'release/%%' OR branch LIKE 'integration/%%'
+                        OR base LIKE 'release/%%' OR base LIKE 'integration/%%'
+                        OR event = 'workflow_dispatch')
+            ) t
+             WHERE rn <= %s
+             ORDER BY concluded_ts DESC, run_id DESC
+            """, (float(since_ts), int(limit)))

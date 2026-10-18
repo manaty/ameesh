@@ -78,6 +78,62 @@
    ]
   },
   {
+   "name": "agents.runner_seen",
+   "write": true,
+   "transport": "op",
+   "scope": [
+    "H"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forced": {
+    "host": "executor_host"
+   },
+   "params": [
+    {
+     "name": "host",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "owner",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "names",
+     "kind": "positional",
+     "schema": {
+      "type": [
+       "array",
+       "null"
+      ],
+      "items": {
+       "type": "string"
+      }
+     },
+     "required": true
+    }
+   ],
+   "result": {
+    "type": "null"
+   },
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": false
+   },
+   "rules": [
+    "Hôte forcé, names limité aux agents admis, owner préfixé exec:<id>: ; sans test de disponibilité."
+   ]
+  },
+  {
    "name": "agents.get",
    "write": false,
    "transport": "op",
@@ -3080,6 +3136,7 @@
    },
    "rules": [
     "author = agent:<agent de l'enveloppe> (membre du fil, `fil.member`) ; le nom nu est aussi admis",
+    "count faux (L361c) : trace de la boîte et `location` seulement — ni `entries` ni `last_*`, que le census de `threads.recount` écrit seul",
     "session : l'enveloppe porte l'agent et l'epoch du jeton"
    ],
    "session": true
@@ -3152,6 +3209,33 @@
       "type": [
        "object",
        "null"
+      ],
+      "properties": {
+       "entry_id": {
+        "type": "string"
+       },
+       "author": {
+        "type": "string"
+       },
+       "excerpt": {
+        "type": "string"
+       },
+       "ts": {
+        "type": "number"
+       },
+       "mailbox_id": {
+        "type": [
+         "integer",
+         "null"
+        ]
+       }
+      },
+      "required": [
+       "entry_id",
+       "author",
+       "excerpt",
+       "ts",
+       "mailbox_id"
       ]
      },
      "required": true
@@ -3174,8 +3258,8 @@
     "natural": true
    },
    "rules": [
-    "L361b : verrou de la ligne, recomptage et expiration de l'index en une seule transaction ; le fichier a déjà été réécrit par l'appelant, sous son propre verrou",
-    "le census de l'hôte (`kept`, `last`, `end`) fait foi : un `counted_until` au-delà de `end` (recomptage plus récent) n'est pas repris",
+    "L361b/L361c : verrou de la ligne, census du fichier et écriture de l'index en une seule transaction — expiration (fichier réécrit) comme indexation (entrée écrite, #877) ; le fichier a déjà été écrit par l'appelant, sous son propre verrou",
+    "le census de l'hôte (`kept`, `last`, `end`) fait foi : un `counted_until` au-delà de `end` (recomptage plus récent) n'est pas repris ; à `end` égal, un census qui rallonge la ligne (`kept > entries`) a été lu avant une expiration de même fin et n'est pas repris (L361c)",
     "portée H : l'hôte est celui de l'exécuteur ; l'opération ne touche pas aux autres hôtes"
    ],
    "session": true
@@ -3697,6 +3781,15 @@
       "type": "string"
      },
      "required": true
+    },
+    {
+     "name": "once",
+     "kind": "keyword",
+     "schema": {
+      "type": "boolean"
+     },
+     "required": false,
+     "default": false
     }
    ],
    "result": {
@@ -3988,12 +4081,12 @@
   }
  ],
  "refused": {
-  "interface_total": 407,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
    "actions": "hors du sous-ensemble de l'exécuteur médié",
    "agents": "hors du sous-ensemble de l'exécuteur médié",
+   "alert_acknowledgements": "human alert acknowledgement (L87c): native operator only",
    "api_requests": "API idempotency (L87): ameesh serve only",
    "approvals": "autorité : jamais d'approbation depuis l'appareil (0012)",
    "authenticators": "autorité (0012)",
@@ -4004,6 +4097,7 @@
    "credentials": "provider credential health: mesh server only",
    "decisions": "owner decision requests (L124): mesh server only",
    "ephemerals": "pas de création d'agent depuis l'appareil",
+   "events": "event log (L85): mesh server only, the API streams it",
    "grants": "autorité (0012)",
    "hosts": "hors du sous-ensemble de l'exécuteur médié",
    "housekeeping": "ménage de l'hôte (L73) : serveur seulement, l'appareil efface son dossier en fin de bail",
@@ -4014,6 +4108,7 @@
    "operations": "hors du sous-ensemble de l'exécuteur médié",
    "packages": "canon et paquets : serveur seulement",
    "placements": "placement : serveur seulement",
+   "prevalidation": "hors du sous-ensemble de l'exécuteur médié",
    "progress": "vue des humains (/api/v1)",
    "projects": "vue des humains (/api/v1)",
    "roadmap": "feuille de route (L96) : serveur seulement",
@@ -4033,10 +4128,14 @@
    "accounts": [
     "hold",
     "holds",
+    "identities",
     "init_active",
+    "placement_state",
+    "publish_identity",
     "release",
     "set_auto",
     "switch",
+    "switch_guarded",
     "switches"
    ],
    "action_source": [
@@ -4065,7 +4164,14 @@
     "set_mode",
     "upsert_unleased",
     "wake_check",
-    "note_unleased"
+    "note_unleased",
+    "operator_pause"
+   ],
+   "alert_acknowledgements": [
+    "acknowledge",
+    "clock",
+    "invalidate",
+    "live"
    ],
    "api_requests": [
     "complete",
@@ -4099,6 +4205,7 @@
     "put"
    ],
    "canon": [
+    "claim_commit",
     "clear_pending_stop",
     "clear_responsible",
     "close_others",
@@ -4139,7 +4246,6 @@
     "failures",
     "finish_guard_scan",
     "for_lot",
-    "guard_runs",
     "head_replaced",
     "latest_concluded",
     "mark_started",
@@ -4149,8 +4255,8 @@
     "observe_runners",
     "open_run",
     "prune_guard_runs",
-    "queued",
     "queued_oldest",
+    "reopen_run",
     "run",
     "running",
     "running_on",
@@ -4181,6 +4287,14 @@
     "creator",
     "exists"
    ],
+   "events": [
+    "after",
+    "bounds",
+    "count_before",
+    "prune",
+    "readable",
+    "record"
+   ],
    "grants": [
     "candidates",
     "get",
@@ -4200,6 +4314,7 @@
     "lend_basis",
     "record_harness_version",
     "release",
+    "runners",
     "since",
     "usage"
    ],
@@ -4222,6 +4337,7 @@
     "revoke"
    ],
    "leases": [
+    "adopt_session_origin",
     "attach_claim",
     "hold_note",
     "release_hold",
@@ -4238,6 +4354,7 @@
     "pending_recipients_sorted",
     "unread_active",
     "unread_counts",
+    "unread_mid_turn",
     "unread_total",
     "withdraw"
    ],
@@ -4248,7 +4365,9 @@
    "operations": [
     "adopt",
     "assigners",
+    "build_lots_activity",
     "gauge_history",
+    "gauge_latest",
     "latest_gauges",
     "listing",
     "open_lots_activity",
@@ -4257,21 +4376,30 @@
     "record_balance",
     "request_restart",
     "resume",
+    "set_dormant",
     "set_settings",
+    "state_lots_activity",
     "turns"
    ],
    "packages": [
     "all",
     "get",
+    "lock_sync",
     "retire",
     "upsert"
    ],
    "placements": [
     "recorded"
    ],
+   "prevalidation": [
+    "latest",
+    "record",
+    "report"
+   ],
    "progress": [
     "actions",
     "agents",
+    "ci_suite",
     "costs",
     "lot_actions",
     "lot_events",
@@ -4309,12 +4437,15 @@
    ],
    "turn_costs": [
     "correct",
+    "first_after",
+    "last_before",
     "ledger",
     "paid_lines",
     "spent_between",
     "unpriced"
    ],
    "turn_resources": [
+    "attach_cgroup",
     "begin_grace",
     "churn",
     "get",
@@ -4341,19 +4472,24 @@
     "add",
     "add_milestone",
     "assign",
+    "assign_capped",
     "assignment_events",
+    "attach_implicit_branch",
     "auto_takes_since",
     "backlog",
     "backlog_add",
     "by_issue_ref",
     "by_package",
+    "claim_review_proposal",
     "close",
     "close_merged",
+    "count_builds",
     "creator",
     "current_delegation",
     "delays",
     "delegate",
     "designate_reviewer",
+    "detach_branch",
     "due_delegations",
     "estimate_history",
     "estimates",
@@ -4363,14 +4499,22 @@
     "handoff_lots",
     "issue_feed",
     "items",
+    "items_missing_ref",
     "land_lock",
     "land_unlock",
+    "train_read",
+    "train_save",
+    "train_fire_read",
+    "train_fire_give",
+    "train_fire_change",
     "link_package",
     "lock_deep_analysis",
+    "log_review_attempt",
     "mark_started",
     "measure",
     "measure_candidates",
     "migration_holder",
+    "migration_landed_holder",
     "milestones",
     "open_by_ref",
     "open_for",
@@ -4382,13 +4526,18 @@
     "queue_remove",
     "queue_update",
     "recent_or_cited",
+    "record_landed_migration",
     "record_resolution",
+    "rectify_close",
     "reference",
     "refresh_package_parents",
+    "release_agent",
     "reserve_migration",
     "resolutions",
     "resolve_delegation",
     "returned_delegations",
+    "review_catch_up_bound",
+    "review_proposals",
     "save_measure",
     "set_app",
     "set_branch",
@@ -4398,8 +4547,11 @@
     "set_partial_seen",
     "timeline",
     "turn_spans",
+    "unassign",
+    "unassign_surplus",
     "unassigned_lots",
     "waiting_episodes",
+    "wip_exceptions",
     "without_project"
    ],
    "watches": [

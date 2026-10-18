@@ -16,7 +16,7 @@ import time
 import unittest
 
 from ameesh import (exploitation, mail, notify, progress, projects, registry, roadmap,
-                    roadmap_dev, roadmap_propose, storage, work)
+                    roadmap_dev, roadmap_propose, storage, work, work_dependencies)
 
 from .support import PgTestCase, hold_for_owner
 
@@ -327,6 +327,8 @@ class RoadmapPgTest(PgTestCase):
 
     def test_engagements_cli(self):
         lot = self._lot(assignee=None)
+        storage.of(self.db).packages.upsert({"id": "L95", "kind": "lot", "title": "Prerequisite",
+                                            "canon_ref": "test:plan/L95"})
         out = self.mesh("plan", "add", "Comptes séparés par organisation", "--pour",
                         "2026-10-12", "--lot", str(lot["id"]), "--source",
                         "conversation 2026-10-10", "--depend-de", "L95")
@@ -505,6 +507,91 @@ class RoadmapPgTest(PgTestCase):
         self.assertFalse([a for a in exploitation.alerts(self.cfg, self.db,
                                                          now=ts("2026-10-14"))
                           if a["type"] == "engagement_overdue"])
+
+    def test_items_carry_the_designated_reviewers(self):
+        # #2204/N5 : la frise lit les relecteurs comme progress/list, pour que
+        # lot_state ne diverge pas entre les deux projections.
+        lot = self._lot()
+        work.move(self.db, lot["id"], "build")
+        work.move(self.db, lot["id"], "qa")
+        self.db.execute("UPDATE work_items SET reviewer = 'first' WHERE id = %s",
+                        (lot["id"],))
+        rows = storage.of(self.db).roadmap.items(
+            since_ts=0, limit=50, done_states=[], project="ameesh")
+        row = next(r for r in rows if int(r["id"]) == lot["id"])
+        self.assertEqual(row["reviewer"], "first")
+        self.assertEqual(row["reviewers"], ["first"])
+
+    def test_engagement_overdue_ignore_dates_calculees_et_lots_en_attente(self):
+        """#2342 : une date p80 est re-datée à la passe suivante, pas alertée ;
+        un lot en attente (bloqué, relu, dépendance) ne l'est pas non plus."""
+        st = storage.of(self.db)
+        scheduled = self._lot("Date calculée par le planificateur")
+        work.move(self.db, scheduled["id"], "build")
+        st.roadmap.plan_item(scheduled["id"], {"start": "2026-10-11", "end": "2026-10-12"},
+                             source="reference p80 (table #6)", actor="auditeur")
+
+        manual = self._lot("Date posée par une personne")
+        work.move(self.db, manual["id"], "build")
+        roadmap.plan(self.db, manual["id"], start="2026-10-11", end="2026-10-12",
+                     source="set by human:o", actor="human:o")
+
+        blocked = self._lot("Lot bloqué")
+        work.move(self.db, blocked["id"], "blocked", actor="human:o")
+        roadmap.plan(self.db, blocked["id"], delivery="2026-10-12",
+                     source="set by human:o", actor="human:o")
+
+        review = self._lot("Lot en relecture")
+        work.move(self.db, review["id"], "build", actor="human:o")
+        work.move(self.db, review["id"], "qa", actor="human:o")
+        roadmap.plan(self.db, review["id"], delivery="2026-10-12",
+                     source="set by human:o", actor="human:o")
+
+        held = self._lot("Lot retenu par une dépendance")
+        work.move(self.db, held["id"], "build", actor="human:o")
+        blocker = self._lot("Bloqueur")
+        work.move(self.db, blocker["id"], "build", actor="human:o")
+        work_dependencies.add(self.db, held["id"], blocker["id"], actor="human:o")
+        roadmap.plan(self.db, held["id"], delivery="2026-10-12",
+                     source="set by human:o", actor="human:o")
+
+        alerts = [a for a in exploitation.alerts(self.cfg, self.db, now=ts("2026-10-14"))
+                  if a["type"] == "engagement_overdue"]
+        self.assertEqual([(a["reason"], a["lot"]) for a in alerts],
+                         [("date_prevue", manual["id"])])
+
+    def test_livraison_manuelle_sur_dates_p80_reste_alertee(self):
+        lot = self._lot("Livraison manuelle après planification p80")
+        work.move(self.db, lot["id"], "build")
+        storage.of(self.db).roadmap.plan_item(
+            lot["id"], {"start": "2026-10-11", "end": "2026-10-12"},
+            source="reference p80 (table #6)", actor="auditeur")
+        # Le planificateur ne touche pas à delivery ; poser seulement cette
+        # date à la main conserve donc la source p80 de start/end.
+        planned = roadmap.plan(self.db, lot["id"], delivery="2026-10-12",
+                               actor="human:o")
+        self.assertEqual(planned["plan"]["planned_source"], "reference p80 (table #6)")
+        rows = [r for r in roadmap.overdue(self.db, now=ts("2026-10-14"))
+                if r["lot"] == lot["id"]]
+        self.assertEqual([(r["reason"], r["due"]) for r in rows],
+                         [("date_prevue", "2026-10-12")])
+
+    def test_engagement_overdue_une_alerte_par_lot(self):
+        """#2342 : deux dates puis un engagement ne font qu'une alerte par lot."""
+        lot = self._lot("Deux dates et une promesse")
+        work.move(self.db, lot["id"], "build")
+        roadmap.plan(self.db, lot["id"], start="2026-10-11", end="2026-10-12",
+                     delivery="2026-10-12", source="set by human:o", actor="human:o")
+        rows = [r for r in roadmap.overdue(self.db, now=ts("2026-10-14"))
+                if r["lot"] == lot["id"]]
+        self.assertEqual([(r["reason"], r["due"]) for r in rows],
+                         [("date_prevue", "2026-10-12")])
+        roadmap.add_commitment(self.db, "Livraison promise", due="2026-10-12",
+                               lot=lot["id"], owner="w1", source_ref="conversation", now=NOW)
+        rows = [r for r in roadmap.overdue(self.db, now=ts("2026-10-14"))
+                if r["lot"] == lot["id"]]
+        self.assertEqual([(r["reason"], r["commitment"]) for r in rows],
+                         [("engagement", 1)])
 
     def test_qui_avance_sur_quoi(self):
         registry.upsert(self.db, "w1", chantier="ameesh", harness="claude", host=self.cfg.host)

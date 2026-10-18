@@ -6,6 +6,8 @@ hook lui remettait le courrier pendant le tour, qui ne finissait jamais, et la
 rotation sur la taille (L26/L60) n'agissait qu'entre deux tours. Désormais :
 plafond de contexte et durée maximale ferment le tour au prochain point sûr,
 le hook borne le courrier d'un tour, et la rotation a son passage.
+#2336 : le plafond de contexte mesure le contexte du dernier appel — la
+taille de la session —, pas la somme des relectures du tour.
 Postgres réel ; faux harnais `claude` du banc.
 """
 from __future__ import annotations
@@ -38,6 +40,19 @@ class LectureDuFluxTest(unittest.TestCase):
         # un message utilisateur sans résultat d'outil n'est pas un point sûr
         self.assertNotIn("safe_point", lecteur.parse(json.dumps(
             {"type": "user", "message": {"content": "texte"}})))
+
+    def test_context_tokens_mesure_le_contexte_d_un_appel(self):
+        """#2336 : le plafond lit le contexte d'un appel — entrée + cache lu +
+        cache écrit —, pas la relecture cumulée du tour."""
+        self.assertEqual(adapters.context_tokens(
+            "claude", {"input_tokens": 3, "cache_read_input_tokens": 7,
+                       "cache_creation_input_tokens": 90}), 100)
+        self.assertEqual(adapters.context_tokens(
+            "deepseek", {"inputTokens": 2, "cacheReadTokens": 5}), 7)
+        # Codex compte déjà le cache dans l'entrée
+        self.assertEqual(adapters.context_tokens(
+            "codex", {"input_tokens": 9, "cached_input_tokens": 6}), 9)
+        self.assertEqual(adapters.context_tokens("claude", None), 0)
 
     def test_codex_et_dsh_points_surs(self):
         codex = adapters.CodexStream()
@@ -159,6 +174,42 @@ class PlafondDeContexteTest(_Base):
         self.assertIsNone(worker.suite)
 
 
+class PlafondParAppelTest(_Base):
+    """#2336 : le plafond de contexte mesure le contexte d'UN appel (la taille
+    de la session), pas la somme des relectures du tour. Un tour de dix appels
+    à 50 k dans une petite session ne dépasse pas un plafond de 400 k, même si
+    sa somme vaut 500 k ; un seul appel au-dessus du plafond clôt le tour."""
+
+    DIX_APPELS = [{"reread": 50_000, "tool": True} for _ in range(10)]
+
+    def test_dix_appels_de_50k_ne_closent_pas_le_tour(self):
+        _runner, worker = self._worker("orch-appel", context_max_tokens=400_000)
+        with self._env(self.DIX_APPELS):
+            self.assertTrue(worker.run_turn({"kind": "prompt", "prompt": "travail",
+                                             "ids": []}))
+        self.assertIsNone(worker.last_turn_closed)
+        self.assertIsNone(worker.rotation_forcee)
+        # la somme du tour (500 k) dépasse le plafond, le contexte (50 k) non
+        self.assertEqual(worker.last_turn_main_reread, 500_000)
+        self.assertEqual(worker.last_turn_context_reread(),
+                         (50_000, "claude-sess-1"))
+        self.assertFalse(worker.context_rotation_due())
+
+    def test_un_appel_au_dessus_du_plafond_clot_le_tour(self):
+        appels = ([{"reread": 50_000, "tool": True}] * 9
+                  + [{"reread": 400_000, "tool": True},          # le contexte dépasse
+                     {"reread": 10, "tool": True, "sleep": 3}])  # jamais exécuté
+        _runner, worker = self._worker("orch-appel-cap", context_max_tokens=400_000)
+        with self._env(appels):
+            self.assertTrue(worker.run_turn({"kind": "prompt", "prompt": "travail",
+                                             "ids": []}))
+        self.assertTrue(worker.last_turn_closed.startswith("context cap"))
+        self.assertTrue(worker.rotation_forcee)
+        flux = self._evenements(worker)
+        self.assertIn('"tool_use_id": "outil-9"', flux)   # l'appel en cours a fini
+        self.assertNotIn('"tool_use_id": "outil-10"', flux)  # le suivant, jamais
+
+
 class DureeMaximaleTest(_Base):
     def test_tour_clos_a_la_duree_maximale_suite_dans_la_meme_session(self):
         _runner, worker = self._worker("orch-duree", turn_max_seconds=1)
@@ -268,6 +319,44 @@ class CourrierBorneTest(_Base):
         sortie = self._hook(worker, "tour-1", borne=0)
         self.assertIn("message n°6", sortie)
         self.assertEqual(self._livres(ids), 7)
+
+    def test_l_instant_du_dernier_message_humain_remis_est_date(self):
+        """L81 §6.3 (#289) : le message humain remis par le hook pendant un
+        tour n'est plus non-lu quand l'exécuteur décide de l'entretien
+        résident — l'instant de sa remise est gardé dans l'état du tour."""
+        _runner, worker = self._worker("orch-humain")
+        mail.send(self.db, "pair", "orch-humain", "message d'agent")
+        self.assertFalse(cli.tour_lu(worker.cfg, worker.name).get("humain"))
+        self._hook(worker, "tour-1")
+        etat = cli.tour_lu(worker.cfg, worker.name)
+        self.assertEqual(etat.get("remis"), 1)
+        self.assertFalse(etat.get("humain"))       # un agent ne tient pas la fenêtre
+        # un humain, marqué à l'envoi : sa remise est datée
+        mail.send(self.db, "proprio", "orch-humain", "fais le point",
+                  payload={"human": True})
+        avant = time.time()
+        self._hook(worker, "tour-1")
+        etat = cli.tour_lu(worker.cfg, worker.name)
+        self.assertEqual(etat.get("remis"), 2)
+        self.assertGreaterEqual(float(etat.get("humain") or 0), avant)
+        self.assertLessEqual(float(etat.get("humain") or 0), time.time())
+
+
+    def test_l_instant_humain_survit_aux_hooks_suivants_meme_sans_borne(self):
+        for borne in (5, 0):
+            with self.subTest(borne=borne):
+                _runner, worker = self._worker("orch-humain-suite-%d" % borne)
+                mail.send(self.db, "proprio", worker.name, "fais le point",
+                          payload={"human": True})
+                self._hook(worker, "tour-1", borne=borne)
+                instant = cli.tour_lu(worker.cfg, worker.name).get("humain")
+                self.assertTrue(instant)
+                mail.send(self.db, "pair", worker.name, "suite d'agent")
+                self._hook(worker, "tour-1", borne=borne)
+                self.assertEqual(cli.tour_lu(worker.cfg, worker.name).get("humain"),
+                                 instant)
+                worker._humain_observe()
+                self.assertTrue(worker._humain_recent())
 
 
 class ReglagesTest(_Base):

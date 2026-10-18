@@ -98,12 +98,13 @@ policy:
   max_agents: 2
   resources:                            # optional pressure limits (v1.3.0)
     min_mem_available: 1GiB
-    max_swap_used: 8GiB
+    max_swap_used: 8GiB                 # a stock: counts only under memory pressure (#2296)
     max_load: 24
     min_disk_free: 2GiB
     min_battery_percent: 25             # on battery: no new turn below (laptop host)
     stop_battery_percent: 10            # on battery: clean stop below
     max_cpu_pressure: 20%               # CPU pressure (PSI some, 60 s): no new turn above
+    max_mem_pressure: 10%               # memory pressure (PSI some, 60 s); default 10 % (#2296)
   work_roots: {example-web: /srv/example-org/example-web}   # working directory per team (v1.3.0)
   work_root: /srv                               # default: work_root/<team>
   work_dirs: {ouvrier: /srv/example-org/ouvrier}       # per agent, wins over the above (v1.3.1)

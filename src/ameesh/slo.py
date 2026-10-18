@@ -35,6 +35,13 @@ SOURCE = "canon §9 (processus/lots.md, home#40, 2026-10-13)"
 #: la source d'une étape : les événements du lot, ou un signal externe
 LOT_EVENTS = "lot_events"
 EXTERNAL = "external"
+#: #2217 : une prise en charge (assignation, réassignation, prise `--claim`)
+#: ouvre une grâce de ce délai. Un dépassement déjà couru avant la prise n'est
+#: pas imputé au nouveau porteur : son escalade est suspendue le temps qu'il
+#: prenne la main, sinon une réassignation pour porteur indisponible déclenche
+#: aussitôt une nouvelle demande de réassignation, en boucle. Le retard reste
+#: mesuré (`elapsed_s`), seule l'escalade est suspendue.
+HANDOVER_GRACE_S = 30 * 60.0
 
 
 class Step(NamedTuple):
@@ -142,19 +149,67 @@ def assigned_ts(item: dict, events: Iterable[dict]) -> float | None:
 
     L'attribution gardée (`assigned to X (before: nobody)`) est un événement ;
     un lot créé déjà assigné (`work add --assignee`, `--new-lot` d'un
-    orchestrateur) l'est dès sa création, sans événement."""
+    orchestrateur) l'est dès sa création, sans événement. #2217 : une prise
+    automatique de la file (`backlog.AUTO_TAKE_NOTE`) ou de l'équipe
+    (`backlog.LOT_TAKE_NOTE`) est aussi une première attribution — elle ne
+    s'applique qu'à un lot sans preneur. Sans elle, un lot pris par la file
+    restait « jamais assigné » : `signal_assigned` courait depuis sa création
+    et l'alerte demandait de le réassigner juste après sa prise (#660)."""
+    from . import backlog
+
     first = None
     for ev in events:
         note = ev.get("note") or ""
-        if note.startswith("assigned to ") and "(before: nobody)" in note:
-            at = ev.get("created_ts")
-            if at is not None and (first is None or float(at) < first):
-                first = float(at)
+        if note.startswith("assigned to "):
+            if "(before: nobody)" not in note:
+                continue
+        elif not note.startswith((backlog.LOT_TAKE_NOTE, backlog.AUTO_TAKE_NOTE)):
+            continue
+        at = ev.get("created_ts")
+        if at is not None and (first is None or float(at) < first):
+            first = float(at)
     if first is not None:
         return first
     if item.get("assignee"):
         return float(item["created_ts"]) if item.get("created_ts") is not None else None
     return None
+
+
+def handover_prefixes() -> tuple:
+    """Les débuts de note qui confient le lot à un porteur (#2217).
+
+    Une seule source pour les attributions : `handoff.assign_prefixes`
+    (assignation, prise automatique de la file ou de l'équipe, reprise d'un
+    lot en pause budget), moins le rendu à la file (`RETURN_NOTE` : le lot
+    n'a plus de porteur, il n'y a pas de prise à dater) ; la délégation
+    (`delegated to …`) transfère aussi le porteur."""
+    from . import handoff
+
+    return tuple(p for p in handoff.assign_prefixes()
+                 if p != handoff.RETURN_NOTE) + ("delegated to ",)
+
+
+def handover_ts(item: dict, events: Iterable[dict]) -> float | None:
+    """L'instant de la dernière prise en charge du lot (#2217).
+
+    Toutes les notes d'attribution comptent (`handover_prefixes`) :
+    `work assign`/`--claim`, prise automatique de la file ou de l'équipe,
+    reprise après une pause budget, délégation. `None` quand le lot n'a pas
+    de porteur courant (rendu à la file) ou quand le journal n'en porte
+    aucune (lot créé déjà assigné par `work add --assignee`) : il n'y a alors
+    pas de prise à dater, donc pas de grâce à ouvrir."""
+    if not str(item.get("assignee") or "").strip():
+        return None
+    prefixes = handover_prefixes()
+    last = None
+    for ev in events:
+        note = ev.get("note") or ""
+        if not note.startswith(prefixes):
+            continue
+        at = ev.get("created_ts")
+        if at is not None and (last is None or float(at) > last):
+            last = float(at)
+    return last
 
 
 def last_event_ts(item: dict, events: Iterable[dict]) -> float | None:
@@ -192,7 +247,7 @@ def _row(step: Step, start, *, now: float, critical: bool, done_ts=None, **extra
 
 
 def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
-              now: float | None = None) -> list:
+              now: float | None = None, packet_slot: float | None = None) -> list:
     """Les étapes mesurables d'un lot, une ligne par étape applicable.
 
     `jalons` vient de `progress._work_item_milestones` — le SEUL lecteur des
@@ -200,6 +255,20 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     étape terminée est rendue avec `done_ts` et `level` 0 ; une étape en cours
     court jusqu'à `now`. Une étape non mesurable n'est pas inventée : elle est
     absente (la table la déclare, `STEPS`).
+
+    #2335/A2 : `packet_slot` (premier créneau de paquet après le GO) décale le
+    départ de `verdict_merge` en cours de route. Le canon §11 bis ne permet pas
+    de fusionner un lot hors paquet : les 30 premières minutes après le GO ne
+    sont pas un retard. La ligne porte `packet_slot` pour que l'alerte dise
+    d'où part la mesure ; une fusion déjà faite garde sa durée réelle.
+
+    #2217 : quand le lot vient d'être pris en charge (dernière ligne
+    `assigned to … (before: …)` il y a moins de `HANDOVER_GRACE_S`), les
+    dépassements déjà courus ne sont pas imputés au nouveau porteur : leur
+    escalade est suspendue (`level` 0, `targets` vides, `overdue_s` 0) et la
+    ligne porte `handover_grace_s` (secondes restantes). La mesure reste
+    visible (`elapsed_s`, `target_s`) ; après la grâce, l'escalade reprend au
+    niveau que le retard justifie.
     """
     events = list(events)
     now = time.time() if now is None else float(now)
@@ -226,8 +295,11 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
             out.append(_row(step, ready, now=now, critical=critical,
                             done_ts=round(started, 3),
                             elapsed_s=int(max(0.0, started - float(ready)))))
-        else:
-            # pas encore démarré : le délai court depuis que le lot est prêt
+        elif state == "intake":
+            # prêt, pas encore démarré : le délai court depuis que le lot est
+            # prêt. Passé intake sans événement `build` (#1982), la phase est
+            # franchie mais non mesurable : aucune ligne, donc aucun retard
+            # inventé — seules l'origine réelle et les durées mesurées restent.
             out.append(_row(step, ready, now=now, critical=critical))
 
     if state == "build":
@@ -245,7 +317,30 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                             done_ts=round(float(merged), 3),
                             elapsed_s=int(max(0.0, float(merged) - float(verdict)))))
         elif state not in ("merged", "promoted", "closed"):
-            out.append(_row(step, verdict, now=now, critical=critical))
+            start = float(verdict)
+            extra = {}
+            if packet_slot is not None and float(packet_slot) > start:
+                # #2335/A2 : la fusion ne peut entrer qu'au prochain paquet ;
+                # l'horloge GO → fusion part de ce créneau, pas du GO.
+                start = float(packet_slot)
+                extra["packet_slot"] = round(start, 3)
+            out.append(_row(step, start, now=now, critical=critical, **extra))
+
+    handover = handover_ts(item, events)
+    if handover is not None and state not in ("merged", "promoted", "closed"):
+        remaining = HANDOVER_GRACE_S - (now - handover)
+        if 0 < remaining <= HANDOVER_GRACE_S:
+            for row in out:
+                if int(row.get("level") or 0) < 1:
+                    continue
+                # #2217 : le retard a couru avant la prise en charge ; le
+                # nouveau porteur n'a pas à recevoir une demande de
+                # réassignation aussitôt. La mesure (elapsed_s, target_s)
+                # reste lisible, l'escalade reprend après la grâce.
+                row["handover_grace_s"] = int(remaining)
+                row["level"] = 0
+                row["targets"] = ()
+                row["overdue_s"] = 0
 
     return out
 

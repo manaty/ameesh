@@ -2,14 +2,18 @@
 """L385 storage: explicit edges, atomic cycle checks and durable audit."""
 from __future__ import annotations
 
+import datetime
 import json
+import os
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from unittest import mock
 
 from ameesh import db as D, mail, plan, planned_waits, progress, stagnation, storage, work
 from ameesh import work_dependencies as dependencies
+from ameesh.storage.postgres.work_dependencies import WorkDependencies as PgLandingStore
 from tests.support import PgTestCase
 
 
@@ -189,7 +193,7 @@ class ReleasedWakeTest(PgTestCase):
 
     def test_merging_the_blocker_wakes_the_assignee_once(self):
         dependencies.add(self.db, self.a, self.b, actor="test")
-        done = work.merged(self.db, self.b, sha="a" * 40, actor="git:main")
+        done = work.close_merged(self.db, self.b, sha="a" * 40, actor="git:main")
         self.assertEqual(done["result"], "merged")
         [row] = self.inbox()
         self.assertEqual((row["kind"], self.mail_lot(row)), ("event", str(self.a)))
@@ -198,7 +202,7 @@ class ReleasedWakeTest(PgTestCase):
         self.assertEqual(mail.message_payload(row)["dependency"],
                          {"dependent": self.a, "blocker": self.b, "blocker_state": "merged"})
         # Rejouer la déclaration de fusion ne réveille pas une seconde fois.
-        self.assertEqual(work.merged(self.db, self.b, sha="a" * 40, actor="git:main")["result"],
+        self.assertEqual(work.close_merged(self.db, self.b, sha="a" * 40, actor="git:main")["result"],
                          "already")
         self.assertEqual(len(self.inbox()), 1)
 
@@ -243,6 +247,91 @@ class ReleasedWakeTest(PgTestCase):
         self.assertEqual([r["id"] for r in dependencies.released_by(self.db, self.b)], [self.a])
         self.assertEqual(storage.of(self.db).mailbox.unread_total(), 0)
 
+    def test_an_unassigned_blocked_dependent_returns_to_intake(self):
+        """#1668 : sans destinataire, le lot que plus rien ne retient repasse
+        `intake` — `actionable()` ne lit que `intake`/`build`, sinon il reste
+        invisible au self-service jusqu'à l'alerte stale (jusqu'à 14 h)."""
+        self.assign(self.a, None)
+        self.db.execute("UPDATE work_items SET state = 'blocked' WHERE id = %s", (self.a,))
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        self.assertEqual(work.get(self.db, self.a)["state"], "intake")
+        notes = [e["note"] for e in work.events(self.db, self.a)]
+        self.assertIn("Dependency released: back to intake (no assignee, #1668)", notes)
+        self.assertEqual(storage.of(self.db).mailbox.unread_total(), 0)
+
+    def test_a_pinned_blocked_dependent_is_not_released_by_a_legacy_closure(self):
+        """#1922/B4 (relecture Claude) : la réouverture historique ne lève pas
+        une retenue du registre Process. Un lot pinné, non assigné, retenu
+        `blocked` par le registre (vérifié par C) et dont le dernier
+        prérequis tombe restait rouvert `intake` : la retenue tombait sans
+        commande `release` ni vérificateur C, et l'étape restait (ex. review
+        avec state intake). Filtre `workflow_ref` dans le SQL."""
+        self.assign(self.a, None)
+        self.db.execute(
+            "UPDATE work_items SET state = 'blocked', workflow_ref = %s,"
+            " workflow_stage = 'review', workflow_version = 1 WHERE id = %s",
+            ("acme/process-workflow@0f1e2d3c", self.a))
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        row = self.db.query(
+            "SELECT state, workflow_stage FROM work_items WHERE id = %s", (self.a,))[0]
+        self.assertEqual(row["state"], "blocked")
+        self.assertEqual(row["workflow_stage"], "review")
+        notes = [e["note"] for e in work.events(self.db, self.a)]
+        self.assertNotIn("Dependency released: back to intake (no assignee, #1668)", notes)
+        self.assertEqual(storage.of(self.db).mailbox.unread_total(), 0)
+
+    def test_a_pinned_assigned_dependent_is_not_woken_by_a_legacy_closure(self):
+        """#1922/N13 (relecture Claude) : la fermeture d'un prérequis ne lève
+        pas la retenue d'un lot pinné — seul un `release` du registre, vérifié
+        par C, le débloque. Le dépendant ASSIGNÉ recevait pourtant le courrier
+        « resume it when you are ready », qui promet une reprise que le
+        registre seul peut autoriser ; il n'est plus candidat à la
+        libération."""
+        self.db.execute(
+            "UPDATE work_items SET state = 'blocked', workflow_ref = %s,"
+            " workflow_stage = 'review', workflow_version = 1 WHERE id = %s",
+            ("acme/process-workflow@0f1e2d3c", self.a))
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        self.assertEqual(dependencies.released_by(self.db, self.b), [])
+        self.assertEqual(self.inbox(), [])
+        row = self.db.query(
+            "SELECT state, workflow_stage FROM work_items WHERE id = %s", (self.a,))[0]
+        self.assertEqual((row["state"], row["workflow_stage"]), ("blocked", "review"))
+
+    def test_an_assigned_blocked_dependent_keeps_its_state(self):
+        """#1668 : un lot assigné garde son état — le courrier de réveil porte
+        le geste à son agent, qui juge la suite (pas de réouverture forcée)."""
+        self.db.execute("UPDATE work_items SET state = 'blocked' WHERE id = %s", (self.a,))
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        self.assertEqual(work.get(self.db, self.a)["state"], "blocked")
+        [row] = self.inbox()
+        self.assertIn("lot #%d was closed" % self.b, row["body"])
+
+    def test_a_dependent_that_another_blocker_holds_stays_blocked(self):
+        """#1668 : la réouverture ne part qu'à la DERNIÈRE attente tombée."""
+        self.assign(self.a, None)
+        self.db.execute("UPDATE work_items SET state = 'blocked' WHERE id = %s", (self.a,))
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        dependencies.add(self.db, self.a, self.c, actor="test")
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        self.assertEqual(work.get(self.db, self.a)["state"], "blocked")
+        work.close(self.db, self.c, abandoned=True, actor="test")
+        self.assertEqual(work.get(self.db, self.a)["state"], "intake")
+
+    def test_an_unassigned_dependent_outside_blocked_is_untouched(self):
+        """#1668 : seule la retenue `blocked` se rouvre — une porte humaine
+        (`waiting_human`) ou un lot en cours ne sont pas des attentes de lot."""
+        self.assign(self.a, None)
+        self.db.execute("UPDATE work_items SET state = 'waiting_human' WHERE id = %s",
+                        (self.a,))
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        self.assertEqual(work.get(self.db, self.a)["state"], "waiting_human")
+
     def test_the_wake_is_written_with_the_closure_in_one_transaction(self):
         """Le courrier part dans la transaction de fermeture : quand il est
         écrit, la transition est déjà visible (et elle n'est pas committée
@@ -259,7 +348,7 @@ class ReleasedWakeTest(PgTestCase):
             return real(db, sender, recipient, body, **kw)
 
         with mock.patch("ameesh.mail.send", side_effect=spy):
-            work.merged(self.db, self.b, sha="b" * 40, actor="git:main")
+            work.close_merged(self.db, self.b, sha="b" * 40, actor="git:main")
         self.assertEqual(seen, [("merged", "dev-a", "event", True)])
 
     def test_a_failed_wake_rolls_back_the_closure_and_a_retry_wakes_once(self):
@@ -273,17 +362,17 @@ class ReleasedWakeTest(PgTestCase):
         dependencies.add(self.db, self.a, self.b, actor="test")
         with mock.patch("ameesh.mail.send", side_effect=RuntimeError("mailbox down")):
             with self.assertRaises(RuntimeError):
-                work.merged(self.db, self.b, sha="c" * 40, actor="git:main")
+                work.close_merged(self.db, self.b, sha="c" * 40, actor="git:main")
         self.assertEqual(work.get(self.db, self.b)["state"], "intake")
         self.assertEqual(self.inbox(), [])
-        done = work.merged(self.db, self.b, sha="c" * 40, actor="git:main")
+        done = work.close_merged(self.db, self.b, sha="c" * 40, actor="git:main")
         self.assertEqual(done["result"], "merged")
         self.assertEqual(work.get(self.db, self.b)["state"], "merged")
         [row] = self.inbox()
         self.assertEqual(mail.message_payload(row)["dependency"],
                          {"dependent": self.a, "blocker": self.b, "blocker_state": "merged"})
         # Rejouer la déclaration, une fois la fusion commise, ne double pas.
-        self.assertEqual(work.merged(self.db, self.b, sha="c" * 40, actor="git:main")["result"],
+        self.assertEqual(work.close_merged(self.db, self.b, sha="c" * 40, actor="git:main")["result"],
                          "already")
         self.assertEqual(len(self.inbox()), 1)
 
@@ -320,7 +409,7 @@ class ReleasedWakeTest(PgTestCase):
                 db = D.connect(self.cfg)
                 try:
                     start.wait(timeout=5)
-                    results.append(work.merged(db, blocker, sha="e" * 40,
+                    results.append(work.close_merged(db, blocker, sha="e" * 40,
                                                actor="git:main")["result"])
                 except Exception as exc:  # noqa: BLE001 - remonté par le test
                     errors.append(exc)
@@ -375,7 +464,7 @@ class ReleasedWakeTest(PgTestCase):
         def closer():
             db = D.connect(self.cfg)
             try:
-                results.append(work.merged(db, self.c, sha="f" * 40, actor="git:main")["result"])
+                results.append(work.close_merged(db, self.c, sha="f" * 40, actor="git:main")["result"])
             except Exception as exc:  # noqa: BLE001
                 errors.append(exc)
             finally:
@@ -414,13 +503,181 @@ class ReleasedWakeTest(PgTestCase):
 
     def test_the_cli_declaration_wakes_too(self):
         dependencies.add(self.db, self.a, self.b, actor="test")
-        proc = self.mesh("work", "merged", str(self.b), "--sha", "d" * 40, "--actor", "test")
+        import os
+        from .test_merged_work_item_tracking import _git
+        repo = os.path.join(self.tmp, "declared-blocker")
+        os.makedirs(repo)
+        _git(repo, "init", "-q", "-b", "main")
+        _git(repo, "remote", "add", "origin", "git@github.com:manaty/ameesh.git")
+        self.db.execute("UPDATE work_items SET issue_ref = %s WHERE id = %s",
+                        ("manaty/ameesh#1", self.b))
+        _git(repo, "commit", "--allow-empty", "-qm", "ameesh-work: %d" % self.b)
+        sha = _git(repo, "rev-parse", "HEAD")
+        proc = self.mesh("work", "merged", str(self.b), "--sha", sha,
+                         "--repo", repo, "--actor", "test")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         [row] = self.inbox()
         self.assertEqual(self.mail_lot(row), str(self.a))
 
 
+class LandingTest(PgTestCase):
+    """#1945 : geste `ameesh work landing`, refus et journal, avant toute écriture."""
+
+    def setUp(self):
+        self.db.execute("TRUNCATE work_items CASCADE")
+        self.waiting = work.add(self.db, title="waiting", app="acme")["id"]
+        self.vehicle = work.add(self.db, title="vehicle", app="acme")["id"]
+        # #2171 N3 : le lot parké est en revue (qa), gelé, verdict ok acquis.
+        work.move(self.db, self.waiting, "build", actor="test")
+        work.move(self.db, self.waiting, "qa", actor="test")
+        self.sha = "a" * 40
+        work.milestone(self.db, self.vehicle, "frozen", sha=self.sha, actor="test")
+        self.lot_sha = "d" * 40
+        work.milestone(self.db, self.waiting, "frozen", sha=self.lot_sha, actor="test")
+        work.milestone(self.db, self.waiting, "verdict", verdict="ok", sha=self.lot_sha,
+                       actor="test")
+
+    def cli(self, *args, ok=True):
+        proc = self.mesh("work", "landing", *args, "--actor", "test")
+        self.assertEqual(proc.returncode, 0 if ok else 1, proc.stdout + proc.stderr)
+        return proc
+
+    def test_declare_renew_clear_and_read_back(self):
+        until = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+        renewed = (datetime.date.fromisoformat(until) + datetime.timedelta(days=2)).isoformat()
+        payload = json.loads(self.cli(str(self.waiting), "--vehicle", str(self.vehicle),
+                                      "--until", until, "--json").stdout)
+        self.assertTrue(payload["changed"])
+        self.assertEqual(payload["landing"]["vehicle_id"], self.vehicle)
+        self.assertEqual(payload["landing"]["until_on"], until)
+        self.assertEqual(payload["landing"]["pinned_sha"], self.sha)
+        self.assertTrue(payload["landing"]["open"])
+        self.assertEqual(payload["landing"]["created_by"], "test")
+        # rejouer remplace la déclaration : une seule ligne, un second journal
+        other = work.add(self.db, title="other vehicle", app="acme")["id"]
+        other_sha = "b" * 40
+        work.milestone(self.db, other, "frozen", sha=other_sha, actor="test")
+        payload = json.loads(self.cli(str(self.waiting), "--vehicle", str(other),
+                                      "--until", renewed, "--json").stdout)
+        self.assertEqual(payload["landing"]["vehicle_id"], other)
+        self.assertEqual(payload["landing"]["pinned_sha"], other_sha)
+        self.assertEqual(len(storage.of(self.db).work_dependencies.landings_for([self.waiting])), 1)
+        notes = [e["note"] for e in work.events(self.db, self.waiting)
+                 if e["note"].startswith("Landing")]
+        self.assertEqual(notes, [
+            "Landing declared: vehicle #%d until %s (frozen %s)" % (other, renewed, other_sha[:12]),
+            "Landing declared: vehicle #%d until %s (frozen %s)" % (self.vehicle, until, self.sha[:12])])
+        text = self.mesh("work", "show", str(self.waiting))
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertIn("landing on vehicle #%d" % other, text.stdout)
+        # le retrait est idempotent et journalisé une fois
+        self.assertTrue(json.loads(self.cli(str(self.waiting), "--clear", "--json").stdout)["changed"])
+        self.assertFalse(json.loads(self.cli(str(self.waiting), "--clear", "--json").stdout)["changed"])
+        self.assertEqual(storage.of(self.db).work_dependencies.landings_for([self.waiting]), [])
+        self.assertIn("Landing cleared: vehicle #%d" % other,
+                      [e["note"] for e in work.events(self.db, self.waiting)])
+
+    def test_refusals_leave_no_row_and_no_journal(self):
+        until = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+        self.assertIn("needs --vehicle and --until", self.cli(str(self.waiting), ok=False).stderr)
+        self.assertIn("itself", self.cli(str(self.waiting), "--vehicle", str(self.waiting),
+                                         "--until", until, ok=False).stderr)
+        self.assertIn("existing lots", self.cli(str(self.waiting), "--vehicle", "999999",
+                                                "--until", until, ok=False).stderr)
+        self.assertIn("not found", self.cli("999999", "--vehicle", str(self.vehicle),
+                                            "--until", until, ok=False).stderr)
+        self.assertIn("ISO day", self.cli(str(self.waiting), "--vehicle", str(self.vehicle),
+                                          "--until", "someday", ok=False).stderr)
+        # un véhicule sans gel ne peut pas être épinglé
+        unfrozen = work.add(self.db, title="unfrozen", app="acme")["id"]
+        self.assertIn("frozen head", self.cli(str(self.waiting), "--vehicle", str(unfrozen),
+                                              "--until", until, ok=False).stderr)
+        # un véhicule bloqué est refusé avant écriture
+        blocked = work.add(self.db, title="blocked vehicle", app="acme")["id"]
+        work.milestone(self.db, blocked, "frozen", sha="c" * 40, actor="test")
+        work.move(self.db, blocked, "blocked", actor="test")
+        self.assertIn("blocked", self.cli(str(self.waiting), "--vehicle", str(blocked),
+                                          "--until", until, ok=False).stderr)
+        work.close(self.db, self.vehicle, abandoned=True)
+        self.assertIn("must still be open", self.cli(str(self.waiting), "--vehicle",
+                                                     str(self.vehicle), "--until", until,
+                                                     ok=False).stderr)
+        self.assertEqual(storage.of(self.db).work_dependencies.landings_for([self.waiting]), [])
+        self.assertEqual([e["note"] for e in work.events(self.db, self.waiting)
+                          if e["note"].startswith("Landing")], [])
+
+
+    def test_refuses_a_lot_that_is_not_in_review_frozen_or_with_acquired_verdict(self):
+        until = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+        lot = work.add(self.db, title="not in review", app="acme")["id"]
+        self.assertIn("must be in review (qa)", self.cli(str(lot), "--vehicle", str(self.vehicle),
+                                                         "--until", until, ok=False).stderr)
+        work.move(self.db, lot, "build", actor="test")
+        self.assertIn("must be in review (qa)", self.cli(str(lot), "--vehicle", str(self.vehicle),
+                                                         "--until", until, ok=False).stderr)
+        work.move(self.db, lot, "qa", actor="test")
+        sha = "e" * 40
+        work.milestone(self.db, lot, "frozen", sha=sha, actor="test")
+        self.assertIn("acquired ok verdict", self.cli(str(lot), "--vehicle", str(self.vehicle),
+                                                      "--until", until, ok=False).stderr)
+        work.milestone(self.db, lot, "verdict", verdict="blocked", sha=sha, actor="test")
+        self.assertIn("acquired ok verdict", self.cli(str(lot), "--vehicle", str(self.vehicle),
+                                                      "--until", until, ok=False).stderr)
+        # un verdict ok d'une AUTRE tête ne vaut pas pour le dernier gel
+        work.milestone(self.db, lot, "verdict", verdict="ok", sha="f" * 40, actor="test")
+        self.assertIn("acquired ok verdict", self.cli(str(lot), "--vehicle", str(self.vehicle),
+                                                      "--until", until, ok=False).stderr)
+        work.milestone(self.db, lot, "verdict", verdict="ok", sha=sha, actor="test")
+        self.cli(str(lot), "--vehicle", str(self.vehicle), "--until", until)
+        self.assertEqual(len(storage.of(self.db).work_dependencies.landings_for([lot])), 1)
+
+    def test_refuses_a_past_or_too_far_deadline(self):
+        today = datetime.date.today()
+        for day, needle in (
+                (today - datetime.timedelta(days=1), "already past"),
+                (today + datetime.timedelta(days=dependencies.DEFAULT_MAX_DAYS + 1), "too far")):
+            self.assertIn(needle, self.cli(str(self.waiting), "--vehicle", str(self.vehicle),
+                                           "--until", day.isoformat(), ok=False).stderr)
+        # la borne haute exacte est admise
+        self.cli(str(self.waiting), "--vehicle", str(self.vehicle), "--until",
+                 (today + datetime.timedelta(days=dependencies.DEFAULT_MAX_DAYS)).isoformat())
+
+    def test_new_unreviewed_freeze_before_landing_is_rejected_atomically(self):
+        transaction = self.db.transaction
+        injected = False
+
+        @contextmanager
+        def racing_transaction():
+            nonlocal injected
+            if not injected:
+                injected = True
+                work.milestone(self.db, self.waiting, "frozen", sha="e" * 40, actor="test")
+            with transaction() as tx:
+                yield tx
+
+        until = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+        with mock.patch.object(self.db, "transaction", side_effect=racing_transaction):
+            with self.assertRaisesRegex(work.WorkError, "acquired ok verdict"):
+                dependencies.land(self.db, self.waiting, self.vehicle,
+                                  until_on=until, actor="test")
+        self.assertEqual(storage.of(self.db).work_dependencies.landings_for([self.waiting]), [])
+        self.assertFalse(any(e["note"].startswith("Landing")
+                             for e in work.events(self.db, self.waiting)))
+
+
 class ResolverTest(unittest.TestCase):
+    def test_invalid_landing_ids_days_and_empty_actor_are_refused_before_storage(self):
+        for item in (-1, 0, True, "1"):
+            with self.assertRaises(work.WorkError):
+                dependencies.land(None, item, 2, until_on="2026-10-18", actor="test")
+        with self.assertRaises(work.WorkError):
+            dependencies.land(None, 1, 2, until_on="2026-10-18", actor="")
+        with self.assertRaises(work.WorkError):
+            dependencies.clear_landing(None, 1, actor="")
+        for day in (None, "", "someday", "2026-13-45"):
+            with self.assertRaises(work.WorkError):
+                dependencies.land(None, 1, 2, until_on=day, actor="test")
+
     def test_direct_links_union_with_commitments_and_ignore_satisfied_edges(self):
         rows = [{"id": 1, "state": "build"}]
         edges = [{"work_item_id": 1, "blocker_id": 2, "blocking": True},
@@ -441,3 +698,100 @@ class ResolverTest(unittest.TestCase):
                 dependencies.add(None, item, 2, actor="test")
         with self.assertRaises(work.WorkError):
             dependencies.add(None, 1, 2, actor="")
+
+    def test_landing_deadline_is_bounded_before_storage(self):
+        """#2171 N4 : ni un jour passé, ni une échéance invraisemblable."""
+        today = datetime.date.today()
+        for day in ((today - datetime.timedelta(days=1)).isoformat(),
+                    (today + datetime.timedelta(days=dependencies.DEFAULT_MAX_DAYS + 1)).isoformat()):
+            with self.assertRaises(work.WorkError):
+                dependencies.land(None, 1, 2, until_on=day, actor="test")
+
+    def test_landing_term_is_an_operating_parameter_not_a_canon_rule(self):
+        """#2171 N4 : le terme vient de `AMEESH_LANDING_MAX_DAYS` (§7)."""
+        self.assertEqual(dependencies.max_days({}), dependencies.DEFAULT_MAX_DAYS)
+        self.assertEqual(dependencies.max_days(
+            {dependencies.LANDING_MAX_ENV: "7"}), 7)
+        for raw in ("0", "-1", "soon"):
+            with self.assertRaises(work.WorkError):
+                dependencies.max_days({dependencies.LANDING_MAX_ENV: raw})
+        today = datetime.date.today()
+        with mock.patch.dict(os.environ, {dependencies.LANDING_MAX_ENV: "7"}):
+            with self.assertRaisesRegex(work.WorkError, "at most 7 days ahead"):
+                dependencies.land(None, 1, 2, actor="test",
+                                  until_on=(today + datetime.timedelta(days=8)).isoformat())
+
+    def test_landing_head_breaks_freeze_ties_on_id_not_reading_order(self):
+        """#2171 N2 : même (at, id) maximal que set_landing, quel que soit l'ordre."""
+        st = mock.Mock()
+        st.progress.lot_milestones.return_value = [
+            {"id": 9, "work_item_id": 2, "kind": "frozen", "at_ts": 5.0, "sha": "b" * 40},
+            {"id": 3, "work_item_id": 2, "kind": "frozen", "at_ts": 5.0, "sha": "a" * 40},
+            {"id": 4, "work_item_id": 2, "kind": "verdict", "at_ts": 9.0, "sha": "c" * 40},
+        ]
+        with mock.patch.object(dependencies.storage, "of", return_value=st):
+            self.assertEqual(dependencies.landing_head(None, 2), "b" * 40)
+
+
+class _RecordingTx:
+    """Transaction factice : enregistre les ordres et rend des réponses fixes."""
+
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def execute(self, sql, params=()):
+        self.calls.append(str(sql))
+
+    def query(self, sql, params=()):
+        self.calls.append(str(sql))
+        return self.responses.pop(0) if self.responses else []
+
+
+class _RecordingDb:
+    """Pilote factice : `transaction()` ouvre la transaction, `execute` non."""
+
+    def __init__(self, tx):
+        self.tx = tx
+        self.calls = []
+
+    def execute(self, sql, params=()):
+        self.calls.append(str(sql))
+
+    def transaction(self):
+        return _TxContext(self.tx)
+
+
+class _TxContext:
+    def __init__(self, tx):
+        self.tx = tx
+
+    def __enter__(self):
+        return self.tx
+
+    def __exit__(self, *exc):
+        return False
+
+
+class LandingTransactionLockTest(unittest.TestCase):
+    """#2171 N1 : le verrou consultatif part dans la TRANSACTION.
+
+    `self.db.execute(_LOCK)` le posait dans une autre session (pilote psql,
+    autocommit) : il était relâché aussitôt, et le « même verrou que le graphe »
+    était faux. Le factice discrimine exactement ce chemin."""
+
+    def test_set_and_clear_take_the_graph_lock_on_the_transaction(self):
+        tx = _RecordingTx(
+            [{"id": 1, "state": "qa"}, {"id": 2, "state": "qa"}],   # les deux lots
+            [{"sha": "a" * 40}],                                    # gel du véhicule
+        )
+        db = _RecordingDb(tx)
+        self.assertEqual(PgLandingStore(db).set_landing(
+            1, 2, until_on="2026-10-18", actor="test"), {"landed": True})
+        clear_tx = _RecordingTx([{"vehicle_id": 2}])
+        clear_db = _RecordingDb(clear_tx)
+        self.assertTrue(PgLandingStore(clear_db).clear_landing(1, actor="test"))
+        for driver, calls in ((db, tx.calls), (clear_db, clear_tx.calls)):
+            self.assertEqual(driver.calls, [], "le verrou est parti hors transaction")
+            self.assertIn("pg_advisory_xact_lock", calls[0],
+                          "le verrou doit précéder toute lecture dans la transaction")

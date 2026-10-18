@@ -22,8 +22,56 @@ _COLUMNS = """
     planned_source, planned_by
 """
 
+#: Un seul verrou par schéma, pour TOUS les canons (L42/0031 : les identifiants
+#: de `work_packages` sont globaux, le premier canon qui en déclare un le
+#: garde). La clé ne dépend ni du canon ni du clone, comme celle du registre
+#: des authentificateurs : deux canons ne doivent pas lire « absent » ensemble
+#: puis s'écraser, et la bascule du canon par défaut écrit la même colonne.
+SYNC_LOCK_SQL = ("SELECT pg_advisory_xact_lock(hashtextextended("
+                 "current_schema() || ':canon-sync-packages', 0))")
+
+#: Borne de l'attente du verrou de sync (#1747) : généreuse — un premier sync
+#: d'hôte peut être long —, mais finie. Sous psycopg, `statement_timeout` levé
+#: pour la prise ne borne plus l'attente : un détenteur resté « idle in
+#: transaction » (par exemple `adopt_default`, qui tient le verrou du registre
+#: des authentificateurs et la ligne `canon_state ''`) figeait le sync sans
+#: fin. Sous psql, le délai CLIENT du pilote (`statement_timeout` de session
+#: + 5 s appliqué à chaque instruction, `db._PsqlTransaction._run`) reste la
+#: borne effective quand elle est plus courte.
+SYNC_LOCK_TIMEOUT_MS = 600_000
+
 
 class WorkPackages(interface.WorkPackages):
+
+    def lock_sync(self) -> None:
+        """Verrou transactionnel des fiches, pris AVANT leur lecture.
+
+        L'attente d'un verrou consultatif compte dans `statement_timeout` : au
+        démarrage d'un hôte, le premier sync d'un canon peut être long (un
+        déploiement change beaucoup de fiches) et les suivants échoueraient en
+        57014, laissant la porte d'hôte fermée jusqu'au réessai. On lève donc
+        le délai le temps de la prise, puis on rétablit ceux de la session pour
+        le reste de la transaction. `set_config(..., true)` (et non un
+        `SET LOCAL ... %s`) : une instruction utilitaire n'accepte pas de
+        paramètre lié, les deux pilotes envoient le leur tel quel.
+
+        L'attente reste BORNÉE (#1747) : `lock_timeout` est posé le temps de la
+        prise (`SYNC_LOCK_TIMEOUT_MS`), puis rétabli avec `statement_timeout`.
+        Sans lui, sous psycopg, un détenteur qui ne rend pas le verrou figeait
+        le sync sans fin ; sous psql, le délai client du pilote
+        (`statement_timeout` de session + 5 s par instruction) borne déjà
+        l'attente, et la plus courte des deux bornes s'applique.
+        """
+        previous = self.db.query(
+            "SELECT current_setting('statement_timeout') AS statement,"
+            " current_setting('lock_timeout') AS lock")[0]
+        self.db.execute("SELECT set_config('statement_timeout', '0', true),"
+                        " set_config('lock_timeout', %s, true)",
+                        ("%dms" % SYNC_LOCK_TIMEOUT_MS,))
+        self.db.execute(SYNC_LOCK_SQL)
+        self.db.execute("SELECT set_config('statement_timeout', %s, true),"
+                        " set_config('lock_timeout', %s, true)",
+                        (previous["statement"], previous["lock"]))
 
     def all(self, *, include_absent: bool = False) -> list[dict]:
         sql = "SELECT %s FROM work_packages" % _COLUMNS

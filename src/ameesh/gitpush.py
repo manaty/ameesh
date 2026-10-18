@@ -1,73 +1,89 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Poussée git faite main : un second essai sur un rejet distant transitoire.
+"""Hand-made git push: one second attempt on a transient remote refusal.
 
-Règle persistée (canon §7, `docs/EXPLOITATION.md` section watch ; lot #1125) :
-une chaîne faite main qui pousse — veilleur de fusion, script de suite — donne
-**un** second essai après un court délai quand le distant refuse la poussée
-(`! [remote rejected] … (failed)`), trace les deux tentatives, puis s'arrête
-et rend compte si le second essai échoue aussi.
+Persisted rule (canon §7, `docs/EXPLOITATION.md` section watch; lots #876 and
+#1125): a hand-made chain that pushes — a merge watcher, a follow-up script —
+gives the push **one** second attempt after a short delay when the remote
+refuses it (`! [remote rejected] … (failed)`), traces both attempts, then
+stops and reports if the second attempt fails too.
 
-Le constat (13/10 23:36-23:41Z, lots #749 et #752) : deux poussées refusées
-puis acceptées au deuxième essai, sans changement de tête ni de droits, quatre
-autres poussées de la même fenêtre passées du premier coup ; chaque refus
-transitoire coûtait un tour d'agent.
+The observation (13/10 23:36-23:41Z, lots #749 and #752): two pushes refused
+then accepted on the second attempt, with no change of head or rights, four
+other pushes of the same window passing on the first try; every transient
+refusal cost an agent turn.
 
-Usage dans une chaîne :
+Use from a chain:
 
     from ameesh.gitpush import push_with_retry
     proc = push_with_retry(run, ["git", "push", "origin", REF], trace=log)
     if proc.returncode != 0:
-        ...  # échec définitif : la chaîne note et s'arrête
+        ...  # definitive failure: the chain notes it and stops
 
-`run` garde la signature de la chaîne (`argv -> CompletedProcess`, `cwd` et
-`env` déjà posés par ses soins) : ce module ne connaît ni le dépôt ni le
-distant, il ne fait que la politique des deux essais. Le délai par défaut est
-de 10 s.
+`run` keeps the chain's signature (`argv -> CompletedProcess`, `cwd` and `env`
+already set by it): this module knows neither the repository nor the remote, it
+only carries the two-attempt policy. The default delay is 10 s.
+
+Wiring is deliberately absent (PR #888): the repository's push sites are on
+sensitive §8 paths (`land.py`, `mediated_executor/work_repo.py`: concurrency;
+`persona_memory.py`: privacy) or already carry their own retry
+(`persona_memory`), so wiring this module there is a sensitive lot of its own.
+Host chains may import it right now.
+
+Only a non-zero exit code is retried. An exception raised by `run`
+(`subprocess.TimeoutExpired`, `OSError`, …) propagates unchanged after a single
+call: the policy cannot tell whether the push reached the remote, and a retry
+after a timeout is not safe. The caller treats it as a definitive failure.
 """
 from __future__ import annotations
 
+import re
 import time
 from typing import Callable, Optional, Sequence
 
-#: délai entre les deux essais (le distant a répondu au deuxième essai en
-#: ~1 min le 13/10 ; 10 s suffisent et ne retardent pas un échec définitif)
+#: delay between the two attempts (the remote answered the second attempt in
+#: ~1 min on 13/10; 10 s is enough and does not delay a definitive failure)
 RETRY_DELAY_S = 10
-#: longueur maximale du détail tracé (la sortie de git est bavarde)
+#: maximum length of the traced detail (git output is verbose)
 DETAIL_MAX = 300
+#: credentials in a URL (`scheme://user:secret@host`): never traced as they are
+_CREDENTIALS = re.compile(r"://[^/@\s]+@")
 
 
 def _detail(proc) -> str:
-    return ((proc.stderr or "") + (proc.stdout or "")).strip()
+    """The push output, credentials masked, for one trace line."""
+    text = ((proc.stderr or "") + (proc.stdout or "")).strip()
+    return _CREDENTIALS.sub("://***@", text)
 
 
 def push_with_retry(run: Callable[[Sequence[str]], object],
                     argv: Sequence[str], *, delay: float = RETRY_DELAY_S,
                     trace: Optional[Callable[[str], None]] = None):
-    """`run(argv)` ; sur un code de sortie non nul, un seul nouvel essai.
+    """`run(argv)`; on a non-zero exit code, exactly one new attempt.
 
-    Tout code non nul est réessayé : distinguer un refus transitoire d'un
-    refus définitif (droits, non fast-forward) demanderait de lire la sortie
-    de git, et le coût d'un essai inutile est `delay` secondes — alors qu'un
-    refus transitoire non réessayé coûte un tour d'agent. Rend le
-    `CompletedProcess` du dernier essai ; `trace` (callable texte) reçoit une
-    ligne par tentative refusée, et une ligne si le second essai passe.
+    Every non-zero code is retried: telling a transient refusal from a
+    definitive one (rights, non fast-forward) would mean parsing git's output,
+    and the cost of a useless attempt is `delay` seconds — while a transient
+    refusal not retried costs an agent turn. An exception raised by `run`
+    propagates without a retry (module docstring). Returns the
+    `CompletedProcess` of the last attempt; `trace` (a text callable) receives
+    one line per refused attempt, and one line when the second attempt passes.
     """
     say = trace if trace is not None else (lambda msg: None)
     proc = run(argv)
     if proc.returncode == 0:
         return proc
-    say("poussée refusée (essai 1/2) : %s ; nouvel essai dans %ss"
+    say("push refused (attempt 1/2): %s; retrying in %ss"
         % (_detail(proc)[:DETAIL_MAX], delay))
     time.sleep(delay)
     proc = run(argv)
     if proc.returncode == 0:
-        say("poussée acceptée au deuxième essai")
+        say("push accepted on the second attempt")
     else:
-        say("poussée refusée (essai 2/2) : %s" % _detail(proc)[:DETAIL_MAX])
+        say("push refused (attempt 2/2): %s" % _detail(proc)[:DETAIL_MAX])
     return proc
 
 
 def push(run: Callable[[Sequence[str]], object], remote: str, refspec: str,
          **kwargs):
-    """Raccourci : `git push <remote> <refspec>` avec le second essai."""
+    """Shortcut: `git push <remote> <refspec>` with the second attempt."""
     return push_with_retry(run, ["git", "push", remote, refspec], **kwargs)

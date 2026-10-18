@@ -443,6 +443,8 @@ def _sync_one(db, cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
               "ameesh placement check --agent A" % (tag, host, ", ".join(refused)))
     print(_status_line(host, report.status, report.diagnostic, recorded=True))
     _print_packages(report.packages)
+    _print_processes(report.processes)
+    _print_mechanics(report.mechanics)
     _print_authenticators(report.authenticators)
     if report.errors:
         print("canon INVALID — %s: the affected agents are not claimable "
@@ -469,6 +471,40 @@ def _print_packages(done) -> None:
         if done.relinked else ""))
     if done.skipped:
         print("  in error: %s (ameesh canon check)" % ", ".join(done.skipped))
+
+
+def _print_processes(done) -> None:
+    """#538 : les règles de travail (fiches Process) poussées par la synchro.
+
+    #1464 : un repère d'envoi figé (canon réécrit, repère d'un autre canon) est
+    dit ici — les envois sont arrêtés, et cela ne doit pas rester muet."""
+    if done is None:
+        return
+    if done.changed:
+        print("rules (Process) : %d pushed to the agents of the host: %s"
+              % (len(done.changed), ", ".join(done.changed)))
+    if done.error:
+        print("rules (Process) NOT pushed: %s" % done.error)
+
+
+def _print_mechanics(done) -> None:
+    """#1616 : les paramètres mécaniques compilés du canon appliqué (constat)."""
+    if done is None:
+        return
+    if done.status == "ok":
+        packets = "%d/jour" % len(done.packets) if done.packets else "aucun"
+        print("mechanics (#1616) : cutoffs %s %s; paquets %s; max_in_build %d; CI %s "
+              "(incident %s); families %s"
+              % (", ".join(done.cutoffs), done.timezone, packets, done.max_in_build,
+                 done.ci.get("packet", "?"), done.ci.get("incident_label", "?"),
+                 ", ".join(done.reviews.get("families") or [])))
+    elif done.status == "absent":
+        print("mechanics (#1616) : absent — the strict reader refuses; "
+              "consumers must not fall back (%s)" % done.error)
+    elif done.status == "invalid":
+        print("mechanics (#1616) : INVALID — %s" % done.error)
+    else:
+        print("mechanics (#1616) : no exact canon commit — not compiled")
 
 
 def _print_authenticators(done: canon_sync.AuthenticatorSync | None) -> None:
