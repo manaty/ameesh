@@ -504,6 +504,16 @@ Le corps du lot porteur nomme ses unités avec leur tête, `#<lot> <tête>`, la
 ligne qu'imprime `scripts/paquet-compose.py --units --base <cible>` (#2360) :
 un `#N` seul n'y déclare aucune unité (#2335).
 
+À la fusion du paquet, ses unités se ferment **sans geste manuel** : le relevé
+de l'exécuteur lit les manifestes `reviews/**paquet**.md` de la cible et, pour
+chaque lot de leur table de composition encore ouvert, examine son dernier gel
+par le contenu — ancêtre, patch-id, squash, revert (#1825) — puis le passe
+`merged` (`packet_close`, #2426). Une ligne de retrait ne ferme rien ; un lot
+re-gelé après la composition reste ouvert. `ameesh work sync-packets --git-dir
+D --target T [--dry-run]` fait le même constat à la main, sur les seules
+unités des manifestes : c'est le balayage ciblé qui manquait à `sync-merges`
+(tous les lots ouverts, plus de 120 s sur ameesh).
+
 ## Le lot en cours
 
 `ameesh projects` montre comme lot en cours d'un agent le dernier lot
