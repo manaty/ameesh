@@ -7,30 +7,41 @@ The release controller must separately verify restoration before migration.
 """
 import argparse
 from contextlib import contextmanager
+import gzip
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import uuid
 from urllib.parse import quote
+import zlib
 
 
 class BackupError(ValueError):
     pass
 
 
-def run(args, *, env=None):
+def run(args, *, env=None, timeout=1800):
     # A driver diagnostic may repeat its DSN, password or upload credentials.
+    # Report only the process, its timeout or exit status, and never its stderr.
+    name = Path(args[0]).name
     try:
         subprocess.run(args, env=env, check=True, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.PIPE, timeout=1800)
-    except (OSError, subprocess.SubprocessError):
-        raise BackupError("backup subprocess failed: " + Path(args[0]).name) from None
+                       stderr=subprocess.PIPE, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise BackupError("%s timed out after %s s" % (name, timeout)) from None
+    except subprocess.CalledProcessError as exc:
+        raise BackupError("%s exited with status %s" % (name, exc.returncode)) from None
+    except subprocess.SubprocessError:
+        raise BackupError("%s failed" % name) from None
+    except OSError as exc:
+        raise BackupError("%s could not be started (%s)" % (name, exc.strerror or "OSError")) from None
 
 
 def private_parent(path, what):
@@ -114,7 +125,14 @@ def dump_parameters(parameters, output, *, snapshot=None):
             args = ["pg_dump", "--no-password", "-Fc", "--dbname", public_dsn]
             if snapshot is not None:
                 args.extend(["--snapshot", snapshot])
-            run(args + ["--file", str(archive)], env=env)
+            try:
+                run(args + ["--file", str(archive)], env=env)
+            except BackupError as exc:
+                try:
+                    written = archive.stat().st_size
+                except OSError:
+                    written = 0
+                raise BackupError("%s; %d bytes written" % (exc, written)) from None
             if not archive.is_file() or archive.stat().st_size == 0:
                 raise BackupError("backup is empty or missing")
             archive.chmod(0o600)
@@ -511,6 +529,85 @@ def retrieve(credentials, host, name, sha256, output, *, version_id=None):
             **({"version_id": version_id} if version_id is not None else {})}
 
 
+def pull(output, sha256, *, expected_bytes=None, timeout=3600, source=None):
+    """Publish a gzip-compressed server-side dump read from ``source``.
+
+    The archive is published by hard link only after its exact size and
+    SHA-256 match the server's attestation. A timeout reports the bytes already
+    written, never a subprocess diagnostic. The server lists the archive with
+    ``pg_restore --list`` before sealing it, so this digest binds the local copy
+    to a structurally readable dump without a second client-version check.
+    """
+    if not isinstance(sha256, str) or re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
+        raise BackupError("invalid dump digest")
+    if (expected_bytes is not None
+            and (isinstance(expected_bytes, bool) or not isinstance(expected_bytes, int)
+                 or expected_bytes <= 0)):
+        raise BackupError("invalid dump size")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+        raise BackupError("invalid retrieval timeout")
+    output = Path(output)
+    private_parent(output.parent, "backup directory")
+    if os.path.lexists(output):
+        raise BackupError("backup destination already exists")
+    source = sys.stdin.buffer if source is None else source
+    written = 0
+    digest = hashlib.sha256()
+
+    class _TimedOut(Exception):
+        pass
+
+    def expired(signum, frame):
+        raise _TimedOut()
+
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.alarm(max(1, int(timeout)))
+    try:
+        with tempfile.TemporaryDirectory(prefix=".pull-", dir=output.parent) as staging:
+            archive = Path(staging) / "archive.dump"
+            descriptor = os.open(archive, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.fchmod(descriptor, 0o600)
+            try:
+                with os.fdopen(descriptor, "wb") as sink, \
+                        gzip.GzipFile(fileobj=source, mode="rb") as compressed:
+                    while True:
+                        chunk = compressed.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        sink.write(chunk)
+                        digest.update(chunk)
+                        written += len(chunk)
+                        if expected_bytes is not None and written > expected_bytes:
+                            raise BackupError("dump retrieval exceeds the attested size: "
+                                              "%d bytes written" % written)
+                    sink.flush()
+                    os.fsync(sink.fileno())
+            except (OSError, EOFError, zlib.error) as exc:
+                raise BackupError("dump retrieval failed (%s); %d bytes written"
+                                  % (type(exc).__name__, written)) from None
+            if expected_bytes is not None and written != expected_bytes:
+                raise BackupError("dump retrieval incomplete: %d of %d bytes written"
+                                  % (written, expected_bytes))
+            if digest.hexdigest() != sha256:
+                raise BackupError("dump retrieval digest mismatch after %d bytes written" % written)
+            try:
+                os.link(archive, output)
+            except OSError:
+                raise BackupError("could not publish retrieved backup") from None
+            directory_fd = os.open(output.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    except _TimedOut:
+        raise BackupError("dump retrieval timed out after %s s; %d bytes written"
+                          % (timeout, written)) from None
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+    return {"artifact_sha256": sha256, "bytes": written}
+
+
 def main():
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -534,6 +631,11 @@ def main():
     recovery.add_argument("--sha256", required=True)
     recovery.add_argument("--output", required=True)
     recovery.add_argument("--version-id")
+    pull_command = commands.add_parser("pull")
+    pull_command.add_argument("--output", required=True)
+    pull_command.add_argument("--sha256", required=True)
+    pull_command.add_argument("--bytes", type=int, dest="expected_bytes")
+    pull_command.add_argument("--timeout", type=float, default=3600)
     verify = commands.add_parser("verify-restore")
     verify.add_argument("--config", required=True)
     verify.add_argument("--file", required=True)
@@ -550,10 +652,19 @@ def main():
             upload(args.file, args.host, receipt=args.receipt)
         elif args.command == "retrieve":
             print(json.dumps(retrieve(args.credentials, args.host, args.name, args.sha256, args.output, version_id=args.version_id)))
+        elif args.command == "pull":
+            print(json.dumps(pull(args.output, args.sha256,
+                                  expected_bytes=args.expected_bytes, timeout=args.timeout)))
         else:
             proof = verify_restore(args.config, args.file, json.loads(Path(args.expected).read_text()))
             print(json.dumps(proof))
         return 0
+    except BackupError as exc:
+        # Every BackupError message is built by this module: process name,
+        # timeout or exit status, bytes written. It never repeats a DSN or a
+        # subprocess diagnostic, so the cause can reach logs and mail.
+        print("private backup failed: %s" % exc, file=sys.stderr)
+        return 1
     except Exception:
         # No raw exception or subprocess diagnostic reaches logs or mail.
         print("private backup failed; existing completed backups retained", file=sys.stderr)

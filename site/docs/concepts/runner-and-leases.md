@@ -125,6 +125,13 @@ limits are declarative, in `policy.resources` of the `Host` card
 (`min_mem_available`, `max_swap_used`, `max_load`, `min_disk_free`; sizes in
 bytes or with a unit such as `1GiB`), else prudent defaults.
 
+`max_swap_used` is a **stock**, not a pressure: pages stay in swap until they
+are touched, so the ceiling only counts with a corroborating memory pressure
+(PSI memory above half its own ceiling); a host that cannot measure PSI keeps
+the old meaning. `max_mem_pressure` (PSI memory `some`, 60 s, 10 % by default)
+is the admission signal that follows the real pressure; an absent or unreadable
+threshold takes the default, it never removes the guard (#2296).
+
 - Before each turn, a crossed limit **holds new turns**; running turns finish.
 - A **critical** crossing pauses the agents of lowest `priority` (an `Agent`
   card key, 0 by default) that have no running turn, never in the middle of a
@@ -147,8 +154,9 @@ bytes or with a unit such as `1GiB`), else prudent defaults.
   of the guest (the agents' slice) and of the application (everything else),
   and the capacity the host could lend, computed on the application's
   consumption over 7 days. `max_cpu_pressure` (no default) holds new turns
-  above that CPU PSI. `ameesh hosts` shows them; relocation ranks a lending
-  host by its lendable memory.
+  above that CPU PSI; `max_mem_pressure` (10 % by default) does the same for
+  memory PSI. `ameesh hosts` shows them; relocation ranks a lending host by its
+  lendable memory.
 
 ## Host gate and durable withdrawal
 

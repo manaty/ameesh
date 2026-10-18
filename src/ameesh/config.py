@@ -254,10 +254,11 @@ class Config:
     #: #706 : au-dessus du plafond de tour par défaut (1800 s).
     session_max_turn_seconds: float = 3600.0
     session_min_turns: int = 3
-    #: plafond de contexte (L60) : au-delà de ce nombre de jetons d'entrée
-    #: relus (cache compris) au dernier tour, la session est tournée avant le
-    #: tour suivant ; réglable par agent (`ameesh set context_max_tokens=…`).
-    #: 0 = plafond désactivé.
+    #: plafond de contexte (L60) : au-delà de ce contexte — les jetons
+    #: d'entrée du dernier appel au modèle, cache lu et écrit compris —, la
+    #: session est tournée avant le tour suivant ; réglable par agent
+    #: (`ameesh set context_max_tokens=…`). La somme des relectures d'un tour
+    #: n'est pas la mesure (#2336). 0 = plafond désactivé.
     context_max_tokens: float = 15_000_000.0
     #: L105 : durée maximale d'un tour d'agent mené (secondes). Au-delà, le
     #: tour se clôt au prochain point sûr (fin de l'appel d'outil en cours) et
