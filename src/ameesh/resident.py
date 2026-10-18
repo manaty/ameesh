@@ -1624,8 +1624,12 @@ class AcpResident(ResidentDriver):
                 # difference with the reading before it (codex r1, #325), as
                 # for Claude; unknown for a resumed session without a base
                 if self.cost_base is not None:
-                    self._cost = (self._cost or 0.0) + max(
-                        client._last_cost - self.cost_base, 0.0)
+                    delta = client._last_cost - self.cost_base
+                    # L80a: an agent that restarts its cumulative on a resumed
+                    # session publishes a lower total; that total is the turn,
+                    # not zero (the durable base may come from another process).
+                    self._cost = (self._cost or 0.0) + (
+                        delta if delta >= 0 else client._last_cost)
                 self.cost_base = client._last_cost
                 self._cost_total = client._last_cost
         parsed = {"display": ["%s (%s)" % (adapters.END_OF_TURN_MARK, stop)]}

@@ -1267,7 +1267,10 @@ class CostBook:
             if event.get("parent_tool_use_id"):
                 continue             # L221 : ni la session ni le cumul d'un sous-agent
             kind = event.get("type")
-            ident = event.get("session_id") or event.get("thread_id")
+            if kind == RESIDENT_USAGE_EVENT:
+                ident = event.get("session")
+            else:
+                ident = event.get("session_id") or event.get("thread_id")
             if isinstance(ident, str) and ident:
                 current = ident
             if current != session:
@@ -1282,6 +1285,19 @@ class CostBook:
                          "cum_usage": [int(u.get("input_tokens", 0)),
                                        int(u.get("cached_input_tokens", 0)),
                                        int(u.get("output_tokens", 0))]}
+            elif kind == RESIDENT_USAGE_EVENT and harness != "claude":
+                # L80a : le dernier repère publié par un tour résident de la
+                # même session (base neuve, ou session reprise sous un autre
+                # agent) — le cumul USD d'ACP, celui du fil Codex.
+                total = _amount(event.get("cost_total"))
+                totals = event.get("usage_total")
+                if total is not None:
+                    found = {"session": session, "cum_usd": total, "cum_usage": None}
+                elif isinstance(totals, dict) and totals:
+                    found = {"session": session, "cum_usd": None,
+                             "cum_usage": [_num(totals, "input_tokens"),
+                                           _num(totals, "cached_input_tokens"),
+                                           _num(totals, "output_tokens")]}
         return found
 
     def resumed_session(self, agent: str, start: int) -> str | None:
@@ -1489,10 +1505,16 @@ class CostBook:
                                    time.time() if ended is None else ended) or triplet
         pin, pcache, pout = triplet or (0.0, 0.0, 0.0)
         tier = prompt_tier(prices, model) if not marque else None
+        # L80a : un tour résident Codex/ACP porte sa mesure dans un événement
+        # `resident.turn`, écrit depuis son TurnResult (le flux brut est du
+        # JSON-RPC). Il fait foi seul pour ce tour : les relevés natifs de la
+        # même tranche ne sont pas recomptés.
+        resident = _resident_event(events)
         cum = self.baseline(agent, harness, session)
         # L71 : session reprise sans relevé de l'agent — le dernier total CONNU
         # de la session (autre agent, ou flux local d'avant le tour) sert de repère.
-        if harness in ("claude", "codex") and session and cum.get("session") != session:
+        if (harness in ("claude", "codex") or resident is not None) \
+                and session and cum.get("session") != session:
             known = self.session_reading(agent, harness, session, start)
             if known:
                 cum = known
@@ -1501,14 +1523,11 @@ class CostBook:
         unknown_resume = (bool(session) and cum.get("session") != session
                           and self.resumed_session(agent, start) == session)
 
-        # L80a : un tour résident Codex/ACP porte sa mesure dans un événement
-        # `resident.turn`, écrit depuis son TurnResult (le flux brut est du
-        # JSON-RPC). Il fait foi seul pour ce tour : les relevés natifs de la
-        # même tranche ne sont pas recomptés.
-        resident = _resident_event(events)
         if resident is not None and harness != "claude":
             return _resident_turn_usage(agent, harness, modele, resident,
-                                        pin, pcache, pout, marque)
+                                        pin, pcache, pout, marque,
+                                        cum=cum, session=session,
+                                        unknown_resume=unknown_resume)
 
         if harness == "claude":
             # L221 : seuls les `result` du fil principal (pas d'un sous-agent,
@@ -1668,6 +1687,13 @@ class CostBook:
                     cum_input = int(last.get("input_tokens", 0))
                     cum_cached = int(last.get("cached_input_tokens", 0))
                     cum_out = int(last.get("output_tokens", 0))
+        if resident is not None and usage.harness != "claude":
+            # L80a : le coût USD cumulé d'une session résidente (ACP) est le
+            # repère durable du tour suivant, y compris après un redémarrage
+            # du processus qui a perdu sa base en mémoire.
+            total = _amount(resident.get("cost_total"))
+            if total is not None:
+                cum_usd = total
         usage = replace(usage, session=session_id or None)
         row = usage.row()
         row["turn"] = turn or usage.turn
@@ -2405,7 +2431,8 @@ def _resident_event(events: Iterable[dict]) -> dict | None:
 
 def _resident_turn_usage(agent: str, harness: str, modele: str, event: dict,
                          pin: float, pcache: float, pout: float,
-                         marque: dict) -> "TurnUsage":
+                         marque: dict, *, cum: dict, session: str | None,
+                         unknown_resume: bool) -> "TurnUsage":
     """La ligne d'un tour résident, lue sur son `resident.turn` (L80a).
 
     Codex publie `usage.last` : l'entrée du `TurnResult` est hors cache, le
@@ -2413,7 +2440,13 @@ def _resident_turn_usage(agent: str, harness: str, modele: str, event: dict,
     (`TurnUsage.input_tokens`), d'où la somme. Les autres harnais résidents
     (ACP) publient un contexte `used` et, souvent, un coût USD cumulé par
     session (`cost`/`cost_total`) : le coût du tour, quand il est là, fait foi
-    plutôt qu'un barème sur des jetons qui ne sont pas des jetons facturés."""
+    plutôt qu'un barème sur des jetons qui ne sont pas des jetons facturés.
+
+    Une reprise de processus (sommeil, réglages changés, redémarrage du
+    worker) perd la base en mémoire du pilote : `cost_total` seul reste alors
+    le cumul de la session, et son delta se calcule sur le dernier repère USD
+    **durable** de la même session (le grand livre), jamais sur zéro — sinon
+    le premier prompt d'une session reprise compterait tout son passé."""
     usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
     if harness == "codex":
         uncached = _num(usage, "input_tokens")
@@ -2428,13 +2461,30 @@ def _resident_turn_usage(agent: str, harness: str, modele: str, event: dict,
     input_tokens = _num(usage, "input_tokens")
     cached = _num(usage, "cache_read_input_tokens")
     output = _num(usage, "output_tokens")
-    cost = event.get("cost")
-    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
-        usd = max(float(cost), 0.0)
+    cost = _amount(event.get("cost"))
+    if cost is not None:
+        usd = max(cost, 0.0)
         mark = {}
     else:
-        usd = (input_tokens * pin + cached * pcache + output * pout) / 1e6
-        mark = marque if (input_tokens or cached or output) else {}
+        total = _amount(event.get("cost_total"))
+        usd = None
+        if total is not None:
+            base = None
+            if cum.get("session") == session and cum.get("cum_usd") is not None:
+                base = float(cum["cum_usd"])
+            elif not unknown_resume and cum.get("session") != session:
+                # session neuve : son cumul USD part de zéro
+                base = 0.0
+            if base is not None:
+                usd = total - base
+                if usd < 0:      # session rouverte : le cumul est reparti
+                    usd = total
+                mark = {}
+        if usd is None:
+            # Aucun repère USD durable : le tour se facture au barème sur ses
+            # jetons (le seul estimable), comme avant L80a.
+            usd = (input_tokens * pin + cached * pcache + output * pout) / 1e6
+            mark = marque if (input_tokens or cached or output) else {}
     return TurnUsage(agent, harness, modele, usd,
                      input_tokens=input_tokens,
                      cached_input_tokens=cached,
@@ -2739,6 +2789,13 @@ def _claude_account_tail(path: str) -> tuple[list, os.stat_result, bool]:
 def _num(usage: dict, key: str) -> int:
     value = usage.get(key) if isinstance(usage, dict) else None
     return int(value) if isinstance(value, (int, float)) else 0
+
+
+def _amount(value) -> float | None:
+    """Un montant USD exploitable, ou None (un booléen n'est pas un montant)."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
 
 
 def _sum(usages: Iterable[dict], key: str) -> int:

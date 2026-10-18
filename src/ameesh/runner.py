@@ -613,6 +613,10 @@ class AgentWorker(threading.Thread):
         self._account = None
         #: #1469 : le marqueur comptable du tour lancé par CE worker
         self._compta_travail: dict | None = None
+        #: L80a : `resident.turn` d'un tour que le disque n'a pas accepté —
+        #: gardés en mémoire jusqu'à leur écriture, pour que la comptabilité ne
+        #: règle jamais un tour dont l'usage n'a pas de source durable.
+        self._resident_usage_pending: list[dict] = []
         self._account_override = None
         #: L242b (3) : harnais emprunté par un agent critique au seuil sur le
         #: sien, `(harnais, compte ou None)`, et harnais imposé au tour de
@@ -3518,6 +3522,23 @@ class AgentWorker(threading.Thread):
         except OSError:
             return ""
 
+    def _resident_usage_flush(self) -> bool:
+        """Écrit l'événement `resident.turn` encore en attente (L80a).
+
+        Vrai quand il n'y a rien à écrire, ou quand l'écriture réussit. Un
+        échec garde l'événement **et** le marqueur comptable : la réparation
+        réessaie, et aucun tour suivant n'est autorisé tant que l'usage du
+        tour n'est pas lisible par le grand livre. Un flux Codex JSON-RPC ne
+        porte pas de `turn.completed` : sans cet événement, la ligne serait
+        réglée à zéro et la dépense perdue en silence."""
+        from . import resident_runner
+        while self._resident_usage_pending:
+            event = self._resident_usage_pending[0]
+            if not resident_runner.write_usage_event(self._path("events.jsonl"), event):
+                return False
+            self._resident_usage_pending.pop(0)
+        return True
+
     def _compta_en_attente(self) -> dict | None:
         """Le marqueur comptable **en base** (L13 B5, arbitrage mesh-design).
 
@@ -3640,6 +3661,11 @@ class AgentWorker(threading.Thread):
 
     def _compta_repare(self) -> None:
         """Avant un tour : rejoue le travail en attente ; `{}` suspend."""
+        if not self._resident_usage_flush():
+            self._compta_en_echec = True
+            log_async("[%s] resident usage event still not written: "
+                      "turn accounting stays suspended" % self.name)
+            return
         travail = self._compta_en_attente()
         if travail is None and self._compta_doute:
             # L72 : la suspension venait d'une base injoignable à la création
@@ -3712,6 +3738,14 @@ class AgentWorker(threading.Thread):
         Le modèle **annoncé par le flux** du harnais prime sur celui figé au
         lancement : c'est la source du tour (mesh-design, 0019 §3).
         """
+        # L80a : sans l'événement d'usage du tour résident, la ligne serait
+        # écrite à zéro (le flux Codex JSON-RPC n'a pas de `turn.completed`) et
+        # le marqueur soldé. On garde les deux : la réparation réessaiera.
+        if not self._resident_usage_flush():
+            self._compta_en_echec = True
+            log_async("[%s] resident usage event not persisted: turn accounting "
+                      "left pending" % self.name)
+            return
         # L72 : le tour a eu lieu ; sa ligne de grand livre attend la base
         # plutôt que d'être remise à une réparation ultérieure.
         travail = self._avec_reprise("turn accounting", self._compta_en_attente)
@@ -4953,6 +4987,28 @@ class AgentWorker(threading.Thread):
                 % (self.name, exc))
             return False
 
+    def _resident_cost_base(self, session: str | None) -> float | None:
+        """Le dernier cumul USD **durable** de la session résidente (L80a).
+
+        Un processus relancé sur la même session ACP (sommeil, réglages
+        changés, redémarrage du worker) a perdu sa base en mémoire : sans ce
+        repère, le premier prompt d'une session reprise compterait tout son
+        passé, ou retomberait sur un barème de jetons. Lu dans le grand livre,
+        jamais dans un fichier. Une lecture impossible laisse le pilote sans
+        base (le grand livre la retrouvera au calcul du tour)."""
+        if not session:
+            return None
+        try:
+            book = cost_mod.CostBook(
+                state_dir=self.cfg.state_dir, db=self.db,
+                tools={self.name: self._ledger_harness()})
+            base = book.baseline(self.name, self._ledger_harness(), session)
+        except Exception as exc:  # une base de repère ne casse pas le tour
+            log("[%s] resident cost baseline not read (%s)"
+                % (self.name, " ".join(str(exc).split())[:120]))
+            return None
+        return base.get("cum_usd") if base.get("session") == session else None
+
     def _resident_for_turn(self, adapter, *, key: tuple, session: str | None, cwd: str,
                            env: dict, model, effort, tier, lot, stderr_path: str):
         """Le processus résident qui sert ce tour : celui qui tourne si sa clé
@@ -4993,9 +5049,15 @@ class AgentWorker(threading.Thread):
             resident_runner.TURN_FILE_ENV: self._path(resident_runner.TURN_FILE),
         })
         stderr = open(stderr_path, "ab")
+        # L80a : une session ACP reprise garde son cumul USD d'un processus à
+        # l'autre ; la base durable est passée au pilote, qui calcule le delta
+        # du premier prompt comme celui des suivants.
+        protocol = (adapter.descriptor.resident or {}).get("protocol")
+        base_cout = self._resident_cost_base(session) if protocol == "acp" else None
         driver = resident.driver_for(
             adapter, cwd=cwd, session=session, model=model or None, effort=effort or None,
-            tier=tier or None, env=env, stderr=stderr, spawn=self._spawn_resident)
+            tier=tier or None, env=env, stderr=stderr, spawn=self._spawn_resident,
+            cost_base=base_cout)
         rp = resident_runner.ResidentProcess(driver, key=key, life_id=life_id, stderr=stderr)
         # L81 (étude §6.1) : le cumul de relu appartient à la session — un
         # processus relancé sur le même id (réveil après sommeil, réglages
@@ -5107,8 +5169,14 @@ class AgentWorker(threading.Thread):
         self._resident_reread_keep(rp)
         evenement = resident_runner.usage_event(
             rp.driver.protocol, fin, turn=self._turn_id or "")
-        resident_runner.write_usage_event(self._path("events.jsonl"), evenement)
         session = fin.session or rp.session
+        if evenement is not None and not resident_runner.write_usage_event(
+                self._path("events.jsonl"), evenement):
+            # L80a B2 : la mesure est gardée pour la réparation, le tour n'est
+            # pas comptablement complet et le marqueur comptable reste en base
+            # (`_compta_termine` ne le solde pas).
+            self._resident_usage_pending.append(evenement)
+            return 1, "resident usage event not written", session
         if fin.status == resident.COMPLETED:
             self._resident_failures = 0     # T2 : la série d'échecs est close
             return 0, None, session

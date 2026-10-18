@@ -591,6 +591,32 @@ class TurnAccountingTest(Sandbox, PgTestCase):
                                      "output_tokens": 0}})
         self.assertAlmostEqual(self.book().record("a1").usd, 0.30, places=9)
 
+    def test_acp_resident_turn_after_restart_uses_the_durable_cost_base(self):
+        # L80a B1: a restarted process has no in-memory `cost_base`; its first
+        # prompt carries only the cumulative `cost_total`. The turn is the delta
+        # against the last durable USD reading of the same session — not the
+        # whole cumulative history, nor a tariff on the context tokens.
+        self.agent("a1", "deepseek", "deepseek-flash")
+        book = self.book()
+        self.events("a1", {"type": "resident.turn", "protocol": "acp",
+                           "session": "sess-1", "status": "completed",
+                           "usage": {"input_tokens": 1234},
+                           "cost": 0.04, "cost_total": 0.04})
+        first = book.record("a1")
+        self.assertAlmostEqual(first.usd, 0.04, places=9)
+        self.assertAlmostEqual(book.baseline("a1", "deepseek", "sess-1")["cum_usd"],
+                               0.04, places=9)
+        # process restart: no delta in the event, only the cumulative reading
+        self.events("a1", {"type": "resident.turn", "protocol": "acp",
+                           "session": "sess-1", "status": "completed",
+                           "usage": {"input_tokens": 1234},
+                           "cost_total": 0.06})
+        second = book.record("a1", start=1)
+        self.assertAlmostEqual(second.usd, 0.02, places=9)
+        self.assertEqual(second.input_tokens, 1234)
+        self.assertAlmostEqual(book.baseline("a1", "deepseek", "sess-1")["cum_usd"],
+                               0.06, places=9)
+
     def test_a_resident_event_never_overrides_the_claude_stream(self):
         # L80a: Claude's stream still carries its own usage; a stray
         # `resident.turn` (never written for it) must not become its cost.

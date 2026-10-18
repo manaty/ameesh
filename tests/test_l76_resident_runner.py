@@ -401,6 +401,75 @@ class ResidentRunnerTest(PgTestCase):
         self.assertEqual([round(r["usd"], 6) for r in rows], [0.02, 0.02])
         self.assertEqual([r["input_tokens"] for r in rows], [1234, 1234])
 
+    def test_acp_resident_cost_base_survives_a_process_restart(self):
+        # L80a B1: sleep, changed settings or a worker restart close the process;
+        # the resumed ACP session has no in-memory cost base. The durable ledger
+        # reading of the same session (0.04) makes the first prompt of the new
+        # process carry its delta (0.06 - 0.04), not its whole history nor a
+        # token-tariff estimate.
+        _runner, worker = self._worker(doc=acp_doc(), harness="deepseek")
+        with mock.patch.dict(os.environ, {"FAKE_ACP_MODE": "normal",
+                                          "FAKE_ACP_COST": "0.04",
+                                          "FAKE_ACP_LOG": self.log}):
+            self.assertTrue(self._turn(worker, "avant"))
+        self.assertIsNotNone(worker.resident)
+        worker._close_resident("test: process restart")
+        self.assertIsNone(worker.resident)
+        with mock.patch.dict(os.environ, {"FAKE_ACP_MODE": "resume",
+                                          "FAKE_ACP_COST": "0.06",
+                                          "FAKE_ACP_LOG": self.log}):
+            self.assertTrue(self._turn(worker, "après"))
+        methods = [e.get("method") for e in self._trace()]
+        self.assertEqual(methods.count("session/new"), 1)
+        self.assertEqual(methods.count("session/resume"), 1)
+        events = self._usage_events(worker)
+        self.assertEqual(len(events), 2)
+        # the driver was restarted on the durable base, so it carries the delta
+        self.assertEqual([round(e["cost"], 6) for e in events], [0.04, 0.02])
+        self.assertEqual([round(e["cost_total"], 6) for e in events], [0.04, 0.06])
+        rows = self.db.query(
+            "SELECT usd::float8 AS usd, input_tokens, cum_usd::float8 AS cum_usd "
+            "FROM turn_costs WHERE agent = 'res1' ORDER BY id")
+        self.assertEqual([round(r["usd"], 6) for r in rows], [0.04, 0.02])
+        self.assertEqual([r["input_tokens"] for r in rows], [1234, 1234])
+        self.assertEqual([round(r["cum_usd"], 6) for r in rows], [0.04, 0.06])
+
+    def test_a_lost_resident_usage_event_is_repaired_not_settled_at_zero(self):
+        # L80a B2: the Codex JSON-RPC stream carries no `turn.completed`; if the
+        # `resident.turn` event cannot be written, settling the marker would
+        # book 0. The turn is not settled, the measurement and the marker stay,
+        # and the repair writes the event then the ledger line before the next
+        # turn is authorised.
+        _runner, worker = self._worker(doc=codex_doc(), harness="codex")
+        with mock.patch.object(resident_runner, "write_usage_event",
+                               return_value=False):
+            self.assertFalse(self._turn(worker, "perdu"))
+            # no next turn before the measurement is durable
+            self.assertFalse(worker.budget_ok())
+            self.assertIsNotNone(registry.pending_spend_get(self.db, "res1"))
+        self.assertTrue(worker._compta_en_echec)
+        self.assertIsNotNone(registry.pending_spend_get(self.db, "res1"))
+        self.assertEqual(len(worker._resident_usage_pending), 1)
+        self.assertEqual(self.db.query(
+            "SELECT count(*)::int AS n FROM turn_costs")[0]["n"], 0)
+        # repair: the kept event is written, then the accounting marker replays
+        self.assertTrue(worker._resident_usage_flush())
+        self.assertTrue(worker.budget_ok())
+        self.assertIsNone(registry.pending_spend_get(self.db, "res1"))
+        self.assertEqual(worker._resident_usage_pending, [])
+        rows = self.db.query(
+            "SELECT usd::float8 AS usd, input_tokens, cached_input_tokens, "
+            "output_tokens, cum_input_tokens FROM turn_costs "
+            "WHERE agent = 'res1' ORDER BY id")
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["usd"],
+                               (100 * 1.25 + 200 * 0.125 + 9 * 10.0) / 1e6,
+                               places=9)
+        self.assertEqual((rows[0]["input_tokens"], rows[0]["cached_input_tokens"],
+                          rows[0]["output_tokens"], rows[0]["cum_input_tokens"]),
+                         (300, 200, 9, 300))
+        self.assertEqual(len(self._usage_events(worker)), 1)
+
     def test_changed_settings_restart_on_the_session(self):
         _runner, worker = self._worker()
         self.assertTrue(self._turn(worker, "un"))
