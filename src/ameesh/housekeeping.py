@@ -1845,12 +1845,13 @@ def tmp_recovery_command(path: str) -> str:
     return " ; ".join(commands)
 
 
-def tmp_git_work(path: str) -> str:
+def tmp_git_work(path: str, rules=()) -> str:
     """#2493 (N2) : why a Git copy inside a temporary directory must be kept,
     empty when every copy is safe to recover: unlocked, readable, clean (no
-    modified or untracked file; ignored files go, as with `git worktree
-    remove`), pushed or integrated, for a clone also no unpushed local branch
-    nor stash, without submodules and with no process inside. A directory is never deleted merely because its
+    modified or untracked file, no ignored file outside the build output
+    `rules`, like the worktree pass), pushed or integrated, for a clone also
+    no unpushed local branch, stash nor other linked worktree, without
+    submodules and with no process inside. A directory is never deleted merely because its
     agent left the registry; this check is the second condition."""
     for copy in _git_copies(path):
         st = worktree_state(copy)
@@ -1866,7 +1867,20 @@ def tmp_git_work(path: str) -> str:
             return "%s: %s" % (copy, st["reason"] or "uncommitted changes")
         if not (st["pushed"] or st["integrated"]):
             return "%s: HEAD %s on no remote branch" % (copy, st["head"][:12] or "?")
+        # an ignored `.env` or dataset would go with the directory (relecture
+        # cx1 sur ab2a2c8c) ; only regenerable build output is exempt
+        leftovers = ignored_leftovers(copy, rules)
+        if leftovers is None:
+            return "%s: ignored files unreadable (git status --ignored)" % copy
+        if leftovers:
+            return "%s: %d ignored file(s) outside build artifacts (%s)" % (
+                copy, len(leftovers), leftovers[0])
         if os.path.isdir(os.path.join(copy, ".git")):
+            linked = _git(["worktree", "list", "--porcelain"], copy)
+            if linked is None or linked.returncode != 0:
+                return "%s: linked worktrees unreadable" % copy
+            if sum(line.startswith("worktree ") for line in linked.stdout.splitlines()) > 1:
+                return "%s: the clone has other linked worktrees" % copy
             # A clone takes its local branches and its stash with it (a linked
             # worktree leaves them in its common repository): HEAD alone does
             # not prove they are saved. Unreadable: a doubt, the copy stays.
@@ -3652,7 +3666,8 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                     # Sinon il reste, avec la raison et la commande à lancer.
                     git_repos: list[str] = []
                     if _git_copies(full):
-                        work = tmp_git_work(full)
+                        work = tmp_git_work(
+                            full, build_artifacts.rules_of(policy.artifacts))
                         if work:
                             command = tmp_recovery_command(full)
                             skipped.append("tmp %s kept: git work — %s ; inspect "

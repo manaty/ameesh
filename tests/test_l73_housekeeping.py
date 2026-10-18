@@ -778,9 +778,9 @@ class MenageDbTest(PgTestCase):
                                 if p.get("action") == "suppression"])
 
     def test_clone_avec_branche_locale_non_poussee_est_garde(self):
-        """#2493 (relecture dev7) : un clone emporte ses branches locales et
-        son stash ; HEAD propre et poussé ne suffit pas — une autre branche
-        aux commits jamais poussés, ou un stash, garde le dossier."""
+        """#2493 (relecture dev7, cx1) : un clone emporte ses branches
+        locales, son stash, ses fichiers ignorés et casse ses worktrees liés ;
+        HEAD propre et poussé ne suffit pas — chacun garde le dossier."""
         _sans_processus(self)
         pol = menage.Policy()
         troot = menage.tmp_root(self.cfgl, pol)
@@ -793,7 +793,15 @@ class MenageDbTest(PgTestCase):
                     _git("checkout", "-q", "main", cwd=c))),
                 ("a1+abcd9996", lambda c: (
                     _write(os.path.join(c, "brouillon.txt"), 10),
-                    _git("stash", "push", "-q", "-u", cwd=c)))):
+                    _git("stash", "push", "-q", "-u", cwd=c))),
+                # relecture cx1 : un fichier ignoré (.env) partirait avec le clone
+                ("a1+abcd9995", lambda c: (
+                    _write(os.path.join(c, ".git", "info", "exclude"), 0),
+                    open(os.path.join(c, ".git", "info", "exclude"), "w").write("*.env\n"),
+                    _write(os.path.join(c, "private.env"), 10))),
+                # un clone qui porte un autre worktree lié ailleurs
+                ("a1+abcd9994", lambda c: _git(
+                    "worktree", "add", "-q", c + "-lie", "-b", "lie", cwd=c))):
             root = os.path.join(troot, nom)
             os.makedirs(root)
             menage._write_owner(troot, nom, menage.mesh_key(self.cfgl),
