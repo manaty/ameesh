@@ -6,6 +6,10 @@
 Ici le verrou est tenu par un autre thread : `land_head` rend une erreur
 CloneBusy, laisse la ligne `queued` sans éjection ni courrier, libère le bail
 de la cible, puis le passage suivant atterrit normalement.
+
+#2435 : le verrou *englobant* est prouvé depuis un autre thread pendant
+`_land` (après `ensure()`, donc hors de son verrou interne) — retirer le
+`with replayer.locked()` de `land_head` fait alors échouer ce témoin.
 """
 from __future__ import annotations
 
@@ -13,7 +17,7 @@ import threading
 import unittest
 from unittest import mock
 
-from ameesh import radar, resolutions
+from ameesh import land, radar, resolutions
 
 from .test_l160b_radar import _git
 from .test_l160e2_land import _Land
@@ -54,6 +58,45 @@ class LandHeadBusyTest(_Land):
         out = self.land(4)
         self.assertEqual(out["result"], "landed", out)
         self.assertEqual(_git(self.origin, "rev-parse", "main^2"), self.tip(4))
+
+    def test_the_whole_landing_holds_the_clone_against_another_thread(self):
+        """#2435 : l'acquisition doit échouer *pendant* l'atterrissage.
+
+        Le témoin ci-dessus tient le verrou avant `land_head` : les verrous
+        internes de `Replayer.ensure()` suffiraient à produire CloneBusy, donc
+        en retirer l'englobant ne le faisait pas échouer. Ici on attend un
+        point situé après `ensure()` (son verrou interne est rendu, seul
+        l'englobant peut rester) : si `land_head` ne tient plus le clone, un
+        autre thread l'acquiert et l'assertion échoue.
+        """
+        self.queued(4)
+        clone = resolutions.Replayer(self.repo, radar.clone_dir(self.cfg, "p"))
+        inside = threading.Event()
+        release = threading.Event()
+        out = []
+        original = land._origin
+
+        def stalled_origin(project):
+            inside.set()  # `_land` est passé à `ensure()` : verrou interne rendu
+            self.assertTrue(release.wait(10), "the landing was never released")
+            return original(project)
+
+        with mock.patch.object(land, "_origin", stalled_origin):
+            thread = threading.Thread(target=lambda: out.append(self.land(4)))
+            thread.start()
+            try:
+                self.assertTrue(inside.wait(5), "the landing never reached _land")
+                try:
+                    with clone.locked(wait=0.05):
+                        grabbed = True
+                except resolutions.CloneBusy:
+                    grabbed = False
+            finally:
+                release.set()
+                thread.join(timeout=10)
+        self.assertFalse(thread.is_alive(), "the landing did not finish")
+        self.assertFalse(grabbed, "land_head released the clone during the landing")
+        self.assertEqual(out[0]["result"], "landed", out)
 
 
 if __name__ == "__main__":
