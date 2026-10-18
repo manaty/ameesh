@@ -166,7 +166,7 @@ class LotSessions(interface.LotSessions):
             (name, int(lot), None if activity_ts is None else float(activity_ts)))
         return rows[0] if rows else {}
 
-    def due_wakes(self, name, now):
+    def due_wakes(self, name, now, claim_ttl_s=120.0):
         if not has_wake_at(self.db):
             return []
         return self.db.query(
@@ -178,11 +178,14 @@ class LotSessions(interface.LotSessions):
                AND w.state NOT IN """ + _CLOSED + """
                AND w.wake_at IS NOT NULL
                AND w.wake_at <= to_timestamp(%s)
+               AND (w.wake_claim_at IS NULL
+                    OR w.wake_claim_at < clock_timestamp() - make_interval(secs => %s))
              ORDER BY w.wake_at ASC, w.priority ASC NULLS LAST, w.id ASC
             """,
-            (name, float(now)))
+            (name, float(now), float(claim_ttl_s)))
 
-    def take_wake(self, name, lot, now):
+    def claim_wake(self, name, lot, now, claim_ttl_s=120.0):
+        """#2466 : bail de livraison du réveil ; l'échéance reste armée."""
         if not has_wake_at(self.db):
             return None
         lot = int(lot)
@@ -194,23 +197,39 @@ class LotSessions(interface.LotSessions):
                 " WHERE id = %s AND assignee = %s"
                 "   AND state NOT IN " + _CLOSED +
                 "   AND wake_at IS NOT NULL AND wake_at <= to_timestamp(%s)"
+                "   AND (wake_claim_at IS NULL"
+                "        OR wake_claim_at < clock_timestamp() - make_interval(secs => %s))"
                 " FOR NO KEY UPDATE",
-                (lot, name, float(now)))
+                (lot, name, float(now), float(claim_ttl_s)))
             if not rows:
                 return None
             row = rows[0]
             now_ts = float(now)
-            tx.execute("UPDATE work_items SET wake_at = NULL, updated_at = now()"
+            tx.execute("UPDATE work_items SET wake_claim_at = clock_timestamp()"
                        " WHERE id = %s", (lot,))
             tx.execute(
                 "INSERT INTO work_item_events (work_item_id, state, note, actor)"
                 " VALUES (%s, %s, %s, %s)",
                 (lot, row["state"],
-                 "wake: scheduled wake fired at %s (due %s)"
+                 "wake: scheduled wake delivered at %s (due %s)"
                  % (_moment(now_ts), _moment(row["wake_ts"])),
                  "ameesh"))
             return {"id": row["id"], "state": row["state"], "title": row["title"],
                     "wake_ts": float(row["wake_ts"])}
+
+    def consume_wake(self, name, lot, wake_ts):
+        """#2466 : le harnais du tour est lancé — l'échéance réclamée est
+        consommée ; une échéance reposée entre-temps est conservée."""
+        if not has_wake_at(self.db):
+            return False
+        rows = self.db.query(
+            "UPDATE work_items SET wake_at = NULL, wake_claim_at = NULL,"
+            "       updated_at = now()"
+            " WHERE id = %s AND assignee = %s"
+            "   AND abs(extract(epoch from wake_at) - %s::float8) < 0.001"
+            "   AND wake_claim_at IS NOT NULL"
+            " RETURNING id", (int(lot), name, float(wake_ts)))
+        return bool(rows)
 
     def purge(self, name=None):
         """Supprime les lignes des lots fusionnés, livrés ou fermés, ou qui ne

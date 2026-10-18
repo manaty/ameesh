@@ -310,14 +310,20 @@ class StockageTest(_Base):
         rows = self.st.due_wakes("aw", now + 61)
         self.assertEqual([(r["id"], r["title"]) for r in rows],
                          [(lot, "séance owner")])
-        taken = self.st.take_wake("aw", lot, now + 61)
+        taken = self.st.claim_wake("aw", lot, now + 61)
         self.assertEqual((taken["id"], taken["state"]), (lot, "build"))
-        self.assertIsNone(self.st.take_wake("aw", lot, now + 61), "une seule fois")
+        self.assertIsNone(self.st.claim_wake("aw", lot, now + 61),
+                          "un claim en cours écarte une seconde délivrance")
         self.assertEqual(self.st.due_wakes("aw", now + 61), [])
-        self.assertIsNone(work.get(self.db, lot)["wake_ts"])
+        self.assertIsNotNone(work.get(self.db, lot)["wake_ts"],
+                             "l'échéance n'est pas consommée par la délivrance")
         event = work.events(self.db, lot)[0]
         self.assertEqual(event["actor"], "ameesh")
-        self.assertTrue(event["note"].startswith("wake: scheduled wake fired"))
+        self.assertTrue(event["note"].startswith("wake: scheduled wake delivered"))
+        self.assertTrue(self.st.consume_wake("aw", lot, taken["wake_ts"]))
+        self.assertIsNone(work.get(self.db, lot)["wake_ts"])
+        self.assertFalse(self.st.consume_wake("aw", lot, taken["wake_ts"]),
+                         "une seule consommation")
         self.assertNotIn(lot, [r["id"] for r in self.st.actionable("aw")],
                          "le témoin wake: ne lève pas la retenue hold:")
 
@@ -333,8 +339,43 @@ class StockageTest(_Base):
         work.note(self.db, lot, "hold: reprise à la séance", actor="aw2",
                   wake_ts=now - 1)
         self.assertEqual([r["id"] for r in self.st.due_wakes("aw2", now)], [lot])
-        taken = self.st.take_wake("aw2", lot, now)
+        taken = self.st.claim_wake("aw2", lot, now)
         self.assertEqual(taken["state"], "waiting_human")
+        self.assertTrue(self.st.consume_wake("aw2", lot, taken["wake_ts"]))
+
+    def test_claim_expire_redelivre_le_reveil(self):
+        """#2466 B1 : un claim non consommé (drainage, arrêt, panne avant
+        lancement) expire et le réveil est délivré de nouveau — jamais perdu."""
+        self.bail("aw5")
+        lot = work.add(self.db, title="séance owner", assignee="aw5",
+                       force=_FORCE)["id"]
+        now = time.time()
+        work.schedule_wake(self.db, lot, now - 1, text="séance",
+                           actor="orchestrateur")
+        self.assertEqual([r["id"] for r in self.st.due_wakes("aw5", now)], [lot])
+        self.assertIsNotNone(self.st.claim_wake("aw5", lot, now, claim_ttl_s=60))
+        self.assertEqual(self.st.due_wakes("aw5", now, claim_ttl_s=60), [],
+                         "claim en cours : pas de seconde délivrance")
+        self.db.execute("UPDATE work_items SET wake_claim_at ="
+                        " now() - interval '2 minutes' WHERE id = %s", (lot,))
+        self.assertEqual([r["id"] for r in self.st.due_wakes("aw5", now,
+                                                            claim_ttl_s=60)],
+                         [lot], "claim expiré : délivré de nouveau")
+
+    def test_consume_ne_detruit_pas_une_echeance_reposee(self):
+        """#2466 : une échéance reposée entre le claim et le lancement n'est
+        pas effacée par la consommation du claim précédent."""
+        self.bail("aw6")
+        lot = work.add(self.db, title="séance owner", assignee="aw6",
+                       force=_FORCE)["id"]
+        now = time.time()
+        work.schedule_wake(self.db, lot, now - 1, text="", actor="pilot")
+        taken = self.st.claim_wake("aw6", lot, now)
+        self.assertIsNotNone(taken)
+        work.schedule_wake(self.db, lot, now + 3600, text="report", actor="pilot")
+        self.assertFalse(self.st.consume_wake("aw6", lot, taken["wake_ts"]))
+        self.assertAlmostEqual(work.get(self.db, lot)["wake_ts"], now + 3600,
+                               delta=2)
 
     def test_reveil_programme_remplace_et_annule(self):
         self.bail("aw3")
@@ -1012,9 +1053,10 @@ class ReveilTest(_Base):
         work.note(self.db, b, "hold: attend l'hôte de test", actor="r6")
         self.assertIsNone(self.pick(worker))
 
-    def test_reveil_programme_consomme_et_temoigne(self):
-        """#2466 : un réveil programmé échu réveille l'agent même sous hold,
-        une seule fois, et laisse une ligne `wake:` au journal."""
+    def test_reveil_programme_delivre_puis_consomme(self):
+        """#2466 : un réveil programmé échu réveille l'agent même sous hold ;
+        la délivrance (claim + témoin `wake:`) ne consomme l'échéance qu'au
+        lancement du harnais."""
         worker = self._worker("r7")
         lot = work.add(self.db, title="séance owner", assignee="r7",
                        force=_FORCE)["id"]
@@ -1024,14 +1066,42 @@ class ReveilTest(_Base):
         spec = self.pick(worker)
         self.assertEqual((spec["kind"], spec["lot"]), ("idle", str(lot)))
         self.assertIn("Scheduled wake", spec["prompt"])
-        self.assertIsNone(work.get(self.db, lot)["wake_ts"])
+        self.assertIsNotNone(work.get(self.db, lot)["wake_ts"],
+                             "la délivrance ne consomme pas l'échéance")
         self.assertTrue(work.events(self.db, lot)[0]["note"].startswith(
-            "wake: scheduled wake fired"))
+            "wake: scheduled wake delivered"))
+        worker._turn_launched = True
+        worker._consume_scheduled_wake(spec)
+        self.assertIsNone(work.get(self.db, lot)["wake_ts"])
         worker._scheduled_wake_checked = float("-inf")
         self.assertIsNone(worker._scheduled_wake_spec(), "l'échéance ne se rejoue pas")
-        fired = [e for e in work.events(self.db, lot)
-                 if e["note"].startswith("wake: scheduled wake fired")]
-        self.assertEqual(len(fired), 1)
+        consumed = [e for e in work.events(self.db, lot)
+                    if e["note"].startswith("wake: scheduled wake delivered")]
+        self.assertEqual(len(consumed), 1)
+
+    def test_reveil_programme_perdu_au_drainage_est_redelivre(self):
+        """#2466 B1 (cx2) : si le drainage refuse le tour entre le choix et le
+        lancement, le claim expire et le réveil est délivré de nouveau."""
+        worker = self._worker("r7b")
+        lot = work.add(self.db, title="séance owner", assignee="r7b",
+                       force=_FORCE)["id"]
+        work.note(self.db, lot, "hold: séance owner", actor="r7b",
+                  wake_ts=time.time() - 1)
+        spec = self.pick(worker)
+        self.assertEqual(spec["lot"], str(lot))
+        worker.runner.draining.set()
+        self.assertFalse(worker.run_turn(spec), "le drainage refuse le tour")
+        self.assertIsNotNone(work.get(self.db, lot)["wake_ts"],
+                             "l'échéance survit au tour refusé")
+        self.db.execute("UPDATE work_items SET wake_claim_at ="
+                        " now() - interval '10 minutes' WHERE id = %s", (lot,))
+        worker._scheduled_wake_checked = float("-inf")
+        again = worker._scheduled_wake_spec()
+        self.assertIsNotNone(again, "claim expiré : le réveil revient")
+        self.assertEqual(again["lot"], str(lot))
+        delivered = [e for e in work.events(self.db, lot)
+                     if e["note"].startswith("wake: scheduled wake delivered")]
+        self.assertEqual(len(delivered), 2, "chaque délivrance a son témoin")
 
     def test_reveil_programme_resiste_a_lot_wake_off(self):
         worker = self._worker("r8", lot_wake=False)
@@ -1220,3 +1290,4 @@ class WakeGrantTest(unittest.TestCase):
             text = fh.read()
         block = text.split("('work_items', ARRAY[", 1)[1].split("]),", 1)[0]
         self.assertIn("'wake_at'", block)
+        self.assertIn("'wake_claim_at'", block)

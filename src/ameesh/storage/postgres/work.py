@@ -79,17 +79,20 @@ def has_reviewer(db) -> bool:
 
 
 def has_wake_at(db) -> bool:
-    """#2466 : `work_items.wake_at` existe-t-elle (migration 0466) ?
+    """#2466 : les colonnes `wake_at`/`wake_claim_at` existent-elles (0466) ?
 
     Même règle que `has_reviewer` : seule la réponse positive est mise en
-    cache ; un exécuteur démarré avant la migration voit la colonne dès
-    qu'elle est appliquée, sans redémarrage."""
+    cache ; un exécuteur démarré avant la migration voit les colonnes dès
+    qu'elles sont appliquées, sans redémarrage. Les deux colonnes viennent de
+    la même migration : les exiger ensemble évite d'utiliser un schéma
+    intermédiaire (wake_at seul) avec le code du claim."""
     if getattr(db, "_has_wake_at", False):
         return True
-    found = bool(db.query(
-        "SELECT 1 AS ok FROM information_schema.columns"
+    rows = db.query(
+        "SELECT count(*)::int AS n FROM information_schema.columns"
         " WHERE table_schema = current_schema() AND table_name = 'work_items'"
-        "   AND column_name = 'wake_at'"))
+        "   AND column_name IN ('wake_at', 'wake_claim_at')")
+    found = bool(rows) and int(rows[0]["n"]) == 2
     if found:
         try:
             db._has_wake_at = True
@@ -1376,8 +1379,9 @@ class WorkItems(interface.WorkItems):
             # l'échéance est écrite avec la note : jamais une retenue dont
             # l'échéance s'est perdue.
             tx.execute(
-                "UPDATE work_items SET wake_at = to_timestamp(%s), updated_at = now()"
-                " WHERE id = %s", (float(wake_ts), int(item_id)))
+                "UPDATE work_items SET wake_at = to_timestamp(%s),"
+                "       wake_claim_at = NULL, updated_at = now() WHERE id = %s",
+                (float(wake_ts), int(item_id)))
 
     def schedule_wake(self, item_id, wake_ts, *, text, actor) -> dict | None:
         """#2466 : pose (ou efface) le réveil programmé et journalise, atomique."""
@@ -1398,12 +1402,13 @@ class WorkItems(interface.WorkItems):
                 "VALUES (%s, %s, %s, %s)",
                 (item_id, rows[0]["state"], text or "", actor or ""))
             if wake_ts is None:
-                tx.execute("UPDATE work_items SET wake_at = NULL, updated_at = now()"
+                tx.execute("UPDATE work_items SET wake_at = NULL,"
+                           "       wake_claim_at = NULL, updated_at = now()"
                            " WHERE id = %s", (item_id,))
             else:
                 tx.execute("UPDATE work_items SET wake_at = to_timestamp(%s),"
-                           "       updated_at = now() WHERE id = %s",
-                           (float(wake_ts), item_id))
+                           "       wake_claim_at = NULL, updated_at = now()"
+                           " WHERE id = %s", (float(wake_ts), item_id))
         return self.get(item_id)
 
     def log_review_attempt(self, item_id, state, text, actor) -> None:

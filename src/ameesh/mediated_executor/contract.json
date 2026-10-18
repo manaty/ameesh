@@ -4576,7 +4576,8 @@
     "purge",
     "switch",
     "due_wakes",
-    "take_wake"
+    "claim_wake",
+    "consume_wake"
    ],
    "host_lifecycle": [
     "agents",

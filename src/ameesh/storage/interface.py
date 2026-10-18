@@ -3765,21 +3765,32 @@ class LotSessions(Domain):
         Rend la ligne."""
 
     @abc.abstractmethod
-    def due_wakes(self, name: str, now: float) -> list[dict]:
+    def due_wakes(self, name: str, now: float, claim_ttl_s: float = 120.0) -> list[dict]:
         """#2466 : les réveils programmés échus des lots encore ouverts de
         `name`, par échéance puis priorité : `id`, `title`, `state`,
         `priority`, `wake_ts`. Un réveil programmé est un rendez-vous
         explicite : il ne dépend ni de l'état `intake`/`build`, ni d'une note
         `hold:`, ni d'une décision ouverte — seulement de l'assignation et de
-        l'échéance. Une base d'avant 0466 rend une liste vide."""
+        l'échéance. Un claim plus récent que `claim_ttl_s` écarte le lot : sa
+        livraison est en cours. Une base d'avant 0466 rend une liste vide."""
 
     @abc.abstractmethod
-    def take_wake(self, name: str, lot: int, now: float) -> dict | None:
-        """#2466 : consomme le réveil programmé échu du lot, dans une
-        transaction : l'échéance est effacée (une seule fois), le journal du
-        lot reçoit une ligne `wake:` de l'acteur `ameesh` (témoin du
-        déclenchement). Rend `{id, state, title, wake_ts}` ou None si le lot
-        n'a plus de réveil échu, n'est plus assigné à `name` ou est fini."""
+    def claim_wake(self, name: str, lot: int, now: float,
+                   claim_ttl_s: float = 120.0) -> dict | None:
+        """#2466 : réclame le réveil programmé échu du lot (bail de livraison),
+        dans une transaction : `wake_claim_at` est posé et le journal reçoit
+        une ligne `wake: … delivered …` (témoin de la délivrance). Rend
+        `{id, state, title, wake_ts}` ou None si le lot n'a plus de réveil
+        échu, est déjà réclamé, n'est plus assigné à `name` ou est fini.
+        L'échéance n'est pas effacée : `consume_wake` le fera au lancement du
+        tour, un claim non consommé expirant après `claim_ttl_s`."""
+
+    @abc.abstractmethod
+    def consume_wake(self, name: str, lot: int, wake_ts: float) -> bool:
+        """#2466 : consomme le réveil programmé délivré : efface `wake_at` et
+        `wake_claim_at` (une seule fois), **seulement** si l'échéance est
+        encore celle qui a été réclamée (`wake_ts`) et sous claim — une
+        nouvelle échéance posée entre-temps est conservée. Rend False sinon."""
 
     @abc.abstractmethod
     def purge(self, name: str | None = None) -> list[dict]:

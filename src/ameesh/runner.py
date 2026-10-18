@@ -4310,6 +4310,9 @@ class AgentWorker(threading.Thread):
 
     #: #2466 : intervalle minimal entre deux lectures des réveils programmés
     SCHEDULED_WAKE_CHECK_S = 10.0
+    #: #2466 : bail de livraison d'un réveil ; non consommé (drainage, arrêt,
+    #: panne avant lancement), il expire et le réveil est délivré de nouveau
+    WAKE_CLAIM_TTL = 120.0
 
     def _scheduled_wake_spec(self) -> dict | None:
         """#2466 : réveil programmé échu d'un lot de l'agent.
@@ -4317,12 +4320,16 @@ class AgentWorker(threading.Thread):
         Une échéance posée par `ameesh work wake` (ou la note `hold:` d'un
         rendez-vous, `--wake-at`) est un rendez-vous explicite : elle réveille
         l'assigné même si le lot est tenu par une note `hold:` ou n'est pas
-        actionnable (`waiting_human`, `blocked`). L'échéance est consommée en
-        une fois (`take_wake`) et le lot reçoit une ligne `wake:` au journal,
-        témoin du déclenchement. Le réglage `lot_wake=off` ne l'éteint pas :
-        c'est un geste posé, pas une relance d'inactivité. Les gardes de
-        `_pick` (arrêt, budget, porte et pression d'hôte, authentification)
-        sont déjà passées ; un lot sans dossier reste armé (#811)."""
+        actionnable (`waiting_human`, `blocked`). La délivrance est un **bail**
+        (`claim_wake`, `wake_claim_at`) et non une consommation : l'échéance
+        reste armée jusqu'au lancement effectif du harnais, et un claim non
+        consommé expire puis est délivré de nouveau — un drainage ou un arrêt
+        entre le choix du tour et son lancement ne perd plus le rendez-vous
+        (#2466 B1). Le lot reçoit une ligne `wake:` au journal par délivrance,
+        témoin. Le réglage `lot_wake=off` ne l'éteint pas : c'est un geste
+        posé, pas une relance d'inactivité. Les gardes de `_pick` (arrêt,
+        budget, porte et pression d'hôte, authentification) sont déjà passées ;
+        un lot sans dossier reste armé (#811)."""
         if storage.is_remote(self.db):
             # L109 : le contrat de l'exécuteur médié ne porte pas encore
             # l'échéance de lot ; le réveil reste porté par un exécuteur local.
@@ -4334,23 +4341,48 @@ class AgentWorker(threading.Thread):
         st = storage.of(self.db).lot_sessions
         now = time.time()
         try:
-            for row in st.due_wakes(self.name, now):
+            for row in st.due_wakes(self.name, now, self.WAKE_CLAIM_TTL):
                 if self._lot_workdir_blocked(row["id"]):
                     continue
-                taken = st.take_wake(self.name, int(row["id"]), now)
+                taken = st.claim_wake(self.name, int(row["id"]), now,
+                                      self.WAKE_CLAIM_TTL)
                 if not taken:
                     continue
                 when = time.strftime("%Y-%m-%d %H:%M %Z",
                                      time.localtime(float(taken["wake_ts"])))
-                log_async("[%s] scheduled wake for lot #%s fired (due %s)"
+                log_async("[%s] scheduled wake for lot #%s claimed (due %s)"
                           % (self.name, taken["id"], when))
                 return {"kind": "idle", "ids": [], "lot": str(taken["id"]),
+                        "scheduled_wake": {"lot": str(taken["id"]),
+                                           "wake_ts": float(taken["wake_ts"])},
                         "prompt": adapters.SCHEDULED_WAKE_PROMPT % {
                             "id": int(taken["id"]), "title": taken.get("title") or "",
                             "state": taken["state"], "when": when}}
         except db_mod.DbError as exc:
             log_async("[%s] scheduled wakes unreadable (%s)" % (self.name, exc))
         return None
+
+    def _consume_scheduled_wake(self, spec: dict) -> None:
+        """#2466 : le harnais du tour est parti — l'échéance est consommée.
+
+        Appelé au lancement (`Popen` ou processus résident) : si le tour n'a
+        pas été lancé (drainage, garde, dossier, session), le claim reste et
+        expirera, puis le réveil sera délivré de nouveau — jamais perdu. Une
+        consommation impossible laisse le claim expirer : un doublon signalé
+        plutôt qu'une perte."""
+        reveil = spec.get("scheduled_wake")
+        if not reveil or not getattr(self, "_turn_launched", False):
+            return
+        lot = int(reveil["lot"])
+        try:
+            if storage.of(self.db).lot_sessions.consume_wake(
+                    self.name, lot, float(reveil["wake_ts"])):
+                log_async("[%s] scheduled wake for lot #%s consumed"
+                          % (self.name, lot))
+        except db_mod.DbError as exc:
+            log_async("[%s] scheduled wake for lot #%s not consumed (%s): it will "
+                      "be redelivered when its claim expires"
+                      % (self.name, lot, exc))
 
     def _lot_wake_spec(self) -> dict | None:
         """Règle 1 (#408) : l'agent au repos depuis plus de `mail_batch` +
@@ -5454,6 +5486,10 @@ class AgentWorker(threading.Thread):
         return texte
 
     def _run_turn(self, spec: dict) -> bool:
+        #: #2466 : vrai dès que le harnais du tour est réellement lancé (Popen
+        #: ou processus résident) ; l'échéance d'un réveil programmé n'est
+        #: consommée qu'à ce moment.
+        self._turn_launched = False
         if spec.get("lot_switch_failed"):
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             return False
@@ -5857,6 +5893,9 @@ class AgentWorker(threading.Thread):
                         adapter, key=cle_resident, session=session, cwd=cwd, env=env,
                         model=model, effort=effort, tier=tier, lot=lot_du_tour,
                         stderr_path=stderr_path)
+                    if rp is not None:
+                        self._turn_launched = True
+                        self._consume_scheduled_wake(spec)
                 if rp is None:
                     # L498 : le cgroup délégué ne concerne que le lancement d'un
                     # harnais par événement ; le processus résident (L76) sert
@@ -5897,6 +5936,8 @@ class AgentWorker(threading.Thread):
                                 start_new_session=True,  # son groupe : on peut le tuer en entier
                                 pass_fds=(ready_w,) if ready_w is not None else (),
                             )
+                            self._turn_launched = True
+                            self._consume_scheduled_wake(spec)
                             self.runner.harness_pids.add(proc.pid)
                     except RuntimeError as exc:
                         raise _LancementImpossible(str(exc)) from exc
