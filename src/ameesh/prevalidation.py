@@ -69,7 +69,8 @@ CAUSES = (
     "plan-path-conflict",   # un parent du plan est un fichier au SHA (conflit D/F, #1820)
     "selection-full",     # le plan retombe sur la suite complète : refus, jamais de repli
     "head-moved",         # le plan ne porte pas la tête candidate exacte
-    "no-vm",              # VM absente, injoignable, job refusé ou arrêté (offload 75)
+    "no-vm",              # VM absente, injoignable, job refusé (offload 75)
+    "gate-preempted",     # le run a été arrêté par la porte de l'hôte (drain), pas une VM
     "run-red",            # la sélection est rouge
     "run-incomplete",     # timeout, annulation, part sans fin : inexploitable (124/130/70)
     "transport-lost",     # connexion perdue, résultat non authentifié
@@ -115,6 +116,9 @@ SECONDS_MARK = "ameesh-prevalidation-seconds="
 PART_MARK = "ameesh-prevalidation-part="
 _SECONDS_RE = re.compile(r"^%s(\d+)\s*$" % re.escape(SECONDS_MARK), re.M)
 _PART_RE = re.compile(r"^%s([A-Za-z0-9_.:-]+)\s*$" % re.escape(PART_MARK), re.M)
+#: note du client offload quand la porte de l'hôte arrête un run (drain)
+_GATE_STOP_RE = re.compile(r"^ameesh offload: stopped on .*: host (?:stopped|draining)\b",
+                           re.M)
 
 
 def _same_commit(a: str | None, b: str | None) -> bool:
@@ -564,10 +568,16 @@ def classify(exit_code: int, output: str = "") -> str:
     """Le sort du run depuis le code de sortie de l'offload (contrat L159b).
 
     Le code 75 couvre l'absence d'hôte, le refus/arrêt du job **et** la
-    connexion perdue : les notes de l'offload les distinguent."""
+    connexion perdue : les notes de l'offload les distinguent. Un run arrêté
+    par la porte de l'hôte (drain, `stopped on … host stopped|draining`) est
+    une `gate-preempted`, jamais un `no-vm` : la VM existe, c'est l'hôte qui a
+    préempté le run (#2298)."""
     code = int(exit_code)
-    if code == 75 and "lost the connection" in (output or ""):
+    output = output or ""
+    if code == 75 and "lost the connection" in output:
         return "transport-lost"
+    if code == 75 and _GATE_STOP_RE.search(output):
+        return "gate-preempted"
     return RUN_OUTCOMES.get(code, "run-incomplete")
 
 
@@ -636,7 +646,9 @@ def run_offload(host: str, command: str, *, timeout: int | None = None,
                         profile=profile, executable=executable)
     started = time.time()
     proc = runner(argv, cwd=cwd, env=env, capture_output=True, text=True)
-    output = (getattr(proc, "stdout", "") or "") + (getattr(proc, "stderr", "") or "")
+    # Les flux ont des lignes indépendantes, même sans saut final sur stdout.
+    output = "\n".join((getattr(proc, "stdout", "") or "",
+                        getattr(proc, "stderr", "") or ""))
     result = {"outcome": classify(proc.returncode, output), "exit": int(proc.returncode),
               "host": host, "flow": parse_flow(output)}
     result["seconds"] = parse_seconds(output)
