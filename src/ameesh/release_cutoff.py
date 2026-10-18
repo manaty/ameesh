@@ -1287,6 +1287,12 @@ def execute(cfg, db, project: ProjectRelease, *, now: float | None = None,
     if not force and due_slot is None:
         return {"result": "not-due", "cutoff_at": at, "label": label}
     if not force and due_slot and due_slot.get("missed"):
+        fetch(project.repo, project.remote, project.target)
+        if recent_tag(project.repo, "%s/%s" % (project.remote, project.target), at, now):
+            # This cutoff's tag is published (staging lock or crash after the
+            # push): reconcile it late, never report "nothing published".
+            due_slot = dict(due_slot, missed=False)
+    if not force and due_slot and due_slot.get("missed"):
         state_slot["last_cutoff"] = at
         state_slot["last_result"] = "missed"
         state_slot["last_label"] = label

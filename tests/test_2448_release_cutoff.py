@@ -271,6 +271,17 @@ class ReleaseFixture(unittest.TestCase):
                          first["release_sha"])
         self.assertEqual(self.git(self.clone, "tag", "--list", "v1.11.8"), "v1.11.8")
 
+    def test_published_tag_after_the_window_is_reconciled_not_missed(self):
+        """Staging busy (75) after the push, window over: staged late, not "missed"."""
+        with mock.patch.object(release_cutoff, "maybe_staging",
+                               return_value={"exit": 75}):
+            with self.assertRaises(release_cutoff.ReleaseBusy):
+                self.execute()
+        later = self.execute(now=_paris(11, 45))
+        self.assertEqual(later["result"], "reconciled", later)
+        self.assertEqual(later["version"], "1.11.8")
+        self.assertEqual(later["staging"]["exit"], 0)
+
     def test_red_head_releases_last_green_with_a_landing_merge(self):
         green = self.head
         self.write("red.txt", "red\n")
