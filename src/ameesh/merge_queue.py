@@ -758,7 +758,7 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     if needs_commit_ci:
         if parts is None and getattr(project, "ci_parts", None):
             parts = _parts_reader(project, repo, target, tip, clone, cfg=cfg)
-        _required_ci(project, tip, commit_ci, parts=parts)
+        _required_ci(project, tip, commit_ci, parts=parts, branch=row["branch"])
         proof = getattr(parts, "proof", None)
     return {"target": target, "frozen_sha": tip, "frozen_id": freeze["id"],
             "pr": (status or {}).get("number"), "class": klass.get("class"),
@@ -771,12 +771,16 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
               tip: str, *, cfg=None, base: str | None = None) -> dict:
     """La classe du lot pour la file (L539) : lue là où la tête gelée vit.
 
-    La classe se lit entre la cible **fraîche** et la tête gelée. La cible
-    fraîche vient de l'admission (`base`, le commit récupéré par `readiness`),
-    sinon de la cible que le radar a récupérée sous `QUEUE_REF` dans son clone ;
-    à défaut seulement, de `origin/<cible>` du dépôt des agents, puis de sa
-    cible locale. La copie `origin/<cible>` du clone `--shared` n'est jamais
-    une borne : c'est la cible locale périmée de sa source (#2207, P2-1).
+    La classe se lit entre la cible **fraîche** et la tête gelée. Seul `base`
+    est une cible fraîche : le commit que l'appelant vient de récupérer
+    (`readiness`), ou `target` quand il nomme déjà un commit. Sinon, la borne
+    est la cible que le radar a laissée sous `QUEUE_REF` dans son clone, à défaut
+    `origin/<cible>` du dépôt des agents, puis sa cible locale : c'est la
+    cible du **dernier** fetch connu, que rien ne prouve fraîche — un fetch
+    antérieur, une cible supprimée depuis sur origin (le fetch ne nettoie pas)
+    ou déjà avancée par la fusion du lot. La lecture garde sa classe, mais son
+    `why` le dit (#2379). La copie `origin/<cible>` du clone `--shared` n'est
+    jamais une borne : c'est la cible locale périmée de sa source (#2207, P2-1).
 
     Toutes les lectures comparées portent sur **la même** cible fraîche : une
     source qui ne la porte pas (référence périmée, objet absent) est écartée
@@ -832,6 +836,11 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
                                    head=tip)
         if best is None or _class_worse(current, best):
             best = current
+    if (target and base is None and best is not None
+            and not _HEX.fullmatch(target.strip().lower())):
+        best = dict(best, why="%s; borne %s non prouvée fraîche (dernier fetch connu, "
+                    "aucune cible récupérée par l'appelant)"
+                    % (best.get("why") or "?", best.get("target") or target))
     return best
 
 
@@ -890,7 +899,8 @@ def _parts_reader(project, repo: str, target: str, sha: str, clone, cfg=None):
     return reader
 
 
-def _required_ci(project, sha: str, commit_ci=None, *, parts=None) -> None:
+def _required_ci(project, sha: str, commit_ci=None, *, parts=None,
+                 branch: str | None = None) -> None:
     """L160g (#473): `ci_required` — GitHub's CI green on the frozen commit
     `sha` itself; QueueError otherwise (no run, running, red, unreadable).
 
@@ -906,7 +916,7 @@ def _required_ci(project, sha: str, commit_ci=None, *, parts=None) -> None:
     one."""
     from . import plan_github, radar
     try:
-        runs = (commit_ci or (lambda s: radar.commit_ci(project, s)))(sha)
+        runs = (commit_ci or (lambda s: radar.commit_ci(project, s, branch=branch)))(sha)
     except plan_github.GithubError as exc:
         raise QueueError("project %s requires CI on the frozen commit (ci_required), "
                          "unreadable (%s): try again once gh works" % (project.name, exc)) from exc
@@ -919,6 +929,10 @@ def _required_ci(project, sha: str, commit_ci=None, *, parts=None) -> None:
     if runs["failed"]:
         raise QueueError("the CI on the frozen commit %s is red (%s)"
                          % (sha[:12], ", ".join(runs["failed"])))
+    if runs.get("missing"):
+        raise QueueError("the frozen commit %s carries no successful %s status: its "
+                         "required validation has not concluded (required_statuses)"
+                         % (sha[:12], " / ".join("%s*" % p for p in runs["missing"])))
     if not runs.get("green"):
         raise QueueError("the CI on the frozen commit %s is not green" % sha[:12])
     if parts is None:
@@ -1104,7 +1118,18 @@ def stack(replayer, target_head: str, lots: list[dict], rows: list[dict], *, gen
     resolutions (`rows`) of this lot with the lots already stacked. A lot
     that leaves a conflict is skipped. Returns `{lot: {state: clean|
     replayed|conflict|generated, files}}`. Generated conflicts are excluded
-    before rerere; each trial tree is regenerated and checked."""
+    before rerere; each trial tree is regenerated and checked.
+
+    #2428: the whole trial holds the radar clone's worktree lock. A landing
+    running in another process owns the same worktree: the trial waits for
+    it, and on timeout raises `resolutions.CloneBusy` instead of checking
+    out the target under the merge's gates."""
+    with replayer.locked():
+        return _stack(replayer, target_head, lots, rows, generated=generated)
+
+
+def _stack(replayer, target_head: str, lots: list[dict], rows: list[dict], *,
+           generated=()) -> dict:
     from . import land, resolutions
     paths = {g.path for g in generated}
     latest: dict = {}
@@ -1389,13 +1414,22 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
             key = (heads.pop(), tuple((o["work_item"], o["tip"]) for o in stacked), commits,
                    generated)
             if key not in stacks:
+                busy = None
                 try:
                     replayer.ensure()
                     stacks[key] = stack(replayer, key[0], stacked, resolution_rows,
                                         generated=generated)
+                except resolutions.CloneBusy as exc:
+                    # #2428: another operation owns the clone's worktree (a
+                    # landing and its gates, another pass). Nothing was read,
+                    # so no lot is ejected and nothing is cached: the next
+                    # pass retries the trial.
+                    busy = "%s: %s" % (type(exc).__name__, exc)
                 except (GitError, OSError) as exc:
                     stacks[key] = {"error": "%s: %s" % (type(exc).__name__, exc)}
-            result = stacks[key]
+                result = {"error": busy} if busy is not None else stacks[key]
+            else:
+                result = stacks[key]
         listed = [{"lot": int(r["work_item_id"]), "rank": 1, "state": "landing",
                    "reason": r.get("reason") or "", "stack": None}
                   for r in landing.get(target) or ()]

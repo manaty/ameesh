@@ -358,6 +358,8 @@ ameesh work dependencies <id> [--add ID|--remove ID] [--actor A]   # blocking pr
 ameesh work migration <id> [--number N] [--release] [--repo R]   # reserve a migration number (L122)
 ameesh work set-app <id> <project> [--actor A] | backfill-app [--dry-run]
 ameesh work link <id> [CARD] [--none] [--actor A] | close <id> (--abandoned | --superseded-by ID | --delivered --sha SHA | --done)
+ameesh work packet record <carrier> [--repo R] [--base SHA] [--head REF] [--dry-run] [--json]
+ameesh work packet show <lot|carrier> [--json]   # recorded package composition (#2443)
 ameesh work sync-merges [--target T] [--dry-run] [--json]   # close frozen lots whose content is merged (L29)
 ameesh work sync-packets [--target T] [--dry-run] [--json] # close the units of merged packages (manifest, #2426)
 ameesh work sync-github [--dry-run] [--json]          # close lots whose PR is merged (read-only)
@@ -398,7 +400,11 @@ with a journal entry (#333). `work link` attaches a lot to a WorkPackage card
 `work close` closes an abandoned, superseded or delivered-outside-target lot
 (`--delivered --sha <reviewed head>`: the `delivered` milestone carries the
 head and counts as a delivery in `estimates`, #988), and `work sync-merges`
-closes the frozen lots whose content is already merged (L29). `work schedule`
+closes the frozen lots whose content is already merged (L29), including a
+unit linked to a merged package by `work packet record` (#2443). `work packet
+record` reads the package's composition commits (`ameesh-work:` trailers) and
+writes the link — never the manifest; `work packet show` prints it.
+`work schedule`
 proposes the planned dates of open assigned lots at the p80 of the L157
 reference table (`--apply` writes), and `work measure` records the actual time
 per phase and the merged diff size. `work project-github` projects the lots (or

@@ -168,6 +168,8 @@ verifier() {
 # Démarre la sauvegarde serveur (copie gardée sur la VM) et atteste le dump
 # qu'elle vient de produire : chemin, taille et SHA-256, sur trois lignes.
 # Le service publie son fichier par lien dur : un dump visible est complet.
+# Un script serveur antérieur réécrit le dump du jour sous le même nom : un
+# dump est donc reconnu nouveau à son nom, son inode, sa taille ou sa date (#2424).
 # Aucun DSN ni secret ne traverse cette commande distante.
 sauvegarde_serveur() {
   printf '%s\n' "$SAUVEGARDES_VM" | ssh_vm 'set -eu
@@ -176,12 +178,12 @@ sauvegarde_serveur() {
     before=$(mktemp "$d/.liste-avant.XXXXXX")
     after=$(mktemp "$d/.liste-apres.XXXXXX")
     trap "rm -f -- \"$before\" \"$after\"" EXIT HUP INT TERM
-    find "$d" -maxdepth 1 -type f -name "ameesh-*.dump" -printf "%f\n" | sort > "$before"
+    find "$d" -maxdepth 1 -type f -name "ameesh-*.dump" -printf "%f %i %s %T@\n" | sort > "$before"
     systemctl start ameesh-sauvegarde.service
     test "$(systemctl show ameesh-sauvegarde.service -p Result --value)" = success
     test "$(systemctl show ameesh-sauvegarde.service -p ExecMainStatus --value)" = 0
-    find "$d" -maxdepth 1 -type f -name "ameesh-*.dump" -printf "%f\n" | sort > "$after"
-    new=$(comm -13 "$before" "$after" | tail -1)
+    find "$d" -maxdepth 1 -type f -name "ameesh-*.dump" -printf "%f %i %s %T@\n" | sort > "$after"
+    new=$(comm -13 "$before" "$after" | tail -1 | cut -d" " -f1)
     if [ -z "$new" ]; then
       echo "ameesh-sauvegarde : aucun nouveau dump dans $d" >&2
       exit 1
