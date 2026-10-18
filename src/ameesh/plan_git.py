@@ -671,11 +671,26 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
     results: list[dict] = []
     for row in sorted(rows, key=lambda r: int(r["id"])):
         lot = int(row["id"])
-        freeze = latest_freeze(declared.get(lot, []))
+        marks = declared.get(lot, [])
+        freeze = latest_freeze(marks)
         sha = ((freeze or {}).get("sha") or "").strip()
+        frozen_id = int(freeze["id"]) if freeze else None
+        freeze_origin = "frozen" if sha else None
+        if not sha:
+            # #2399 (cas #2366) : un avis `ok` sur la tête publiée vaut gel
+            # effectif (`freeze.origin=verdict`, #1756) ; sans jalon `frozen`,
+            # c'est le contenu relu qui entre dans la cible. Un avis sur une
+            # autre tête ne prouve rien : la branche a avancé depuis.
+            candidate = freeze_candidate(marks, repo_dir,
+                                         target or row.get("branch_target") or default)
+            reviewed = commit_id(candidate.get("sha"))
+            if candidate.get("origin") == "verdict" and reviewed:
+                head = _tip(repo_dir, row["branch"]) if row.get("branch") else None
+                if head is None or same_commit(reviewed, head):
+                    sha, freeze_origin = reviewed, "verdict"
         entry = {"work_item": lot, "package": row.get("package_id"),
                  "state": row["state"], "result": "no-commit", "how": None, "ref": None,
-                 "target": None, "off_target": None,
+                 "target": None, "off_target": None, "freeze_origin": freeze_origin,
                  "detail": ("last freeze has no commit (milestone frozen --sha)" if freeze
                             else "no freeze declared (milestone frozen --sha)")}
         if not sha:
@@ -746,7 +761,7 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
         else:
             done = work_mod.close_merged(
                 db, lot, sha=entry["ref"] or "", actor="git:%s" % found_target,
-                source="content (%s)" % entry["how"], frozen_id=int(freeze["id"]),
+                source="content (%s)" % entry["how"], frozen_id=frozen_id,
                 repo=repo_dir)          # L539 : dépôt du relevé, indice de classe
             entry["result"] = done["result"]
             detail = "%s — %s" % (entry["detail"], done["detail"])
