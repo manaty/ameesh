@@ -726,3 +726,130 @@ class DeclaredMergeWitnessTest(_Witness):
         self.assertEqual(work.merged(self.db, lot, sha="abcdef1234",
                                      actor="claude1")["result"], "merged")
         self.assertEqual(self.review_lots(lot), [])
+
+
+class CloseGuardWitnessTest(_Witness):
+    """#2374 R1 : la clôture d'une relecture après fusion n'est pas
+    déclarative — `work.close --delivered` compte les avis dus sur le sha
+    fusionné, relus de la marque structurée du lot de relecture."""
+
+    def setUp(self):
+        super().setUp()
+        for name, harness in (("codex1", "codex"), ("codex2", "codex"),
+                              ("claude2", "claude"), ("deepseek2", "deepseek")):
+            registry.upsert(self.db, name, harness=harness, host=self.cfg.host,
+                            cwd=self.repo)
+
+    def critical_review(self, sha):
+        lot = self.merged_lot("porte de fusion", sha=sha)
+        out = review_lot.open_after_merge(
+            self.db, lot=lot,
+            klass={"class": "light", "why": "policy",
+                   "files": [{"path": "src/ameesh/merge_pr.py", "class": "light"}]},
+            merged_sha=sha)
+        self.assertTrue(out["created"], out)
+        return lot, out["id"]
+
+    def verdict(self, lot, sha, actor):
+        work.milestone(self.db, lot, "verdict", sha=sha, actor=actor, verdict="ok")
+
+    def test_la_marque_porte_le_nombre_d_avis_et_le_sha(self):
+        sha = "b" * 40
+        lot, review = self.critical_review(sha)
+        found = review_lot.requirement_of(self.db, work.get(self.db, review))
+        self.assertEqual((found["source"], found["required"], found["sha"]),
+                         (lot, 2, sha), found)
+        self.assertEqual(found["author"], "claude1", found)
+
+    def test_la_famille_de_l_auteur_ne_compte_pas(self):
+        """Deux verdicts dont un de la famille de l'auteur (deepseek) ne font
+        pas les deux avis : la seconde famille doit être indépendante."""
+        sha = "9" * 40
+        lot = self.merged_lot("porte auteur deepseek", sha=sha)
+        with mock.patch.object(review_lot, "_author_at_freeze",
+                               return_value={"name": "claude1",
+                                             "harness": "deepseek"}):
+            out = review_lot.open_after_merge(
+                self.db, lot=lot,
+                klass={"class": "light", "why": "policy",
+                       "files": [{"path": "src/ameesh/merge_pr.py",
+                                  "class": "light"}]},
+                merged_sha=sha)
+        self.assertTrue(out["created"], out)
+        found = review_lot.requirement_of(self.db, work.get(self.db, out["id"]))
+        self.assertEqual(found["author_family"], "deepseek", found)
+        self.verdict(lot, sha, "codex1")
+        self.verdict(lot, sha, "deepseek2")
+        with self.assertRaises(work.WorkError):
+            work.close(self.db, out["id"], delivered=True, sha=sha, actor="codex1")
+        self.verdict(lot, sha, "claude2")
+        row = work.close(self.db, out["id"], delivered=True, sha=sha, actor="claude2")
+        self.assertEqual(row["state"], "closed")
+
+    def test_un_seul_avis_ne_clot_pas_une_relecture_sensible(self):
+        sha = "b" * 40
+        lot, review = self.critical_review(sha)
+        with self.assertRaises(work.WorkError) as ctx:
+            work.close(self.db, review, delivered=True, sha=sha, actor="codex1")
+        self.assertIn("2 avis", str(ctx.exception))
+        self.verdict(lot, sha, "codex1")
+        with self.assertRaises(work.WorkError):
+            work.close(self.db, review, delivered=True, sha=sha, actor="codex1")
+        self.verdict(lot, sha, "claude2")
+        row = work.close(self.db, review, delivered=True, sha=sha, actor="claude2")
+        self.assertEqual(row["state"], "closed")
+
+    def test_deux_avis_de_la_meme_famille_ne_suffisent_pas(self):
+        sha = "c" * 40
+        lot, review = self.critical_review(sha)
+        self.verdict(lot, sha, "codex1")
+        self.verdict(lot, sha, "codex2")
+        with self.assertRaises(work.WorkError):
+            work.close(self.db, review, delivered=True, sha=sha, actor="codex1")
+        self.verdict(lot, sha, "claude2")
+        row = work.close(self.db, review, delivered=True, sha=sha, actor="claude2")
+        self.assertEqual(row["state"], "closed")
+
+    def test_un_ok_ancien_ne_survit_pas_a_un_blocage_plus_recent(self):
+        """Le dernier verdict de chaque relecteur compte, comme à la porte des
+        avis : codex1 `ok` puis `blocked` ne vaut pas un avis favorable."""
+        sha = "f" * 40
+        lot, review = self.critical_review(sha)
+        self.verdict(lot, sha, "codex1")
+        work.milestone(self.db, lot, "verdict", sha=sha, actor="codex1",
+                       verdict="blocked")
+        self.verdict(lot, sha, "claude2")
+        with self.assertRaises(work.WorkError):
+            work.close(self.db, review, delivered=True, sha=sha, actor="claude2")
+        self.verdict(lot, sha, "codex1")      # plus récent : le blocage est levé
+        row = work.close(self.db, review, delivered=True, sha=sha, actor="claude2")
+        self.assertEqual(row["state"], "closed")
+
+    def test_un_avis_suffit_pour_une_relecture_legere(self):
+        sha = "d" * 40
+        lot = self.merged_lot("docs", sha=sha)
+        out = review_lot.open_after_merge(
+            self.db, lot=lot, klass={"class": "light", "why": "policy"},
+            merged_sha=sha)
+        with self.assertRaises(work.WorkError):
+            work.close(self.db, out["id"], delivered=True, sha=sha, actor="codex1")
+        self.verdict(lot, sha, "codex1")
+        row = work.close(self.db, out["id"], delivered=True, sha=sha, actor="codex1")
+        self.assertEqual(row["state"], "closed")
+
+    def test_un_lot_ordinaire_se_clot_sans_avis(self):
+        lot = self.lot("rapport ordinaire")
+        row = work.close(self.db, lot, delivered=True, sha="e" * 40, actor="claude1")
+        self.assertEqual(row["state"], "closed")
+
+    def test_sans_marque_un_lot_ancien_garde_un_avis(self):
+        sha = "1" * 40
+        lot = self.merged_lot("relecture ancienne", sha=sha)
+        ref = review_lot.ref_of(lot)
+        review = work.add(self.db, title="REVUE ancienne", source=ref, issue_ref=ref,
+                          app="ameesh", actor="orch")["id"]
+        with self.assertRaises(work.WorkError):
+            work.close(self.db, review, delivered=True, sha=sha, actor="codex1")
+        self.verdict(lot, sha, "codex1")
+        row = work.close(self.db, review, delivered=True, sha=sha, actor="codex1")
+        self.assertEqual(row["state"], "closed")
