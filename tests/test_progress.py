@@ -138,6 +138,42 @@ class JalonsTest(unittest.TestCase):
         j = progress._jalons_de_lot(self.item, events, [], declared[:1])
         self.assertEqual((j["source"], j["frozen"], j["requested"]), ("events", 200, 100))
 
+    def test_1693_correction_annule_la_fusion_dans_toutes_les_sources(self):
+        events = [ev("intake", 100), ev("qa", 200), ev("merged", 300), ev("build", 400)]
+        actions = [{"connector": "git-merge", "state": "confirmed", "finished_ts": 300}]
+        for declared in ([], [{"kind": "frozen", "at_ts": 200}],
+                         [{"kind": "frozen", "at_ts": 200},
+                          {"kind": "merged", "at_ts": 300}]):
+            with self.subTest(declared=declared):
+                j = progress._jalons_de_lot(self.item, events, actions, declared)
+                self.assertIsNone(j["merged"])
+                j = progress._jalons_de_lot(self.item, events + [ev("qa", 450)],
+                                            actions, declared)
+                self.assertIsNone(j["merged"])
+                j = progress._jalons_de_lot(self.item, events + [ev("merged", 500)],
+                                            actions, declared)
+                self.assertEqual(j["merged"], 500)
+
+    def test_1693_blocage_apres_fusion_conserve_sa_date(self):
+        for suite in ([ev("blocked", 400)], [ev("promoted", 400), ev("merged", 500)]):
+            with self.subTest(suite=suite):
+                j = progress._jalons_de_lot(self.item,
+                                            [ev("intake", 100), ev("merged", 300)] + suite, [])
+                self.assertEqual(j["merged"], 300)
+
+    def test_1693_le_dernier_jalon_merged_effectif_date(self):
+        # #1693 (N4) : plusieurs jalons `merged` coexistent (l'historique
+        # n'est pas réécrit) ; le dernier encore effectif date la livraison.
+        events = [ev("intake", 100), ev("qa", 200), ev("merged", 300),
+                  ev("build", 400), ev("qa", 450), ev("merged", 500)]
+        declared = [{"kind": "merged", "at_ts": 300},
+                    {"kind": "merged", "at_ts": 500}]
+        j = progress._jalons_de_lot(self.item, events, [], declared)
+        self.assertEqual(j["merged"], 500)
+        # sans correction, le dernier jalon déclaré l'emporte aussi
+        j = progress._jalons_de_lot(self.item, [ev("intake", 100)], [], declared)
+        self.assertEqual(j["merged"], 500)
+
     def test_sans_journal(self):
         j = progress._jalons_de_lot(self.item, [], [])
         self.assertEqual(j["requested"], 100.0)
