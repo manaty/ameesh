@@ -1098,6 +1098,13 @@ class Mailbox(Domain):
         """Derniers messages du destinataire, du plus récent au plus ancien."""
 
     @abc.abstractmethod
+    def delivered_for_lot(self, recipient: str, lot: str, limit: int) -> list[dict]:
+        """Messages déjà remis d'un lot, du plus récent au plus ancien, bornés
+        par `limit`. Filtre destinataire ET lot dans la requête, sans fenêtre
+        de temps : un verdict ancien reste lisible dans le brief de son lot.
+        Non admis en mode médié (contrat fermé) : l'appelant garde les non-lus."""
+
+    @abc.abstractmethod
     def pending_recipients(self) -> list[str]:
         """Destinataires qui ont du courrier non remis."""
 

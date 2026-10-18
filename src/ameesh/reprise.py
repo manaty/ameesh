@@ -765,17 +765,14 @@ def deterministic_brief(cfg: Config, db, row: dict | None, *, session: str | Non
 
 #: Bornes du brief de lot (décision du bureau, 2026-10-13) : plus serré que le
 #: brief de reprise, il ne porte que le canon, la fiche du lot, le diff de sa
-#: branche et son fil réduit aux décisions et messages non lus. Ni transcript
-#: d'une session, ni autre lot, ni synthèse de rotation.
+#: branche et son fil réduit aux décisions, messages non lus et courriers déjà
+#: livrés pour ce lot (#2539). Ni transcript d'une session, ni autre lot, ni
+#: synthèse de rotation.
 LOT_BRIEF_MAX_BYTES = 16000
 LOT_NOTES_MAX = 6
 LOT_NOTE_CHARS = 600
 LOT_MAIL_MAX = 8
 LOT_MAIL_CHARS = 300
-#: fenêtre des messages déjà livrés repris dans le brief (#2539) : un courrier
-#: livré dans la session d'un autre lot ne doit pas disparaître quand la
-#: session dédiée à son lot s'ouvre. Au-delà, il reste dans le fil du lot.
-LOT_MAIL_RECENT_S = 86400.0
 LOT_DECISIONS_MAX = 5
 LOT_DIFF_MAX_LINES = 40
 LOT_DIFF_MAX_BYTES = 3000
@@ -953,11 +950,11 @@ def _lot_sheet(db, item: dict) -> list[str]:
 
 
 def _lot_thread(db, name: str, lot: str) -> list[str]:
-    """Le fil du lot : décisions en attente, non-lus et courriers récemment
-    livrés pour ce lot (#2539). Ces derniers ne sont plus ``unread`` : sans
-    eux, une session neuve ouverte après une bascule perdrait le verdict reçu
-    dans la session précédente."""
-    section = ["## Lot thread — decisions, unread and recently delivered messages"]
+    """Le fil du lot : décisions en attente, non-lus et courriers déjà livrés
+    pour ce lot (#2539). Ces derniers ne sont plus ``unread`` : sans eux, une
+    session neuve ouverte après une bascule perdrait le verdict reçu dans la
+    session précédente."""
+    section = ["## Lot thread — decisions, unread and delivered messages"]
     lignes: list[str] = []
     try:
         decisions = storage.of(db).decisions.pending_for_lot(str(lot))
@@ -985,24 +982,22 @@ def _lot_thread(db, name: str, lot: str) -> list[str]:
     # dans la session du lot courant (le lot du tour est alors ambigu). Quand
     # cette session est mise de côté, le brief de la session dédiée au lot ne
     # les voit plus (delivered_at est posé) : on reprend ici les courriers
-    # récemment livrés pour CE lot, bornés, pour qu'un verdict ne se perde pas.
+    # livrés pour CE lot, filtrés côté stockage (destinataire + lot, sans
+    # fenêtre de temps), bornés pour le coût du brief.
     try:
-        recents = [m for m in mail.history(db, name, limit=200)
-                   if str(m.get("work_item_id") or "").strip() == str(lot)
-                   and m.get("delivered_ts")
-                   and float(m["delivered_ts"]) >= time.time() - LOT_MAIL_RECENT_S]
+        livres = mail.delivered_for_lot(db, name, lot, LOT_MAIL_MAX + 1) or []
     except Exception:
-        recents = []
-    recents.sort(key=lambda m: float(m.get("delivered_ts") or 0), reverse=True)
-    for m in recents[:LOT_MAIL_MAX]:
-        lignes.append("- recently delivered #%s (from %s, %s): %s" % (
+        # Mode médié : la lecture n'est pas admise au contrat (mailbox.
+        # delivered_for_lot refusé) ; on garde les non-lus, sans échouer.
+        livres = []
+    for m in livres[:LOT_MAIL_MAX]:
+        lignes.append("- delivered #%s (from %s, %s): %s" % (
             m.get("id"), m.get("sender") or "?", _stamp(m.get("delivered_ts")),
             fil.excerpt(m.get("body") or "", LOT_MAIL_CHARS)))
-    if len(recents) > LOT_MAIL_MAX:
-        lignes.append("- … and %d more recently delivered messages for this lot"
-                      % (len(recents) - LOT_MAIL_MAX))
+    if len(livres) > LOT_MAIL_MAX:
+        lignes.append("- … and more delivered messages for this lot")
     if not lignes:
-        lignes = ["- no pending decision, unread or recently delivered message for this lot."]
+        lignes = ["- no pending decision, unread or delivered message for this lot."]
     return section + lignes + [""]
 
 
@@ -1012,7 +1007,8 @@ def lot_brief(cfg: Config, db, row: dict | None, lot, *, consigne: str = "",
 
     Contenu minimal décidé par le bureau le 2026-10-13 : canon (les règles de
     travail, ajoutées par `with_process_rules`), fiche du lot, diff de sa
-    branche, fil du lot réduit aux décisions en attente et messages non lus.
+    branche, fil du lot réduit aux décisions en attente, messages non lus et
+    courriers déjà livrés pour ce lot (#2539).
     Aucun transcript, aucun autre lot, aucune synthèse : une session par lot,
     jamais partagée."""
     row = dict(row or {})

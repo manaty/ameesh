@@ -17,7 +17,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 66 opérations et la liste des 393 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 66 opérations et la liste des 394 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -65,7 +65,7 @@ Comptes : 66 opérations, dont 26 lectures et 40 écritures. 56 passent par
 lignes de `op` sont marquées `session: true` (contrats 1.1, 1.2 et 1.3) :
 elles sont servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (459
+signature et les mêmes types. Il vérifie aussi que l'interface entière (460
 opérations) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
@@ -513,7 +513,7 @@ Le client vit dans `src/ameesh/storage/remote/` :
 
 | Fichier | Rôle |
 |---|---|
-| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 64 opérations), `LeaseBook` (carnet des baux) |
+| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 66 opérations), `LeaseBook` (carnet des baux) |
 | `http.py` | `HttpTransport(ExecTransport)`, `StaticTokenSource`, `FileTokenSource` |
 | `events.py` | `RemoteSubscription` : SSE, repli en attente longue, curseur gardé |
 | `__init__.py` | `connect(cfg)`, `set_token_source_factory` (point d'attache de L110) |
