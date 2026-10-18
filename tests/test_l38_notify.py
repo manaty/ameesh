@@ -16,7 +16,7 @@ import tempfile
 import threading
 import unittest
 
-from ameesh import fil, mail, notify, registry, storage, work
+from ameesh import alert_ack, fil, mail, notify, registry, storage, work
 
 from .support import FAKEBIN, PgTestCase
 from .test_canon import _TmpMixin, write
@@ -557,6 +557,76 @@ class FiabiliteTest(_Base):
         self.assertEqual([r["event"] for r in records], ["summary"])
         self.assertIn("1 stopped_with_mail", records[0]["text"])
         self.assertIn("resolved: 2", records[0]["text"])
+        self.assertEqual(notifier.state["summary"], {})
+
+    def test_resume_de_debit_marque_les_membres_et_bloque_le_renvoi(self):
+        # #2395 B2 : une alerte livrée par un résumé de débit entre dans le
+        # registre `notified` (identités/sévérités/humains des membres), après
+        # le succès du résumé et avant tout redémarrage ; la même alerte
+        # revenue après la fenêtre ne repart pas en envoi direct.
+        path = os.path.join(self.tmp, "notify", "state.json")
+        ncfg = self.ncfg(default_human="human:proprio", rate_per_minute=1)
+        a, b = _alert(agent="a"), _alert(agent="b")
+        notifier = self.notifier(ncfg)
+        records = self.passe(notifier, [a, b])
+        self.assertEqual([(r["event"], r["delivery"]) for r in records],
+                         [("raised", "envoyee"), ("raised", "resumee"),
+                          ("summary", "envoyee")])
+        self.assertEqual(len(_desktop_log(self.desk)), 2)
+        entree_b = {"key": notify.key_of(b), "severity": alert_ack.severity(b), "alert": b}
+        identite_b = notify.Notifier._notified_id(entree_b, "human:proprio")
+        self.assertIn(identite_b, notifier.state["notified"])
+        notify.save_state(path, notifier.state)
+        # reprise : le registre relu suffit à ne pas renvoyer B
+        notifier = self.notifier(ncfg, notify.load_state(path))
+        self.now += 61
+        self.assertEqual([r["event"] for r in self.passe(notifier, [a])], ["summary"])
+        envoyes = len(_desktop_log(self.desk))
+        records = self.passe(notifier, [a, b])
+        self.assertEqual([r for r in records if r["event"] == "raised"], [])
+        self.assertEqual(len(_desktop_log(self.desk)), envoyes)
+
+    def test_resume_de_debit_en_echec_ne_marque_pas_avant_le_succes(self):
+        # #2395 B2 : le registre n'est marqué qu'après un envoi réussi ; un
+        # résumé en échec reste en attente et ne fait pas taire l'alerte.
+        ncfg = self.ncfg(default_human="human:proprio", rate_per_minute=1)
+        a, b = _alert(agent="a"), _alert(agent="b")
+        reel = notify.Sender(env=_sender_env(self.desk))
+        appels = []
+
+        class EchecPuisSucces:
+            def send(self, channel, message):
+                appels.append(channel.name)
+                if len(appels) == 2:
+                    raise notify.ChannelError("panne simulee")
+                return reel.send(channel, message)
+
+        notifier = self.notifier(ncfg, sender=EchecPuisSucces())
+        self.passe(notifier, [a, b])
+        entree_b = {"key": notify.key_of(b), "severity": alert_ack.severity(b), "alert": b}
+        identite_b = notify.Notifier._notified_id(entree_b, "human:proprio")
+        self.assertNotIn(identite_b, notifier.state["notified"])
+        self.assertIn("human:proprio", notifier.state["summary"])
+        # le résumé est retenté au passage suivant et marque alors son membre
+        self.passe(notifier, [a, b])
+        self.assertIn(identite_b, notifier.state["notified"])
+        self.assertEqual(notifier.state["summary"], {})
+
+    def test_ancien_resume_de_debit_est_rendu_une_fois(self):
+        # état persisté avant #2395 : le compte par type reste rendu par le
+        # résumé, puis le registre n'a plus de membre à retenir. Bucket d'un
+        # humain qui n'est pas l'owner : le compte de résolutions sans type
+        # reste attribuable.
+        ncfg = self.ncfg(default_human="human:owner")
+        state = notify.empty_state()
+        state["summary"]["human:proprio"] = {
+            "raised": {"stopped_with_mail": 2}, "resolved": 1, "attempts": 0}
+        notifier = self.notifier(ncfg, state)
+        records = self.passe(notifier, [])
+        resumes = [r for r in records if r["event"] == "summary"]
+        self.assertEqual(len(resumes), 1)
+        self.assertIn("2 stopped_with_mail", resumes[0]["text"])
+        self.assertIn("resolved: 1", resumes[0]["text"])
         self.assertEqual(notifier.state["summary"], {})
 
     def test_canal_en_echec_isole_et_retente(self):

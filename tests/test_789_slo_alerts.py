@@ -486,6 +486,46 @@ class NotifyLivreTest(_Base):
         self.assertFalse([r for r in records if r["delivery"] == "envoyee"])
         self.assertEqual(self.desktop(), [])
 
+    def test_ancien_resume_slo_owner_n_est_pas_envoye(self):
+        # #2395 B1 : un bucket de résumé persisté par l'ancienne politique
+        # (`human:owner`, raised slo_breach) ne part pas au desktop owner ; il
+        # est filtré, pas seulement les entrées active/resolved.
+        notifier = self.notifier(types=["slo_breach"])
+        notifier.state["summary"]["human:owner"] = {
+            "raised": {"slo_breach": 1}, "resolved": 0, "attempts": 0}
+        records = notifier.run_pass(self.db, current=[])
+        self.assertEqual([r for r in records if r["event"] == "summary"], [])
+        self.assertEqual(self.desktop(), [])
+        self.assertEqual(notifier.state["summary"], {})
+
+    def test_ancien_resume_owner_garde_les_autres_types(self):
+        # le filtrage est ciblé : les autres alertes du même bucket owner
+        # restent rendues (sans le slo_breach).
+        notifier = self.notifier(types=["slo_breach"])
+        notifier.state["summary"]["human:owner"] = {
+            "raised": {"slo_breach": 1, "stopped_with_mail": 2},
+            "resolved": 0, "attempts": 0}
+        records = notifier.run_pass(self.db, current=[])
+        resumes = [r for r in records if r["event"] == "summary"]
+        self.assertEqual(len(resumes), 1)
+        self.assertIn("2 stopped_with_mail", resumes[0]["text"])
+        self.assertNotIn("slo_breach", resumes[0]["text"])
+        self.assertEqual(len(self.desktop()), 1)
+        self.assertNotIn("slo_breach", self.desktop()[0][-1])
+        self.assertEqual(notifier.state["summary"], {})
+
+    def test_ancien_resume_owner_sans_type_ne_part_pas(self):
+        # Un compte de résolutions de l'ancien format ne porte pas le type :
+        # impossible de garantir l'absence de slo_breach, donc il ne part pas
+        # vers l'owner (règle owner 18/10).
+        notifier = self.notifier(types=["slo_breach"])
+        notifier.state["summary"]["human:owner"] = {
+            "raised": {}, "resolved": 1, "attempts": 0}
+        records = notifier.run_pass(self.db, current=[])
+        self.assertEqual([r for r in records if r["event"] == "summary"], [])
+        self.assertEqual(self.desktop(), [])
+        self.assertEqual(notifier.state["summary"], {})
+
     def test_cle_de_dedoublonnage_change_avec_le_niveau(self):
         self.age(1.5 * HEURE)
         bas = self.slo()[0]

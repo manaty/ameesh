@@ -50,12 +50,14 @@ refused. See docs/EXPLOITATION.md, "Alertes poussées — ameesh notify".
 Reliability: the delivery state is kept in `<state>/notify/state.json` (a
 lasting alert is not resent after a restart; an alert resolved while
 stopped is sent on restart); rate limited per human (beyond that, a
-summary); a failing channel does not block the others and is retried on
+summary, whose members enter the `notified` ledger once the summary is
+delivered); a failing channel does not block the others and is retried on
 later passes, a bounded number of times. #2395: the state also keeps a
 persistent `notified` ledger — one notification per alert identity (same
 `since`, same severity) and per human, even if the alert resolves and comes
 back, and even after `ameesh notify` restarts; `slo_breach` is never pushed
-to the owner (canon §9, owner decision 18/10).
+to the owner (canon §9, owner decision 18/10), including from an old
+persisted summary bucket.
 
 Channels: `desktop`, `ntfy`, `slack`, `app`. L66 — the `desktop` channel
 follows the OS through `ameesh.platform.notify`: `notify-send` on Linux,
@@ -606,15 +608,38 @@ def render(alert: dict, event: str, now: float, *, raised_ts=None) -> Message:
     return Message(title, body, urgent=kind in URGENT_TYPES or bool(alert.get("urgent")))
 
 
+def _summary_raised_counts(raised) -> dict:
+    """Compte les membres levés d'un bucket (`{identité: membre}`) ; accepte
+    aussi l'ancien format `{type: compte}` d'un état persisté avant #2395."""
+    counts = {}
+    if not isinstance(raised, dict):
+        return counts
+    for identity, member in raised.items():
+        if isinstance(member, dict):
+            kind = member.get("type") or "?"
+            counts[kind] = counts.get(kind, 0) + 1
+        else:
+            kind = str(identity)
+            counts[kind] = counts.get(kind, 0) + int(member or 0)
+    return counts
+
+
+def _summary_resolved_count(resolved) -> int:
+    if isinstance(resolved, dict):
+        return len(resolved)
+    return int(resolved or 0)
+
+
 def render_summary(bucket: dict, host: str) -> Message:
-    raised = bucket.get("raised") or {}
-    total = sum(raised.values()) + int(bucket.get("resolved") or 0)
+    raised = _summary_raised_counts(bucket.get("raised"))
+    resolved = _summary_resolved_count(bucket.get("resolved"))
+    total = sum(raised.values()) + resolved
     parts = []
     if raised:
         parts.append("raised: " + ", ".join(
             "%d %s" % (n, kind) for kind, n in sorted(raised.items())))
-    if bucket.get("resolved"):
-        parts.append("resolved: %d" % int(bucket["resolved"]))
+    if resolved:
+        parts.append("resolved: %d" % resolved)
     title = "ameesh: %d alert(s) not detailed (rate limit)" % total
     # L94 : la sous-utilisation a sa ligne dans le résumé
     underuse = sum(n for kind, n in raised.items() if kind in sous_utilisation.UNDERUSE_TYPES)
@@ -1012,6 +1037,13 @@ def key_of(alert: dict) -> str:
     return json.dumps(key, ensure_ascii=False)
 
 
+def _notification_id(key, severity, human) -> str:
+    """Identité du registre `notified` : clé, sévérité, humain. Les résumés de
+    débit s'en servent aussi pour leurs membres (#2395 B2), d'où la fonction
+    partagée : les deux chemins doivent produire exactement la même clé."""
+    return json.dumps([key, severity, human], ensure_ascii=False)
+
+
 def forces_owner(alert: dict) -> bool:
     """#789 t2, restreint par #2395 : une cible `owner` force la livraison à
     l'humain même hors `notify.types`. Un `slo_breach` n'en bénéficie jamais :
@@ -1382,16 +1414,27 @@ class Notifier:
     def _forget_summary(self, entry: dict) -> None:
         if entry.get("status") != "resumee":
             return
-        bucket = self.state["summary"].get(entry.get("human"))
-        if bucket:
-            kind = entry["alert"]["type"]
-            remaining = bucket["raised"].get(kind, 0) - 1
-            if remaining > 0:
-                bucket["raised"][kind] = remaining
-            else:
-                bucket["raised"].pop(kind, None)
-            if not bucket["raised"] and not bucket["resolved"]:
-                self.state["summary"].pop(entry.get("human"), None)
+        human = entry.get("human")
+        bucket = self.state["summary"].get(human)
+        if not bucket:
+            return
+        bucket = self._normalize_summary_bucket(human, bucket)
+        member = self._summary_member(entry, human)
+        identity = self._summary_member_id(member)
+        members = bucket["raised"]
+        if identity in members:
+            del members[identity]
+        else:
+            # Bucket persisté avant #2395 : les identités n'y étaient pas
+            # gardées. On retire un membre du même type, comme l'ancien
+            # compteur, sans toucher aux identités réelles.
+            for old_id, old in list(members.items()):
+                if (old.get("type") == member.get("type")
+                        and str(old.get("key") or "").startswith("legacy:")):
+                    del members[old_id]
+                    break
+        if not members and not bucket["resolved"]:
+            self.state["summary"].pop(human, None)
 
     def _mute(self, entry: dict) -> None:
         self._forget_summary(entry)
@@ -1518,7 +1561,7 @@ class Notifier:
         qui se résout puis revient ne repart pas ; une escalade de niveau a
         une autre identité et part bien."""
         key = entry.get("key") or key_of(entry["alert"])
-        return json.dumps([key, entry.get("severity"), human], ensure_ascii=False)
+        return _notification_id(key, entry.get("severity"), human)
 
     def _already_notified(self, entry: dict, human: str) -> bool:
         return self._notified_id(entry, human) in (self.state.get("notified") or {})
@@ -1589,8 +1632,7 @@ class Notifier:
             return
         if not self._allow(human, now):
             entry["status"] = "resumee"
-            bucket = self._bucket(human)
-            bucket["raised"][alert["type"]] = bucket["raised"].get(alert["type"], 0) + 1
+            self._summary_add(self._bucket(human), "raised", entry)
             self._record("raised", entry, "resumee", {})
             return
         entry["status"] = "envoi"
@@ -1800,7 +1842,7 @@ class Notifier:
             self._record("resolved", entry, status, {})
             return
         if status == "resumee":
-            self._bucket(human)["resolved"] += 1
+            self._summary_add(self._bucket(human), "resolved", entry)
             return
         delivered = [name for name, st in entry["channels"].items() if st.get("ok")]
         if not delivered:
@@ -1814,7 +1856,7 @@ class Notifier:
                     "channels": {name: {"ok": False, "attempts": 0, "error": None}
                                  for name in delivered}}
         if not self._allow(human, now):
-            self._bucket(human)["resolved"] += 1
+            self._summary_add(self._bucket(human), "resolved", resolved)
             self._record("resolved", resolved, "resumee", {})
             return
         self._attempt(resolved, "resolved", now)
@@ -1890,13 +1932,136 @@ class Notifier:
         self.state["rate"][human] = window
         return True
 
+    # -- résumés de débit (#2395 : membres identifiés) -------------------------
+    @staticmethod
+    def _summary_member(entry: dict, human: str) -> dict:
+        alert = entry.get("alert") or {}
+        return {"key": entry.get("key") or key_of(alert),
+                "severity": entry.get("severity"),
+                "type": alert.get("type"),
+                "human": human}
+
+    @staticmethod
+    def _summary_member_id(member: dict) -> str:
+        """Même identité que le registre `notified` : clé, sévérité, humain."""
+        return _notification_id(member.get("key"), member.get("severity"),
+                                member.get("human"))
+
+    def _owner_human(self, human) -> bool:
+        owner = normalize_human(self.ncfg.default_human)
+        return bool(owner) and normalize_human(human) == owner
+
+    def _summary_forbidden(self, human, kind) -> bool:
+        return kind == "slo_breach" and self._owner_human(human)
+
+    def _normalize_summary_raised(self, human, raised) -> dict:
+        out = {}
+        if not isinstance(raised, dict):
+            return out
+        for identity, member in raised.items():
+            if isinstance(member, dict):
+                normalized = {"key": member.get("key") or str(identity),
+                              "severity": member.get("severity"),
+                              "type": member.get("type"),
+                              "human": human}
+                if self._summary_forbidden(human, normalized["type"]):
+                    self.log("owner rate summary: slo_breach member filtered (#2395)")
+                    continue
+                out[self._summary_member_id(normalized)] = normalized
+                continue
+            # Ancien format `{type: compte}` : les identités n'étaient pas
+            # gardées. Un membre synthétique par alerte rend le compte, et
+            # permet au registre de retenir ce qui a été livré.
+            kind = str(identity)
+            count = int(member or 0)
+            if self._summary_forbidden(human, kind):
+                if count:
+                    self.log("owner rate summary: %d slo_breach alert(s) filtered (#2395)"
+                             % count)
+                continue
+            for index in range(max(count, 0)):
+                normalized = {"key": "legacy:%s:%s:%d" % (human, kind, index),
+                              "severity": None, "type": kind, "human": human}
+                out[self._summary_member_id(normalized)] = normalized
+        return out
+
+    def _normalize_summary_resolved(self, human, resolved) -> dict:
+        if isinstance(resolved, dict):
+            out = {}
+            for identity, member in resolved.items():
+                if not isinstance(member, dict):
+                    continue
+                normalized = {"key": member.get("key") or str(identity),
+                              "severity": member.get("severity"),
+                              "type": member.get("type"),
+                              "human": human}
+                if self._summary_forbidden(human, normalized["type"]):
+                    continue
+                out[self._summary_member_id(normalized)] = normalized
+            return out
+        count = int(resolved or 0)
+        if not count:
+            return {}
+        if self._owner_human(human):
+            # Un compte de l'ancien format ne dit pas le type : impossible de
+            # garantir qu'aucun slo_breach n'y figure (règle owner 18/10).
+            self.log("owner rate summary: %d untyped resolution(s) filtered (#2395)"
+                     % count)
+            return {}
+        out = {}
+        for index in range(max(count, 0)):
+            normalized = {"key": "legacy-resolved:%s:%d" % (human, index),
+                          "severity": None, "type": None, "human": human}
+            out[self._summary_member_id(normalized)] = normalized
+        return out
+
+    def _normalize_summary_bucket(self, human, bucket) -> dict:
+        if not isinstance(bucket, dict):
+            bucket = {}
+        bucket["raised"] = self._normalize_summary_raised(human, bucket.get("raised"))
+        bucket["resolved"] = self._normalize_summary_resolved(human, bucket.get("resolved"))
+        bucket["attempts"] = int(bucket.get("attempts") or 0)
+        return bucket
+
     def _bucket(self, human: str) -> dict:
-        return self.state["summary"].setdefault(
-            human, {"raised": {}, "resolved": 0, "attempts": 0})
+        bucket = self.state["summary"].get(human)
+        if not isinstance(bucket, dict):
+            bucket = {}
+            self.state["summary"][human] = bucket
+        return self._normalize_summary_bucket(human, bucket)
+
+    def _summary_add(self, bucket: dict, event: str, entry: dict) -> None:
+        human = entry.get("human")
+        if not human:
+            return
+        member = self._summary_member(entry, human)
+        if self._summary_forbidden(human, member.get("type")):
+            self.log("[slo_breach] owner summary member refused (#2395)")
+            if not bucket.get("raised") and not bucket.get("resolved"):
+                self.state["summary"].pop(human, None)
+            return
+        bucket.setdefault(event, {})[self._summary_member_id(member)] = member
+
+    def _mark_member_notified(self, member: dict, now: float) -> None:
+        human = member.get("human")
+        if not human:
+            return
+        self.state.setdefault("notified", {})[
+            self._summary_member_id(member)] = round(float(now), 3)
+
+    def _mark_summary_notified(self, bucket: dict, now: float) -> None:
+        for event in ("raised", "resolved"):
+            for member in (bucket.get(event) or {}).values():
+                if isinstance(member, dict):
+                    self._mark_member_notified(member, now)
 
     def _summaries(self, now: float) -> None:
         for human in list(self.state["summary"]):
-            bucket = self.state["summary"][human]
+            bucket = self._bucket(human)
+            if not bucket["raised"] and not bucket["resolved"]:
+                # Stock entièrement filtré (ancien résumé SLO owner, #2395 B1).
+                del self.state["summary"][human]
+                continue
             last = self.state["last_summary"].get(human)
             if last is not None and now - float(last) < RATE_WINDOW_S:
                 continue
@@ -1918,6 +2083,11 @@ class Notifier:
             self.state["rate"].setdefault(human, []).append(now)
             entry = {"alert": {"type": "summary"}, "human": human, "source": "debit"}
             bucket["attempts"] = int(bucket.get("attempts") or 0) + 1
+            if ok and not self.dry_run:
+                # #2395 B2 : les membres livrés par le résumé entrent au
+                # registre, sinon la même alerte repart en envoi direct après
+                # la fenêtre. Après succès seulement ; un échec reste retenté.
+                self._mark_summary_notified(bucket, now)
             if ok or bucket["attempts"] >= self.ncfg.max_attempts:
                 if not ok:
                     self.log("rate summary → %s: GIVING UP after %d attempt(s)"
