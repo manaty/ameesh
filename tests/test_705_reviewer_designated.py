@@ -471,13 +471,14 @@ class ReviewerDesignationTest(PgTestCase):
         lot = self._lot(app="ameesh")
         proc = self._qa(lot)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        storage.of(self.db).work.designate_reviewer(lot["id"], "chef", actor="chef")
         work.milestone(self.db, lot["id"], "verdict", verdict="blocked", actor="chef")
 
         proc = self.mesh("work", "reviewer", str(lot["id"]), "--no-verdict",
                          "--actor", "chef", env=self._env())
         self.assertEqual(proc.returncode, 1)
         self.assertIn("blocked verdict", proc.stderr)
-        self.assertEqual(work.get(self.db, lot["id"])["reviewer"], "")
+        self.assertEqual(work.get(self.db, lot["id"])["reviewer"], "chef")
 
     def test_verdict_non_requis_accepte_sur_verdict_bloquant_perime(self):
         """#1979 : un verdict bloquant PÉRIMÉ (gel postérieur) ne barre pas la

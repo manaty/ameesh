@@ -663,9 +663,8 @@ class WorkItems(interface.WorkItems):
         elif reviewer == REVIEWER_NONE:
             expression, params = "ARRAY[%s]::text[]", [REVIEWER_NONE]
         else:
-            expression = ("array_remove(CASE WHEN %s = ANY(reviewers) THEN reviewers"
-                          " ELSE array_append(reviewers, %s) END, %s)")
-            params = [reviewer, reviewer, REVIEWER_NONE]
+            expression = "array_append(array_remove(array_remove(reviewers, %s), %s), %s)"
+            params = [REVIEWER_NONE, reviewer, reviewer]
         rows = self.db.query(
             "UPDATE work_items SET reviewers = " + expression + ", updated_at = now()"
             " WHERE id = %s AND state = 'qa'"

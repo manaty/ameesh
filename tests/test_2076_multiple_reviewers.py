@@ -13,7 +13,7 @@ from ameesh import alert_briefs, progress, stagnation, storage, work
 
 class ReviewWaitingTest(unittest.TestCase):
     def marks(self, *verdicts, frozen="a" * 40, reviewers=None):
-        reviewers = list(reviewers or ("first", "second"))
+        reviewers = list(("first", "second") if reviewers is None else reviewers)
         item = {"state": "qa", "assignee": "author",
                 "reviewer": reviewers[-1] if reviewers else "", "reviewers": reviewers}
         rows = [{"kind": "frozen", "at_ts": 1, "sha": frozen}]
@@ -75,11 +75,19 @@ class ReviewWaitingTest(unittest.TestCase):
 
     def test_blocked_verdict_of_a_withdrawn_reviewer_does_not_hold_the_lot(self):
         a = "a" * 40
-        item, marks = self.marks(("first", "blocked", a), ("second", "ok", a),
-                                 reviewers=["second"])
-        self.assertEqual(stagnation.waiting(item, marks)["what"], "merge")
-        self.assertEqual(progress.lot_state("qa", marks), "approved")
-        self.assertEqual(marks["pending_reviewers"], [])
+        verdicts = [("first", "blocked", a), ("second", "ok", a)]
+        for ordered in (verdicts, verdicts[::-1]):
+            with self.subTest(ordered=ordered):
+                item, marks = self.marks(*ordered, reviewers=["second"])
+                self.assertEqual(stagnation.waiting(item, marks)["what"], "merge")
+                self.assertEqual(progress.lot_state("qa", marks), "approved")
+                self.assertEqual(marks["pending_reviewers"], [])
+
+    def test_withdrawn_last_reviewer_does_not_keep_a_current_blocker(self):
+        item, marks = self.marks(("first", "blocked", "a" * 40), reviewers=[])
+        self.assertFalse(marks["verdict_current"])
+        self.assertIsNone(marks["reviewer"])
+        self.assertEqual(stagnation.waiting(item, marks)["what"], "verdict")
 
     def test_human_prefixed_actor_matches_a_bare_designation(self):
         a = "a" * 40
@@ -90,6 +98,17 @@ class ReviewWaitingTest(unittest.TestCase):
                                  reviewers=["first", "human:second"])
         self.assertEqual(marks["pending_reviewers"], [])
         self.assertEqual(stagnation.waiting(item, marks)["what"], "merge")
+
+    def test_human_aliases_share_the_latest_current_verdict(self):
+        a = "a" * 40
+        for bare, prefixed in (("second", "human:second"), ("human:second", "second")):
+            for latest, expected in (("ok", "merge"), ("blocked", "fix")):
+                with self.subTest(bare=bare, latest=latest):
+                    prior = "blocked" if latest == "ok" else "ok"
+                    item, marks = self.marks((bare, prior, a), (prefixed, latest, a),
+                                             reviewers=[bare])
+                    self.assertEqual(stagnation.waiting(item, marks)["what"], expected)
+                    self.assertEqual(marks["verdict_kind"], latest)
 
     def test_waiver_is_not_a_reviewer_and_light_lots_can_merge(self):
         from ameesh import lot_class
@@ -150,6 +169,13 @@ class MultipleReviewersTest(PgTestCase):
         self.assertEqual(work.get(self.db, self.lot["id"])["reviewers"], ["second"])
         notes = [e["note"] for e in work.events(self.db, self.lot["id"])]
         self.assertIn("reviewer first cleared (they now hold the lot)", notes)
+
+    def test_redesignation_via_api_moves_the_existing_name_last(self):
+        for name in ("first", "second", "first"):
+            self.designate(name)
+        row = work.get(self.db, self.lot["id"])
+        self.assertEqual(row["reviewers"], ["second", "first"])
+        self.assertEqual(row["reviewer"], "first")
 
     def test_legacy_writer_accumulates_and_cannot_reintroduce_author(self):
         for name in ("first", "second", "first"):

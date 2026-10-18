@@ -277,15 +277,15 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     reviewer = (last["actor"] if last else None) if verdict_current else designated
     from .work_reviewers import designated as designated_reviewers
     reviewers = designated_reviewers(item)
-    current = {v["actor"]: v for v in verdicts if _verdict_applies(v, last_frozen)}
-    pending = ([name for name in reviewers
-                if not any(_same_actor(name, actor) and verdict["kind"] == "ok"
-                           for actor, verdict in current.items())]
+    # Key by designation: aliases share one latest verdict, and withdrawn
+    # reviewers cannot supply the aggregate verdict after their removal.
+    current = {name: v for v in verdicts if _verdict_applies(v, last_frozen)
+               for name in reviewers if _same_actor(name, v["actor"])}
+    pending = ([name for name in reviewers if current.get(name, {}).get("kind") != "ok"]
                if item.get("reviewers") is not None else [])
     # Every designated reviewer owes their own verdict on the frozen head.
     # A later GO from another reviewer cannot erase a blocking verdict.
-    blocked = [v for v in current.values() if v["kind"] == "blocked"
-               and any(_same_actor(name, v["actor"]) for name in reviewers)]
+    blocked = [v for v in current.values() if v["kind"] == "blocked"]
     if item.get("reviewers") is not None and reviewers and blocked:
         last = max(blocked, key=lambda v: v["at_ts"])
         verdict_current = True
@@ -294,6 +294,10 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     elif item.get("reviewers") is not None and reviewers and current:
         last = max(current.values(), key=lambda v: v["at_ts"])
         verdict_current = True
+    elif item.get("reviewers") is not None and not reviewers \
+            and last and last["kind"] == "blocked":
+        verdict_current = False
+        reviewer = designated
     if item.get("reviewers") is not None and reviewers:
         reviewer = last["actor"] if verdict_current and last else designated
     # #1979 : le pilote peut dispenser de re-verdict (résolution de composition
