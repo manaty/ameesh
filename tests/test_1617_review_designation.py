@@ -133,6 +133,13 @@ class CoveringRequestTest(unittest.TestCase):
             self.assertNotIn("cancels this request", body)
             self.assertIn("A new freeze does not cancel this request", body)
 
+    def test_an_ordinary_request_does_not_suppress_a_review_request(self):
+        for payload in ({}, {"question": "Please clarify this lot"},
+                        {"review_request": "invalid"}, "invalid json", []):
+            row = dict(self.row(), payload=payload)
+            self.assertFalse(self.covered(row, self.SHA))
+            self.assertFalse(self.covered(row))
+
 
 class PolicyTest(unittest.TestCase):
     """Le nombre requis : le maximum des règles par chemin, zéro pour un léger."""

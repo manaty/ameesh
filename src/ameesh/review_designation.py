@@ -485,16 +485,16 @@ def manual_reviewer_message(lot: Mapping, *, freeze: Optional[Mapping] = None,
 REQUEST_HISTORY = 200
 
 
-def _request_sha(row: Mapping) -> str:
-    """The frozen head a review request names, `""` when it names none."""
+def _request_sha(row: Mapping) -> Optional[str]:
+    """Review request head, empty before freeze, None for another mail."""
     payload = row.get("payload") or {}
     if isinstance(payload, str):
         try:
             payload = json.loads(payload)
         except ValueError:
-            return ""
+            return None
     if not isinstance(payload, Mapping):
-        return ""
+        return None
     auto = payload.get("review_designation")
     if isinstance(auto, Mapping):
         return str(auto.get("sha") or "").strip().lower()
@@ -503,7 +503,8 @@ def _request_sha(row: Mapping) -> str:
         freeze = manual.get("freeze")
         if isinstance(freeze, Mapping):
             return str(freeze.get("sha") or "").strip().lower()
-    return ""
+        return ""
+    return None
 
 
 def covering_request(rows: Iterable[Mapping], *, lot, reviewer: str,
@@ -529,6 +530,8 @@ def covering_request(rows: Iterable[Mapping], *, lot, reviewer: str,
         if str(row.get("recipient") or "").strip() != name:
             continue
         prior = _request_sha(row)
+        if prior is None:
+            continue
         if prior and target and _same_freeze(prior, target):
             return dict(row)
         if not prior and (not target or not row.get("delivered_ts")):
