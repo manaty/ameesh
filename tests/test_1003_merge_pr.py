@@ -107,6 +107,11 @@ class _Base(unittest.TestCase):
         self.lot_target = "main"
         self.lot_marks = []
         self.ready_marks()
+        # #2333 : le journal du lot (déclaration d'exception du paquet) est en
+        # mémoire ; `merge_queue.readiness` relit la déclaration écrite par la
+        # garde de `direct_merge` au dernier geste d'admission.
+        self.db = object()
+        self.journal: list[dict] = []
         # These Git/PR fixtures simulate storage. #1680's real shared-lease
         # exclusion and fencing are exercised by test_1680_packet_reservation.
         self.writer = mock.Mock()
@@ -115,11 +120,20 @@ class _Base(unittest.TestCase):
                 mock.patch.object(work, "get", side_effect=self._lot_row),
                 mock.patch.object(work, "milestones",
                                   side_effect=lambda db, n, *a, **kw: list(self.lot_marks)),
+                mock.patch.object(work, "note", side_effect=self._note),
+                mock.patch.object(work, "events", side_effect=self._events),
                 mock.patch.object(merge_queue, "actor_family",
                                   side_effect=lambda db, n: self.FAMILIES.get(
                                       str(n or "").strip(), ""))):
             patch.start()
             self.addCleanup(patch.stop)
+
+    def _note(self, db, item_id, text, **kw):
+        self.journal.append({"id": len(self.journal) + 1, "note": text})
+        return True
+
+    def _events(self, db, item_id, limit=100):
+        return list(reversed(self.journal))
 
     def _lot_row(self, db, lot, *a, **kw):
         row = {"id": int(lot), "state": "build", "branch": self.lot_branch,
@@ -159,8 +173,13 @@ class _Base(unittest.TestCase):
         kw.setdefault("sleep", lambda s: None)
         kw.setdefault("lot", self.lot)
         kw.setdefault("repo", self.repo)
-        kw.setdefault("db", None)
+        kw.setdefault("db", self.db)
         kw.setdefault("cfg", None)
+        # #2333 : ces bancs simulent la fusion d'un paquet ; une exception
+        # incident est la déclaration qui autorise un lot hors paquet. Les
+        # témoins de la garde elle-même passent exception="" explicitement.
+        kw.setdefault("exception", "incident")
+        kw.setdefault("reason", "test: lot merge fixture outside the packet")
         return merge_pr.direct_merge(slug or self.slug, 7, self.head, gh=gh, **kw)
 
     def move_main(self):
@@ -174,6 +193,83 @@ class _Base(unittest.TestCase):
         _git(mover, "commit", "-q", "-m", "moved")
         _git(mover, "push", "-q", "origin", "main")
         return _git(self.origin, "rev-parse", "main").lower()
+
+
+class PacketGuardTest(_Base):
+    """#2333/canon §11 bis : une tête `lot/**` ne se fusionne pas hors paquet ;
+    `integration/**` passe ; l'exception est déclarée et journalisée."""
+
+    def test_a_lot_branch_is_refused_outside_the_packet(self):
+        gh = self.gh()
+        with self.assertRaises(merge_pr.MergePrError) as caught:
+            self.merge(gh, exception="", reason="")
+        message = str(caught.exception)
+        self.assertIn("§11 bis", message)
+        self.assertIn("integration/**", message)
+        self.assertEqual(len(gh.calls), 1, "le refus précède toute autre lecture")
+        self.assertEqual(self.tip(), self.base, "rien n'a été écrit")
+
+    def test_an_integration_packet_passes_without_exception(self):
+        from ameesh import packet_guard
+        out = packet_guard.check_merge(None, self.lot, "integration/paquet-2333", "main",
+                                       self.head, exception="", reason="")
+        self.assertTrue(out["allowed"])
+        self.assertEqual(out["exception"], "")
+
+    def test_the_exception_is_written_to_the_lot_journal(self):
+        from ameesh import packet_guard
+        head = self.head.lower()
+        db = mock.Mock()
+
+        def note(_db, lot, text, **kw):
+            declared["note"] = (int(lot), text, kw.get("actor"))
+            return True
+
+        declared = {}
+        events = []
+        with mock.patch.object(work, "note", side_effect=note), \
+                mock.patch.object(work, "events", return_value=events):
+            out = packet_guard.check_merge(db, self.lot, "lot/7-work", "main", head,
+                                           exception="incident",
+                                           reason="cible rouge 18/10",
+                                           actor="human:pilote")
+        self.assertTrue(out["allowed"])
+        self.assertTrue(out["journaled"])
+        self.assertEqual(declared["note"][0], self.lot)
+        self.assertIn("packet-exception incident sha=%s" % head, declared["note"][1])
+        self.assertIn("cible rouge 18/10", declared["note"][1])
+        self.assertEqual(declared["note"][2], "human:pilote")
+
+
+    def test_any_head_but_a_packet_is_a_lot_branch(self):
+        """Relecture #2333 (B1) : le doute refuse. Une tête `fix/**`,
+        `auditeur/**`, `remise/**` ou illisible n'est pas un paquet ; seuls
+        `integration/**` et une ref d'intégration (`release/*`) passent."""
+        from ameesh import packet_guard
+        for source in ("fix/974-x", "auditeur/autoprise", "remise/1770-rebase", "canon/2329",
+                       "lot/7-work", "agent/a-1", "review/r-1", ""):
+            with self.subTest(source=source), self.assertRaises(packet_guard.PacketGuardError):
+                packet_guard.check_merge(None, self.lot, source, "main", self.head)
+        for source in ("integration/paquet-62", "origin/integration/p", "release/1.12.0"):
+            with self.subTest(source=source):
+                self.assertTrue(packet_guard.check_merge(None, self.lot, source, "main",
+                                                         self.head)["allowed"])
+
+    def test_a_dry_run_does_not_journal_the_exception(self):
+        """Relecture #2333 (N1 #1003) : `--dry-run` valide l'exception sans
+        l'écrire au journal du lot."""
+        from ameesh import packet_guard
+        db = mock.Mock()
+        with mock.patch.object(work, "note") as note, \
+                mock.patch.object(work, "events", return_value=[]):
+            out = self.merge(self.gh(), db=db, dry_run=True, exception="incident",
+                             reason="cible rouge")
+        self.assertEqual(out["state"], "dry-run")
+        note.assert_not_called()
+        with mock.patch.object(work, "note") as note:
+            packet_guard.check_merge(db, self.lot, "lot/7-work", "main", self.head.lower(),
+                                     exception="incident", reason="cible rouge")
+        note.assert_called_once()
 
 
 class GuardTest(_Base):
@@ -515,8 +611,11 @@ class AdmissionGuardTest(_Base):
         self.assertEqual(self.tip(), self.base)
 
     def test_a_blocked_verdict_is_refused(self):
+        # #1630 : le témoin vise le blocage lui-même — le préfixe commun
+        # « no review verdict ok » passerait aussi sur un simple manque d'avis.
         self.ready_marks(verdict="blocked")
-        with self.assertRaisesRegex(merge_pr.MergePrError, "no review verdict ok"):
+        with self.assertRaisesRegex(merge_pr.MergePrError,
+                                    r"blocked verdict\(s\) not lifted: rev1"):
             self.merge(self.gh())
         self.assertEqual(self.tip(), self.base)
 
@@ -545,6 +644,9 @@ class AdmissionGuardTest(_Base):
         self.assertEqual(self.tip(), self.base)
 
     def test_a_target_the_lot_is_not_queued_for_is_refused(self):
+        # #2278 : la cible visée doit exister pour que l'admission passe ;
+        # c'est ensuite le garde « queued for » qui refuse le lot.
+        _git(self.repo, "push", "-q", "origin", "main:develop")
         self.lot_target = "develop"
         with self.assertRaisesRegex(merge_pr.MergePrError, "queued for"):
             self.merge(self.gh())
@@ -591,7 +693,8 @@ class FreshGuardTest(_Base):
             return original(*a, **kw)
 
         with mock.patch.object(merge_pr, "message", side_effect=side_effect):
-            with self.assertRaisesRegex(merge_pr.MergePrError, "no review verdict ok"):
+            with self.assertRaisesRegex(merge_pr.MergePrError,
+                                        r"blocked verdict\(s\) not lifted: rev1"):
                 self.merge(gh)
         self.assertEqual(self.tip(), self.base)
 
@@ -603,7 +706,7 @@ class RunTest(unittest.TestCase):
         import argparse
         data = dict(repo="o/r", fetch_url="", push_url="git@github.com:o/r.git",
                     target=None, pr=7, head="a" * 40, dry_run=False, lot=1003, json=True,
-                    actor="impl-03")
+                    exception="", reason="", actor="impl-03")
         data.update(over)
         return argparse.Namespace(**data)
 

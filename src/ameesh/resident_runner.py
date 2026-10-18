@@ -22,14 +22,16 @@ published as `AgentWorker.proc` / `pgid` for the whole life of the process,
 so the deadline watchdog, a lost lease and the runner shutdown kill it as
 they kill a turn; nothing outlives the lease.
 
-L76 enables the resident mode for `claude-stream-json` only: its events are
-the lines of `claude -p --output-format stream-json`, which the ledger
-already reads. Codex app-server and ACP report their usage in other messages
-(`thread/tokenUsage/updated`, `session/update`); they stay at one turn per
-event until L80 counts them.
+L80a enables the resident mode for the three protocols: Claude's stream is
+read by the ledger as it is (`result`), while the usage Codex app-server and
+ACP report in other messages (`thread/tokenUsage/updated`, `session/update`)
+is carried by their `TurnResult` and written once per logical turn as a
+`resident.turn` event (see `resident.usage_event`), which `cost.CostBook`
+reads instead of the raw stream.
 """
 from __future__ import annotations
 
+import json
 import os
 import queue
 import signal
@@ -47,8 +49,9 @@ SETTING = "resident"
 SLEEP_SETTING = "resident_sleep"
 #: decision 0035 §5, study §1: 30 min of inactivity by default
 DEFAULT_SLEEP_S = 1800
-#: protocols whose events the ledger reads as they are (see the module doc)
-PROTOCOLS = ("claude-stream-json",)
+#: protocols whose usage the ledger can count: Claude's stream carries it,
+#: Codex app-server and ACP report it in their `TurnResult` (see `usage_event`)
+PROTOCOLS = ("claude-stream-json", "codex-app-server", "acp")
 #: L76 T3: a resident whose last proof of life is older than this is probed
 #: (bounded) outside its turns, before it serves another one
 PROBE_EVERY_S = 30.0
@@ -136,8 +139,10 @@ def reread_max(value: str | None) -> float:
 
 
 def turn_reread(usage: dict | None) -> int:
-    """Tokens a turn re-read (sum of its model calls): the measure of the L60
-    context ceiling, carried by `TurnResult.usage`."""
+    """Tokens a turn re-read (sum of its model calls): the cost and alert
+    measure carried by `TurnResult.usage`. The L60 context ceiling is measured
+    on the context of the last call (`context_tokens`), not on this sum
+    (#2336): the sum grows with the number of steps, not with the session."""
     return sum(int((usage or {}).get(key) or 0) for key in
                ("input_tokens", "cache_read_input_tokens",
                 "cache_creation_input_tokens"))
@@ -149,16 +154,19 @@ def maintenance(*, context: int | None, window: int | None, reread: int,
                 compact_retry_s: float = 0.0) -> str:
     """What a finished resident session asks for (L81, study §6.2).
 
-    `ROTATE`: the per-agent L60 ceiling is reached on the turn's re-read — a
-    hard bound, acted on at the first passage between turns. `ALERT`: the
-    session's cumulative re-read passed `reread_max` (the study's alert
-    threshold) — acted on when quiet. `COMPACT`: the context fills `share` of
-    its window — acted on when quiet too, and not again within
-    `compact_retry_s` of the last request (`since_compact`), so that a
-    compaction which does not land never loops. Rotation wins over
-    compaction: a compaction would not bring the session back under a hard
-    bound."""
-    if cap and reread >= cap:
+    `ROTATE`: the per-agent L60 ceiling is reached on the session's context —
+    the context of the last call, `context`; when the harness does not publish
+    it, the turn's re-read (`reread`) remains the fallback measure, so a
+    harness without context reporting is not left unprotected — a hard bound,
+    acted on at the first passage between turns. `ALERT`: the session's
+    cumulative re-read passed `reread_max` (the study's alert threshold) —
+    acted on when quiet. `COMPACT`: the context fills `share` of its window —
+    acted on when quiet too, and not again within `compact_retry_s` of the
+    last request (`since_compact`), so that a compaction which does not land
+    never loops. Rotation wins over compaction: a compaction would not bring
+    the session back under a hard bound."""
+    mesure = context if context is not None else reread
+    if cap and mesure >= cap:
         return ROTATE
     if reread_max and session_reread >= reread_max:
         return ALERT
@@ -224,6 +232,83 @@ def refusal(adapter) -> str:
         return ("resident protocol %s: its usage is not counted on the ledger yet "
                 "(L80)" % protocol)
     return resident.availability(adapter.descriptor, binary_version(adapter))
+
+
+#: protocols whose raw stream already carries the turn's usage, as the ledger
+#: reads it (Claude's `result`): they need no `resident.turn` event
+NATIVE_USAGE = ("claude-stream-json",)
+
+
+def usage_event(protocol: str, result: "resident.TurnResult", *,
+                turn: str = "") -> dict | None:
+    """The ledger event of a finished resident turn (L80a), or None when the
+    stream itself already carries the usage (Claude).
+
+    `usage` is the turn's `TurnResult.usage`, normalized by the driver: input
+    tokens without the cache read, cache read apart, output. `cost` and
+    `cost_total` are the harness's USD when it publishes them (ACP
+    `usage_update.cost`, cumulative for `cost_total`). The event is written
+    once per logical turn, so two turns served by the same process each carry
+    their own measure, never a cumulative one that the ledger would subtract
+    twice."""
+    if protocol in NATIVE_USAGE:
+        return None
+    event = {
+        "type": resident.USAGE_EVENT,
+        "protocol": protocol,
+        "usage": dict(result.usage or {}),
+        "session": result.session or "",
+        "turn": turn or "",
+        "status": result.status,
+    }
+    if result.usage_total:
+        event["usage_total"] = dict(result.usage_total)
+    if result.cost is not None:
+        event["cost"] = float(result.cost)
+    if result.cost_total is not None:
+        event["cost_total"] = float(result.cost_total)
+    return event
+
+
+def write_usage_event(path: str, event: dict | None) -> bool:
+    """Append `event` to the agent's event stream; True when written.
+
+    Flushed and fsynced before the ledger line: if the runner dies before the
+    database write, the repair reads the event and counts the same turn
+    instead of losing its usage.
+
+    #2453: a failed write (ENOSPC) is truncated back to the size before it,
+    and a stream that does not end with a newline (a partial line left by an
+    earlier crash) gets one first — otherwise the repaired event would be
+    glued to that fragment and unreadable, and the turn booked at 0."""
+    if event is None:
+        return False
+    data = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
+    except OSError as exc:
+        resident.log("resident usage event not written (%s)" % exc)
+        return False
+    size = None
+    try:
+        size = os.fstat(fd).st_size
+        if size and os.pread(fd, 1, size - 1) != b"\n":
+            data = b"\n" + data
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+        return True
+    except OSError as exc:
+        resident.log("resident usage event not written (%s)" % exc)
+        if size is not None:
+            try:
+                os.ftruncate(fd, size)
+            except OSError as trunc:
+                resident.log("resident usage event not truncated (%s)" % trunc)
+        return False
+    finally:
+        os.close(fd)
 
 
 class ResidentProcess:

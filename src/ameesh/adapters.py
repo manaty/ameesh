@@ -906,11 +906,32 @@ def reread_tokens(harness: str, usage: Mapping | None) -> int:
     """Jetons d'entrée relus par UN appel, cache compris (L105).
 
     Même mesure que le grand livre (`TurnUsage.reread_tokens`, L60) : Codex
-    compte déjà le cache dans l'entrée, les autres harnais à part."""
+    compte déjà le cache dans l'entrée, les autres harnais à part. C'est la
+    relecture CUMULÉE d'un tour, pas la taille du contexte d'un appel : le
+    plafond de contexte se mesure avec `context_tokens` (#2336)."""
     entree, cache, _sortie = usage_tokens(usage)
     if harness == "codex":
         return max(entree, cache)
     return entree + cache
+
+
+def context_tokens(harness: str, usage: Mapping | None) -> int:
+    """Contexte d'UN appel au modèle : la taille de la session à cet instant
+    (L60, #2336).
+
+    C'est la mesure du plafond de contexte, celle qu'un appel relit réellement :
+    entrée neuve + entrée relue en cache + entrée écrite en cache (Claude), ou
+    l'entrée seule quand le harnais y compte déjà le cache (Codex). La somme
+    des appels d'un tour n'est PAS une taille de contexte : elle dépend du
+    nombre d'étapes, pas de la session (#2336)."""
+    entree, cache, _sortie = usage_tokens(usage)
+    if harness == "codex":
+        return max(entree, cache)
+    ecrits = 0
+    value = (usage or {}).get("cache_creation_input_tokens")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        ecrits = max(int(value), 0)
+    return entree + cache + ecrits
 
 
 class AcpStream(StreamReader):

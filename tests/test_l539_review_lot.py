@@ -118,6 +118,102 @@ class RuleTest(unittest.TestCase):
         self.assertNotIn("codex ou claude", body)
         self.assertIn("a" * 12, body)
         self.assertIn("ameesh work milestone 539 verdict", body)
+        # #1280 B2 : la mission dit au lecteur comment la clore après verdict
+        self.assertIn("clore cette mission", body)
+        self.assertIn("--done", body)
+
+    def gate_klass(self):
+        """La classe réelle de la porte de fusion avant le correctif : le canon
+        ne nomme pas `merge_pr.py`, la politique le rend donc `light` (#2374)."""
+        return {"class": "light",
+                "why": "policy of ameesh; 2 file(s) since b791534b",
+                "files": [
+                    {"path": "src/ameesh/merge_pr.py", "class": "light", "rule": None},
+                    {"path": "tests/test_2273_merge_pr_required.py", "class": "light",
+                     "rule": None},
+                ]}
+
+    def test_un_light_sur_la_porte_de_fusion_ouvre_deux_avis(self):
+        """#2374 : une classe light qui touche `CRITICAL_SCOPE` (porte de
+        fusion) ouvre une relecture **sensible**, avec deux familles."""
+        out = self.open(self.gate_klass(), merged_sha="b" * 40, pr=476)
+        self.assertTrue(out["created"], out)
+        self.assertEqual(out["class"], "sensitive", out)
+        self.assertEqual(out["merged_class"], "light", out)
+        self.assertTrue(out["critical"], out)
+        self.assertEqual(out["reviews"], 2, out)
+        body = self.ops.added[0]["body"]
+        self.assertIn("**porte de fusion** : deux avis indépendants", body)
+        self.assertIn("Classe : sensitive", body)
+        self.assertIn("porte de fusion : chemin critique, deux avis requis", body)
+        self.assertIn("deux familles distinctes", body)
+        self.assertIn("claude et deepseek", body)
+        self.assertIn("Avis requis : **2**", body)
+        self.assertIn("livrer un verdict par relecteur", body)
+        self.assertIn("second avis avant la clôture", body)
+        self.assertNotIn("§2, lot léger", body)
+        # #2384 : un auteur dont la famille est tracée n'a pas la route de sortie
+        self.assertNotIn("Famille de l'auteur non tracée", body)
+
+    def test_porte_de_fusion_sans_famille_auteur_explique_la_route(self):
+        """#2384 : quand la famille de l'auteur n'est pas tracée, le corps ne
+        peut pas promettre les deux avis sans dire que la garde refusera
+        `--done` ; la route (pilote : abandon/remplacement ou dispense) est
+        écrite avant les verdicts."""
+        self.ops.milestones_rows.pop(LOT)
+        out = self.open(self.gate_klass(), merged_sha="c" * 40)
+        self.assertTrue(out["created"], out)
+        body = self.ops.added[0]["body"]
+        self.assertIn("harnais non tracé au gel", body)
+        self.assertIn("**Famille de l'auteur non tracée**", body)
+        self.assertIn("--done", body)
+        self.assertIn("pilote", body)
+        self.assertIn("--abandoned", body)
+        self.assertIn("--superseded-by", body)
+        self.assertIn("dispense", body)
+        self.assertIn("route ci-dessus", body)
+        self.assertIn("deux familles distinctes", body)
+        self.assertIn("livrés les verdicts ? saisir le pilote", body)
+        self.assertNotIn("clore cette mission** : `ameesh work close <id> --done`", body)
+
+    def test_auteur_humain_sans_harnais_ne_promet_pas_un_refus(self):
+        body = review_lot.body_of(
+            self.item, LOT, klass={"class": "sensitive", "critical": True},
+            author={"name": "human:smichea", "harness": ""})
+        self.assertNotIn("Famille de l'auteur non tracée", body)
+        self.assertNotIn("sera refusé", body)
+        self.assertIn("clore cette mission** : `ameesh work close <id> --done`", body)
+
+    def test_tiers_qui_regele_ne_donne_pas_sa_famille_a_lauteur(self):
+        body = review_lot.body_of(
+            self.item, LOT, klass={"class": "sensitive", "critical": True},
+            author={"name": "a1", "harness": "", "refroze": "claude1"})
+        self.assertIn("Famille de l'auteur non tracée", body)
+        self.assertIn("codex et claude", body)
+        self.assertNotIn("codex et deepseek", body)
+
+    def test_un_light_hors_porte_de_fusion_reste_un_avis(self):
+        """Le correctif ne transforme pas toute fusion light en relecture
+        sensible : un chemin ordinaire garde un avis et le gabarit léger."""
+        klass = {"class": "light", "why": "policy of ameesh",
+                 "files": [{"path": "docs/guide.md", "class": "light", "rule": None}]}
+        out = self.open(klass)
+        self.assertTrue(out["created"], out)
+        self.assertEqual(out["class"], "light", out)
+        self.assertEqual(out["reviews"], 1, out)
+        self.assertFalse(out["critical"], out)
+        body = self.ops.added[0]["body"]
+        self.assertIn("§2, lot léger", body)
+        self.assertIn("une **autre famille de modèle**", body)
+        self.assertNotIn("Avis requis", body)
+
+    def test_la_porte_de_fusion_deja_ouverte_ne_rouvre_pas(self):
+        first = self.open(self.gate_klass())
+        again = self.open(self.gate_klass())
+        self.assertTrue(first["created"], first)
+        self.assertFalse(again["created"], again)
+        self.assertEqual(again["id"], first["id"])
+        self.assertEqual(len(self.ops.added), 1)
 
     def test_sans_tour_trace_la_famille_reste_inconnue(self):
         """#1053 : aucun tour au gel — le registre courant (deepseek) ne sert
@@ -128,6 +224,19 @@ class RuleTest(unittest.TestCase):
         body = self.ops.added[0]["body"]
         self.assertIn("harnais non tracé au gel", body)
         self.assertIn("codex ou claude", body)
+
+    def test_un_avis_n_ouvre_pas_la_relecture_d_un_avis(self):
+        """R codex3 #1280 B2 : un avis déclaré fusionné ne rouvre pas la
+        relecture d'un avis — la garde coupe la récursion avant la création."""
+        self.ops.items[LOT] = {
+            "id": LOT, "title": "REVUE #12 : relecture après fusion",
+            "source": "review-after-merge:#12",
+            "issue_ref": "review-after-merge:#12",
+            "state": "merged", "app": "ameesh"}
+        out = self.open()
+        self.assertFalse(out["created"], out)
+        self.assertIn("avis", out["why"])
+        self.assertEqual(self.ops.added, [])
 
     def test_la_seconde_ouverture_est_un_no_op(self):
         first = self.open()
@@ -172,6 +281,11 @@ class RuleTest(unittest.TestCase):
         self.assertEqual(review_lot.reviewer_family("claude"), "codex")
         self.assertEqual(review_lot.reviewer_family("codex"), "claude")
         self.assertIn("codex", review_lot.reviewer_family(""))
+        # #2374 : deux familles distinctes, hors de l'auteur, pour la porte
+        self.assertEqual(review_lot.review_families("deepseek"), ("codex", "claude"))
+        self.assertEqual(review_lot.review_families("claude"), ("codex", "deepseek"))
+        self.assertEqual(review_lot.review_families("codex"), ("claude", "deepseek"))
+        self.assertEqual(review_lot.review_families(""), ("codex", "claude"))
         self.assertEqual(review_lot.ref_of(539), "review-after-merge:#539")
 
 

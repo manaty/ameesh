@@ -201,6 +201,8 @@ def cmd_handoff(cfg: Config, args: argparse.Namespace) -> int:
             print(json.dumps({"operation": row,
                               "events": storage.of(db).handoffs.events(args.operation)}, ensure_ascii=False))
             return 0
+        from .agent_names import resolve
+        args.agent = resolve(args.agent, db=db, operation="handoff.agent")
         binding = identity.resolve_binding(cfg, db)
         if not binding.ok or binding.name != args.agent:
             work.corrector(cfg, db)
@@ -246,18 +248,23 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         # et le compte par agent en dérivent.
         lots = work.delays(db, limit=500)
         open_by_agent: dict[str, int] = {}
+        build_by_agent: dict[str, int] = {}
         for lot in lots:
             if lot.get("assignee") and lot.get("state") not in work.TERMINAL:
                 open_by_agent[lot["assignee"]] = open_by_agent.get(lot["assignee"], 0) + 1
+                if lot.get("state") == "build":
+                    # §4 (owner 14/10/2026) : le compte d'en-cours est tous
+                    # projets confondus, comme le plafond lui-même
+                    build_by_agent[lot["assignee"]] = build_by_agent.get(lot["assignee"], 0) + 1
         # regroupé par projet (tri stable : dans un projet, l'ordre de
         # `overview`, vu le plus récemment d'abord) ; les sans-projet en dernier
         rows.sort(key=lambda r: (r["project"] is None, r["project"] or ""))
         # #1782 : la colonne HARNESS fait 10, pas 9 — la valeur étoilée d'un
         # harnais vivant de 9 lettres (`(live or '?')[:9] + '*'`) en fait 10 ;
         # à 9, la ligne entière se décalait d'un caractère.
-        print("%-20s %-12s %-10s %-10s %-11s %-22s %-8s %-5s %-13s %-4s %s" % (
-            "NAME", "PROJECT", "HARNESS", "HOST", "STATUS", "LEASE", "UNREAD", "ITEMS", "BUDGET",
-            "KEY", "SEEN"))
+        print("%-20s %-12s %-10s %-10s %-11s %-22s %-8s %-5s %-5s %-13s %-4s %s" % (
+            "NAME", "PROJECT", "HARNESS", "HOST", "STATUS", "LEASE", "UNREAD", "ITEMS",
+            "BUILD", "BUDGET", "KEY", "SEEN"))
         session_differs = False
         for row in rows:
             status = row.get("status") or "?"
@@ -281,12 +288,14 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
             starred = bool(live) and live != declared
             if starred:
                 session_differs = True
-            print("%-20s %-12s %-10s %-10s %-11s %-22s %-8d %-5d %-13s %-4s %s" % (
+            wip = build_by_agent.get(row["name"], 0)
+            print("%-20s %-12s %-10s %-10s %-11s %-22s %-8d %-5d %-5s %-13s %-4s %s" % (
                 row["name"][:20], project_label(agent_project_label(row))[:12],
                 ((live or "?")[:9] + ("*" if starred else "")),
                 (row.get("host") or "")[:10],
                 status[:11], _lease(row), int(row.get("unread") or 0),
-                open_by_agent.get(row["name"], 0), _budget(row),
+                open_by_agent.get(row["name"], 0),
+                "%d!" % wip if wip > work.BUILD_LIMIT else str(wip), _budget(row),
                 ("owner" if row.get("has_owner_key")
                  else "agent" if row.get("key_ready") else "—"),
                 _fmt_age(now - float(row.get("last_seen_ts") or 0)),
@@ -309,6 +318,13 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
                                if name in counts)
             waiting = " — oldest freeze: %s" % _fmt_age(now - oldest) if oldest else ""
             print("items    : %d (%s)%s" % (len(lots), detail, waiting))
+        # §4 : qui dépasse le plafond d'en-cours (le balayage rend le surplus)
+        over = sorted(name for name, count in build_by_agent.items()
+                      if count > work.BUILD_LIMIT)
+        if over:
+            print("wip      : %d agent(s) above the §4 cap (%d lots in build): %s — "
+                  "ameesh work wip [--apply] returns the surplus to the team queue"
+                  % (len(over), work.BUILD_LIMIT, ", ".join(over)))
         return 0
     finally:
         db.close()
@@ -550,14 +566,32 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
             def tag(key: str) -> str:
                 return " [%s]" % origin.get(key, res.DEFAULT_ORIGIN) if fiches else ""
 
-            print("  thresholds memory ≥ %s%s; swap ≤ %s%s; load ≤ %.2f%s; disk ≥ %s%s"
+            # #2354: no declared swap ceiling and no PSI to corroborate one —
+            # the host is under the 0028 conservative fallback, the stock is
+            # then the only memory signal; say it instead of a bare "—".
+            swap = limits["max_swap_used"]
+            if swap is None and latest.get("psi_mem_some") is None:
+                swap = res.DEFAULT_MAX_SWAP_USED_WITHOUT_PSI
+                swap_tag = " [fallback: no PSI]"
+                swap_note = "counts alone, no PSI"
+            else:
+                # #2296: the declared ceiling, or none at all — "— [défaut]"
+                # would claim a default value that does not exist
+                swap_tag = tag("max_swap_used") if swap is not None else " [no default]"
+                swap_note = "counts only under memory pressure"
+
+            print("  thresholds memory ≥ %s%s; swap ≤ %s%s (%s); load ≤ %.2f%s; disk ≥ %s%s"
                   "; tmpfs ≤ %s%s"
                   % (_fmt_bytes(limits["min_mem_available"]), tag("min_mem_available"),
-                     _fmt_bytes(limits["max_swap_used"]), tag("max_swap_used"),
+                     _fmt_bytes(swap), swap_tag, swap_note,
                      limits["max_load"], tag("max_load"),
                      _fmt_bytes(limits["min_disk_free"]), tag("min_disk_free"),
                      res.fmt_value("max_tmpfs_used", limits.get("max_tmpfs_used")),
                      tag("max_tmpfs_used")))
+            # #2296: the admission signal that follows the real pressure
+            print("  thresholds memory pressure ≤ %s%s"
+                  % (res.fmt_value("max_mem_pressure", limits["max_mem_pressure"]),
+                     tag("max_mem_pressure")))
             if limits.get("max_cpu_pressure") is not None:
                 print("  thresholds CPU pressure ≤ %s%s"
                       % (res.fmt_value("max_cpu_pressure", limits["max_cpu_pressure"]),
@@ -1511,15 +1545,20 @@ def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
 
 
 def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
-    from . import plan, plan_cli, stagnation  # plan de travail (L29)
+    from . import plan, plan_cli, prevalidation, stagnation  # plan de travail (L29)
     db = _open(cfg)
     try:
         _work_actor(cfg, db, args)
+        if args.work_command in prevalidation.COMMANDS:   # #1770 prévalidation au gel
+            return prevalidation.run(cfg, db, args)
         if args.work_command in plan_cli.COMMANDS:
             return plan_cli.run(db, args)
         if args.work_command == "backlog":   # file d'amélioration (L119, 0037)
             from . import backlog
             return backlog.run(db, args, cfg)
+        if args.work_command in ("wip", "return"):   # limite d'en-cours (§4)
+            from . import wip
+            return wip.run(db, args, cfg)
         if args.work_command == "unrecorded":   # demandes d'humains sans lot (L130)
             from . import unrecorded
             return unrecorded.run(cfg, db, args)
@@ -1529,6 +1568,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "dependencies":
             from . import work_dependencies
             return work_dependencies.run(db, args)
+        if args.work_command == "landing":   # #1945 : atterrissage planifié sur un véhicule
+            from . import work_dependencies
+            return work_dependencies.run_landing(db, args)
         if args.work_command == "queue":   # merge queue per target (L160e)
             from . import merge_queue
             return merge_queue.run(cfg, db, args)
@@ -1603,7 +1645,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             out = work.assign(db, args.id, args.agent, externe=args.externe,
                               actor=args.actor, cfg=cfg, branch=args.branch,
                               branch_target=args.target, force=args.force,
-                              claim=args.claim, if_holder=args.if_holder)
+                              claim=args.claim, if_holder=args.if_holder,
+                              wip_exception=args.wip_exception)
             if out.get("queue_warning"):
                 print("lot #%d not assigned to %s (before: %s)" % (
                     out["item"]["id"], args.agent, out["previous"] or "nobody"))
@@ -1618,12 +1661,19 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("lot #%d already assigned to %s: claim is a no-op, nothing changed"
                       % (out["item"]["id"], out["item"]["assignee"]))
             elif out["previous"] == out["item"]["assignee"]:
-                print("lot #%d: branch %s (assigned to %s)" % (
-                    out["item"]["id"], out["item"].get("branch"), out["item"]["assignee"]))
+                if args.wip_exception:
+                    print("lot #%d: WIP exception recorded for %s%s" % (
+                        out["item"]["id"], out["item"]["assignee"],
+                        "; branch %s" % out["item"]["branch"] if args.branch else ""))
+                else:
+                    print("lot #%d: branch %s (assigned to %s)" % (
+                        out["item"]["id"], out["item"].get("branch"),
+                        out["item"]["assignee"]))
             else:
-                print("lot #%d assigned to %s (before: %s)%s" % (
+                print("lot #%d assigned to %s (before: %s)%s%s" % (
                     out["item"]["id"], out["item"]["assignee"], out["previous"] or "nobody",
-                    "; branch %s" % out["item"]["branch"] if args.branch else ""))
+                    "; branch %s" % out["item"]["branch"] if args.branch else "",
+                    "; WIP exception (§4)" if args.wip_exception else ""))
             _print_assignment(out["check"])
             return 0
         if args.work_command == "branch":
@@ -1777,7 +1827,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 delivered = next((m.get("sha") for m in item.get("milestones", [])
                                   if m.get("kind") == "delivered" and m.get("sha")), "")
                 print("closed   : %s%s" % (
-                    work.close_label(item),
+                    work.close_how(item.get("close_reason"), item.get("superseded_by")),
                     " (head %s)" % delivered[:12] if delivered else ""))
             if item.get("pr_ref"):
                 print("PR       : %s" % item["pr_ref"])
@@ -1844,6 +1894,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     (event.get("actor") or "—")[:12], event["note"]))
             return 0
         if args.work_command == "migration":
+            from . import migration_reservations
+            if (args.slot or args.list or args.landed or args.target_branch
+                    or args.target_sha or args.reservation_id):
+                return migration_reservations.run(db, args, cfg)
             # L122 : numéro de migration réservé au lot, avant d'écrire le fichier
             item = work.reserve_migration(db, args.id, args.number, release=args.release,
                                           repo=args.repo, actor=args.actor, cfg=cfg,
@@ -1972,13 +2026,78 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("lot #%d: %s — %s" % (row["id"], row["status"],
                                            row.get("project") or row.get("reason", "changed concurrently")))
             return 0
+        if args.work_command == "reviewers":
+            from . import review_designation_activation as activation
+            out = activation.reviewers(cfg, db, args.id, apply=args.apply)
+            if args.json:
+                print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
+            else:
+                freeze = out.get("freeze")
+                if not freeze:
+                    print("lot #%d is not frozen: no automatic designation" % args.id)
+                else:
+                    print("lot #%d: freeze #%s %s" % (
+                        args.id, freeze["id"], str(freeze.get("sha") or "")[:12]))
+                    designation = out.get("designation")
+                    if not designation:
+                        print("designation: none recorded")
+                    elif designation.get("state") == "designated":
+                        names = ", ".join("%s (%s)" % (r.get("name"), r.get("family"))
+                                          for r in designation.get("reviewers") or ())
+                        print("designation: %s" % names)
+                        if designation.get("policy_ref"):
+                            print("policy     : %s" % designation["policy_ref"])
+                    else:
+                        print("designation: %s — %s" % (
+                            designation.get("state"), designation.get("why") or ""))
+                    if out.get("manual"):
+                        print("manual     : %s" % ", ".join(out["manual"]))
+                    if out.get("error"):
+                        print("mark       : %s" % out["error"])
+            applied = out.get("applied")
+            if applied is not None and not args.json:
+                state = applied.get("state")
+                if state == "designated":
+                    names = ", ".join("%s (%s)" % (r.get("name"), r.get("family"))
+                                      for r in applied.get("reviewers") or ())
+                    print("designated: %s" % names)
+                elif state == "waiting":
+                    print("waiting    : %s" % (applied.get("why") or ""))
+                elif state == "manual":
+                    print("manual     : %s" % (applied.get("why") or ""))
+                elif state in ("unavailable", "none", "unfrozen"):
+                    print("%-11s: %s" % (state, applied.get("why") or ""))
+                else:
+                    print("designation: %s" % state)
+            return 0
         if args.work_command == "milestone":
+            from . import review_designation_activation as activation
+            threads: list = []
+            outcome: dict = {}
+            on_frozen = None
+            if args.kind == "frozen" and activation.enabled(cfg):
+                on_frozen = activation.hook(cfg, outcome)
             row = work.milestone(
                 db, args.id, args.kind, sha=args.sha or "", actor=args.actor or "",
-                verdict=args.verdict, note=args.note or "")
+                verdict=args.verdict, note=args.note or "",
+                on_frozen=on_frozen, after_commit=threads if on_frozen else None)
+            for record in threads:
+                record(db.cfg, db)
             print("milestone %s added to lot #%d%s" % (
                 row["kind"], args.id,
                 " (%s)" % row["verdict"] if row.get("verdict") else ""))
+            state = str(outcome.get("state") or "")
+            if state == "designated":
+                print("reviewers: %s" % ", ".join(
+                    "%s (%s)" % (r.get("name"), r.get("family"))
+                    for r in outcome.get("reviewers") or ()))
+            elif state == "waiting":
+                print("review pending: %s" % (outcome.get("why") or ""))
+            elif state == "manual":
+                print("reviewers: manual designation kept (%s)"
+                      % ", ".join(r.get("name") for r in outcome.get("reviewers") or ()))
+            elif state == "unavailable":
+                print("review designation unavailable: %s" % (outcome.get("why") or ""))
             return 0
         print(USAGE_HINT % "unknown work subcommand", file=sys.stderr)
         return 2
@@ -2239,6 +2358,8 @@ def cmd_set(cfg: Config, args) -> int:
     db = db_mod.connect(cfg)
     try:
         db_mod.require_schema(db, defer=True)
+        from .agent_names import resolve
+        args.agent = resolve(args.agent, db=db, operation="settings.permission_mode")
         agent = registry.get(db, args.agent)
         if agent is None:
             print("unknown agent: %s" % args.agent, file=sys.stderr)
@@ -2841,6 +2962,7 @@ def build_parser() -> argparse.ArgumentParser:
     pw_show.set_defaults(func=cmd_work)
     from . import work_dependencies
     work_dependencies.add_parser(work_sub, cmd_work)
+    work_dependencies.add_landing_parser(work_sub, cmd_work)
     pw_mig = work_sub.add_parser(
         "migration", help="reserve the next free migration number for the work item (L122), "
                           "before writing the file; idempotent, visible in work show")
@@ -2863,6 +2985,8 @@ def build_parser() -> argparse.ArgumentParser:
     pw_mig.add_argument("--json", action="store_true")
     pw_mig.add_argument("--actor", default="",
                         help="default: the session's bound identity (AGENT_MAIL_NAME)")
+    from . import migration_reservations
+    migration_reservations.add_options(pw_mig)
     pw_mig.set_defaults(func=cmd_work)
     pw_move = work_sub.add_parser("move")
     pw_move.add_argument("id", type=int)
@@ -2898,6 +3022,17 @@ def build_parser() -> argparse.ArgumentParser:
                              help="who designates: the session's bound identity by default; "
                                   "a human or an orchestrator (same authority as --correct)")
     pw_reviewer.set_defaults(func=cmd_work)
+    pw_reviewers = work_sub.add_parser(
+        "reviewers",
+        help="#2447: read the automatic reviewer designation of the latest freeze, "
+             "or retry it outside the freeze hook (recovery)")
+    pw_reviewers.add_argument("id", type=int)
+    pw_reviewers.add_argument("--apply", action="store_true",
+                              help="retry the designation of the latest freeze (same head); "
+                                   "a waiting state yields to the designation when capacity "
+                                   "or the canon policy comes back")
+    pw_reviewers.add_argument("--json", action="store_true")
+    pw_reviewers.set_defaults(func=cmd_work)
     pw_merged = work_sub.add_parser(
         "merged", help="declare a work item merged outside a PR and without freeze (local merge "
                        "on the target): any open state → merged, merged milestone with the commit")
@@ -2933,6 +3068,11 @@ def build_parser() -> argparse.ArgumentParser:
                            help="work item branch (L118); allowed on a work item already assigned "
                                 "to this agent")
     pw_assign.add_argument("--target", default=None, help="target branch (see work add)")
+    pw_assign.add_argument("--wip-exception", default=None, metavar="REASON",
+                           help="explicit pilot exception to the §4 WIP limit (at most %d "
+                                "lots in build per agent): this lot may stay beyond the cap; "
+                                "reserved to humans and orchestrator/design agents"
+                                % work.BUILD_LIMIT)
     pw_assign.add_argument("--actor", default="")
     pw_assign.set_defaults(func=cmd_work)
     pw_branch = work_sub.add_parser(
@@ -3016,8 +3156,12 @@ def build_parser() -> argparse.ArgumentParser:
     pw_ms.set_defaults(func=cmd_work)
     from . import plan_cli
     plan_cli.add_parsers(work_sub, cmd_work)  # plan de travail (L29)
+    from . import prevalidation
+    prevalidation.add_parsers(work_sub, cmd_work)  # #1770 prévalidation au gel
     from . import backlog
     backlog.add_parsers(work_sub, cmd_work)  # file d'amélioration (L119, 0037)
+    from . import wip
+    wip.add_parsers(work_sub, cmd_work)  # limite d'en-cours §4 (owner 14/10)
     from . import unrecorded
     unrecorded.add_parser(work_sub, cmd_work)  # demandes d'humains sans lot (L130)
     from . import resolutions

@@ -5,7 +5,8 @@
   agent-runner [--host H] [--runner-id ID] [--agents a,b] [--once [--wait S]]
                [--dry-run] [--max-turns N] [--migrate]
                [--take-idle S] [--take-max-per-hour N]
-               [--take-lot-idle S] [--take-lot-max-per-hour N] [--take-interval S]
+               [--take-lot-idle S] [--take-lot-max-per-hour N]
+               [--take-review-max-per-hour N] [--take-interval S]
         claims this host's agents, renews their leases, starts a turn
         when a message arrives (LISTEN/NOTIFY) or after inactivity.
         Every --take-interval seconds, takes for its own idle agents the
@@ -57,7 +58,7 @@ from . import persona_memory as memory_mod
 from . import train_events
 from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, NAME_RE, Config
 from . import accounts as accounts_mod, session_backup as session_backup_mod
-from .config import load as load_config
+from .config import fresh_radar, load as load_config
 
 
 def log(message: str) -> None:
@@ -441,6 +442,11 @@ class AgentWorker(threading.Thread):
     #: held » ou « attach requested ») — le worker n'espace et ne rend visible
     #: qu'un verrou tenu par un tiers.
     deferred_reason = ""
+    #: #2160 : motif de la série de reports en cours. Un changement de motif
+    #: (attach ↔ verrou tenu) clôt la série : la grâce d'un verrou tenu ne
+    #: compte que les reports de verrou, pas les passations d'attach qui l'ont
+    #: précédé.
+    deferred_series_reason = ""
 
     #: L76 : le processus résident de l'agent entre ses tours, ou None.
     #: Défaut de classe : les constructions partielles (`__new__` sans
@@ -571,18 +577,20 @@ class AgentWorker(threading.Thread):
         self.last_final: str | None = None
         self.summary_display: list[str] = []
         self._summary_chars = 0
-        #: plafond de contexte (L60) : jetons d'entrée relus (cache compris) par
-        #: le dernier tour inscrit au grand livre, et sa session
+        #: L60 : jetons d'entrée relus (cache compris) par le dernier tour
+        #: inscrit au grand livre, et sa session — mesure de coût et de
+        #: l'alerte `session_too_big`, pas du plafond (#2336)
         self.last_turn_reread = 0
         self.last_turn_reread_session: str | None = None
-        #: L217 : relevé du flux du dernier tour, fil principal (la mesure du
-        #: plafond pendant le tour) et sous-agents (pour information)
+        #: L217 : relevé du flux du dernier tour, fil principal (somme des
+        #: relectures, pour le grand livre et l'information) et sous-agents
         self.last_turn_main_reread = 0
         self.last_turn_subagent_reread = 0
-        #: L217b : la mesure de la rotation entre deux tours, celle du plafond
-        #: (fil principal relevé dans le flux), et sa session ; None = pas de
-        #: relevé d'appel dans le flux (harnais sans usage par appel, tour de
-        #: résumé, worker relancé) : repli sur le grand livre
+        #: L217b/#2336 : la mesure de la rotation entre deux tours, celle du
+        #: plafond — le contexte du dernier appel du fil principal (taille de
+        #: session) —, et sa session ; None = pas de relevé d'appel dans le
+        #: flux (harnais sans usage par appel, tour de résumé, worker relancé) :
+        #: repli sur le grand livre (somme des relectures du tour)
         self.last_turn_context: int | None = None
         self.last_turn_context_session: str | None = None
         #: L81 (étude §6.3) : instant monotone du dernier message humain en
@@ -610,6 +618,10 @@ class AgentWorker(threading.Thread):
         self._account = None
         #: #1469 : le marqueur comptable du tour lancé par CE worker
         self._compta_travail: dict | None = None
+        #: L80a : `resident.turn` d'un tour que le disque n'a pas accepté —
+        #: gardés en mémoire jusqu'à leur écriture, pour que la comptabilité ne
+        #: règle jamais un tour dont l'usage n'a pas de source durable.
+        self._resident_usage_pending: list[dict] = []
         self._account_override = None
         #: L242b (3) : harnais emprunté par un agent critique au seuil sur le
         #: sien, `(harnais, compte ou None)`, et harnais imposé au tour de
@@ -747,6 +759,53 @@ class AgentWorker(threading.Thread):
                 fh.write(session_id + "\n")
         except OSError:
             pass
+
+    def _note_session(self, session_new: str, session: str | None, harness: str,
+                      compte, cwd: str, resume: str, harnais_lance: str) -> None:
+        """Enregistre la session ouverte par le tour : fichier local, registre
+        et mémoire du worker. Le tour résident (L80a) comme le tour par
+        événement passent par ici : le premier ne voit sa session que dans son
+        `TurnResult`, jamais dans un événement du flux brut (Codex)."""
+        self.write_session_file(session_new)
+        if resume:
+            # #389 r2 : le résumé a ouvert une session connue
+            # (gardé jusque-là : un départ avorté le rejoue)
+            self._resume_drop()
+        # L242b (3) : le harnais de la session (rotation au changement de
+        # harnais, `account_turn.continuity`)
+        self._state_note("session_harness", harness)
+        # L39 (0030) : le compte d'origine de la session, en registre avec son
+        # id (le marqueur du flux reste la source des relevés du tour) ; #408 :
+        # et le harnais et le dossier de son ouverture, ceux du lancement,
+        # seulement si le tour l'OUVRE (une session reprise garde l'origine de
+        # son ouverture)
+        ouverte = session_new != session
+        origine = (harnais_lance if ouverte else None, cwd if ouverte else None)
+        try:
+            registry.set_session(
+                self.db, self.name, session_new,
+                compte.name if compte is not None else None,
+                harness=origine[0], cwd=origine[1])
+        except db_mod.DbError as exc:
+            # L72 : une panne de base ne tue pas le tour (le bail, lui, est
+            # défendu par le battement) ; l'enregistrement est rejoué après le
+            # tour.
+            self._session_en_attente = (
+                session_new, compte.name if compte is not None else None,
+                *origine)
+            log_async("[%s] session %s not recorded (%s): replayed "
+                      "after the turn" % (self.name, session_new,
+                                          db_mod.explain(exc)))
+        if self.agent is not None:
+            # #1898 N4 : le registre porte la session qui vient d'être
+            # ouverte ; la mémoire du worker suit, sinon `current_session`
+            # retombait sur le fichier local et sa comparaison d'horloges
+            # (marge de dérive) pour chaque tour de la même session.
+            self.agent["session_id"] = session_new
+            self.agent["session_account"] = (
+                compte.name if compte is not None else None)
+        if ouverte:
+            self._installe_hook_preuve(cwd)
 
     def _fil_note(self, text: str, *, meta: dict | None = None) -> None:
         """Trace d'audit dans le fil du projet de l'agent (R12) ; ne lève jamais."""
@@ -1491,17 +1550,19 @@ class AgentWorker(threading.Thread):
             return "runner shutdown"
         return ""
 
-    def turn_close_due(self, started: float, reread: int,
+    def turn_close_due(self, started: float, context: int,
                        now: float | None = None) -> str | None:
         """Le tour en cours doit-il se clore au prochain point sûr ? (L105)
 
-        Deux plafonds : les jetons relus depuis le début du tour (somme des
-        appels, la mesure du plafond de contexte L60) et la durée du tour.
-        Rend la raison, ou None."""
+        Deux plafonds : le contexte du dernier appel au modèle du fil
+        principal — la taille de la session, mesure du plafond de contexte
+        L60 (#2336) — et la durée du tour. La somme des relectures du tour
+        n'est pas une taille de contexte : elle croît avec le nombre
+        d'étapes, quelle que soit la session. Rend la raison, ou None."""
         plafond = self.context_max_tokens()
-        if plafond > 0 and reread >= plafond and self.session_policy() != "jamais":
-            return "context cap: %d tokens reread in the turn (cap %d)" % (
-                reread, plafond)
+        if plafond > 0 and context >= plafond and self.session_policy() != "jamais":
+            return "context cap: %d tokens in context (cap %d)" % (
+                context, plafond)
         duree_max = self.turn_max_seconds()
         now = time.time() if now is None else now
         # L159f : le temps gelé par la garde de l'hôte ne compte pas
@@ -1511,24 +1572,25 @@ class AgentWorker(threading.Thread):
         return None
 
     def last_turn_context_reread(self) -> tuple[int, str | None]:
-        """Jetons relus au dernier tour au sens du plafond de contexte, et leur
-        session (L217b) : le fil principal relevé dans le flux, le compteur
-        même du plafond pendant le tour (les sous-agents n'y sont pas, ni
-        pour un tour clos avant son `result`) ; sans relevé dans le flux, le
-        dernier tour inscrit au grand livre (L60)."""
+        """Contexte du dernier appel au dernier tour, et sa session (L217b) :
+        le fil principal relevé dans le flux, sans les sous-agents, ni pour un
+        tour clos avant son `result` ; sans relevé dans le flux, les jetons
+        relus par le dernier tour inscrit au grand livre (L60)."""
         if self.last_turn_context is not None:
             return self.last_turn_context, self.last_turn_context_session
         return self.last_turn_reread, self.last_turn_reread_session
 
     def context_rotation_due(self) -> bool:
-        """Le dernier tour a-t-il relu plus que le plafond de contexte ? (L60)
+        """Le contexte de la session dépasse-t-il le plafond ? (L60)
 
-        La mesure est celle du plafond du tour (L217b) : les jetons relus par
-        le fil principal, relevés dans le flux ; à défaut, celle de l'alerte
-        `session_too_big` (entrée + entrée relue en cache du dernier tour
-        inscrit au grand livre). Chaque étape
-        d'un tour relit tout le contexte : une session qui grossit coûte de
-        plus en plus cher à chaque tour, et l'alerte seule n'y changeait rien.
+        La mesure est celle du plafond du tour (L217b) : le contexte du
+        dernier appel du fil principal, relevé dans le flux ; à défaut, celle
+        de l'alerte `session_too_big` (entrée + entrée relue en cache du
+        dernier tour inscrit au grand livre — un harnais qui ne publie son
+        usage qu'en fin de tour, comme Codex). Chaque étape d'un tour relit
+        tout le contexte : une session qui grossit coûte de plus en plus cher
+        à chaque tour, et l'alerte seule n'y changeait rien. La somme des
+        appels d'un tour n'est pas la taille de la session (#2336).
         Ni minimum de tours, ni rotation pendant un tour ; la politique
         `jamais` s'en dispense ; il faut une session courante, et que le
         relevé soit bien celui de cette session.
@@ -1645,9 +1707,9 @@ class AgentWorker(threading.Thread):
             if self.session_policy() != "jamais" and self.current_session():
                 return self._rotate(raison)
         if self.context_rotation_due():
-            return self._rotate("context cap: %d tokens reread in the last turn "
+            return self._rotate("context cap: %d tokens in context "
                                 "(cap %d)" % (self.last_turn_context_reread()[0],
-                                                  self.context_max_tokens()))
+                                              self.context_max_tokens()))
         if not self.rotation_due():
             return False
         return self._rotate("turns=%d, tokens=%.0f, last turn=%.0fs" % (
@@ -1725,8 +1787,11 @@ class AgentWorker(threading.Thread):
         if rp is None:
             return False
         if decision == resident_runner.ROTATE:
-            raison = ("context cap: %d tokens reread in the last turn (cap %d)"
-                      % (rp.last_reread, self.context_max_tokens()))
+            # #2336 : le contexte du dernier appel (taille de session), ou le
+            # relu du tour quand le harnais ne le donne pas.
+            mesure = rp.last_context if rp.last_context is not None else rp.last_reread
+            raison = ("context cap: %d tokens in context (cap %d)"
+                      % (mesure, self.context_max_tokens()))
         elif decision == resident_runner.ALERT:
             if self._humain_recent():
                 return False
@@ -3462,6 +3527,53 @@ class AgentWorker(threading.Thread):
         except OSError:
             return ""
 
+    def _resident_usage_marker(self, usage: dict | None,
+                               travail: dict | None) -> bool:
+        """Pose (ou efface) la mesure résidente dans le marqueur (L80a).
+
+        Le marqueur est l'état **durable** : un worker de remplacement y
+        retrouve l'événement et peut réparer le tour avant de le régler.
+        `created_ts` borne l'écriture au marqueur de CE tour, jamais celui
+        d'un remplaçant."""
+        try:
+            return registry.pending_spend_set_resident_usage(
+                self.db, self.name, usage,
+                None if travail is None else travail.get("created_ts"))
+        except db_mod.DbError as exc:
+            log_async("[%s] resident usage marker not written (%s)"
+                      % (self.name, db_mod.explain(exc)))
+            return False
+
+    def _resident_usage_durable(self, travail: dict | None) -> bool:
+        """Met la mesure du tour résident à l'abri avant comptabilité (L80a).
+
+        Elle vit d'abord dans le marqueur comptable (`resident_usage`), puis
+        dans le flux (`resident.turn`) que lit le grand livre. Vrai seulement
+        quand les deux sont faits : un worker de remplacement retrouve la
+        mesure et ne règle jamais zéro. Un échec laisse le marqueur en place
+        (fail-closed)."""
+        from . import resident_runner
+        path = self._path("events.jsonl")
+        marker = travail
+        usage = marker.get("resident_usage") if isinstance(marker, dict) else None
+        if isinstance(usage, dict):
+            if not resident_runner.write_usage_event(path, usage):
+                return False
+            # le flux porte la mesure : le marqueur n'a plus à la garder
+            self._resident_usage_marker(None, marker)
+            marker = dict(marker, resident_usage=None)
+        while self._resident_usage_pending:
+            event = self._resident_usage_pending[0]
+            if not isinstance(marker, dict):
+                return False       # pas de marqueur : rien de durable à réparer
+            if not self._resident_usage_marker(event, marker):
+                return False
+            if not resident_runner.write_usage_event(path, event):
+                return False
+            self._resident_usage_marker(None, marker)
+            self._resident_usage_pending.pop(0)
+        return True
+
     def _compta_en_attente(self) -> dict | None:
         """Le marqueur comptable **en base** (L13 B5, arbitrage mesh-design).
 
@@ -3591,6 +3703,11 @@ class AgentWorker(threading.Thread):
             self._compta_doute = False
             self._compta_en_echec = False
         if travail:
+            if not self._resident_usage_durable(travail):
+                self._compta_en_echec = True
+                log_async("[%s] resident usage still not durable: "
+                          "turn accounting stays suspended" % self.name)
+                return
             if self._annonce_ram:
                 # Ce worker a vu l'annonce du flux ; si la base ne l'a pas gardée,
                 # la mémoire fait foi (jamais le modèle du lancement).
@@ -3667,6 +3784,13 @@ class AgentWorker(threading.Thread):
             # marqueur d'un autre
             travail = dict(propre, model=self._annonce_ram or propre.get("model"))
         if travail:
+            # L80a : la mesure résidente doit être durable (marqueur puis flux)
+            # avant la ligne ; sinon on laisse le marqueur et le tour suspendu.
+            if not self._resident_usage_durable(travail):
+                self._compta_en_echec = True
+                log_async("[%s] resident usage not durable: turn accounting "
+                          "left pending" % self.name)
+                return
             if model_annonce:
                 travail = dict(travail, model=model_annonce)
             self._compta_ecrit(travail, incertain=incertain)
@@ -4451,6 +4575,18 @@ class AgentWorker(threading.Thread):
         résident doit reprendre la main dès la passation finie. Rend le pas de
         reprise."""
         maintenant = self.monotonic()
+        motif = self.deferred_reason
+        if self.deferred_series_reason != motif:
+            # #2160 : le motif a changé (attach ↔ verrou tenu) — la série
+            # précédente est close, sa marque éventuelle levée, et la grâce
+            # d'un verrou tenu repart de zéro : un report d'attach (passation
+            # normale) qui la précède ne la consomme pas.
+            self._deferral_over()
+            self.deferred_series_reason = motif
+            # #2206 : `_deferral_over` remet `deferred_reason` à vide ; le
+            # motif de la série qui commence est rétabli pour que la lecture
+            # qui suit (grâce d'un verrou tenu) porte sur ce motif.
+            self.deferred_reason = motif
         if self.deferred_since is None:
             self.deferred_since = maintenant
         self.deferred_streak += 1
@@ -4494,6 +4630,7 @@ class AgentWorker(threading.Thread):
         self.deferred_alerted = False
         self.deferred_wait_s = self.DEFERRED_RETRY
         self.deferred_reason = ""
+        self.deferred_series_reason = ""
         if not etait:
             return
         try:
@@ -4897,6 +5034,28 @@ class AgentWorker(threading.Thread):
                 % (self.name, exc))
             return False
 
+    def _resident_cost_base(self, session: str | None) -> float | None:
+        """Le dernier cumul USD **durable** de la session résidente (L80a).
+
+        Un processus relancé sur la même session ACP (sommeil, réglages
+        changés, redémarrage du worker) a perdu sa base en mémoire : sans ce
+        repère, le premier prompt d'une session reprise compterait tout son
+        passé, ou retomberait sur un barème de jetons. Lu dans le grand livre,
+        jamais dans un fichier. Une lecture impossible laisse le pilote sans
+        base (le grand livre la retrouvera au calcul du tour)."""
+        if not session:
+            return None
+        try:
+            book = cost_mod.CostBook(
+                state_dir=self.cfg.state_dir, db=self.db,
+                tools={self.name: self._ledger_harness()})
+            base = book.baseline(self.name, self._ledger_harness(), session)
+        except Exception as exc:  # une base de repère ne casse pas le tour
+            log("[%s] resident cost baseline not read (%s)"
+                % (self.name, " ".join(str(exc).split())[:120]))
+            return None
+        return base.get("cum_usd") if base.get("session") == session else None
+
     def _resident_for_turn(self, adapter, *, key: tuple, session: str | None, cwd: str,
                            env: dict, model, effort, tier, lot, stderr_path: str):
         """Le processus résident qui sert ce tour : celui qui tourne si sa clé
@@ -4937,9 +5096,15 @@ class AgentWorker(threading.Thread):
             resident_runner.TURN_FILE_ENV: self._path(resident_runner.TURN_FILE),
         })
         stderr = open(stderr_path, "ab")
+        # L80a : une session ACP reprise garde son cumul USD d'un processus à
+        # l'autre ; la base durable est passée au pilote, qui calcule le delta
+        # du premier prompt comme celui des suivants.
+        protocol = (adapter.descriptor.resident or {}).get("protocol")
+        base_cout = self._resident_cost_base(session) if protocol == "acp" else None
         driver = resident.driver_for(
             adapter, cwd=cwd, session=session, model=model or None, effort=effort or None,
-            tier=tier or None, env=env, stderr=stderr, spawn=self._spawn_resident)
+            tier=tier or None, env=env, stderr=stderr, spawn=self._spawn_resident,
+            cost_base=base_cout)
         rp = resident_runner.ResidentProcess(driver, key=key, life_id=life_id, stderr=stderr)
         # L81 (étude §6.1) : le cumul de relu appartient à la session — un
         # processus relancé sur le même id (réveil après sommeil, réglages
@@ -5031,25 +5196,50 @@ class AgentWorker(threading.Thread):
                 return
         self.stop_group_now(raison, group=False)
 
-    def _resident_result(self, rp, tour, voulu: bool) -> tuple[int, str | None]:
-        """Code et erreur d'un tour résident fini (`voulu` : clos par
-        l'exécuteur, une interruption n'est pas un échec)."""
-        from . import resident
+    def _resident_result(self, rp, tour, voulu: bool) -> tuple[int, str | None, str | None]:
+        """Code, erreur et session d'un tour résident fini (`voulu` : clos par
+        l'exécuteur, une interruption n'est pas un échec).
+
+        Le `TurnResult` est aussi la seule source d'usage du tour pour le grand
+        livre quand le flux brut ne la porte pas (Codex app-server, ACP) : il
+        est écrit une fois dans `events.jsonl` (L80a), avant la comptabilité.
+        Si le flux refuse l'écriture, l'événement est d'abord confié au
+        marqueur comptable : un worker de remplacement pourra réparer le tour
+        sans dépendre de la mémoire de celui-ci."""
+        from . import resident, resident_runner
         if tour is None:
-            return 1, None              # pas lancé : l'erreur est déjà notée
+            return 1, None, rp.session  # pas lancé : l'erreur est déjà notée
         fin = tour.wait(RESIDENT_END_WAIT_S)
         if fin is None:
-            return 1, "resident turn did not end"
+            return 1, "resident turn did not end", rp.session
         # L81 (étude §6.1) : la mesure continue d'un tour résident — contexte
         # courant, fenêtre, relu du tour et relu cumulé de la session.
         rp.record_turn(fin)
         self._resident_reread_keep(rp)
+        evenement = resident_runner.usage_event(
+            rp.driver.protocol, fin, turn=self._turn_id or "")
+        session = fin.session or rp.session
+        if evenement is not None and not resident_runner.write_usage_event(
+                self._path("events.jsonl"), evenement):
+            # L80a B2 : la mesure passe d'abord dans le marqueur comptable
+            # (durable) ; à défaut elle reste en mémoire pour ce worker. Le
+            # tour n'est pas comptablement complet et le marqueur ne sera pas
+            # soldé tant que le flux ne porte pas la mesure.
+            travail = getattr(self, "_compta_travail", None)
+            if self._resident_usage_marker(evenement, travail):
+                if travail is not None:
+                    self._compta_travail = dict(travail, resident_usage=evenement)
+            else:
+                self._resident_usage_pending.append(evenement)
+                self._compta_en_echec = True
+            return 1, "resident usage event not written", session
         if fin.status == resident.COMPLETED:
             self._resident_failures = 0     # T2 : la série d'échecs est close
-            return 0, None
+            return 0, None, session
         if fin.status == resident.INTERRUPTED:
-            return (0, None) if voulu else (1, "resident turn interrupted")
-        return 1, fin.error or "resident turn failed"
+            return ((0, None, session) if voulu
+                    else (1, "resident turn interrupted", session))
+        return 1, fin.error or "resident turn failed", session
 
     def _resident_turn_end(self, rp) -> None:
         """Fin d'un tour résident : dépublié ; le processus reste pour le tour
@@ -5491,10 +5681,15 @@ class AgentWorker(threading.Thread):
         self.last_final = None
         self.summary_display = []
         self._summary_chars = 0
-        # L105 : plafonds pendant le tour — jetons relus (une fois par appel)
-        # et durée ; jamais sur un tour de résumé (rotation, bascule de compte)
+        # L105 : plafonds pendant le tour — contexte du dernier appel (une
+        # fois par appel) et durée ; jamais sur un tour de résumé (rotation,
+        # bascule de compte)
         plafonne = spec.get("prompt") != adapters.SUMMARY_PROMPT
+        #: L105 : somme des relectures du tour (grand livre, information)
         relus = 0
+        #: L60 (#2336) : contexte du dernier appel du fil principal — la taille
+        #: de la session, mesure du plafond de contexte
+        contexte_appel = 0
         #: L217 : jetons relus par les sous-agents, à part et pour information
         #: (jamais comptés au plafond de contexte, qui mesure le fil principal)
         relus_sous_agents = 0
@@ -5750,49 +5945,8 @@ class AgentWorker(threading.Thread):
                             conversation_usage = parsed["usage"]
                     if parsed.get("session") and not session_new:
                         session_new = parsed["session"]
-                        self.write_session_file(session_new)
-                        if resume:
-                            # #389 r2 : le résumé a ouvert une session connue
-                            # (gardé jusque-là : un départ avorté le rejoue)
-                            self._resume_drop()
-                        # L242b (3) : le harnais de la session (rotation au
-                        # changement de harnais, `account_turn.continuity`)
-                        self._state_note("session_harness", harness)
-                        # L39 (0030) : le compte d'origine de la session, en
-                        # registre avec son id (le marqueur du flux reste la
-                        # source des relevés du tour) ; #408 : et le harnais
-                        # et le dossier de son ouverture, ceux du lancement,
-                        # seulement si le tour l'OUVRE (une session reprise
-                        # garde l'origine de son ouverture)
-                        ouverte = session_new != session
-                        origine = (harnais_lance if ouverte else None,
-                                   cwd if ouverte else None)
-                        try:
-                            registry.set_session(
-                                self.db, self.name, session_new,
-                                compte.name if compte is not None else None,
-                                harness=origine[0], cwd=origine[1])
-                        except db_mod.DbError as exc:
-                            # L72 : une panne de base ne tue pas le tour (le
-                            # bail, lui, est défendu par le battement) ;
-                            # l'enregistrement est rejoué après le tour.
-                            self._session_en_attente = (
-                                session_new, compte.name if compte is not None else None,
-                                *origine)
-                            log_async("[%s] session %s not recorded (%s): replayed "
-                                      "after the turn" % (self.name, session_new,
-                                                         db_mod.explain(exc)))
-                        if self.agent is not None:
-                            # #1898 N4 : le registre porte la session qui vient
-                            # d'être ouverte ; la mémoire du worker suit, sinon
-                            # `current_session` retombait sur le fichier local et
-                            # sa comparaison d'horloges (marge de dérive) pour
-                            # chaque tour de la même session.
-                            self.agent["session_id"] = session_new
-                            self.agent["session_account"] = (
-                                compte.name if compte is not None else None)
-                        if ouverte:
-                            self._installe_hook_preuve(cwd)
+                        self._note_session(session_new, session, harness, compte,
+                                           cwd, resume, harnais_lance)
                     if parsed.get("model") and parsed["model"] != modele_annonce:
                         modele_annonce = parsed["model"]  # source du tour (L13 B4)
                         self._compta_annonce(modele_annonce)  # persisté tout de suite
@@ -5828,6 +5982,7 @@ class AgentWorker(threading.Thread):
                             if not ident or ident not in appels_vus:
                                 if ident:
                                     appels_vus.add(ident)
+                                contexte_appel = adapters.context_tokens(harness, appel)
                                 relus += adapters.reread_tokens(harness, appel)
                         appel = parsed.get("subagent_call_usage")
                         if isinstance(appel, dict):
@@ -5837,7 +5992,7 @@ class AgentWorker(threading.Thread):
                                     appels_vus.add(ident)
                                 relus_sous_agents += adapters.reread_tokens(harness, appel)
                         if cloture is None and not clos:
-                            cloture = self.turn_close_due(started, relus)
+                            cloture = self.turn_close_due(started, contexte_appel)
                             if cloture:
                                 log_async("[%s] %s: turn closed at the next safe point"
                                           % (self.name, cloture))
@@ -5880,9 +6035,17 @@ class AgentWorker(threading.Thread):
                             background_handles[pid] = handle
                 result_code = proc.wait()
             else:
-                result_code, erreur_resident = self._resident_result(
+                result_code, erreur_resident, session_resident = self._resident_result(
                     rp, tour_resident, clos or self.host_yield is not None)
                 error = error or erreur_resident
+                # L80a : un tour résident Codex/ACP n'annonce sa session que
+                # dans son `TurnResult` (le flux brut est du JSON-RPC) ; sans
+                # cet enregistrement, le tour suivant la verrait changée et
+                # relancerait le processus sur une session neuve.
+                if session_resident and not session_new:
+                    session_new = session_resident
+                    self._note_session(session_new, session, harness, compte,
+                                       cwd, resume, harnais_lance)
         except _LancementImpossible as exc:
             echec_lancement = str(exc)
             result_code = 127
@@ -5972,8 +6135,10 @@ class AgentWorker(threading.Thread):
         # L217 : fil principal et sous-agents, mesurés à part dans le flux
         self.last_turn_main_reread = relus
         self.last_turn_subagent_reread = relus_sous_agents
-        # L217b : la rotation entre deux tours juge sur ce même compteur
-        self.last_turn_context = relus if relus_mesures else None
+        # L217b/#2336 : la rotation entre deux tours juge sur le contexte du
+        # dernier appel du fil principal (la taille de la session), jamais sur
+        # la somme des relectures du tour.
+        self.last_turn_context = contexte_appel if relus_mesures else None
         self.last_turn_context_session = session_new or session or None
         if resume and not session_new and not result_code and not error:
             self._resume_drop()  # tour achevé sans id de session : livré
@@ -6662,7 +6827,10 @@ class Runner:
         self.db = db
         self.host = cfg.host
         self.runner_id = cfg.runner
-        self.agents_filter = agents
+        from .agent_names import resolve
+        self.agents_filter = (list(dict.fromkeys(
+            resolve(n, db=self.db, operation="runner.filter") for n in agents))
+            if agents is not None else None)
         self.once = once
         self.wait = wait
         self.dry_run = dry_run
@@ -7375,8 +7543,8 @@ class Runner:
             try:
                 self.take_pass()
             except Exception as exc:
-                log_async("auto-take pass failed (%s): runner continues"
-                          % type(exc).__name__)
+                log_async("auto-take pass failed (%s): %s; runner continues"
+                          % (type(exc).__name__, db_mod.brief(exc)))
         for agent in registry.claimable(self.db, self.host, self.agents_filter):
             with self.lock:
                 if not self.once and agent["name"] in self.workers:
@@ -8457,10 +8625,12 @@ class Runner:
         """#1374 : le passage du feu du pilote — arme l'auto-fusion des lots
         couverts par le gel courant et dont les portes sont vertes, invalide un
         feu dont la tête a bougé, réconcilie une PR fusionnée. Ne lève jamais :
-        un feu raté est retenté au passage suivant."""
+        un feu raté est retenté au passage suivant. #2212 : `radar` est relu à
+        chaque passage, le mode du feu (file ou fusion directe) suit la
+        configuration de l'hôte, pas celle du démarrage."""
         from . import fire
         try:
-            report = fire.run_pass(self.cfg, db, dry_run=self.dry_run)
+            report = fire.run_pass(fresh_radar(self.cfg), db, dry_run=self.dry_run)
             for entry in report:
                 if entry.get("result") in fire.LOUD:
                     log_async("fire: lot #%s %s%s" % (
@@ -8490,13 +8660,15 @@ class Runner:
     def radar_once(self, db) -> None:
         """L160b : un passage du radar de conflits, après le relevé des
         branches, sur l'hôte qui déclare `radar.projects` : journal, et
-        courrier aux assignés sur conflit nouveau (L160c). Ne lève jamais."""
+        courrier aux assignés sur conflit nouveau (L160c). Ne lève jamais.
+        #2212 : `radar` relu à chaque passage, comme pour le feu."""
         from . import radar
         try:
             if getattr(self, "_radar_cache", None) is None:
                 self._radar_cache = radar.Cache()
             owner = getattr(self, "runner_id", None) or None
-            for line in radar.run_pass(self.cfg, db, cache=self._radar_cache, owner=owner):
+            for line in radar.run_pass(fresh_radar(self.cfg), db, cache=self._radar_cache,
+                                       owner=owner):
                 if line.get("mail"):
                     log_async("radar %s: %d mail(s), including %d wake-up(s)" % (
                         line["project"], len(line["mail"]),
@@ -9627,6 +9799,14 @@ def build_parser() -> argparse.ArgumentParser:
                             "AMEESH_TAKE_LOT_MAX_PER_HOUR", backlog.DEFAULT_LOT_MAX_PER_HOUR)),
                         help="maximum team lots taken per rolling hour, for the whole mesh "
                              "(default 6)")
+    # #1738 (N3) : l'interrupteur des propositions de relecture/correction,
+    # le même qu'`ameesh notify` ; l'exécuteur est le preneur actif (#804).
+    parser.add_argument("--take-review-max-per-hour", type=int,
+                        default=int(exploitation._env_float(
+                            "AMEESH_TAKE_REVIEW_MAX_PER_HOUR",
+                            backlog.REVIEW_PROPOSAL_MAX_PER_HOUR)),
+                        help="maximum review/correction proposals per rolling hour, for "
+                             "the whole mesh (default 6; 0 turns them off)")
     parser.add_argument("--take-interval", type=float,
                         default=exploitation._env_float("AMEESH_TAKE_INTERVAL",
                                                         TAKE_INTERVAL_S),
@@ -9651,6 +9831,8 @@ def cmd_register(cfg: Config, db: db_mod.Db, args: list[str]) -> int:
     parser.add_argument("--model", default=None)
     parser.add_argument("--budget", type=float, default=None)
     parsed = parser.parse_args(args)
+    from .agent_names import resolve
+    parsed.name = resolve(parsed.name, db=db, operation="runner.register")
     cwd = os.path.abspath(os.path.expanduser(parsed.cwd)) if parsed.cwd else None
     row = registry.upsert(
         db, parsed.name, chantier=parsed.chantier, harness=parsed.harness, host=cfg.host,
@@ -10020,6 +10202,8 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
     """
     from . import attach as attach_mod
     from .platform import session_lock
+    from .agent_names import resolve
+    name = resolve(name, db=db, operation="lease.attach")
     agent = registry.get(db, name)
     if agent is None:
         print("unknown agent: %s" % name, file=sys.stderr)

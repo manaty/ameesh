@@ -161,6 +161,7 @@ from __future__ import annotations
 from .conversations import Conversations
 from .provenance import Provenance
 from .work_dependencies import WorkDependencies
+from .migration_reservations import MigrationReservations
 
 import abc
 import re
@@ -171,6 +172,28 @@ from typing import Any, Callable, Protocol, Sequence, TypedDict
 #: réservation (`migration_repo`) n'est alors pas appliqué, les appelants qui
 #: ne lisent pas la réservation gardent le CAS d'origine.
 UNCHECKED = object()
+
+#: §4 (owner 14/10/2026) : début de la note de journal d'un lot RENDU à la file
+#: d'équipe (`work.return_to_queue`, balayage `ameesh work wip`). Un lot
+#: `build` sans assigné n'est prenable QUE s'il a été rendu ainsi : un lot en
+#: cours (prérequis, travail confié par courrier) garde son état sans passer à
+#: la file (le pilote lit ce marqueur dans le journal, `requeued_sql`).
+RETURNED_NOTE = "returned to the queue"
+#: Débuts des notes par lesquelles un lot est CONFIÉ : attribution et création
+#: (`work.assign`, `work.add`), délégation à échéance (`work.delegate`), prises
+#: automatiques (`backlog.LOT_TAKE_NOTE`, `backlog.AUTO_TAKE_NOTE`), reprise
+#: sur pause budget (`handoff.HANDOFF_NOTE`). La DERNIÈRE de ces notes porte
+#: l'exception pilote à la limite d'en-cours (`work.WIP_EXCEPTION_MARK`) : une
+#: note postérieure sans le marqueur l'efface, et un retour §4 doit être
+#: POSTÉRIEUR à la dernière attribution pour rendre le lot prenable.
+#: Les textes sont définis ici, seuls : `wip_exceptions`, `requeued_sql`,
+#: `handoff.last_assigner` et les prises y lisent les mêmes constantes.
+DELEGATED_NOTE = "delegated to "
+LOT_TAKE_NOTE = "lot de l'équipe pris de lui-même"
+AUTO_TAKE_NOTE = "prise automatique"
+HANDOFF_NOTE = "pause budget (reprise) : lot repris"
+ASSIGN_NOTE_PREFIXES = ("assigned to ", "assigné à ", "created and assigned to ",
+                        DELEGATED_NOTE, LOT_TAKE_NOTE, AUTO_TAKE_NOTE, HANDOFF_NOTE)
 
 
 class Domain(abc.ABC):
@@ -215,7 +238,11 @@ class Agents(Domain):
 
     @abc.abstractmethod
     def get(self, name: str) -> dict | None:
-        """La ligne de l'agent, ou None."""
+        """Agent by primary or alias; alias resolutions are durably audited."""
+
+    @abc.abstractmethod
+    def resolve_name(self, name: str, *, operation: str = "lookup") -> str:
+        """Resolve a spelling and audit aliases; unknown names stay unchanged."""
 
     @abc.abstractmethod
     def operator_pause(self, name: str, *, paused: bool, reason: str,
@@ -506,9 +533,17 @@ class PendingSpend(Domain):
         """Remplace le modèle du marqueur ; faux s'il n'y a pas de marqueur."""
 
     @abc.abstractmethod
+    def set_resident_usage(self, name: str, usage: dict | None,
+                           created_ts: float | None = None) -> bool:
+        """Pose (ou efface avec None) l'événement `resident.turn` du marqueur
+        (L80a) ; faux s'il n'y a pas de marqueur, ou si `created_ts` désigne
+        un autre marqueur. Cet état durable permet à un worker de remplacement
+        de réparer un tour résident dont l'événement n'a pas été écrit."""
+
+    @abc.abstractmethod
     def get(self, name: str) -> dict | None:
         """Le marqueur (agent, start_index, turn, model, created_ts,
-        work_item_id, turn_id), ou None."""
+        work_item_id, turn_id, resident_usage), ou None."""
 
     @abc.abstractmethod
     def clear(self, name: str) -> bool:
@@ -1769,13 +1804,76 @@ class WorkItems(Domain):
         (la prise automatique, `backlog.auto_take`) : même contrôle sous le
         même verrou, mais le lot reste où il est et `PendingLot` est levée.
         `ready_only` (L165) exige un lot intake sans assigné dont toutes les
-        dépendances sont satisfaites ; vérifié sous verrou dans la même
-        transaction que l'attribution. `current` doit alors être NULL : toute
-        autre valeur est une erreur d'appel (`ValueError` immédiate, avant le
-        verrou) et non un None silencieux (#1696). La réservation manuelle
-        garde son comportement par défaut. #705 : si le nouvel assigné est le
-        relecteur désigné, la désignation tombe dans la même écriture (le
-        journal la nomme) — un relecteur ne relit pas son propre travail."""
+        dépendances sont FUSIONNÉES (`merged`/`promoted`/`closed`, #2252) ;
+        vérifié sous verrou dans la même transaction que l'attribution.
+        `current` doit alors être NULL : toute autre valeur est une erreur
+        d'appel (`ValueError` immédiate, avant le verrou) et non un None
+        silencieux (#1696). La réservation manuelle garde son comportement par
+        défaut. #705 : si le nouvel assigné est le relecteur désigné, la
+        désignation tombe dans la même écriture (le journal la nomme) — un
+        relecteur ne relit pas son propre travail."""
+
+    @abc.abstractmethod
+    def count_builds(self, assignee: str) -> int:
+        """§4 (owner 14/10/2026) : les lots en `build` de l'agent, tous projets
+        confondus."""
+
+    @abc.abstractmethod
+    def assign_capped(self, item_id: int, assignee: str, *, current: str | None,
+                      note: str, actor: str, max_build: int,
+                      queued_note: str | None = None,
+                      forced_note: str | None = None, take: bool = False,
+                      ready_only: bool = False) -> dict | None:
+        """`assign` sous la limite d'en-cours (§4), en UNE transaction : le
+        verrou consultatif de l'agent est pris AVANT le compte de ses lots en
+        `build`, si bien que deux prises simultanées du même agent ne peuvent
+        pas franchir `max_build`. None si le plafond est atteint ou si le lot a
+        bougé.
+
+        Reprend les options de `assign` (#540 `queued_note`/`forced_note`/
+        `take`, L165 `ready_only`) : la prise automatique vérifie donc le lot
+        non démarré, les dépendances et le plafond §4 sous le même verrou.
+        `ready_only` accepte un lot `intake` ou un lot `build` RENDU à la file
+        (§4) dont toutes les dépendances sont satisfaites."""
+
+    @abc.abstractmethod
+    def unassign(self, item_id: int, *, current: str | None, note: str,
+                 actor: str, states: Sequence[str] | None = None) -> dict | None:
+        """§4 : rend le lot à la file — assignation retirée si le lot a encore
+        l'assigné `current` et n'est ni fusionné ni fermé, journal dans la même
+        transaction ; None sinon. `states` borne en plus les états rendus (le
+        retour manuel §4 : `intake` ou `build`), relu dans la transaction qui
+        écrit. Branche, tête de branche et jalons ne sont pas touchés ; L40 :
+        la délégation en cours est annulée."""
+
+    @abc.abstractmethod
+    def unassign_surplus(self, item_id: int, *, current: str, marker: str,
+                         prefixes: Sequence[str], max_build: int, note: str,
+                         actor: str) -> dict | None:
+        """§4 : restitution du SURPLUS d'un agent, sous les gardes
+        transactionnelles — le verrou consultatif de l'agent (`assign_capped`)
+        est pris AVANT toute relecture, puis TOUTES les lignes `build` de
+        l'agent sont verrouillées (`FOR NO KEY UPDATE`, id croissant : ordre
+        stable) AVANT de lire la moindre exception. Le candidat doit faire
+        partie de ces lignes : encore en `build`, encore assigné à `current`,
+        sans exception pilote (`marker` dans la note de sa dernière
+        attribution, `prefixes`) ; l'agent doit encore dépasser `max_build`
+        lots en `build` SANS exception, recensés sous ces verrous. None sinon,
+        rien n'est écrit : deux balayages concurrents ne peuvent donc pas
+        rendre plus que le surplus, aucun geste sur un AUTRE lot compté
+        (réattribution ou exception, qui passent par un UPDATE de sa ligne) ne
+        peut se glisser dans le compte, et un lot passé en `qa`, repris ou doté
+        d'une exception avant la lecture n'est pas rendu. Journal et annulation
+        de la délégation en cours dans la même transaction (comme
+        `unassign`)."""
+
+    @abc.abstractmethod
+    def wip_exceptions(self, item_ids: Sequence[int], marker: str,
+                       prefixes: Sequence[str]) -> list[int]:
+        """§4 : parmi `item_ids`, ceux dont la DERNIÈRE attribution (note
+        commençant par l'un des `prefixes`) porte `marker` — l'exception pilote
+        explicite à la limite d'en-cours. Une réassignation postérieure sans le
+        marqueur l'a retirée."""
 
     @abc.abstractmethod
     def handoff(self, item_id: int, assignee: str | None, *, current: str, state: str,
@@ -1910,10 +2008,12 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def close_merged(self, item_id: int, *, current: str, sha: str, actor: str, note: str,
                      pr_ref: str | None, frozen_id: int | None = None,
-                     landed: tuple[int, str] | None = None) -> dict | None:
+                     landed: tuple[int, str] | None = None,
+                     unfrozen: bool = False) -> dict | None:
         """Fusion constatée (L29) : `current` → `merged` si le lot y est encore
         et, si `frozen_id` est donné, si ce jalon `frozen` est toujours le
-        dernier gel du lot (sinon None, rien d'écrit) ; journal et jalon
+        dernier gel du lot — `unfrozen` (#2444) : si le lot n'a toujours aucun
+        gel (sinon None, rien d'écrit) ; journal et jalon
         `merged` (commit, auteur de la fusion) dans la même transaction.
         `landed` (#1567) : `(numéro, dépôt)` du numéro réellement atterri,
         écrit dans la même transaction."""
@@ -1922,9 +2022,18 @@ class WorkItems(Domain):
     def close(self, item_id: int, *, current: str, reason: str, superseded_by: int | None,
               sha: str = "", actor: str, note: str) -> dict | None:
         """Fermeture explicite (L29, #988) : `current` → `closed` (`abandoned` |
-        `superseded` | `delivered`) si le lot y est encore, journal et jalon
-        `closed` dans la même transaction ; `delivered` écrit en plus le jalon
-        `delivered` (le `sha` de la tête relue, l'auteur) ; None sinon."""
+        `superseded` | `delivered` | `done`) si le lot y est encore, journal et
+        jalon `closed` dans la même transaction ; `delivered` écrit en plus le
+        jalon `delivered` (le `sha` de la tête relue, l'auteur) ; None sinon."""
+
+    @abc.abstractmethod
+    def rectify_close(self, item_id: int, *, current_reason: str, reason: str,
+                      actor: str, note: str) -> dict | None:
+        """Rectifie la raison d'une fermeture déjà écrite (#1280) : le lot reste
+        `closed` — `closed_at` et le jalon `closed` sont conservés, la fermeture
+        a bien eu lieu — seule la raison change (`superseded_by` est effacé) et
+        l'événement est journalisé. None si le lot n'est plus `closed` avec
+        `current_reason` (course perdue)."""
 
     @abc.abstractmethod
     def refresh_package_parents(self) -> int:
@@ -1948,9 +2057,11 @@ class WorkItems(Domain):
                 ready_only: bool = False) -> list[dict]:
         """Les éléments de la file dans l'ordre de prise (priorité, puis valeur
         décroissante, puis ancienneté). `open_only` : seulement ceux qu'on peut
-        encore prendre (`intake`, sans assigné) ; sinon tous les éléments non
-        terminés. `ready_only` exclut les dépendances ouvertes avant la borne
-        pour la prise automatique ; la liste ordinaire les conserve."""
+        encore prendre (`intake`, ou `build` RENDU à la file par la limite
+        d'en-cours §4 — `RETURNED_NOTE` postérieur à la dernière attribution —
+        sans assigné) ; sinon tous les éléments non terminés. `ready_only`
+        exclut les dépendances ouvertes avant la borne pour la prise
+        automatique ; la liste ordinaire les conserve."""
 
     @abc.abstractmethod
     def auto_takes_since(self, seconds: float, note_prefix: str) -> int:
@@ -1960,15 +2071,24 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def unassigned_lots(self, limit: int) -> list[dict]:
-        """L165 : les lots du projet encore à confier (`intake`, sans assigné,
-        hors file d'amélioration, sans dépendance ouverte), dans l'ordre de
-        prise : priorité, puis dates prévues (début, fin, livraison ; sans date en dernier), puis
-        ancienneté. Chaque ligne ajoute `lot_team` (équipe du lot, sinon de sa
-        fiche ou de la fiche parente, sinon son application),
-        `pending_decision` (une demande de décision attend sur le lot) et
-        `decision_milestone` (un jalon de décision ouvert y est rattaché).
+        """L165 : les lots du projet encore à confier (`intake`, ou `build`
+        RENDU à la file par la limite d'en-cours §4 : `RETURNED_NOTE` postérieur
+        à la dernière attribution, il garde son état et sa branche —, sans
+        assigné, hors file d'amélioration, sans dépendance non fusionnée), dans
+        l'ordre de prise : priorité, puis les `build` avant les `intake` à
+        priorité égale, puis dates prévues (début, fin, livraison ; sans date en
+        dernier), puis ancienneté. Chaque ligne ajoute `lot_team` (équipe du lot,
+        sinon de sa fiche ou de la fiche parente, sinon son application),
+        `pending_decision` (une demande de décision attend sur le lot),
+        `decision_milestone` (un jalon de décision ouvert y est rattaché) et
+        `returned_to_queue` (§4, le lot `build` a été rendu ; `false` pour un
+        `intake`).
         #1193: a lot whose explicit prerequisite is not finished is excluded —
-        the ready intake never offers a lot that cannot be started."""
+        the ready intake never offers a lot that cannot be started.
+        #2252 : « finished » veut dire fusionné (`merged`/`promoted`/`closed`) :
+        un bloqueur en `qa`, même à verdict favorable, garde une tête qui peut
+        encore changer ; la règle est celle de `work show` et de
+        « planned: waiting on lots »."""
 
     @abc.abstractmethod
     def review_proposals(self, limit: int, *, proposal_prefix: str,
@@ -1984,6 +2104,22 @@ class WorkItems(Domain):
         moins de `window_s` n'est pas reproposé. Le verdict retenu est celui
         qui nomme le dernier gel (#1677 B1) : un `ok` périmé par un regel ne
         dispense pas de la relecture."""
+
+    @abc.abstractmethod
+    def claim_review_proposal(self, item_id: int, *, agent: str, kind: str,
+                              proposal_prefix: str, window_s: float,
+                              actor: str) -> bool:
+        """#1738 (N5/N7) : enregistre la proposition d'un lot en `qa` sous un
+        verrou consultatif par lot — le contrôle (fenêtre `window_s`,
+        `proposal_prefix` au journal, lot encore en `qa`, agent différent de
+        l'assigné), la désignation du relecteur (#705, pour `kind='review'`)
+        et la note tiennent ensemble. Rend False sans rien écrire si un autre
+        passage a déjà proposé le lot, si le lot n'est plus en `qa`, ou si
+        l'agent en est l'assigné — deux passages (hôtes distincts) ne
+        proposent jamais le même lot deux fois. #1738 R1 (B1) : sous le
+        verrou, le lot est revalidé avec le prédicat de `review_proposals`
+        (relecteur vide, verdict courant, gel) et `kind` doit y correspondre ;
+        le relecteur n'est posé que s'il est encore vide (compare-and-set)."""
 
     @abc.abstractmethod
     def assignment_events(self, item_id: int, prefixes: Sequence[str]) -> list[dict]:
@@ -2071,8 +2207,11 @@ class WorkPackages(Domain):
         toute écriture de `canon` (`canon.rebase_default`). À appeler dans une
         transaction ouverte : il tient jusqu'au COMMIT, comme
         `authenticators.lock_registry`. L'attente du verrou ne compte pas dans
-        le délai de requête de la session (un premier sync long ne fait pas
-        échouer les suivants)."""
+        le `statement_timeout` de la session (un premier sync long ne fait pas
+        échouer les suivants), mais elle reste BORNÉE (#1747) : par le
+        `lock_timeout` que le pilote Postgres pose le temps de la prise, et,
+        sous psql, par le délai client de chaque instruction
+        (`statement_timeout` + 5 s) — la plus courte des deux s'applique."""
 
 
 # --------------------------------------------------------------------------
@@ -2739,6 +2878,20 @@ class Progress(Domain):
         base) : `usd_window`, `usd_1h`, `usd_24h`, tours et jetons de la
         fenêtre. `agents` restreint aux agents nommés (None = tous)."""
 
+    @abc.abstractmethod
+    def ci_suite(self, *, since_ts: float, limit: int) -> list[dict]:
+        """Exécutions CONCLUES de la suite complète des tests depuis
+        `since_ts` (#1476), de la plus récente à la plus ancienne, au plus
+        `limit` **par dépôt**, dans les contextes qui la garantissent :
+        poussée ou pull request `release/**`|`integration/**` (source ou
+        cible), ou exécution manuelle (`workflow_dispatch`) ; une poussée sur
+        `main` est écartée (la voie documentation seule L161a y saute les
+        parts, et `ci_runs` ne garde pas le mode du plan). Chaque ligne :
+        repo, run_id, branch, base, event, `duration_s` (premier relevé du
+        veilleur → conclusion, l'unité de la vue) et `concluded_ts`. Les
+        exécutions annulées ou remplacées ne comptent pas (pas de durée de
+        suite)."""
+
 
 # --------------------------------------------------------------------------
 # vue par projet (lot L62) : qui travaille sur quoi
@@ -3059,6 +3212,15 @@ class Operations(Domain):
         `open_lots_activity` — qui exclut `merged`, `promoted` et `closed` :
         un lot promu qu'un agent arrêté garde doit rester visible (#753, R1
         auditeur). `limit=None` : toute la vérité."""
+
+    @abc.abstractmethod
+    def build_lots_activity(self, limit: int | None) -> list[dict]:
+        """§4 : les lots en `build` assignés à un agent, avec leur dernière
+        activité (`last_activity_ts`, même calcul que `open_lots_activity`),
+        les plus anciennement actifs d'abord. Lecture DÉDIÉE du balayage de la
+        limite d'en-cours : le plafond global de `open_lots_activity` peut
+        tronquer les lots d'un agent sur un mesh chargé, jamais ici (les lots
+        en `build` sont bornés par le plafond par agent)."""
 
     @abc.abstractmethod
     def turns(self, *, agent: str | None, since_s: float, limit: int) -> list[dict]:
@@ -3838,6 +4000,26 @@ class Handoffs(Domain):
     def unfence(self, operation: str, expected: str, state: str) -> dict | None: ...
 
 
+class PrevalidationReports(Domain):
+    """Rapports de prévalidation au gel (#1770, 0450) : une ligne par (lot, tête).
+
+    Le rapport `ameesh-prevalidation/1` est une preuve, pas un verdict : il ne
+    remplace ni la désignation au gel (#1617) ni le gel dérivé (#1756)."""
+
+    @abc.abstractmethod
+    def record(self, report: dict) -> None:
+        """Écrit le rapport de sa clé (lot, tête), après le run distant ;
+        réécrire la même clé remplace le rapport courant."""
+
+    @abc.abstractmethod
+    def report(self, work_item_id: int, head_sha: str) -> dict | None:
+        """Le rapport enregistré pour cette tête exacte, ou None."""
+
+    @abc.abstractmethod
+    def latest(self, work_item_id: int) -> dict | None:
+        """Le rapport le plus récent du lot (toute tête), ou None."""
+
+
 # --------------------------------------------------------------------------
 # le stockage d'une connexion
 # --------------------------------------------------------------------------
@@ -3871,6 +4053,7 @@ class Storage(abc.ABC):
     work: WorkItems
     work_dependencies: WorkDependencies
     provenance: Provenance
+    migration_reservations: MigrationReservations
     lot_sessions: LotSessions
     packages: WorkPackages
     actions: Actions
@@ -3895,3 +4078,4 @@ class Storage(abc.ABC):
     ci: CiResults
     conversations: Conversations
     handoffs: Handoffs
+    prevalidation: PrevalidationReports

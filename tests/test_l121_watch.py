@@ -40,17 +40,18 @@ class TextTest(unittest.TestCase):
         for words in ("Merge first", "PREPARED in full", "rollback", "owner's decisions"):
             self.assertIn(words, text)
         # the working rules of the canon (home#71, §§3/6/11 bis/12): integration
-        # by packages, review before CI and no CI per lot between cuts, sober
-        # proofs — carried by the injected text because the Process card is
-        # truncated in the brief
+        # by hourly packages, review before CI and no CI per lot between
+        # packages, sober proofs — carried by the watch text, which travels
+        # alone (the brief also carries the card's short projection)
         for words in ("packages", "30 min at most", "Review before CI",
                       "frozen head", "cancelled", "Sober proofs",
                       "a proof is a link", "sha256", "merge-tree", "3 lines"):
             self.assertIn(words, text)
-        # #1676 : le paquet est celui de la coupure, avec tous les lots prêts —
-        # plus la promesse « about ten lots » que le §11 bis a remplacée
-        self.assertIn("next cut's single package", text)
+        # #1676/#1658/#2332 : le paquet est horaire (canon §11 bis, owner 15/10
+        # 19:50) ; la coupure 11:00/23:00 ne compose plus de paquet
+        self.assertIn("a new package waits for the previous one", text)
         self.assertNotIn("about ten lots", text)
+        self.assertNotIn("next cut", text)
         self.assertIsNone(fil.unreadable_reason(text))
 
     def test_units(self):

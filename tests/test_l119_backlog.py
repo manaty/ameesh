@@ -167,19 +167,13 @@ class PriseTest(_Base):
             return sous_utilisation.idle_capacity(
                 self.db, listing, self.now, [], idle_s=30, paid=("deepseek",), **kw)
 
-        # #1608 : l'alerte ne se tait plus devant un lot de projet bloqué — elle
-        # le garde dans `lots`, le classe dans `blocked_lots` et écarte le
-        # dispatch ; la prise automatique (0037) garde, elle, le filtre `db=db`
-        # de #1021 (test suivant).
-        self.assertEqual([a["type"] for a in alertes()], ["idle_capacity"])
-        self.assertEqual(alertes()[0]["lots"], [lot["id"]])
-        self.assertEqual(alertes()[0]["startable_lots"], [])
-        self.assertEqual(alertes()[0]["blocked_lots"][str(lot["id"])]["what"], "dependency")
-        self.assertNotIn("ameesh work assign", alertes()[0]["detail"])
+        # #2337 B1 : un lot qu'une dépendance retient n'est pas du travail à
+        # confier — sans lot démarrable, l'alerte ne se lève plus (le détail
+        # des bloqués reste couvert par test_l94_underuse). La prise
+        # automatique (0037) garde, elle, le filtre `db=db` de #1021.
+        self.assertEqual(alertes(), [])
         self.assertEqual(
-            [a["type"] for a in alertes(
-                lots=storage.of(self.db).operations.open_lots_activity(500))],
-            ["idle_capacity"])
+            alertes(lots=storage.of(self.db).operations.open_lots_activity(500)), [])
         work.close(self.db, amont["id"], abandoned=True)
         self.assertEqual([a["type"] for a in alertes()], ["idle_capacity"])
         self.assertEqual(alertes()[0]["startable_lots"], [lot["id"]])
@@ -438,6 +432,11 @@ class AlerteEtNotifyTest(_Base):
         self.assertEqual(work.get(self.db, item["id"])["assignee"], "claude1")
         args = notify.build_parser().parse_args(["--take-idle", "0", "--take-lot-idle", "0"])
         self.assertIsNone(notify.take_settings(args))
+        # #1738 R1 (B2) : les propositions suivent une prise active ; leur
+        # interrupteur à 0 les coupe en plus, la prise restant active.
+        args = notify.build_parser().parse_args(["--take-review-max-per-hour", "0"])
+        self.assertEqual(notify.take_settings(args)["review_max_per_hour"], 0)
+        self.assertTrue(notify.take_settings(args)["max_per_hour"])
 
 
 if __name__ == "__main__":

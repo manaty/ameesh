@@ -411,6 +411,9 @@ class ExecApp:
         with self.pool.connection() as conn:
             with conn.transaction() as tx:
                 rules = self.dispatcher.rules(tx)
+                from ..agent_names import resolve
+                fence = dataclasses.replace(fence, agent=resolve(
+                    fence.agent, db=tx, operation="mediated.session-token"))
                 if fence.agent not in rules.admitted_agents(principal):
                     issued = None
                     code = "forbidden_scope"

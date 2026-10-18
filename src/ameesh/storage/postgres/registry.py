@@ -20,6 +20,7 @@ garanties, inchangées :
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Sequence
 
@@ -32,7 +33,7 @@ _ALIAS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 LINEAGE_MAX = 32
 
 AGENT_COLUMNS = """
-    name, chantier, harness, host, cwd, session_id, status, status_text, model,
+    name, aliases, chantier, harness, host, cwd, session_id, status, status_text, model,
     budget_usd, spent_usd, turns, pending_prompt, current_prompt, last_error,
     lease_owner, lease_epoch, runner_seen_host, runner_seen_owner,
     extract(epoch from runner_seen_at)::float8 as runner_seen_ts,
@@ -341,9 +342,14 @@ class Agents(interface.Agents):
         return rows[0]
 
     def get(self, name) -> dict | None:
-        rows = self.db.query("SELECT %s FROM agent_registry WHERE name = %%s" % AGENT_COLUMNS,
-                             (name,))
+        rows = self.db.query("SELECT %s FROM agent_registry WHERE name = "
+                             "(SELECT ameesh_resolve_agent_name(%%s, %%s))" % AGENT_COLUMNS,
+                             (name, "agents.get"))
         return rows[0] if rows else None
+
+    def resolve_name(self, name, *, operation="lookup") -> str:
+        return self.db.query("SELECT ameesh_resolve_agent_name(%s, %s) AS name",
+                             (name, operation))[0]["name"]
 
     def harnesses(self) -> dict[str, str]:
         rows = self.db.query("SELECT name, harness FROM agent_registry")
@@ -352,7 +358,8 @@ class Agents(interface.Agents):
     def overview(self) -> list[dict]:
         return self.db.query(
             """
-            SELECT name, chantier, harness, host, cwd, session_id, status, status_text,
+            SELECT name, (SELECT r.aliases FROM agent_registry r WHERE r.name=o.name) AS aliases,
+                   chantier, harness, host, cwd, session_id, status, status_text,
                    model, budget_usd, spent_usd, turns, pending_prompt, last_error,
                    lease_owner, lease_epoch, lease_expires_ts, last_seen_ts, last_turn_ts,
                    public_key_fingerprint, key_role, key_ready, has_owner_key, unread,
@@ -696,10 +703,10 @@ class Leases(interface.Leases):
     def state(self, name) -> dict | None:
         rows = self.db.query(
             """
-            SELECT lease_owner, lease_epoch, status,
+            SELECT name, lease_owner, lease_epoch, status,
                    (lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp()) AS live,
                    projects, team, chantier
-              FROM agent_registry WHERE name = %s
+              FROM agent_registry WHERE name = (SELECT ameesh_resolve_agent_name(%s, 'registry.lease_matches'))
             """,
             (name,),
         )
@@ -1081,8 +1088,10 @@ class PendingSpend(interface.PendingSpend):
                 model        = excluded.model,
                 work_item_id = excluded.work_item_id,
                 turn_id      = excluded.turn_id,
+                resident_usage = null,
                 created_at   = now()
             RETURNING agent, start_index, turn, model, work_item_id, turn_id,
+                      resident_usage,
                       extract(epoch from created_at)::float8 as created_ts
             """,
             (name, int(start_index), turn, model,
@@ -1098,10 +1107,27 @@ class PendingSpend(interface.PendingSpend):
         )
         return bool(rows)
 
+    def set_resident_usage(self, name, usage, created_ts=None) -> bool:
+        """L80a : l'événement `resident.turn` d'un tour non réglé, dans le
+        marqueur ; `created_ts` borne l'écriture au marqueur de ce tour."""
+        value = None if usage is None else json.dumps(usage, ensure_ascii=False)
+        if created_ts is None:
+            rows = self.db.query(
+                "UPDATE spend_pending SET resident_usage = %s::jsonb"
+                " WHERE agent = %s RETURNING agent", (value, name))
+        else:
+            rows = self.db.query(
+                "UPDATE spend_pending SET resident_usage = %s::jsonb"
+                " WHERE agent = %s"
+                " AND abs(extract(epoch from created_at)::float8 - %s) < 0.0000005"
+                " RETURNING agent", (value, name, float(created_ts)))
+        return bool(rows)
+
     def get(self, name) -> dict | None:
         rows = self.db.query(
             """
             SELECT agent, start_index, turn, model, work_item_id, turn_id,
+                   resident_usage,
                    extract(epoch from created_at)::float8 as created_ts
               FROM spend_pending WHERE agent = %s
             """,

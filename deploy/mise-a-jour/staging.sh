@@ -61,6 +61,8 @@
 # retour, arret de la sequence et courrier urgent au pilote. Rien n'est
 # repris apres un echec ; relancer la commande est sur : un hote deja au
 # commit vise ne le reinstallle pas (le previous-sha reste le bon).
+# Un seul operateur a la fois : un second passage sort en 75 (verrou
+# ~/.local/state/ameesh/mise-a-jour/staging.lock) sans rien modifier.
 #
 # Traces : une ligne JSON par evenement (date, hote, etape, verdict, sha,
 # precedent, detail) dans ~/.local/state/ameesh/mise-a-jour/staging-<date>.jsonl ;
@@ -246,6 +248,19 @@ fi
 mkdir -p "$TRAVAIL"; chmod 700 "$TRAVAIL"
 touch "$JOURNAL"; chmod 600 "$JOURNAL"
 
+# Operateur unique (#2448) : le staging est une sequence d'hotes, jamais deux a
+# la fois, qu'il soit lance a la main ou par la release automatique. Le verrou
+# tombe avec le processus ; un second passage sort en 75 sans rien modifier
+# (un `--a-blanc` reste possible, il ne modifie rien).
+if [ "$A_BLANC" != 1 ]; then
+  VERROU="$TRAVAIL/staging.lock"
+  exec 9>"$VERROU"
+  if ! flock -n 9; then
+    echo "staging deja en cours (verrou $VERROU) : rien n'est modifie" >&2
+    exit 75
+  fi
+fi
+
 # Un BASCULE_ENV temporaire par hote : vm.sh relit le fichier qu'on lui donne,
 # et la topologie doit primer sur d'eventuels AGENTS_SSH/HOTE_AGENTS restes
 # dans le fichier prive.
@@ -430,7 +445,11 @@ if [ "$SAUVER" = 1 ]; then
 fi
 
 etape "migrations de $SHA_TRAVE (additives seulement, base partagee)"
-"$POSTE_SH" migrer --additif-seulement "$SHA" || { echo "migrations en echec : aucune installation" >&2; exit 1; }
+# #2357 : une sonde d'auto-prise en echec ne doit pas arreter la sequence. La
+# suite par hote installe et redemarre les VM d'abord, le poste en dernier
+# (canon §14) ; sans ce drapeau, poste.sh redemarrerait le poste tout de suite
+# et interromprait l'operateur avant les VM, sur une base deja migree.
+MIGRER_SANS_REDEMARRAGE=1 "$POSTE_SH" migrer --additif-seulement "$SHA" || { echo "migrations en echec : aucune installation" >&2; exit 1; }
 trace poste migrations ok "migrations de $SHA_TRAVE passees avant toute installation"
 
 # --- sequence par hote ----------------------------------------------------

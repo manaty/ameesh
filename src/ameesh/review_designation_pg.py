@@ -132,12 +132,22 @@ class PgPort:
     (no nesting in the `frozen` milestone's one). Built without `after_commit`
     on an open transaction, the port refuses to write (`DesignationError`,
     nothing written): a nested `with` does not commit, so draining the thread
-    there would publish it before the caller's commit (#1775, N2)."""
+    there would publish it before the caller's commit (#1775, N2).
 
-    def __init__(self, db, *, sender: str = SENDER, after_commit: Optional[list] = None):
+    `at_freeze` says whether the write happens inside the `frozen` milestone:
+    an unknown recipient is then a waiting designation instead of a refusal
+    (#1634), because raising would cancel the acquired freeze. It defaults to
+    True when `after_commit` is given (the hook's transaction), False when the
+    port owns the transaction (a recovery outside the hook keeps the refusal).
+    """
+
+    def __init__(self, db, *, sender: str = SENDER, after_commit: Optional[list] = None,
+                 at_freeze: Optional[bool] = None):
         self.db = db
         self.sender = sender or SENDER
         self.after_commit = after_commit
+        self.at_freeze = ((after_commit is not None) if at_freeze is None
+                          else bool(at_freeze))
 
     # -- reads ------------------------------------------------------------
     def latest_freeze(self, lot: int) -> Optional[dict]:
@@ -207,7 +217,8 @@ class PgPort:
             return self._write(self.db, lot, freeze=freeze, required=required,
                                state=state, reviewers=reviewers, missing=missing,
                                why=why, authors=authors, policy_ref=policy_ref,
-                               notify=notify, messages=messages, hook=True)
+                               notify=notify, messages=messages,
+                               hook=self.at_freeze)
         threads: list = []
         inner = PgPort(self.db, sender=self.sender, after_commit=threads)
         with self.db.transaction() as tx:

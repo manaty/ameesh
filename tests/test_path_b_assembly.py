@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import tempfile
@@ -192,8 +193,15 @@ class MainIntegrationTest(unittest.TestCase):
         from ameesh.storage.postgres.work import WorkItems
         principal = Principal("session", "exec", "mesh", "host", agent="a", epoch=1)
         db = mock.Mock()
+        db.transaction.side_effect = lambda: contextlib.nullcontext(db)
         # Assignment succeeds; UPDATE simulates a lot without an open request.
-        db.query.side_effect = lambda sql, params: ([{"ok": 1}] if "w.assignee" in sql else [])
+        def query(sql, params):
+            if "w.assignee" in sql:
+                return [{"ok": 1}]
+            if sql.startswith("SELECT migration_repo FROM work_items"):
+                return [{"migration_repo": None}]
+            return []
+        db.query.side_effect = query
         rules = HostScopeRules(db)
         for supplied in ({}, {"held": False}, {"held": True}):
             with self.subTest(supplied=supplied):

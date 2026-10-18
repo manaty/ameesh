@@ -1,0 +1,32 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Host chrome of the L92 example. The host page styles itself with the
+   published tokens (ameesh-ui.css) and never reaches into a component's
+   shadow root: the interface keeps its own styles (study §2.5). */
+:root {
+  --_page: var(--ameesh-color-page, #f9f9f7);
+  --_ink: var(--ameesh-color-ink, #0b0b0b);
+  --_grid: var(--ameesh-color-grid, #e1e0d9);
+  --_surface: var(--ameesh-color-surface, #fcfcfb);
+  --_radius: var(--ameesh-radius, 8px);
+}
+
+body {
+  margin: 0;
+  background: var(--_page);
+  color: var(--_ink);
+  font-family: var(--ameesh-font, system-ui, sans-serif);
+}
+
+.bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--_grid);
+  background: var(--_surface);
+}
+
+.bar label { display: inline-flex; align-items: center; gap: 6px; }
+.muted { color: var(--ameesh-color-muted, #6f6d68); font-size: 0.9rem; }
+#status { flex: 1 1 16rem; min-width: 0; overflow-wrap: anywhere; }

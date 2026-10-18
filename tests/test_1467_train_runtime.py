@@ -1,11 +1,36 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Real SQL receipts through the runtime, including final-gate races/restart."""
 import types
+import unittest
 from unittest import mock
 
 from ameesh import land, merge_queue, train, train_ci, train_fire, train_runtime, train_store, work
 from .support import PgTestCase
 from .test_1467_train import MemoryPorts, row
+
+
+class MigrationReconcileTest(unittest.TestCase):
+    def test_landing_bookkeeping_requires_a_confirmed_receipt(self):
+        for receipt in (None, {"state": "landed"}):
+            with self.subTest(receipt=receipt):
+                runtime = object.__new__(train_runtime.Runtime)
+                runtime.repository = mock.Mock(source="github.com/o/r")
+                runtime.target_branch = "main"
+                runtime.ledger = mock.Mock()
+                runtime.ledger.acquire.return_value = 7
+                runtime.fires = mock.Mock()
+                runtime.fires.reconcile.return_value = receipt
+                runtime.migrations = mock.Mock()
+                runtime.migrations.landed.return_value = []
+                runtime.notify = mock.Mock()
+                plan = dict(source="github.com/o/r", target="main",
+                            migrations=[dict(work_item_id=1, reserved=525, landed=517)])
+                self.assertIs(runtime.reconcile(plan, {"id": "fire"}, 7), receipt)
+                if receipt is None:
+                    runtime.migrations.landed.assert_not_called()
+                else:
+                    runtime.migrations.landed.assert_called_once_with(
+                        plan, path=runtime.repository.clone.path)
 
 
 class TrainRuntimeTest(PgTestCase):
@@ -88,6 +113,40 @@ class TrainRuntimeTest(PgTestCase):
         self.repository.publish.assert_called_once()
         self.assertEqual(self.repository.publish.call_args.kwargs["workflows"], self.ci.workflows)
         self.repository.promote.assert_called_once()
+
+    def test_migration_mapping_is_persisted_and_recorded_after_promotion(self):
+        # #2400: composition reserves and the runtime records the landed
+        # number only after a confirmed promotion, then frees it.
+        compose = self.memory.compose
+        mapping = [dict(work_item_id=1, reserved=525, landed=517, files=[])]
+        self.memory.compose = lambda base, rows, nonce: dict(
+            compose(base, rows, nonce), migrations=mapping)
+        allocator = mock.Mock()
+        allocator.landed.return_value = []
+        self.engine = self.engine_for(self.runtime_for(migrations=allocator))
+        plan, _ = self.ready()
+        self.assertEqual(plan["migrations"], mapping)
+        self.assertEqual(self.ledger.load()["plan"]["migrations"], mapping)
+        self.assertEqual(self.engine.step(3602)["result"], "landed")
+        allocator.landed.assert_called_once()
+        landed, = allocator.landed.call_args.args
+        self.assertEqual(landed["migrations"], mapping)
+        self.assertEqual(allocator.landed.call_args.kwargs["path"],
+                         self.repository.clone.path)
+
+    def test_migration_landing_record_failure_never_revokes_the_merge(self):
+        compose = self.memory.compose
+        mapping = [dict(work_item_id=1, reserved=525, landed=517, files=[])]
+        self.memory.compose = lambda base, rows, nonce: dict(
+            compose(base, rows, nonce), migrations=mapping)
+        allocator = mock.Mock()
+        allocator.landed.return_value = ["record unavailable"]
+        self.engine = self.engine_for(self.runtime_for(migrations=allocator))
+        self.ready()
+        outcome = self.engine.step(3602)
+        self.assertEqual(outcome["result"], "landed", outcome)
+        self.assertIn("migration landing record incomplete: record unavailable",
+                      self.memory.notices)
 
     def test_ci_rerun_after_engine_green_before_effect_retains_claim_without_push(self):
         plan, fire = self.ready()

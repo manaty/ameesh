@@ -919,9 +919,16 @@ def idle_agents(listing: list, now: float, idle_s: float, *,
 
 def is_backlog_item(lot: dict) -> bool:
     """Élément de la file d'amélioration encore à prendre (L119) : il attend un
-    preneur automatique, ce n'est ni un lot en souffrance ni un lot stagnant."""
-    return (lot.get("type") == "improvement" and not (lot.get("assignee") or "").strip()
-            and lot.get("state") == "intake")
+    preneur automatique, ce n'est ni un lot en souffrance ni un lot stagnant.
+    §4 : un élément `build` sans assigné n'est un élément de la file que s'il a
+    été RENDU (`returned_to_queue`) — un élément en cours sans preneur n'y est
+    pas."""
+    if (lot.get("assignee") or "").strip():
+        return False
+    if lot.get("state") == "intake":
+        return lot.get("type") == "improvement"
+    return (lot.get("type") == "improvement" and lot.get("state") == "build"
+            and bool(lot.get("returned_to_queue")))
 
 
 def waiting_project_lots(lots: list, *, db=None, now: float | None = None) -> list:
@@ -985,6 +992,23 @@ def split_startable(waiting_lots: list, waits: dict) -> tuple:
     return startable, blocked
 
 
+def lots_for_idle(lots: list, idle: list) -> list:
+    """#2337 B4 : ne garder que les lots qu'un agent au repos peut prendre —
+    le projet du lot (`app`, `workstream` ; `projects.lot_project`) doit
+    figurer dans ceux d'au moins un agent. Un lot sans projet connu reste (on
+    ne devine pas) et un repos sans projet déclaré ne filtre rien (cas hub).
+    Sans ce croisement, cinq agents Nexlink au repos et un lot ameesh
+    démarrable levaient encore l'alerte."""
+    from . import projects as projects_mod
+    wanted = {project for row in idle
+              for project in projects_mod.agent_projects(row)}
+    if not wanted:
+        return list(lots)
+    return [lot for lot in lots
+            if not projects_mod.lot_project(lot)
+            or projects_mod.lot_project(lot) in wanted]
+
+
 def waiting_text(blocked: dict, limit: int = 6) -> str:
     """« #12 waits on #3, #4; #15 is scheduled for 2026-10-16 » (L368)."""
     parts = []
@@ -1039,6 +1063,10 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     # (démarrables / en attente d'un prérequis) ; le filtrage `db=db` de
     # #1021 reste dans `waiting_project_lots` pour la prise automatique (0037).
     waiting_lots = waiting_project_lots(lots)
+    # #2337 B4 : un lot démarrable d'un autre projet n'est pas une capacité
+    # pour ces agents (cinq agents Nexlink au repos + un lot ameesh levait
+    # encore l'alerte) ; on croise avec les projets des agents au repos.
+    waiting_lots = lots_for_idle(waiting_lots, idle)
     waits = planned_waits.read(db, waiting_lots, now=now) if waiting_lots else {}
     startable_lots, blocked_lots = split_startable(waiting_lots, waits)
     backlog = [row for row in listing
@@ -1050,7 +1078,12 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
                           and _state(row) == "working" and not _attached(row))
     plan_idle = [row for row in idle if paid is not None and row.get("harness") not in paid]
     aggravating = bool(paid_working and plan_idle)
-    if not (waiting_lots or backlog or aggravating):
+    # #2337 : la levée se lit sur les lots DÉMARRABLES — un lot qu'une
+    # dépendance ou une date retient n'est pas du travail à confier, et
+    # `waiting_lots` en compte 24 sans qu'un agent puisse rien prendre. Les
+    # bloqués restent dans le détail d'une alerte levée par autre chose (un
+    # courrier en souffrance, le forfait au repos).
+    if not (startable_lots or backlog or aggravating):
         return []
     names = sorted(row["name"] for row in idle)
     # #1677 (b) : le repos se lit sur les lots actionnables, plus sur le temps
@@ -1127,8 +1160,9 @@ def orchestrator_briefs(alert: dict, listing: list, lot_titles: dict | None = No
     et (L165b) aux agents de conception.
 
     Rend `{orchestrateur: texte}` : à chacun, les agents au repos sans lot de
-    SON équipe (tous s'il n'en a pas) et les lots ouverts sans agent (un lot
-    ne dit pas son équipe : tous). Un orchestrateur sans agent à occuper ne
+    SON équipe (tous s'il n'en a pas) et les lots ouverts sans agent (filtrés
+    en amont sur les projets des agents au repos, #2337 B4 ; un lot sans
+    projet connu reste). Un orchestrateur sans agent à occuper ne
     reçoit rien ; il n'est jamais cité dans sa propre liste.
 
     #1608 : seuls les lots sans attente planifiée sont proposés (L368) ; les
@@ -1151,8 +1185,8 @@ def orchestrator_briefs(alert: dict, listing: list, lot_titles: dict | None = No
             not mine or mine & set(projects_mod.agent_projects(by_name.get(n) or {})))]
         if not names:
             continue
-        parts = ["Idle capacity: %d wakeable agent(s) without a lot in progress for more "
-                 "than %s: %s." % (len(names), _duration(alert.get("threshold") or 0), ", ".join(names))]
+        parts = ["Idle capacity: %d wakeable agent(s) without an actionable lot: %s."
+                 % (len(names), ", ".join(names))]
         if startable:
             parts.append("Open lots without an agent: %s." % ", ".join(
                 "#%d%s" % (i, " \"%s\"" % titles[i] if titles.get(i) else "")

@@ -348,10 +348,13 @@ test (three messages → three notifications) caught the bug.
   The size is read
   from the usage in each harness's stream (keys normalized by
   `adapters.usage_tokens`; DeepSeek publishes usage per step). **Context
-  ceiling (L60)**: if the last turn re-read more than
-  `AMEESH_CONTEXT_MAX_TOKENS` tokens (default 15 M, input + cache, adjustable per
-  agent with `ameesh set <agent> context_max_tokens=…`), the same rotation takes
-  place before the next turn, with no minimum number of turns (see
+  ceiling (L60)**: if the context of the last model call (the session size:
+  input + cache read + cache written) exceeds `AMEESH_CONTEXT_MAX_TOKENS`
+  tokens (default 15 M, adjustable per agent with `ameesh set <agent>
+  context_max_tokens=…`), the same rotation takes place before the next turn,
+  with no minimum number of turns. The sum of a turn's re-reads is not the
+  measure (#2336): it grows with the number of steps of the turn, not with the
+  session (see
   [EXPLOITATION.md](EXPLOITATION.md#plafond-de-contexte-l60)).
 * **Moved working directory (0018)**: at registration, the git identity of the
   directory (common repository + branch) is written to

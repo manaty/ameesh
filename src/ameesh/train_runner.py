@@ -15,8 +15,8 @@ import time
 from dataclasses import asdict, replace
 
 from . import (merge_queue, radar, resolutions, train, train_admissions,
-               train_candidates, train_ci, train_fire, train_git, train_history, train_policy,
-               train_runtime, train_store)
+               train_candidates, train_ci, train_fire, train_git, train_history,
+               train_migrations, train_policy, train_runtime, train_store)
 
 
 class Passage:
@@ -114,7 +114,12 @@ class Passage:
         clone = resolutions.Replayer(self.project.repo, directory, script=None)
         transports = (None if self.transports is None else
                       lambda **context: self.transports(db, **context))
-        repository = train_git.Repository(self.project, clone, transports=transports)
+        # #2400: composition moves the L122 reservation before publication and
+        # records the landed number after a confirmed promotion. The allocator
+        # is bound to this passage's scoped connection and dies with it.
+        migrations = train_migrations.Allocator(db, cfg=self.cfg, actor="ameesh train")
+        repository = train_git.Repository(self.project, clone, transports=transports,
+                                          migrations=migrations)
         ledger = (self.reservation_ledger(db) if self.reservation is not None else
                   train_store.Ledger(db, self.project, target, self.owner))
         authority = fires(self.cfg, ledger) if rules.merge_named_fire else fires(ledger, rules)
@@ -128,7 +133,8 @@ class Passage:
             enrollment = train_candidates.Enrollment(preparation, admissions, initial=self.initial)
         return train_runtime.Runtime(ledger=ledger, repository=repository, ci=ci,
             fires=authority, admissions=admissions,
-            target=target, policy=policy, notify=self.notify, inventory=inventory, enrollment=enrollment)
+            target=target, policy=policy, notify=self.notify, inventory=inventory,
+            enrollment=enrollment, migrations=migrations)
 
     def step(self, db, now):
         """One bounded event/pass; never wait for CI and never retain ``db``."""

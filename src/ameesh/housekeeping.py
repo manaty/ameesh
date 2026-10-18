@@ -2129,6 +2129,14 @@ def common_dir(cwd: str) -> str:
     return os.path.abspath(os.path.join(cwd, proc.stdout.strip()))
 
 
+def same_repository(path: str, repo: str) -> bool:
+    """#2180: `path` is a worktree of `repo`, whichever form the record kept
+    (common dir from `common_dir`, or top level) and through symlinks."""
+    here = common_dir(path)
+    there = common_dir(repo) if repo and os.path.isdir(repo) else ""
+    return bool(here and there) and _real(here) == _real(there)
+
+
 def _scratch_merge_tree(path: str, ref: str):
     """`git merge-tree --write-tree ref HEAD` whose new objects go to a
     scratch directory (the repository's objects as alternates), deleted
@@ -2310,25 +2318,60 @@ def owns_worktree(path: str, cwd: str | None, other_cwds) -> bool:
 #: sous `lot/` et `work/` l'id est le premier groupe numérique, sous `agent/`
 #: et `review/` le dernier. #1694 : une branche peut citer plusieurs groupes
 #: (`review/claude2-t3-unit-459-460-r2`) ; ils sont essayés dans cet ordre.
+#: #2182 : le chiffre que porte le nom de l'agent (`review/mty-amh-impl-02-…`)
+#: n'est pas un lot — il est écarté quand l'agent de la branche est connu, et
+#: un groupe complété d'un zéro (`-02`) ne l'est jamais (un id de lot s'écrit
+#: en décimal, `#2`, jamais `#02`).
 CITED_LOT = re.compile(r"^(lot|work|agent|review)/(.+)$")
 
 
-def cited_lots(branch: str) -> list[int]:
+def branch_agent(branch: str, agents=()) -> str:
+    """#2182 : l'agent que nomme une branche `agent/<agent>-…` ou
+    `review/<agent>-…` en tête, quand l'un de `agents` (le registre, ou
+    l'agent enregistré pour ce worktree) le nomme ; le plus long gagne
+    (`mty-amh-impl-02` plutôt que `mty-amh`). '' sinon — un nom qu'aucun
+    agent connu ne porte n'est pas deviné."""
+    found = CITED_LOT.match(branch or "")
+    if not found or found.group(1) not in ("agent", "review"):
+        return ""
+    rest = found.group(2)
+    for name in sorted((name for name in agents or () if name), key=len, reverse=True):
+        if rest.startswith(name + "-"):
+            return name
+    return ""
+
+
+def cited_lots(branch: str, agent: str = "") -> list[int]:
     """#1694: every lot id a branch name cites, in trial order — first to last
     under `lot/`/`work/`, last to first under `agent/`/`review/` (the agent
     name may itself carry a digit, the lot id is the last group there). Empty
-    when the branch cites no number."""
+    when the branch cites no number.
+
+    #2182: the number an agent name carries is not a lot. `agent` — the
+    branch's agent, see `branch_agent` — is dropped from the groups first;
+    without it, a zero-padded group (`review/mty-amh-impl-02-1234`, the
+    `-02` of the agent's name) is still not a lot: a lot id is written as
+    its decimal (`#2`), never padded. So that review branch cites #1234."""
     found = CITED_LOT.match(branch or "")
     if not found:
         return []
-    groupes = [int(part) for part in found.group(2).split("-") if part.isdigit()]
+    rest = found.group(2)
+    if agent and found.group(1) in ("agent", "review") and rest.startswith(agent + "-"):
+        rest = rest[len(agent) + 1:]
+    groupes = []
+    for part in rest.split("-"):
+        if not part.isdigit():
+            continue
+        if found.group(1) in ("agent", "review") and len(part) > 1 and part.startswith("0"):
+            continue
+        groupes.append(int(part))
     return groupes if found.group(1) in ("lot", "work") else list(reversed(groupes))
 
 
-def cited_lot(branch: str) -> int | None:
+def cited_lot(branch: str, agent: str = "") -> int | None:
     """#1665 : l'id de lot cité par un nom de branche, ou None — le premier
     candidat de `cited_lots`, pour les appelants qui n'en veulent qu'un."""
-    lots = cited_lots(branch)
+    lots = cited_lots(branch, agent=agent)
     return lots[0] if lots else None
 
 
@@ -2341,7 +2384,8 @@ def named_lot(name: str, agent: str) -> int | None:
     return int(found.group(1)) if found else None
 
 
-def lot_of_worktree(db, agent: str, path: str, branch: str = "") -> str | None:
+def lot_of_worktree(db, agent: str, path: str, branch: str = "",
+                    branch_owner: str = "") -> str | None:
     """#1665 : le lot qu'un worktree SERT, quand c'est prouvable : sa branche
     ou, à défaut, son dossier nomment l'id, et ce lot est assigné à CET agent.
     Sinon None : le worktree reste non attribué (jamais retiré à ce titre, il
@@ -2350,10 +2394,12 @@ def lot_of_worktree(db, agent: str, path: str, branch: str = "") -> str | None:
 
     #1694: the branch candidates are tried in `cited_lots` order and the first
     lot owned by the agent wins; the folder name is only read when the branch
-    cites no number (the #1665 rule)."""
+    cites no number (the #1665 rule). #2182: `branch_owner` — the agent named
+    at the head of an `agent/`/`review/` branch — is not a lot candidate
+    (else `review/reviewer-02-459` could wrongly attach to lot #2)."""
     if not agent:
         return None
-    idents = cited_lots(branch)
+    idents = cited_lots(branch, agent=branch_owner or agent)
     if not idents:
         nom = named_lot(os.path.basename(os.path.normpath(path)), agent)
         idents = [nom] if nom is not None else []
@@ -2652,7 +2698,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                    protected: set[str], now: float,
                    running: set | None = None, artifacts=None,
                    allow=(), lock_path: str | None = None, journal_path: str | None = None,
-                   skip_roots=()) -> tuple[list[dict], list[dict]]:
+                   skip_roots=(), known_agents=()) -> tuple[list[dict], list[dict]]:
     """Fin de lot des worktrees suivis : (lignes du journal, plan lisible).
 
     Garde-fous (L73b) avant tout retrait : worktree attribué à l'agent du
@@ -2685,12 +2731,18 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
     # agents-2, 1 309 on the workstation)
     for row in store.worktrees(host, ("active", "kept"), limit=None):
         path, lot = row["path"], row.get("lot")
+        branch = row.get("branch") or ""
+        # #2182: the agent at the head of an `agent/`/`review/` branch is
+        # known from the registry (else from the recorded agent), so its own
+        # number is not read as a cited lot (`review/reviewer-02-1234`).
+        branch_owner = branch_agent(branch, known_agents) or (row.get("agent") or "")
         if (row.get("detail") or "").startswith((UNATTRIBUTED, UNATTRIBUTED_LEGACY)):
             # #1665 : la branche (ou, à défaut, le dossier) d'un worktree
             # frère nomme le lot qu'il sert ; si ce lot est assigné à l'agent
             # qui l'a vu apparaître, il suit la fin de son lot au lieu de
             # rester « non attribué » à jamais.
-            lot = lot_of_worktree(db, row.get("agent") or "", path, row.get("branch") or "")
+            lot = lot_of_worktree(db, row.get("agent") or "", path, branch,
+                                  branch_owner=branch_owner)
         base = {"kind": "worktree", "path": path, "agent": row["agent"], "lot": lot}
         if not os.path.isdir(path):
             plan.append(dict(base, action="disparu", detail=UNATTRIBUTED))
@@ -2701,7 +2753,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                 entries.append(dict(base, action="gone", detail="directory gone; "
                                     "git worktree prune (%s)" % UNATTRIBUTED))
             continue
-        named = cited_lot(row.get("branch") or "") or named_lot(
+        named = cited_lot(branch, agent=branch_owner) or named_lot(
             os.path.basename(os.path.normpath(path)), row.get("agent") or "")
         # #2174: a named lot that cannot be attributed (another agent's: a
         # review copy, a reassigned lot) follows the orphan rule once that lot
@@ -2714,7 +2766,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                 # #1694: review branches can cite several candidates. One
                 # ended lot proves nothing about the others still served.
                 states = [_lot_state(db, ident) for ident in
-                          (cited_lots(row.get("branch") or "") or [named])]
+                          (cited_lots(branch, agent=branch_owner) or [named])]
             except Exception:  # registre illisible : rien n'est prouvé
                 states = [None]
             if any(state not in LOT_ENDED for state in states):
@@ -2760,7 +2812,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         # #2180: a reused tracked path may now be a clone, a symlink or a
         # worktree of another repository. Old metadata never authorises it.
         from .housekeeping_discovery import _marker
-        if _marker(path) != "linked" or common_dir(path) != _real(row.get("repo") or ""):
+        if _marker(path) != "linked" or not same_repository(path, row.get("repo") or ""):
             plan.append(dict(base, action="garde",
                              detail="linked worktree no longer matches its tracked repository"))
             continue
@@ -2777,7 +2829,18 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             plan.append(dict(base, action="garde", detail="%s; %s" % (why, st["reason"])))
             continue
         if foreign and not st["pushed"]:
-            plan.append(dict(base, action="garde", detail="%s; commits not pushed" % why))
+            # #2182: never remove a foreign copy that carries unpushed work,
+            # but say it — without the `kept` status (and its `worktree_kept`
+            # alert), this work was only in the pass plan, named to nobody.
+            detail = "%s: kept — %s" % (
+                why, st["reason"] if "commits not pushed" in (st["reason"] or "")
+                else "commits not pushed" + ("; %s" % st["reason"] if st["reason"] else ""))
+            plan.append(dict(base, action="garde", detail=detail))
+            if not dry_run and (row["status"] != "kept" or row.get("detail") != detail):
+                store.set_worktree_status(row["id"], "kept", detail)
+                entries.append(dict(base, action="kept", detail=detail, data={
+                    "command": "git -C %s status ; git -C %s log --branches --not --remotes"
+                               % (shlex.quote(path), shlex.quote(path))}))
             continue
         if worktree_in_use(path, allow=allow):
             plan.append(dict(base, action="attend",
@@ -3426,6 +3489,14 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
             # idle, like the directory of an agent absent from the registry
             orphan = FALLBACK_SEP in name or (registered is not None
                                               and agent not in registered)
+            # #2326 : la suppression ne vise que ce qui est À NOUS. Un dossier
+            # sans fichier de propriétaire de ce mesh (worktree créé par un
+            # agent à la racine partagée, dossier d'un autre mesh d'avant L219,
+            # nom inconnu) n'est jamais supprimé, même ancien : un registre
+            # vide, partiel ou ancien ne doit rien détruire.
+            if orphan and owner != key:
+                skipped.append("tmp %s kept: not owned by this mesh" % full)
+                continue
             why = tmp_problem(full, owner, key, registered=not orphan,
                               idle_after=policy.orphan_idle, now=now)
             if why:
@@ -3445,6 +3516,13 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                     skipped.append("tmp %s kept: changed during the pass" % full)
                     continue
                 if orphan:
+                    # #2326 : même à nous, un dossier qui porte une copie git
+                    # (worktree de relecture créé dans le dossier temporaire)
+                    # n'est pas un simple tmp : on ne le supprime pas.
+                    if _git_copies(full):
+                        skipped.append("tmp %s kept: contains a Git worktree or "
+                                       "clone" % full)
+                        continue
                     size = size_of(full)
                     plan.append({"kind": "tmp", "path": full, "agent": agent,
                                  "action": "suppression", "bytes": size,
@@ -3565,7 +3643,8 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                                              allow=policy.unreadable_ok, lock_path=lock_path,
                                              journal_path=journal_path,
                                              skip_roots=(troot, croot, cfg.state_dir)
-                                             + _shared_roots())
+                                             + _shared_roots(),
+                                             known_agents=registered or ())
         entries += wt_entries
         plan += wt_plan
     # 3b. L230: regenerable build dirs of idle worktrees

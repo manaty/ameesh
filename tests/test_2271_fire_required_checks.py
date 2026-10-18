@@ -31,6 +31,13 @@ import unittest
 from ameesh import fire, land, radar
 
 SHA = "9e790414749cdb05e5c446a8e8291f26eaf039e7"
+
+#: #2306 : la classification passagère des lectures de la forge
+#: (`TransientLandError`) vient de la résolution 659bd757 (#2306 × #2285).
+#: Les deux témoins de l'union restent inactifs tant que #2306 n'est pas dans
+#: l'arbre, et s'activent dès son rejeu — sans quoi ils seraient rouges sur la
+#: seule branche #2285, qui n'a pas encore cette classe.
+TRANSIENT = getattr(land, "TransientLandError", None)
 #: le rollup exact de la PR #1638 : couverture verte, suite du paquet sautée,
 #: aucun check `tests`.
 INCIDENT = [
@@ -69,16 +76,18 @@ def _run(name, app_id=15368, conclusion="success", status="completed", sha=SHA):
 
 
 class FakeGh:
-    """Le peu de `gh` que le feu lit : la PR, la protection de la cible et les
-    check runs de la tête (leur source)."""
+    """Le peu de `gh` que le feu lit : la PR, la protection de la cible, les
+    rulesets de branche et les check runs de la tête (leur source)."""
 
     def __init__(self, *, rows=(), protection=PROTECTED, error="", check_runs=(),
-                 check_error=""):
+                 check_error="", rules=(), rules_error=""):
         self.rows = list(rows)
         self.protection = protection
         self.error = error
         self.check_runs = list(check_runs)
         self.check_error = check_error
+        self.rules = list(rules)
+        self.rules_error = rules_error
         self.calls = []
 
     def __call__(self, argv, **kwargs):
@@ -91,6 +100,13 @@ class FakeGh:
                 return types.SimpleNamespace(returncode=1, stdout="", stderr=self.error)
             return types.SimpleNamespace(returncode=0,
                                          stdout=json.dumps(self.protection), stderr="")
+        if any("/rules/branches/" in arg for arg in argv):
+            if self.rules_error:
+                return types.SimpleNamespace(returncode=1, stdout="",
+                                             stderr=self.rules_error)
+            # pages slurpées : une page, la liste des règles appliquées
+            return types.SimpleNamespace(returncode=0,
+                                         stdout=json.dumps([self.rules]), stderr="")
         path = next((arg for arg in argv if "/check-runs" in arg), "")
         if path:
             if self.check_error:
@@ -102,6 +118,21 @@ class FakeGh:
                                          stderr="")
         return types.SimpleNamespace(returncode=1, stdout="",
                                      stderr="unexpected gh %s" % " ".join(argv))
+
+
+class FailingGh(FakeGh):
+    """Une lecture de la protection qui échoue avec le détail donné (vide
+    possible : `gh` sort en erreur sans rien écrire)."""
+
+    def __init__(self, detail):
+        super().__init__()
+        self.detail = detail
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        if argv[:1] == ["api"] and len(argv) > 1 and argv[1].endswith("/protection"):
+            return types.SimpleNamespace(returncode=1, stdout="", stderr=self.detail)
+        return super().__call__(argv, **kwargs)
 
 
 def _project(**extra):
@@ -165,6 +196,29 @@ class ProtectionTest(unittest.TestCase):
         project = _project(required_checks=("coverage",))
         self.assertEqual(self._required(gh, project=project), (("coverage", None),))
 
+    def test_only_a_proven_403_lets_the_declaration_cover_the_protection(self):
+        # #2344 N1 : un 404, un GOAWAY, un DNS ou une sortie vide ne prouvent
+        # pas un refus de droits ; la déclaration ne remplace pas la source.
+        project = _project(required_checks=("coverage",))
+        with self.assertRaises(land.LandError) as raised:
+            fire.required_checks("manaty/ameesh", "main", project,
+                                 gh=FakeGh(error="gh: Not Found (HTTP 404)"))
+        self.assertNotIsInstance(raised.exception, land.TransientLandError)
+        for detail in (
+                "dial tcp: lookup api.github.com on 127.0.0.53:53: server misbehaving",
+                "http2: server sent GOAWAY and closed the connection",
+                ""):
+            with self.subTest(detail=detail), self.assertRaises(land.TransientLandError):
+                fire.required_checks("manaty/ameesh", "main", project,
+                                     gh=FailingGh(detail))
+
+    def test_a_malformed_protection_is_not_covered_by_the_declaration(self):
+        project = _project(required_checks=("coverage",))
+        with self.assertRaises(land.LandError):
+            fire.required_checks(
+                "manaty/ameesh", "main", project,
+                gh=FakeGh(protection={"required_status_checks": {"contexts": "tests"}}))
+
     def test_the_declaration_completes_the_forge_never_weakens_it(self):
         project = _project(required_checks=("coverage",))
         self.assertEqual(self._required(FakeGh(), project=project),
@@ -200,6 +254,146 @@ class ProtectionTest(unittest.TestCase):
                         {"context": "tests", "app_id": True}]}}):
             with self.subTest(bad=bad), self.assertRaises(land.LandError):
                 self._required(FakeGh(protection=bad))
+
+    def test_an_app_id_minus_one_means_any_application(self):
+        # #2285 N1 : `app_id: -1` est « toute application » ; le traiter en
+        # réponse malformée fermait la porte sur un dépôt sans fournisseur
+        # imposé.
+        gh = FakeGh(protection={"required_status_checks": {
+            "contexts": ["tests"],
+            "checks": [{"context": "tests", "app_id": -1}]}})
+        self.assertEqual(self._required(gh), (("tests", None),))
+
+    def test_another_negative_app_id_is_still_refused(self):
+        gh = FakeGh(protection={"required_status_checks": {
+            "checks": [{"context": "tests", "app_id": -2}]}})
+        with self.assertRaises(land.LandError):
+            self._required(gh)
+
+
+RULESET = [{"type": "required_status_checks", "parameters": {
+    "required_status_checks": [{"context": "tests", "integration_id": 15368}]}}]
+
+
+class RulesetTest(unittest.TestCase):
+    """#2285 N2 : un check requis par un ruleset de branche est exigé."""
+
+    def _required(self, gh, *, project=None, target="main"):
+        return fire.required_checks("manaty/ameesh", target, project, gh=gh)
+
+    def test_a_ruleset_required_check_is_read(self):
+        gh = FakeGh(protection={"required_status_checks": None}, rules=RULESET)
+        self.assertEqual(self._required(gh), (("tests", 15368),))
+        self.assertTrue(any("/rules/branches/main" in arg for call in gh.calls
+                            for arg in call))
+
+    def test_a_ruleset_without_an_integration_imposes_no_app(self):
+        rules = [{"type": "required_status_checks", "parameters": {
+            "required_status_checks": [{"context": "coverage"}]}}]
+        self.assertEqual(self._required(FakeGh(protection={"required_status_checks": None},
+                                               rules=rules)),
+                         (("coverage", None),))
+
+    def test_a_ruleset_integration_minus_one_means_any_application(self):
+        rules = [{"type": "required_status_checks", "parameters": {
+            "required_status_checks": [{"context": "tests", "integration_id": -1}]}}]
+        self.assertEqual(self._required(FakeGh(protection={"required_status_checks": None},
+                                               rules=rules)),
+                         (("tests", None),))
+
+    def test_the_rulesets_complete_the_classic_protection(self):
+        rules = [{"type": "required_status_checks", "parameters": {
+            "required_status_checks": [{"context": "coverage",
+                                        "integration_id": 42}]}}]
+        self.assertEqual(self._required(FakeGh(rules=rules)),
+                         (("tests", 15368), ("coverage", 42)))
+
+    def test_the_same_check_in_both_sources_is_not_duplicated(self):
+        self.assertEqual(self._required(FakeGh(rules=RULESET)), (("tests", 15368),))
+
+    def test_a_non_check_ruleset_is_ignored(self):
+        rules = [{"type": "pull_request", "parameters": {}}]
+        self.assertEqual(self._required(FakeGh(protection={"required_status_checks": None},
+                                               rules=rules)), ())
+
+    def test_a_ruleset_is_read_even_when_the_branch_is_not_protected(self):
+        gh = FakeGh(error="gh: Branch not protected (HTTP 404)", rules=RULESET)
+        self.assertEqual(self._required(gh), (("tests", 15368),))
+
+    def test_an_unreadable_ruleset_fails_closed_without_a_declaration(self):
+        gh = FakeGh(rules_error="gh: Resource not accessible by integration (HTTP 403)")
+        with self.assertRaises(land.LandError):
+            self._required(gh)
+
+    def test_a_declaration_covers_an_unreadable_ruleset_without_erasing_the_protection(self):
+        # #2285 : une source illisible n'efface pas l'autre ; la déclaration
+        # ne retire jamais un check que la forge exige encore.
+        gh = FakeGh(rules_error="gh: Resource not accessible by integration (HTTP 403)")
+        project = _project(required_checks=("coverage",))
+        self.assertEqual(self._required(gh, project=project),
+                         (("tests", 15368), ("coverage", None)))
+
+    def test_a_declaration_covers_an_unreadable_protection_without_erasing_the_rulesets(self):
+        gh = FakeGh(error="gh: Resource not accessible by integration (HTTP 403)",
+                    rules=RULESET)
+        project = _project(required_checks=("coverage",))
+        self.assertEqual(self._required(gh, project=project),
+                         (("tests", 15368), ("coverage", None)))
+
+    @unittest.skipUnless(TRANSIENT, "requires #2306 (TransientLandError)")
+    def test_a_transient_ruleset_read_is_not_replaced_by_the_declaration(self):
+        # #2306 x #2285 : le repli par source de #2285 ne vaut pas pour un
+        # échec passager ; la file réessaiera, la déclaration ne prouve pas
+        # les checks d'un ruleset qu'on n'a pas lu. Témoin de la résolution
+        # 659bd757, porté ici pour que le rejeu (qui ne transporte que
+        # fire.py) ne le perde pas.
+        gh = FakeGh(rules_error="gh: HTTP 502")
+        with self.assertRaises(TRANSIENT):
+            self._required(gh, project=_project(required_checks=("tests",)))
+
+    def test_a_malformed_ruleset_page_is_refused(self):
+        with self.assertRaises(land.LandError):
+            fire._ruleset_required("manaty/ameesh", "main",
+                                   gh=PagesGh([{"not": "a page"}]))
+
+    def test_a_malformed_ruleset_rule_is_refused(self):
+        for bad in ({"type": "required_status_checks"},
+                    [{"type": "required_status_checks", "parameters": []}],
+                    [{"type": "required_status_checks", "parameters": {}}],
+                    [{"type": "required_status_checks", "parameters": {
+                        "required_status_checks": [{"integration_id": 1}]}}],
+                    [{"type": "required_status_checks", "parameters": {
+                        "required_status_checks": [{"context": "tests",
+                                                    "integration_id": "15368"}]}}],
+                    "not-a-list"):
+            with self.subTest(bad=bad), self.assertRaises(land.LandError):
+                fire._ruleset_required("manaty/ameesh", "main",
+                                       gh=FakeGh(rules=bad))
+
+    def test_a_ruleset_app_is_enforced_on_the_frozen_head(self):
+        # Le ruleset impose l'application : un homonyme d'une autre
+        # application ne prouve pas le check (le rollup, lui, est vert).
+        gh = FakeGh(protection={"required_status_checks": None}, rules=RULESET,
+                    check_runs=[_run("tests", app_id=99999)])
+        ok, why = fire.ready_pr(_status([_check("tests")]), target="main", project=None,
+                                frozen=SHA, slug="manaty/ameesh", gh=gh)
+        self.assertFalse(ok)
+        self.assertIn("tests (app 99999, expected 15368)", why)
+
+    def test_a_ruleset_app_check_from_the_expected_app_is_ready(self):
+        gh = FakeGh(protection={"required_status_checks": None}, rules=RULESET,
+                    check_runs=[_run("tests", app_id=15368)])
+        ok, why = fire.ready_pr(_status([_check("tests")]), target="main", project=None,
+                                frozen=SHA, slug="manaty/ameesh", gh=gh)
+        self.assertTrue(ok, why)
+
+    def test_an_any_app_required_check_accepts_a_status_context(self):
+        gh = FakeGh(protection={"required_status_checks": {
+            "contexts": ["tests"],
+            "checks": [{"context": "tests", "app_id": -1}]}})
+        ok, why = fire.ready_pr(_status([_context("tests")]), target="main", project=None,
+                                frozen=SHA, slug="manaty/ameesh", gh=gh)
+        self.assertTrue(ok, why)
 
 
 class ReadyPrTest(unittest.TestCase):
@@ -489,6 +683,91 @@ class WiringTest(unittest.TestCase):
         self.assertEqual(result["result"], "not-ready")
         self.assertIn("tests (absent)", result["detail"])
         self.assertTrue(any("/protection" in call[1] for call in gh.calls))
+
+
+class NoSlurpGh:
+    """Le gh 2.45 de l'hôte (#2285) : `--slurp` inconnu, pages concaténées."""
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.calls = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        if "--slurp" in argv:
+            return types.SimpleNamespace(returncode=1, stdout="",
+                                         stderr="unknown flag: --slurp")
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout="".join(json.dumps(page) for page in self.pages),
+            stderr="")
+
+
+class ApiPagesTest(unittest.TestCase):
+    """#2285 : la lecture paginée ne dépend pas de `--slurp` (gh 2.45)."""
+
+    def test_the_read_falls_back_without_slurp(self):
+        gh = NoSlurpGh([{"check_runs": [_run("couverture")]},
+                        {"check_runs": [_run("tests")]}])
+        runs = fire._head_check_runs("manaty/ameesh", SHA, gh=gh)
+        self.assertEqual([run["name"] for run in runs], ["couverture", "tests"])
+        self.assertEqual(["--slurp" in call for call in gh.calls], [True, False])
+
+    def test_the_ruleset_read_falls_back_without_slurp(self):
+        gh = NoSlurpGh([RULESET])
+        self.assertEqual(fire._ruleset_required("manaty/ameesh", "main", gh=gh),
+                         (("tests", 15368),))
+        self.assertEqual(["--slurp" in call for call in gh.calls], [True, False])
+
+    def test_a_real_read_failure_is_not_hidden(self):
+        class Broken(NoSlurpGh):
+            def __call__(self, argv, **kwargs):
+                self.calls.append(list(argv))
+                return types.SimpleNamespace(returncode=1, stdout="",
+                                             stderr="gh: Not Found (HTTP 404)")
+        with self.assertRaises(land.LandError):
+            fire._head_check_runs("manaty/ameesh", SHA, gh=Broken([]))
+
+    @unittest.skipUnless(TRANSIENT, "requires #2306 (TransientLandError)")
+    def test_a_transient_failure_after_the_no_slurp_retry_is_retried(self):
+        # #2285 (gh 2.45) x #2306 : le second appel, sans --slurp, garde la
+        # classification passagère. Témoin de la résolution 659bd757, porté
+        # ici pour que le rejeu (qui ne transporte que fire.py) ne le perde
+        # pas.
+        class NoSlurpThenDown(NoSlurpGh):
+            def __call__(self, argv, **kwargs):
+                self.calls.append(list(argv))
+                if "--slurp" in argv:
+                    return types.SimpleNamespace(returncode=1, stdout="",
+                                                 stderr="unknown flag: --slurp")
+                return types.SimpleNamespace(returncode=1, stdout="",
+                                             stderr="gh: HTTP 502")
+
+        with self.assertRaises(TRANSIENT):
+            fire._head_check_runs("manaty/ameesh", SHA, gh=NoSlurpThenDown([]))
+
+
+class ReadClassificationTest(unittest.TestCase):
+    """#2344 : seul un 403 prouvé ouvre le repli sur la déclaration."""
+
+    def test_only_a_proven_403_is_forbidden(self):
+        for detail in ("gh: Resource not accessible by integration (HTTP 403)",
+                       "HTTP 403: Forbidden (https://api.github.com/repos/o/r)"):
+            self.assertTrue(fire._forbidden_read(detail), detail)
+        for detail in ("gh: Not Found (HTTP 404)", "",
+                       "http2: server sent GOAWAY and closed the connection"):
+            self.assertFalse(fire._forbidden_read(detail), detail)
+
+    def test_dns_goaway_and_empty_output_are_transient(self):
+        for detail in (
+                "dial tcp: lookup api.github.com on 127.0.0.53:53: server misbehaving",
+                "http2: server sent GOAWAY and closed the connection",
+                "", "   "):
+            self.assertTrue(fire._transient_read(detail), detail)
+
+    def test_a_404_is_not_transient(self):
+        self.assertFalse(fire._transient_read("gh: Not Found (HTTP 404)"))
+        self.assertFalse(fire._transient_read("gh: Branch not protected (HTTP 404)"))
 
 
 if __name__ == "__main__":

@@ -155,12 +155,14 @@ class TestAllersRetours(PgTestCase):
                    AMEESH_LEASE_EPOCH=str(lease["lease_epoch"]))
         trace = self._trace(self.cli, "hook", "claude", stdin=stdin, **env)
         self.assertIn("bonjour", trace["stdout"])
-        # première fois : + l'inscription de la session, + le solde de la remise
-        self._borne(trace, BORNES["hook"] + 2)
+        # première fois : + l'inscription de la session, + le solde de la remise,
+        # + les trois résolutions d'alias (#423 : registre, réservation, remise)
+        self._borne(trace, BORNES["hook"] + 2 + 3)
         trace = self._trace(self.cli, "hook", "claude", stdin=stdin, **env)
         self.assertEqual(trace["stdout"], "")
-        # l'inscription récente n'est pas refaite (REGISTER_EVERY_S)
-        self._borne(trace, BORNES["hook"])
+        # l'inscription récente n'est pas refaite (REGISTER_EVERY_S) ; les
+        # résolutions d'alias de la réservation et de la remise restent
+        self._borne(trace, BORNES["hook"] + 2)
         self.assertFalse(any(s.startswith("INSERT INTO agent_registry")
                              for s in trace["statements"]), trace["statements"])
         # un autre dossier : réinscrit tout de suite ; la session du hook,
