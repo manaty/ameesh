@@ -188,7 +188,7 @@ class InventoryTest(unittest.TestCase):
         }
         self.families = {"author": "deepseek", "reviewer": "claude"}
 
-    def inventory(self, **kwargs):
+    def inventory(self, *, family=None, **kwargs):
         def fake_class(db, lot, **rest):
             return {"lot": lot, "class": self.classes[lot], "doubt": False,
                     "why": "test", "files": self.files.get(
@@ -199,7 +199,8 @@ class InventoryTest(unittest.TestCase):
 
         with mock.patch.object(storage, "of", return_value=self.store), \
                 mock.patch.object(lot_class, "of_lot", side_effect=fake_class), \
-                mock.patch.object(merge_queue, "actor_family", side_effect=fake_family):
+                mock.patch.object(merge_queue, "actor_family",
+                                  side_effect=family or fake_family):
             return packet_candidates.inventory(
                 object(), SimpleNamespace(name="ameesh", target="main"),
                 repo=self.repo, clone=self.clone, target="main", cfg=None, **kwargs)
@@ -235,6 +236,25 @@ class InventoryTest(unittest.TestCase):
         self.assertFalse(entry["ready"])
         self.assertIn("verdicts-missing", [cause["code"] for cause in entry["causes"]])
         self.assertGreaterEqual(entry["gate"]["required"], 2)
+
+    def test_unreadable_registry_is_an_error_not_a_verdicts_missing_wait(self):
+        # #2521 : une lecture du registre impossible ne doit pas se lire
+        # « verdicts-missing » (le lot serait écarté du paquet comme sans avis).
+        def unreadable(db, name):
+            raise merge_queue.RegistryReadError(
+                'cannot read the agent registry for %s: column "aliases" does not exist'
+                % name)
+
+        payload = self.inventory(family=unreadable)
+        entry = self.by_id(payload)[1]
+        self.assertFalse(entry["ready"])
+        self.assertIn("aliases", entry["error"])
+        self.assertNotIn("verdicts-missing",
+                         [cause["code"] for cause in entry["causes"]])
+        self.assertIn(1, [e["work_item"] for e in payload["candidates"] if e["error"]])
+        self.assertTrue(any("aliases" in error for error in payload["errors"]))
+        self.assertNotIn(1, payload["waiting"])
+        self.assertNotIn(1, payload["ready"])
 
     def test_conflict_with_target_is_named(self):
         entry = self.by_id(self.inventory())[4]
@@ -325,6 +345,36 @@ class ReadyOutTest(unittest.TestCase):
             )
         self.assertEqual(code, 2)
         self.assertFalse(self.path.exists())
+
+    def test_script_exits_1_and_clears_ready_out_on_a_read_error(self):
+        # #2521 : une lecture du registre impossible rend la liste incomplète :
+        # code 1 et aucun export, comme une porte illisible.
+        self.path.write_text("#100\n", encoding="utf-8")
+        payload = {
+            "schema": "ameesh-packet-candidates/1", "project": "ameesh",
+            "repo": self.tmp, "clone": self.tmp, "target": "main",
+            "target_head": "a" * 40, "base": "a" * 40, "base_source": "target",
+            "candidates": [], "ready": [], "waiting": [],
+            "errors": ["#1 : cannot read the review gate: registry unreadable"],
+        }
+        project = SimpleNamespace(name="ameesh", target="main")
+        conn = mock.Mock()
+        with mock.patch.object(candidates_script.config, "load",
+                               return_value=object()), \
+                mock.patch.object(candidates_script, "resolve_project",
+                                  return_value=(project, True)), \
+                mock.patch.object(candidates_script.db, "connect", return_value=conn), \
+                mock.patch.object(candidates_script.merge_queue, "working_clone",
+                                  return_value=(self.tmp, None)), \
+                mock.patch.object(candidates_script.packet_candidates, "inventory",
+                                  return_value=payload):
+            code = candidates_script.main(
+                ["--repo", self.tmp, "--project", "ameesh", "--target", "main",
+                 "--ready-out", str(self.path)]
+            )
+        self.assertEqual(code, 1)
+        self.assertFalse(self.path.exists())
+        conn.close.assert_called_once()
 
 
 if __name__ == "__main__":

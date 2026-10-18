@@ -299,6 +299,11 @@ def _candidate(db, row: dict, *, target_branch: str, tips: dict, where: str,
             gate = merge_queue.review_gate(db, marks, frozen, repo=where,
                                            klass=klass, item=row)
             entry["gate"] = gate
+            if gate.get("error"):
+                # #2521 : une lecture impossible n'est pas un verdict manquant ;
+                # la liste est incomplète et ne doit pas servir de base.
+                entry["error"] = "cannot read the review gate: %s" % gate["error"]
+                return entry
             if not gate.get("ok"):
                 entry["causes"].append(_cause(
                     "verdicts-missing", gate.get("why") or "required verdicts missing"))
