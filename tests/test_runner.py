@@ -16,7 +16,7 @@ from ameesh import adapters, db as db_mod, mail, registry
 from ameesh import platform as os_layer
 from ameesh.runner import AgentWorker, Runner, _AsyncLog
 
-from .support import PgTestCase
+from .support import FAKEBIN, PgTestCase
 
 HARNESSES = {
     "claude": {"session": "claude-sess-1", "reprise": ["--resume", "claude-sess-1"]},
@@ -200,6 +200,40 @@ class RunnerTest(PgTestCase):
         with mock.patch.object(registry, "renew", side_effect=db_mod.DbError("base absente")):
             self.assertFalse(worker.renew())
         self.assertTrue(worker.lease_lost.is_set())
+
+    def test_le_battement_couvre_la_preparation_du_tour(self):
+        """#2544 : le battement de bail couvre la préparation du tour.
+
+        Run 39158768160 (psql 6/16) : sous charge, la préparation d'un tour
+        dépassait le bail de 3 s avant que le battement ne démarre ; le veilleur
+        tuait le worker avant le `Popen` et le tour ne démarrait jamais. Le bail
+        protège le tour entier : son renouvellement doit commencer avec la
+        préparation, pas une fois le harnais publié.
+        """
+        cwd = self._cwd("lent")
+        self.register("lent", "claude", cwd=cwd, prompt="tour préparé lentement")
+        runner = Runner(self.cfg, self.db, once=True)
+        runner.lease_ttl = 3.0
+        lease = registry.claim(self.db, "lent", runner.runner_id, 3.0)
+        self.assertIsNotNone(lease)
+        worker = AgentWorker(runner, registry.get(self.db, "lent"), lease)
+        self.addCleanup(worker.watchdog_stop.set)
+        worker.ensure_watchdog()
+        ouverture = AgentWorker._ouverture
+
+        def lente(self_):
+            time.sleep(5.0)  # plus long que le bail : la préparation doit le couvrir
+            return ouverture(self_)
+
+        with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN,
+                                          "AMEESH_TEST_LOG": self.turns_log}), \
+                mock.patch.object(AgentWorker, "_ouverture", lente):
+            ok = worker.run_turn({"kind": "prompt", "prompt": "consigne", "ids": []})
+        self.assertTrue(ok, "le tour n'a pas démarré : le bail n'a pas survécu "
+                            "à la préparation")
+        self.assertFalse(worker.lease_lost.is_set(),
+                         "le veilleur a tué le worker pendant la préparation du tour")
+        self.assertEqual(len(self.turns()), 1, "le harnais n'a pas été lancé")
 
     def test_dossier_absent_marque_bloque(self):
         self.register("sansdossier", "claude", cwd=os.path.join(self.tmp, "jamais-cree"),
@@ -805,7 +839,15 @@ class RunnerTest(PgTestCase):
         renew2.assert_called_once()
 
     def test_branche_bail_perdu_ne_perd_pas_la_consigne(self):
-        """Sonde codex3 (2) : la clôture d'un tour au bail perdu restaure la consigne."""
+        """Sonde codex3 (2) : la clôture d'un tour au bail perdu restaure la consigne.
+
+        #2537 : en service, l'exécuteur reprend l'agent dès la passe suivante
+        (reprise voulue, R5) et consomme la consigne restaurée ; un témoin qui
+        échantillonne `pending_prompt` ne voit qu'un état transitoire et peut
+        le rater sous charge CI. Le témoin fait donc UN seul tour (`--once`) :
+        aucune reprise ne consomme la consigne, et l'état final se lit, stable,
+        après la sortie de l'exécuteur.
+        """
         cwd = self._cwd("perdu")
         self.register("perdu", "claude", cwd=cwd, prompt="consigne du tour perdu")
         # Le témoin mesure la clôture au bail perdu, pas la porte d'hôte réelle
@@ -819,7 +861,7 @@ class RunnerTest(PgTestCase):
                        AMEESH_HOST_GATE="file", AMEESH_HOST_GATE_PATH=gate_state,
                        AMEESH_HOST_GATE_ACK=os.path.join(self.tmp, "gate-ack", "ack.json"),
                        AMEESH_HOST_GATE_FALLBACK="available")
-        proc = self.runner_popen("--agents", "perdu", "--lease-ttl", "3", "--poll", "2", env=env)
+        proc = self.runner_popen("--once", "--agents", "perdu", "--lease-ttl", "3", env=env)
         # Le tuyau est lu en continu : un tampon plein ne bloque plus
         # l'exécuteur, et le témoin peut nommer sa sortie au refus.
         sortie_lignes: list[str] = []
@@ -844,11 +886,13 @@ class RunnerTest(PgTestCase):
             self.db.execute(
                 "UPDATE agent_registry SET lease_expires_at = now() - interval '1 second' "
                 "WHERE name = 'perdu'")
-            # Le harnais dort 120 s : un arrêt manqué à la perte du bail échoue
-            # donc encore dans cette borne. Sous charge CI, l'ordonnancement
-            # peut retarder le battement : 90 s, et la sortie nomme la cause.
-            self.wait_for(
-                lambda: registry.get(self.db, "perdu")["pending_prompt"] is not None, timeout=90)
+            # Le harnais dort 120 s : un arrêt manqué à la perte du bail laisse
+            # l'exécuteur vivant au-delà de cette borne. `--once` sort juste
+            # après le tour : sa sortie est le repère stable (rien ne vient
+            # reprendre la consigne restaurée). Sous charge CI, le battement
+            # peut tarder : 90 s, et la sortie nomme la cause.
+            self.wait_for(lambda: proc.poll() is not None, timeout=90)
+            proc.wait(timeout=10)
         except AssertionError as exc:
             arreter()
             self.fail("%s\nsortie de l'exécuteur :\n%s"
@@ -859,6 +903,9 @@ class RunnerTest(PgTestCase):
         # pas de mort par signal à l'arrêt (SIGABRT du fil `journal`, 2026-10-05)
         self.assertGreaterEqual(proc.returncode, 0, "code %r\n%s" % (proc.returncode, sortie))
         self.assertNotIn("exiting immediately", sortie)
+        # la perte de bail est nommée (toute issue admise par #2497)
+        self.assertTrue(any(m in sortie for m in ARRETS_DE_BAIL),
+                        "perte de bail non nommée :\n%s" % sortie)
         row = registry.get(self.db, "perdu")
         self.assertEqual(row["pending_prompt"], "consigne du tour perdu")
         self.assertIsNone(row["current_prompt"])

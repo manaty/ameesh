@@ -85,9 +85,12 @@ def render(payload: dict) -> str:
         for lot in payload["ready"]:
             entry = by_id[lot]
             klass = (entry.get("review_class") or {}).get("class") or "?"
-            lines.append("  #%-5d %s  %-14s %-9s %s"
-                         % (lot, entry["published_head"][:12],
-                            entry.get("assignee") or "-", klass, entry["branch"]))
+            remise = entry.get("remise") or {}
+            lines.append("  #%-5d %s  %-14s %-9s %s%s"
+                         % (lot, (entry.get("source") or entry["published_head"])[:12],
+                            entry.get("assignee") or "-", klass, entry["branch"],
+                            "  (remise %s, %s)" % (remise["ref"], remise["cover"])
+                            if remise else ""))
     if payload["waiting"]:
         lines += ["", "EN ATTENTE (motif calculé)"]
         for lot in payload["waiting"]:

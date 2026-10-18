@@ -260,16 +260,15 @@ _DELEGATION_COLUMNS = """
 """
 
 
-#: #1693 (N4) : un jalon `merged` n'est effectif que si aucune correction
-#: `merged → build` ne l'a annulé — une correction au moins aussi récente que
-#: le jalon. Les jalons annulés RESTENT dans la table (aucune reprise
-#: destructive) ; la lecture calcule le jalon effectif depuis le journal.
+#: #1693 (N4)/#2317 (N2) : un jalon `merged` n'est effectif que si aucune
+#: correction `merged → build` ne l'a annulé — une correction au moins aussi
+#: récente que le jalon. Les jalons annulés RESTENT dans la table (aucune
+#: reprise destructive) ; la lecture calcule le jalon effectif depuis le
+#: journal. La correction se reconnaît à la TRANSITION du journal (fonction
+#: 0463), jamais au texte libre de sa note.
 def _effective_merged(alias: str) -> str:
-    return ("NOT EXISTS (SELECT 1 FROM work_item_events c"
-            " WHERE c.work_item_id = %s.work_item_id"
-            "   AND c.state = 'build'"
-            "   AND starts_with(c.note, 'correction: merged → build')"
-            "   AND c.created_at >= %s.at)" % (alias, alias))
+    return ("NOT agent_mesh_merged_annulled(%s.work_item_id, %s.at)"
+            % (alias, alias))
 
 
 #: Les délais d'un lot, dérivés de ses jalons (L10, R19). Forme **stable** :
@@ -1425,11 +1424,46 @@ class WorkItems(interface.WorkItems):
             tuple(params),
         )
 
+    def corrections(self, ids=None) -> dict[int, float]:
+        """#2317 (N2/N4) : instant de la dernière correction `merged → build`
+        par lot, `{}` sans correction.
+
+        Une correction se reconnaît à la TRANSITION du journal — l'événement
+        `build` dont l'état précédent du lot est `merged` —, jamais au texte
+        de sa note (une note libre du même préfixe n'annule rien). `ids`
+        borne la lecture aux lots candidats (index `work_item_events_item_idx`)
+        au lieu de relire tout le journal à chaque relevé."""
+        params: list = []
+        borne = ""
+        if ids is not None:
+            ids = sorted({int(item_id) for item_id in ids})
+            if not ids:
+                return {}
+            borne = " AND c.work_item_id IN (%s)" % ", ".join(["%s"] * len(ids))
+            params.extend(ids)
+        rows = self.db.query(
+            """
+            SELECT c.work_item_id,
+                   max(extract(epoch from c.created_at))::float8 as created_ts
+              FROM work_item_events c
+              JOIN LATERAL (SELECT p.state FROM work_item_events p
+                             WHERE p.work_item_id = c.work_item_id AND p.id < c.id
+                             ORDER BY p.id DESC LIMIT 1) prev ON true
+             WHERE c.state = 'build' AND prev.state = 'merged'
+            """ + borne + """
+             GROUP BY c.work_item_id
+            """,
+            tuple(params),
+        )
+        return {int(row["work_item_id"]): float(row["created_ts"]) for row in rows}
+
     def milestones(self, item_id, limit) -> list[dict]:
         return self.db.query(
             """
             SELECT id, work_item_id, kind, sha, actor, verdict, note,
-                   extract(epoch from at)::float8 as at_ts, at
+                   extract(epoch from at)::float8 as at_ts, at,
+                   (kind = 'merged'
+                    AND agent_mesh_merged_annulled(work_item_id, at)) AS annulled
               FROM work_item_milestones
              WHERE work_item_id = %s
              ORDER BY at DESC, id DESC LIMIT %s
@@ -2756,7 +2790,12 @@ class WorkItems(interface.WorkItems):
             "                               OR w.estimate_minutes IS NOT NULL)) AS late,"
             "       coalesce(n.n, 0)::int AS revisions"
             "  FROM work_items w"
-            "  JOIN LATERAL (SELECT max(m.at) AS at FROM work_item_milestones m"
+            # #2317 (N6) : la fin reste la PREMIÈRE livraison — la fusion,
+            # sinon la livraison hors cible —, mais on ignore les jalons
+            # `merged` annulés par une correction. Le max de #1693 faisait
+            # glisser la fin d'un lot historique au jalon `delivered` le plus
+            # récent et faussait la table de référence.
+            "  JOIN LATERAL (SELECT min(m.at) AS at FROM work_item_milestones m"
             "                 WHERE m.work_item_id = w.id"
             "                   AND m.kind IN ('merged', 'delivered')"
             "                   AND (m.kind <> 'merged' OR "

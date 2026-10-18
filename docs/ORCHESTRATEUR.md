@@ -434,7 +434,7 @@ Un lot prêt entre dans la file de sa cible, au lieu d'un « feu de fusion »
 donné à la main :
 
 ```
-ameesh work milestone <id> frozen --sha <commit>               le gel
+ameesh work milestone <id> frozen --sha <commit>               le gel (contrôles statiques d'abord, #2542)
 ameesh work milestone <id> verdict --verdict ok --sha <commit>  le GO de revue, sur ce commit
 ameesh work queue add <id>                                      dans la file
 ```

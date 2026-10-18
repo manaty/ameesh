@@ -61,13 +61,29 @@ transaction : gel et verdicts y sont relus, et un gel ou un verdict concurrent
 passe entièrement avant ou après.
 Une issue définitive (reporté ou non) est journalisée une fois par
 couple (tête relue, tête gelée) ; le passage suivant ne la recalcule pas.
+
+**Désignation au gel (#2487)** — la désignation automatique (#2447) tourne
+dans la transaction du gel, donc **avant** le report. Quand le report couvre la
+tête, elle s'abstient : `would_carry` donne le plan du report avant le gel,
+`work.milestone` le passe au hook, qui garde les relecteurs reportés dans la
+colonne `work_items.reviewers` et n'envoie aucun courrier. Les sièges du gel
+précédent qui n'ont pas encore voté restent désignés : le report ne reporte que
+des verdicts, pas une attente (B/P1 de dev1). Par gel, **la dernière marque du
+journal fait foi** (`review-designation:` pour une sélection,
+`review-designation-carried:` pour un report) : un report tardif qui aboutit
+retire la sélection qu'il supplante, une désignation de repli (`force`) plus
+récente reprend la main, et un report après elle réécrit sa marque. Les marques
+reportées sont des désignations automatiques pour `_previous_reviewers` : un
+vrai gel ultérieur les remplace.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import tempfile
+from typing import Mapping, Optional
 
 from . import merge_queue, plan_git, storage, work
 
@@ -75,10 +91,77 @@ from . import merge_queue, plan_git, storage, work
 CARRIED = "verdict carried: alignment"
 #: préfixe de la ligne de journal d'un réalignement qui n'en est pas un
 NOT_CARRIED = "verdict not carried:"
+#: préfixe de la marque de désignation gardée par un report : la désignation
+#: au gel s'abstient et laisse la colonne `reviewers` aux relecteurs reportés
+CARRIED_MARK_PREFIX = "review-designation-carried:"
 #: résultats qu'un passage de l'exécuteur dit dans son journal
 LOUD = ("carried", "not-carried", "error")
 #: lots examinés par passage
 MAX_LOTS = 1000
+
+
+def carried_mark_prefix(lot: int) -> str:
+    """Le préfixe des marques reportées d'un lot (le gel filtre ensuite)."""
+    return "%s%d:" % (CARRIED_MARK_PREFIX, int(lot))
+
+
+def carried_mark_note(lot: int, freeze: Mapping, plan: Mapping,
+                      extra_reviewers=()) -> str:
+    """La marque du gel dont les relecteurs sont gardés par un report.
+
+    Elle a la forme des marques de désignation (lot + gel dans le préfixe, JSON
+    après) pour que `_previous_reviewers` la lise comme une désignation
+    automatique : un vrai gel ultérieur retire ces noms de la colonne.
+
+    `extra_reviewers` (#2487, B/P1 de dev1) : les sièges du gel précédent qui
+    n'ont pas encore voté restent désignés par le gel réaligné ; le report ne
+    reporte que des verdicts, pas une attente.
+    """
+    freeze = dict(freeze or {})
+    plan = dict(plan or {})
+    reviewers = []
+    for entry in plan.get("carried") or ():
+        name = str((entry or {}).get("actor") or "").strip()
+        if name and name not in [r["name"] for r in reviewers]:
+            reviewers.append({"name": name, "family": ""})
+    for entry in extra_reviewers or ():
+        name = str((entry or {}).get("name") or "").strip()
+        if name and name not in [r["name"] for r in reviewers]:
+            reviewers.append({"name": name,
+                              "family": str((entry or {}).get("family") or "")})
+    payload = {
+        "state": "carried",
+        "reviewers": reviewers,
+        "freeze": {"id": int(freeze.get("id") or 0),
+                   "sha": _norm(freeze.get("sha"))},
+        "carried": [dict(entry or {}) for entry in plan.get("carried") or ()],
+        "why": str(plan.get("detail") or ""),
+    }
+    return "%s%d:%d: %s" % (CARRIED_MARK_PREFIX, int(lot),
+                            int(payload["freeze"]["id"]),
+                            json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def carried_mark_of(note: str) -> Optional[dict]:
+    """La marque reportée portée par une ligne de journal, ou None.
+
+    Une marque illisible n'est jamais interprétée : None, la colonne et la
+    reprise restent à la désignation normale.
+    """
+    text = str(note or "")
+    if not text.startswith(CARRIED_MARK_PREFIX):
+        return None
+    _, separator, payload = text.partition(": ")
+    if not separator:
+        return None
+    try:
+        found = json.loads(payload)
+    except ValueError:
+        return None
+    if (not isinstance(found, dict) or found.get("state") != "carried"
+            or not isinstance(found.get("freeze"), dict)):
+        return None
+    return found
 
 
 def _norm(sha) -> str:
@@ -378,6 +461,33 @@ def _passive(db, to, lot: int, text: str, data: dict) -> None:
         pass
 
 
+def would_carry(cfg, db, lot: int, frozen_sha: str, *, repo: str | None = None,
+                clone=None, notes=None, fetched: dict | None = None) -> dict:
+    """Lecture seule : `carry` copierait-il des verdicts sur `frozen_sha` ?
+
+    Le gel n'a pas besoin d'exister encore : `frozen_sha` est la tête qu'on
+    s'apprête à geler. Sert à la désignation au gel (#2487) pour s'abstenir
+    quand le report couvre la tête — aucun nouveau relecteur, aucun courrier.
+    Même critère et mêmes lectures que `carry` (`realigned`), sans écriture ni
+    bail. Rend la forme de `carry`, `result` : `would-carry`, `not-carried`,
+    `idle`, `no-repository`, `error`. Ne lève jamais.
+    """
+    lot = int(lot)
+    out: dict = {"lot": lot, "result": "idle", "frozen": "", "target": "", "tip": "",
+                 "carried": [], "refused": [], "detail": ""}
+    try:
+        out, plan, refused, _where = _plan_for(
+            cfg, db, lot, out, _norm(frozen_sha), repo=repo, clone=clone,
+            notes=notes, fetched={} if fetched is None else fetched)
+    except Exception as exc:  # noqa: BLE001 - la désignation garde son cours
+        out.update(result="error", detail="%s: %s" % (type(exc).__name__, str(exc)[:300]))
+        return out
+    if out["result"] in ("no-repository", "error"):
+        return out
+    out["result"] = "would-carry" if plan else "not-carried" if refused else "idle"
+    return out
+
+
 def carry(cfg, db, lot: int, *, repo: str | None = None, clone=None,
           dry_run: bool = False, lock: bool = True, notes=None,
           fetched: dict | None = None) -> dict:
@@ -407,36 +517,74 @@ def carry(cfg, db, lot: int, *, repo: str | None = None, clone=None,
 
 def _carry(cfg, db, lot: int, out: dict, *, repo, clone, dry_run: bool, lock: bool,
            notes, fetched: dict) -> dict:
-    from . import fire, lot_class
+    from . import fire
     row = work.get(db, lot)
     if row is None or row.get("state") in tuple(work.MERGED_STATES) + ("closed",):
         out["detail"] = "lot not open"
         return out
-    marks = work.milestones(db, lot)
-    freeze = plan_git.latest_freeze(marks)
+    freeze = plan_git.latest_freeze(work.milestones(db, lot))
     declared = _norm((freeze or {}).get("sha"))
     if not declared:
         out["detail"] = "not frozen"
         return out
+    out, plan, refused, where = _plan_for(
+        cfg, db, lot, out, declared, repo=repo, clone=clone, notes=notes,
+        fetched=fetched)
+    if out["result"] in ("no-repository", "error"):
+        return out
+    if not plan and not refused:
+        out["result"] = "idle"
+        return out
+    if dry_run:
+        out["result"] = "would-carry" if plan else "not-carried"
+        return out
+    handle = fire._lock(db, lot) if lock else None
+    if lock and handle is None:
+        out.update(result="busy", detail="another host holds the lease of lot #%d" % lot)
+        return out
+    try:
+        return _write(db, lot, out, declared, plan, refused, where)
+    finally:
+        if handle is not None:
+            fire._unlock(handle)
+
+
+def _plan_for(cfg, db, lot: int, out: dict, declared: str, *, repo, clone, notes,
+              fetched: dict) -> tuple:
+    """Le plan du report pour `declared` : `(out, plan, refused, where)`.
+
+    Lecture seule, partagée par `carry` (écrit) et `would_carry` (désignation au
+    gel, avant même que le jalon `frozen` existe). `out["result"]` ne porte que
+    les refus terminaux (`no-repository`, `error`) ; l'appelant décide
+    `idle`/`would-carry`/`not-carried`."""
+    from . import lot_class
+    row = work.get(db, lot)
+    if row is None or row.get("state") in tuple(work.MERGED_STATES) + ("closed",):
+        out["detail"] = "lot not open"
+        return out, [], [], ""
+    if not declared:
+        out["detail"] = "not frozen"
+        return out, [], [], ""
     out["frozen"] = declared
+    marks = work.milestones(db, lot)
     candidates = pending(marks, declared)
     if not candidates:
         out["detail"] = "no verdict to carry"
-        return out
+        return out, [], [], ""
     if notes is None:
         notes = _outcomes(db, [lot])[lot]
     if all(_decided(notes, m.get("sha"), declared) for m in candidates.values()):
         out["detail"] = "already decided for this freeze"
-        return out
+        return out, [], [], ""
     repo = repo or lot_class.repository(cfg, row)
     if not repo:
         out.update(result="no-repository", detail="no repository known for the lot on this "
                    "host: the executor's branch sweep retries")
-        return out
+        return out, [], [], ""
     target = lot_class.default_base(cfg, row, repo)
     if not target:
         out.update(result="error", detail="no target branch known for the lot")
-        return out
+        return out, [], [], ""
     out["target"] = merge_queue._remote_branch(target)
     clone = clone or _clone(cfg, row, repo)
     key = (repo, out["target"])
@@ -446,7 +594,7 @@ def _carry(cfg, db, lot: int, out: dict, *, repo, clone, dry_run: bool, lock: bo
     tip, where = fetched[key]
     if not tip:
         out.update(result="error", detail="target %s not found on origin" % out["target"])
-        return out
+        return out, [], [], ""
     out["tip"] = tip
     if merge_queue.pinned(where, declared) is None and row.get("branch"):
         merge_queue.fetch_fresh(repo, [row["branch"]], clone)   # objets de la tête gelée
@@ -454,7 +602,7 @@ def _carry(cfg, db, lot: int, out: dict, *, repo, clone, dry_run: bool, lock: bo
     if not frozen:
         out.update(result="error", detail="the freeze %s is not a commit of %s"
                    % (declared[:12], where))
-        return out
+        return out, [], [], ""
     out["frozen"] = frozen
     verdicts: dict = {}          # tête relue complète -> (oui, raison)
     plan: list = []              # (relecteur, verdict reporté)
@@ -477,24 +625,10 @@ def _carry(cfg, db, lot: int, out: dict, *, repo, clone, dry_run: bool, lock: bo
     if not plan and not refused:
         if not out["detail"]:
             out["detail"] = "nothing decidable"
-        return out
-    if dry_run:
-        out.update(result="would-carry" if plan else "not-carried",
-                   carried=[_entry(m, r) for m, r in plan],
-                   refused=[{"reviewed": r, "why": w} for r, w in refused])
-        return out
-    # N3 qa-01 #2486 : le bail ne couvre que l'écriture. Les preuves ci-dessus
-    # sont des lectures (clone du radar, objets jetables) et peuvent se
-    # chevaucher entre passages ; la transaction de `_write` sérialise la copie.
-    handle = fire._lock(db, lot) if lock else None
-    if lock and handle is None:
-        out.update(result="busy", detail="another host holds the lease of lot #%d" % lot)
-        return out
-    try:
-        return _write(db, lot, out, declared, plan, refused, where)
-    finally:
-        if handle is not None:
-            fire._unlock(handle)
+        return out, [], [], where
+    out["carried"] = [_entry(m, r) for m, r in plan]
+    out["refused"] = [{"reviewed": r, "why": w} for r, w in refused]
+    return out, plan, refused, where
 
 
 def _entry(mark: dict, reviewed: str) -> dict:
@@ -522,7 +656,13 @@ def _write(db, lot: int, out: dict, declared: str, plan: list, refused: list,
     sont relus, un gel plus récent annule tout (`moved`), et un relecteur dont
     le dernier verdict a changé entre-temps garde le sien. Un gel ou un verdict
     concurrent attend le COMMIT, ou est vu s'il l'a précédé. Les lignes de
-    journal et les mots suivent le COMMIT."""
+    journal et les mots suivent le COMMIT.
+
+    Quand le report couvre la tête (aucun refus), la colonne `reviewers` est
+    gardée sur les relecteurs reportés et la marque `review-designation-carried`
+    est écrite dans la même transaction (#2487) : la désignation au gel s'est
+    abstenue, et un relevé d'exécuteur tardif ne laisse pas une autre
+    désignation fermer la porte."""
     from . import train_events
     frozen, tip, target = out["frozen"], out["tip"], out["target"]
     carried = []
@@ -550,6 +690,8 @@ def _write(db, lot: int, out: dict, declared: str, plan: list, refused: list,
                                   target=merge_queue._remote_branch(row.get("branch_target") or ""))
             except ValueError:
                 pass                  # lot sans sujet de train : le jalon reste valide
+        if carried and not refused:
+            _keep_reviewers(tx, lot, row, freeze, plan, out)
     st = storage.of(db).work
     state = row.get("state") or ""
     by_head: dict = {}
@@ -580,6 +722,62 @@ def _write(db, lot: int, out: dict, declared: str, plan: list, refused: list,
     return out
 
 
+def _keep_reviewers(tx, lot: int, row: dict, freeze: dict, plan: list, out: dict) -> None:
+    """Garde les relecteurs reportés dans la colonne lue par la porte.
+
+    La désignation au gel s'abstient déjà quand le plan est connu avant le gel
+    (#2487) ; ce chemin couvre le report tardif (relevé de l'exécuteur, ou gel
+    fait par un autre appelant) : sans lui, une désignation du nouveau gel
+    resterait dans la colonne et `progress` attendrait un verdict qui n'a pas
+    lieu d'être.
+
+    La marque porte aussi les **sièges du gel précédent sans verdict** (B/P1 de
+    dev1) : le report ne reporte que des verdicts, pas une attente. Le hook les
+    filtre sur la colonne d'avant le gel ; ici, la sélection du nouveau gel a
+    déjà pu retirer ces noms, donc on les reprend de la marque effective du gel
+    précédent (un siège retiré à la main n'est pas distinguable — la marque est
+    la source automatique). Une marque `review-designation-carried` est écrite
+    quand la dernière marque du gel n'est pas un report qui porte déjà ces noms
+    (report après une désignation `force`, ou report tardif qui complète des
+    sièges) : elle devient l'effective et la colonne la suit. La marque rend la
+    reprise et la lecture (`ameesh work reviewers`) idempotentes."""
+    from . import review_designation_activation as activation
+    freeze_id = int(freeze.get("id") or 0)
+    names = []
+    for mark, _reviewed in plan:
+        name = str(mark.get("actor") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    if not names:
+        return
+    payload = {"state": "carried", "carried": out.get("carried") or []}
+    extra = activation._previous_designees(tx, int(lot), freeze_id)
+    note = carried_mark_note(int(lot), freeze, payload, extra_reviewers=extra)
+    wanted = carried_mark_of(note) or {}
+    wanted_names = [str((reviewer or {}).get("name") or "").strip()
+                    for reviewer in wanted.get("reviewers") or ()]
+    wanted_names = [name for name in wanted_names if name]
+    effective = activation._effective_mark(
+        tx, int(lot), freeze_id, since_ts=float(freeze.get("at_ts") or 0.0))
+    current_names = []
+    if effective is not None and effective[1] == "carried":
+        current_names = [str((reviewer or {}).get("name") or "").strip()
+                         for reviewer in (effective[2].get("reviewers") or ())]
+        current_names = [name for name in current_names if name]
+    if effective is None or effective[1] != "carried" or current_names != wanted_names:
+        # #2487 : un report tardif qui aboutit après une vraie désignation
+        # (repli `force`) écrit une marque plus récente ; la colonne et la
+        # lecture suivent alors le report, pas la sélection supplantée. Les
+        # sièges du gel précédent sans verdict restent désignés, comme au gel ;
+        # la colonne a déjà suivi la sélection, elle ne filtre donc pas.
+        storage.of(tx).work.note(int(lot), str(row.get("state") or ""), note,
+                                 work.SYSTEM_SENDER)
+    activation._sync_reviewers(
+        tx, dict(row), freeze, wanted_names,
+        text="reviewers kept from carried verdicts at freeze #%d: %s (#2442/#2487)"
+             % (freeze_id, ", ".join(wanted_names)))
+
+
 def describe(result: dict) -> str:
     """Une ligne lisible du résultat de `carry` (CLI, journal de l'exécuteur)."""
     kind = result.get("result")
@@ -592,6 +790,39 @@ def describe(result: dict) -> str:
         return "verdicts not carried: %s" % "; ".join(
             "%s: %s" % (e["reviewed"][:12], e["why"]) for e in result.get("refused") or ())
     return "verdicts not carried (%s): %s" % (kind, result.get("detail") or "")
+
+
+def _carried_pending(db, lot: int, freeze: dict) -> bool:
+    """Un report planifié au gel n'a pas eu lieu : faut-il désigner ?
+
+    La désignation au gel s'est abstenue sur le plan du report (#2487) et a
+    laissé la marque `review-designation-carried` ; si le report refuse ensuite
+    (cible déplacée, dépôt absent), personne n'est désigné. Vrai quand cette
+    marque est **effective** (la dernière du gel, aucune sélection réelle ne la
+    remplace), que ses verdicts ne sont pas déjà sur la tête gelée, et qu'aucun
+    échec de désignation n'a déjà été constaté pour ce gel (sinon la passe
+    suivante répéterait la même lecture sans rien changer)."""
+    from . import review_designation_activation as activation
+    lot = int(lot)
+    freeze_id = int(freeze.get("id") or 0)
+    try:
+        effective = activation._effective_mark(
+            db, lot, freeze_id, since_ts=float(freeze.get("at_ts") or 0.0))
+        if effective is None or effective[1] != "carried":
+            return False
+        carried = effective[2].get("carried") or ()
+        if carried:
+            on_head = {_key(mark.get("actor")) for mark in work.milestones(db, lot, None)
+                       if mark.get("kind") == "verdict"
+                       and _same(mark.get("sha"), freeze.get("sha"))}
+            if all(_key(entry.get("actor")) in on_head for entry in carried):
+                return False
+        prefix = "%s%d:%d:" % (activation.UNAVAILABLE_PREFIX, lot, freeze_id)
+        if storage.of(db).work.events_noted(prefix, 0.0, ids=[lot]):
+            return False
+        return True
+    except Exception:  # noqa: BLE001 - lecture impossible : rien à réparer
+        return False
 
 
 def run_pass(cfg, db, *, dry_run: bool = False, limit: int = MAX_LOTS) -> list[dict]:
@@ -622,4 +853,19 @@ def run_pass(cfg, db, *, dry_run: bool = False, limit: int = MAX_LOTS) -> list[d
         result = carry(cfg, db, lot, dry_run=dry_run, notes=notes.get(lot), fetched=fetched)
         if result.get("result") != "idle":
             out.append(result)
+        if dry_run or result.get("result") not in ("not-carried", "error",
+                                                   "no-repository", "idle"):
+            continue
+        # #2487 : le gel s'est abstenu sur un plan de report qui n'a pas abouti.
+        # Personne n'est désigné ; on rejoue la désignation réelle du gel, une
+        # fois, sans toucher au reste. Le gel n'est pas re-déclaré.
+        freeze = plan_git.latest_freeze(marks.get(lot, []))
+        if not freeze or not _carried_pending(db, lot, freeze):
+            continue
+        try:
+            from . import review_designation_activation as activation
+            fixed = activation.designate(cfg, db, lot, force=True)
+            result["designation"] = str((fixed or {}).get("state") or "")
+        except Exception as exc:  # noqa: BLE001 - la passe suivante retente
+            result["designation"] = "error: %s" % (type(exc).__name__,)
     return out
