@@ -2006,7 +2006,7 @@ class WorkItems(interface.WorkItems):
             (package_id,))
 
     def close_merged(self, item_id, *, current, sha, actor, note, pr_ref,
-                     frozen_id=None, landed=None) -> dict | None:
+                     frozen_id=None, landed=None, unfrozen=False) -> dict | None:
         """`current` → `merged` si le lot y est encore (sinon None, rien d'écrit),
         en UNE transaction : transition, journal, puis le jalon `merged` (posé
         par le trigger de 0013) reçoit le commit et l'auteur de la fusion.
@@ -2018,7 +2018,9 @@ class WorkItems(interface.WorkItems):
         COMMITTED elle voit tout gel validé pendant l'attente (le sous-select
         d'une seule instruction verrait l'instantané d'avant l'attente). S'il
         a changé, rien n'est écrit (None). Un gel ne peut pas s'insérer
-        ensuite : `add_milestone` prend le même verrou de ligne.
+        ensuite : `add_milestone` prend le même verrou de ligne. `unfrozen`
+        (#2444, gel d'origine verdict) : aucun gel examiné ; tout gel relu
+        à cet instant refuse de même.
 
         `landed` (#1567) : `(numéro, dépôt)` du numéro réellement atterri,
         écrit dans la transaction de la fusion (`migration_landed`,
@@ -2039,12 +2041,13 @@ class WorkItems(interface.WorkItems):
                 (int(item_id), current))
             if not locked:
                 return None
-            if frozen_id is not None:
+            if frozen_id is not None or unfrozen:
                 latest = tx.query(
                     "SELECT id FROM work_item_milestones"
                     " WHERE work_item_id = %s AND kind = 'frozen'"
                     " ORDER BY at DESC, id DESC LIMIT 1", (int(item_id),))
-                if not latest or int(latest[0]["id"]) != int(frozen_id):
+                if (bool(latest) if frozen_id is None
+                        else not latest or int(latest[0]["id"]) != int(frozen_id)):
                     return None
             rows = tx.query(
                 """

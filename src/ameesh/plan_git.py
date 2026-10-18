@@ -676,6 +676,7 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
         sha = ((freeze or {}).get("sha") or "").strip()
         frozen_id = int(freeze["id"]) if freeze else None
         freeze_origin = "frozen" if sha else None
+        unchecked = None
         if not sha:
             # #2399 (cas #2366) : un avis `ok` sur la tête publiée vaut gel
             # effectif (`freeze.origin=verdict`, #1756) ; sans jalon `frozen`,
@@ -683,16 +684,21 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
             # autre tête ne prouve rien : la branche a avancé depuis.
             candidate = freeze_candidate(marks, repo_dir,
                                          target or row.get("branch_target") or default)
+            # #2444 : la tête confrontée est la tête publiée (origin d'abord) ;
+            # une branche disparue ne vaut pas un contrôle de la tête.
             reviewed = commit_id(candidate.get("sha"))
             if candidate.get("origin") == "verdict" and reviewed:
-                head = _tip(repo_dir, row["branch"]) if row.get("branch") else None
-                if head is None or same_commit(reviewed, head):
+                head = _published_tip(repo_dir, row["branch"]) if row.get("branch") else None
+                if head is None:
+                    unchecked = "verdict freeze not checked: branch head not found"
+                elif same_commit(reviewed, head):
                     sha, freeze_origin = reviewed, "verdict"
         entry = {"work_item": lot, "package": row.get("package_id"),
                  "state": row["state"], "result": "no-commit", "how": None, "ref": None,
                  "target": None, "off_target": None, "freeze_origin": freeze_origin,
-                 "detail": ("last freeze has no commit (milestone frozen --sha)" if freeze
-                            else "no freeze declared (milestone frozen --sha)")}
+                 "detail": unchecked or (
+                     "last freeze has no commit (milestone frozen --sha)" if freeze
+                     else "no freeze declared (milestone frozen --sha)")}
         if not sha:
             results.append(entry)
             continue
@@ -762,6 +768,7 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
             done = work_mod.close_merged(
                 db, lot, sha=entry["ref"] or "", actor="git:%s" % found_target,
                 source="content (%s)" % entry["how"], frozen_id=frozen_id,
+                unfrozen=frozen_id is None,   # #2444 : un gel apparu entre-temps refuse
                 repo=repo_dir)          # L539 : dépôt du relevé, indice de classe
             entry["result"] = done["result"]
             detail = "%s — %s" % (entry["detail"], done["detail"])
@@ -1004,6 +1011,16 @@ def target_candidates(repo: str, primary: str | None,
 
 def _tip(repo: str, branch: str) -> str | None:
     for ref in ("refs/heads/" + branch, "refs/remotes/origin/" + branch):
+        found = _commit(repo, ref)
+        if found:
+            return found
+    return None
+
+
+def _published_tip(repo: str, branch: str) -> str | None:
+    """#2444 : la tête publiée d'abord (`origin/<branche>`), la locale à
+    défaut — un avis se confronte à ce que la forge porte, pas à un clone."""
+    for ref in ("refs/remotes/origin/" + branch, "refs/heads/" + branch):
         found = _commit(repo, ref)
         if found:
             return found

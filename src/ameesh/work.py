@@ -1654,7 +1654,7 @@ def _resume_review_after_merge(db, item_id, *, sha: str = "", pr_ref=None,
 def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source: str = "",
                  pr_ref: str | None = None, frozen_id: int | None = None,
                  declared: bool = False, extra: str = "", repo: str | None = None,
-                 landed: tuple[int, str] | None = None) -> dict:
+                 landed: tuple[int, str] | None = None, unfrozen: bool = False) -> dict:
     """Fusion constatée : le lot passe `merged` et son jalon `merged` est posé.
 
     Idempotent : un lot déjà fusionné reste tel quel (`already`). Jamais de
@@ -1664,7 +1664,9 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
 
     `frozen_id` (preuve par le contenu) : le jalon `frozen` examiné ; si ce
     n'est plus le dernier gel du lot au moment d'écrire, rien n'est fermé
-    (`refrozen`) — le nouveau gel n'a pas été examiné.
+    (`refrozen`) — le nouveau gel n'a pas été examiné. `unfrozen` (#2444,
+    gel d'origine verdict) : aucun gel n'a été examiné ; un gel déclaré
+    depuis rend aussi `refrozen`.
 
     `landed` (#1567) : `(numéro, dépôt)` du numéro réellement atterri, écrit
     dans la transaction de la fusion ; l'appelant l'a validé et réservé.
@@ -1732,7 +1734,7 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
                 work_dependencies.lock(tx)
                 row = storage.of(tx).work.close_merged(
                     item_id, current=state, sha=sha, actor=actor, note=note, pr_ref=pr_ref,
-                    frozen_id=frozen_id, landed=landed)
+                    frozen_id=frozen_id, landed=landed, unfrozen=unfrozen)
                 if row is not None:
                     _notify_released(tx, item_id, blocker_state="merged",
                                      after_commit=threads)
@@ -1758,9 +1760,10 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
                 detail += " — relecture non ouverte : %s" % (review.get("why") or "?")
             return {"id": int(item_id), "result": "merged", "item": row,
                     "detail": detail, "review_lot": review}
-        if frozen_id is not None:
+        if frozen_id is not None or unfrozen:
             freezes = [m for m in milestones(db, item_id) if m["kind"] == "frozen"]
-            if not freezes or int(freezes[0]["id"]) != int(frozen_id):
+            if (bool(freezes) if frozen_id is None
+                    else not freezes or int(freezes[0]["id"]) != int(frozen_id)):
                 return {"id": int(item_id), "result": "refrozen", "item": get(db, item_id),
                         "detail": "new freeze declared in the meantime: not closed, review again"}
     raise WorkError("lot %s moved in the meantime: retry" % item_id)

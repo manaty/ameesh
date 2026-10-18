@@ -1137,6 +1137,50 @@ class ContentMergeTest(_PlanDb):
         self.assertIsNone(result["freeze_origin"])
         self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
 
+    def _verdict_lot(self, branch):
+        git(self.repo, "checkout", "-q", "-b", branch)
+        reviewed = self.commit("src/%s.py" % branch.split("/")[-1], "x = 1\n", "relu")
+        item = work.add(self.db, title=branch, branch=branch)
+        for state in ("build", "qa"):
+            work.move(self.db, item["id"], state)
+        work.milestone(self.db, item["id"], "verdict", verdict="ok", sha=reviewed,
+                       actor="relecteur")
+        return item, reviewed
+
+    def test_2444_la_tete_publiee_prime_sur_la_locale(self):
+        """#2444 : la tête confrontée à l'avis est `origin/<branche>` d'abord ;
+        une locale restée sur le commit relu ne masque pas une forge avancée."""
+        item, reviewed = self._verdict_lot("agent/lot-publie")
+        ahead = self.commit("src/lot-publie.py", "x = 2\n", "poussé après l'avis")
+        git(self.repo, "update-ref", "refs/remotes/origin/agent/lot-publie", ahead)
+        git(self.repo, "checkout", "-q", "main")
+        git(self.repo, "branch", "-f", "--no-track", "agent/lot-publie", reviewed)
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet", reviewed)
+        result = self.run_sync()[item["id"]]
+        self.assertEqual((result["result"], result["freeze_origin"]), ("no-commit", None))
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+
+    def test_2444_une_branche_disparue_ne_vaut_pas_controle_de_la_tete(self):
+        """#2444 : sans tête lisible, le gel d'origine verdict n'est pas retenu."""
+        item, reviewed = self._verdict_lot("agent/lot-disparu")
+        git(self.repo, "checkout", "-q", "main")
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet", "agent/lot-disparu")
+        git(self.repo, "branch", "-q", "-D", "agent/lot-disparu")
+        result = self.run_sync()[item["id"]]
+        self.assertEqual((result["result"], result["freeze_origin"]), ("no-commit", None))
+        self.assertIn("branch head not found", result["detail"])
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+
+    def test_2444_un_gel_apparu_sans_gel_examine_refuse(self):
+        """#2444 : fermeture par gel d'origine verdict (`unfrozen`) — un gel
+        déclaré entre la lecture et l'écriture rend `refrozen`."""
+        item, reviewed = self._verdict_lot("agent/lot-regel")
+        work.milestone(self.db, item["id"], "frozen", sha=reviewed, actor="auteur")
+        done = work.close_merged(self.db, item["id"], sha=reviewed, actor="git:main",
+                                 source="content (ancestor)", unfrozen=True)
+        self.assertEqual(done["result"], "refrozen")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+
     # -- revue codex1 (750c221), sondes reprises telles quelles -----------------
     def test_seul_le_dernier_gel_compte(self):
         """P2-1 : un gel antérieur déjà fusionné ne ferme pas un lot regelé
