@@ -52,6 +52,14 @@ class LandError(RuntimeError):
     """A lot that cannot be landed now: actionable message."""
 
 
+class TransientLandError(LandError):
+    """#2306 : une lecture distante a échoué pour une raison passagère (HTTP
+    5xx, délai, coupure réseau). Le refus tient (fail-closed), mais la même
+    demande peut aboutir au passage suivant : la file garde sa ligne au lieu
+    de l'éjecter. Une réponse malformée, un 4xx ou un manque prouvé restent des
+    `LandError` ordinaires, qui éjectent."""
+
+
 def lock_key(project, target: str) -> str:
     return "%s:%s" % (project.name, merge_queue._remote_branch(target))
 
@@ -77,22 +85,38 @@ def _passive(db, to, lot: int, text: str, data: dict) -> None:
         pass
 
 
-def _fire_guard(landing) -> dict | None:
+def _fire_guard(landing, *, gh=None) -> dict | None:
     """#1374, P1-2 : le feu et les blocages sont revalidés au dernier geste.
 
     Le retrait ou l'invalidation d'un feu retire la ligne de file au passage
     suivant ; entre les deux, `land` pourrait encore pousser ou fusionner. Sous
     son bail, juste avant le geste, il redemande l'autorisation : un lot qui a
     porté un feu ne part que sous un feu actif couvrant le gel de sa file et
-    sans verdict bloqué non levé. Rend l'éjection, ou None si la voie est
-    libre."""
+    sans verdict bloqué non levé.
+
+    #2286 : sur un atterrissage local, la garde exige aussi les checks requis
+    déclarés du projet sur le gel : la voie file ne contourne pas la porte des
+    checks requis. Rend l'éjection, ou None si la voie est libre.
+
+    #2306 : une lecture passagère des checks (5xx, délai) ne prouve pas un
+    manque ; la ligne reste en file et repart au passage suivant, au lieu
+    d'éjecter le lot."""
     from . import fire
-    ok, why = fire.land_guard(landing.db, landing.lot, landing.row.get("frozen_sha") or "",
-                              repo=landing.project.repo)
+    try:
+        ok, why = fire.land_guard(landing.db, landing.lot,
+                                  landing.row.get("frozen_sha") or "",
+                                  repo=landing.project.repo, project=landing.project,
+                                  target=landing.row.get("target") or "", gh=gh)
+    except TransientLandError as exc:
+        return landing.retry(
+            "the required checks of %s on the freeze %s cannot be read now (%s)"
+            % (landing.row.get("target") or "?", (landing.row.get("frozen_sha") or "")[:12],
+               exc))
     if ok:
         return None
-    return landing.eject(why, "The fire no longer authorizes this landing: ask the pilot for a "
-                              "fire on the current freeze, or take the lot out of the queue "
+    return landing.eject(why, "The fire or the required checks no longer authorize this "
+                              "landing: restore them on the freeze (or ask the pilot for a "
+                              "fire on the current freeze), or take the lot out of the queue "
                               "(`ameesh work queue remove %d`)." % landing.lot)
 
 
@@ -456,6 +480,17 @@ class _Landing:
         self.release = False
         return {"lot": self.lot, "result": "busy", "error": why}
 
+    def retry(self, why: str) -> dict:
+        """#2306 : un refus passager garde la ligne en file (état `queued`,
+        raison datée) et la rend au passage suivant ; le bail est relâché pour
+        ne pas retarder ce passage, contrairement à `busy` qui le garde."""
+        self.release = True
+        if not self.write(state="queued", reason="%s: retried at the next pass" % why,
+                          note="merge queue of %s: %s, retried" % (self.row["target"], why),
+                          actor=work.SYSTEM_SENDER):
+            return self.busy("lease on %s lost: retry not written" % self.key)
+        return {"lot": self.lot, "result": "retry", "error": why}
+
     def held(self) -> bool:
         """The lease is still ours, renewed, right before a push or a merge."""
         if self.ops.land_lock(self.key, self.owner, LOCK_TTL_S, epoch=self.epoch) is not None:
@@ -535,14 +570,17 @@ class _Landing:
     def review_after_merge(self, *, merged_sha: str = "", pr=None) -> dict:
         """L539 : ouvre le lot de relecture d'un lot **léger** (canon §2), une
         seule fois, après que la fusion est un fait enregistré. La classe est
-        relue sur le diff gelé (`merge_queue._class_of`, canon §8) ; un doute
-        ou une classe supérieure n'ouvre rien. Ne lève jamais."""
-        from . import merge_queue, review_lot
+        relue sur le diff que la fusion a fait entrer (`class_at_merge`) —
+        jamais `cible..gel`, vide une fois le gel devenu ancêtre de la cible ;
+        un `light` qui touche la porte de fusion ouvre deux avis (#2374). Ne
+        lève jamais."""
+        from . import review_lot
         try:
             item = work.get(self.db, self.lot)
-            klass = merge_queue._class_of(
-                self.db, self.lot, item, self.project.repo, self.clone,
-                self.row.get("target"), self.row.get("frozen_sha") or "", cfg=self.cfg)
+            klass = review_lot.class_at_merge(
+                self.db, self.lot, item=item,
+                repo=self.clone or self.project.repo,
+                target=self.row.get("target") or "", sha=merged_sha)
             return review_lot.open_after_merge(
                 self.db, lot=self.lot, klass=klass, item=item, merged_sha=merged_sha,
                 pr=pr, target=self.row.get("target") or "")
@@ -777,7 +815,7 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
     if project.land == "local":
         if not landing.held():
             return landing.busy("lease on %s lost before pushing" % landing.key)
-        stopped = _fire_guard(landing)
+        stopped = _fire_guard(landing, gh=gh)
         if stopped is not None:
             return stopped
         # #194 r6: one atomic push, two compare-and-swaps that the server
@@ -817,7 +855,7 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
             "ameesh work queue add %d." % lot)
     if not landing.held():
         return landing.busy("lease on %s lost before pushing" % landing.key)
-    stopped = _fire_guard(landing)
+    stopped = _fire_guard(landing, gh=gh)
     if stopped is not None:
         return stopped
     # #194 r4: compare and swap on the freeze (see `local`)
@@ -959,7 +997,7 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
         return refused
     if not landing.held():
         return landing.busy("lease lost before merging PR #%s" % status["number"])
-    stopped = _fire_guard(landing)
+    stopped = _fire_guard(landing, gh=gh)
     if stopped is not None:
         return stopped
     error = pr_merge(slug, status["number"], row["landing_sha"], project.merge_method, gh=gh)
