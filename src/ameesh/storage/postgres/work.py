@@ -2049,6 +2049,7 @@ class WorkItems(interface.WorkItems):
                 "UPDATE work_item_milestones SET sha = %s, actor = %s, note = %s"
                 " WHERE id = (SELECT id FROM work_item_milestones"
                 "              WHERE work_item_id = %s AND kind = 'merged' AND sha = ''"
+                "                AND " + _effective_merged("work_item_milestones") +
                 "              ORDER BY at DESC, id DESC LIMIT 1) RETURNING id",
                 (sha or "", actor or "", note or "", int(item_id)))
             return rows[0]

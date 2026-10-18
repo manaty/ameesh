@@ -211,11 +211,11 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
         if prev == "qa" and state in ("build", "merged"):
             ev_verdicts.append((at, "ok" if state == "merged" else "blocked",
                                 ev.get("actor") or None))
-        if state == "merged" and prev != "promoted":
-            # #1693 (N4) : la DERNIÈRE entrée en merged date la livraison — un
-            # lot rouvert par correction `merged → build` puis refusionné porte
-            # deux transitions, la première annulée. Une correction depuis
-            # promoted conserve, elle, la fusion réelle.
+        if state == "merged" and merged is None:
+            # #1693 (N4) : la première entrée en merged APRÈS la dernière
+            # correction `merged → build` (qui remet `merged` à None) date la
+            # livraison. Un retour depuis promoted, blocked ou waiting_human
+            # conserve la fusion réelle.
             merged = at
         elif prev == "merged" and state == "build":
             # La correction annule aussi les replis depuis le journal et

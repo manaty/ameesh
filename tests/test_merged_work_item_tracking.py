@@ -336,6 +336,21 @@ class CorrectionTest(_Base):
                             for r in storage.of(self.db).work.estimate_history(
                                 app=None, limit=200)))
 
+    def test_1693_retour_de_blocked_ne_redate_pas_la_fusion(self):
+        # R1 dev2 (B1) : `merged → blocked → merged` n'est pas une nouvelle
+        # fusion ; sans index unique, le déclencheur ne doit pas écrire un
+        # second jalon qui redaterait le lot et perdrait le SHA.
+        lot = work.add(self.db, title="aller-retour", actor="orch")
+        work.close_merged(self.db, lot["id"], sha=SHA, actor="orch")
+        avant = work.timeline(self.db, lot["id"])["merged_ts"]
+        work.move(self.db, lot["id"], "blocked", actor="orch")
+        work.move(self.db, lot["id"], "merged", actor="orch")
+        jalons = [m for m in work.milestones(self.db, lot["id"])
+                  if m["kind"] == "merged"]
+        self.assertEqual(len(jalons), 1)
+        self.assertEqual(jalons[0]["sha"], SHA)
+        self.assertEqual(work.timeline(self.db, lot["id"])["merged_ts"], avant)
+
     def test_role_de_conception_au_canon(self):
         class Fiche:
             def __init__(self, data):
