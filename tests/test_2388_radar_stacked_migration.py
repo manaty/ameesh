@@ -112,9 +112,54 @@ class StackedMigrationTest(unittest.TestCase):
 
         self.scan([STACKED, PARENT], reservations=reservations)
 
+        # One representative keeps the attribution; the stacked copy is the
+        # inherited one, so a third holder still collides with the parent.
+        self.assertIn(INHERITED, seen[PARENT["id"]])
         self.assertNotIn(INHERITED, seen[STACKED["id"]])
         self.assertIn(own, seen[STACKED["id"]])
         self.assertEqual(self.scan([STACKED, PARENT])["migrations"], [])
+
+    def test_inherited_copy_still_collides_with_a_third_party(self):
+        """Review #2388: hiding both copies hid a real collision.
+
+        parent adds 516_parent, stacked forks it, parent advances, and an
+        independent lot adds a different 516. The inherited copy must keep a
+        representative: 516 is a real duplicate with the independent lot.
+        """
+        self.branch("main", PARENT["branch"],
+                    {MIG + "/516_parent.sql": CONTENT})
+        self.branch(PARENT["branch"], STACKED["branch"], {"stacked.py": "b\n"})
+        self.branch(PARENT["branch"], PARENT["branch"], {"parent.py": "a\n"})
+        self.branch("main", OTHER["branch"],
+                    {MIG + "/516_independent.sql": "-- third\n"})
+
+        report = self.scan([PARENT, STACKED, OTHER])
+
+        self.assertEqual([m["number"] for m in report["migrations"]], ["516"])
+        self.assertEqual([h["work_item"] for h in report["migrations"][0]["lots"]],
+                         [PARENT["id"], OTHER["id"]])
+        # The same collision is seen when the stacked lot is not scanned.
+        self.assertEqual([m["number"] for m in self.scan([PARENT, OTHER])["migrations"]],
+                         ["516"])
+
+    def test_two_siblings_without_their_parent_still_collide_with_a_third_party(self):
+        """Two lots forked on the same base (the parent itself is not scanned)
+        and a third independent lot reusing the number: one sibling copy is
+        inherited, the other representative still collides."""
+        anchor = "lot/2340-anchor"
+        self.branch("main", anchor, {MIG + "/516_shared.sql": CONTENT})
+        self.branch(anchor, STACKED["branch"], {"stacked.py": "b\n"})
+        self.branch(anchor, SIBLING["branch"], {"sibling.py": "c\n"})
+        self.branch("main", OTHER["branch"],
+                    {MIG + "/516_independent.sql": "-- third\n"})
+
+        self.assertEqual(self.scan([STACKED, SIBLING])["migrations"], [])
+        report = self.scan([STACKED, SIBLING, OTHER])
+
+        self.assertEqual([m["number"] for m in report["migrations"]], ["516"])
+        holders = [h["work_item"] for h in report["migrations"][0]["lots"]]
+        self.assertEqual(len(holders), 2)
+        self.assertIn(OTHER["id"], holders)
 
 
 if __name__ == "__main__":

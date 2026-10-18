@@ -942,9 +942,12 @@ def _native_migration_additions(repo: str, branches: list[dict], directory: str)
     ancestor with the same path and blob (#2279), or — when neither holder
     descends from the other — a common merge-base that already carries the
     same path and blob (#2388: a lot stacked on a package whose tip has moved
-    since the fork). Equal tips, independent additions, modified SQL and
-    unreadable evidence keep their warnings. Both probes use this view;
-    branch diffs in the report keep their full scope.
+    since the fork). Of the two diverged copies, one keeps the attribution
+    (the tip that advanced last); the other is the inherited one, so a third
+    holder, the duplicate probe and the reservation probe still see the
+    number. Equal tips, independent additions, modified SQL and unreadable
+    evidence keep their warnings. Both probes use this view; branch diffs in
+    the report keep their full scope.
     """
     groups: dict = {}
     for one in branches:
@@ -1006,6 +1009,26 @@ def _native_migration_additions(repo: str, branches: list[dict], directory: str)
             blobs[key] = proc.stdout.strip() if proc.returncode == 0 else None
         return blobs[key]
 
+    tip_dates: dict = {}
+
+    def tip_date(tip: str) -> int:
+        if tip not in tip_dates:
+            proc = _git(repo, "log", "-1", "--format=%ct", tip,
+                        env_extra=NO_LAZY_FETCH)
+            try:
+                tip_dates[tip] = int(proc.stdout.strip() or b"0")
+            except ValueError:
+                tip_dates[tip] = 0
+        return tip_dates[tip]
+
+    def rank(one: dict):
+        """Pick the representative of two diverged holders: the tip that
+        advanced last, then the oldest work item. Git cannot tell which of two
+        diverged branches was the base (both carry the same file at their
+        merge-base); the ranking only keeps one attribution, so a third holder
+        and the reservation probe still see the number (#2388 review)."""
+        return (tip_date(one["tip"]), -int(one["work_item"]), one["branch"])
+
     for (_, _, path), holders in groups.items():
         if len(holders) < 2:
             continue
@@ -1026,15 +1049,17 @@ def _native_migration_additions(repo: str, branches: list[dict], directory: str)
                     # #2388: diverged holders (a lot stacked on a base that
                     # moved since the fork). A common ancestor carrying the
                     # identical file proves that neither of them added it;
-                    # the first-parent requirement keeps a merge of the
-                    # target from being mistaken for a stack (#1333).
+                    # keeping both copies would hide a real collision with a
+                    # third holder, dropping both would hide the migration
+                    # from the duplicate and reservation probes. Keep one
+                    # representative, inherited from the other (#2388 review).
                     base = common_base(a, b)
                     value = blob(base, path) if base else None
                     if (value and value == blob(a, path) == blob(b, path)
                             and on_first_parent(base, a)
                             and on_first_parent(base, b)):
-                        inherited.setdefault(one["work_item"], set()).add(path)
-                        inherited.setdefault(other["work_item"], set()).add(path)
+                        drop = min(one, other, key=rank)
+                        inherited.setdefault(drop["work_item"], set()).add(path)
                     continue
                 if blob(parent, path) and blob(parent, path) == blob(child_tip, path):
                     inherited.setdefault(child["work_item"], set()).add(path)
