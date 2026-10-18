@@ -7,13 +7,13 @@ run can stand in for complete CI. This adapter does not poll or rerun.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 import re
 from urllib.parse import quote
 
 from . import land, resolutions
-from .train import TrainError
+from .train import TrainError, digest
 
 
 def _slurp_unsupported(proc) -> bool:
@@ -97,6 +97,44 @@ class Workflow:
                 raise ValueError("full audited source blob expected")
 
 
+#: #2503: jobs a dispatched Nexlink suite may legitimately skip. Every other
+#: job of the run is required by the train; `lot-*` plumbing and the optional
+#: `Desktop suite (...)` matrix are never execution proof.
+DUE_TOLERATED = ("changed-paths", "github-bridge", "desktop-platform")
+#: The reusable plumbing jobs every suite carries; never execution proof.
+DUE_PLUMBING_PREFIX = "lot-"
+#: The optional hosted desktop matrix, skipped when `CI_HOSTED_DESKTOP` is off.
+DUE_TOLERATED_PREFIX = "Desktop suite ("
+
+
+def _tolerated_job(name):
+    return (name.startswith(DUE_PLUMBING_PREFIX) or name in DUE_TOLERATED
+            or name.startswith(DUE_TOLERATED_PREFIX))
+
+
+@dataclass(frozen=True)
+class DueWorkflow:
+    """A suite selected by the repository's own due-parts selector (#2503).
+
+    The 23 Nexlink suites are not frozen by the contract: the selector names
+    the `lot/<suite>` parts the integrated change set makes due, and the run's
+    own jobs (minus the documented tolerated/plumbing ones) are the proof.
+    """
+
+    path: str
+    context: str
+    event: str = "workflow_dispatch"
+
+    def __post_init__(self):
+        if not self.path.startswith(".github/workflows/") \
+                or not self.path.endswith((".yml", ".yaml")):
+            raise ValueError("explicit workflow path expected")
+        if not re.fullmatch(r"lot/[A-Za-z0-9_-]+", self.context):
+            raise ValueError("lot/<suite> context expected")
+        if self.event != "workflow_dispatch":
+            raise ValueError("a due part is a dispatched suite")
+
+
 def audited_sources(workflows):
     if not workflows:
         raise TrainError("complete audited CI contract required")
@@ -107,6 +145,26 @@ def audited_sources(workflows):
                 raise TrainError("conflicting audited CI source contracts")
             sources[path] = blob
     return sources
+
+
+def contract_digest(workflows):
+    """The stable identity of a CI contract for the packet reservation.
+
+    A static tuple is digested over all of its workflows. A dynamic contract
+    (#2503) supplies `digest()`: the required set varies per packet, but the
+    reservation binds the shared audited contract, never the due subset of one
+    plan.
+    """
+    digest_method = getattr(workflows, "digest", None)
+    if callable(digest_method):
+        return digest_method()
+    return digest([asdict(workflow) for workflow in workflows])
+
+
+def parts_cache(cfg):
+    """#2503: the on-disk due-parts proof cache of this host, if it has state."""
+    from . import ci_parts
+    return ci_parts.cache_dir(cfg)
 
 
 def _job_match(required, actual):
@@ -167,23 +225,72 @@ def verify_local(path, plan, workflows):
 
     The worktree and remote default branch are not execution evidence for
     this commit. Check the object type too: a symlink is not a workflow file.
+    A dynamic contract (#2503) supplies the sources of the parts this plan
+    makes due; its undued suites are not executed, so their files are not
+    part of this packet's proof.
     """
-    for source, blob in sorted(audited_sources(workflows).items()):
+    sources_for = getattr(workflows, "sources_for", None)
+    sources = (sources_for(plan, repo=path) if callable(sources_for)
+               else audited_sources(workflows))
+    for source, blob in sorted(sources.items()):
         proc = resolutions._run(path, "ls-tree", plan["head"], "--", source)
         fields = resolutions._text(proc).strip().split()
         if proc.returncode or len(fields) != 4 or fields[0] not in ("100644", "100755") \
                 or fields[1:] != ["blob", blob, source]:
             raise TrainError("full-suite source differs from audited CI contract: %s" % source)
+    due_for = getattr(workflows, "due_for", None)
+    if callable(due_for):
+        # The suite's own workflow is the reviewed project code, not a frozen
+        # blob: the run and its jobs are the proof. It must exist at the head
+        # the branch will publish.
+        for workflow in due_for(plan, repo=path):
+            proc = resolutions._run(path, "ls-tree", plan["head"], "--", workflow.path)
+            fields = resolutions._text(proc).strip().split()
+            if proc.returncode or len(fields) != 4 or fields[0] not in ("100644", "100755") \
+                    or fields[1] != "blob" or fields[3] != workflow.path:
+                raise TrainError("due suite workflow missing at the train head: %s"
+                                 % workflow.path)
 
 
 class GitHub:
-    def __init__(self, slug: str, workflows: tuple[Workflow, ...], *, gh=land._gh):
+    def __init__(self, slug: str, workflows, *, gh=land._gh, repo=None, cache=None):
         from . import radar
         if not radar._GITHUB_RE.fullmatch(slug) or not workflows:
             raise ValueError("repository and complete required workflow contract expected")
-        if len({w.path for w in workflows}) != len(workflows):
-            raise ValueError("duplicate workflow contract")
-        self.slug, self.workflows, self.gh = slug, workflows, gh
+        if callable(getattr(workflows, "resolve", None)):
+            # #2503: a dynamic contract selects its due suites per plan; there
+            # is no static 23-suite tuple to freeze or de-duplicate.
+            self.workflows = workflows
+        else:
+            items = tuple(workflows)
+            if not items:
+                raise ValueError("repository and complete required workflow contract expected")
+            if len({w.path for w in items}) != len(items):
+                raise ValueError("duplicate workflow contract")
+            self.workflows = items
+        self.slug, self.gh = slug, gh
+        #: #2503: the private train clone and the due-parts proof cache. A
+        #: static contract ignores both; a dynamic contract resolves its due
+        #: suites from the repository's own selector at each plan.
+        self.repo, self.cache = repo, cache
+
+    def _due(self, plan):
+        """The workflows this plan makes due (all of a static contract)."""
+        resolve = getattr(self.workflows, "resolve", None)
+        if not callable(resolve):
+            return tuple(self.workflows)
+        if not self.repo:
+            raise TrainError("dynamic CI contract requires the train repository")
+        return resolve(plan, repo=self.repo, cache=self.cache)
+
+    def _sources(self, plan):
+        """The audited sources of the parts this plan actually executes."""
+        sources_for = getattr(self.workflows, "sources_for", None)
+        if not callable(sources_for):
+            return audited_sources(self.workflows)
+        if not self.repo:
+            raise TrainError("dynamic CI contract requires the train repository")
+        return sources_for(plan, repo=self.repo, cache=self.cache)
 
     def _api(self, path):
         proc = self.gh(["api", "--paginate", "--slurp", "repos/%s/%s" % (self.slug, path)])
@@ -202,12 +309,28 @@ class GitHub:
         In particular, changing a matrix or making an executable step
         conditional cannot be covered by the old list of green job names.
         This is read-only and performed before dispatch and before using CI.
+        A long packet CI re-reads the same plan; the successful check of an
+        exact head is remembered on the contract, never re-fetched per poll.
         """
-        for path, blob in sorted(audited_sources(self.workflows).items()):
+        verified = getattr(self.workflows, "verified_heads", None)
+        if verified is not None and plan["head"] in verified:
+            return
+        for path, blob in sorted(self._sources(plan).items()):
             pages = self._api("contents/%s?ref=%s" % (quote(path, safe="/"), plan["head"]))
             if len(pages) != 1 or not isinstance(pages[0], dict) \
                     or pages[0].get("type") != "file" or pages[0].get("sha") != blob:
                 raise TrainError("full-suite source differs from audited CI contract: %s" % path)
+        for workflow in self._due(plan):
+            if not isinstance(workflow, DueWorkflow):
+                continue
+            pages = self._api("contents/%s?ref=%s"
+                              % (quote(workflow.path, safe="/"), plan["head"]))
+            if len(pages) != 1 or not isinstance(pages[0], dict) \
+                    or pages[0].get("type") != "file":
+                raise TrainError("due suite workflow missing at the train head: %s"
+                                 % workflow.path)
+        if verified is not None:
+            verified.add(plan["head"])
 
     def start(self, plan):
         """Called once, after durable ci-intent. Push contracts need no dispatch.
@@ -217,7 +340,7 @@ class GitHub:
         The pilot can reconcile absent runs before a bounded recovery.
         """
         self.verify(plan)
-        for workflow in self.workflows:
+        for workflow in self._due(plan):
             if workflow.event != "workflow_dispatch":
                 continue
             proc = self.gh(["workflow", "run", workflow.path, "--repo", self.slug,
@@ -228,7 +351,7 @@ class GitHub:
     def read(self, plan):
         self.verify(plan)
         evidence, pending, red, absent = [], False, False, False
-        for workflow in self.workflows:
+        for workflow in self._due(plan):
             name = quote(workflow.path.rsplit("/", 1)[-1], safe="")
             path = ("actions/workflows/%s/runs?head_sha=%s&event=%s&per_page=100"
                     % (name, plan["head"], workflow.event))
@@ -248,22 +371,36 @@ class GitHub:
                 continue
             if run.get("conclusion") not in ("success", "failure"):
                 raise TrainError("complete CI interrupted or cancelled: no culpable lot proved")
-            if workflow.called:
+            if getattr(workflow, "called", ""):
                 # #2446: the reusable workflow has no `workflow_call` run of
                 # its own; the caller push must reference it at this exact
                 # head, and its called jobs are read below.
                 called_workflow(run, workflow, plan)
             jobs = [j for page in self._api("actions/runs/%s/attempts/%s/jobs?per_page=100"
                                             % (run["id"], attempt)) for j in page.get("jobs", ())]
-            failed = False
-            for required in workflow.jobs:
-                found = required_job(required, jobs)
-                if len(found) != 1 or found[0].get("status") != "completed" \
-                        or found[0].get("conclusion") not in ("success", "failure"):
-                    # Success of the workflow with a skipped or ambiguous
-                    # required job cannot prove that this suite actually ran.
-                    raise TrainError("required full-suite job missing, skipped or interrupted")
-                failed = failed or found[0]["conclusion"] == "failure"
+            if isinstance(workflow, DueWorkflow):
+                # #2503: the suite is not frozen; every job it actually ran
+                # that is not documented plumbing/tolerated must be green.
+                required = [job for job in jobs
+                            if isinstance(job.get("name"), str)
+                            and not _tolerated_job(job["name"])]
+                if not required:
+                    raise TrainError("due suite has no executable job: %s" % workflow.path)
+                for job in required:
+                    if job.get("status") != "completed" \
+                            or job.get("conclusion") not in ("success", "failure"):
+                        raise TrainError("required suite job missing, skipped or interrupted")
+                failed = any(job["conclusion"] == "failure" for job in required)
+            else:
+                failed = False
+                for required in workflow.jobs:
+                    found = required_job(required, jobs)
+                    if len(found) != 1 or found[0].get("status") != "completed" \
+                            or found[0].get("conclusion") not in ("success", "failure"):
+                        # Success of the workflow with a skipped or ambiguous
+                        # required job cannot prove that this suite actually ran.
+                        raise TrainError("required full-suite job missing, skipped or interrupted")
+                    failed = failed or found[0]["conclusion"] == "failure"
             if failed != (run["conclusion"] == "failure"):
                 # A failed ancillary job with all test jobs green is not
                 # evidence against a lot; nor is an allowed failing test

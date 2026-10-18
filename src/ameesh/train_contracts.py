@@ -3,8 +3,13 @@
 
 The source blobs describe the execution semantics behind the required jobs.
 A new workflow/planner needs a new audit; an unchanged display name does not
-transfer full-suite proof. No Nexlink contract is supplied while its backend
-and website dispatch can still select impacted tests on integration/train-*.
+transfer full-suite proof. Nexlink's packet CI is dynamic (#2503): the parts
+a packet makes due are recomputed from the integrated change set by the
+repository's own `lot-plan` selector, and only those parts are dispatched and
+proved. The selector and the shared plan/status workflows are audited; the 23
+suite definitions are not frozen — each due suite is the project's reviewed
+code at the integrated head, and every non-plumbing/non-tolerated job it runs
+must be green.
 
 #2446: ``paquet.yml`` is the caller run of the packet gate. A push to
 ``integration/**`` creates that run; when no open PR covers the pushed head,
@@ -15,6 +20,11 @@ workflow, the called suite and the planning blobs, and requires the called
 jobs (prefixed by the caller job) — the full 8 psycopg + 16 psql matrix, the
 macOS platform job and the aggregate ``tests`` check.
 """
+import re
+import types
+
+from . import ci_parts, radar, resolutions, train_ci
+from .train import TrainError, digest
 from .train_ci import Workflow
 
 
@@ -47,3 +57,139 @@ def ameesh() -> tuple[Workflow, ...]:
                  ("scripts/ci-flow.py", "ac574bd1f38eb788c70800095efde70bd2b8b751"),
                  ("scripts/map.py", "7a7516683643ff7cd66abf3d50147b25446a03bb")),
     ),)
+
+
+#: Nexlink target commit whose selector was audited. Only the shared
+#: plan/status workflows and the due-parts selector are frozen; the 23 suite
+#: definitions are the reviewed project code and are selected per packet.
+NEXLINK_AUDIT_COMMIT = "9103c1673dc451396db0202ff3fca7f87cd87bf8"
+
+_NEXLINK_LOT_PLAN = (".github/workflows/lot-plan.yml",
+                     "ae94763e5fcec34cf92cf0e3cadc6c4ec780afde")
+_NEXLINK_LOT_STATUS = (".github/workflows/lot-status.yml",
+                       "237d75fc555ca37281ea562ed49aca47857d6e7f")
+_NEXLINK_LOT_SELECTOR = ("scripts/ci/lot-plan.mjs",
+                         "7b9f01de9ab4075b16c5bb80032c762b45299d0c")
+
+#: The shared execution contract of a Nexlink packet: the selector that
+#: computes the due parts, the reusable plan job and the reusable status
+#: publisher. The suite workflows themselves are not pinned: they are the
+#: project's reviewed code, selected per packet by the selector.
+_NEXLINK_SOURCES = {
+    _NEXLINK_LOT_PLAN[0]: _NEXLINK_LOT_PLAN[1],
+    _NEXLINK_LOT_STATUS[0]: _NEXLINK_LOT_STATUS[1],
+    _NEXLINK_LOT_SELECTOR[0]: _NEXLINK_LOT_SELECTOR[1],
+}
+
+
+class Nexlink:
+    """Dynamic Nexlink packet contract (#2503).
+
+    A Nexlink packet is not one caller run over the 23 suites and the contract
+    does not freeze them. Each lot suite is a `workflow_dispatch` workflow
+    that publishes its `lot/<suite>` status; the parts a packet makes due are
+    computed by the repository's own `scripts/ci/lot-plan.mjs` from the
+    integrated change set. This contract pins the selector and the shared
+    plan/status workflows, resolves the due contexts through the audited
+    `ci_parts` sandbox, and dispatches those suites with `expected_sha`. The
+    suite workflow itself must exist at the head; its own jobs, minus the
+    documented plumbing/tolerated ones, are the proof. An empty due list is
+    refused: a doc-only packet is not a train proof.
+    """
+
+    ci_parts = radar.CiParts(
+        selector="scripts/ci/lot-plan.mjs",
+        argv=("node", "{selector}", "--files", "{files}", "--out", "{out}"),
+        schema="nexlink-lot-plan/1",
+        due="due")
+
+    def __init__(self):
+        self._resolved_key = None
+        self._resolved = ()
+        #: #2503: successful remote source checks by exact head; a long packet
+        #: CI is re-read at each service step and must not re-fetch the shared
+        #: blobs and the due workflow existence at every poll.
+        self.verified_heads = set()
+
+    def digest(self):
+        """The shared contract identity, never a frozen list of the 23 suites."""
+        return digest({
+            "schema": "nexlink-train-contract/1",
+            "ci_parts": {"selector": self.ci_parts.selector,
+                         "argv": list(self.ci_parts.argv),
+                         "schema": self.ci_parts.schema,
+                         "due": self.ci_parts.due},
+            "sources": sorted(_NEXLINK_SOURCES.items()),
+            "tolerated": list(train_ci.DUE_TOLERATED),
+            "tolerated_prefix": train_ci.DUE_TOLERATED_PREFIX,
+            "plumbing_prefix": train_ci.DUE_PLUMBING_PREFIX,
+        })
+
+    def _project(self):
+        return types.SimpleNamespace(name="nexlink", ci_parts=self.ci_parts)
+
+    def _audit_base(self, repo, base):
+        """The selector that computes the due list must be the audited one.
+
+        `ci_parts.due` extracts the base tree and runs the selector there; a
+        target that changed the selector would compute a different due list,
+        so it needs a new contract, never a silently different selection. The
+        suite workflows are deliberately not checked here: they are the
+        project's reviewed code and the selector reads them at the target.
+        """
+        proc = resolutions._run(repo, "ls-tree", base, "--", _NEXLINK_LOT_SELECTOR[0])
+        fields = resolutions._text(proc).strip().split()
+        if proc.returncode or len(fields) != 4 or fields[0] not in ("100644", "100755") \
+                or fields[1] != "blob" or fields[2] != _NEXLINK_LOT_SELECTOR[1] \
+                or fields[3] != _NEXLINK_LOT_SELECTOR[0]:
+            raise TrainError("the target selector differs from the audited Nexlink contract: %s"
+                             % _NEXLINK_LOT_SELECTOR[0])
+
+    def resolve(self, plan, *, repo, cache=None):
+        """The dispatched suites of the `lot/<suite>` parts this plan makes due."""
+        key = (plan["head"], plan["base"])
+        if key == self._resolved_key:
+            return self._resolved
+        self._audit_base(repo, plan["base"])
+        try:
+            proof = ci_parts.due(self._project(), plan["head"], plan["base"], repo,
+                                 cache=cache)
+        except ci_parts.PartsError as exc:
+            raise TrainError("the due parts of the packet cannot be proven: %s" % exc) from exc
+        due = proof["due"]
+        if not due:
+            raise TrainError("no due part: a packet CI cannot be proven (doc-only packet?)")
+        workflows = []
+        for context in due:
+            match = re.fullmatch(r"lot/([A-Za-z0-9_-]+)", context)
+            if match is None:
+                raise TrainError("malformed due part: %r" % context)
+            path = ".github/workflows/%s.yml" % match.group(1)
+            # The context and the workflow file are two declarations in the
+            # target; the selector names the context, the dispatch needs the
+            # file. Refuse a due context the named file does not declare at
+            # the base, rather than dispatching an unrelated workflow.
+            proc = resolutions._run(repo, "show", "%s:%s" % (plan["base"], path))
+            declared = re.search(r"(?m)^\s*context:\s*(lot/[A-Za-z0-9_-]+)\s*$",
+                                 resolutions._text(proc) if not proc.returncode else "")
+            if proc.returncode or declared is None or declared.group(1) != context:
+                raise TrainError("due part %s is not declared by %s at the base"
+                                 % (context, path))
+            workflows.append(train_ci.DueWorkflow(path=path, context=context))
+        self._resolved_key = key
+        self._resolved = tuple(workflows)
+        return self._resolved
+
+    def due_for(self, plan, *, repo, cache=None):
+        """The due suites, for the local existence check before publication."""
+        return self.resolve(plan, repo=repo, cache=cache)
+
+    def sources_for(self, plan, *, repo, cache=None):
+        """The shared sources pinned by this contract, for one valid plan."""
+        self.resolve(plan, repo=repo, cache=cache)
+        return dict(_NEXLINK_SOURCES)
+
+
+def nexlink() -> Nexlink:
+    """The Nexlink packet contract: due suites only, dispatched with expected_sha."""
+    return Nexlink()
