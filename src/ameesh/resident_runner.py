@@ -275,18 +275,40 @@ def write_usage_event(path: str, event: dict | None) -> bool:
 
     Flushed and fsynced before the ledger line: if the runner dies before the
     database write, the repair reads the event and counts the same turn
-    instead of losing its usage."""
+    instead of losing its usage.
+
+    #2453: a failed write (ENOSPC) is truncated back to the size before it,
+    and a stream that does not end with a newline (a partial line left by an
+    earlier crash) gets one first — otherwise the repaired event would be
+    glued to that fragment and unreadable, and the turn booked at 0."""
     if event is None:
         return False
+    data = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
     try:
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(event, ensure_ascii=False) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        return True
+        fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
     except OSError as exc:
         resident.log("resident usage event not written (%s)" % exc)
         return False
+    size = None
+    try:
+        size = os.fstat(fd).st_size
+        if size and os.pread(fd, 1, size - 1) != b"\n":
+            data = b"\n" + data
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+        return True
+    except OSError as exc:
+        resident.log("resident usage event not written (%s)" % exc)
+        if size is not None:
+            try:
+                os.ftruncate(fd, size)
+            except OSError as trunc:
+                resident.log("resident usage event not truncated (%s)" % trunc)
+        return False
+    finally:
+        os.close(fd)
 
 
 class ResidentProcess:

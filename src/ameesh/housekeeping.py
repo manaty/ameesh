@@ -3489,6 +3489,14 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
             # idle, like the directory of an agent absent from the registry
             orphan = FALLBACK_SEP in name or (registered is not None
                                               and agent not in registered)
+            # #2326 : la suppression ne vise que ce qui est À NOUS. Un dossier
+            # sans fichier de propriétaire de ce mesh (worktree créé par un
+            # agent à la racine partagée, dossier d'un autre mesh d'avant L219,
+            # nom inconnu) n'est jamais supprimé, même ancien : un registre
+            # vide, partiel ou ancien ne doit rien détruire.
+            if orphan and owner != key:
+                skipped.append("tmp %s kept: not owned by this mesh" % full)
+                continue
             why = tmp_problem(full, owner, key, registered=not orphan,
                               idle_after=policy.orphan_idle, now=now)
             if why:
@@ -3508,6 +3516,13 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                     skipped.append("tmp %s kept: changed during the pass" % full)
                     continue
                 if orphan:
+                    # #2326 : même à nous, un dossier qui porte une copie git
+                    # (worktree de relecture créé dans le dossier temporaire)
+                    # n'est pas un simple tmp : on ne le supprime pas.
+                    if _git_copies(full):
+                        skipped.append("tmp %s kept: contains a Git worktree or "
+                                       "clone" % full)
+                        continue
                     size = size_of(full)
                     plan.append({"kind": "tmp", "path": full, "agent": agent,
                                  "action": "suppression", "bytes": size,
