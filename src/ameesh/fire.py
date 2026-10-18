@@ -616,7 +616,8 @@ def _transient_read(detail: str) -> bool:
     gardent la ligne en file ; un 4xx, un refus de droits ou une réponse
     malformée restent des échecs prouvés, qui éjectent."""
     low = str(detail or "").lower()
-    return bool(_TRANSIENT_CODE.search(low)) or any(word in low for word in _TRANSIENT_TEXT)
+    return bool(_TRANSIENT_CODE.search(low) or re.search(r"(?:^|:\s*)eof\s*$", low)
+                or any(word in low for word in _TRANSIENT_TEXT))
 
 
 def _head_check_runs(slug: str | None, sha: str, *, gh) -> list:

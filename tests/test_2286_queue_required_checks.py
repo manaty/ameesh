@@ -132,6 +132,19 @@ class RequiredOnHeadTest(unittest.TestCase):
         with self.assertRaises(land.TransientLandError):
             self._gaps(FakeHeadGh(statuses_error="gh: HTTP 502"))
 
+    def test_a_connection_closed_with_eof_is_transient(self):
+        # gh peut rendre EOF seul quand la connexion ferme sans réponse.
+        detail = 'Get "https://api.github.com/repos/o/r": EOF'
+        for source in ("runs_error", "statuses_error"):
+            with self.subTest(source=source), self.assertRaises(land.TransientLandError):
+                self._gaps(FakeHeadGh(**{source: detail}))
+
+    def test_eof_in_the_requested_path_does_not_make_a_404_transient(self):
+        detail = 'gh: Not Found (https://api.github.com/repos/eof/r) (HTTP 404)'
+        with self.assertRaises(land.LandError) as raised:
+            self._gaps(FakeHeadGh(runs_error=detail))
+        self.assertNotIsInstance(raised.exception, land.TransientLandError)
+
     def test_a_refusal_of_rights_is_not_retried(self):
         # un 4xx ne dit pas « réessaie » : la source est refusée, pas passagère
         with self.assertRaises(land.LandError) as raised:
@@ -260,6 +273,23 @@ class LocalLandingRequiredChecksTest(_Land):
         self.assertIn("retried at the next pass", self.fake.queue_rows[4]["reason"])
         self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
         self.assertEqual(self.sent, [])
+
+    def test_a_closed_connection_retries_then_lands_without_requeueing(self):
+        self.queued(4)
+        entry = dict(self.fake.queue_rows[4])
+        before = _git(self.origin, "rev-parse", "main")
+        locks = {}
+        out = self.land(4, gh=FakeHeadGh(runs_error='Get "https://api.github.com/": EOF'),
+                        locks=locks)
+        self.assertEqual(out["result"], "retry", out)
+        self.assertEqual(self.fake.queue_rows[4]["state"], "queued")
+        self.assertEqual(self.fake.queue_rows[4]["generation"], entry["generation"])
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+        self.assertEqual(locks, {})
+        self.assertIsNone(self.locks.held["p:main"][0])
+        self.assertEqual(self.sent, [])
+        out = self.land(4, gh=FakeHeadGh(runs=[_run(sha=self.tip(4))]), locks=locks)
+        self.assertEqual(out["result"], "landed", out)
 
     def test_a_refusal_of_rights_ejects_instead_of_merging(self):
         # #2306 N1 : un 404 n'est pas passager — un manque de droits ou une
