@@ -801,7 +801,7 @@ class BriefDeLotTest(_Base):
         self.assertIn("lot/b1", text)
         self.assertIn("travail.py", text)
         self.assertIn("1 file changed", text)
-        self.assertIn("## Lot thread — decisions and unread messages", text)
+        self.assertIn("## Lot thread — decisions, unread and recently delivered messages", text)
         self.assertIn("un message non lu sur le lot", text)
         # jamais le contenu d'un autre lot, ni l'ancienne session, ni la liste
         # des lots assignés du brief de reprise
@@ -809,6 +809,31 @@ class BriefDeLotTest(_Base):
         self.assertNotIn("un message pour un autre lot", text)
         self.assertNotIn("Previous session", text)
         self.assertNotIn("Work items assigned to you", text)
+
+    def test_courrier_livre_reparait_dans_le_brief_de_la_nouvelle_session(self):
+        """#2539 : un message livré dans la session d'un autre lot ne disparaît
+        pas quand la session dédiée à son lot s'ouvre.
+
+        Le cas réel : un tour de courrier sur le lot A livre aussi un verdict
+        du lot B (le lot du tour est ambigu) ; la session de A est ensuite mise
+        de côté, celle de B s'ouvre sur son brief. Le message de B, marqué
+        livré, doit rester visible dans le brief de B — sinon le nouveau tour
+        ne sait pas qu'un verdict l'attend."""
+        from ameesh import reprise
+        self.bail("b3")
+        a = work.add(self.db, title="Le lot de la session neuve", assignee="b3")["id"]
+        autre = work.add(self.db, title="Un autre lot", assignee="b3")["id"]
+        vu = mail.send(self.db, "orch", "b3", "verdict bloqué déjà livré",
+                       work_item_id=str(a))
+        self.assertEqual(mail.mark_delivered(self.db, [vu]), 1)
+        ailleurs = mail.send(self.db, "orch", "b3", "message livré d'un autre lot",
+                             work_item_id=str(autre))
+        mail.mark_delivered(self.db, [ailleurs])
+
+        text = reprise.lot_brief(self.cfg, self.db, registry.get(self.db, "b3"), a,
+                                 consigne="go")
+        self.assertIn("verdict bloqué déjà livré", text)
+        self.assertNotIn("message livré d'un autre lot", text)
 
     def test_brief_ne_dit_pas_put_aside_quand_rien_n_est_garde(self):
         """#2242 : `_switch_lot` peut ne rien garder (lot courant fini ou
