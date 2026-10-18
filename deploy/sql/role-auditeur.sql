@@ -35,8 +35,8 @@
 --
 -- PG 16+ : une appartenance préexistante accordée alors que le rôle était
 -- NOINHERIT garde `inherit_option=false` ; le script force `INHERIT TRUE` sur
--- les deux contrats et relit l'héritage, puis les droits effectifs (une
--- colonne d'état et une de contenus).
+-- les deux contrats et relit l'héritage, puis les droits effectifs (l'USAGE
+-- du schéma, une colonne d'état et une de contenus).
 --
 -- Sans ce rôle (ou sans `AUDITEUR_DSN` dans le drop-in de l'exécuteur),
 -- l'analyse se contente des commandes `ameesh … --json` ; elle n'utilise
@@ -189,9 +189,15 @@ BEGIN
         END IF;
     END IF;
 
-    -- Droits EFFECTIFS : lire une colonne de chaque contrat prouve l'héritage
-    -- au-delà des catalogues d'appartenance (une colonne d'état, une de
-    -- contenus ; les droits directs ont été retirés plus haut).
+    -- Droits EFFECTIFS : l'USAGE du schéma et la lecture d'une colonne de
+    -- chaque contrat prouvent l'héritage au-delà des catalogues
+    -- d'appartenance (une colonne d'état, une de contenus ; les droits
+    -- directs ont été retirés plus haut). Sans USAGE, les GRANT de colonne
+    -- restent accordés mais aucune requête ne passe le schéma : la lecture
+    -- serait illusoire (N #2355).
+    IF NOT has_schema_privilege(r, s, 'USAGE') THEN
+        RAISE EXCEPTION 'USAGE du schéma absent pour % : la lecture par les contrats ne passerait pas le schéma ; transaction annulée', r;
+    END IF;
     IF NOT has_column_privilege(r, format('%I.%I', s, 'agent_mailbox'), 'id', 'SELECT')
        OR NOT has_column_privilege(r, format('%I.%I', s, 'agent_mailbox'), 'body', 'SELECT') THEN
         RAISE EXCEPTION 'droits effectifs absents pour % : lecture de l''état ou des contenus non héritée ; transaction annulée', r;
