@@ -296,9 +296,20 @@ class SweepWitnessTest(_Witness):
         _git(self.repo, "checkout", "-q", "develop")
         # le contenu entre d'abord par cherry-pick : le merge qui suit n'ajoute
         # aucun fichier (arbre du merge = arbre du premier parent)
+        # Une cible divergente empêche le cherry-pick de réutiliser le SHA du
+        # gel si les deux commits sont créés dans la même seconde.
+        _git(self.repo, "commit", "-q", "--allow-empty", "-m", "cible divergente")
         _git(self.repo, "cherry-pick", sha)
         _git(self.repo, "merge", "-q", "--no-ff", "-m", "ameesh-work: %d" % lot,
              "lot/2374-vide")
+        merged = _git(self.repo, "rev-parse", "HEAD")
+        self.assertEqual(_git(self.repo, "rev-parse", "HEAD^2"), sha)
+        self.assertEqual(_git(self.repo, "rev-parse", "HEAD^{tree}"),
+                         _git(self.repo, "rev-parse", "HEAD^1^{tree}"))
+        klass = review_lot.class_at_merge(self.db, lot, repo=self.repo,
+                                         target="develop", sha=merged)
+        self.assertEqual(klass["class"], "sensitive", klass)
+        self.assertFalse(klass.get("doubt"), klass)
         report = {r["work_item"]: r for r in plan_git.sync_branches(
             self.db, host=self.cfg.host)["results"]}
         self.assertEqual(report[lot]["result"], "merged")
