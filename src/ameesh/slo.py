@@ -212,6 +212,36 @@ def handover_ts(item: dict, events: Iterable[dict]) -> float | None:
     return last
 
 
+def intake_ready_ts(assigned: float | None, requested: float | None,
+                    dependencies: Iterable[dict] = (), *,
+                    started: float | None = None) -> float | None:
+    """L'instant où le lot est prêt pour `intake_started` (#2551).
+
+    Une dépendance bloquante ouverte retient le lot : son porteur ne peut rien
+    faire avant sa levée, donc le lot n'est pas « prêt, pas démarré » et aucun
+    délai ne court (`None`). Toutes les dépendances satisfaites, le départ est
+    le plus tardif de l'attribution (ou de la demande) et de la levée du
+    dernier bloqueur — les jalons `merged` ou `closed` du bloqueur, portés par
+    `satisfied_ts`. Le délai mesure alors l'attente d'un preneur, pas le temps
+    où le travail dépendait d'un autre lot.
+
+    Un lot déjà démarré (`started`) garde sa mesure : seules les levées
+    antérieures au début comptent, et une dépendance ajoutée après le début ne
+    réécrit pas le passé.
+    """
+    base = assigned if assigned is not None else requested
+    if base is None:
+        return None
+    edges = list(dependencies or ())
+    if started is None and any(edge.get("blocking") for edge in edges):
+        return None
+    stamps = [float(edge["satisfied_ts"]) for edge in edges
+              if edge.get("satisfied_ts") is not None]
+    if started is not None:
+        stamps = [stamp for stamp in stamps if stamp <= float(started)]
+    return max([float(base)] + stamps)
+
+
 def last_event_ts(item: dict, events: Iterable[dict]) -> float | None:
     """Dernière activité écrite (ligne du lot ou événement)."""
     stamps = [item.get("updated_ts"), item.get("created_ts")]
@@ -247,7 +277,8 @@ def _row(step: Step, start, *, now: float, critical: bool, done_ts=None, **extra
 
 
 def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
-              now: float | None = None, packet_slot: float | None = None) -> list:
+              now: float | None = None, packet_slot: float | None = None,
+              dependencies: Iterable[dict] = ()) -> list:
     """Les étapes mesurables d'un lot, une ligne par étape applicable.
 
     `jalons` vient de `progress._work_item_milestones` — le SEUL lecteur des
@@ -269,6 +300,12 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     ligne porte `handover_grace_s` (secondes restantes). La mesure reste
     visible (`elapsed_s`, `target_s`) ; après la grâce, l'escalade reprend au
     niveau que le retard justifie.
+
+    #2551 : `dependencies` sont les arêtes de prérequis du lot
+    (`work_dependencies.grouped`, enrichies de `satisfied_ts` — fusion ou
+    clôture du bloqueur — par l'appelant). Une dépendance bloquante ouverte ne
+    produit pas de ligne `intake_started` ; toutes satisfaites, le départ est
+    la levée du dernier bloqueur (`intake_ready_ts`).
     """
     events = list(events)
     now = time.time() if now is None else float(now)
@@ -290,8 +327,13 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     started = _first_event(events, "build")
     if requested is not None and state not in ("merged", "promoted", "closed"):
         step = step_of("intake_started")
-        ready = assigned if assigned is not None else requested
-        if started is not None:
+        ready = intake_ready_ts(assigned, requested, dependencies, started=started)
+        if ready is None:
+            # #2551 : dépendance bloquante ouverte — le lot n'est pas prêt,
+            # aucun délai ne court : son porteur ne peut rien faire avant la
+            # levée du prérequis. La mesure repart de cette levée.
+            pass
+        elif started is not None:
             out.append(_row(step, ready, now=now, critical=critical,
                             done_ts=round(started, 3),
                             elapsed_s=int(max(0.0, started - float(ready)))))
