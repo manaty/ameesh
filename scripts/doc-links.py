@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Vérificateur des liens internes et des ancres de `docs/` (#775).
+"""Checker of the internal links and anchors of `docs/` (#775).
 
 `docs/` is read on GitHub (the MkDocs site is built from `site/docs/`): its
 relative links and `#anchors` must resolve there. Nothing checked them until
@@ -13,9 +13,14 @@ documentation tree and reports:
   suffixed `-1`, `-2`…);
 - a reference-style use `[text][id]` whose `[id]:` definition is missing.
 
-External links (`http:`, `mailto:`…), links inside fenced or inline code, and
-links to an existing directory (GitHub renders its tree page) are not
-reported. Usage:
+External links (`http:`, `mailto:`…), links inside fenced, indented or inline
+code, and links to an existing directory (GitHub renders its tree page) are
+not reported. Headings are ATX (`# title`) or setext (`title` underlined by
+`===`/`---`); HTML anchors `<a id="…">`/`<a name="…">` also count. A fenced
+block closes only on its own marker character and on a run at least as long
+as the opening one, so a `~~~` inside a ``` block stays code.
+
+Usage:
 
     python3 scripts/doc-links.py [--root docs] [--json]
 
@@ -36,17 +41,33 @@ from urllib.parse import unquote
 REPO = pathlib.Path(__file__).resolve().parent.parent
 DOCS = REPO / "docs"
 
-# [texte](cible "titre") — capture aussi les images ![alt](cible)
+# [text](target "title") — also captures images ![alt](target)
 INLINE_LINK = re.compile(r"\[[^\]]*\]\(\s*<?([^)>\s]+)>?(?:\s+[\"'][^\"']*[\"'])?\s*\)")
-# [texte][id] : usage d'une référence
+# [text][id]: use of a reference
 REFERENCE_USE = re.compile(r"\[[^\]]*\]\[([^\]]+)\]")
-# [id]: cible "titre" — définition d'une référence
+# [id]: target "title" — definition of a reference (footnotes `[^1]:` excluded
+# at use site, they are prose, not a link target)
 REFERENCE_DEF = re.compile(r"^\s{0,3}\[([^\]]+)\]:\s*<?(\S+?)>?(?:\s+[\"'(].*)?$")
-HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
-FENCE = re.compile(r"^\s*(```|~~~)")
+# ATX heading: a closing `#` run needs a space before it (`# C#` keeps its `#`).
+HEADING = re.compile(r"^(#{1,6})\s+(.*?)(?:\s+#+)?\s*$")
+# Setext heading underline: `===` (h1) or `---` (h2).
+SETEXT = re.compile(r"^ {0,3}(?:=+|-+)\s*$")
+# Fence opening/closing: up to 3 spaces, then a run of at least 3 backticks or
+# tildes, then an optional info string (opening) or only spaces (closing).
+FENCE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
+# Indented code block (CommonMark: 4 spaces or a tab).
+INDENTED_CODE = re.compile(r"^(?: {4,}|\t)")
 INLINE_CODE = re.compile(r"`+[^`]*`+")
-# tout ce qui a un schéma (http:, mailto:, data:…) ou commence par // est externe
+# An explicit HTML anchor GitHub exposes as an id (`<a id="x">`, `<a name="x">`).
+HTML_ANCHOR = re.compile(r"<a\s+[^>]*?(?:id|name)\s*=\s*[\"']([^\"']+)[\"']", re.I)
+# A line that cannot be the text of a setext heading.
+LIST_ITEM = re.compile(r"^\s*(?:[-+*]|\d+[.)])\s+")
+# Anything with a scheme (http:, mailto:, data:…) or starting with // is external.
 EXTERNAL = re.compile(r"^(?:[a-zA-Z][a-zA-Z0-9+.-]*:|//)")
+
+MISSING_FILE = "missing file"
+MISSING_ANCHOR = "missing anchor"
+MISSING_DEFINITION = "reference without definition"
 
 
 def slug(text: str) -> str:
@@ -69,24 +90,92 @@ def slug(text: str) -> str:
     return "".join(out)
 
 
+def fence_state(line: str, opened: tuple[str, int] | None) -> tuple[str, int] | None:
+    """Update the fenced-code state on `line`.
+
+    `opened` is `(marker character, marker length)` of the opening fence, or
+    None outside a fence. An opening fence is a run of at least three
+    backticks or tildes; it closes only on the same character with a run at
+    least as long, and only spaces may follow the closing run (#1406/N1).
+    """
+    match = FENCE.match(line)
+    if opened is None:
+        if match is None:
+            return None
+        marker, info = match.group(2), match.group(3)
+        if marker[0] == "`" and "`" in info:
+            return None  # an inline code span, not a fence
+        return marker[0], len(marker)
+    if match is None:
+        return opened
+    marker, rest = match.group(2), match.group(3)
+    if marker[0] == opened[0] and len(marker) >= opened[1] and not rest.strip():
+        return None
+    return opened
+
+
+def _prose_lines(lines):
+    """Yield `(line number, line)`, with fenced/indented code blanked out.
+
+    A blank line in place of each code line also resets the setext context of
+    the caller: a `---` after a code block is a thematic break, not the
+    underline of a paragraph written before the block (#1406/N2).
+    """
+    opened: tuple[str, int] | None = None
+    for number, line in enumerate(lines, 1):
+        if opened is not None:
+            opened = fence_state(line, opened)
+            yield number, ""
+            continue
+        if INDENTED_CODE.match(line):
+            yield number, ""
+            continue
+        state = fence_state(line, None)
+        if state is not None:
+            opened = state
+            yield number, ""
+            continue
+        yield number, line
+
+
+def _setext_text(line: str) -> bool:
+    """True when `line` may be the text of a setext heading."""
+    text = line.strip()
+    return bool(
+        text
+        and not text.startswith(("#", ">", "|", "<"))
+        and not LIST_ITEM.match(text)
+        and not SETEXT.match(text)
+        and not REFERENCE_DEF.match(line)
+    )
+
+
+def _add_anchor(anchors: set[str], seen: dict[str, int], text: str) -> None:
+    base = slug(text)
+    rank = seen.get(base, 0)
+    seen[base] = rank + 1
+    anchors.add(base if rank == 0 else f"{base}-{rank}")
+
+
 def headings(path: pathlib.Path) -> set[str]:
-    """Every anchor GitHub produces for the headings of `path`."""
+    """Every anchor GitHub produces for the headings and HTML anchors of `path`."""
     anchors: set[str] = set()
     seen: dict[str, int] = {}
-    fenced = False
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        if FENCE.match(line):
-            fenced = not fenced
-            continue
-        if fenced:
-            continue
+    previous = ""
+    text = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    for _, line in _prose_lines(text):
+        for match in HTML_ANCHOR.finditer(line):
+            anchors.add(match.group(1))
         match = HEADING.match(line)
-        if not match:
+        if match:
+            _add_anchor(anchors, seen, match.group(2))
+            previous = ""
             continue
-        base = slug(match.group(2))
-        rank = seen.get(base, 0)
-        seen[base] = rank + 1
-        anchors.add(base if rank == 0 else f"{base}-{rank}")
+        if previous and SETEXT.match(line):
+            _add_anchor(anchors, seen, previous)
+            previous = ""
+            continue
+        previous = line.strip() if _setext_text(line) else ""
     return anchors
 
 
@@ -95,28 +184,17 @@ def links_of(path: pathlib.Path):
 
     Reference definitions are collected first: a `[text][id]` use may precede
     its `[id]: target` definition (the usual layout puts them at the end).
+    Footnote definitions (`[^1]: …`) are prose, not link definitions.
     """
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     definitions: dict[str, str] = {}
-    fenced = False
-    for line in lines:
-        if FENCE.match(line):
-            fenced = not fenced
-            continue
-        if fenced:
-            continue
+    for _, line in _prose_lines(lines):
         definition = REFERENCE_DEF.match(line)
-        if definition:
+        if definition and not definition.group(1).startswith("^"):
             definitions[definition.group(1).lower()] = definition.group(2)
-    fenced = False
-    for number, line in enumerate(lines, 1):
-        if FENCE.match(line):
-            fenced = not fenced
-            continue
-        if fenced:
-            continue
+    for number, line in _prose_lines(lines):
         definition = REFERENCE_DEF.match(line)
-        if definition:
+        if definition and not definition.group(1).startswith("^"):
             yield number, definition.group(2)
             continue
         line = INLINE_CODE.sub("", line)
@@ -137,7 +215,7 @@ def broken_links(root: pathlib.Path, repo: pathlib.Path | None = None):
             if EXTERNAL.match(target):
                 continue
             if target.startswith("[") and target.endswith("]"):
-                problems.append((path, number, target, "référence sans définition"))
+                problems.append((path, number, target, MISSING_DEFINITION))
                 continue
             file_part, _, anchor = target.partition("#")
             file_part, anchor = unquote(file_part), unquote(anchor).lower()
@@ -146,7 +224,7 @@ def broken_links(root: pathlib.Path, repo: pathlib.Path | None = None):
             else:
                 destination = (path.parent / file_part).resolve()
             if file_part and not destination.exists():
-                problems.append((path, number, target, "fichier absent"))
+                problems.append((path, number, target, MISSING_FILE))
                 continue
             if not anchor:
                 continue
@@ -156,7 +234,7 @@ def broken_links(root: pathlib.Path, repo: pathlib.Path | None = None):
                 continue
             found = anchors.setdefault(destination, headings(destination))
             if anchor not in found:
-                problems.append((path, number, target, "ancre absente"))
+                problems.append((path, number, target, MISSING_ANCHOR))
     return problems
 
 
@@ -171,7 +249,7 @@ def report(root: pathlib.Path, problems, as_json: bool) -> str:
                 for path, number, target, reason in problems
             ],
         }, ensure_ascii=False, indent=2)
-    lines = [f"{root}: {files} fichiers, {len(problems)} lien(s) cassé(s)"]
+    lines = [f"{root}: {files} file(s), {len(problems)} broken link(s)"]
     for path, number, target, reason in problems:
         lines.append(f"  {path}:{number}: {target} ({reason})")
     return "\n".join(lines)
@@ -180,14 +258,14 @@ def report(root: pathlib.Path, problems, as_json: bool) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--root", default=str(DOCS),
-                        help="arborescence de documentation à vérifier (défaut : docs/)")
+                        help="documentation tree to check (default: docs/)")
     parser.add_argument("--repo", default=str(REPO),
-                        help="racine du dépôt, pour les liens absolus (défaut : le dépôt)")
-    parser.add_argument("--json", action="store_true", help="rapport JSON")
+                        help="repository root, for absolute links (default: the repository)")
+    parser.add_argument("--json", action="store_true", help="JSON report")
     args = parser.parse_args(argv)
     root, repo = pathlib.Path(args.root), pathlib.Path(args.repo)
     if not root.is_dir():
-        print(f"doc-links: {root} n'est pas un dossier", file=sys.stderr)
+        print(f"doc-links: {root} is not a directory", file=sys.stderr)
         return 2
     problems = broken_links(root, repo)
     print(report(root, problems, args.json))

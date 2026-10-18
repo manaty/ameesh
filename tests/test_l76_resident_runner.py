@@ -247,6 +247,37 @@ class UsageEventTest(unittest.TestCase):
         # an unwritable path is a lost event, never a failed turn
         self.assertFalse(resident_runner.write_usage_event(tempfile.mkdtemp(), first))
 
+    def test_a_partial_write_is_truncated_and_the_repair_stays_readable(self):
+        # #2453: ENOSPC mid-line must not leave a fragment the repaired event
+        # would be glued to; a fragment already there gets a newline first.
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "events.jsonl")
+        first = {"type": resident.USAGE_EVENT, "usage": {"input_tokens": 1}}
+        turn = {"type": resident.USAGE_EVENT, "usage": {"input_tokens": 2}}
+        self.assertTrue(resident_runner.write_usage_event(path, first))
+        real_write = os.write
+
+        def partial(fd, buf):
+            real_write(fd, bytes(buf[:5]))
+            raise OSError(28, "No space left on device")
+
+        with mock.patch.object(resident_runner.os, "write", side_effect=partial):
+            self.assertFalse(resident_runner.write_usage_event(path, turn))
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual([json.loads(line) for line in fh], [first])
+        # the repair after the failure is a readable line of its own
+        self.assertTrue(resident_runner.write_usage_event(path, turn))
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual([json.loads(line) for line in fh], [first, turn])
+        # a fragment left by a crash (no truncation possible) is isolated
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write('{"type": "resi')
+        self.assertTrue(resident_runner.write_usage_event(path, turn))
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        self.assertEqual(lines[2], '{"type": "resi')
+        self.assertEqual(json.loads(lines[3]), turn)
+
 
 class ResidentRunnerTest(PgTestCase):
     def setUp(self) -> None:
