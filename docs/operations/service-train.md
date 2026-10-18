@@ -153,17 +153,26 @@ donc **pas** les 23 suites : il épingle seulement le sélecteur
 commit `NEXLINK_AUDIT_COMMIT` (`9103c167`, develop du 18/10 19:09 Paris). Le
 sélecteur de la cible est vérifié au commit de base (une modification exige un
 nouveau contrat) ; `ci_parts.due` (bac à sable `bwrap`, aucun repli) rend les
-contextes `lot/<suite>` dus ; le fichier doit déclarer le même `context` à la
-base, puis il est dispatché avec `expected_sha`.
+contextes `lot/<suite>` dus. Le même sélecteur audité tourne sur **deux
+arbres** : celui de la base (le plan déjà publié par la cible, qu'une tête ne
+peut pas réduire) et celui de la tête (les suites que le paquet ajoute ou
+élargit). Le sélecteur de l'arbre de la tête doit être le même blob que celui
+de la base : un sélecteur modifié est refusé, jamais exécuté. L'union des deux
+plans est exigée ; chaque fichier doit déclarer le même `context` à la tête
+dispatchée, puis il est dispatché avec `expected_sha`.
 À la lecture, la suite doit exister à la tête et **tous ses jobs exécutables**
-doivent être verts : seuls la plomberie `lot-*` et les jobs tolérés sauté
-(`changed-paths`, `github-bridge`, `desktop-platform`, `Desktop suite (...)`)
-sont écartés — un job nouveau est donc requis sans nouvelle relecture du
-contrat. Une liste due vide refuse : un paquet documentation seule n'est pas
-une preuve de train. Le contrat est livré pour le mode ombre seulement :
-aucune configuration d'hôte ni bascule n'est faite par ce lot. Prérequis
-d'hôte : `bwrap` (N3 de #1666) et `node` (le sélecteur) — sans eux, la preuve
-des parts est refusée, jamais remplacée par une exécution non isolée.
+doivent être verts. Seuls des jobs de plomberie **nommés exactement**
+(`lot-plan`, `lot-plan-retry`, `lot-pending`, `lot-status` et leurs jobs
+appelés) et les exceptions **de la suite concernée** sont écartés :
+`changed-paths` dans backend-suite, `github-bridge` dans compute, la matrice
+`Desktop suite (...)` dans desktop-suite. Un job de test nommé `lot-*` ou
+`Desktop suite (...)` hors de sa suite reste donc requis, comme tout job
+nouveau — sans nouvelle relecture du contrat. Une liste due vide refuse : un
+paquet documentation seule n'est pas une preuve de train. Le contrat est livré
+pour le mode ombre seulement : aucune configuration d'hôte ni bascule n'est
+faite par ce lot. Prérequis d'hôte : `bwrap` (N3 de #1666) et `node` (le
+sélecteur) — sans eux, la preuve des parts est refusée, jamais remplacée par
+une exécution non isolée.
 
 ## Retour arrière
 

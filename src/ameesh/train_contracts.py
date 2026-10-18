@@ -9,7 +9,10 @@ repository's own `lot-plan` selector, and only those parts are dispatched and
 proved. The selector and the shared plan/status workflows are audited; the 23
 suite definitions are not frozen — each due suite is the project's reviewed
 code at the integrated head, and every non-plumbing/non-tolerated job it runs
-must be green.
+must be green. The audited selector runs twice: over the base tree (the plan
+the target already published, so the head cannot narrow it away) and over the
+head tree (the suites the packet adds or widens). A declarations tree whose
+selector blob differs from the base is refused, never executed.
 
 #2446: ``paquet.yml`` is the caller run of the packet gate. A push to
 ``integration/**`` creates that run; when no open PR covers the pushed head,
@@ -91,10 +94,11 @@ class Nexlink:
     computed by the repository's own `scripts/ci/lot-plan.mjs` from the
     integrated change set. This contract pins the selector and the shared
     plan/status workflows, resolves the due contexts through the audited
-    `ci_parts` sandbox, and dispatches those suites with `expected_sha`. The
-    suite workflow itself must exist at the head; its own jobs, minus the
-    documented plumbing/tolerated ones, are the proof. An empty due list is
-    refused: a doc-only packet is not a train proof.
+    `ci_parts` sandbox over both the base and the head declarations, and
+    dispatches those suites with `expected_sha`. The suite workflow itself
+    must exist at the head; its own jobs, minus the identified plumbing jobs
+    and the skip-by-design jobs of that suite, are the proof. An empty due
+    list is refused: a doc-only packet is not a train proof.
     """
 
     ci_parts = radar.CiParts(
@@ -120,9 +124,9 @@ class Nexlink:
                          "schema": self.ci_parts.schema,
                          "due": self.ci_parts.due},
             "sources": sorted(_NEXLINK_SOURCES.items()),
-            "tolerated": list(train_ci.DUE_TOLERATED),
-            "tolerated_prefix": train_ci.DUE_TOLERATED_PREFIX,
-            "plumbing_prefix": train_ci.DUE_PLUMBING_PREFIX,
+            "plumbing": list(train_ci.DUE_PLUMBING),
+            "tolerated": {path: list(names) for path, names
+                          in sorted(train_ci.DUE_SUITE_TOLERATED.items())},
         })
 
     def _project(self):
@@ -131,11 +135,14 @@ class Nexlink:
     def _audit_base(self, repo, base):
         """The selector that computes the due list must be the audited one.
 
-        `ci_parts.due` extracts the base tree and runs the selector there; a
+        `ci_parts.due` extracts the base tree and runs that selector there; a
         target that changed the selector would compute a different due list,
         so it needs a new contract, never a silently different selection. The
-        suite workflows are deliberately not checked here: they are the
-        project's reviewed code and the selector reads them at the target.
+        head-declarations proof additionally refuses a selector blob that
+        differs at the head (`ci_parts.due`), and the head's own blob is
+        checked by `GitHub.verify`. The suite workflows are deliberately not
+        checked here: they are the project's reviewed code and the selector
+        reads them at the target and at the head.
         """
         proc = resolutions._run(repo, "ls-tree", base, "--", _NEXLINK_LOT_SELECTOR[0])
         fields = resolutions._text(proc).strip().split()
@@ -145,18 +152,34 @@ class Nexlink:
             raise TrainError("the target selector differs from the audited Nexlink contract: %s"
                              % _NEXLINK_LOT_SELECTOR[0])
 
+    def _proof(self, plan, *, repo, cache, declarations_sha=None):
+        """One due-parts proof: the audited selector over base or head tree."""
+        try:
+            return ci_parts.due(self._project(), plan["head"], plan["base"], repo,
+                                cache=cache, declarations_sha=declarations_sha)
+        except ci_parts.PartsError as exc:
+            label = "base" if declarations_sha is None else "head declarations"
+            raise TrainError("the due parts of the packet cannot be proven (%s): %s"
+                             % (label, exc)) from exc
+
     def resolve(self, plan, *, repo, cache=None):
-        """The dispatched suites of the `lot/<suite>` parts this plan makes due."""
+        """The dispatched suites of the `lot/<suite>` parts this plan makes due.
+
+        #2503: two proofs. The base selector over the base tree preserves the
+        plan the target already published (a head cannot narrow a due part
+        away); the same audited selector over the **head** tree covers the
+        workflows the packet adds or widens. The union is required, and each
+        declaration is read at the dispatched head.
+        """
         key = (plan["head"], plan["base"])
         if key == self._resolved_key:
             return self._resolved
         self._audit_base(repo, plan["base"])
-        try:
-            proof = ci_parts.due(self._project(), plan["head"], plan["base"], repo,
-                                 cache=cache)
-        except ci_parts.PartsError as exc:
-            raise TrainError("the due parts of the packet cannot be proven: %s" % exc) from exc
-        due = proof["due"]
+        base_proof = self._proof(plan, repo=repo, cache=cache)
+        head_proof = self._proof(plan, repo=repo, cache=cache,
+                                 declarations_sha=plan["head"])
+        due = tuple(base_proof["due"]) + tuple(
+            context for context in head_proof["due"] if context not in base_proof["due"])
         if not due:
             raise TrainError("no due part: a packet CI cannot be proven (doc-only packet?)")
         workflows = []
@@ -165,15 +188,16 @@ class Nexlink:
             if match is None:
                 raise TrainError("malformed due part: %r" % context)
             path = ".github/workflows/%s.yml" % match.group(1)
-            # The context and the workflow file are two declarations in the
-            # target; the selector names the context, the dispatch needs the
-            # file. Refuse a due context the named file does not declare at
-            # the base, rather than dispatching an unrelated workflow.
-            proc = resolutions._run(repo, "show", "%s:%s" % (plan["base"], path))
+            # The context and the workflow file are two declarations at the
+            # dispatched head; the selector names the context, the dispatch
+            # needs the file. Refuse a due context the named file does not
+            # declare at the head (a removed, renamed or divergent suite),
+            # rather than dispatching an unrelated workflow.
+            proc = resolutions._run(repo, "show", "%s:%s" % (plan["head"], path))
             declared = re.search(r"(?m)^\s*context:\s*(lot/[A-Za-z0-9_-]+)\s*$",
                                  resolutions._text(proc) if not proc.returncode else "")
             if proc.returncode or declared is None or declared.group(1) != context:
-                raise TrainError("due part %s is not declared by %s at the base"
+                raise TrainError("due part %s is not declared by %s at the train head"
                                  % (context, path))
             workflows.append(train_ci.DueWorkflow(path=path, context=context))
         self._resolved_key = key

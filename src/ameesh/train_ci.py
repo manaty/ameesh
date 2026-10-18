@@ -97,19 +97,47 @@ class Workflow:
                 raise ValueError("full audited source blob expected")
 
 
-#: #2503: jobs a dispatched Nexlink suite may legitimately skip. Every other
-#: job of the run is required by the train; `lot-*` plumbing and the optional
-#: `Desktop suite (...)` matrix are never execution proof.
-DUE_TOLERATED = ("changed-paths", "github-bridge", "desktop-platform")
-#: The reusable plumbing jobs every suite carries; never execution proof.
-DUE_PLUMBING_PREFIX = "lot-"
-#: The optional hosted desktop matrix, skipped when `CI_HOSTED_DESKTOP` is off.
-DUE_TOLERATED_PREFIX = "Desktop suite ("
+#: #2503: the identified plumbing jobs every lot suite carries. A reusable
+#: caller exposes its jobs as ``<caller> / <job>``; only these exact names —
+#: read from the audited `lot-plan.yml` / `lot-status.yml` — are excluded
+#: from the execution proof. A test job that merely starts with ``lot-`` (or
+#: with a plumbing caller's name) is required.
+DUE_PLUMBING = (
+    "lot-plan",
+    "lot-plan / Due parts of the change set",
+    "lot-plan / Announce the due parts still missing a status",
+    "lot-plan-retry",
+    "lot-plan-retry / Due parts of the change set",
+    "lot-plan-retry / Announce the due parts still missing a status",
+    "lot-pending",
+    "lot-status",
+)
+
+#: #2503: jobs a suite may legitimately leave skipped on a packet dispatch,
+#: scoped to the suite that declares them. A name carries no exception on its
+#: own: `changed-paths` classifies a develop push (backend-suite),
+#: `github-bridge` needs a develop dispatch recipe (compute), and the hosted
+#: desktop matrix only exists when `CI_HOSTED_DESKTOP` is `on`
+#: (desktop-suite). The matrix legs are named explicitly so a new leg is
+#: required rather than silently tolerated; a whole skipped matrix is exposed
+#: by the API with the unexpanded name (`Desktop suite (${{ matrix.os }})`).
+DUE_SUITE_TOLERATED = {
+    ".github/workflows/backend-suite.yml": ("changed-paths",),
+    ".github/workflows/compute.yml": ("github-bridge",),
+    ".github/workflows/desktop-suite.yml": ("Desktop suite (${{ matrix.os }})",
+                                           "Desktop suite (windows-latest)",
+                                           "Desktop suite (macos-latest)"),
+}
 
 
-def _tolerated_job(name):
-    return (name.startswith(DUE_PLUMBING_PREFIX) or name in DUE_TOLERATED
-            or name.startswith(DUE_TOLERATED_PREFIX))
+def _tolerated_job(name, path, context):
+    """An identified plumbing job, or a skip-by-design job of *this* suite."""
+    if name in DUE_PLUMBING:
+        return True
+    if name in ("lot-pending / Lot status (%s)" % context,
+                "lot-status / Lot status (%s)" % context):
+        return True
+    return name in DUE_SUITE_TOLERATED.get(path, ())
 
 
 @dataclass(frozen=True)
@@ -118,7 +146,8 @@ class DueWorkflow:
 
     The 23 Nexlink suites are not frozen by the contract: the selector names
     the `lot/<suite>` parts the integrated change set makes due, and the run's
-    own jobs (minus the documented tolerated/plumbing ones) are the proof.
+    own jobs (minus the identified plumbing jobs and the skip-by-design jobs
+    of this suite) are the proof.
     """
 
     path: str
@@ -380,10 +409,16 @@ class GitHub:
                                             % (run["id"], attempt)) for j in page.get("jobs", ())]
             if isinstance(workflow, DueWorkflow):
                 # #2503: the suite is not frozen; every job it actually ran
-                # that is not documented plumbing/tolerated must be green.
+                # that is not an identified plumbing job, or a skip-by-design
+                # job of this suite, must be green. A job the API does not
+                # name cannot be proved, and a name alone never exempts it.
+                for job in jobs:
+                    if not isinstance(job.get("name"), str):
+                        raise TrainError("due suite job without a name: %s"
+                                         % workflow.path)
                 required = [job for job in jobs
-                            if isinstance(job.get("name"), str)
-                            and not _tolerated_job(job["name"])]
+                            if not _tolerated_job(job["name"], workflow.path,
+                                                  workflow.context)]
                 if not required:
                     raise TrainError("due suite has no executable job: %s" % workflow.path)
                 for job in required:
