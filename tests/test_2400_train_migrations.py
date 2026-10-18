@@ -145,6 +145,18 @@ class RewriteTest(unittest.TestCase):
         with self.assertRaisesRegex(train.TrainError, "not contiguous"):
             train_migrations.audit(self.repo, self.base, head, self.layout)
 
+    def test_a_transport_carrying_a_migration_is_deferred(self):
+        _, head = self.merge("lot/1", {
+            "supabase/migrations/517_media.sql": "-- 517 media\n"})
+        with self.assertRaisesRegex(train.MemberDeferred, "qualified transport"):
+            train_migrations.guard_transport(self.repo, self.base, head,
+                                             self.layout, self.row)
+
+    def test_a_transport_without_a_migration_delta_is_left_to_its_qualification(self):
+        _, head = self.merge("lot/1", {"backend/service.ts": "export {};\n"})
+        train_migrations.guard_transport(self.repo, self.base, head,
+                                         self.layout, self.row)
+
     def test_destination_collision_defers_the_member(self):
         _, head = self.merge("lot/1", {
             "supabase/migrations/525_media.sql": "-- 525\n",
@@ -190,7 +202,7 @@ class AllocatorTest(PgTestCase):
         # The promotion reached the remote; the private clone's local branch
         # is still on the base until the landing bookkeeping aligns it.
         _git(self.repo, "update-ref", "refs/heads/develop", base)
-        plan = dict(target="develop", head=head,
+        plan = dict(target="develop", base=base, head=head,
                     migrations=[dict(work_item_id=self.lot["id"],
                                      reserved=525, landed=517)])
         errors = train_migrations.Allocator(self.db).landed(plan, path=self.repo)

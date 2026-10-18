@@ -314,6 +314,27 @@ def audit(path: str, base: str, head: str, target: Layout) -> None:
                          % (sorted(added), expected))
 
 
+def guard_transport(path: str, base: str, head: str, target: Layout, row: dict) -> None:
+    """Refuse a qualified transport that carries an unrenumbered migration.
+
+    A transport receipt freezes its tree and delta, so composition cannot
+    renumber it without invalidating the qualification it was reviewed under.
+    The member is deferred: its migration must be renumbered before the
+    transport is qualified (or it takes the direct-merge path).
+    """
+    changes = _diff(path, base, head)
+    historical = [name for status, name in changes
+                  if status in ("M", "D") and target.under(name)]
+    if historical:
+        raise _rename(row, historical[0],
+                      "a historical migration cannot be changed by composition")
+    added = [name for status, name in changes
+             if status == "A" and target.under(name) and name.endswith(".sql")]
+    if added:
+        raise _rename(row, added[0],
+                      "a qualified transport cannot carry an unrenumbered migration")
+
+
 class Allocator:
     """L122 side of the composition: move a reservation, release it at landing.
 
@@ -387,7 +408,18 @@ class Allocator:
         branch = merge_queue._remote_branch((plan.get("target") or "").strip())
         if not branch:
             return
-        proc = _run(path, "update-ref", "refs/heads/" + branch, plan["head"])
+        ref = "refs/heads/" + branch
+        current = _run(path, "rev-parse", "--verify", "--quiet", ref)
+        if current.returncode == 0:
+            sha = resolutions._text(current).strip()
+            if sha == plan["head"]:
+                return
+            if sha != plan.get("base"):
+                # An unexpected local branch is never rewound; work.merged
+                # decides from the actual ref and reports a refusal.
+                return
+        old = () if current.returncode else (plan.get("base") or "",)
+        proc = _run(path, "update-ref", ref, plan["head"], *old)
         if proc.returncode:
             raise TrainError("cannot align local target %s on %s: %s" % (
                 branch, plan["head"], resolutions._err(proc)[:300]))

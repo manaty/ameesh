@@ -756,7 +756,10 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    le lot qui en modifie une est écarté avec un motif. Les fichiers compagnons
    du même préfixe (rollback, test, banc) sont renommés avec elle, les
    références par nom de fichier et les numéros en commentaire suivent ; les
-   littéraux de code ne changent pas. La réservation L122 est déplacée avant
+   littéraux de code ne changent pas. Un transport qualifié qui porterait une
+   migration ajoutée ou modifiée est refusé et le lot écarté : sa qualification
+   fige l'arbre et le delta, la renumérotation doit donc précéder la
+   qualification. La réservation L122 est déplacée avant
    la publication (journal « before: … »), le plan porte la correspondance
    (`reserved`/`landed`) et le commit final la ligne
    `ameesh-migration: <lot> <ancien> <nouveau>`. Après promotion confirmée,

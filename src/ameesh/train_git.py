@@ -101,6 +101,11 @@ class Repository:
             receipt = (self._transport(branch, row, head, expected=expected)
                        if transports is None or expected is not None else None)
             if receipt is not None:
+                # #2400: a transport freezes its tree and reviewed delta, so
+                # composition cannot renumber the migration it carries.
+                if self.migrations is not None and migration_layout is not None:
+                    train_migrations.guard_transport(
+                        self.clone.path, head, receipt["head"], migration_layout, row)
                 head = receipt["head"]
                 receipts.append(receipt)
                 if expected is not None:
