@@ -469,14 +469,18 @@ class PgTestCase(unittest.TestCase):
             os.unlink(self.turns_log)
 
     # -- attentes ----------------------------------------------------------
-    def wait_for(self, predicate, timeout: float = 10.0, interval: float = 0.1):
+    def wait_for(self, predicate, timeout: float = 10.0, interval: float = 0.1,
+                 msg=None):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             value = predicate()
             if value:
                 return value
             time.sleep(interval)
-        self.fail("condition non remplie après %ss" % timeout)
+        # #2497 : `msg` (appelable) joint l'état observé à l'échec, sans quoi
+        # un rouge de CI sous charge reste muet sur sa cause
+        self.fail("condition non remplie après %ss%s"
+                  % (timeout, "\n" + msg() if msg else ""))
 
     def make_test_key(self, name: str = "test-owner") -> tuple[str, str, str]:
         """Paire de clés de TEST dans le bac à sable — jamais une clé réelle."""
