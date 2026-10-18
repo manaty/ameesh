@@ -120,6 +120,9 @@ CRITICAL_SCOPE = (
                # la porte de fusion hors API, la classe du lot et son classement
                # (#2249 ; ligne perdue dans une composition, restaurée #2374)
                r"(^|/)(merge_pr|lot_class|review)\.py$|"
+               # ce qui entre dans un paquet : la liste calculée des lots
+               # prêts et ses remises (#2496)
+               r"^src/ameesh/packet_candidates\.py$|^scripts/paquet-candidats\.py$|"
                # le report des verdicts acquis sur une tête réalignée (#2442)
                r"^src/ameesh/verdict_carry\.py$|"
                # preuve de famille indépendante des avis (#2265)
