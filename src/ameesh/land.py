@@ -52,6 +52,14 @@ class LandError(RuntimeError):
     """A lot that cannot be landed now: actionable message."""
 
 
+class TransientLandError(LandError):
+    """#2306 : une lecture distante a échoué pour une raison passagère (HTTP
+    5xx, délai, coupure réseau). Le refus tient (fail-closed), mais la même
+    demande peut aboutir au passage suivant : la file garde sa ligne au lieu
+    de l'éjecter. Une réponse malformée, un 4xx ou un manque prouvé restent des
+    `LandError` ordinaires, qui éjectent."""
+
+
 def lock_key(project, target: str) -> str:
     return "%s:%s" % (project.name, merge_queue._remote_branch(target))
 
@@ -88,7 +96,7 @@ def _fire_guard(landing, *, gh=None) -> dict | None:
 
     #2286 : sur un atterrissage local, la garde exige aussi les checks requis
     déclarés du projet sur le gel : la voie file ne contourne pas la porte des
-    checks requis.
+    checks requis. Rend l'éjection, ou None si la voie est libre.
 
     #2333 (canon §11 bis) : la file d'équipe ne contourne pas la règle du
     paquet. La tête de la ligne (`lot/**`, `agent/**`, `review/**`) ne se
@@ -96,8 +104,11 @@ def _fire_guard(landing, *, gh=None) -> dict | None:
     (`integration/**`) ou sous une exception déclarée au journal du lot, pour
     cette tête exacte — et cela **sans dépendre d'un feu** : une ligne déjà en
     file ou `work queue add` (qui ne passe ni par `give` ni par `_act`) est
-    arrêtée ici, sur les voies `local` et `pr`. Rend l'éjection, ou None si la
-    voie est libre."""
+    arrêtée ici, sur les voies `local` et `pr`.
+
+    #2306 : une lecture passagère des checks (5xx, délai) ne prouve pas un
+    manque ; la ligne reste en file et repart au passage suivant, au lieu
+    d'éjecter le lot."""
     from . import fire, packet_guard
     row = landing.row or {}
     try:
@@ -109,9 +120,16 @@ def _fire_guard(landing, *, gh=None) -> dict | None:
                                        "remove %d`) and let the packet carry it, or declare "
                                        "the incident/unblock exception in the lot's note."
                               % landing.lot)
-    ok, why = fire.land_guard(landing.db, landing.lot, landing.row.get("frozen_sha") or "",
-                              repo=landing.project.repo, project=landing.project,
-                              target=landing.row.get("target") or "", gh=gh)
+    try:
+        ok, why = fire.land_guard(landing.db, landing.lot,
+                                  landing.row.get("frozen_sha") or "",
+                                  repo=landing.project.repo, project=landing.project,
+                                  target=landing.row.get("target") or "", gh=gh)
+    except TransientLandError as exc:
+        return landing.retry(
+            "the required checks of %s on the freeze %s cannot be read now (%s)"
+            % (landing.row.get("target") or "?", (landing.row.get("frozen_sha") or "")[:12],
+               exc))
     if ok:
         return None
     return landing.eject(why, "The fire or the required checks no longer authorize this "
@@ -479,6 +497,17 @@ class _Landing:
         self.locks.pop(self.key, None)
         self.release = False
         return {"lot": self.lot, "result": "busy", "error": why}
+
+    def retry(self, why: str) -> dict:
+        """#2306 : un refus passager garde la ligne en file (état `queued`,
+        raison datée) et la rend au passage suivant ; le bail est relâché pour
+        ne pas retarder ce passage, contrairement à `busy` qui le garde."""
+        self.release = True
+        if not self.write(state="queued", reason="%s: retried at the next pass" % why,
+                          note="merge queue of %s: %s, retried" % (self.row["target"], why),
+                          actor=work.SYSTEM_SENDER):
+            return self.busy("lease on %s lost: retry not written" % self.key)
+        return {"lot": self.lot, "result": "retry", "error": why}
 
     def held(self) -> bool:
         """The lease is still ours, renewed, right before a push or a merge."""

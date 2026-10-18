@@ -26,7 +26,8 @@ The reviewed provider entry is:
 e40106ed35a1e1744c016e77f2cf59b07f87969bb7c4b424d26fb08da75e3922
 ```
 
-The entry's imported helper modules are pinned too:
+The entry's imported helper modules are pinned too, along with its separate
+`./runner` export:
 
 ```
 runner-launch-B2zsQ1Dz.js 6df08adc4a27f278878a5f4cde8b551b51e647b922ac7d6591fd62d272ced153
@@ -34,11 +35,14 @@ runner.js                 4e21528dfdb3e92bdce2340945dc4dcb202e4a4af0bbeb8b97585f
 output.js                 4f77ef6da608d36df168c99177e9b527e7145df1418845eba567635e64a4c2a3
 ```
 
-`output.js` is new in 0.2.0-rc.2; the entry imports it, so it is pinned like the
-helper. The 0.2.0 delta adds no Linux `systemd-run` call site: `execFile` still
-runs only `systemctl` queries, and the scope probe and launch keep the reviewed
-`spawnSync`/`spawn` bindings. `node-pty`, `koffi` and `@deepseek-ai/dsh-lazy-require`
-are loaded lazily, without changing the guarded `child_process` bindings.
+The entry imports `runner-launch-B2zsQ1Dz.js` and `output.js`; `runner.js` is
+the separate `./runner` export and is not imported by the entry. Its hash stays
+in the pinned set, harmlessly. `output.js` is new in 0.2.0-rc.2 and is imported
+by the entry, so it is pinned like the other imported helper. The 0.2.0 delta
+adds no Linux `systemd-run` call site: `execFile` still runs only `systemctl`
+queries, and the scope probe and launch keep the reviewed `spawnSync`/`spawn`
+bindings. `node-pty`, `koffi` and `@deepseek-ai/dsh-lazy-require` are loaded
+lazily, without changing the guarded `child_process` bindings.
 
 For the verified entry only, the loader replaces its `child_process` import
 with module-local bindings refusing dsh's native scope probe before any user
@@ -100,19 +104,19 @@ check below reports them): that accepted residual is separate from
 same-process worker threads.
 
 Unavailable protection no longer stops the turn (#1460). A missing dsh package
-or provider, a changed or unreviewed provider (such as `dsh-subprocess-local`
-0.2.0-rc.3 under `/opt/node/lib/node_modules` on the VMs), unavailable source,
-an unexpected module format or export, or an unsupported Node module-hook API
-logs `[ameesh] WARNING: DeepSeek cgroup protection unavailable, running dsh
-without it: …` on stderr, and dsh runs as installed. At startup no hook is
-installed and the preload removes its own option from `NODE_OPTIONS`; a
-profile-local provider failing verification later is loaded unmodified. Its
-tools may then run in native `dsh-subprocess-*` scopes outside the runner
-cgroup: the warning is the only signal, the turn is not `host_not_ready`.
-Misuse of the guard still exits 127 before provider execution (provider
-preloaded or cached, guard not first or loaded with `--import`, asynchronous
-loaders and VM-module flags, a provider in a worker, `SHARE_ENV` with ambient
-preloads), classified `host_not_ready` by the headless runner. Review a
+or provider, a changed or unreviewed provider (a later `dsh-subprocess-local`,
+for example 0.2.0-rc.3, under `/opt/node/lib/node_modules` on the VMs),
+unavailable source, an unexpected module format or export, or an unsupported
+Node module-hook API logs `[ameesh] WARNING: DeepSeek cgroup protection
+unavailable, running dsh without it: …` on stderr, and dsh runs as installed.
+At startup no hook is installed and the preload removes its own option from
+`NODE_OPTIONS`; a profile-local provider failing verification later is loaded
+unmodified. Its tools may then run in native `dsh-subprocess-*` scopes outside
+the runner cgroup: the warning is the only signal, the turn is not
+`host_not_ready`. Misuse of the guard still exits 127 before provider execution
+(provider preloaded or cached, guard not first or loaded with `--import`,
+asynchronous loaders and VM-module flags, a provider in a worker, `SHARE_ENV`
+with ambient preloads), classified `host_not_ready` by the headless runner. Review a
 provider upgrade and its regression results before changing the pin. A
 resident driver reports startup failure; its eventual runner integration must
 retain host-error handling.

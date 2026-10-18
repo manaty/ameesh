@@ -85,6 +85,10 @@ class WorkDependencies(Contract):
         self.db = db
 
     def lock(self):
+        # Les fermetures de lot appellent ce verrou avec la TRANSACTION
+        # (`work_dependencies.lock(tx)`, work.py) : il tient jusqu'au commit.
+        # #2171 N1 : les gestes d'atterrissage ci-dessous, eux, tenaient `db`
+        # (le pilote) et non `tx` — ils utilisent donc `tx.execute(_LOCK)`.
         self.db.execute(_LOCK)
 
     @staticmethod
@@ -153,6 +157,92 @@ class WorkDependencies(Contract):
             FROM work_item_dependencies d JOIN work_items w ON w.id = d.blocker_id
             WHERE d.work_item_id IN (""" + ", ".join(["%s"] * len(ids)) + ")"
             " ORDER BY d.work_item_id, d.blocker_id", tuple(ids))
+
+    @staticmethod
+    def _landing_journal(tx, item_id, note, actor):
+        tx.execute("INSERT INTO work_item_events(work_item_id, state, note, actor, created_at)"
+                   " SELECT id, state, %s, %s, clock_timestamp() FROM work_items WHERE id = %s",
+                   (note, actor, item_id))
+        tx.execute("UPDATE work_items SET updated_at = clock_timestamp() WHERE id = %s", (item_id,))
+
+    def set_landing(self, item_id, vehicle_id, *, until_on, actor):
+        if item_id == vehicle_id:
+            return {"error": "self_landing"}
+        with self.db.transaction() as tx:
+            # #2171 N1 : le verrou est celui de la TRANSACTION. `self.db.execute`
+            # le posait dans une autre session (pilote psql, autocommit) : il
+            # était relâché aussitôt, et le « même verrou que le graphe » était
+            # faux.
+            tx.execute(_LOCK)
+            rows = tx.query("SELECT id, state FROM work_items WHERE id IN (%s, %s)"
+                            " ORDER BY id FOR UPDATE", (item_id, vehicle_id))
+            states = {int(row["id"]): row["state"] for row in rows}
+            if item_id not in states or vehicle_id not in states:
+                return {"error": "unknown_lot"}
+            if states[item_id] in _DONE:
+                return {"error": "finished_lot"}
+            # #2171 N3 : seul un lot en revue peut être parqué ; un lot en
+            # build, bloqué ou en attente d'un humain garde son signal.
+            if states[item_id] != "qa":
+                return {"error": "not_in_review"}
+            if states[vehicle_id] in _DONE:
+                return {"error": "finished_vehicle"}
+            if states[vehicle_id] == "blocked":
+                return {"error": "blocked_vehicle"}
+            # #1945, revue B : l'admission est ÉPINGLÉE au gel du véhicule. La
+            # tête est lue dans la même transaction que l'écriture ; sans gel,
+            # rien ne peut être épinglé et la déclaration est refusée.
+            # #2171 N2 : à instants égaux, le dernier gel est le (at, id) le plus
+            # grand — même règle que planned_waits.latest_freeze.
+            freezes = tx.query("""
+                SELECT sha FROM work_item_milestones
+                 WHERE work_item_id = %s AND kind = 'frozen'
+                   AND btrim(coalesce(sha, '')) <> ''
+                 ORDER BY at DESC, id DESC LIMIT 1""", (vehicle_id,))
+            if not freezes:
+                return {"error": "no_freeze"}
+            pinned = freezes[0]["sha"].strip()
+            tx.execute("""
+                INSERT INTO work_landings(work_item_id, vehicle_id, pinned_sha, until_on, created_by)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (work_item_id) DO UPDATE
+                    SET vehicle_id = EXCLUDED.vehicle_id,
+                        pinned_sha = EXCLUDED.pinned_sha,
+                        until_on = EXCLUDED.until_on,
+                        created_by = EXCLUDED.created_by,
+                        created_at = clock_timestamp()
+                """, (item_id, vehicle_id, pinned, until_on, actor))
+            self._landing_journal(
+                tx, item_id,
+                "Landing declared: vehicle #%d until %s (frozen %s)"
+                % (vehicle_id, until_on, pinned[:12]), actor)
+            return {"landed": True}
+
+    def clear_landing(self, item_id, *, actor):
+        with self.db.transaction() as tx:
+            tx.execute(_LOCK)                 # #2171 N1 : même verrou, dans la transaction
+            removed = tx.query("DELETE FROM work_landings WHERE work_item_id = %s"
+                               " RETURNING vehicle_id", (item_id,))
+            if not removed:
+                return False
+            self._landing_journal(
+                tx, item_id, "Landing cleared: vehicle #%d" % int(removed[0]["vehicle_id"]), actor)
+            return True
+
+    def landings_for(self, item_ids):
+        ids = sorted({int(i) for i in item_ids})
+        if not ids:
+            return []
+        return self.db.query("""
+            SELECT l.work_item_id, l.vehicle_id, l.pinned_sha,
+                   l.until_on::text AS until_on,
+                   l.created_by,
+                   extract(epoch FROM l.created_at)::float8 AS created_ts,
+                   w.state AS vehicle_state,
+                   w.state NOT IN ('merged', 'promoted', 'closed') AS open
+            FROM work_landings l JOIN work_items w ON w.id = l.vehicle_id
+            WHERE l.work_item_id IN (""" + ", ".join(["%s"] * len(ids)) + ")"
+            " ORDER BY l.work_item_id", tuple(ids))
 
     def release_unassigned(self, item_ids, *, actor):
         """#1668 : un dépendant NON ASSIGNÉ dont la dernière attente vient de

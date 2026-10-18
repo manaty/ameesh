@@ -849,8 +849,8 @@ class MapTest(unittest.TestCase):
 
     def test_always_list_sorted_and_known(self):
         always = plan.read_list(plan.ALWAYS_FILE, parts.modules())
-        self.assertEqual(always, ["test_339_orphan_settle", "test_cluster",
-                                  "test_events_attach", "test_l31_orphans",
+        self.assertEqual(always, ["test_2340_auditeur_role", "test_339_orphan_settle",
+                                  "test_cluster", "test_events_attach", "test_l31_orphans",
                                   "test_l50_group_orphan_work_items",
                                   "test_l72_panne_de_base", "test_migrations"])
 
@@ -3061,10 +3061,10 @@ class WorkflowTest(unittest.TestCase):
 
     def test_plan_job_passes_the_pushed_range(self):
         # #833: a push is planned from github.event.before, not HEAD^1 alone ;
-        # #1343 : une demande de gel est planifiée depuis la base du payload
-        # (`pull_request.base.sha`), la composition même du merge-ref vérifié.
+        # #2328 : la pointe cible figée dans la description de l'étiquette
+        # nomme la composition, même si pull_request.base.sha est périmé.
         self.assertIn("AMEESH_CI_BASE: ${{ github.event_name == 'pull_request' && "
-                      "github.event.pull_request.base.sha || (github.event_name == 'push' && "
+                      "github.event.label.description || (github.event_name == 'push' && "
                       "github.event.before || 'HEAD^1') }}", self.text)
         self.assertIn('--base "$AMEESH_CI_BASE" --ref "$AMEESH_CI_REF"', self.text)
 
@@ -3162,7 +3162,7 @@ class WorkflowTest(unittest.TestCase):
     def test_label_gate_exact_frozen_sha_and_composition(self):
         # #1343 : le job plan ne teste que la composition demandée — étiquette
         # exacte `ci-lot/ci-full-<40hex>`, SHA égal à `pull_request.head.sha`,
-        # checkout = merge-ref composé de la base du payload et de cette tête.
+        # checkout = merge-ref composé de la base de l'étiquette et de cette tête.
         # Un refus rougit le check requis sans exécuter de tests, jamais un vert
         # sur une autre tête.
         self.assertIn("^ci-(lot|full)-[0-9a-f]{40}$", self.text)
@@ -3200,6 +3200,9 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("run-name:", self.text)
         self.assertIn("format(' [PR #{0} {1} base {2}]'", self.text)
         self.assertIn("github.event.label.name", self.text)
+        run_name = next(line for line in self.text.splitlines() if line.startswith("run-name:"))
+        self.assertIn("github.event.label.description", run_name)
+        self.assertNotIn("github.event.pull_request.base.sha", run_name)
 
 
 class LotFreezePlanTest(unittest.TestCase):
@@ -3315,7 +3318,7 @@ class LotFreezePlanTest(unittest.TestCase):
         self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
 
     def test_cli_mode_lot_sans_base_refuse(self):
-        # sans la base du payload, la sélection porterait sur HEAD^1 et
+        # sans la base demandée, la sélection porterait sur HEAD^1 et
         # manquerait des modules du lot : la CLI refuse plutôt que de deviner.
         err = io.StringIO()
         with contextlib.redirect_stderr(err):

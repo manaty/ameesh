@@ -250,10 +250,17 @@ def _required_refusal(slug: str, target: str, project, rollup, *, head: str = ""
     de `gh pr view` ne porte ni application ni source, donc un statut de commit
     ou un homonyme d'une autre application ne satisfait pas l'exigence. Une
     protection ou une source illisible sans déclaration refuse : le geste hors
-    API n'est jamais plus faible que la file. Un transport local n'a pas de
-    protection de branche, il n'y a donc rien à exiger."""
-    if not slug or not _GITHUB_KEY.match(slug):
+    API n'est jamais plus faible que la file. Un transport local (chemin réel
+    existant, celui que lie `_bind_repo_identity`) n'a pas de protection de
+    branche, il n'y a donc rien à exiger ; un slug vide ou malformé n'est ni
+    l'un ni l'autre et refuse, sans s'en remettre à l'appelant (#2289)."""
+    ident = _slug_identity(slug)
+    if ident is None:
+        return ("the required checks cannot be proven: the repository %r is neither "
+                "owner/repo nor a local transport" % ((slug or "").strip(),))
+    if ident[0] == "path":
         return ""
+    slug = ident[1]
     if not target:
         return "the required checks of the target cannot be proven: no target branch"
     try:
