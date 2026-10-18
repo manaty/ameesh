@@ -43,6 +43,47 @@ class TrainCiTest(unittest.TestCase):
         self.assertEqual((result["status"], result["complete"]), ("green", True))
         self.assertEqual(result["workflows"][0]["run"], 9)
 
+    def test_gh_without_slurp_reads_concatenated_pages(self):
+        """#2295 : le gh 2.45 de l'hôte refuse --slurp ; le repli sans --slurp
+        décode les pages concaténées et rend la même preuve exacte."""
+        def gh(args):
+            self.calls.append(args)
+            if "--slurp" in args:
+                return types.SimpleNamespace(returncode=1, stdout="",
+                                             stderr="unknown flag: --slurp")
+            if "/contents/" in args[-1]:
+                payload = dict(type="file", sha=self.blob)
+            elif "/jobs?" in args[-1]:
+                payload = dict(jobs=self.jobs)
+            else:
+                # deux pages concaténées, comme `--paginate` sans `--slurp`
+                return types.SimpleNamespace(
+                    returncode=0, stderr="",
+                    stdout=json.dumps(dict(workflow_runs=[self.run]))
+                    + json.dumps(dict(workflow_runs=[dict(self.run, id=10,
+                                                          head_sha="c" * 40)])))
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+        ci = train_ci.GitHub("o/r", (train_ci.Workflow(
+            ".github/workflows/tests.yml", ("suite",), "push",
+            sources=((".github/workflows/tests.yml", "d" * 40),)),), gh=gh)
+        result = ci.read(self.plan)
+        self.assertEqual((result["status"], result["complete"]), ("green", True))
+        self.assertEqual(result["workflows"][0]["run"], 9)
+        self.assertTrue(any("--slurp" in c for c in self.calls), self.calls)
+        self.assertTrue(any("--slurp" not in c for c in self.calls), self.calls)
+
+    def test_other_gh_failure_is_not_retried_without_slurp(self):
+        """#2295 : un échec sans rapport avec --slurp garde son diagnostic."""
+        def gh(args):
+            self.calls.append(args)
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="HTTP 403")
+        ci = train_ci.GitHub("o/r", (train_ci.Workflow(
+            ".github/workflows/tests.yml", ("suite",), "push",
+            sources=((".github/workflows/tests.yml", "d" * 40),)),), gh=gh)
+        with self.assertRaisesRegex(train.TrainError, "cannot read"):
+            ci.read(self.plan)
+        self.assertEqual(len(self.calls), 1)
+
     def test_other_branch_other_head_other_workflow_cannot_vouch(self):
         for key, value in (("head_branch", "other"), ("head_sha", "c" * 40),
                            ("path", ".github/workflows/other.yml"), ("event", "workflow_dispatch")):

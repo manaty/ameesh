@@ -8,11 +8,39 @@ run can stand in for complete CI. This adapter does not poll or rerun.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import re
 from urllib.parse import quote
 
 from . import land, resolutions
 from .train import TrainError
+
+
+def _slurp_unsupported(proc) -> bool:
+    """#2295 : le gh 2.45 de l'hôte ne connaît pas `--slurp`."""
+    return "unknown flag: --slurp" in ((proc.stderr or "") + (proc.stdout or ""))
+
+
+def _json_pages(proc) -> list:
+    """#2295 : pages concaténées de `gh api --paginate` sans `--slurp`.
+
+    Chaque page doit être un objet JSON, comme les pages slurpées que rend
+    `_api` (l'appelant lit `page.get(...)`).
+    """
+    text, pages, at = proc.stdout or "", [], 0
+    decoder = json.JSONDecoder()
+    while True:
+        while at < len(text) and text[at].isspace():
+            at += 1
+        if at >= len(text):
+            return pages
+        try:
+            page, at = decoder.raw_decode(text, at)
+        except ValueError as exc:
+            raise TrainError("cannot read exact train CI evidence: %s" % exc) from exc
+        if not isinstance(page, dict):
+            raise TrainError("cannot read exact train CI evidence: unexpected page")
+        pages.append(page)
 
 
 @dataclass(frozen=True)
@@ -81,6 +109,11 @@ class GitHub:
 
     def _api(self, path):
         proc = self.gh(["api", "--paginate", "--slurp", "repos/%s/%s" % (self.slug, path)])
+        if proc.returncode and _slurp_unsupported(proc):
+            # #2295 : sans --slurp, `--paginate` concatène les pages JSON.
+            proc = self.gh(["api", "--paginate", "repos/%s/%s" % (self.slug, path)])
+            if not proc.returncode:
+                return _json_pages(proc)
         if proc.returncode:
             raise TrainError("cannot read exact train CI evidence")
         return land._json(proc, "train CI API", list)
