@@ -111,7 +111,8 @@ CRITICAL_SCOPE = (
                r"(^|/)scripts/(ci|deploy|compute|test)|(^|/)(Dockerfile|pyproject\.toml)$|"
                r"(^|/)host[-_]|(^|/)(hostcheck|exploitation|relay|serve|progress_serve|"
                r"relocation|placement|merge_queue|land|fire)\.py$|"
-               # la classe du lot, son classement et la fusion hors API (#2249)
+               # la porte de fusion hors API, la classe du lot et son classement
+               # (#2249 ; ligne perdue dans une composition, restaurée #2374)
                r"(^|/)(merge_pr|lot_class|review)\.py$|"
                # preuve de famille indépendante des avis (#2265)
                r"^src/ameesh/(review_lot|registry)\.py$"),

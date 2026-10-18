@@ -2130,6 +2130,13 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
     son jalon restent, la rectification est journalisée. Jalon `closed` ; rien
     ne reste ouvert par oubli.
 
+    Un lot de relecture après fusion (`issue_ref = review-after-merge:#<lot>`)
+    n'est livrable que lorsque les avis dus sur la fusion sont rendus : la
+    marque structurée de la relecture (au journal du lot fusionné) est relue
+    et les verdicts `ok` du lot source comptés à son sha
+    (`review_lot.guard_delivery`, #2374). Un lot antérieur, sans marque, garde
+    l'avis historique (un).
+
     Dans la MÊME transaction, les agents des lots qui déclarent ce lot en
     prérequis explicite et dont c'était la dernière attente reçoivent un
     courrier durable (L385 suite) : l'abandon libère l'attente sans prouver la
@@ -2188,6 +2195,11 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
                             "nothing to close done" % (item_id, state))
     elif state in MERGED_STATES:
         raise WorkError("lot %s already %s: nothing to close" % (item_id, state))
+    if delivered:
+        # #2374 : la clôture d'une relecture après fusion n'est pas un simple
+        # constat — les avis dus sur la fusion sont comptés avant d'écrire.
+        from . import review_lot
+        review_lot.guard_delivery(db, item)
     if abandoned:
         reason, base = "abandoned", "abandoned"
     elif superseded_by is not None:
