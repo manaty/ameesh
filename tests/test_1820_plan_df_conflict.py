@@ -138,6 +138,22 @@ class PlanPathConflictTest(unittest.TestCase):
             pv.remote_plan_path(self._plan_path(self.plan_rel), self.repo, head=head),
             self.plan_rel)
 
+    def test_parent_absent_sous_un_arbre_ne_confond_pas_les_voisins(self):
+        os.makedirs(os.path.join(self.repo, "tracked"))
+        _write(self._plan_path("tracked/keep.txt"), "keep\n")
+        _git(self.repo, "add", "tracked")
+        _git(self.repo, "commit", "-q", "-m", "tracked directory")
+        head = _git(self.repo, "rev-parse", "HEAD")
+        relative = "tracked/new/plan.json"
+        self.assertEqual(
+            pv.remote_plan_path(self._plan_path(relative), self.repo, head=head),
+            relative)
+        # Le filtrage des voisins doit conserver le vrai parent-fichier.
+        with self.assertRaises(pv.PrevalidationError) as caught:
+            pv.remote_plan_path(self._plan_path("tracked/keep.txt/plan.json"),
+                                self.repo, head=head)
+        self.assertEqual(caught.exception.cause, "plan-path-conflict")
+
 
 class ValidateRefusalTest(unittest.TestCase):
     """Le geste complet refuse avant l'offload, avec la cause de l'opérateur."""

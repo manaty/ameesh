@@ -519,7 +519,9 @@ def remote_plan_path(plan_path: str, root: str, *, head: str = "",
         parts = remote.split("/")
         parents = ["/".join(parts[:cut]) for cut in range(1, len(parts))]
         for _mode, kind, path in _tree_entries(root, head, parents, runner=runner):
-            if kind != "tree":
+            # Plusieurs pathspecs peuvent faire développer un arbre par Git :
+            # ses autres enfants ne sont pas des parents du plan.
+            if path in parents and kind != "tree":
                 qualifie = {"blob": "un fichier",
                             "commit": "un sous-module"}.get(kind, "un objet " + kind)
                 raise PrevalidationError(
