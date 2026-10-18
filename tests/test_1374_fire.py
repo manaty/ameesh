@@ -264,6 +264,10 @@ class ReviewGateTest(unittest.TestCase):
             klass = lot_class.class_of_paths([canon], "ameesh", [path])
             self.assertEqual(klass["class"], "sensitive", (path, klass))
             self.assertFalse(klass["doubt"], (path, klass))
+            # #2374 : ces trois chemins comptent pour la porte, même quand le
+            # canon les classe par une règle groupée (le motif de secours les
+            # reconnaît et exige les deux familles).
+            self.assertEqual(merge_queue.required_verdicts(klass), 2, (path, klass))
         critical = lot_class.class_of_paths(
             [canon], "ameesh", [self.CRITICAL_CANON_PATH])
         self.assertEqual(critical["class"], "sensitive", critical)

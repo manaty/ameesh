@@ -183,7 +183,7 @@ class ReviewAfterMergeTest(LocalLandTest):
             return {"lot": kw["lot"], "id": 900, "created": True, "class": "light",
                     "why": "ouvert"}
 
-        with mock.patch.object(merge_queue, "_class_of",
+        with mock.patch.object(review_lot, "class_at_merge",
                                return_value={"class": "light", "why": "policy of ameesh"}), \
                 mock.patch.object(review_lot, "open_after_merge", side_effect=opened):
             out = self.land(4)
@@ -205,7 +205,7 @@ class ReviewAfterMergeTest(LocalLandTest):
     def test_a_doubt_or_a_higher_class_opens_nothing(self):
         """La classe relue n'est pas `light` : rien n'est ouvert."""
         self.queued(4)
-        with mock.patch.object(merge_queue, "_class_of",
+        with mock.patch.object(review_lot, "class_at_merge",
                                return_value={"class": "sensitive", "why": "doute"}):
             out = self.land(4)
         self.assertEqual(out["result"], "landed", out)

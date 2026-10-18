@@ -292,6 +292,51 @@ def diff_range(repo: str, sha: str, target: str | None = None) -> tuple[str, str
     return (parents[0] if parents else empty), sha
 
 
+def lot_diff_range(repo: str, sha: str, target: str | None = None) -> tuple[str, str] | None:
+    """The (base, head) of the **lot's own** change brought by `sha` (#2374).
+
+    `diff_range` reads what the merge made enter the target: a merge whose tree
+    equals its first parent has no diff there, even though the lot changed
+    files that another commit had already carried (a rebase, a cherry-pick, an
+    adaptation merged first). Classifying that empty diff would say « light »
+    without ever reading the lot.
+
+    The lot's delta is `merge-base(first parent, lot head)..lot head`: the
+    commit the merge brought in (its second parent), or `sha` itself when the
+    merge record is the branch tip. None without a merge commit to anchor it —
+    never a guess."""
+    if not has_commit(repo, sha):
+        return None
+    merge = ""
+    if len(_parents(repo, sha)) >= 2:
+        merge = sha
+    else:
+        tgt = _target(repo, target)
+        if tgt and _is_ancestor(repo, sha, tgt):
+            merges = (_git(repo, "rev-list", "--ancestry-path", "--merges", "--reverse",
+                           "%s..%s" % (sha, tgt), env_extra=NO_LAZY_FETCH) or "").split()
+            for candidate in merges:
+                first = _parents(repo, candidate)[:1]
+                if first and not _is_ancestor(repo, sha, first[0]):
+                    merge = candidate
+                    break
+    parents = _parents(repo, merge) if merge else []
+    if len(parents) < 2:
+        return None
+    base = (_git(repo, "merge-base", parents[0], parents[1],
+                 env_extra=NO_LAZY_FETCH) or "").strip()
+    return (base or parents[0], parents[1])
+
+
+def diff_paths(repo: str, base: str, head: str) -> list[str] | None:
+    """The paths changed between two commits, or None when the diff is not
+    readable (the caller then doubts, never concludes « light »)."""
+    text = _git(repo, "diff", "--name-only", "--no-renames", base, head)
+    if text is None:
+        return None
+    return [line for line in text.splitlines() if line]
+
+
 def diff_stat(repo: str, sha: str, target: str | None = None) -> dict | None:
     """The size of the change merged by `sha` (`diff_range`): `{diff_files,
     diff_insertions, diff_deletions, measured_size}`, or None when the

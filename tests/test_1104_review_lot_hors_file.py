@@ -90,6 +90,8 @@ class ClassAtMergeRuleTest(unittest.TestCase):
                 mock.patch("ameesh.plan_git.latest_freeze",
                            return_value={"kind": "frozen", "sha": "f" * 40}), \
                 mock.patch("ameesh.lot_measures.diff_range", **diff), \
+                mock.patch("ameesh.lot_measures.diff_paths",
+                           return_value=["docs/preuve.md"]), \
                 mock.patch.object(review_lot.lot_class, "of_lot") as of_lot:
             out = review_lot.class_at_merge(None, 1, item=dict(self.ITEM), sha="s" * 40)
         return out, of_lot
@@ -248,6 +250,27 @@ class SweepWitnessTest(_Witness):
         self.assertIn("23:59 Europe/Paris", item["body"])
         self.assertIn("codex", item["body"])       # famille opposée à deepseek
 
+    def test_une_fusion_light_sur_la_porte_de_fusion_ouvre_deux_avis(self):
+        """#2374 : `merge_pr.py` est classé `light` par le canon, mais il est
+        la porte de fusion (`CRITICAL_SCOPE`) : la relecture après fusion doit
+        être sensible et demander deux familles, pas un avis léger."""
+        lot = self.lot()
+        self.frozen_on_branch(lot, "lot/2374-porte", name="src/ameesh/merge_pr.py")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "ameesh-work: %d" % lot,
+             "lot/2374-porte")
+        report = {r["work_item"]: r for r in plan_git.sync_branches(
+            self.db, host=self.cfg.host)["results"]}
+        self.assertEqual(report[lot]["result"], "merged")
+        rows = self.review_lots(lot)
+        self.assertEqual(len(rows), 1, rows)
+        body = work.get(self.db, rows[0]["id"])["body"]
+        self.assertIn("Classe : sensitive", body)
+        self.assertIn("**porte de fusion** : deux avis indépendants", body)
+        self.assertIn("deux familles distinctes", body)
+        self.assertIn("Avis requis : **2**", body)
+        self.assertNotIn("§2, lot léger", body)
+
     def test_une_fusion_sensible_n_ouvre_rien(self):
         """Le piège du gel devenu ancêtre : `cible..gel` est vide après la
         fusion et se lirait « light ». La classe est lue sur le diff que la
@@ -257,6 +280,36 @@ class SweepWitnessTest(_Witness):
         _git(self.repo, "checkout", "-q", "develop")
         _git(self.repo, "merge", "-q", "--no-ff", "-m", "ameesh-work: %d" % lot,
              "lot/1104-sensible")
+        report = {r["work_item"]: r for r in plan_git.sync_branches(
+            self.db, host=self.cfg.host)["results"]}
+        self.assertEqual(report[lot]["result"], "merged")
+        self.assertEqual(self.review_lots(lot), [])
+
+    def test_une_fusion_sans_delta_ne_se_classe_pas_light_sur_un_diff_vide(self):
+        """#2374, second cas (#2340) : l'arbre du merge égale son premier
+        parent (le delta du lot est déjà porté par un autre commit de la
+        cible). Le diff de fusion est vide ; la classe se relit sur le delta
+        du lot — `db/x.sql` est sensible, donc rien ne s'ouvre — au lieu de
+        conclure « light » sur le vide."""
+        lot = self.lot()
+        sha = self.frozen_on_branch(lot, "lot/2374-vide", name="db/x.sql")
+        _git(self.repo, "checkout", "-q", "develop")
+        # le contenu entre d'abord par cherry-pick : le merge qui suit n'ajoute
+        # aucun fichier (arbre du merge = arbre du premier parent)
+        # Une cible divergente empêche le cherry-pick de réutiliser le SHA du
+        # gel si les deux commits sont créés dans la même seconde.
+        _git(self.repo, "commit", "-q", "--allow-empty", "-m", "cible divergente")
+        _git(self.repo, "cherry-pick", sha)
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "ameesh-work: %d" % lot,
+             "lot/2374-vide")
+        merged = _git(self.repo, "rev-parse", "HEAD")
+        self.assertEqual(_git(self.repo, "rev-parse", "HEAD^2"), sha)
+        self.assertEqual(_git(self.repo, "rev-parse", "HEAD^{tree}"),
+                         _git(self.repo, "rev-parse", "HEAD^1^{tree}"))
+        klass = review_lot.class_at_merge(self.db, lot, repo=self.repo,
+                                         target="develop", sha=merged)
+        self.assertEqual(klass["class"], "sensitive", klass)
+        self.assertFalse(klass.get("doubt"), klass)
         report = {r["work_item"]: r for r in plan_git.sync_branches(
             self.db, host=self.cfg.host)["results"]}
         self.assertEqual(report[lot]["result"], "merged")
@@ -308,6 +361,27 @@ class CatchUpWitnessTest(_Witness):
         third = plan_git.sync_branches(self.db, host=self.cfg.host)
         self.assertEqual(third["review_catch_up"]["opened"], 0)
         self.assertEqual(len(self.review_lots(lot)), 1)
+
+    def test_un_light_critique_non_ouvert_reste_reessayable(self):
+        """#2374 : l'échec d'ouverture d'une relecture sensible (chemin
+        critique classé light) ne doit pas devenir terminal — la classe du
+        diff fusionné reste `light`, la relecture à deux avis reste due."""
+        lot = self.merged_lot("porte de fusion non ouverte")
+        klass = {"class": "light", "why": "policy",
+                 "files": [{"path": "src/ameesh/merge_pr.py", "class": "light"}]}
+        with mock.patch.object(review_lot, "class_at_merge", return_value=klass), \
+                mock.patch.object(review_lot.work, "add",
+                                  side_effect=work.WorkError("refusé")):
+            first = review_lot.catch_up(self.db, retry_s=0)
+        self.assertEqual((first["examined"], first["missing"], first["attempted"],
+                          first["terminal"]), (1, 1, 1, 0), first)
+        self.assertEqual(self.review_lots(lot), [])
+        with mock.patch.object(review_lot, "class_at_merge", return_value=klass):
+            second = review_lot.catch_up(self.db, retry_s=0)
+        self.assertEqual((second["examined"], second["opened"]), (1, 1), second)
+        body = work.get(self.db, self.review_lots(lot)[0]["id"])["body"]
+        self.assertIn("Classe : sensitive", body)
+        self.assertIn("Avis requis : **2**", body)
 
     def test_un_lot_deja_fusionne_reprend_l_ouverture(self):
         lot = self.lot()
@@ -569,6 +643,29 @@ class CatchUpWitnessTest(_Witness):
                          review_lot.TERMINAL_PREFIX + str(lot))]
         self.assertEqual(len(terminals), 1, terminals)
         self.assertIn("doute", str(terminals[0].get("note") or ""))
+
+    def test_les_tentatives_anciennes_comptent_malgre_200_evenements(self):
+        """#1448 N2 : `attempts()` ne lisait que les 200 derniers événements ;
+        un lot très bavard remettait son compteur de tentatives à zéro et
+        retentait sans fin au lieu de devenir terminal. Le compteur porte sur
+        les seules notes de tentative du lot, aussi anciennes soient-elles."""
+        lot = self.merged_lot("doute bavard")
+        for _ in range(review_lot.CATCH_UP_MAX_ATTEMPTS - 1):
+            out = review_lot.catch_up(self.db, retry_s=0)
+            self.assertEqual((out["examined"], out["attempted"], out["terminal"]),
+                             (1, 1, 0), out)
+        # Bruit postérieur : sans la correction, les marques de tentative
+        # sortent de la fenêtre des 200 derniers événements.
+        self.db.execute(
+            "INSERT INTO work_item_events (work_item_id, state, note, actor)"
+            " SELECT %s, 'merged', 'bruit ' || g, 'témoin'"
+            "   FROM generate_series(1, 250) g", (lot,))
+        last = review_lot.catch_up(self.db, retry_s=0)
+        self.assertEqual((last["examined"], last["attempted"], last["terminal"]),
+                         (1, 0, 1), last)
+        after = review_lot.catch_up(self.db, retry_s=0)
+        self.assertEqual(after["examined"], 0, after)
+        self.assertEqual(self.review_lots(lot), [])
 
     def test_deux_executeurs_ne_doublent_pas_la_relecture(self):
         """Concurrence entre exécuteurs : l'autre exécuteur ouvre la relecture
