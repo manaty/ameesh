@@ -397,7 +397,8 @@ class DynamicGitHubTest(unittest.TestCase):
 
     def setUp(self):
         self.head, self.tree = "a" * 40, "b" * 40
-        self.plan = dict(head=self.head, tree=self.tree, branch="integration/train-test")
+        self.plan = dict(head=self.head, tree=self.tree, base="c" * 40,
+                         branch="integration/train-test")
         self.due = train_ci.DueWorkflow(
             ".github/workflows/backend-suite.yml", "lot/backend-suite")
         self.sources = {
@@ -551,12 +552,31 @@ class DynamicGitHubTest(unittest.TestCase):
         with self.assertRaisesRegex(train.TrainError, "skipped or interrupted"):
             self.ci().read(self.plan)
 
-    def test_remote_source_check_runs_once_per_head(self):
+    def test_a_tolerated_job_that_ran_and_failed_is_red(self):
+        """N2 de la relecture #2503 : la suite fautive reste nommable."""
+        self.due = train_ci.DueWorkflow(".github/workflows/desktop-suite.yml",
+                                        "lot/desktop-suite")
+        self.contract.due = (self.due,)
+        self.runs[0].update(path=self.due.path, conclusion="failure")
+        self.jobs = [
+            dict(id=19, name="desktop", status="completed", conclusion="success"),
+            dict(id=20, name="Desktop suite (windows-latest)", status="completed",
+                 conclusion="failure"),
+        ]
+        result = self.ci().read(self.plan)
+        self.assertEqual((result["status"], result["complete"]), ("red", True))
+        self.assertEqual([item["workflow"] for item in result["workflows"]],
+                         [self.due.path])
+
+    def test_remote_source_check_runs_once_per_head_and_base(self):
+        """N1 de la relecture #2503 : la preuve dépend aussi de la base."""
         ci = self.ci()
         ci.read(self.plan)
         self.calls.clear()
         ci.read(self.plan)
         self.assertFalse(any("/contents/" in call[-1] for call in self.calls))
+        ci.read(dict(self.plan, base="d" * 40))
+        self.assertTrue(any("/contents/" in call[-1] for call in self.calls))
 
     def test_remote_source_check_refuses_a_changed_shared_blob(self):
         original = self.gh

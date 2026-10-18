@@ -339,10 +339,13 @@ class GitHub:
         conditional cannot be covered by the old list of green job names.
         This is read-only and performed before dispatch and before using CI.
         A long packet CI re-reads the same plan; the successful check of an
-        exact head is remembered on the contract, never re-fetched per poll.
+        exact (head, base) is remembered on the contract, never re-fetched per
+        poll. The base is part of the key: the due set and its sources are
+        resolved against it (#2503, N1), so a changed base is a new proof.
         """
         verified = getattr(self.workflows, "verified_heads", None)
-        if verified is not None and plan["head"] in verified:
+        key = (plan["head"], plan["base"]) if verified is not None else None
+        if verified is not None and key in verified:
             return
         for path, blob in sorted(self._sources(plan).items()):
             pages = self._api("contents/%s?ref=%s" % (quote(path, safe="/"), plan["head"]))
@@ -359,7 +362,7 @@ class GitHub:
                 raise TrainError("due suite workflow missing at the train head: %s"
                                  % workflow.path)
         if verified is not None:
-            verified.add(plan["head"])
+            verified.add(key)
 
     def start(self, plan):
         """Called once, after durable ci-intent. Push contracts need no dispatch.
@@ -425,7 +428,10 @@ class GitHub:
                     if job.get("status") != "completed" \
                             or job.get("conclusion") not in ("success", "failure"):
                         raise TrainError("required suite job missing, skipped or interrupted")
-                failed = any(job["conclusion"] == "failure" for job in required)
+                # A tolerated job is tolerated when *skipped by design*; if it
+                # actually ran and failed, the run is red and this suite is the
+                # faulty one (N2): a generic conclusion mismatch would hide it.
+                failed = any(job.get("conclusion") == "failure" for job in jobs)
             else:
                 failed = False
                 for required in workflow.jobs:
@@ -437,9 +443,9 @@ class GitHub:
                         raise TrainError("required full-suite job missing, skipped or interrupted")
                     failed = failed or found[0]["conclusion"] == "failure"
             if failed != (run["conclusion"] == "failure"):
-                # A failed ancillary job with all test jobs green is not
-                # evidence against a lot; nor is an allowed failing test
-                # hidden behind a successful workflow.
+                # A red run with no proved failing job (an ancillary failure
+                # for a static suite) names no culpable lot; nor is a failed
+                # required job hidden behind a successful workflow.
                 raise TrainError("workflow conclusion does not prove full-suite job outcome")
             red = red or failed
             evidence.append(dict(workflow=workflow.path, run=run["id"], attempt=attempt,

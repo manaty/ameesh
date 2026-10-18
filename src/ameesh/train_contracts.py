@@ -110,9 +110,10 @@ class Nexlink:
     def __init__(self):
         self._resolved_key = None
         self._resolved = ()
-        #: #2503: successful remote source checks by exact head; a long packet
-        #: CI is re-read at each service step and must not re-fetch the shared
-        #: blobs and the due workflow existence at every poll.
+        #: #2503: successful remote source checks by exact (head, base); the
+        #: due set and the sources are resolved against the base, so a changed
+        #: base is a new proof. A long packet CI is re-read at each service
+        #: step and must not re-fetch the shared blobs at every poll.
         self.verified_heads = set()
 
     def digest(self):
