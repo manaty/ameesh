@@ -8601,6 +8601,7 @@ class Runner:
                     log_async("work item #%s delivered: %s%s" % (
                         entry["work_item"], entry["detail"],
                         " [dry-run]" if entry["result"] == "would-merge" else ""))
+            self.carry_once(db)
             self.fire_once(db)
             if not self.dry_run:
                 self.measure_once(db)
@@ -8620,6 +8621,30 @@ class Runner:
                     db.close()
                 except Exception:
                     pass
+
+    def carry_once(self, db) -> None:
+        """#2442 : reporte sur la tête gelée les verdicts d'une tête dont elle
+        n'est qu'un réalignement mécanique sur la cible, avant le passage du
+        feu qui lit la porte des avis. Ne lève jamais ; une même erreur n'est
+        dite qu'une fois."""
+        from . import verdict_carry
+        try:
+            report = verdict_carry.run_pass(fresh_radar(self.cfg), db, dry_run=self.dry_run)
+        except Exception as exc:  # jamais fatal pour l'exécuteur
+            report = [{"lot": "?", "result": "error",
+                       "detail": "%s: %s" % (type(exc).__name__, exc)}]
+        seen = getattr(self, "_carry_errors", set())
+        errors = set()
+        for entry in report:
+            if entry.get("result") not in verdict_carry.LOUD:
+                continue
+            line = "verdict carry: lot #%s %s" % (entry["lot"], verdict_carry.describe(entry))
+            if entry["result"] == "error":
+                errors.add(line)
+                if line in seen:
+                    continue
+            log_async(line)
+        self._carry_errors = errors
 
     def fire_once(self, db) -> None:
         """#1374 : le passage du feu du pilote — arme l'auto-fusion des lots
