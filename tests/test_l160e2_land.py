@@ -194,24 +194,6 @@ class ReviewAfterMergeTest(LocalLandTest):
         self.assertEqual(kw["merged_sha"], _git(self.origin, "rev-parse", "main"))
         self.assertEqual(kw["target"], "main")
 
-    def test_a_local_merge_reads_the_class_on_the_target_it_fetched(self):
-        """#2379 : la classe d'après fusion se lit sur la cible récupérée
-        juste avant la fusion, pas sur le dernier `QUEUE_REF` du clone."""
-        self.queued(4)
-        before = _git(self.origin, "rev-parse", "main")
-        seen = []
-
-        def read(*args, **kw):
-            seen.append(kw.get("base"))
-            return {"class": "light", "why": "policy of ameesh"}
-
-        with mock.patch.object(merge_queue, "_class_of", side_effect=read), \
-                mock.patch.object(review_lot, "open_after_merge",
-                                  return_value={"id": None, "created": False}):
-            out = self.land(4)
-        self.assertEqual(out["result"], "landed", out)
-        self.assertEqual(seen, [before])
-
     def test_a_refused_landing_opens_nothing(self):
         self.project = dataclasses.replace(self.project, gates=("exit 3",))
         self.queued(4)

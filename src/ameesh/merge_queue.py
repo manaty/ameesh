@@ -733,8 +733,8 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
 
     La classe se lit entre la cible **fraîche** et la tête gelée. Seul `base`
     est une cible fraîche : le commit que l'appelant vient de récupérer
-    (`readiness`, l'atterrissage local). Sans `base`, la borne est la cible
-    que le radar a laissée sous `QUEUE_REF` dans son clone, à défaut
+    (`readiness`), ou `target` quand il nomme déjà un commit. Sinon, la borne
+    est la cible que le radar a laissée sous `QUEUE_REF` dans son clone, à défaut
     `origin/<cible>` du dépôt des agents, puis sa cible locale : c'est la
     cible du **dernier** fetch connu, que rien ne prouve fraîche — un fetch
     antérieur, une cible supprimée depuis sur origin (le fetch ne nettoie pas)
@@ -796,7 +796,8 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
                                    head=tip)
         if best is None or _class_worse(current, best):
             best = current
-    if target and base is None and best is not None:
+    if (target and base is None and best is not None
+            and not _HEX.fullmatch(target.strip().lower())):
         best = dict(best, why="%s; borne %s non prouvée fraîche (dernier fetch connu, "
                     "aucune cible récupérée par l'appelant)"
                     % (best.get("why") or "?", best.get("target") or target))

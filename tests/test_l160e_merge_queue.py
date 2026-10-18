@@ -824,6 +824,10 @@ class ClassOfFreshTargetGitTest(unittest.TestCase):
                                               target, c, cfg=None, base=b)
                 self.assertEqual(fresh["class"], "light")
                 self.assertNotIn("non prouvée fraîche", fresh["why"])
+                # une borne déjà nommée par un commit n'est pas une ref périmée
+                exact = merge_queue._class_of(None, 1, self.row, agents, clone.path,
+                                              b, c, cfg=None)
+                self.assertNotIn("non prouvée fraîche", exact["why"])
 
 
 class OrderTest(unittest.TestCase):
