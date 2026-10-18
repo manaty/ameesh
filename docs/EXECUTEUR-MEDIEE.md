@@ -2,9 +2,10 @@
 
 Contrat figé par le lot L107 (version `1.0.0`, schéma
 `ameesh-exec-contract/1`), complété à l'assemblage de la voie B (version
-`1.1.0`, compatible : voir « Contrat 1.1 ») puis par l'expiration médiée des
-fils (version `1.2.0`, compatible : voir « Contrat 1.2 »). Étude et décision :
-`docs/design/etudes/executeur-mediee.md`,
+`1.1.0`, compatible : voir « Contrat 1.1 »), par l'expiration médiée des fils
+(version `1.2.0`, compatible : voir « Contrat 1.2 ») puis par la résolution
+d'alias des agents (#423, version `1.3.0`, compatible : voir « Contrat 1.3 »).
+Étude et décision : `docs/design/etudes/executeur-mediee.md`,
 `docs/design/decisions/00xx-executeur-mediee.md`.
 
 Un exécuteur ameesh tourne sur un appareil prêté (VM Compute) **sans accès à
@@ -61,7 +62,7 @@ Les portées :
 
 Comptes : 66 opérations, dont 26 lectures et 40 écritures. 56 passent par
 `op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Sept
-lignes de `op` sont marquées `session: true` (contrats 1.1, 1.2 et #423) :
+lignes de `op` sont marquées `session: true` (contrats 1.1, 1.2 et 1.3) :
 elles sont servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
 signature et les mêmes types. Il vérifie aussi que l'interface entière (459
@@ -309,6 +310,21 @@ L'ajout est compatible : la version passe à `1.2.0` et une sixième ligne de
   deux en 1.2.0) ; seule la répartition des écritures change.
 - **Sans connexion, rien n'expire** : `fil expire` refuse et ne touche à
   aucun fichier ; `--dry-run` liste ce qui expirerait.
+
+## Contrat 1.3
+
+La résolution d'alias des agents (L243b, #423) ajoute une opération,
+`agents.resolve_name` : le nom primaire d'une identité à partir d'une
+orthographe alternative déclarée au registre, sans accorder d'autorité.
+L'ajout est compatible : la version passe à `1.3.0` et une septième ligne de
+`op` est marquée `session: true`.
+
+- **`agents.resolve_name`** (lecture, portée `aggregate`, sans enveloppe de
+  bail) : `name`, et `operation` (motif d'audit, `lookup` par défaut). Rend le
+  nom primaire ; un nom inconnu est rendu inchangé, et `human:*` comme `all`
+  ne sont jamais résolus. Toute résolution qui change l'orthographe est
+  auditée (`agent_name_resolutions`) ; elle ne donne aucun droit : les gardes
+  d'autorité restent sur les opérations qui les portent.
 
 ## Porte d'hôte
 

@@ -1935,6 +1935,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # est indicatif (canon §2).
             if item.get("reviewer_warning"):
                 print("warning: %s" % item["reviewer_warning"], file=sys.stderr)
+            # #2478 : la désignation est écrite ; un courrier non remis est dit.
+            if item.get("reviewer_request_warning"):
+                print("warning: %s" % item["reviewer_request_warning"], file=sys.stderr)
             return 0
         if args.work_command == "reviewer":
             # #2076 : ajouter ou retirer un relecteur d'un lot DÉJÀ en qa,
@@ -1987,6 +1990,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # famille est indicatif (canon §2).
                 if item.get("reviewer_warning"):
                     print("warning: %s" % item["reviewer_warning"], file=sys.stderr)
+                # #2478 : la désignation est écrite ; un courrier non remis est dit.
+                if item.get("reviewer_request_warning"):
+                    print("warning: %s" % item["reviewer_request_warning"], file=sys.stderr)
             return 0
         if args.work_command == "merged":
             def _declare_constat(constat: dict) -> None:

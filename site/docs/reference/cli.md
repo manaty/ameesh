@@ -361,6 +361,7 @@ ameesh work link <id> [CARD] [--none] [--actor A] | close <id> (--abandoned | --
 ameesh work packet record <carrier> [--repo R] [--base SHA] [--head REF] [--dry-run] [--json]
 ameesh work packet show <lot|carrier> [--json]   # recorded package composition (#2443)
 ameesh work sync-merges [--target T] [--dry-run] [--json]   # close frozen lots whose content is merged (L29)
+ameesh work sync-packets [--target T] [--dry-run] [--json] # close the units of merged packages (manifest, #2426)
 ameesh work sync-github [--dry-run] [--json]          # close lots whose PR is merged (read-only)
 ameesh work schedule [--apply] [--json]               # planned dates at the p80 (L157c)
 ameesh work measure [<id>…] [--no-ci] [--json]        # actual time per phase, merged diff size (L157c)

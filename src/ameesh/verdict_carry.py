@@ -20,6 +20,10 @@ répété, ni second avis sur delta ») ; ce module le fait sans jugement (§7).
    structurelle qui rend le report durable : un contenu que l'auteur ajoute à
    l'identique de la cible, sans en descendre, est masqué par `T` dans la
    preuve 1 mais change le delta — et réapparaîtrait si la cible le retirait.
+   N1 (#2486) : un commit relu que la cible porte **déjà** — sa fusion dans `T`
+   ne change pas l'arbre de `T` — peut manquer à `F`, un rebase l'ayant
+   abandonné comme déjà appliqué, sans que le delta du lot change. Il est alors
+   ignoré ; tout commit relu ni rejoué ni déjà atterri refuse le report.
 
 Tout autre écart laisse la porte exiger ses verdicts : un commit de l'auteur,
 une fusion « maligne », le contenu d'une branche qui n'est pas dans la cible,
@@ -27,7 +31,9 @@ une résolution de conflit (la tête relue ne fusionne plus proprement : la
 résolution est un jugement, que seule la dispense du pilote couvre, #1979), et
 par prudence un réalignement dont les lignes de contexte ont bougé près des
 morceaux du lot. Une cible illisible, un commit absent ou une fusion d'essai
-ratée ne prouvent rien : pas de report.
+ratée ne prouvent rien : pas de report. Un **clone superficiel** ne prouve rien
+non plus (N2 #2486) : `mechanical_history` dépend de l'histoire complète, comme
+`train_history` (`rev-parse --is-shallow-repository`).
 
 **Report** — pour chaque relecteur, son **dernier** verdict, s'il porte sur une
 tête réalignée, est recopié en jalon `verdict` sur la tête gelée : au nom du
@@ -44,11 +50,15 @@ relecteur rendu sur une autre tête (non réalignée) n'est pas remplacé par un
 plus ancien.
 
 Le report se fait au gel (`ameesh work milestone <lot> frozen`, `carry`) et à
-chaque relevé des branches de l'exécuteur (`run_pass`), sous le bail du feu du
-lot (`fire:<lot>`, un seul calcul git à la fois). L'écriture (R1 cx1, P1-1)
-tient **le verrou de ligne du lot** — celui que prend `add_milestone` pour
-tout gel et tout verdict — dans une seule transaction : gel et verdicts y sont
-relus, et un gel ou un verdict concurrent passe entièrement avant ou après.
+chaque relevé des branches de l'exécuteur (`run_pass`). Les calculs git
+(récupération de la pointe, fusions d'essai, patch-ids) sont **en lecture
+seule** — clone du radar et objets jetables (L230) — et peuvent donc se
+chevaucher entre passages et hôtes : le bail `fire:<lot>` ne les couvre pas.
+L'écriture (R1 cx1, P1-1) est sérialisée : `carry` prend ce bail juste avant
+d'écrire, et la transaction tient **le verrou de ligne du lot** — celui que
+prend `add_milestone` pour tout gel et tout verdict — dans une seule
+transaction : gel et verdicts y sont relus, et un gel ou un verdict concurrent
+passe entièrement avant ou après.
 Une issue définitive (reporté ou non) est journalisée une fois par
 couple (tête relue, tête gelée) ; le passage suivant ne la recalcule pas.
 """
@@ -149,6 +159,78 @@ def _lines_of(repo: str, *args: str) -> list[str] | None:
     return proc.stdout.decode("utf-8", "replace").split()
 
 
+def _complete_history(repo: str) -> bool:
+    """L'histoire complète est-elle lisible ? Un clone superficiel ne prouve
+    rien (N2 qa-01 #2486) : ses `rev-list` omettent des commits sans le dire.
+    Même garde que `train_history` (`rev-parse --is-shallow-repository`)."""
+    return plan_git._out(repo, "rev-parse", "--is-shallow-repository") == "false"
+
+
+#: commits relus abandonnés examinés au plus pour la preuve « déjà atterri »
+MAX_DROPPED_COMMITS = 200
+
+
+def _own_delta(repo: str, head: str, tip: str) -> dict | None:
+    """{patch-id verbatim: commit} des commits non-fusions propres à `head`
+    depuis sa base de fusion avec `tip`, ou None si le delta est illisible."""
+    base = plan_git._out(repo, "merge-base", head, tip)
+    if not base:
+        return None
+    try:
+        return plan_git._patch_ids(repo, "%s..%s" % (base, head))
+    except Exception:  # noqa: BLE001 - patch-id illisible : rien de prouvé
+        return None
+
+
+def _landed(repo: str, tip: str, commit: str) -> bool | None:
+    """Le commit `commit` est-il **déjà atterri** dans la cible `tip` ? Vrai si
+    sa fusion dans `tip` laisse l'arbre de `tip` intact, None si la preuve est
+    illisible (conflit, objet absent). Un commit de même patch-id dans
+    l'historique ne suffit pas : si la cible l'a annulé depuis, la fusion le
+    réintroduit et la réponse est non (N1 #2486)."""
+    tree = plan_git._out(repo, "rev-parse", tip + "^{tree}")
+    if not tree:
+        return None
+    merged = merged_tree(repo, tip, commit)
+    if merged is None:
+        return None
+    return merged == tree
+
+
+def _same_delta_with_landed(repo: str, reviewed: str, frozen: str,
+                            tip: str) -> tuple:
+    """N1 qa-01 #2486 : le delta propre du lot est constant si chaque commit
+    relu est **rejoué** dans `frozen` (même patch-id verbatim) ou **déjà
+    atterri** dans la cible (sa fusion ne change pas l'arbre de `tip`). Un
+    rebase abandonne alors un commit déjà appliqué sans changer l'atterrissage.
+    Rend `(oui, raison)` ; aucun report sur un doute ni sur un commit relu
+    disparu sans preuve d'atterrissage."""
+    old = _own_delta(repo, reviewed, tip)
+    new = _own_delta(repo, frozen, tip)
+    if old is None or new is None:
+        return False, "the lot's own delta cannot be read"
+    if not old:
+        return False, "the lot has no commit of its own"
+    added = [pid for pid in new if pid not in old]
+    if added:
+        return False, ("the new head brings %d commit(s) outside the reviewed delta"
+                       % len(added))
+    dropped = [commit for pid, commit in old.items() if pid not in new]
+    if not dropped:
+        return False, "no reviewed commit is missing from the new head"
+    if len(dropped) > MAX_DROPPED_COMMITS:
+        return False, "too many dropped commits to prove (%d)" % len(dropped)
+    for commit in sorted(dropped):
+        landed = _landed(repo, tip, commit)
+        if landed is None:
+            return False, ("the merge of reviewed commit %s into the target cannot be "
+                           "read" % commit[:12])
+        if not landed:
+            return False, ("reviewed commit %s is neither replayed nor already landed "
+                           "in the target" % commit[:12])
+    return True, "%d reviewed commit(s) already landed in the target ignored" % len(dropped)
+
+
 def mechanical_history(repo: str, reviewed: str, frozen: str, tip: str) -> tuple:
     """R1 cx1/qa-01 : chaque commit atteignable depuis `frozen` mais ni depuis
     `reviewed` ni depuis la cible `tip` est **mécanique** — rien de ce que la
@@ -162,7 +244,11 @@ def mechanical_history(repo: str, reviewed: str, frozen: str, tip: str) -> tuple
 
     Une copie à la main d'un fichier de la cible, un ajout suivi d'un retrait
     (un secret resterait dans l'historique), une fusion « maligne » ou le
-    contenu d'une autre branche sont refusés. Rend `(oui, raison)`."""
+    contenu d'une autre branche sont refusés. Un clone superficiel l'est aussi
+    (N2 #2486) : l'histoire manquante ferait passer un commit pour neuf. Rend
+    `(oui, raison)`."""
+    if not _complete_history(repo):
+        return False, "complete Git history required; shallow clone refused"
     new = _lines_of(repo, "rev-list", "--topo-order", "--reverse", frozen, "--not",
                    reviewed, tip)
     if new is None:
@@ -207,7 +293,10 @@ def mechanical_history(repo: str, reviewed: str, frozen: str, tip: str) -> tuple
 def realigned(repo: str, reviewed: str, frozen: str, tip: str) -> tuple:
     """`frozen` est-elle un réalignement mécanique de `reviewed` sur la cible
     de pointe `tip` ? Trois preuves : même atterrissage, historique mécanique,
-    même delta de lot. Rend `(oui, raison)` ; la raison dit pourquoi non."""
+    même delta de lot. Rend `(oui, raison)` ; la raison dit pourquoi non. Un
+    clone superficiel est refusé d'emblée (N2 #2486)."""
+    if not _complete_history(repo):
+        return False, "complete Git history required; shallow clone refused"
     if _same(reviewed, frozen):
         return False, "same head"
     theirs = merged_tree(repo, tip, frozen)
@@ -227,11 +316,16 @@ def realigned(repo: str, reviewed: str, frozen: str, tip: str) -> tuple:
     # (`plan_git.rebase_identity`, #1905 : patch-id verbatim du diff écrasé
     # depuis la base de chaque tête avec la cible).
     same = plan_git.rebase_identity(repo, reviewed, frozen, tip)
+    reason = "same merge result, mechanical history and same lot delta"
     if not same.get("mechanical"):
-        return False, ("the lot's own delta differs from the reviewed one (%s): content "
-                       "not inherited from the target, or context moved near the lot's "
-                       "hunks" % (same.get("detail") or "?"))
-    return True, "same merge result, mechanical history and same lot delta"
+        # N1 qa-01 #2486 : un rebase peut abandonner un commit relu déjà
+        # atterri dans la cible ; il ne compte alors pas dans le delta.
+        ok, why = _same_delta_with_landed(repo, reviewed, frozen, tip)
+        if not ok:
+            return False, ("the lot's own delta differs from the reviewed one (%s): %s"
+                           % (same.get("detail") or "?", why))
+        reason += " (%s)" % why
+    return True, reason
 
 
 def _outcomes(db, lots) -> dict:
@@ -296,7 +390,9 @@ def carry(cfg, db, lot: int, *, repo: str | None = None, clone=None,
     pendant le calcul), `error` (cible illisible…). `would-carry` en essai.
     `notes` : les issues déjà journalisées du lot, lues par l'appelant ;
     `fetched` : les pointes de cible déjà récupérées pendant ce passage, par
-    `(dépôt, cible)` (N2 qa-01 : une récupération par projet, pas par lot).
+    `(dépôt, cible)` (N2 qa-01 : une récupération par projet, pas par lot) ;
+    `lock` : prend le bail `fire:<lot>` pour l'écriture **seule** — les calculs
+    git sont des lectures concurrentes (N3 qa-01 #2486).
     Ne lève jamais."""
     lot = int(lot)
     out: dict = {"lot": lot, "result": "idle", "frozen": "", "target": "", "tip": "",
@@ -387,6 +483,9 @@ def _carry(cfg, db, lot: int, out: dict, *, repo, clone, dry_run: bool, lock: bo
                    carried=[_entry(m, r) for m, r in plan],
                    refused=[{"reviewed": r, "why": w} for r, w in refused])
         return out
+    # N3 qa-01 #2486 : le bail ne couvre que l'écriture. Les preuves ci-dessus
+    # sont des lectures (clone du radar, objets jetables) et peuvent se
+    # chevaucher entre passages ; la transaction de `_write` sérialise la copie.
     handle = fire._lock(db, lot) if lock else None
     if lock and handle is None:
         out.update(result="busy", detail="another host holds the lease of lot #%d" % lot)
