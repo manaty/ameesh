@@ -85,6 +85,14 @@ MAX_ACTIONS = 500
 #: longueur d'une tâche affichée (consigne en cours, libellé)
 TASK_CHARS = 140
 
+#: #1476 : cible de la durée bout en bout d'une suite complète (demande du
+#: bureau, 15/10/2026), en secondes, et fenêtre de la médiane affichée (jours)
+#: avec sa borne de lecture par dépôt
+CI_SUITE_TARGET_S = 15 * 60
+CI_SUITE_WINDOW_D = 7
+CI_SUITE_LIMIT = 500
+CI_SUITE_SCHEMA = "ameesh-ci-suite/1"
+
 #: états du lot rendus par la vue (décision 0024)
 LOT_STATES = ("active", "review", "blocked", "approved", "merged", "closed")
 #: états d'agent rendus par la vue
@@ -153,7 +161,8 @@ def parse_since(text: str | None, now: float) -> float:
 # --------------------------------------------------------------------------
 
 def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[dict],
-                          declared: Iterable[dict] | None = None) -> dict:
+                          declared: Iterable[dict] | None = None, *,
+                          agents: Iterable[str] | None = None) -> dict:
     """Les jalons d'un lot : requested / frozen / verdict / merged / delivered.
 
     SEUL point de lecture des jalons de lot. Deux sources, même résultat :
@@ -184,10 +193,18 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
       Un avis nomme sa tête (`sha`) : il reste valide tant qu'un gel — même
       renouvelé plus tard — nomme le même commit ; un avis d'une autre tête
       ne compte pas ; sans SHA des deux côtés, comparaison des instants ;
+    * `verdict_required` : False quand le pilote a marqué « verdict non
+      requis » (`work.REVIEWER_NONE`, #1979) — la revue n'attend plus rien ;
     * `blocked_verdicts` : nombre de verdicts bloquants ;
     * `blocks` : nombre de mises en attente (`blocked`, `waiting_human`) ;
     * `source` : `milestones` (table L10) ou `events` (déduction).
+
+    `agents` : les noms d'agents du registre (#2346). `seb` et `human:seb` ne
+    nomment le même acteur que si `seb` n'est PAS un agent ; sans cette
+    classification (None), aucun alias n'est admis — le sens est restreint,
+    jamais deviné.
     """
+    agents = None if agents is None else set(agents)
     requested = item.get("created_ts")
     merged = None
     blocks = 0
@@ -273,6 +290,32 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     # du verdict que le gel a rendu caduc.
     designated = (item.get("reviewer") or "").strip() or None
     reviewer = (last["actor"] if last else None) if verdict_current else designated
+    from .work_reviewers import designated as designated_reviewers
+    reviewers = designated_reviewers(item)
+    # Key by designation: aliases share one latest verdict, and withdrawn
+    # reviewers cannot supply the aggregate verdict after their removal.
+    current = {name: v for v in verdicts if _verdict_applies(v, last_frozen)
+               for name in reviewers if _same_actor(name, v["actor"], agents)}
+    pending = ([name for name in reviewers if current.get(name, {}).get("kind") != "ok"]
+               if item.get("reviewers") is not None else [])
+    # Every designated reviewer owes their own verdict on the frozen head.
+    # A later GO from another reviewer cannot erase a blocking verdict.
+    blocked = [v for v in current.values() if v["kind"] == "blocked"]
+    if item.get("reviewers") is not None and reviewers and blocked:
+        last = max(blocked, key=lambda v: v["at_ts"])
+        verdict_current = True
+    elif reviewers and pending:
+        verdict_current = False
+    elif item.get("reviewers") is not None and reviewers and current:
+        last = max(current.values(), key=lambda v: v["at_ts"])
+        verdict_current = True
+    if item.get("reviewers") is not None and reviewers:
+        reviewer = last["actor"] if verdict_current and last else designated
+    # #1979 : le pilote peut dispenser de re-verdict (résolution de composition
+    # mécanique, canon §11 bis/#87) en marquant la colonne du relecteur
+    # (`work.waive_review`) : l'attente passe alors à la fusion, sans faux
+    # « waiting: verdict » ni rappel à un relecteur.
+    verdict_required = designated != work_mod.REVIEWER_NONE
     return {
         "requested": requested,
         "frozen": freezes[0]["at_ts"] if freezes else None,
@@ -280,7 +323,10 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
         "verdict": last["at_ts"] if last else None,
         "verdict_kind": last["kind"] if last else None,
         "reviewer": reviewer,
+        "reviewers": reviewers,
+        "pending_reviewers": pending,
         "verdict_current": verdict_current,
+        "verdict_required": verdict_required,
         "merged": merged,
         "delivered": delivered,
         "blocked_verdicts": sum(1 for v in verdicts if v["kind"] == "blocked"),
@@ -294,6 +340,29 @@ def _same_commit(a: str | None, b: str | None) -> bool:
     Un identifiant vide n'est jamais « le même commit »."""
     a, b = (a or "").strip().lower(), (b or "").strip().lower()
     return bool(a and b) and (a == b or a.startswith(b) or b.startswith(a))
+
+
+def _same_actor(left: str | None, right: str | None,
+                agents: set[str] | None = None) -> bool:
+    """#2204/N4, #2346 : `seb` et `human:seb` ne nomment le même acteur que si
+    `seb` n'est pas un agent du registre. Un agent nommé `seb` ne peut donc ni
+    valider l'approbation humaine `human:seb`, ni fournir le verdict attendu
+    d'un relecteur `human:seb`. `agents` None (classification inconnue) :
+    aucun alias — on restreint plutôt que de deviner."""
+    left, right = (left or "").strip(), (right or "").strip()
+    if left == right:
+        return True
+    if not left or not right:
+        return False
+    if left.startswith("human:"):
+        bare, other = left[len("human:"):], right
+    elif right.startswith("human:"):
+        bare, other = right[len("human:"):], left
+    else:
+        return False
+    if not bare or other != bare:
+        return False
+    return agents is not None and bare not in agents
 
 
 def _verdict_applies(verdict: dict | None, freeze: dict | None) -> bool:
@@ -316,7 +385,9 @@ def _verdict_applies(verdict: dict | None, freeze: dict | None) -> bool:
 
 def lot_state(work_state: str, jalons: dict) -> str:
     """État affiché d'un lot (décision 0024) : en revue, il n'est approuvé
-    que par un verdict `ok` qui porte sur le DERNIER gel (même SHA)."""
+    que par un verdict `ok` qui porte sur le DERNIER gel (même SHA) — ou,
+    #1979, par la marque « verdict non requis » du pilote (résolution de
+    composition mécanique, canon §11 bis/#87)."""
     if work_state in ("merged", "promoted"):
         return "merged"
     if work_state == "closed":
@@ -328,6 +399,13 @@ def lot_state(work_state: str, jalons: dict) -> str:
         if current is None:                 # jalons partiels : repli par les instants
             last_frozen = jalons.get("last_frozen", jalons.get("frozen")) or 0
             current = (jalons.get("verdict") or 0) >= last_frozen
+        # #1979 : dispensé de re-verdict, le lot n'est pas « en revue » : il
+        # est prêt à fusionner, comme après un verdict `ok` courant. Un verdict
+        # bloquant COURANT garde la main (une correction est due), comme dans
+        # `stagnation.waiting`.
+        if not (jalons.get("verdict_kind") == "blocked" and current) \
+                and jalons.get("verdict_required", True) is False:
+            return "approved"
         if jalons.get("verdict_kind") == "ok" and current:
             return "approved"
         return "review"
@@ -362,8 +440,9 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
               planned_wait: dict | None = None,
               dependencies: list[dict] | None = None,
               agent_states: dict[str, str] | None = None,
-              agent_externals: dict[str, str | None] | None = None) -> dict:
-    jalons = _work_item_milestones(item, events, actions, declared)
+              agent_externals: dict[str, str | None] | None = None,
+              agents: Iterable[str] | None = None) -> dict:
+    jalons = _work_item_milestones(item, events, actions, declared, agents=agents)
     packages = packages or {}
     package = packages.get(item.get("package_id"))
     closed_at = next((r.get("at_ts") for r in (declared or []) if r.get("kind") == "closed"),
@@ -383,7 +462,12 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
         "state": lot_state(item.get("state") or "", jalons),
         "work_state": item.get("state") or "",
         "assignee": item.get("assignee") or None,
-        "reviewer": jalons["reviewer"],
+        # #1979 : une revue dispensée n'a pas de relecteur — l'état `approved`
+        # le dit ; le jeton de la colonne ne sort pas dans la vue.
+        "reviewer": (None if jalons["reviewer"] == work_mod.REVIEWER_NONE
+                     else jalons["reviewer"]),
+        "reviewers": jalons["reviewers"],
+        "pending_reviewers": jalons["pending_reviewers"],
         "milestones": {k: _round(jalons[k])
                        for k in ("requested", "frozen", "verdict", "merged", "delivered")},
         "last_frozen_ts": _round(jalons["last_frozen"]),
@@ -454,11 +538,40 @@ def agent_state(row: dict) -> str:
         return "paused"
     if status == "running":
         return "working" if row.get("lease_live") else "stopped"
+    if row.get("operator_paused") and status not in ("stopped", "dead"):
+        return "paused"
     if status == "blocked":
         return "paused"                 # pause budget ou comptable (L13)
     if status in ("stopped", "dead"):
         return "stopped"
     return "idle"                       # idle, queued
+
+
+def operator_pause_of(row: dict) -> dict | None:
+    """#2200 : la pause opérateur d'une ligne, projetée une seule fois.
+
+    `ameesh show`, `ameesh projects`/`progress` et les alertes lisent la même
+    pause (raison, auteur, principal, début) : une projection partagée évite
+    que l'un l'affiche et que l'autre la perde en route. `after_turn` dit que
+    le tour en cours finit avant que la pause ne prenne effet (`running`,
+    comme `ameesh list` : le statut suffit, la lecture `show` n'a pas de
+    `lease_live`)."""
+    if not row.get("operator_paused"):
+        return None
+    return {
+        "reason": row.get("operator_pause_reason"),
+        "by": row.get("operator_pause_by"),
+        "for": row.get("operator_pause_for"),
+        "since_ts": _round(row.get("operator_pause_ts")),
+        "after_turn": row.get("status") == "running",
+    }
+
+
+def paused_on_budget(row: dict) -> bool:
+    """#1070 : is the agent in a BUDGET pause? Delegates to `handoff.paused`
+    (L233b), the single definition, so no second rule is kept here."""
+    from . import handoff
+    return handoff.paused(row)
 
 
 def _excerpt(text: str | None, limit: int = TASK_CHARS) -> str | None:
@@ -506,15 +619,22 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
         "state": state,
         "status": row.get("status") or None,
         "status_text": _excerpt(row.get("status_text"), 160),
+        # #1070 : a budget pause is distinct from a `blocked` for another
+        # cause, without decoding the text
+        "paused_on_budget": paused_on_budget(row),
         "since_ts": _round(since),
         "turn": turn,
         "turns": int(row.get("turns") or 0),
         "unread": int(row.get("unread") or 0),
+        # §4 (owner 14/10/2026) : lots en `build` de l'agent, tous projets
+        # confondus (le plafond est global) ; le rendu signale le dépassement
+        "builds": int(row.get("builds") or 0),
         "pending_prompt": bool(row.get("has_pending_prompt")),
         "lease_live": bool(row.get("lease_live")),
         # L37 (0030) : mode et raison d'arrêt structurée
         "mode": row.get("mode") or "execute",
         "stop_reason": row.get("stop_reason") if state == "stopped" else None,
+        "operator_pause": operator_pause_of(row),
     }
 
 
@@ -711,6 +831,48 @@ def _real_spend(db, paid: Iterable[str], since_ts: float, now: float) -> list[di
 # l'instantané
 # --------------------------------------------------------------------------
 
+def _ci_priority(row: dict) -> bool:
+    """#1468 : le pool prioritaire de runners couvre `integration/**` et
+    `release/**` (source ou cible d'une PR) ; une poussée sur `main` suit la
+    fusion d'un paquet déjà validé sur sa branche d'intégration et n'est pas
+    le chemin critique de la cible ; une exécution manuelle sur `main` non
+    plus (elle ne prend pas le pool prioritaire)."""
+    return any((row.get(ref) or "").startswith(("release/", "integration/"))
+               for ref in ("branch", "base"))
+
+
+def build_ci_suite(rows: list[dict]) -> dict:
+    """#1476 : durée médiane (et p80) des suites complètes conclues, par
+    dépôt, et la part couverte par le pool prioritaire.
+
+    La durée est celle du veilleur CI (`ci_runs`) : du premier relevé de
+    l'exécution à celui de sa conclusion. L'instant de création GitHub n'est
+    pas gardé ; l'écart est borné par l'intervalle de `ameesh notify`, et il
+    porte des deux côtés, donc la médiane reste juste à un relevé près.
+    """
+    by_repo: dict = {}
+    for row in rows:
+        by_repo.setdefault(row.get("repo") or "?", []).append(row)
+    repos = []
+    for repo, runs in sorted(by_repo.items()):
+        durees = [r["duration_s"] for r in runs if r.get("duration_s") is not None]
+        prio = [r["duration_s"] for r in runs
+                if r.get("duration_s") is not None and _ci_priority(r)]
+        last = max(runs, key=lambda r: (r.get("concluded_ts") or 0, r.get("run_id") or 0))
+        repos.append({
+            "repo": repo,
+            "runs": len(durees),
+            "median_s": estimates_mod.quantile(durees, 0.5),
+            "p80_s": estimates_mod.quantile(durees, 0.8),
+            "last_s": last.get("duration_s"),
+            "last_concluded_ts": last.get("concluded_ts"),
+            "priority_runs": len(prio),
+            "priority_median_s": estimates_mod.quantile(prio, 0.5),
+        })
+    return {"schema": CI_SUITE_SCHEMA, "window_days": CI_SUITE_WINDOW_D,
+            "target_s": CI_SUITE_TARGET_S, "repos": repos}
+
+
 def _truncation(rows: list[dict], limit: int) -> dict | None:
     """`{shown, total, limit}` si la borne de rendu a coupé, sinon None."""
     total = int(rows[0].get("total") or len(rows)) if rows else 0
@@ -788,7 +950,7 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     # agrégation, jamais de la lecture des notes.
     for ev in st.lot_transitions(ids):
         events.setdefault(int(ev["work_item_id"]), []).append(ev)
-    last_events = {int(r["work_item_id"]): r.get("last_ts")
+    last_events = {int(r["work_item_id"]): float(r["last_ts"])
                    for r in st.lot_event_last(ids)}
     by_item: dict = {}
     for row in st.lot_actions(ids):
@@ -798,21 +960,51 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     packages = {p["id"]: p for p in package_rows}
     threshold = stagnation.stale_after() if stale_after is None else float(stale_after)
     messages = {int(r["work_item_id"]): r.get("last_ts") for r in st.lot_messages(ids)}
-    states, externals = stagnation.availability_of(st.agents(None))
+    all_agents = st.agents(None)
+    states, externals = stagnation.availability_of(all_agents)
+    # #2346 : un nom nu du registre reste un agent ; `human:<nom>` est l'autre
+    # acteur. Cette table classe les homonymes pour `_same_actor`.
+    agent_names = {row["name"] for row in all_agents if row.get("name")}
     from . import planned_waits
     from . import work_dependencies
     dependencies = work_dependencies.grouped(db, ids)
-    holds = planned_waits.read(db, items, now=now, packages=packages,
-                              dependencies=[e for edges in dependencies.values() for e in edges])
+    # #1664 : le flux ciblé du stockage (transitions + notes hold/levée) ;
+    # jamais le journal entier ni le texte des notes ordinaires.
+    waits = planned_waits.read(
+        db, items, now=now, packages=packages,
+        dependencies=[e for edges in dependencies.values() for e in edges],
+        holds=planned_waits.pilot_holds(
+            db, st.lot_hold_events(ids, planned_waits.HOLD_NOTE_PATTERNS), cfg=cfg))
     lots = [build_lot(item, events.get(int(item["id"]), []),
                       by_item.get(int(item["id"]), []), declared.get(int(item["id"])),
                       packages=packages, now=now, stale_after=threshold,
                       messages_ts=messages.get(int(item["id"])),
                       events_ts=last_events.get(int(item["id"])), agent_states=states,
-                      planned_wait=holds.get(int(item["id"])),
+                      planned_wait=waits.get(int(item["id"])),
                       dependencies=dependencies.get(int(item["id"]), []),
-                      agent_externals=externals)
+                      agent_externals=externals, agents=agent_names)
             for item in items]
+    # #1822 : un lot léger sans verdict courant attend la fusion, pas un
+    # verdict ; la classe n'est lue — une fois par passage — que pour ces lots.
+    from . import lot_class
+    classes: dict = {}
+    for lot, item in zip(lots, items):
+        if (lot.get("waiting_for") or {}).get("what") != "verdict":
+            continue
+        cls = stagnation.review_class_of(db, item, cfg=cfg, memo=classes,
+                                         milestones=declared.get(int(item["id"]), []))
+        if cls != lot_class.LIGHT:
+            continue
+        rid = int(item["id"])
+        acts = by_item.get(rid, [])
+        jalons = _work_item_milestones(item, events.get(rid, []), acts, declared.get(rid),
+                                       agents=agent_names)
+        lot["waiting_for"] = stagnation.with_availability(
+            stagnation.waiting(item, jalons, acts,
+                               responsible=(packages.get(item.get("package_id"))
+                                            or {}).get("responsible"),
+                               review_class=cls),
+            states, externals)
     package_items = st.package_items()
     plan = plan_mod.summarize(package_rows, package_items)
     action_rows = st.actions(since_ts=since_ts, project=project, limit=max_actions)
@@ -880,6 +1072,11 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
         version_view = versions_mod.empty(
             "versions: unreadable (%s)" % " ".join(str(exc).split())[:200])
 
+    # #1476 : la durée médiane des suites complètes, par dépôt (veilleur CI) ;
+    # la cible de 15 min est portée par la vue, jamais inventée.
+    ci_suite = build_ci_suite(
+        st.ci_suite(since_ts=now - CI_SUITE_WINDOW_D * 86400.0, limit=CI_SUITE_LIMIT))
+
     return {
         "schema": SCHEMA,
         "generated_ts": _round(now),
@@ -898,6 +1095,8 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
         "decisions": pending,
         # L160f (#497) : versions publiées et prochaines releases par produit
         "versions": version_view,
+        # #1476 (champ ajouté) : durée médiane des suites complètes, cible 15 min
+        "ci_suite": ci_suite,
         "lots": lots,
         "agents": agents,
         "milestones": plan["milestones"],
@@ -939,6 +1138,43 @@ def _duration(seconds) -> str:
     return "%d d %d h" % (seconds // 86400, (seconds % 86400) // 3600)
 
 
+def _wip_label(builds: int) -> str:
+    """§4 : l'en-cours d'un agent, et le dépassement du plafond s'il y en a un."""
+    cap = work_mod.BUILD_LIMIT
+    if builds > cap:
+        return "%d lots in build (above the §4 cap of %d)" % (builds, cap)
+    return "%d lot(s) in build" % builds
+
+
+def _ci_suite_lines(ci: dict, width: int) -> list[str]:
+    """#1476 : la durée médiane des suites complètes, par dépôt, face à la
+    cible ; la part couverte par le pool prioritaire de #1468 est dite."""
+    target = int(ci.get("target_s") or CI_SUITE_TARGET_S)
+    out = [textwrap.fill("CI FULL SUITE (median over %d d, target ≤ %s)" % (
+        int(ci.get("window_days") or CI_SUITE_WINDOW_D), _duration(target)), width)]
+    for r in ci.get("repos", []):
+        if not r.get("runs"):
+            out.append(textwrap.fill("%s: no concluded full suite" % r["repo"], width,
+                                     subsequent_indent="  "))
+            continue
+        if r["median_s"] <= target:
+            verdict = "target met"
+        elif r.get("priority_median_s") is not None and r["priority_median_s"] <= target:
+            verdict = "target met on the priority pool only"
+        else:
+            verdict = "target not met"
+        out.append(textwrap.fill(
+            "%s: median %s · p80 %s (%d runs, %s)" % (
+                r["repo"], _duration(r["median_s"]), _duration(r.get("p80_s")),
+                r["runs"], verdict), width, subsequent_indent="  "))
+        if r.get("priority_runs"):
+            out.append(textwrap.fill(
+                "priority pool (integration/release): median %s over %d runs" % (
+                    _duration(r.get("priority_median_s")), r["priority_runs"]),
+                width, initial_indent="  ", subsequent_indent="    "))
+    return out
+
+
 def format_text(snap: dict, width: int | None = None) -> str:
     """La sortie lisible : une colonne, coupée à la largeur du terminal."""
     if width is None:
@@ -970,6 +1206,11 @@ def format_text(snap: dict, width: int | None = None) -> str:
         out.append("")
         out.extend(versions_mod.format_lines(snap["versions"], width))
 
+    if (snap.get("ci_suite") or {}).get("repos"):
+        # #1476 : durée médiane des suites complètes, cible de 15 min
+        out.append("")
+        out.extend(_ci_suite_lines(snap["ci_suite"], width))
+
     if snap.get("roadmap"):
         # L96 : la feuille de route (Gantt texte), avant le détail des lots
         from . import roadmap as roadmap_mod
@@ -994,9 +1235,7 @@ def format_text(snap: dict, width: int | None = None) -> str:
             state = "STALE %s (%s)" % (_duration(stale["idle_s"]), state)
         closed = lot.get("closed")
         if closed:
-            state = ("delivered outside the target" if closed.get("reason") == "delivered"
-                     else "abandoned" if closed.get("reason") == "abandoned"
-                     else "superseded by #%s" % closed.get("superseded_by"))
+            state = work_mod.close_how(closed.get("reason"), closed.get("superseded_by"))
         line("#%s %s — %s%s" % (lot["id"], state, lot["title"],
                                 " [%s]" % lot["epic"] if lot.get("epic") else ""), "  ")
         line("requested %s · frozen %s · verdict %s%s · merged %s%s" % (
@@ -1007,7 +1246,9 @@ def format_text(snap: dict, width: int | None = None) -> str:
         extra = []
         if lot["assignee"]:
             extra.append("author %s" % lot["assignee"])
-        if lot["reviewer"]:
+        if lot.get("reviewers"):
+            extra.append("reviewers %s" % ", ".join(lot["reviewers"]))
+        elif lot["reviewer"]:
             extra.append("reviewer %s" % lot["reviewer"])
         if lot["blocked_verdicts"] or lot["blocks"]:
             extra.append("blocks %d" % ((lot["blocked_verdicts"] or 0) + lot["blocks"]))
@@ -1043,13 +1284,19 @@ def format_text(snap: dict, width: int | None = None) -> str:
         since = agent["since_ts"]
         line("%s — %s%s" % (agent["name"], _FR_AGENT.get(agent["state"], agent["state"]),
                             " for %s" % _duration(now - since) if since else ""), "  ")
-        line("%s · %s · effort %s" % (agent["harness"] or "?", agent["model"] or "default",
-                                      agent["effort"] or "default"), "    ")
+        line("%s · %s · effort %s · %s" % (
+            agent["harness"] or "?", agent["model"] or "default",
+            agent["effort"] or "default", _wip_label(agent.get("builds") or 0)), "    ")
         turn = agent.get("turn")
         if turn:
             line("turn: %s" % (turn["task"] or turn["label"] or "running"), "    ")
         elif agent["state"] in ("paused", "stopped") and agent["status_text"]:
             line("reason: %s" % agent["status_text"], "    ")
+        hold = agent.get("operator_pause")
+        if hold:
+            line("operator pause%s: %s (by %s for %s)" % (
+                " after this turn" if hold["after_turn"] else "",
+                hold["reason"], hold["by"], hold["for"]), "    ")
 
     out.append("")
     if snap["milestones"]:

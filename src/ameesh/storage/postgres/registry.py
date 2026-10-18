@@ -20,6 +20,7 @@ garanties, inchangées :
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Sequence
 
@@ -32,9 +33,10 @@ _ALIAS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 LINEAGE_MAX = 32
 
 AGENT_COLUMNS = """
-    name, chantier, harness, host, cwd, session_id, status, status_text, model,
+    name, aliases, chantier, harness, host, cwd, session_id, status, status_text, model,
     budget_usd, spent_usd, turns, pending_prompt, current_prompt, last_error,
-    lease_owner, lease_epoch,
+    lease_owner, lease_epoch, runner_seen_host, runner_seen_owner,
+    extract(epoch from runner_seen_at)::float8 as runner_seen_ts,
     extract(epoch from lease_wait_since)::float8 as lease_wait_since_ts,
     extract(epoch from lease_expires_at)::float8 as lease_expires_ts,
     extract(epoch from last_seen)::float8         as last_seen_ts,
@@ -54,7 +56,9 @@ AGENT_COLUMNS = """
     -- #1037 : le harnais, le dossier et l'id d'OUVERTURE de la session ACTIVE
     -- (0384) ; NULL hors d'une session ouverte par l'exécuteur. Le harnais
     -- déclaré (`harness`) ne dit pas sous lequel la session tourne (L242b).
-    session_harness, session_cwd, session_origin
+    session_harness, session_cwd, session_origin,
+    operator_paused, operator_pause_reason, operator_pause_by, operator_pause_for,
+    extract(epoch from operator_pause_at)::float8 as operator_pause_ts
 """
 
 
@@ -106,7 +110,7 @@ def canon_governed_sql(alias: str = "agent_registry") -> str:
         "a": a, "max": LINEAGE_MAX}
 
 
-def canon_claim_predicate_sql(alias: str = "agent_registry") -> str:
+def canon_claim_predicate_sql(alias: str = "agent_registry", *, probe: bool = False) -> str:
     """Condition SQL de réclamation liée au canon (§4.1), pour un `WHERE`.
 
     Vraie si l'agent de la ligne `alias` (une ligne de `agent_registry`, ou de
@@ -134,20 +138,28 @@ def canon_claim_predicate_sql(alias: str = "agent_registry") -> str:
     paramètre lié (`%s`) : elle s'insère telle quelle dans une requête
     paramétrée, avec les deux pilotes. Utilisée par `claimable()` et
     `claim()` ; à réutiliser telle quelle pour `ameesh attach` (C9).
+
+    `probe=True` (L232b) : la réclamation d'un agent **nommé** (le pas de tour
+    du contrôleur) passe par `ameesh_agent_claims_open`, qui rouvre la
+    fermeture de release au seul agent sonde enrôlé de l'hôte. Les décisions
+    d'ordonnancement (`claimable`, `wakeable`, aperçu) gardent le prédicat
+    strict d'une fermeture.
     """
     a = _alias(alias)
     # L42 (0031) : l'état est celui du canon DE L'AGENT sur son hôte (colonne
     # `canon` ; NULL = canon par défaut, clé '') — un canon invalide ne ferme
     # que ses propres agents et leurs éphémères (qui portent son canon)
-    return """(ameesh_host_claims_open(%(a)s.host) AND NOT ameesh_handoff_fenced(%(a)s.name) AND (NOT %(governed)s
+    open_sql = ("ameesh_agent_claims_open(%(a)s.host, %(a)s.name)" if probe
+                else "ameesh_host_claims_open(%(a)s.host)")
+    sql = """(""" + open_sql + """ AND NOT ameesh_handoff_fenced(%(a)s.name) AND (NOT %(governed)s
        OR (EXISTS (SELECT 1 FROM canon_state s
                     WHERE s.host = %(a)s.host AND s.canon = coalesce(%(a)s.canon, '')
                       AND s.status = 'ok')
            AND coalesce(%(a)s.placement_ok, false)
            AND %(a)s.placement_profile IS NOT DISTINCT FROM ameesh_placement_profile(
                    %(a)s.host, %(a)s.harness, %(a)s.provider, %(a)s.model,
-                   %(a)s.credential_mode))))""" % {
-        "governed": canon_governed_sql(a), "a": a}
+                   %(a)s.credential_mode))))"""
+    return sql % {"governed": canon_governed_sql(a), "a": a}
 
 
 def placement_admitted_sql(alias: str = "agent_registry") -> str:
@@ -162,6 +174,31 @@ def placement_admitted_sql(alias: str = "agent_registry") -> str:
                    %(a)s.host, %(a)s.harness, %(a)s.provider, %(a)s.model,
                    %(a)s.credential_mode)))""" % {
         "governed": canon_governed_sql(a), "a": a}
+
+
+def write_runner_seen(db, host, owner, names, *, admission_sql=None, admission_params=()):
+    """#508 : une écriture groupée, verrous ordonnés comme le cycle de vie hôte.
+
+    Le chemin médié fournit un prédicat d'admission revérifié par l'UPDATE,
+    après l'attente éventuelle d'une révocation concurrente du placement.
+    """
+    if names is not None and not names:
+        return
+    selected = "host = %s AND mode = 'execute' AND status <> 'stopped'"
+    if names is not None:
+        selected += " AND name IN (%s)" % name_list(names)
+    sql = f"""UPDATE agent_registry r
+                SET runner_seen_at = clock_timestamp(),
+                    runner_seen_host = %s, runner_seen_owner = %s
+               FROM (SELECT name FROM agent_registry WHERE {selected}
+                     ORDER BY name FOR UPDATE) s
+              WHERE r.name = s.name AND r.host = %s
+                AND r.mode = 'execute' AND r.status <> 'stopped'"""
+    params = [host, owner, host, host]
+    if admission_sql is not None:
+        sql += " AND (" + admission_sql + ")"
+        params.extend(admission_params)
+    db.execute(sql, tuple(params))
 
 
 # --------------------------------------------------------------------------
@@ -195,6 +232,22 @@ def name_lock_key(name: str) -> str:
 # --------------------------------------------------------------------------
 
 class Agents(interface.Agents):
+
+    def operator_pause(self, name, *, paused, reason, actor, principal,
+                       expect_reason=None) -> dict | None:
+        # #2152 : reprise conditionnelle (une seule instruction SQL, verrou de
+        # ligne) ; `expect_reason` n'a de sens que pour LEVER une pause.
+        if expect_reason is not None:
+            if paused:
+                raise ValueError("expect_reason only lifts an operator pause")
+            rows = self.db.query(
+                "SELECT * FROM ameesh_operator_resume_if(%s, %s, %s, %s, %s)",
+                (name, reason, actor, principal, expect_reason))
+            return rows[0] if rows else None
+        rows = self.db.query(
+            "SELECT * FROM ameesh_operator_pause(%s, %s, %s, %s, %s)",
+            (name, paused, reason, actor, principal))
+        return rows[0] if rows else None
 
     def upsert(self, name, *, chantier, harness, host, cwd, session_id, status,
                status_text, model, budget_usd, mode=None) -> dict:
@@ -289,9 +342,14 @@ class Agents(interface.Agents):
         return rows[0]
 
     def get(self, name) -> dict | None:
-        rows = self.db.query("SELECT %s FROM agent_registry WHERE name = %%s" % AGENT_COLUMNS,
-                             (name,))
+        rows = self.db.query("SELECT %s FROM agent_registry WHERE name = "
+                             "(SELECT ameesh_resolve_agent_name(%%s, %%s))" % AGENT_COLUMNS,
+                             (name, "agents.get"))
         return rows[0] if rows else None
+
+    def resolve_name(self, name, *, operation="lookup") -> str:
+        return self.db.query("SELECT ameesh_resolve_agent_name(%s, %s) AS name",
+                             (name, operation))[0]["name"]
 
     def harnesses(self) -> dict[str, str]:
         rows = self.db.query("SELECT name, harness FROM agent_registry")
@@ -300,7 +358,8 @@ class Agents(interface.Agents):
     def overview(self) -> list[dict]:
         return self.db.query(
             """
-            SELECT name, chantier, harness, host, cwd, session_id, status, status_text,
+            SELECT name, (SELECT r.aliases FROM agent_registry r WHERE r.name=o.name) AS aliases,
+                   chantier, harness, host, cwd, session_id, status, status_text,
                    model, budget_usd, spent_usd, turns, pending_prompt, last_error,
                    lease_owner, lease_epoch, lease_expires_ts, last_seen_ts, last_turn_ts,
                    public_key_fingerprint, key_role, key_ready, has_owner_key, unread,
@@ -308,6 +367,14 @@ class Agents(interface.Agents):
                    canon_ref,
                    ephemeral, created_by, ephemeral_expires_ts, responsible_ok, priority,
                    mode, stop_reason, canon,
+                   (SELECT extract(epoch from r.runner_seen_at)::float8
+                      FROM agent_registry r WHERE r.name = o.name) AS runner_seen_ts,
+                   (SELECT r.runner_seen_host FROM agent_registry r
+                     WHERE r.name = o.name) AS runner_seen_host,
+                   (SELECT r.runner_seen_owner FROM agent_registry r
+                     WHERE r.name = o.name) AS runner_seen_owner,
+                   p.operator_paused, p.operator_pause_reason, p.operator_pause_by,
+                   p.operator_pause_for, p.operator_pause_ts,
                    __GOVERNED__ AS canon_governed,
                    (SELECT s.status FROM canon_state s WHERE s.host = o.host
                        AND s.canon = coalesce(o.canon, '')) AS canon_status,
@@ -317,8 +384,19 @@ class Agents(interface.Agents):
                    (SELECT extract(epoch from s.checked_at)::float8 FROM canon_state s
                      WHERE s.host = o.host
                        AND s.canon = coalesce(o.canon, '')) AS canon_checked_ts,
-                   __CLAIM_OK__ AS canon_claim_ok
+                   __CLAIM_OK__ AS canon_claim_ok,
+                   -- #1250 : le harnais de la session VIVANTE (0384), absent de
+                   -- la vue dont les colonnes sont figées à sa création ;
+                   -- sous-requête pour ne pas qualifier toutes les colonnes.
+                   (SELECT r.session_harness FROM agent_registry r
+                     WHERE r.name = o.name) AS session_harness
             FROM agent_mesh_overview o
+            LEFT JOIN LATERAL (
+                SELECT operator_paused, operator_pause_reason, operator_pause_by,
+                       operator_pause_for,
+                       extract(epoch from operator_pause_at)::float8 AS operator_pause_ts
+                  FROM agent_registry WHERE name = o.name
+            ) p ON true
             ORDER BY last_seen_ts DESC NULLS LAST
             """.replace("__GOVERNED__", canon_governed_sql("o"))
                .replace("__CLAIM_OK__", canon_claim_predicate_sql("o"))
@@ -348,6 +426,9 @@ class Agents(interface.Agents):
             sql += " AND name IN (%s)" % name_list(names)
         sql += " ORDER BY last_seen"
         return self.db.query(sql, tuple(params))
+
+    def runner_seen(self, host, owner, names) -> None:
+        write_runner_seen(self.db, host, owner, names)
 
     def note_unleased(self, name, host, error) -> bool:
         if not error.startswith("lease_not_taken: "):
@@ -444,6 +525,8 @@ class Agents(interface.Agents):
             """
             SELECT r.name, r.mode, r.status, r.stop_reason, r.responsible, r.host,
                    r.canon_ref, r.placement_ok, r.placement_diagnostic,
+                   -- #2200 : la pause opérateur fait partie de la disponibilité
+                   r.operator_paused, r.operator_pause_reason, r.operator_pause_by,
                    (NOT r.ephemeral OR r.ephemeral_expires_at > now()) AS alive,
                    __GOVERNED__ AS canon_governed,
                    __CLAIM_OK__ AS canon_claim_ok,
@@ -557,7 +640,9 @@ class Leases(interface.Leases):
         """
         sql = sql.replace("__RESPONSABLE__",
                           "AND coalesce(r.responsible, '') <> ''" if require_responsible else "")
-        sql = sql.replace("__CANON__", canon_claim_predicate_sql("r"))
+        # L232b : réclamation d'un agent nommé (pas de tour du contrôleur) —
+        # seul l'agent sonde de la fermeture de release rouvre la condition.
+        sql = sql.replace("__CANON__", canon_claim_predicate_sql("r", probe=True))
         rows = self.db.query(sql, (name, owner, ttl_seconds, owner, owner, owner, owner))
         return rows[0] if rows else None
 
@@ -618,9 +703,10 @@ class Leases(interface.Leases):
     def state(self, name) -> dict | None:
         rows = self.db.query(
             """
-            SELECT lease_owner, lease_epoch, status,
-                   (lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp()) AS live
-              FROM agent_registry WHERE name = %s
+            SELECT name, lease_owner, lease_epoch, status,
+                   (lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp()) AS live,
+                   projects, team, chantier
+              FROM agent_registry WHERE name = (SELECT ameesh_resolve_agent_name(%s, 'registry.lease_matches'))
             """,
             (name,),
         )
@@ -694,7 +780,14 @@ class Leases(interface.Leases):
     @track_change("rotation")
     def clear_session(self, name, owner, epoch) -> bool:
         """Fencé par un bail valide : verrou pris d'abord, échéance
-        recontrôlée avec `clock_timestamp()` dans l'écriture."""
+        recontrôlée avec `clock_timestamp()` dans l'écriture.
+
+        L'oubli est **durable** : `session_reset_at` est posé dans la même
+        écriture (#794, contrôle bureau du 14/10). Un fichier local que l'agent
+        n'a pas pu retirer (PermissionError) reste ainsi antérieur au dernier
+        oubli, donc `AgentWorker.current_session` ne le reprend pas — y compris
+        sur un worker recréé, qui relit ce champ au registre.
+        """
         rows = self.db.query(
             """
             WITH verrou AS (
@@ -702,7 +795,8 @@ class Leases(interface.Leases):
                   FROM agent_registry WHERE name = %s FOR UPDATE
             )
             UPDATE agent_registry AS r
-               SET session_id = NULL, session_work_item = NULL, updated_at = now()
+               SET session_id = NULL, session_work_item = NULL,
+                   session_reset_at = clock_timestamp(), updated_at = now()
               FROM verrou
              WHERE r.name = verrou.name
                AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
@@ -710,6 +804,38 @@ class Leases(interface.Leases):
             RETURNING r.name
             """,
             (name, owner, epoch),
+        )
+        return bool(rows)
+
+    def adopt_session_origin(self, name, owner, epoch, session, lot, *,
+                             harness=None, cwd=None) -> bool:
+        """#1900 B1 : origine d'une session sans origine, sous verrou.
+
+        Verrou de ligne d'abord, puis recontrôle dans l'écriture : bail vivant
+        (owner, epoch, échéance recontrôlée après l'attente du verrou), et
+        ligne portant encore la session ET le lot attendus. Seuls
+        `session_origin`, `session_cwd` et `session_harness` sont écrits —
+        jamais `session_id`, qu'une rotation ou un remplaçant a pu poser
+        pendant l'attente."""
+        rows = self.db.query(
+            """
+            WITH verrou AS (
+                SELECT name, session_id, session_work_item, lease_owner, lease_epoch,
+                       lease_expires_at
+                  FROM agent_registry WHERE name = %s FOR UPDATE
+            )
+            UPDATE agent_registry AS r
+               SET session_origin = %s, session_cwd = %s, session_harness = %s,
+                   updated_at = now()
+              FROM verrou
+             WHERE r.name = verrou.name
+               AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
+               AND verrou.lease_expires_at > clock_timestamp()
+               AND verrou.session_id = %s
+               AND verrou.session_work_item = %s
+            RETURNING r.name
+            """,
+            (name, session, cwd, harness, owner, int(epoch), session, str(lot)),
         )
         return bool(rows)
 
@@ -847,7 +973,7 @@ class Leases(interface.Leases):
         rows = self.db.query(
             """
             WITH verrou AS (
-                SELECT name, status, handoff_fenced, pending_prompt, lease_owner, lease_epoch,
+                SELECT name, status, handoff_fenced, operator_paused, pending_prompt, lease_owner, lease_epoch,
                        lease_expires_at
                   FROM agent_registry WHERE name = %s FOR UPDATE
             )
@@ -861,8 +987,9 @@ class Leases(interface.Leases):
              WHERE r.name = verrou.name
                AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
                AND verrou.pending_prompt IS NOT NULL
+               AND NOT verrou.operator_paused
                AND NOT verrou.handoff_fenced
-               AND ameesh_host_claims_open(r.host)
+               AND ameesh_agent_claims_open(r.host, r.name)
                AND verrou.status <> 'stopped'
                AND verrou.lease_expires_at > clock_timestamp()
             RETURNING verrou.pending_prompt
@@ -875,7 +1002,7 @@ class Leases(interface.Leases):
         rows = self.db.query(
             """
             WITH verrou AS (
-                SELECT name, status, handoff_fenced, lease_owner, lease_epoch, lease_expires_at
+                SELECT name, status, handoff_fenced, operator_paused, lease_owner, lease_epoch, lease_expires_at
                   FROM agent_registry WHERE name = %s FOR UPDATE
             )
             UPDATE agent_registry AS r
@@ -885,7 +1012,8 @@ class Leases(interface.Leases):
                AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
                AND verrou.lease_expires_at > clock_timestamp()
                AND NOT verrou.handoff_fenced
-               AND ameesh_host_claims_open(r.host)
+               AND NOT verrou.operator_paused
+               AND ameesh_agent_claims_open(r.host, r.name)
                AND verrou.status <> 'stopped'   -- arrêté entre lecture et tour (L35)
             RETURNING r.name
             """,
@@ -903,6 +1031,8 @@ class Leases(interface.Leases):
                        ELSE current_prompt || E'\n\n' || pending_prompt
                    END,
                    current_prompt = NULL,
+                   status = CASE WHEN operator_paused AND status = 'running'
+                                 THEN 'queued' ELSE status END,
                    updated_at = now()
              WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
                AND current_prompt IS NOT NULL
@@ -958,8 +1088,10 @@ class PendingSpend(interface.PendingSpend):
                 model        = excluded.model,
                 work_item_id = excluded.work_item_id,
                 turn_id      = excluded.turn_id,
+                resident_usage = null,
                 created_at   = now()
             RETURNING agent, start_index, turn, model, work_item_id, turn_id,
+                      resident_usage,
                       extract(epoch from created_at)::float8 as created_ts
             """,
             (name, int(start_index), turn, model,
@@ -975,10 +1107,27 @@ class PendingSpend(interface.PendingSpend):
         )
         return bool(rows)
 
+    def set_resident_usage(self, name, usage, created_ts=None) -> bool:
+        """L80a : l'événement `resident.turn` d'un tour non réglé, dans le
+        marqueur ; `created_ts` borne l'écriture au marqueur de ce tour."""
+        value = None if usage is None else json.dumps(usage, ensure_ascii=False)
+        if created_ts is None:
+            rows = self.db.query(
+                "UPDATE spend_pending SET resident_usage = %s::jsonb"
+                " WHERE agent = %s RETURNING agent", (value, name))
+        else:
+            rows = self.db.query(
+                "UPDATE spend_pending SET resident_usage = %s::jsonb"
+                " WHERE agent = %s"
+                " AND abs(extract(epoch from created_at)::float8 - %s) < 0.0000005"
+                " RETURNING agent", (value, name, float(created_ts)))
+        return bool(rows)
+
     def get(self, name) -> dict | None:
         rows = self.db.query(
             """
             SELECT agent, start_index, turn, model, work_item_id, turn_id,
+                   resident_usage,
                    extract(epoch from created_at)::float8 as created_ts
               FROM spend_pending WHERE agent = %s
             """,

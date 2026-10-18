@@ -3,10 +3,10 @@
 Un hôte d’agents utilise les unités **utilisateur**
 `ameesh-runner-agent@<agent>.service`, sous le compte `ameesh`.
 Depuis le poste, `deploy/mise-a-jour/vm.sh agents redemarrer` les redémarre
-une par une, hors tour. `agents controler` (ou `agents verifier`) contrôle
-les unités et les baux, sans redémarrer personne. `agents installer [REF]`
-installe une révision gelée dans le layout du compte et `agents retour`
-réinstalle la précédente (#1252).
+une par une, arrêt prouvé avant chaque démarrage. `agents controler` (ou
+`agents verifier`) contrôle les unités et les baux, sans redémarrer personne.
+`agents installer [REF]` installe une révision gelée dans le layout du compte
+et `agents retour` réinstalle la précédente (#1252).
 
 Dans le fichier privé `$BASCULE_ENV` (par défaut
 `~/.config/ameesh/bascule.env`), renseigner la cible SSH **root** et le nom
@@ -31,19 +31,58 @@ deploy/mise-a-jour/vm.sh agents redemarrer
 deploy/mise-a-jour/vm.sh agents controler
 ```
 
-Le redémarrage attend la fin des tours, pendant au plus `ATTENTE_MAX`
-secondes (7200 par défaut). Il relit le placement avant chaque redémarrage :
-un agent déplacé, arrêté ou passé en observation est ignoré. Le compte
+Le redémarrage ferme l’admission de chaque unité par `stop` (SIGTERM) avant
+de la démarrer : le tour en cours draine, borné par `TimeoutStopSec` (35 min),
+et le démarrage n’a lieu qu’après preuve du point sûr (`ActiveState=inactive`
+et `MainPID=0`). Aucune fenêtre « idle » n’est attendue : une persona en tour
+ne bloque plus la mise à jour.
+
+Si l’unité est déjà en échec avant l’arrêt, `reset-failed` efface cet échec
+antérieur avant `stop`. Un échec de cette remise à zéro ou du drainage, un
+état final différent de `inactive` ou un `MainPID` non nul interdit toujours
+le démarrage. Un nouvel échec pendant l’arrêt n’est jamais effacé.
+
+Quand `DRAIN_ATTENTE` est supérieur à 0 (0 par défaut : désactivé), c’est un
+interrupteur, pas un délai : un agent vu en tour reçoit **immédiatement**,
+avant l’arrêt prouvé ci-dessus, une pause opérateur courte et nommée (drain,
+#2152) : le tour en cours se termine — aucun tour n’est interrompu —, plus
+aucun ne commence, puis le redémarrage procède à l’arrêt prouvé et la pause
+est levée après le démarrage. La valeur ne mesure plus une attente d’un
+créneau « idle » ; aucune fenêtre « idle » n’est attendue. Le mesh journalise
+la pose et la levée (`operator_pause_events`) ; une pause déjà posée par un
+autre acteur n’est ni doublée ni levée, et aucune pause posée par le script ne
+survit à sa sortie. La levée est **conditionnelle** : le motif exact de la
+pause posée (unique, avec son jeton) est son identité, et `ameesh resume
+--operator --expect-reason` ne lève que cette pause-là — la comparaison et la
+levée se font dans la même instruction SQL (migration 0458), donc une pause
+étrangère posée entre la lecture et la reprise n’est jamais levée. Si la
+réponse de la pause se perd (SSH coupé, JSON illisible), le script réconcilie
+par l’état réel : motif identique, le drain continue ; sinon il ne redémarre
+ni ne lève rien et s’arrête en le disant, en nommant l’agent, le motif exact
+et la commande conditionnelle de levée manuelle. Pose et levée sont des gestes
+d’opérateur : le CLI local refuse une session liée à un agent (`bad_actor`),
+donc `vm.sh` doit être lancé hors session d’agent ; sinon la pause est refusée
+et le redémarrage de cet agent s’arrête sans interrompre aucun tour. Un CLI de
+cible antérieur à #2152 (sans `--expect-reason`) n’est jamais utilisé pour
+drainer : le script arrête l’agent sans drain plutôt que de laisser une pause
+orpheline. Il relit le placement avant chaque redémarrage :
+un agent déplacé ou passé en observation est ignoré ; un agent arrêté n’est
+pas réactivé (aucun bail, aucun tour — #1131), mais son unité encore active
+est rechargée sur le nouveau code (#1633), sans quoi elle servirait la
+reprise de l’owner avec la version d’avant le déploiement. Le compte
 `ameesh` doit avoir un gestionnaire systemd utilisateur ; le script pose
 `HOME`, `XDG_RUNTIME_DIR` et `DBUS_SESSION_BUS_ADDRESS` pour joindre son bus.
 Le CLI distant est celui de l’unité :
 `/home/ameesh/.local/share/ameesh/venv/bin/ameesh`.
 La CLI et la lecture de l’horloge passent par `systemd-run --user --pipe
---wait --quiet`, avec `EnvironmentFile=%h/.config/ameesh/env` obligatoire.
-Systemd lit ce fichier avec le même parseur que le runner : les valeurs
-contenant `$USER`, des guillemets ou `#` restent intactes. Un fichier absent
-ou illisible produit une erreur avant toute exécution, sans configuration
-de repli.
+--wait --quiet`, avec `EnvironmentFile` sur un chemin absolu : `systemd-run
+-p` n’étend pas le spécificateur `%h` dans une unité transitoire (#1133), le
+shell expanse donc `$HOME` (`/home/ameesh/.config/ameesh/env`). Les fichiers
+d’unité `deploy/systemd/*.service` gardent `%h`, résolu dans une unité
+installée. Systemd lit ce fichier avec le même parseur que le runner : les
+valeurs contenant `$USER`, des guillemets ou `#` restent intactes. Un
+fichier absent ou illisible produit une erreur avant toute exécution, sans
+configuration de repli.
 
 Une unité active ne suffit pas à prouver la reprise d’un bail. Le contrôle
 partagé avec le poste et le serveur (`deploy/mise-a-jour/bail.sh`, #502/#503)
@@ -140,8 +179,22 @@ La séquence de staging écrit chaque événement en JSONL (`date`, `hôte`, `é
 l’étape `sante` est le **rapport JSON** de `sante-courrier.py` (hôte, commit,
 verdict, et pour une remise réelle le message de sonde, son destinataire,
 l’hôte de ce destinataire et son délai) : c’est la preuve structurée que le
-signal ci-dessous exige. Un verdict `sans-sonde` — `SONDE_<HOTE>=jamais`, ou
-`auto` sans persona menée — ne prouve aucune remise.
+signal ci-dessous exige. L’événement porte aussi ce rapport comme objet
+`rapport`, et une notification d’échec le reprend en clair : un KO de sonde
+garde son message, son destinataire et son motif, jamais un simple « santé en
+échec » (#2190). Un verdict `sans-sonde` — `SONDE_<HOTE>=jamais`, `auto` sans
+persona menée, ou toutes les personas menées occupées ou en pause opérateur —
+ne prouve aucune remise.
+
+La sonde ne vise qu’une persona **menée et libre** (bail vivant, pas en tour,
+pas en pause opérateur) : une persona occupée ne reçoit le courrier qu’à la fin
+de son tour, et une persona en pause garde `status` `idle` mais son exécuteur
+refuse le tour ; la sonde mesurerait leur file d’attente, pas la chaîne de
+l’hôte. Si aucune persona menée n’est libre, le verdict est `sans-sonde` et
+nomme les personas occupées ou en pause ; le délai de 300 s ne s’applique qu’à
+une remise partie vers une persona libre, et exige toujours la réponse outil et
+la fin propre du tour (#2190). Le courrier actif en attente chez une persona
+en pause n’est pas compté comme bloqué : son tour est refusé par construction.
 
 ## Signal « staging actif » (#1323)
 
@@ -160,23 +213,24 @@ séquence, les preuves `installer`/`redemarrer`/`controler`/`sante` et les lots
 concernés. Un échec, un retour automatique, une séquence partielle
 (`--hotes`), un journal d’une autre exécution ou une santé sans sonde de
 remise réelle (`--sans-sonde`, `SONDE_<HOTE>=jamais`, `auto` sans persona
-menée) n’émettent **aucun signal de réussite** : chaque événement de la
-fenêtre doit porter le commit visé, et le message de sonde est relu en base
+menée, ou toutes occupées ou en pause) n’émettent **aucun signal de réussite** :
+chaque événement de la fenêtre doit porter le commit visé, et le message de sonde est
+relu en base
 (expéditeur système, destinataire, hôte, commit, remise effective). Aucune
 clôture de lot n’est automatique : le rapporteur reprend lui-même sa
 vérification après déploiement.
 
 Un hôte **sans exécutant** (mode serveur, comme `manaty-mesh-1`) ne peut pas
 prouver sa chaîne par une remise locale : sa preuve est le `controler` vert
-plus une **sonde croisée**, remise à une persona menée d’un autre hôte
+plus une **sonde croisée**, remise à une persona menée et libre d’un autre hôte
 canonique **après son redémarrage** — la remise traverse alors sa base, le
 message étant déposé dans la base du serveur et relevé par l’exécuteur de
 l’autre hôte. `sante-courrier.py --serveur` produit cette sonde et nomme
 l’hôte destinataire (`hote_destinataire`) ; `actif.py` relit la remise en base
 et exige qu’elle soit postérieure au `redemarrer` de l’hôte mesuré. Un serveur
 qui porte des exécutants garde la règle locale : une santé `sans-sonde`
-(aucune persona menée) n’atteste rien, et une sonde croisée n’est acceptée que
-pour un hôte à zéro persona.
+(aucune persona menée libre) n’atteste rien, et une sonde croisée n’est
+acceptée que pour un hôte à zéro persona.
 
 L’émission est bornée et **idempotente** : un seul courrier par rapporteur et
 par commit, même si la séquence est relancée. La clé d’émission est écrite
@@ -201,3 +255,81 @@ du code, selon la procédure de [BASCULE.md](BASCULE.md). Les commandes de cette
 page sont à exécuter par le responsable du déploiement après revue et
 validation CI, une VM à la fois ; `controler` affiche le code installé, le
 clone et `previous-sha` avant les unités.
+
+## Release automatique aux coupures (#2448)
+
+À 11:00 et 23:00 (Europe/Paris), la tête de `main` est taguée et déployée en
+staging sans agent. Le calendrier n'est pas écrit dans une unité systemd : il
+vient du bloc mécanique du canon compilé (`processus/mecanique.yaml`,
+`mechanics.cutoffs`), lu au commit exact du canon appliqué. Sans ce document,
+la commande refuse — aucun repli sur une heure locale.
+
+**Configuration de l'hôte opérateur** (pc-smichea seulement) :
+
+```json
+"release": {
+  "host": "pc-smichea",
+  "projects": {
+    "ameesh": {
+      "repo": "/home/ameesh/work/ameesh",
+      "target": "main",
+      "github": "manaty/ameesh",
+      "report": "smichea",
+      "staging_timeout_s": 7200
+    }
+  }
+}
+```
+
+`repo` est un clone dédié du projet, propre et à jour (le service y crée un
+worktree de version, pousse la cible et lance `deploy/mise-a-jour/staging.sh`
+depuis un worktree du commit publié). `staging` est facultatif (défaut
+`deploy/mise-a-jour/staging.sh`, relatif à `repo`). `window_s` (défaut 1800)
+borne le retard toléré après une coupure ; `lock_wait_s` (défaut 3600) borne
+l'attente du verrou d'écriture de la cible. `version_bump` vaut `level` (le
+plancher de `scripts/version-level.py`, appliqué par le pilote pour #2448) ou
+`patch` (dérogation explicite) ; un niveau `major` n'est jamais publié sans
+go owner.
+
+**Activation** (une fois, par l'opérateur) :
+
+```sh
+install -m 0644 deploy/systemd/ameesh-release.service \
+                   deploy/systemd/ameesh-release.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now ameesh-release.timer
+ameesh release calendar                # prochaine coupure et canon lu
+ameesh release cutoff --dry-run        # plan, notes, aucun effet
+```
+
+**Ce que fait un tick** : il prend `B`, la tête de la cible si la CI du
+commit exact est verte, sinon le plus récent commit vert de la chaîne
+first-parent (un commit de release `[skip ci]` hérite de l'état de son premier
+parent). Il calcule le niveau de version (`level <dernier tag> B`), génère
+`docs/versions/<version>.md` depuis les manifestes des paquets fusionnés (lots
+inclus et écartés), puis crée `V` sur `B` : version + notes, `[skip ci]`, avec
+le trailer `ameesh-release:`. Si la cible vaut encore `B`, `V` part en
+fast-forward ; sinon un commit de fusion `M = merge(main, V)` porte la version
+et les notes sur la tête courante, sans réécrire `main`. `V` et l'étiquette
+`v<version>` partent dans **une seule poussée atomique**, sans force : un rejet
+donne un seul recalcul, puis un rapport. Le staging déploie **le tag** (le
+contenu vert `V`), jamais la tête de `main`, puis crée la release GitHub. Un
+retour automatique de l'hôte en échec est celui de `staging.sh`. Le rapport
+part à l'owner (`report`) avec la version, les lots, les écarts et la santé par
+hôte ; il est aussi écrit sous `~/.local/state/ameesh/release/reports/`.
+
+**Idempotence** : l'état local
+(`~/.local/state/ameesh/release/state.json`) évite de reprendre une coupure
+déjà faite ; les faits durables sont l'étiquette et l'attestation
+`actif-<sha>.json`. Une étiquette créée à la coupure ou après, une release
+GitHub manquante ou un staging interrompu sont **réconciliés** au tick suivant
+sans publier une seconde version. La release prend le **même** bail d'écriture
+que le train (#2446), `land.lock_key(project, 'main')`, avec un owner propre et
+sans partage d'epoch ; elle attend qu'il soit libre dans sa borne avant la
+poussée atomique, puis le rend. `staging.sh` refuse deux séquences simultanées
+(code 75, `staging.lock`).
+
+**Preuve** : le journal `~/.local/state/ameesh/mise-a-jour/staging-<date>.jsonl`,
+l'attestation `actif-<sha>.json` (quatre hôtes, sonde de courrier remise) et le
+rapport JSON du tick. Aucune prod : le staging n'est pas une release de prod
+(canon §14), un go owner reste requis pour la prod.

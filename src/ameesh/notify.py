@@ -6,7 +6,9 @@
                 [--session-tokens N] [--stale-lot S] [--orphan-lot S]
                 [--take-idle S] [--take-max-per-hour N]
                 [--take-lot-idle S] [--take-lot-max-per-hour N]
+                [--take-review-max-per-hour N]
                 [--handoff-max-per-hour N] [--handoff-idle S]
+                [--wip-max-returns N] [--wip-apply]
         follows the operations alerts (`ameesh alerts --follow`, same
         thresholds, same dedupe keys) and sends each raised alert and each
         resolution to the responsible human, on their channels.
@@ -17,10 +19,22 @@
         (default 15 min) takes the highest-priority unassigned lot of its
         team and the orchestrator is told; `--take-lot-idle 0` turns it
         off.
-        L233b: before any take, the intake and build lots of a non-critical
-        Claude agent paused on budget go to a free DeepSeek agent of the
-        same project (`ameesh.handoff.budget_handoff`);
+        #1677/#1738: when no lot is free, auto-take proposes a review (a
+        `qa` lot without a current verdict, another model family than the
+        author) or a correction (current blocking verdict, author busy) to
+        an idle agent; `--take-review-max-per-hour 0` turns these
+        proposals off, and the improvement backlog then keeps the pass.
+        L233b/L165: before any take, the non-started (`intake`) lots of a
+        non-critical Claude agent paused on budget are returned to the team
+        queue (no assignee, a journal note), where the automatic take gives
+        them to any free capable agent (DeepSeek or Codex); its started
+        (`build`) lots go to a free DeepSeek or Codex agent of the same
+        project (`ameesh.handoff.budget_handoff`);
         `--handoff-max-per-hour 0` turns it off.
+        §4 (owner 14/10/2026): each pass can also return the surplus lots of
+        an agent above the WIP cap (`ameesh.wip.sweep`); the pass is off by
+        default (`--wip-max-returns 0`) and, without `--wip-apply`, it only
+        reports (nothing is returned).
         L126: on the host named by the `github` config key, each pass also
         maintains the GitHub issues of the lots
         (`ameesh.plan_github.Projector`) and polls the running CI: each
@@ -50,11 +64,17 @@ stopped is sent on restart); rate limited per human (beyond that, a
 summary); a failing channel does not block the others and is retried on
 later passes, a bounded number of times.
 
-Channels: `desktop`, `ntfy`, `slack`. L66 — the `desktop` channel follows
-the OS through `ameesh.platform.notify`: `notify-send` on Linux, `osascript`
-on macOS, a Windows toast through `powershell.exe` under WSL2; native
-Windows comes with L67. `ameesh doctor --notify-test` says which backend
-this OS uses (and sends a test if a `desktop` route is configured).
+Channels: `desktop`, `ntfy`, `slack`, `app`. L66 — the `desktop` channel
+follows the OS through `ameesh.platform.notify`: `notify-send` on Linux,
+`osascript` on macOS, a Windows toast through `powershell.exe` under WSL2;
+native Windows comes with L67. `ameesh doctor --notify-test` says which
+backend this OS uses (and sends a test if a `desktop` route is configured).
+L90 — the `app` channel is the embedded interface: it pushes nothing, the
+application reads the alerts through the mesh's event stream
+(`GET /api/v1/events`, `alert.raised` / `alert.resolved`) and the alerts
+view. Declaring it in a route says that this human's alerts are read in the
+application; without it, a human whose only interface is the application
+would be counted as having no channel.
 """
 from __future__ import annotations
 
@@ -90,8 +110,17 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_mail",
                  "delegation_expired", "engagement_overdue", "plan_underused",
                  "idle_capacity", "orchestrator_held", "host_underused", "balance_low",
+                 # L226b/#1883 : un compte de forfait facturé au-delà du plan —
+                 # l'owner le sait tout de suite, la règle est « jamais de dépassement »
+                 "account_overage",
+                 # #1883 : deux configurations de l'hôte déclarent le même nom de
+                 # compte vers deux dossiers — lecture ambiguë, compte refusé
+                 "account_identity",
                  "host_not_ready", "host_power_low",
                  "host_unavailable", "host_drain_overdue", "lease_not_taken", "backlog_empty", "mail_undeliverable",
+                 # #2341 : un hôte dont l'échantillonneur s'est tu n'alimente plus
+                 # les autres alertes ; son propriétaire l'apprend
+                 "host_unsampled",
                  # L124 : une demande de décision attend le propriétaire, et sa
                  # relance à l'échéance (urgentes si la demande l'est)
                  "decision_pending", "decision_overdue",
@@ -102,6 +131,10 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "ci_runner_stuck", "ci_queue_saturated",
                  # #246 : btrfs presque plein côté allocation (df ne le voit pas)
                  "host_disk_low",
+                 # #2022 : un volume presque plein, ou au plancher de pause bientôt
+                 "host_disk_soon_full",
+                 # #2022 : des zombies s'accumulent sur un hôte
+                 "host_zombies",
                  # L225 : des tours sans tarif au barème échappent à la dépense
                  "turn_unpriced",
                  # L226b : un agent attend un compte authentifié sain
@@ -116,6 +149,8 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "critical_budget_pause",
                  # #1268 : un agent critique enchaîne les échecs de tour réels
                  "critical_turn_failures",
+                 # L242c : canon illisible, rôles critiques tenus
+                 "critical_roles_unreadable",
                  # #330: an owner key registered or replaced lately
                  "owner_key_registered",
                  # L160e2: a merge queue no longer moves
@@ -126,7 +161,7 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "budget_drift",
                  # #532: a local PgBouncer pool queues its mesh clients
                  "pgbouncer_pool_waiting")
-CHANNEL_KINDS = ("desktop", "ntfy", "slack")
+CHANNEL_KINDS = ("desktop", "ntfy", "slack", "app")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_TIMEOUT_S = 10.0
@@ -143,6 +178,9 @@ CHANNEL_OPTIONS = {
     "desktop": ("type", "timeout"),
     "ntfy": ("type", "timeout", "url", "topic", "token_env", "token_file"),
     "slack": ("type", "timeout", "webhook_env", "webhook_file"),
+    # L90 : l'application embarquée lit le journal d'événements ; le canal ne
+    # porte ni adresse ni secret, il déclare seulement la route.
+    "app": ("type", "timeout"),
 }
 TOP_KEYS = ("default_human", "types", "routes", "default", "channels", "rate_per_minute",
             "max_attempts", "interval", "timeout")
@@ -164,7 +202,10 @@ TYPE_LABELS = {
     # #789 t2 (canon §9) : adressée aux agents (alert_briefs) ; poussée aux
     # humains si le type est dans `notify.types`
     "slo_breach": "internal deadline (SLO) overdue",
+    # #1107 (n2 P3 de #1035) : un lot que les passes d'alerte ne savent pas lire
+    "lot_unreadable": "work item unreadable by the alert passes",
     "host_pressure": "host under pressure",
+    "host_unsampled": "host sampler silent",
     "orphan_resource": "orphan resource",
     "tmpfs_full": "tmpfs almost full",
     "worktree_kept": "worktree kept at end of lot",
@@ -199,6 +240,8 @@ TYPE_LABELS = {
     "ci_queue_saturated": "CI queue beyond its SLO",
     "deep_analysis_overdue": "deep analysis without a report in time",
     "host_disk_low": "btrfs disk almost full",
+    "host_disk_soon_full": "disk almost full, or filling up",
+    "host_zombies": "zombie processes piling up on a host",
     "docker_orphan_volumes": "Docker orphan volumes accumulating",
     "docker_build_cache": "Docker reclaimable build cache above threshold",
     "docker_storage_unavailable": "Docker storage inventory unavailable",
@@ -216,6 +259,10 @@ TYPE_LABELS = {
     "critical_budget_pause": "critical agent paused on budget",
     # #1268 : deux échecs de tour réels d'affilée sur un agent critique
     "critical_turn_failures": "critical agent failing turns",
+    "critical_roles_unreadable": "canon unreadable: critical roles held",
+    # #1466: briefed to the orchestrators and auditors (alert_briefs); not
+    # pushed to humans by default (add it to `notify.types` to receive it)
+    "budget_pause_long": "agent paused on budget for a long time",
     # #254: not pushed by default (add it to `notify.types`)
     "host_hold": "host on hold",
     "budget_drift": "counted spend strays from the provider balance",
@@ -418,12 +465,12 @@ def parse_config(raw) -> NotifyConfig:
             raise NotifyConfigError("notify.routes: key %r, `human:<id>` expected" % who)
         routes[human] = _names(names, "notify.routes.%s" % who)
     default = _names(raw.get("default") or [], "notify.default")
-    # un canal nommé par son type (desktop, slack) n'a pas besoin d'être déclaré
+    # un canal nommé par son type (desktop, slack, app) n'a pas besoin d'être déclaré
     for names in list(routes.values()) + [default]:
         for name in names:
             if name in channels:
                 continue
-            if name in ("desktop", "slack"):
+            if name in ("desktop", "slack", "app"):
                 channels[name] = _channel(name, {})
             elif name == "ntfy":
                 raise NotifyConfigError("ntfy channel used without declaration: "
@@ -782,6 +829,13 @@ class Sender:
               {"Content-Type": "application/json; charset=utf-8"}, timeout,
               show_url=False)   # l'URL d'un webhook est un secret : jamais journalisée
 
+    def _app(self, channel: Channel, message: Message, timeout: float) -> None:
+        """L90 : le canal de l'interface embarquée. Rien à pousser : l'alerte
+        est déjà dans le journal d'événements (`GET /api/v1/events`), que
+        l'application suit en direct. Le canal réussit donc toujours ; il sert
+        à router un humain vers son application, pas à transporter un texte."""
+        return
+
 
 class DrySender:
     """`--dry-run` : n'envoie rien, retient ce qui serait envoyé."""
@@ -988,14 +1042,17 @@ def group_orphan_lots(alerts: list, resolve) -> list:
 _KEPT = ("module", "rule", "project", "declaration_id", "subject", "action",
          "type", "agent", "lot", "title", "host", "since", "detail", "reason", "value",
          "responsible", "stop_reason", "assignee", "harness", "account", "gauge",
-         "provider", "currency", "urgent",
+         "provider", "currency", "urgent", "severity", "level",
          # L96 : `engagement_overdue` (la clé de dédoublonnage les lit)
          "commitment", "package", "due",
          # L124 : `decision_pending`, `decision_overdue`
          "decision", "grouped",
          # #789 t2 (canon §9) : un P1 garde son niveau et ses cibles dans
          # l'état — la livraison au propriétaire et la résolution les relisent
-         "critical", "targets")
+         "critical", "targets",
+         # #1901 : l'hôte qui a observé l'alerte (porte d'hôte) reste dans
+         # l'état — une famille non relue ne résout pas ses alertes
+         "observation_host")
 
 
 # --------------------------------------------------------------------------
@@ -1012,13 +1069,17 @@ class Notifier:
 
     def __init__(self, cfg: Config, ncfg: NotifyConfig, state: dict | None = None, *,
                  sender=None, dry_run: bool = False, emit=None, log=None, clock=None,
-                 take: dict | None = None, handoff: dict | None = None):
+                 take: dict | None = None, handoff: dict | None = None,
+                 wip: dict | None = None):
         self.cfg, self.ncfg = cfg, ncfg
         #: L119 : réglages de la prise automatique (`backlog.auto_take`) ; None la coupe
         self.take = take
         #: L233b : réglages de la reprise sur pause budget
         #: (`handoff.budget_handoff`) ; None la coupe
         self.handoff = handoff
+        #: §4 : réglages du balayage de la limite d'en-cours (`wip.sweep`) ;
+        #: None le coupe (défaut : aucun balayage du mesh actif à ce stade)
+        self.wip = wip
         self.state = state if state is not None else empty_state()
         self.dry_run = dry_run
         self.sender = sender or (DrySender() if dry_run else Sender(timeout=ncfg.timeout))
@@ -1033,17 +1094,61 @@ class Notifier:
     # -- passage --------------------------------------------------------------
     def run_pass(self, db, current: list | None = None, thresholds: dict | None = None,
                  ) -> list:
+        from . import alert_ack
+        from .mediated_executor import availability
+        observed_ts = storage.of(db).alert_acknowledgements.clock() if db is not None else None
         now = float(self.clock())
+        #: #1901 : familles qu'une passe n'a pas pu lire du tout (porte d'hôte
+        #: au registre illisible) ; une alerte absente d'un relevé incomplet
+        #: n'est pas résolue pour autant.
+        unreadable: list[str] = []
         if current is None:
+            # #2105 : without explicit thresholds, observe and declare the same
+            # perimeter — the parser's defaults (`default_thresholds`,
+            # environment included), as the CLI and the API do, not the bare
+            # defaults of `alerts`, which may differ. The perimeter declared
+            # below is then exactly the one observed here.
+            thresholds = thresholds or alert_ack.default_thresholds()
             # #1179 : la console du pool local n'est pas lue par la passe
             # ordinaire ; `run_local_pass` la lit depuis `cfg` seule et reste
             # seul juge de ses alertes. Une console illisible n'y échoue plus.
             current = exploitation.alerts(self.cfg, db, now=now, local_pool=False,
-                                          **(thresholds or {}))
+                                          unreadable=unreadable, **thresholds)
         records: list = []
         self._records = records
         router = Router(self.cfg, db, self.ncfg)
-        notifications = group_orphan_lots(current, router.resolve)
+        acknowledgements = []
+        if db is not None:
+            # #1473 : un accusé se juge dans le périmètre qui l'a pris ; cette
+            # passe réobserve l'alerte dans le sien avant de la dire résolue.
+            def reobserve(own):
+                # Sans la console locale (#1179) : ses alertes ne s'accusent pas.
+                return alert_ack.current(self.cfg, db, now=now, local_pool=False, **own)
+
+            acknowledgements = alert_ack.reconcile(
+                db, current, observed_ts=observed_ts, dry_run=self.dry_run,
+                observation_host=getattr(self.cfg, "host", None),
+                unreadable=unreadable,
+                perimeter=alert_ack.canonical(thresholds or alert_ack.default_thresholds()),
+                evaluate=reobserve)
+        # Reuse each subject's route for acknowledgement and group membership;
+        # lot/package lookups belong to this snapshot, not to every projection.
+        routes = {id(a): router.resolve(a) for a in current}
+
+        def resolve_current(alert):
+            return routes[id(alert)]
+
+        notifications = group_orphan_lots(current, resolve_current)
+        # Retain all group identities, including fully acknowledged groups:
+        # filtering them out of wanted would falsely announce a resolution.
+        unacknowledged = [a for a in current if alert_ack.matches(
+            acknowledgements, a, resolve_current(a)[0]) is None]
+        audible = {key_of(a): a for a in group_orphan_lots(unacknowledged, resolve_current)}
+        subjects_by_key = {}
+        for subject in current:
+            group = group_orphan_lots([subject], resolve_current)[0]
+            subjects_by_key.setdefault(key_of(group), []).append({
+                "key": alert_ack.key_of(subject), "severity": alert_ack.severity(subject)})
         # #789 t2 (canon §9) : une alerte qui CIBLE le propriétaire
         # (`targets` contient "owner", le P1 d'un dépassement de SLO) ne se
         # perd pas — elle atteint l'humain même si son type a été retiré de
@@ -1072,7 +1177,17 @@ class Notifier:
                 # pouvoir les résoudre ; ne pas les voir ici n'est pas une
                 # preuve de résolution.
                 continue
+            observer = entry["alert"].get("observation_host")
+            if (availability.GATE_FAMILY in unreadable
+                    and entry["alert"].get("type") in availability.ALERT_TYPES
+                    and observer in (None, getattr(self.cfg, "host", None))):
+                # #1901 : la famille « porte d'hôte » n'a pas été lue par cette
+                # passe ; ni résolution ni acquittement invalidé sur une absence.
+                # L'état antérieur à #1901 ne gardait pas observation_host.
+                continue
             del active[key]
+            if self._acknowledged(entry, acknowledgements):
+                self._mute(entry)
             if entry["alert"].get("type") not in self.ncfg.types \
                     and "owner" not in (entry["alert"].get("targets") or ()):
                 self.log("[%s] removed from notify.types: forgotten without resolution"
@@ -1082,6 +1197,30 @@ class Notifier:
             self._event(db, "alert.resolved", key, entry["alert"])
         for key, alert in wanted.items():
             entry = active.get(key)
+            subjects = subjects_by_key[key]
+            human, _ = (routes[id(alert)] if id(alert) in routes
+                        else router.resolve(alert))
+            muted = key not in audible
+            # A partial orphan group only mentions its unacknowledged members.
+            alert = audible.get(key, alert)
+            level = alert_ack.severity(alert)
+            changed_ack_level = any(r["principal"] == human
+                and any(r["alert_key"] == a["key"] and r["severity"] != a["severity"]
+                        for a in subjects)
+                for r in acknowledgements)
+            if entry is not None and ((entry.get("status") == "acknowledged" and not muted)
+                                      or changed_ack_level):
+                self._forget_summary(entry)
+                entry.update(status="nouvelle", channels={}, alert={
+                    k: alert.get(k) for k in _KEPT if alert.get(k) is not None})
+                entry.pop("escalated", None)
+            if muted:
+                if entry is None:
+                    entry = active[key] = {"alert": {k: alert.get(k) for k in _KEPT
+                        if alert.get(k) is not None}, "raised_ts": now, "channels": {}}
+                entry.update(human=human, severity=level, ack_subjects=subjects)
+                self._mute(entry)
+                continue
             if entry is None:
                 entry = active[key] = {
                     "alert": {k: alert.get(k) for k in _KEPT if alert.get(k) is not None},
@@ -1109,9 +1248,13 @@ class Notifier:
                     self._raise(entry, router, now)
                 else:
                     self._retry(entry, "raised", now)
+            entry.update(severity=level, ack_subjects=subjects)
         self._brief_agents(db, current, router, now)
         for key in list(self.state["resolved"]):
             entry = self.state["resolved"][key]
+            if self._acknowledged(entry, acknowledgements):
+                del self.state["resolved"][key]
+                continue
             self._retry(entry, "resolved", now)
             if not self._pending(entry):
                 del self.state["resolved"][key]
@@ -1120,6 +1263,8 @@ class Notifier:
             self._budget_handoff(db, now)
         if self.take:
             self._auto_take(db, current, now)
+        if self.wip:
+            self._wip_sweep(db, now)
         self._github_issues(db, now)
         self._ci_failures(db)
         for human in list(self.state["rate"]):
@@ -1193,6 +1338,33 @@ class Notifier:
             self._retry(entry, "resolved", now)
             if not self._pending(entry):
                 del self.state["resolved"][key]
+
+    @staticmethod
+    def _acknowledged(entry: dict, rows: list) -> bool:
+        from . import alert_ack
+        subjects = entry.get("ack_subjects") or [{"key": alert_ack.key_of(entry["alert"]),
+                                                "severity": alert_ack.severity(entry["alert"])}]
+        return all(any(r["alert_key"] == a["key"] and r["severity"] == a["severity"]
+                       and r["principal"] == entry.get("human") for r in rows)
+                   for a in subjects)
+
+    def _forget_summary(self, entry: dict) -> None:
+        if entry.get("status") != "resumee":
+            return
+        bucket = self.state["summary"].get(entry.get("human"))
+        if bucket:
+            kind = entry["alert"]["type"]
+            remaining = bucket["raised"].get(kind, 0) - 1
+            if remaining > 0:
+                bucket["raised"][kind] = remaining
+            else:
+                bucket["raised"].pop(kind, None)
+            if not bucket["raised"] and not bucket["resolved"]:
+                self.state["summary"].pop(entry.get("human"), None)
+
+    def _mute(self, entry: dict) -> None:
+        self._forget_summary(entry)
+        entry.update(status="acknowledged", channels={})
 
     def _reconcile_orphan_groups(self, active: dict, wanted: dict, router: Router) -> None:
         """Adopt persisted per-lot deliveries before checking for resolutions.
@@ -1282,9 +1454,33 @@ class Notifier:
             entry = {"alert": {"type": "auto_take", "agent": take["agent"],
                                "lot": int(item["id"]), "title": item.get("title")},
                      "human": None,
-                     "source": "lot de l'équipe" if take.get("kind") == "lot"
-                     else "file d'amélioration"}
+                     "source": {"lot": "lot de l'équipe",
+                                "review": "relecture proposée",
+                                "correction": "correction proposée"}.get(
+                                    take.get("kind"), "file d'amélioration")}
             self._record("auto_take", entry, "a_blanc" if self.dry_run else "prise", {})
+
+    # -- §4 (owner 14/10/2026) : limite d'en-cours -----------------------------
+    def _wip_sweep(self, db, now: float) -> None:
+        """Rend à la file le surplus des agents au-dessus du plafond (§4).
+        Sans `--wip-apply` — et sous le `--dry-run` global — le passage ne rend
+        rien : il ne fait que relever (`a_blanc`)."""
+        from . import wip as wip_mod
+        dry = bool(self.dry_run or not self.wip.get("apply"))
+        try:
+            returned = wip_mod.sweep(self.cfg, db, dry_run=dry,
+                                     limit=int(self.wip.get("limit") or 0))
+        except db_mod.DbError:
+            raise
+        except Exception as exc:     # le balayage ne fait jamais tomber les alertes
+            self.log("WIP sweep failed: %s" % _clean(exc, 200))
+            return
+        for row in returned:
+            item = row["item"]
+            entry = {"alert": {"type": "wip_return", "agent": row["agent"],
+                               "lot": int(item["id"]), "title": item.get("title")},
+                     "human": None, "source": "limite d'en-cours (§4)"}
+            self._record("wip_return", entry, "a_blanc" if dry else "rendu", {})
 
     def _budget_handoff(self, db, now: float) -> None:
         from . import handoff
@@ -1298,10 +1494,12 @@ class Notifier:
             return
         for move in moved:
             item = move["item"]
+            queued = bool(move.get("queued"))
             entry = {"alert": {"type": "budget_handoff", "agent": move["agent"],
                                "lot": int(item["id"]), "title": item.get("title")},
                      "human": None, "source": "pause budget de %s" % move["previous"]}
-            self._record("budget_handoff", entry, "a_blanc" if self.dry_run else "prise", {})
+            self._record("budget_handoff", entry,
+                         "a_blanc" if self.dry_run else ("rendu" if queued else "prise"), {})
 
     # -- levée ----------------------------------------------------------------
     def _event(self, db, kind: str, key: str, alert: dict) -> None:
@@ -1451,6 +1649,14 @@ class Notifier:
             if not briefs:
                 continue        # personne à prévenir : on réessaie au passage suivant
             if entry is not None:
+                # #1787 N1 : la relance repart aux destinataires de la levée,
+                # pas à ceux que l'état vivant désignerait maintenant (le brief
+                # d'un lot sans assigné est atomique, #1026) ; si aucun n'est
+                # plus joignable, rien ne part et `reminded` reste à poser.
+                keep = {str(n) for n in entry.get("to") or ()}
+                briefs = {n: t for n, t in briefs.items() if n in keep}
+                if not briefs:
+                    continue
                 raised = float(entry["sent_ts"])
                 briefs = {n: alert_briefs.reminder(t, raised, now) for n, t in briefs.items()}
             payload = {"alert": kind, "reminder": entry is not None}
@@ -1528,6 +1734,9 @@ class Notifier:
             # L124 : l'humain a répondu (ou la demande est retirée) : rien à envoyer
             self._record("resolved", entry, "sans_envoi", {})
             return
+        if status == "acknowledged":
+            self._record("resolved", entry, "sans_envoi", {})
+            return
         if status in ("sans_destinataire", "sans_canal", "nouvelle"):
             self.log("alert resolved [%s] %s (never sent: %s)" % (
                 alert.get("type"), _subject(alert), _DELIVERY_LABELS.get(status, status)))
@@ -1543,6 +1752,7 @@ class Notifier:
             self._record("resolved", entry, "abandonnee", {})
             return
         resolved = {"alert": alert, "raised_ts": entry.get("raised_ts"), "resolved_ts": now,
+                    "ack_subjects": entry.get("ack_subjects"),
                     "human": human, "source": entry.get("source"), "status": "envoi",
                     "channels": {name: {"ok": False, "attempts": 0, "error": None}
                                  for name in delivered}}
@@ -1730,7 +1940,8 @@ def desktop_probe(cfg, env: dict | None = None) -> tuple[bool, str]:
             backend, ou)
     if problem:
         return False, "KO — %s" % problem
-    results = send_test(ncfg, human, cfg.host, sender=Sender(env=env), kinds=("desktop",))
+    results = send_test(ncfg, human, cfg.host,
+                        sender=Sender(env=env, timeout=ncfg.timeout), kinds=("desktop",))
     errors = [detail for _name, detail in results if detail]
     if errors:
         return False, "%s (%s) — test to %s failed: %s" % (backend, ou, human, errors[0])
@@ -1749,14 +1960,15 @@ _DELIVERY_LABELS = {"a_blanc": "dry run", "envoyee": "sent", "echec": "failed",
                     "sans_destinataire": "no recipient", "sans_canal": "no channel",
                     "resumee": "summarized", "abandonnee": "abandoned",
                     "sans_envoi": "not sent", "prise": "taken", "nouvelle": "new",
-                    "envoi": "sending"}
+                    "rendu": "returned to the queue", "envoi": "sending"}
 
 
 def _format(record: dict) -> str:
     who = record.get("human") or "—"
     what = "[%s] %s" % (record.get("type"), _subject(record))
     event = {"raised": "raised", "resolved": "resolved", "summary": "summary",
-             "auto_take": "auto-take", "budget_handoff": "budget handoff"}.get(
+             "auto_take": "auto-take", "budget_handoff": "budget handoff",
+             "wip_return": "WIP return"}.get(
         record["event"], record["event"])
     channels = ", ".join("%s %s" % (k, v) for k, v in sorted(record["channels"].items()))
     delivery = record["delivery"]
@@ -1836,18 +2048,38 @@ def build_parser() -> argparse.ArgumentParser:
                             "AMEESH_TAKE_LOT_MAX_PER_HOUR", backlog.DEFAULT_LOT_MAX_PER_HOUR)),
                         help="maximum team lots taken per rolling hour, for the whole mesh "
                              "(default 6)")
+    # #1738 (N3) : les propositions de relecture/correction (#1677) ont leur
+    # propre interrupteur — 0 les coupe, la file d'amélioration reprend alors
+    # tout le passage.
+    parser.add_argument("--take-review-max-per-hour", type=int,
+                        default=int(exploitation._env_float(
+                            "AMEESH_TAKE_REVIEW_MAX_PER_HOUR",
+                            backlog.REVIEW_PROPOSAL_MAX_PER_HOUR)),
+                        help="maximum review/correction proposals per rolling hour, for "
+                             "the whole mesh (default 6; 0 turns them off)")
     # L233b : reprise des lots d'un agent Claude en pause budget
     parser.add_argument("--handoff-max-per-hour", type=int,
                         default=int(exploitation._env_float(
                             "AMEESH_HANDOFF_MAX_PER_HOUR", handoff.DEFAULT_MAX_PER_HOUR)),
-                        help="maximum lots handed per rolling hour from non-critical Claude "
-                             "agents paused on budget to free DeepSeek agents of the same "
-                             "project (default 4; 0 turns this off)")
+                        help="maximum lots returned to the queue or handed per rolling hour "
+                             "from non-critical Claude agents paused on budget, the handed "
+                             "ones to free DeepSeek or Codex agents of the same project "
+                             "(default 4; 0 turns this off)")
     parser.add_argument("--handoff-idle", type=float,
                         default=exploitation._env_float("AMEESH_HANDOFF_IDLE",
                                                         handoff.DEFAULT_IDLE_S),
-                        help="a DeepSeek agent takes a handed lot once idle for S seconds "
-                             "(default 300)")
+                        help="a DeepSeek or Codex agent takes a handed lot once idle for S "
+                             "seconds (default 300)")
+    # §4 (owner 14/10/2026) : balayage de la limite d'en-cours, coupé par
+    # défaut — l'activation du balayage mutant vient après les portes et le
+    # déploiement ; sans --wip-apply, le passage ne fait que relever.
+    parser.add_argument("--wip-max-returns", type=int,
+                        default=int(exploitation._env_float("AMEESH_WIP_MAX_RETURNS", 0)),
+                        help="WIP sweep (§4): at most N surplus lots returned per pass "
+                             "(default 0: off); without --wip-apply, dry run only")
+    parser.add_argument("--wip-apply", action="store_true",
+                        help="WIP sweep: actually return the lots to the team queue "
+                             "(never with --dry-run)")
     return parser
 
 
@@ -1860,21 +2092,38 @@ def handoff_settings(args) -> dict | None:
             "idle_s": max(0.0, float(getattr(args, "handoff_idle", 0) or 0))}
 
 
+def wip_settings(args) -> dict | None:
+    """§4 : réglages du balayage de la limite d'en-cours lus des options ; None
+    si le balayage est coupé (le défaut). Voir `wip.notify_settings`."""
+    from . import wip as wip_mod
+    return wip_mod.notify_settings(args)
+
+
 def take_settings(args) -> dict | None:
     """Réglages de `backlog.auto_take` lus des options ; None si les deux
-    prises (file d'amélioration, lots de l'équipe) sont coupées."""
+    prises (file d'amélioration, lots de l'équipe) sont coupées — les
+    propositions #1677 n'existent qu'avec une prise active, et
+    `review_max_per_hour` à 0 les coupe en plus."""
+    from . import backlog
     idle = float(getattr(args, "take_idle", 0) or 0)
     most = int(getattr(args, "take_max_per_hour", 0) or 0)
     lot_idle = float(getattr(args, "take_lot_idle", 0) or 0)
     lot_most = int(getattr(args, "take_lot_max_per_hour", 0) or 0)
+    # #1738 (N3) : absent du namespace (appelant ancien), l'interrupteur reste
+    # au défaut du produit — les propositions ne sont pas coupées par surprise.
+    review_most = int(getattr(args, "take_review_max_per_hour",
+                              backlog.REVIEW_PROPOSAL_MAX_PER_HOUR) or 0)
     if idle <= 0 or most <= 0:
         idle, most = 0.0, 0
     if lot_idle <= 0 or lot_most <= 0:
         lot_idle, lot_most = 0.0, 0
+    # #1738 R1 (B2) : les propositions suivent une prise active — les deux
+    # prises à 0 coupent toujours toute la prise automatique (comme avant).
     if not most and not lot_most:
         return None
     return {"idle_s": idle, "max_per_hour": most,
-            "lot_idle_s": lot_idle, "lot_max_per_hour": lot_most}
+            "lot_idle_s": lot_idle, "lot_max_per_hour": lot_most,
+            "review_max_per_hour": max(0, review_most)}
 
 
 def _interval(args, ncfg: NotifyConfig) -> float:
@@ -1927,7 +2176,8 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
             print(_format(record), flush=True)
 
     notifier = Notifier(cfg, ncfg, state, dry_run=args.dry_run, emit=emit,
-                        take=take_settings(args), handoff=handoff_settings(args))
+                        take=take_settings(args), handoff=handoff_settings(args),
+                        wip=wip_settings(args))
     seuils = exploitation.thresholds(args)
     interval = _interval(args, ncfg)
     db = None

@@ -183,7 +183,7 @@ class ReviewAfterMergeTest(LocalLandTest):
             return {"lot": kw["lot"], "id": 900, "created": True, "class": "light",
                     "why": "ouvert"}
 
-        with mock.patch.object(merge_queue, "_class_of",
+        with mock.patch.object(review_lot, "class_at_merge",
                                return_value={"class": "light", "why": "policy of ameesh"}), \
                 mock.patch.object(review_lot, "open_after_merge", side_effect=opened):
             out = self.land(4)
@@ -205,7 +205,7 @@ class ReviewAfterMergeTest(LocalLandTest):
     def test_a_doubt_or_a_higher_class_opens_nothing(self):
         """La classe relue n'est pas `light` : rien n'est ouvert."""
         self.queued(4)
-        with mock.patch.object(merge_queue, "_class_of",
+        with mock.patch.object(review_lot, "class_at_merge",
                                return_value={"class": "sensitive", "why": "doute"}):
             out = self.land(4)
         self.assertEqual(out["result"], "landed", out)
@@ -487,6 +487,38 @@ class StaleExecutorTest(_Land):
     def test_local_next_epoch_sees_it_already_landed(self):
         self.queued(4)
         _git(self.repo, "push", "-q", "origin", "lot/4-d:main")   # pushed by an earlier epoch
+        before = _git(self.origin, "rev-parse", "main")
+        out = self.land(4)
+        self.assertEqual(out["result"], "landed", out)
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)  # nothing pushed
+
+    def test_reverted_composition_is_not_already_landed(self):
+        """#1776 : une composition revertée sur la cible laisse le gel ancêtre
+        sans son contenu ; le raccourci « already landed » ne peut pas la
+        livrer — le lot est éjecté avec la marche à suivre."""
+        self.queued(4)
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "composition", "lot/4-d")
+        _git(self.repo, "revert", "-m", "1", "--no-edit", "HEAD")
+        _git(self.repo, "push", "-q", "origin", "main")
+        before = _git(self.origin, "rev-parse", "main")
+        out = self.land(4)
+        self.assertEqual(out["result"], "ejected", out)
+        self.assertIn("content", self.fake.queue_rows[4]["reason"])
+        self.assertIn("revert", self.fake.queue_rows[4]["reason"])
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)  # nothing pushed
+        self.assertNotEqual(self.fake.queue_rows[4]["state"], "landed")
+        self.assertIn("ameesh work queue add 4", self.sent[-1][1])
+
+    def test_local_empty_freeze_already_in_the_target_is_landed(self):
+        """#1776 : un gel vide (`commit --allow-empty`) dont le contenu est
+        toujours dans la cible reste « already landed » — la preuve de contenu
+        ne le prend pas pour un retrait."""
+        _git(self.repo, "checkout", "-q", "lot/4-d")
+        _git(self.repo, "commit", "--allow-empty", "-q", "-m", "gel vide")
+        _git(self.repo, "push", "-q", "origin", "lot/4-d")
+        _git(self.repo, "checkout", "-q", "main")
+        self.queued(4)
+        _git(self.repo, "push", "-q", "origin", "lot/4-d:main")   # earlier epoch
         before = _git(self.origin, "rev-parse", "main")
         out = self.land(4)
         self.assertEqual(out["result"], "landed", out)

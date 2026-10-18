@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from ameesh import build_artifacts as ba
+from ameesh import housekeeping_discovery as hd
 from ameesh import menage, platform
 from ameesh.platform import process
 
@@ -596,6 +597,15 @@ class OrphanGuardsTest(unittest.TestCase):
             for label, branch, owner, state, recent in (
                 ("other-active", "lot/7-x", "other", "build", False),
                 ("other-closed", "lot/7-x", "other", "closed", False),
+                ("other-open-candidate", "review/other-6-7", "other",
+                 {7: "closed", 6: "build"}, False),
+                ("other-unknown-candidate", "review/other-6-7", "other",
+                 {7: "closed", 6: None}, False),
+                ("other-closed-candidates", "review/other-6-7", "other",
+                 {7: "closed", 6: "merged"}, False),
+                ("other-merged-kept", "lot/7-x", "other", "merged", False),
+                ("other-merged-kept-recent", "lot/7-x", "other", "merged", True),
+                ("other-unpushed-equivalent", "lot/7-x", "other", "closed", False),
                 ("unknown", "lot/7-x", None, None, False),
                 ("unreadable", "lot/7-x", None, RuntimeError("offline"), False),
                 ("named-directory", "", "other", "build", False),
@@ -614,25 +624,46 @@ class OrphanGuardsTest(unittest.TestCase):
                     if recent:
                         os.utime(source, (now - 60, now - 60))
                     row = dict(id=1, path=path, agent="a1", lot=None, branch=branch,
-                               detail=menage.UNATTRIBUTED, status="active", created_ts=now - 3 * 86400)
+                               repo=root, detail=menage.UNATTRIBUTED, status="active",
+                               created_ts=now - 3 * 86400)
+                    if label.startswith("other-merged-kept"):
+                        row.update(status="kept", checked_ts=now - 2 * DAY,
+                                   detail="lot #7 merged (assigned to another agent): "
+                                          "kept — not integrated")
                     lookup = mock.Mock(return_value=dict(assignee=owner, state=state)
                                        if owner else None)
                     if isinstance(state, Exception):
                         lookup.side_effect = state
+                    elif isinstance(state, dict):
+                        lookup.side_effect = lambda ident: dict(
+                            assignee=owner, state=state.get(ident))
                     store = SimpleNamespace(work=SimpleNamespace(get=lookup),
-                        housekeeping=SimpleNamespace(worktrees=lambda *args: [row]))
+                        housekeeping=SimpleNamespace(worktrees=mock.Mock(return_value=[row])))
                     git = dict(exists=True, clean=True, pushed=True, integrated=False,
                                locked=False, submodules="", gitdir="", reason="not integrated")
+                    if label == "other-unpushed-equivalent":
+                        # git cherry / a squash can prove equivalent content
+                        # on main while the original HEAD is still unpushed.
+                        git.update(pushed=False, integrated=True, reason="")
+                    # Git is simulated here: the #2180 marker and repository
+                    # guards are too (their own witnesses use real worktrees)
                     with mock.patch.object(menage.storage, "of", return_value=store), \
                             mock.patch.object(menage, "worktree_state", return_value=git), \
                             mock.patch.object(menage, "worktree_in_use", return_value=False), \
                             mock.patch.object(menage, "ignored_leftovers", return_value=[]), \
+                            mock.patch.object(hd, "_marker", return_value="linked"), \
+                            mock.patch.object(menage, "same_repository", return_value=True), \
                             mock.patch.object(platform, "user_paths", return_value=platform.UserPaths()):
                         entries, plan = menage._worktree_pass(None, "pc", dry_run=True,
                                                              protected=set(), now=now)
                     self.assertEqual(entries, [])
+                    # #2174: the pass reads every tracked worktree, uncapped
+                    self.assertIsNone(store.housekeeping.worktrees.call_args.kwargs["limit"])
+                    # #2174: another agent's ENDED lot follows the orphan
+                    # rule; its open, unknown or unreadable lot proves nothing
                     self.assertEqual(plan[0]["action"] == "retrait",
-                                     label in ("orphan", "own-closed"), plan)
+                                     label in ("orphan", "own-closed", "other-closed",
+                                               "other-closed-candidates", "other-merged-kept"), plan)
                     if recent:
                         outcome, freed, reason, built = menage._remove_kept_worktree(
                             path, root, "", artifacts=None, allow=(),
@@ -659,7 +690,10 @@ class _Store:
 class MergedKeptTest(_Repo):
     def row(self, path, *, checked_ago, detail=None, lot="7"):
         st = menage.worktree_state(path)
-        return {"id": 1, "path": path, "agent": "dev2", "lot": lot, "repo": self.main,
+        # #2180: `repo` porte le common dir du dépôt (comme les lignes écrites
+        # par `register_worktree`), pas le chemin du worktree principal.
+        return {"id": 1, "path": path, "agent": "dev2", "lot": lot,
+                "repo": menage.common_dir(self.main),
                 "status": "kept", "created_ts": time.time() - 3 * DAY,
                 "checked_ts": time.time() - checked_ago,
                 "detail": detail if detail is not None else

@@ -1,8 +1,93 @@
-# Embeddable read screens
+# @ameesh/ui
 
-The bundle served at `/ui/ameesh-ui.js` registers `<ameesh-app>` and seven
+Embeddable web components of an [ameesh](https://github.com/manaty/ameesh) mesh:
+projects, timeline, agent, alerts, hosts, budget and threads, as standard custom
+elements (Lit, Shadow DOM) — no framework is imposed on the host application.
+
+The same sources are served by `ameesh serve` as a standalone page (`/ui/`, the
+reference client); this package is the form for an application that embeds the
+interface: an Electron desktop application, or a web page.
+
+Design: `docs/design/etudes/ui-integrable.md` (study §2). Licence:
+**AGPL-3.0-only**; a third party that embeds the components in a proprietary
+application receives a written exception from the owner, case by case
+(decision 0013).
+
+**Not published yet.** The package is prepared (`npm run dist`, `npm pack`); the
+publication is a release gesture, with the owner's go.
+
+## Install
+
+```sh
+npm install @ameesh/ui
+```
+
+`lit` is a dependency of the package: let your bundler resolve it, do not bundle
+a second copy (two registries of custom elements).
+
+## Use
+
+```html
+<ameesh-config api-base="https://mesh.example.org">
+  <ameesh-app></ameesh-app>
+</ameesh-config>
+```
+
+```js
+import { connectHost } from "@ameesh/ui";
+
+const host = {
+  // the host holds the token (Electron: the main process, sealed); the
+  // components never store it
+  getToken: (mesh) => tokens.for(mesh),
+  // an approval always opens in the foreground: system browser or native facade
+  openApproval: (url) => shell.openExternal(url),
+  // system notification; the main process can notify with the window closed
+  notify: (alert) => new Notification(alert.title ?? "ameesh", { body: alert.text }),
+  // meshes this host knows; the first one is the default
+  meshes: () => [{ id: "org", name: "Org", apiBase: "https://mesh.example.org" }],
+  // optional navigation, when the host opens the screens itself
+  open: (target) => router.go(target),
+};
+
+const unbind = connectHost(host, { root: document });
+```
+
+`connectHost` feeds the `<ameesh-config>` found under `root` (or creates one) and
+routes the components' events to the host:
+
+| Event | Host member |
+|---|---|
+| `ameesh:open-project`, `ameesh:open-agent`, `ameesh:open-lot` | `open(target)` |
+| `ameesh:approval-requested` (`detail.url`) | `openApproval(url)` |
+| `ameesh:alert` (`detail.text`) | `notify(alert)` |
+
+Nothing else crosses: no `window.open`, no cookie, no local storage, no access
+to the host page's navigation (study §2.2).
+
+## Host contract
+
+| Member | Required | Role |
+|---|---|---|
+| `getToken(mesh?)` | yes | token of the mesh; `null` asks the user (the standalone form) |
+| `openApproval(url)` | yes | open an approval URL in the foreground |
+| `notify(alert)` | yes | system notification (`{ text, title?, kind?, url?, mesh? }`) |
+| `meshes()` | no | meshes known; the first is the default (`{ id?, name?, apiBase }`) |
+| `open(target)` | no | navigate to `{ kind, id, mesh? }` instead of leaving it to the page |
+| `theme` | no | `auto` (default), `light`, `dark` |
+| `language` | no | `fr`, `en` |
+
+In Electron, expose exactly this object through `contextBridge` from a
+self-contained CommonJS preload (`preload.cjs`: a sandboxed preload cannot use
+ESM) with `contextIsolation: true`, `sandbox: true`, `nodeIntegration: false`
+— see `docs/ui/GUIDE-ELECTRON.md`.
+
+## Screens
+
+The bundle served at `/ui/ameesh-ui.js` registers `<ameesh-app>` and eight
 independent elements: `<ameesh-projects>`, `<ameesh-timeline>`, `<ameesh-agent>`,
-`<ameesh-alerts>`, `<ameesh-hosts>`, `<ameesh-budget>` and `<ameesh-thread>`.
+`<ameesh-alerts>`, `<ameesh-hosts>`, `<ameesh-budget>`, `<ameesh-thread>` and
+`<ameesh-decisions>`.
 The standalone `/ui/` page assembles them with internal navigation.
 
 An embedded screen uses the nearest `<ameesh-config api-base="…">`, or a
@@ -25,7 +110,20 @@ Selection buttons emit bubbling, composed `ameesh:open-project`,
 `ameesh:open-agent` and `ameesh:open-lot` events. Their `detail` contains the
 selected `project`, `agent` or `lot`; the host chooses navigation. The app handles
 these events internally while leaving them available to its host. Thread text
-is rendered literally. These screens do not expose write actions.
+is rendered literally.
+
+`<ameesh-decisions>` (R17) is the human's single queue: gated actions waiting for
+an approval, requests filed by agents, lots waiting for a human, prose decisions.
+Its "Approve" button does not approve. It files the request
+(`POST /api/v1/actions/{id}/approval-request`) and emits a bubbling, composed
+`ameesh:approval-requested` event whose `detail` carries the `action` and the
+`url` of the ameesh-approve link; the host opens that link in the foreground
+(the component never navigates, contract §2.2). On the standalone page the link
+stays a real `target="_blank" rel="noopener noreferrer"` anchor: the human opens
+it. The passkey is signed on ameesh-approve's origin and the receipt comes back
+through the event stream (`receipt.attached`). One `Idempotency-Key` per action
+makes a retry after a network refusal replay the same request instead of filing
+twice. No other screen exposes a write action.
 
 Views using the same client share one `/api/v1/events` connection. Event bursts
 coalesce into at most one scheduled refresh per second per view; a change during
@@ -35,5 +133,41 @@ removing the last view aborts it after the current DOM update. A missing SSE end
 keeps the initial snapshot and manual Refresh button available with a visible
 status. The live service is supplied by L85 (#373).
 
+## Content Security Policy and theme
+
+The components work under a strict CSP: `script-src 'self'` (or the module's
+hash), no `eval`, no inline style (constructed stylesheets), `connect-src`
+limited to the mesh's origin. Texts are rendered as text, never as HTML.
+
+The theme goes through public CSS tokens (`--ameesh-color-page`,
+`--ameesh-color-ink`, `--ameesh-color-good`, `--ameesh-color-critical`,
+`--ameesh-font`, `--ameesh-radius`…), light and dark, and the `theme` attribute.
+The `@ameesh/ui/tokens` module exports the sheet; the import has **no side
+effect**, so the host installs it once:
+
+```js
+import { tokensSheet } from "@ameesh/ui/tokens";
+
+const tokens = new CSSStyleSheet();
+tokens.replaceSync(tokensSheet());
+document.adoptedStyleSheets = [...document.adoptedStyleSheets, tokens];
+```
+
+The standalone page links the same sheet as `/ui/ameesh-ui.css`, written by
+`npm run build` (`<link rel="stylesheet" href="/ui/ameesh-ui.css">`) — a host
+page that copies the served module can use that link instead.
+
+## Guides
+
+* `docs/ui/CONTRAT-HOTE.md` — the host contract, in detail;
+* `docs/ui/GUIDE-ELECTRON.md` — preload, partitions per mesh, notifications, CSP;
+* `docs/ui/GUIDE-PAGE-WEB.md` — ES module, SRI, CORS, token provider;
+* `ui/examples/acme-mesh/` — a fictional organisation, opened with the components
+  (`node ui/examples/acme-mesh/fixtures-server.mjs`).
+
+## Develop
+
 Run `npm run typecheck`, `npm test`, `npm run build`, then `npm run check` in
 `ui/`. The build is committed in `src/ameesh/ui/static/` for Python packaging.
+`npm run dist` writes `dist/` (ES module with `lit` external, type declarations)
+and the licence: what `npm pack` would ship.

@@ -166,7 +166,7 @@ DECLARATIVE = ("harness", "host", "cwd", "model", "budget_usd", "responsible", "
                "provider", "credential_mode", "capabilities", "canon_ref", "ephemeral",
                "priority", "admitted_hosts", "admitted_tags", "memory_repository",
                "visibility_ok", "visibility_diagnostic",
-               "placement_ok", "placement_diagnostic", "placement_ref", "projects",
+               "placement_ok", "placement_diagnostic", "placement_ref", "projects", "aliases",
                # L244 (#420) : les rôles déclarés d'une fiche Agent/Persona,
                # persistés pour le garde SQL du rôle QA. Le vocabulaire est
                # celui des fiches (L242c, #414) ; aucune criticité n'est écrite.
@@ -1399,6 +1399,8 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     if findings is None:
         findings = canon_mod.validate(canon)
     findings = list(findings)
+    from .agent_names import conflicts
+    findings.extend(conflicts(db, canon))
     status, diagnostic = assess(canon, host, findings)
     if status != CANON_OK:
         record_state(db, host, status, diagnostic, canon, key=key)
@@ -1436,6 +1438,11 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         if agent is None or not NAME_RE.match(name):
             continue
         row = rows.get(name)
+        known = registry.get(db, name)
+        if known is not None and known["name"] != name:
+            actions.append(SyncAction(name, "conflit", "primary name is another agent's alias",
+                                      ["agent-alias-conflict"]))
+            continue
         # L42 (0031) : noms globaux, premier déclarant. Une ligne gouvernée par
         # un AUTRE canon, et non libérée, n'est jamais reprise : constat limité
         # à cette fiche, aucune écriture.
@@ -1502,6 +1509,9 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             # stays the primary one for the readers of a single project
             "team": agent.team,
             "projects": agent.effective_projects,
+            "aliases": (list((row or {}).get("aliases") or [])
+                        if any(r.startswith("agent-alias") for r in reasons)
+                        else list(agent.aliases or [])),
             # L244 (#420): les rôles déclarés, vocable des fiches (L242c, #414),
             # pour que le garde SQL du verdict QA les lise au registre.
             "roles": agent.roles,
@@ -1646,12 +1656,14 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     machine = sync_mechanics(canon)
     processes = ProcessSync()
     if status == CANON_OK:
-        # #538 : les règles de travail modifiées partent aux agents de cet hôte
-        # AVANT que l'état n'avance (le repère de comparaison est l'ancien
-        # commit, encore dans canon_state).
-        processes = sync_processes(db, canon, host, sorted(process_agents))
         # les conflits de noms (L42) figurent au diagnostic, sans fermer le canon
         status, diagnostic = assess(canon, host, findings)
+        if status == CANON_OK:
+            # #538 : les règles de travail modifiées partent aux agents de cet
+            # hôte AVANT que l'état n'avance (le repère de comparaison est
+            # l'ancien commit, encore dans canon_state) ; #793 : seulement si
+            # ce commit est enregistré `ok`, et par une seule synchronisation.
+            processes = sync_processes(db, canon, host, sorted(process_agents))
         record_state(db, host, status, diagnostic, canon, key=key)
     # registre des authentificateurs (§8.2) : copie de travail des fiches
     # Member, quel que soit l'état du canon pour cet hôte (ses propres règles).
@@ -1721,20 +1733,19 @@ def sync_packages(db: Db, canon: Canon, findings: list[Finding], *,
 
     with db.transaction() as tx:
         st = storage.of(tx)
-        # #802 : au démarrage d'un hôte, N exécutants synchronisent le même
+        # #802/#831 : au démarrage d'un hôte, N exécutants synchronisent le même
         # canon en parallèle. Sans sérialisation, chacun lit le même état
         # initial (`before`), rejoue les mêmes upserts et attend les verrous de
         # ligne du premier : la file de verrous dépasse statement_timeout, le
         # sync échoue et la porte d'hôte reste fermée (« canon not read in
-        # full, no claim »). Le verrou consultatif est pris AVANT la lecture :
-        # une fois le premier sync commité, les suivants relisent l'état à
-        # jour et n'écrivent rien. Lié à la transaction, il est relâché au
-        # commit comme au rollback ; la clé est le canon ET le schéma (la table
-        # `work_packages` est partagée, et une base de test porte plusieurs
-        # schémas : deux schémas ne doivent pas s'attendre).
-        tx.query("SELECT pg_advisory_xact_lock(hashtextextended("
-                 "current_schema() || ':canon-sync-packages:' || %s, 0))",
-                 (ident or "",))
+        # full, no claim »). Le verrou est pris AVANT la lecture
+        # (`packages.lock_sync`) : une fois le premier sync commité, les
+        # suivants relisent l'état à jour et n'écrivent rien. Lié à la
+        # transaction, il est relâché au commit comme au rollback ; un seul
+        # verrou par schéma, tous canons confondus — les identifiants de
+        # paquets sont globaux (le premier canon qui en déclare un le garde),
+        # et la bascule du canon par défaut écrit la même colonne.
+        st.packages.lock_sync()
         before = {row["id"]: row for row in st.packages.all(include_absent=True)}
         seen: set[str] = set()
         for package in canon.packages:
@@ -1792,6 +1803,8 @@ class MechanicsSync:
     schema: str = ""
     timezone: str = ""
     cutoffs: list[str] = field(default_factory=list)
+    #: cadence des paquets horaires (#1757) ; liste vide = aucune cadence déclarée
+    packets: list[str] = field(default_factory=list)
     max_in_build: int = 0
     ci: dict = field(default_factory=dict)
     reviews: dict = field(default_factory=dict)
@@ -1801,6 +1814,7 @@ class MechanicsSync:
     def to_dict(self) -> dict:
         out = {"status": self.status, "schema": self.schema,
                "timezone": self.timezone, "cutoffs": list(self.cutoffs),
+               "packets": list(self.packets),
                "max_in_build": self.max_in_build, "ci": dict(self.ci),
                "reviews": dict(self.reviews), "projects": list(self.projects)}
         if self.error:
@@ -1842,6 +1856,7 @@ def sync_mechanics(canon: Canon) -> MechanicsSync:
     done.schema = document.schema
     done.timezone = document.timezone
     done.cutoffs = list(document.cutoffs)
+    done.packets = list(document.packet_cutoffs)
     done.max_in_build = document.max_in_build
     done.ci = {"packet": document.ci_packet,
                "incident_label": document.ci_incident_label}
@@ -1878,12 +1893,23 @@ class ProcessSync:
 
 def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> ProcessSync:
     """#538 : pousse aux agents de `host` les fiches Process modifiées depuis
-    le dernier commit appliqué (`canon_state.last_good_commit`).
+    le dernier commit poussé (`canon_state.process_commit` ; au premier envoi,
+    le dernier état connu `last_good_commit`).
 
     La première synchronisation ne pousse rien : elle pose le repère. Un diff
     illisible ne pousse rien non plus (`error`) : mieux vaut manquer un
     rappel que pousser un texte qu'on n'a pas su relire — la règle, elle, est
-    déjà dans le brief de la prochaine session."""
+    déjà dans le brief de la prochaine session.
+
+    #793 : les synchronisations concurrentes d'un hôte lisent le même ancien
+    commit ; seule celle qui l'avance (`claim_commit`, dans la transaction
+    des envois) pousse, les autres ne poussent rien. Le repère est indépendant
+    de `record_state`, qu'un sync ancien peut écrire après un sync récent ;
+    un commit antérieur au repère ne pousse jamais des règles périmées.
+
+    #1464 : un repère qui n'appartient à aucune des deux histoires (canon
+    réécrit, repère d'un autre canon) ne peut plus produire de diff ; il est
+    signalé (`error`) au lieu de laisser les envois s'arrêter en silence."""
     done = ProcessSync()
     if not canon.sources or not canon.processes or not agents:
         return done
@@ -1891,10 +1917,27 @@ def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> Proces
     if source.mode != "git" or not source.commit:
         return done
     previous = state(db, host, canon) or {}
-    old = previous.get("last_good_commit") or ""
+    old = previous.get("process_commit") or previous.get("last_good_commit") or ""
     if not old or old == source.commit:
         return done
     try:
+        if not canon_mod.git_contains(source.repo, old, source.commit):
+            if canon_mod.git_contains(source.repo, source.commit, old):
+                # sync ancien : un sync plus récent a déjà poussé au-delà de ce
+                # commit — rien à pousser, rien à signaler, repère conservé
+                return done
+            # #1464 (N1 #793) : repère figé — l'historique du canon a été réécrit
+            # (ou le repère vient d'un autre dépôt) : le diff `old..source.commit`
+            # est impossible, et sans ré-ancrage du repère `process_commit` les
+            # envois de règles ne repartiront JAMAIS. On le dit (`error`) au lieu
+            # de perdre les envois en silence ; les règles, elles, restent dans le
+            # brief de la prochaine session.
+            done.error = (
+                "process_commit %s is not in the history of %s: the canon history "
+                "was rewritten (or this marker comes from another canon) — the "
+                "changed Process rules are no longer pushed on this host until "
+                "the push marker is re-anchored" % (old[:12], source.commit[:12]))
+            return done
         # #538 : la comparaison porte sur la RÉFÉRENCE APPROUVÉE (`source.commit`),
         # pas sur HEAD ni l'arbre de travail : si la référence avance sans que le
         # checkout suive, le changement est quand même poussé (sinon le point de
@@ -1904,22 +1947,28 @@ def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> Proces
     except canon_mod.GitError as exc:
         done.error = str(exc)
         return done
+    changed = [process for process in canon.processes
+               if process.valid and process.fiche.member == source.member
+               and process.fiche.path in touched]
+    if not changed:
+        return done
     from . import mail as mail_mod
     from . import work as work_mod
-    for process in canon.processes:
-        if not process.valid or process.fiche.member != source.member \
-                or process.fiche.path not in touched:
-            continue
-        texte = ("Règles de travail du canon : %s\n\n%s"
-                 % (process.title, (process.body or "").strip())).strip()
-        for name in sorted(set(agents)):
-            mail_mod.send(db, work_mod.SYSTEM_SENDER, name, texte, host=host,
-                          kind="event",
-                          payload={"event": "canon-process",
-                                   "path": process.fiche.path},
-                          thread=False)
-            done.sent += 1
-        done.changed.append(process.title)
+    with db.transaction() as tx:
+        if not storage.of(tx).canon.claim_commit(host, old, source.commit,
+                                                 state_key(db, canon, host)):
+            return done
+        for process in changed:
+            texte = ("Règles de travail du canon : %s\n\n%s"
+                     % (process.title, (process.body or "").strip())).strip()
+            for name in sorted(set(agents)):
+                mail_mod.send(tx, work_mod.SYSTEM_SENDER, name, texte, host=host,
+                              kind="event",
+                              payload={"event": "canon-process",
+                                       "path": process.fiche.path},
+                              thread=False)
+                done.sent += 1
+            done.changed.append(process.title)
     return done
 
 

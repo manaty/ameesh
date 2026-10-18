@@ -340,8 +340,12 @@ class AdoptRevoqueLesLiaisonsTest(_BaseL39):
         session_bindings.bind(self.cfg, self.db, "coord", session_id="s-ext",
                               harness="claude", by="human:proprio")
         self.assertEqual(len(session_bindings.listing(self.db)), 1)
-        out = reprise.adopt(self._cfg(comptes), self.db, "coord", session_id=SID,
-                            harness="codex", actor="human:proprio")
+        # #1965 : table des processus de l'hôte injectée (déterministe), comme
+        # AdoptTest.setUp — le sujet est la révocation des liaisons, pas la
+        # lecture de /proc (témoins : tests/test_l63_platform.py).
+        with mock.patch.object(os_layer, "holders", lambda *a, **k: []):
+            out = reprise.adopt(self._cfg(comptes), self.db, "coord", session_id=SID,
+                                harness="codex", actor="human:proprio")
         self.assertEqual(session_bindings.listing(self.db), [])
         self.assertTrue(any("session binding(s) revoked: claude:s-ext" in n
                             for n in out["notes"]))

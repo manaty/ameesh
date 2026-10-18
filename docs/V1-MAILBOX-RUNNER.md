@@ -204,10 +204,11 @@ local files). The lease is the only authorization to run.
   adds a client delay (the same + 5 s) that abandons the subprocess if the
   server no longer responds at all. Migrations, for their part, lift the timeout for
   the duration of their transaction (`SET LOCAL statement_timeout = 0`) and bound their
-  wait for a table lock (`SET LOCAL lock_timeout = 5 s`; a migration that must wait
-  longer sets its own, which wins): a migration queued behind an `ACCESS EXCLUSIVE`
+  wait for a lock — table or row (`SET LOCAL lock_timeout = 5 s`; a migration that must
+  wait longer sets its own, which wins): a migration queued behind an `ACCESS EXCLUSIVE`
   lock fails in seconds and stays pending, instead of holding every reader and writer
-  of the table behind it.
+  of the table behind it. The same bound applies to a row lock (`select … for update`):
+  a data migration that must wait for another transaction's row sets its own timeout.
 * **Robust heartbeat** — a database outage during a turn does not leave the
   harness running without a lease: the heartbeat counts failures
   (`max(3, ttl/3)` second interval), and stops the process as soon as the
@@ -311,11 +312,16 @@ test (three messages → three notifications) caught the bug.
   renewed as long as the session lives, the harness is killed if the lease is lost, and
   the lease is returned on exit.
 * **Priority interrupt (0018, R19)**: an undelivered message marked
-  `payload.urgent` from an **authorized sender** (`AMEESH_INTERRUPT_SENDERS`
-  without canon; the "interrupt" capability of a canon card will be added) stops the
+  `payload.urgent` from an **authorized sender** stops the
   running turn (brief SIGTERM then SIGKILL), puts the turn's prompt back as
   pending, and `pick()` serves the priority message **first** on the next turn,
-  on the same session. An urgent message from an unauthorized sender interrupts nothing
+  on the same session. Authorized senders (#795): the owner (`human:*`) always;
+  `ameesh` only for an event **verified in the database** (the end of CI of one
+  of the agent's work items — the run is recorded, the lot is assigned to the
+  agent, and the mail is the one CI posted for that run), so an imitated
+  `--from ameesh` does not interrupt; agents declared in
+  `AMEESH_INTERRUPT_SENDERS` (the "interrupt" capability of a canon card will be
+  added). An urgent message from an unauthorized sender interrupts nothing
   (this is logged): it is delivered like a message — since L125, without
   waiting for the batching window; the thread keeps a record of
   the interruption and its reason.
@@ -342,10 +348,13 @@ test (three messages → three notifications) caught the bug.
   The size is read
   from the usage in each harness's stream (keys normalized by
   `adapters.usage_tokens`; DeepSeek publishes usage per step). **Context
-  ceiling (L60)**: if the last turn re-read more than
-  `AMEESH_CONTEXT_MAX_TOKENS` tokens (default 15 M, input + cache, adjustable per
-  agent with `ameesh set <agent> context_max_tokens=…`), the same rotation takes
-  place before the next turn, with no minimum number of turns (see
+  ceiling (L60)**: if the context of the last model call (the session size:
+  input + cache read + cache written) exceeds `AMEESH_CONTEXT_MAX_TOKENS`
+  tokens (default 15 M, adjustable per agent with `ameesh set <agent>
+  context_max_tokens=…`), the same rotation takes place before the next turn,
+  with no minimum number of turns. The sum of a turn's re-reads is not the
+  measure (#2336): it grows with the number of steps of the turn, not with the
+  session (see
   [EXPLOITATION.md](EXPLOITATION.md#plafond-de-contexte-l60)).
 * **Moved working directory (0018)**: at registration, the git identity of the
   directory (common repository + branch) is written to
@@ -519,7 +528,12 @@ agent fail: any error → exit 0 with nothing.
 `scripts/pg-up.sh` starts `agent-mesh-pg` (`postgres:17`, port published
 only on `127.0.0.1:55432`, named volume). `scripts/test.sh` runs the
 suite twice: `psql` driver, then `psycopg` driver in a local venv if
-installation is possible.
+installation is possible. Each run takes a throwaway `agent_mesh_test_*`
+database (#1992); when the connection profile only covers `agent_mesh`, the
+script derives a private `PGPASSFILE` for the bench's databases from the
+existing entry and removes it on exit (#2170). During the two runs that private
+profile is the only one libpq reads: the user's other profile entries are
+masked (wanted — the bench's databases share the entry's host, port and role).
 
 63 `unittest` tests (stdlib), a throwaway Postgres schema and a throwaway disk
 state per class: migrations, mailbox, notifications, leases (races with 2 and

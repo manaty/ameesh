@@ -36,6 +36,10 @@ from .gate import DEFAULT_DRAIN_S, STATES
 from .host_gate import OVERDUE_GRACE_S
 
 REGISTRY_SCHEMA = "ameesh-host-availability-registry/1"
+#: #1901 : nom de la famille d'alertes de la porte d'hôte, tel que le
+#: signalent les relevés incomplets (`exploitation._gate_alerts`) pour que
+#: `alert_ack.reconcile` ne conclue pas une résolution sur une absence.
+GATE_FAMILY = "gate"
 #: hôte indisponible depuis plus longtemps : alerte (un appareil prêté est
 #: souvent indisponible ; seule une longue absence mérite d'être dite)
 DEFAULT_UNAVAILABLE_ALERT_S = 86400.0
@@ -114,22 +118,42 @@ class MemoryRegistry(AvailabilityRegistry):
         return [dict(self._rows[h]) for h in sorted(self._rows)]
 
 
+class RegistryUnreadable(RuntimeError):
+    """#2128 : le registre existe mais ne se lit pas ; `put` refuse d'écrire
+    plutôt que de réécrire le fichier sans les lignes des autres hôtes."""
+
+
 class FileRegistry(AvailabilityRegistry):
     """Dans un fichier JSON (verrou `flock`, écriture atomique)."""
 
     def __init__(self, path: str):
         self.path = path
+        #: #1901 : dernière lecture en échec (fichier présent mais illisible,
+        #: tronqué ou de schéma inconnu) ; `None` quand la lecture a abouti.
+        #: Un fichier absent n'est pas une erreur : c'est un hôte sans porte.
+        self.error: str | None = None
 
     def _load(self) -> dict:
+        self.error = None
         try:
             with open(self.path, encoding="utf-8") as fh:
                 data = json.load(fh)
-        except (OSError, ValueError):
+        except FileNotFoundError:
+            # #2128 : un fichier absent n'est pas une lecture en échec — la
+            # première écriture doit pouvoir le créer (le commentaire de
+            # `error` le disait déjà, l'implémentation le traitait en erreur).
+            return {}
+        except (OSError, ValueError) as exc:
+            self.error = "%s: %s" % (self.path, exc)
             return {}
         if not isinstance(data, dict) or data.get("schema") != REGISTRY_SCHEMA:
+            self.error = "%s: schéma %s attendu" % (self.path, REGISTRY_SCHEMA)
             return {}
         hosts = data.get("hosts")
-        return hosts if isinstance(hosts, dict) else {}
+        if not isinstance(hosts, dict):
+            self.error = "%s: hôtes illisibles" % self.path
+            return {}
+        return hosts
 
     def put(self, host, body, *, executor_id="", gate=None, ack=None, now=None) -> dict:
         body = check_body(body)
@@ -137,6 +161,10 @@ class FileRegistry(AvailabilityRegistry):
         with open(self.path + ".lock", "a") as verrou:
             fcntl.flock(verrou, fcntl.LOCK_EX)
             hosts = self._load()
+            if self.error is not None:
+                # #2128 : ne jamais réécrire un registre illisible avec le seul
+                # hôte écrit — les lignes des autres hôtes seraient perdues.
+                raise RegistryUnreadable(self.error)
             row = _merge(hosts.get(host), host, body, executor_id, gate, ack,
                          time.time() if now is None else float(now))
             hosts[host] = row
@@ -174,10 +202,10 @@ def default_path(cfg) -> str:
     return os.path.join(cfg.state_dir, "exec", "availability.json")
 
 
-def _deadline(row: Mapping) -> float:
+def _deadline(row: Mapping, body: Mapping) -> float:
     gate = row.get("gate") or {}
     deadline = gate.get("drain_deadline_ts")
-    if (row.get("body") or {}).get("state") == "stopped":
+    if body.get("state") == "stopped":
         return float(row.get("since_ts") or 0.0)
     if isinstance(deadline, (int, float)) and not isinstance(deadline, bool):
         return float(deadline)
@@ -186,17 +214,30 @@ def _deadline(row: Mapping) -> float:
 
 def alerts(rows: Iterable[Mapping], *, now: float | None = None,
            held: Mapping[str, Iterable[str]] | None = None,
-           unavailable_after_s: float = DEFAULT_UNAVAILABLE_ALERT_S) -> list[dict]:
+           unavailable_after_s: float = DEFAULT_UNAVAILABLE_ALERT_S,
+           errors: list | None = None) -> list[dict]:
     """Alertes au format d'`exploitation` (`ameesh-alert/1`). `held` : agents
     dont l'hôte détient encore le bail, par hôte (la base fait foi) ; à
-    défaut, l'acquittement enregistré."""
+    défaut, l'acquittement enregistré.
+
+    #2129 : une ligne dont `body` n'est pas un objet n'est pas une
+    observation. Elle est sautée et nommée dans `errors` quand une liste est
+    fournie — la passe des autres hôtes continue, la famille n'est plus dite
+    lue pour autant (`local_alerts` la marque non lue)."""
     from .. import exploitation
 
     now = time.time() if now is None else float(now)
     out: list[dict] = []
     for row in rows:
         host = row.get("host")
-        body = row.get("body") or {}
+        body = row.get("body")
+        if body is None:
+            body = {}
+        if not isinstance(body, Mapping):
+            if errors is not None:
+                errors.append("hôte %s : corps d'état non objet (%s)"
+                              % (host or "?", type(body).__name__))
+            continue
         state = body.get("state")
         if not host or state not in STATES or state == "available":
             continue
@@ -215,7 +256,7 @@ def alerts(rows: Iterable[Mapping], *, now: float | None = None,
             detenus = sorted(held.get(host) or ())
         else:
             detenus = sorted((row.get("ack") or {}).get("held") or ())
-        deadline = _deadline(row)
+        deadline = _deadline(row, body)
         if detenus and now >= deadline + OVERDUE_GRACE_S:
             out.append(exploitation._alert(
                 "host_drain_overdue", None, deadline, int(now - deadline), OVERDUE_GRACE_S,
@@ -225,14 +266,42 @@ def alerts(rows: Iterable[Mapping], *, now: float | None = None,
     return out
 
 
-def local_alerts(cfg, listing: list[dict], now: float | None = None) -> list[dict]:
+def local_alerts(cfg, listing: list[dict], now: float | None = None,
+                 unreadable: list | None = None, errors: list | None = None) -> list[dict]:
     """Alertes du registre local de ce poste (`default_path`), baux tirés du
-    listing de la base ; rien si le registre n'existe pas."""
+    listing de la base ; rien si le registre n'existe pas.
+
+    #1901 : un registre présent mais illisible ne rend pas « aucune alerte »
+    pour autant — c'est une famille non observée, et `GATE_FAMILY` est ajouté
+    à `unreadable` quand une liste est fournie.
+
+    #2127 : `errors` reçoit le message de la lecture en échec, pour que
+    `exploitation._gate_alerts` dise la porte non lue (`host_gate_unreadable`).
+
+    #2129 : une ligne au `body` non objet ne fait pas tomber la passe ; la
+    famille est dite non lue (une ligne non observée ne résout rien) et le
+    message part dans `errors`."""
     path = default_path(cfg)
-    if not os.path.exists(path):
+    try:
+        os.stat(path)
+    except FileNotFoundError:
         return []
+    registre = FileRegistry(path)
+    rows = registre.rows()
+    if registre.error is not None:
+        if unreadable is not None:
+            unreadable.append(GATE_FAMILY)
+        if errors is not None:
+            errors.append(registre.error)
     held: dict[str, list[str]] = {}
     for row in listing:
         if row.get("lease_live") and row.get("host"):
             held.setdefault(row["host"], []).append(row["name"])
-    return alerts(FileRegistry(path).rows(), now=now, held=held)
+    malformees: list = []
+    out = alerts(rows, now=now, held=held, errors=malformees)
+    if malformees:
+        if unreadable is not None and GATE_FAMILY not in unreadable:
+            unreadable.append(GATE_FAMILY)
+        if errors is not None:
+            errors.extend(malformees)
+    return out

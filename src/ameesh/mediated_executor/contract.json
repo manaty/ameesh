@@ -78,6 +78,62 @@
    ]
   },
   {
+   "name": "agents.runner_seen",
+   "write": true,
+   "transport": "op",
+   "scope": [
+    "H"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forced": {
+    "host": "executor_host"
+   },
+   "params": [
+    {
+     "name": "host",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "owner",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "names",
+     "kind": "positional",
+     "schema": {
+      "type": [
+       "array",
+       "null"
+      ],
+      "items": {
+       "type": "string"
+      }
+     },
+     "required": true
+    }
+   ],
+   "result": {
+    "type": "null"
+   },
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": false
+   },
+   "rules": [
+    "Hôte forcé, names limité aux agents admis, owner préfixé exec:<id>: ; sans test de disponibilité."
+   ]
+  },
+  {
    "name": "agents.get",
    "write": false,
    "transport": "op",
@@ -109,6 +165,48 @@
     "natural": true
    },
    "rules": []
+  },
+  {
+   "name": "agents.resolve_name",
+   "write": false,
+   "transport": "op",
+   "scope": [
+    "aggregate"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forced": {},
+   "params": [
+    {
+     "name": "name",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "operation",
+     "kind": "keyword",
+     "schema": {
+      "type": "string"
+     },
+     "required": false,
+     "default": "lookup"
+    }
+   ],
+   "result": {
+    "type": "string"
+   },
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
+   },
+   "rules": [
+    "Name resolution grants no authority; every changed spelling is audited."
+   ],
+   "session": true
   },
   {
    "name": "agents.cwd_used",
@@ -3337,7 +3435,7 @@
    },
    "rules": [
     "name = agent du jeton de session",
-    "rendu : {lease_owner, lease_epoch, status, live} (clés du pilote, lues par registry.lease_matches)"
+    "rendu : {name, lease_owner, lease_epoch, status, live} (name = nom primaire résolu ; clés du pilote, lues par registry.lease_matches)"
    ]
   },
   {
@@ -3725,6 +3823,15 @@
       "type": "string"
      },
      "required": true
+    },
+    {
+     "name": "once",
+     "kind": "keyword",
+     "schema": {
+      "type": "boolean"
+     },
+     "required": false,
+     "default": false
     }
    ],
    "result": {
@@ -3957,12 +4064,12 @@
   }
  ],
  "refused": {
-  "interface_total": 411,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
    "actions": "hors du sous-ensemble de l'exécuteur médié",
    "agents": "hors du sous-ensemble de l'exécuteur médié",
+   "alert_acknowledgements": "human alert acknowledgement (L87c): native operator only",
    "api_requests": "API idempotency (L87): ameesh serve only",
    "approvals": "autorité : jamais d'approbation depuis l'appareil (0012)",
    "authenticators": "autorité (0012)",
@@ -3983,7 +4090,9 @@
    "nonces": "autorité (0012)",
    "operations": "hors du sous-ensemble de l'exécuteur médié",
    "packages": "canon et paquets : serveur seulement",
+   "pending_spend": "usage résident : hôte local seulement (L80a), le chemin médié refuse le résident",
    "placements": "placement : serveur seulement",
+   "prevalidation": "hors du sous-ensemble de l'exécuteur médié",
    "progress": "vue des humains (/api/v1)",
    "projects": "vue des humains (/api/v1)",
    "roadmap": "feuille de route (L96) : serveur seulement",
@@ -4003,10 +4112,14 @@
    "accounts": [
     "hold",
     "holds",
+    "identities",
     "init_active",
+    "placement_state",
+    "publish_identity",
     "release",
     "set_auto",
     "switch",
+    "switch_guarded",
     "switches"
    ],
    "action_source": [
@@ -4035,7 +4148,14 @@
     "set_mode",
     "upsert_unleased",
     "wake_check",
-    "note_unleased"
+    "note_unleased",
+    "operator_pause"
+   ],
+   "alert_acknowledgements": [
+    "acknowledge",
+    "clock",
+    "invalidate",
+    "live"
    ],
    "api_requests": [
     "complete",
@@ -4069,6 +4189,7 @@
     "put"
    ],
    "canon": [
+    "claim_commit",
     "clear_pending_stop",
     "clear_responsible",
     "close_others",
@@ -4109,7 +4230,6 @@
     "failures",
     "finish_guard_scan",
     "for_lot",
-    "guard_runs",
     "head_replaced",
     "latest_concluded",
     "mark_started",
@@ -4119,8 +4239,8 @@
     "observe_runners",
     "open_run",
     "prune_guard_runs",
-    "queued",
     "queued_oldest",
+    "reopen_run",
     "run",
     "running",
     "running_on",
@@ -4178,6 +4298,7 @@
     "lend_basis",
     "record_harness_version",
     "release",
+    "runners",
     "since",
     "usage"
    ],
@@ -4200,6 +4321,7 @@
     "revoke"
    ],
    "leases": [
+    "adopt_session_origin",
     "attach_claim",
     "hold_note",
     "release_hold",
@@ -4216,6 +4338,7 @@
     "pending_recipients_sorted",
     "unread_active",
     "unread_counts",
+    "unread_mid_turn",
     "unread_total",
     "withdraw"
    ],
@@ -4226,7 +4349,9 @@
    "operations": [
     "adopt",
     "assigners",
+    "build_lots_activity",
     "gauge_history",
+    "gauge_latest",
     "latest_gauges",
     "listing",
     "open_lots_activity",
@@ -4234,21 +4359,33 @@
     "record_balance",
     "request_restart",
     "resume",
+    "set_dormant",
     "set_settings",
+    "state_lots_activity",
     "turns"
    ],
    "packages": [
     "all",
     "get",
+    "lock_sync",
     "retire",
     "upsert"
+   ],
+   "pending_spend": [
+    "set_resident_usage"
    ],
    "placements": [
     "recorded"
    ],
+   "prevalidation": [
+    "latest",
+    "record",
+    "report"
+   ],
    "progress": [
     "actions",
     "agents",
+    "ci_suite",
     "costs",
     "lot_actions",
     "lot_events",
@@ -4286,12 +4423,15 @@
    ],
    "turn_costs": [
     "correct",
+    "first_after",
+    "last_before",
     "ledger",
     "paid_lines",
     "spent_between",
     "unpriced"
    ],
    "turn_resources": [
+    "attach_cgroup",
     "begin_grace",
     "churn",
     "get",
@@ -4318,19 +4458,24 @@
     "add",
     "add_milestone",
     "assign",
+    "assign_capped",
     "assignment_events",
+    "attach_implicit_branch",
     "auto_takes_since",
     "backlog",
     "backlog_add",
     "by_issue_ref",
     "by_package",
+    "claim_review_proposal",
     "close",
     "close_merged",
+    "count_builds",
     "creator",
     "current_delegation",
     "delays",
     "delegate",
     "designate_reviewer",
+    "detach_branch",
     "due_delegations",
     "estimate_history",
     "estimates",
@@ -4340,14 +4485,22 @@
     "handoff_lots",
     "issue_feed",
     "items",
+    "items_missing_ref",
     "land_lock",
     "land_unlock",
+    "train_read",
+    "train_save",
+    "train_fire_read",
+    "train_fire_give",
+    "train_fire_change",
     "link_package",
     "lock_deep_analysis",
+    "log_review_attempt",
     "mark_started",
     "measure",
     "measure_candidates",
     "migration_holder",
+    "migration_landed_holder",
     "milestones",
     "open_by_ref",
     "open_for",
@@ -4359,13 +4512,18 @@
     "queue_remove",
     "queue_update",
     "recent_or_cited",
+    "record_landed_migration",
     "record_resolution",
+    "rectify_close",
     "reference",
     "refresh_package_parents",
+    "release_agent",
     "reserve_migration",
     "resolutions",
     "resolve_delegation",
     "returned_delegations",
+    "review_catch_up_bound",
+    "review_proposals",
     "save_measure",
     "set_app",
     "set_branch",
@@ -4375,8 +4533,11 @@
     "set_partial_seen",
     "timeline",
     "turn_spans",
+    "unassign",
+    "unassign_surplus",
     "unassigned_lots",
     "waiting_episodes",
+    "wip_exceptions",
     "without_project"
    ],
    "watches": [

@@ -1,23 +1,23 @@
 ---
 type: Exploration
 status: exploration
-title: "Évaluation des modèles"
+title: "Model evaluation"
 ---
 
-# Évaluation des modèles
+# Model evaluation
 
-## Problème
+## Problem
 
-Les observations sur la qualité, l’effort et le coût des modèles sont difficiles à comparer entre tâches et sessions. Elles ne suffisent pas à recommander un modèle pour une classe de travail.
+Observations about model quality, effort and cost are hard to compare across tasks and sessions. They are not enough to recommend a model for a class of work.
 
 ## Intuitions
 
-Des tâches de référence isolées de leur solution et de l’historique pourraient aider à comparer les résultats. La qualité de la vérification, le coût et les erreurs de contexte pourraient être observés séparément.
+Reference tasks isolated from their solution and from the history could help compare results. Verification quality, cost and context errors could be observed separately.
 
-## Questions ouvertes
+## Open questions
 
-- Comment éviter la contamination par la solution de référence ?
-- Quelles tâches représentent les usages du projet ?
-- Comment distinguer effet du modèle, du harnais, de l’effort et de la longueur de session ?
+- How can contamination by the reference solution be avoided?
+- Which tasks represent the project's uses?
+- How can the effect of the model, the harness, the effort and the session length be told apart?
 
-Contexte existant : [Constats sur les modèles et l’effort](../etudes/constats-modeles-2026-10.md), [Essai Hermes et DeepSeek](../etudes/l153-hermes-deepseek-trial.md). Ces références éclairent la question ; elles ne promeuvent pas cette fiche en étude ou en travail décidé.
+Existing context: [Observations on models and effort](../etudes/constats-modeles-2026-10.md), [Hermes and DeepSeek trial](../etudes/l153-hermes-deepseek-trial.md). These references inform the question; they do not promote this card to a study or to decided work.

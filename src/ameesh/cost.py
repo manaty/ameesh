@@ -20,7 +20,10 @@
 
   * Claude   : différence du `total_cost_usd` cumulé de la session ;
   * Codex    : différence de l'usage cumulé porté par `turn.completed` ;
-  * DeepSeek : usage par étape (`status`/`step_end`) × barème.
+  * DeepSeek : usage par étape (`status`/`step_end`) × barème ;
+  * résident : l'événement `resident.turn` écrit une fois par tour depuis son
+    `TurnResult` (Codex app-server, ACP ; L80a), qui fait foi seul pour ce
+    tour — les relevés natifs de la même tranche ne sont pas recomptés.
 
 Le barème est un fichier JSON (USD par million de jetons, entrée
 `[entrée, entrée en cache, sortie]`), lu dans `$AMEESH_PRICES` ou au chemin par
@@ -47,12 +50,13 @@ import re
 import math
 import time
 from dataclasses import dataclass, replace
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable, Iterator, Sequence
 
 from . import config as config_mod
 from . import harnesses
 from . import storage
 from .gauge_cache import CLAUDE_GAUGES
+from .resident import USAGE_EVENT as RESIDENT_USAGE_EVENT
 
 #: Barème par défaut du poste de travail (reprise de l'outil de comptage
 #: existant). USD par million de jetons : [entrée, entrée en cache, sortie].
@@ -260,6 +264,22 @@ class Gauge:
     #: #1561 : quand le relevé a été produit (epoch), None si la source ne le
     #: date pas. Toutes les fenêtres d'un même relevé portent le même âge.
     read_at: float | None = None
+    #: #1132 : instant de PRODUCTION du relevé (epoch), None quand le flux ne
+    #: le date pas (sans marqueur, ou Codex) — l'heure d'insertion n'en tient
+    #: pas lieu, un relevé périmé ne doit pas se faire passer pour frais.
+    produced_at: float | None = None
+    #: #1132 : journal d'origine du relevé (nom de l'agent), '' si inconnu.
+    source: str = ""
+    #: #1580 (tranche 3) : le modèle auquel ce seau est propre (le `title` du
+    #: widget omarchy, ex. « Fable Weekly » → « fable »), '' pour une fenêtre
+    #: générale. Un seau propre à un modèle ne compte que pour une session de
+    #: ce modèle (`accounts.gauges_of`) ; l'affichage les montre tous.
+    scope: str = ""
+    #: #1702 (N2) : cette fenêtre vient de l'historique partagé, pas de la
+    #: lecture locale. Elle sert à la garde — c'est la mesure la plus fraîche —
+    #: mais ne doit jamais être réécrite dans l'historique : chaque hôte
+    #: évaluateur réinscrivait sinon le relevé d'un autre avec sa source (échos).
+    from_history: bool = False
 
     def elapsed(self, now: float) -> float:
         """Part écoulée de la fenêtre, 1.0 quand on ne sait pas la dater."""
@@ -384,14 +404,17 @@ def stale_reading(gauges, now: float) -> bool:
     * **absent** (aucune jauge) : rien ne dit l'état du compte ;
     * **partiel** : une fenêtre datée s'est remise à zéro alors qu'une autre
       court encore — la fenêtre ouverte n'est plus qu'une borne inférieure
-      (le compte a pu servir depuis, ici ou ailleurs) ;
+      (le compte a pu servir depuis, ici ou ailleurs) ; une fenêtre **non
+      datée** ne prouve pas sa remise à zéro, elle compte donc comme encore
+      ouverte (#1566 N2) ;
     * **non daté** : l'âge du relevé (`read_at`) dépasse sa plus courte
       fenêtre.
 
-    Un relevé dont **toutes** les fenêtres datées sont remises à zéro n'est
-    pas périmé : la suivante est vierge, 0 % (L71). Un relevé sans âge connu
-    n'est pas présumé périmé : une source qui ne date pas garde son sens, et
-    le choix la traite comme avant.
+    Un relevé dont **toutes** les fenêtres sont remises à zéro n'est pas
+    périmé : la suivante est vierge, 0 % (L71) — ce qui exige que toutes les
+    fenêtres soient datées, une fenêtre non datée interdisant de conclure.
+    Un relevé sans âge connu n'est pas présumé périmé : une source qui ne
+    date pas garde son sens, et le choix la traite comme avant.
     """
     gauges = list(gauges)
     if not gauges:
@@ -399,7 +422,12 @@ def stale_reading(gauges, now: float) -> bool:
     dated = [g for g in gauges if g.resets_at]
     if dated:
         passed = [g.reset_passed(now) for g in dated]
-        return any(passed) and not all(passed)
+        if not any(passed):
+            return False
+        # #1566 N2 : `all(passed)` ne portait que sur les fenêtres datées ; une
+        # fenêtre non datée encore là rendait le mélange « datée échue + non
+        # datée » faussement courant. Elle ne prouve pas sa remise à zéro.
+        return not all(passed) or any(not g.resets_at for g in gauges)
     stamps = [stamp for stamp in (getattr(g, "read_at", None) for g in gauges) if stamp]
     if not stamps:
         return False
@@ -478,9 +506,11 @@ class TurnUsage:
     def reread_tokens(self) -> int:
         """Jetons d'entrée **relus** par le tour, cache compris (L60).
 
-        C'est la mesure du plafond de contexte : chaque étape d'un tour relit
-        tout le contexte de la session. Codex compte déjà l'entrée en cache
-        dans `input_tokens` ; les autres harnais la comptent à part."""
+        Mesure du coût du tour et de l'alerte `session_too_big` : chaque étape
+        d'un tour relit tout le contexte de la session. Ce n'est pas la taille
+        du contexte — le plafond de contexte mesure le dernier appel (#2336).
+        Codex compte déjà l'entrée en cache dans `input_tokens` ; les autres
+        harnais la comptent à part."""
         if self.harness == "codex":
             return max(int(self.input_tokens), int(self.cached_input_tokens))
         return int(self.input_tokens) + int(self.cached_input_tokens)
@@ -813,29 +843,45 @@ class CostBook:
         except OSError:
             return ""
 
-    def events(self, agent: str, start: int = 0, tail: bool = False) -> list:
-        """Les événements JSONL d'un agent, à partir de la ligne `start`."""
+    def events(self, agent: str, start: int = 0, tail: bool = False,
+               end: int | None = None) -> list:
+        """Les événements JSONL d'un agent, de la ligne `start` (incluse) à la
+        ligne `end` (exclue ; None = fin du flux).
+
+        #2096 : le flux est lu **en flux**, jamais chargé entier. Un journal de
+        200 Mo rendait une liste de tous ses événements (pic de plusieurs
+        centaines de Mo par lecture, et plusieurs lectures par tour) alors
+        qu'un tour n'en veut que la tranche ; les lignes hors de la tranche
+        sont comptées en C, jamais analysées, et la lecture reprend à l'octet
+        de `start`. Avec `tail`, seule la fin du fichier est lue et les index
+        partent du début de cette fin (inchangé)."""
         path = os.path.join(self.agent_dir(agent), "events.jsonl")
-        raw = _read_tail(path) if tail else _read_all(path)
-        out = []
-        for index, line in enumerate(raw.splitlines()):
-            if index < start:
-                continue
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except ValueError:
-                continue
-            # Un `[]` ou un `null` est une ligne JSON valide mais pas un événement :
-            # la garder ferait planter le premier `.get` venu (sonde codex2).
-            if isinstance(event, dict):
-                out.append(event)
-        return out
+        if tail:
+            return _parse_events(_read_tail(path).splitlines(), start, end)
+        try:
+            with open(path, "rb") as flux:
+                offset = _byte_offset_of_line(flux, start)
+                if offset is None:
+                    return []
+                fin = None if end is None else _byte_offset_of_line(flux, end)
+                if fin is not None and fin <= offset:
+                    return []  # tranche vide (end <= start)
+                flux.seek(offset)
+                brut = flux.read() if fin is None else flux.read(fin - offset)
+        except OSError:
+            return []
+        # la tranche lue est exactement [start, end) : tout ce qu'elle contient
+        # est dans la tranche, et un octet invalide écarte sa ligne (JSON
+        # illisible) au lieu de faire échouer toute la lecture. Coupée sur
+        # "\n" seul, comme le compte de l'exécuteur (`events_start`) : un
+        # `splitlines()` couperait aussi sur U+2028 ou U+0085, qu'un harnais
+        # écrit tels quels dans une chaîne JSON, et perdrait l'événement.
+        texte = brut.decode("utf-8", "replace")
+        return _parse_events(texte.split("\n"), 0)
 
     # -- jauges de forfait --------------------------------------------------
-    def claude_gauges(self, account: str | None = None, primary: str | None = None) -> list:
+    def claude_gauges(self, account: str | None = None,
+                      primary: str | None = None) -> "Gauges":
         """Read the latest Claude rate-limit gauges, shared across an account.
 
         With `account` (L30), use the marker preceding each turn, including
@@ -845,6 +891,20 @@ class CostBook:
         account claims them (L1078), never "the account itself". Leading
         readings before any established marker in a marked stream stay
         unknown, never primary.
+
+        #1132 : une mesure est classée par son instant de **production** (le ts
+        du marqueur du tour qui l'a publiée), jamais par le mtime du fichier —
+        un flux sans marqueur est non daté et ne remplace pas une mesure datée.
+
+        #1661 : TOUS les chemins rendent un `Gauges` (liste + `overage`),
+        jamais une liste nue : un appelant qui lit `.overage` en direct ne
+        doit pas tomber sur le chemin vide. Le chemin par compte rend une
+        copie (le relevé est mis en cache et partagé entre CostBook).
+
+        #1702 (N4) : la lecture sans compte récupère elle aussi le marqueur de
+        compte hors de la tranche lue, comme le chemin par compte — sans cela
+        une mesure dont le marqueur précédait la tranche restait non datée et
+        perdait contre toute mesure datée d'un autre flux.
         """
         if account is not None:
             return self._claude_gauges_of(account, primary)
@@ -854,28 +914,35 @@ class CostBook:
                 continue
             path = os.path.join(self.agent_dir(agent), "events.jsonl")
             try:
-                mtime = os.stat(path).st_mtime
+                # #1702 (N4) : même récupération du marqueur hors tail que le
+                # chemin par compte ; la mtime ne sert qu'à départager deux
+                # mesures non datées, jamais à en dater une.
+                events, stat, _complete = _claude_account_tail(path)
             except OSError:
                 continue
-            if newest is not None and mtime <= newest[0]:
+            found = _last_claude_reading(events, agent, stat.st_mtime)
+            if found is None:
                 continue
-            for line in reversed(self.events(agent, tail=True)):
-                if line.get("type") != "rate_limit_event":
-                    continue
-                gauges = _claude_windows(line, mtime)
-                if gauges is None:
-                    break
-                newest = (mtime, Gauges(gauges, _claude_overage(line)))
-                break
-        return newest[1] if newest else []
+            if newest is None or _reading_rank(found) >= _reading_rank(newest):
+                newest = found
+        return newest[2] if newest else Gauges()
 
-    def _claude_gauges_of(self, account: str, primary: str | None) -> list:
+    def _claude_gauges_of(self, account: str, primary: str | None) -> "Gauges":
         """Read the newest gauges for one Claude account (L30).
 
         Compare turn-marker timestamps across agents. Only a stream without
         any marker uses the `primary` account (the harness's default one,
-        L1078) and file modification time; with `primary` None, no account
-        claims them.
+        L1078), dated by the event itself or left undated, never by the file
+        modification time (#1720); with `primary` None, no account claims
+        them.
+
+        #1132 : la comparaison porte sur l'instant de production, puis la
+        lecture est complétée par l'historique partagé (`_gauges_with_history`)
+        — un exécuteur qui ne voit que des flux figés ne juge plus un compte
+        sur la mesure périmée quand un autre état a publié plus frais.
+
+        #1661 : rend un `Gauges` (copie du relevé caché, `overage` compris),
+        jamais une liste nue — même quand aucun relevé n'existe.
         """
         best = None
         for agent in self.agents():
@@ -895,7 +962,7 @@ class CostBook:
                     # make a racy snapshot old enough to be cached.
                     seen = time.time_ns()
                     events, stat, complete = _claude_account_tail(path)
-                    readings = _claude_account_readings(events, stat.st_mtime)
+                    readings = _claude_account_readings(events, agent)
                     if complete and not _racy(stat, seen):
                         self._claude_gauge_cache[path] = (_journal_signature(stat), readings)
                     else:
@@ -906,13 +973,83 @@ class CostBook:
             found = readings.get(account)
             if found is None and primary is not None and account == primary:
                 found = readings.get(None)  # fully verified, unmarked legacy stream
-            if found and (best is None or found[0] >= best[0]):
+            if found and (best is None or _reading_rank(found) >= _reading_rank(best)):
                 best = found
         # A caller must not mutate the cached list seen by another CostBook;
         # the copy keeps the reading's overage flags (L226b, #1649).
         # No reading: an empty Gauges (overage None), the same type as a
         # reading, so a direct `.overage` read never meets a bare list (N1 impl-04).
-        return Gauges(best[1], best[2]) if best else Gauges()
+        # #1661 : le relevé caché est immuable et partagé entre CostBooks ; on
+        # en rend une copie fraîche, en gardant le type `Gauges` et son overage.
+        # #1132 : la lecture locale (overage compris) est complétée par
+        # l'historique partagé ; le type `Gauges` est conservé sur ce chemin
+        # aussi — #1132 rendait une liste nue, l'historique ne porte pas les
+        # drapeaux d'overage.
+        reading = Gauges(best[2], best[2].overage) if best else Gauges()
+        return self._gauges_with_history(account, reading)
+
+    def _gauges_with_history(self, account: str, gauges: "Gauges") -> "Gauges":
+        """#1132 : complète la lecture locale par l'historique partagé (0027/0434).
+
+        Un exécuteur ne voit que SON dossier d'état : la mesure la plus récente
+        y est vite périmée alors qu'un autre état (ou hôte) a publié plus frais
+        pour le même compte. Fenêtre par fenêtre, l'historique l'emporte quand
+        son instant de production est STRICTEMENT plus récent que celui de la
+        mesure locale ; une mesure non datée ne remplace jamais une mesure
+        datée. Lecture seule, jamais fatale : sans base, en panne, ou sans
+        relevé daté, la lecture locale est rendue.
+
+        L'historique ne porte pas les drapeaux d'overage : la copie rendue
+        garde ceux de la lecture locale, avec le type `Gauges` (#1649).
+
+        #1702 (N2) : une fenêtre reprise d'ici porte `from_history=True` ; la
+        garde la lit comme la mesure la plus fraîche, mais `record_gauges` ne
+        la réécrit jamais — chaque hôte évaluateur réinscrivait sinon le relevé
+        d'un autre sous sa source (échos toutes les dix minutes).
+
+        Sur un exécuteur `backend=mediated`, `operations.gauge_latest` n'est
+        pas admise au contrat médié : l'appel est refusé, l'exception est
+        avalée et la lecture locale est rendue sans réconciliation. C'est
+        documenté dans `docs/COMPTES.md` ; l'admettre toucherait le contrat
+        d'autorisation (deux avis), ce n'est pas le geste de ce lot.
+        """
+        if self.db is None:
+            return gauges
+        try:
+            rows = self._gauge_latest("claude", account)
+        except Exception:  # historique facultatif : jamais fatal à la garde
+            return gauges
+        known = {row.get("key"): row for row in rows if row.get("produced_ts") is not None}
+        if not known:
+            return gauges
+        merged, changed = [], False
+        for gauge in gauges:
+            row = known.get(gauge.key)
+            if row is not None and (gauge.produced_at is None
+                                    or float(row["produced_ts"]) > float(gauge.produced_at)):
+                produced = float(row["produced_ts"])
+                merged.append(Gauge("claude", gauge.key, float(row["used"]),
+                                    row.get("resets_at_ts"), float(row["window_s"]),
+                                    read_at=produced, produced_at=produced,
+                                    source=row.get("source") or "", from_history=True))
+                changed = True
+            else:
+                merged.append(gauge)
+        if not gauges:
+            for key in sorted(known):
+                row, produced = known[key], float(known[key]["produced_ts"])
+                merged.append(Gauge("claude", key, float(row["used"]),
+                                    row.get("resets_at_ts"), float(row["window_s"]),
+                                    read_at=produced, produced_at=produced,
+                                    source=row.get("source") or "", from_history=True))
+                changed = True
+        if not changed:
+            return gauges
+        return Gauges(merged, gauges.overage)
+
+    def _gauge_latest(self, harness: str, account: str) -> list:
+        """Le dernier relevé connu de chaque jauge d'un compte (#1132)."""
+        return storage.of(self.db).operations.gauge_latest(harness=harness, account=account)
 
     def codex_gauges(self, sessions: str | None = None) -> list:
         """Les `rate_limits` primaire et secondaire du journal de session le plus récent.
@@ -999,17 +1136,27 @@ class CostBook:
         la garde de budget qui lit les jauges avant chaque tour.
 
         `account` (L30, migration 0028) : les jauges sont celles de ce compte.
+
+        #1702 (N2) : une fenêtre reprise de l'historique (`from_history`) n'y
+        est jamais réécrite — elle y est déjà, et la réinscrire sous la source
+        de l'hôte évaluateur fabriquait des échos toutes les dix minutes.
         """
         if self.db is None or not gauges:
             return 0
         try:
             lignes = []
             for g in gauges:
+                if getattr(g, "from_history", False):
+                    continue
                 ligne = {"harness": g.harness, "key": g.key, "used": g.used,
-                         "resets_at": g.resets_at, "window_s": g.window_s}
+                         "resets_at": g.resets_at, "window_s": g.window_s,
+                         "produced_at": getattr(g, "produced_at", None),
+                         "source": getattr(g, "source", "")}
                 if account is not None:
                     ligne["account"] = account
                 lignes.append(ligne)
+            if not lignes:
+                return 0
             return storage.of(self.db).operations.record_gauges(lignes)
         except Exception:  # historique facultatif : jamais fatal
             return 0
@@ -1111,14 +1258,19 @@ class CostBook:
                                   int(row["cum_output_tokens"] or 0)]
                     if row["cum_input_tokens"] is not None else None,
                 }
-        before = self.events(agent)[:max(0, start)] if start else []
+        # #2096 : le préfixe seul est demandé — inutile de lire (et d'analyser)
+        # les événements du tour qui suit, encore moins de charger le journal.
+        before = self.events(agent, end=max(0, start)) if start else []
         current = ""
         found: dict = {}
         for event in before:
             if event.get("parent_tool_use_id"):
                 continue             # L221 : ni la session ni le cumul d'un sous-agent
             kind = event.get("type")
-            ident = event.get("session_id") or event.get("thread_id")
+            if kind == RESIDENT_USAGE_EVENT:
+                ident = event.get("session")
+            else:
+                ident = event.get("session_id") or event.get("thread_id")
             if isinstance(ident, str) and ident:
                 current = ident
             if current != session:
@@ -1133,6 +1285,19 @@ class CostBook:
                          "cum_usage": [int(u.get("input_tokens", 0)),
                                        int(u.get("cached_input_tokens", 0)),
                                        int(u.get("output_tokens", 0))]}
+            elif kind == RESIDENT_USAGE_EVENT and harness != "claude":
+                # L80a : le dernier repère publié par un tour résident de la
+                # même session (base neuve, ou session reprise sous un autre
+                # agent) — le cumul USD d'ACP, celui du fil Codex.
+                total = _amount(event.get("cost_total"))
+                totals = event.get("usage_total")
+                if total is not None:
+                    found = {"session": session, "cum_usd": total, "cum_usage": None}
+                elif isinstance(totals, dict) and totals:
+                    found = {"session": session, "cum_usd": None,
+                             "cum_usage": [_num(totals, "input_tokens"),
+                                           _num(totals, "cached_input_tokens"),
+                                           _num(totals, "output_tokens")]}
         return found
 
     def resumed_session(self, agent: str, start: int) -> str | None:
@@ -1279,8 +1444,28 @@ class CostBook:
         nouveau `thread.started`, et la session se perdrait alors sur la ligne —
         le relevé suivant, comparé au mauvais repère, compterait un tour de trop
         (sonde codex2, B5). La session se résout donc en amont et se transmet.
+
+        #2096 : lue **de la fin vers le début**, elle n'a plus à charger ni à
+        analyser le journal entier à chaque tour ; la dernière session est
+        presque toujours dans les derniers blocs. Le parcours reste complet
+        quand il faut (flux sans session, ou que des sous-agents en fin de
+        flux), et rend la même session que le parcours direct.
         """
-        return _last_session(self.events(agent)) or None
+        path = os.path.join(self.agent_dir(agent), "events.jsonl")
+        for ligne in _lines_reverse(path):
+            ligne = ligne.strip()
+            if not ligne:
+                continue
+            try:
+                event = json.loads(ligne)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            trouve = _session_event(event)
+            if trouve:
+                return trouve
+        return None
 
     def turn_usage(self, agent: str, start: int = 0, session: str | None = None,
                    model: str | None = None, ended: float | None = None) -> TurnUsage:
@@ -1320,10 +1505,16 @@ class CostBook:
                                    time.time() if ended is None else ended) or triplet
         pin, pcache, pout = triplet or (0.0, 0.0, 0.0)
         tier = prompt_tier(prices, model) if not marque else None
+        # L80a : un tour résident Codex/ACP porte sa mesure dans un événement
+        # `resident.turn`, écrit depuis son TurnResult (le flux brut est du
+        # JSON-RPC). Il fait foi seul pour ce tour : les relevés natifs de la
+        # même tranche ne sont pas recomptés.
+        resident = _resident_event(events)
         cum = self.baseline(agent, harness, session)
         # L71 : session reprise sans relevé de l'agent — le dernier total CONNU
         # de la session (autre agent, ou flux local d'avant le tour) sert de repère.
-        if harness in ("claude", "codex") and session and cum.get("session") != session:
+        if (harness in ("claude", "codex") or resident is not None) \
+                and session and cum.get("session") != session:
             known = self.session_reading(agent, harness, session, start)
             if known:
                 cum = known
@@ -1331,6 +1522,12 @@ class CostBook:
         # harnais porte toute l'histoire de la session, pas ce tour.
         unknown_resume = (bool(session) and cum.get("session") != session
                           and self.resumed_session(agent, start) == session)
+
+        if resident is not None and harness != "claude":
+            return _resident_turn_usage(agent, harness, modele, resident,
+                                        pin, pcache, pout, marque,
+                                        cum=cum, session=session,
+                                        unknown_resume=unknown_resume)
 
         if harness == "claude":
             # L221 : seuls les `result` du fil principal (pas d'un sous-agent,
@@ -1468,6 +1665,7 @@ class CostBook:
         # L30 : le compte du tour est celui du dernier marqueur AVANT le tour.
         account = self.account_at(agent, start, usage.harness)
         cum_usd = cum_input = cum_cached = cum_out = None
+        resident = _resident_event(events)
         if usage.harness == "claude":
             # L221 : le repère est le cumul du fil principal, jamais d'un sous-agent.
             totals = [float(e["total_cost_usd"]) for e in _claude_main_results(events, session_id)
@@ -1475,12 +1673,27 @@ class CostBook:
             if totals:
                 cum_usd = totals[-1]
         elif usage.harness == "codex":
-            completed = [e.get("usage") or {} for e in events if e.get("type") == "turn.completed"]
-            if completed:
-                last = completed[-1]
-                cum_input = int(last.get("input_tokens", 0))
-                cum_cached = int(last.get("cached_input_tokens", 0))
-                cum_out = int(last.get("output_tokens", 0))
+            if resident is not None:
+                # L80a : cumul natif du fil (`tokenUsage.total`), ou à défaut
+                # dernier relevé de la même session + le tour ; le repère du
+                # tour suivant reste ainsi le cumul du fil, pas le tour seul.
+                cum_input, cum_cached, cum_out = _resident_codex_cumulative(
+                    self, agent, session_id, resident)
+            else:
+                completed = [e.get("usage") or {} for e in events
+                             if e.get("type") == "turn.completed"]
+                if completed:
+                    last = completed[-1]
+                    cum_input = int(last.get("input_tokens", 0))
+                    cum_cached = int(last.get("cached_input_tokens", 0))
+                    cum_out = int(last.get("output_tokens", 0))
+        if resident is not None and usage.harness != "claude":
+            # L80a : le coût USD cumulé d'une session résidente (ACP) est le
+            # repère durable du tour suivant, y compris après un redémarrage
+            # du processus qui a perdu sa base en mémoire.
+            total = _amount(resident.get("cost_total"))
+            if total is not None:
+                cum_usd = total
         usage = replace(usage, session=session_id or None)
         row = usage.row()
         row["turn"] = turn or usage.turn
@@ -1967,7 +2180,8 @@ def _claude_windows(event: dict, read_at: float | None = None) -> list | None:
     """Les fenêtres d'un `rate_limit_event` Claude, ou None si illisibles.
 
     `read_at` (#1561) : l'horodatage du relevé — le marqueur de compte qui
-    précède le tour, ou la date du flux pour un flux sans marqueur.
+    précède le tour, ou la date de l'événement pour un flux sans marqueur
+    (#1720, 0.0 = non daté).
     """
     info = event.get("rate_limit_info") or {}
     windows = info.get("unifiedWindows") or {} if isinstance(info, dict) else None
@@ -2078,32 +2292,228 @@ def _codex_config_model(path: str) -> str:
     return ""
 
 
+def _byte_offset_of_line(flux, numero: int, bloc: int = 1 << 20) -> int | None:
+    """L'offset du début de la ligne `numero` (0 = la première) d'un flux binaire.
+
+    Compte les sauts de ligne par blocs, sans décoder ni garder une ligne :
+    c'est le saut rapide de `events(start=…)` sur un journal de plusieurs
+    centaines de Mo. None quand le flux a moins de lignes (appelant : aucun
+    événement dans la tranche)."""
+    if numero <= 0:
+        return 0
+    flux.seek(0)
+    vues = 0
+    offset = 0
+    while True:
+        morceau = flux.read(bloc)
+        if not morceau:
+            return None
+        debut = 0
+        while True:
+            i = morceau.find(b"\n", debut)
+            if i < 0:
+                break
+            vues += 1
+            if vues == numero:
+                return offset + i + 1
+            debut = i + 1
+        offset += len(morceau)
+
+
+def _parse_events(lines: Iterable[str], start: int, end: int | None = None) -> list:
+    """Les événements JSONL des lignes `[start, end)` (#2096).
+
+    Les lignes hors de la tranche sont comptées sans être analysées : c'est
+    tout l'intérêt du flux — le journal peut faire des centaines de Mo, la
+    tranche d'un tour quelques kilo-octets. Un `[]` ou un `null` est une ligne
+    JSON valide mais pas un événement : le garder ferait planter le premier
+    `.get` venu (sonde codex2)."""
+    out = []
+    for index, line in enumerate(lines):
+        if index < start:
+            continue
+        if end is not None and index >= end:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            out.append(event)
+    return out
+
+
+def _lines_reverse(path: str, bloc: int = 1 << 20) -> Iterator[bytes]:
+    """Les lignes d'un fichier, de la dernière à la première (#2096).
+
+    Lit par blocs depuis la fin et recolle la ligne à cheval sur deux blocs.
+    Les morceaux de cette ligne s'accumulent dans une liste et ne sont joints
+    qu'une fois, quand elle est complète : une ligne géante (un événement de
+    plusieurs Mo) coûte alors O(n), au lieu de la concaténation quadratique
+    d'un `bloc + reste` qui recopiait toute la ligne à chaque tour (#2125).
+    La mémoire reste bornée par le bloc et la plus longue ligne, jamais par le
+    fichier. Les lignes sont rendues en octets, décodées par l'appelant."""
+    try:
+        with open(path, "rb") as flux:
+            flux.seek(0, os.SEEK_END)
+            pos = flux.tell()
+            morceaux: list[bytes] = []  # la ligne en cours, de sa fin vers son début
+            while pos > 0:
+                debut = max(0, pos - bloc)
+                flux.seek(debut)
+                donnees = flux.read(pos - debut)
+                pos = debut
+                parties = donnees.split(b"\n")
+                if len(parties) == 1:
+                    # aucun saut de ligne : tout le bloc prolonge la ligne en cours
+                    morceaux.append(parties[0])
+                    continue
+                morceaux.append(parties[-1])
+                yield b"".join(reversed(morceaux))
+                morceaux = [parties[0]]  # peut-être la fin d'une ligne antérieure
+                for ligne in reversed(parties[1:-1]):
+                    yield ligne
+            if morceaux:
+                ligne = b"".join(reversed(morceaux))
+                if ligne:                # même contrat que l'ancien `if reste`
+                    yield ligne
+    except OSError:
+        return
+
+
+def _session_event(event: dict) -> str:
+    """Ce qu'un événement apporte à la session courante (L60, L221).
+
+    Vide pour un événement de sous-agent ; sinon sa clé `session` si elle est
+    remplie, à défaut le dernier identifiant non vide (`session_id`,
+    `thread_id`, `sessionId` — l'ordre des remplacements du relevé direct)."""
+    if event.get("parent_tool_use_id"):
+        return ""                # L221 : la session d'un sous-agent n'est pas celle du tour
+    found = ""
+    for key in ("session_id", "thread_id", "sessionId"):
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            found = value
+    session = event.get("session")
+    if isinstance(session, str) and session:
+        found = session
+    return found
+
+
 def _last_session(events: Iterable[dict]) -> str:
     """L'identifiant de session/fil le plus récent du flux, s'il y en a un.
 
     `sessionId` est la clé du harnais DeepSeek (`{"type": "session",
     "sessionId": …}`) et du pont ACP : sans elle, les tours DeepSeek étaient
     inscrits au grand livre sans session (L60)."""
+    found = ""
+    for event in events:
+        found = _session_event(event) or found
+    return found
+
+
+def _resident_event(events: Iterable[dict]) -> dict | None:
+    """L'événement `resident.turn` de la tranche, s'il y en a un (L80a).
+
+    Un tour logique n'en écrit qu'un ; le dernier est retenu, comme le
+    `turn.completed` d'un flux natif. La présence de cet événement fait foi :
+    `turn_usage` ne retombe pas sur les relevés natifs de la tranche, pour ne
+    jamais compter deux fois le même tour."""
     found = None
     for event in events:
-        if event.get("parent_tool_use_id"):
-            continue                 # L221 : la session d'un sous-agent n'est pas celle du tour
-        for key in ("session_id", "thread_id", "sessionId"):
-            value = event.get(key)
-            if isinstance(value, str) and value:
-                found = value
-        session = event.get("session")
-        if isinstance(session, str) and session:
-            found = session
-    return found or ""
+        if event.get("type") == RESIDENT_USAGE_EVENT:
+            found = event
+    return found
 
 
-def _read_all(path: str) -> str:
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return fh.read()
-    except OSError:
-        return ""
+def _resident_turn_usage(agent: str, harness: str, modele: str, event: dict,
+                         pin: float, pcache: float, pout: float,
+                         marque: dict, *, cum: dict, session: str | None,
+                         unknown_resume: bool) -> "TurnUsage":
+    """La ligne d'un tour résident, lue sur son `resident.turn` (L80a).
+
+    Codex publie `usage.last` : l'entrée du `TurnResult` est hors cache, le
+    cache à part. Le grand livre Codex compte l'entrée cache comprise
+    (`TurnUsage.input_tokens`), d'où la somme. Les autres harnais résidents
+    (ACP) publient un contexte `used` et, souvent, un coût USD cumulé par
+    session (`cost`/`cost_total`) : le coût du tour, quand il est là, fait foi
+    plutôt qu'un barème sur des jetons qui ne sont pas des jetons facturés.
+
+    Une reprise de processus (sommeil, réglages changés, redémarrage du
+    worker) perd la base en mémoire du pilote : `cost_total` seul reste alors
+    le cumul de la session, et son delta se calcule sur le dernier repère USD
+    **durable** de la même session (le grand livre), jamais sur zéro — sinon
+    le premier prompt d'une session reprise compterait tout son passé."""
+    usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+    if harness == "codex":
+        uncached = _num(usage, "input_tokens")
+        cached = _num(usage, "cache_read_input_tokens")
+        output = _num(usage, "output_tokens")
+        usd = (uncached * pin + cached * pcache + output * pout) / 1e6
+        return TurnUsage(agent, harness, modele, usd,
+                         input_tokens=uncached + cached,
+                         cached_input_tokens=cached,
+                         output_tokens=output,
+                         **(marque if (uncached or cached or output) else {}))
+    input_tokens = _num(usage, "input_tokens")
+    cached = _num(usage, "cache_read_input_tokens")
+    output = _num(usage, "output_tokens")
+    cost = _amount(event.get("cost"))
+    if cost is not None:
+        usd = max(cost, 0.0)
+        mark = {}
+    else:
+        total = _amount(event.get("cost_total"))
+        usd = None
+        if total is not None:
+            base = None
+            if cum.get("session") == session and cum.get("cum_usd") is not None:
+                base = float(cum["cum_usd"])
+            elif not unknown_resume and cum.get("session") != session:
+                # session neuve : son cumul USD part de zéro
+                base = 0.0
+            if base is not None:
+                usd = total - base
+                if usd < 0:      # session rouverte : le cumul est reparti
+                    usd = total
+                mark = {}
+        if usd is None:
+            # Aucun repère USD durable : le tour se facture au barème sur ses
+            # jetons (le seul estimable), comme avant L80a.
+            usd = (input_tokens * pin + cached * pcache + output * pout) / 1e6
+            mark = marque if (input_tokens or cached or output) else {}
+    return TurnUsage(agent, harness, modele, usd,
+                     input_tokens=input_tokens,
+                     cached_input_tokens=cached,
+                     output_tokens=output,
+                     **mark)
+
+
+def _resident_codex_cumulative(book: "CostBook", agent: str, session: str | None,
+                               event: dict) -> tuple[int, int, int]:
+    """Cumul du fil Codex après un tour résident (L80a).
+
+    `usage_total` vient de `thread/tokenUsage/updated.total` : c'est le cumul
+    natif du fil, qui sert de repère au tour suivant. À défaut, le cumul
+    s'obtient en ajoutant le tour au dernier relevé connu de la même session
+    (jamais à celui d'une autre session)."""
+    total = event.get("usage_total")
+    if isinstance(total, dict) and total:
+        return (_num(total, "input_tokens"), _num(total, "cached_input_tokens"),
+                _num(total, "output_tokens"))
+    usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+    previous = [0, 0, 0]
+    base = book.baseline(agent, "codex", session)
+    if base.get("session") == session and isinstance(base.get("cum_usage"), list):
+        previous = base["cum_usage"]
+    uncached = _num(usage, "input_tokens")
+    cached = _num(usage, "cache_read_input_tokens")
+    return (int(previous[0]) + uncached + cached,
+            int(previous[1]) + cached,
+            int(previous[2]) + _num(usage, "output_tokens"))
 
 
 def _read_tail(path: str, limit: int = TAIL_BYTES) -> str:
@@ -2177,26 +2587,151 @@ def _racy(stat, now_ns: int) -> bool:
     return now_ns - stat.st_ctime_ns < RACY_CTIME_NS
 
 
-def _claude_account_readings(events: list, mtime: float) -> dict:
+#: #1132 : tolérance entre le ts du marqueur d'un tour et le `resetsAt` d'une
+#: fenêtre qu'il publie. Au-delà, la fenêtre était déjà close quand le tour a
+#: commencé : le harnais a rejoué une mesure périmée (incident du 13/10, la
+#: five_hour du relevé figé était échue de ~24 h sous un marqueur récent).
+REPLAY_TOLERANCE_S = 60.0
+
+
+def _marker_ts(event: dict) -> float | None:
+    """Le ts d'un marqueur de compte, ou None s'il est absent/illisible."""
+    try:
+        value = float(event.get("ts") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _reading_rank(found) -> tuple:
+    """#1132 : classe une mesure par son instant de PRODUCTION.
+
+    Une mesure non datée (flux sans marqueur) ne date pas le fichier : l'heure
+    du fichier ne sert qu'à départager deux mesures non datées entre elles,
+    jamais à battre une mesure datée (`(False, mtime) < (True, ts)`).
+    """
+    stamp, produced = found[0], found[1]
+    return (produced is not None, produced if produced is not None else stamp)
+
+
+def _stamp_gauges(gauges: list, produced: float | None, agent: str,
+                  overage: Overage | None) -> Gauges:
+    """#1132 : chaque fenêtre porte sa provenance (production, journal).
+
+    `read_at` (#1561) garde l'horodatage du relevé posé par `_claude_windows` ;
+    `produced_at` (#1132) est la provenance que lisent l'historique partagé
+    (0434) et la réconciliation.
+    """
+    return Gauges([replace(gauge, produced_at=produced, source=agent or "")
+                   for gauge in gauges], overage)
+
+
+def _replayed(gauges: list, produced: float | None) -> bool:
+    """#1132 : une fenêtre déjà close avant le tour qui la publie est un rejeu.
+
+    Un `rate_limit_event` ne porte pas d'instant ; le ts du marqueur de compte
+    borne le début du tour. Si le `resetsAt` d'une fenêtre publiée est
+    antérieur à cette borne (tolérance `REPLAY_TOLERANCE_S`, même horloge), le
+    harnais a rejoué une mesure d'un tour antérieur : elle ne doit jamais
+    remplacer une mesure fraîche.
+    """
+    if produced is None:
+        return False
+    return any(gauge.resets_at is not None
+               and float(gauge.resets_at) < produced - REPLAY_TOLERANCE_S
+               for gauge in gauges)
+
+
+def _last_claude_reading(events: list, agent: str, mtime: float):
+    """Le MEILLEUR `rate_limit_event` d'un flux, daté par son marqueur (#1132).
+
+    Rend `(estampille, production, Gauges)` : `production` est le ts du dernier
+    marqueur de compte vu avant l'événement (None pour un flux sans marqueur ou
+    pour un rejeu), `estampille` l'heure du fichier quand il n'y a pas de
+    marqueur — elle ne sert qu'à départager deux mesures non datées. Les
+    mesures du flux sont classées par `_reading_rank`, jamais par leur ordre de
+    lecture : un rejeu publié APRÈS une mesure fraîche du même journal ne
+    masque plus celle-ci.
+    """
+    produced, best = None, None
+    for event in events:
+        if _is_claude_marker(event):
+            produced = _marker_ts(event)
+        elif event.get("type") == "rate_limit_event":
+            stamp = produced if produced is not None else mtime
+            gauges = _claude_windows(event, stamp)
+            if gauges is None:
+                continue
+            at = produced
+            if _replayed(gauges, at):
+                at = None                 # rejeu : jamais daté
+            found = (stamp, at,
+                     _stamp_gauges(gauges, at, agent, _claude_overage(event)))
+            if best is None or _reading_rank(found) >= _reading_rank(best):
+                best = found
+    return best
+
+
+def _claude_event_date(event: dict) -> float:
+    """La date que l'événement porte lui-même, 0.0 s'il n'en porte pas (#1720).
+
+    Un `rate_limit_event` Claude réel n'a ni `ts` ni `timestamp` : un flux sans
+    marqueur reste donc **non daté**, au lieu d'être daté de la mtime du journal
+    (dernière écriture de n'importe quel événement), qui le faisait passer pour
+    plus frais qu'un widget plus récent (#1648).
+    """
+    for key in ("ts", "timestamp"):
+        date = _epoch(event.get(key))
+        if date:
+            return date
+    return 0.0
+
+
+def _claude_account_readings(events: list, agent: str = "") -> dict:
     """Attribute all accounts in one pass; None is a verified legacy stream.
 
-    Each reading is (stamp, gauges, overage): the overage flags stay beside
-    the gauges, so the shared cache keeps them too (L226b, #1649).
+    Each reading is (read_at, produced, Gauges): the overage flags stay on the
+    gauges (L226b, #1649) and the production instant (#1132) is the marker ts
+    of the publishing turn. `read_at` (#1720) est le ts du marqueur pour un flux
+    marqué, la date de l'événement pour un flux sans marqueur, 0.0 (non daté)
+    quand il n'en porte pas — jamais la mtime du fichier.
+
+    #1132 : chaque mesure porte sa provenance. `produced_at` est le ts du
+    marqueur du tour qui l'a publiée, jamais le mtime du fichier. Une mesure
+    dont une fenêtre était déjà close au début du tour est un rejeu : elle est
+    rendue NON datée, pour ne pas remplacer une mesure fraîche. Un rejeu publié
+    après une mesure fraîche du même compte ne la remplace pas non plus : le
+    compte garde la meilleure mesure du flux (`_reading_rank`).
+
+    #1720 : un flux sans marqueur ne se date plus de la mtime du journal
+    (dernière écriture de n'importe quel événement), qui le faisait passer pour
+    plus frais qu'un widget plus récent (#1648) ; il se date de l'événement
+    lui-même (`_claude_event_date`), sinon il reste non daté.
     """
     marked = any(_is_claude_marker(e) for e in events)
-    current, stamp = None, 0.0 if marked else mtime
+    current, stamp, produced = None, 0.0, None
     readings = {}
     for event in events:
         if _is_claude_marker(event):
             current = str(event.get("account") or "") or None
-            try:
-                stamp = float(event.get("ts") or 0.0)
-            except (TypeError, ValueError):
-                stamp = 0.0
+            produced = _marker_ts(event)
+            stamp = produced if produced is not None else 0.0
         elif event.get("type") == "rate_limit_event" and (current is not None or not marked):
-            gauges = _claude_windows(event, stamp)
-            if gauges is not None:
-                readings[current] = (stamp, gauges, _claude_overage(event))
+            read_at = stamp if marked else _claude_event_date(event)
+            gauges = _claude_windows(event, read_at)
+            if gauges is None:
+                continue
+            at = produced
+            if _replayed(gauges, at):
+                at = None             # rejeu : jamais daté
+            # #1661 : `_stamp_gauges` recopie chaque fenêtre (`replace`) et rend
+            # un `Gauges` neuf : le cache ne partage jamais la liste mutable du
+            # producteur, et l'overage reste porté par les `Gauges` (#1649).
+            found = (read_at, at, _stamp_gauges(gauges, at, agent,
+                                                _claude_overage(event)))
+            old = readings.get(current)
+            if old is None or _reading_rank(found) >= _reading_rank(old):
+                readings[current] = found
     return readings
 
 
@@ -2254,6 +2789,13 @@ def _claude_account_tail(path: str) -> tuple[list, os.stat_result, bool]:
 def _num(usage: dict, key: str) -> int:
     value = usage.get(key) if isinstance(usage, dict) else None
     return int(value) if isinstance(value, (int, float)) else 0
+
+
+def _amount(value) -> float | None:
+    """Un montant USD exploitable, ou None (un booléen n'est pas un montant)."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
 
 
 def _sum(usages: Iterable[dict], key: str) -> int:

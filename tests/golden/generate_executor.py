@@ -35,6 +35,7 @@ READING_ROW = dict(READING, id=77, sampled_ts=TS)
 
 ARGS = {  # op: (args, kwargs, résultat)
  "agents.claimable": ([HOST, [AG]], {"require_responsible": False}, [{**ROW, "status": "queued"}]),
+ "agents.runner_seen": ([HOST, OWN, [AG]], {}, None),
  "agents.get": ([AG], {}, ROW),
  "agents.resolve_name": ([AG], {}, AG),
  "agents.cwd_used": (["/var/lib/ameesh-exec/work/inge-front/42", AG], {}, False),
@@ -121,7 +122,8 @@ ARGS = {  # op: (args, kwargs, résultat)
                           "end": 4096}, 4096),
  "work.mark_delegate_turn": ([AG, [812], "délégation : tour de inge-front sur le lot"], {}, [812]),
  # session
- "leases.state": ([AG], {}, {"lease_owner": OWN, "lease_epoch": EP, "status": "running", "live": True}),
+ "leases.state": ([AG], {}, {"lease_owner": OWN, "lease_epoch": EP, "status": "running", "live": True,
+                             "name": AG}),
  "agents.overview": ([], {}, [{"name": AG, "role": "ingénieur", "team": "ingénieur", "chantier": "site",
                                 "canon_governed": True, "status": "running"},
                                {"name": "coord", "role": "coordinateur", "team": "coordinateur", "chantier": "site",

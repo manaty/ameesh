@@ -39,7 +39,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Iterable
 
-from . import fil, platform, registry, storage
+from . import fastmail, fil, platform, registry, storage
 from .config import NAME_RE, Config
 
 #: harnais dont le hook passe un identifiant de session
@@ -124,6 +124,8 @@ def check_pid(pid) -> int | None:
 
 def lease_holder(db, agent: str) -> str | None:
     """Le détenteur du bail VIVANT de l'agent, ou None (pas de bail vivant)."""
+    from .agent_names import resolve as resolve_agent_name
+    agent = resolve_agent_name(agent, db=db, operation="session_bindings.lease_holder")
     row = storage.of(db).leases.state(agent)
     if row and row.get("live") and row.get("lease_owner"):
         return str(row["lease_owner"])
@@ -131,6 +133,9 @@ def lease_holder(db, agent: str) -> str | None:
 
 
 def _audit(cfg: Config, db, *, by: str, agent: str, text: str, meta: dict) -> None:
+    from .agent_names import resolve as resolve_agent_name
+    agent = resolve_agent_name(agent, db=db, operation="session_bindings._audit")
+    by = resolve_agent_name(by, db=db, operation="session_bindings._audit")
     row = registry.get(db, agent)
     fil.record(cfg, db, sender=by, recipients=[agent], text=text,
                project=fil.project_for(cfg, fil.agent_project(row)),
@@ -161,6 +166,9 @@ def bind(cfg: Config, db, agent: str, *, session_id: str, harness: str,
     l'instant) est refusé sauf `force` — entre deux tours, la session externe
     prendrait le courrier destiné à son prochain tour. `force` ne lève jamais
     le refus du bail vivant."""
+    from .agent_names import resolve as resolve_agent_name
+    agent = resolve_agent_name(agent, db=db, operation="session_bindings.bind")
+    by = resolve_agent_name(by, db=db, operation="session_bindings.bind")
     if not NAME_RE.match(agent or ""):
         raise BindError("invalid agent name: %r" % (agent,))
     check_harness(harness)
@@ -239,11 +247,16 @@ def bind(cfg: Config, db, agent: str, *, session_id: str, harness: str,
                    " (no pid check)"),
                meta={"action": "bind", "harness": harness, "session": session_id,
                      "host": host, "pid": pid})
+    # #1689 (N4) : le cache local de la session (chemin rapide) pouvait garder
+    # l'ancien nom ; une liaison qui change l'invalide.
+    fastmail.forget_liaison(cfg, harness, session_id)
     return result
 
 
 def unbind(cfg: Config, db, *, session_id: str, harness: str, by: str) -> dict | None:
     """Révoque la liaison active de la session sur cet hôte ; None s'il n'y en a pas."""
+    from .agent_names import resolve as resolve_agent_name
+    by = resolve_agent_name(by, db=db, operation="session_bindings.unbind")
     check_harness(harness)
     check_session(session_id)
     row = storage.of(db).session_bindings.revoke(cfg.host, harness, session_id)
@@ -253,6 +266,9 @@ def unbind(cfg: Config, db, *, session_id: str, harness: str, by: str) -> dict |
                    harness, session_id, row["agent"], cfg.host, by),
                meta={"action": "unbind", "harness": harness, "session": session_id,
                      "host": cfg.host})
+    # #1689 (N4) : la session ne doit plus être reconnue par le chemin rapide,
+    # même si aucune liaison active n'existait plus (cache d'un bind révoqué).
+    fastmail.forget_liaison(cfg, harness, session_id)
     return row
 
 
@@ -261,12 +277,18 @@ def revoke_agent(cfg: Config, db, agent: str, *, by: str, why: str) -> list[dict
     `ameesh adopt` le fait passer sous l'exécuteur : aucune session externe ne
     doit plus recevoir son courrier. Journalisé dans le fil ; rend les
     liaisons révoquées."""
+    from .agent_names import resolve as resolve_agent_name
+    agent = resolve_agent_name(agent, db=db, operation="session_bindings.revoke_agent")
+    by = resolve_agent_name(by, db=db, operation="session_bindings.revoke_agent")
     store = storage.of(db).session_bindings
     done = []
     for row in store.listing(agent=agent):
         revoked = store.revoke(row["host"], row["harness"], row["session_id"])
         if revoked is not None:
             done.append(revoked)
+            # #1689 (N4) : le cache local de cette session ne doit plus la
+            # faire reconnaître (seul l'hôte courant a un cache à invalider).
+            fastmail.forget_liaison(cfg, row["harness"], row["session_id"])
     if done:
         _audit(cfg, db, by=by, agent=agent,
                text="Session binding(s) of %s revoked by %s (%s): %s." % (
@@ -296,6 +318,8 @@ def import_file(cfg: Config, db, path: str, *, by: str) -> ImportReport:
     d'identité (0030). Chaque entrée passe par les mêmes contrôles que
     `bind` ; une entrée refusée est rapportée avec sa raison, sans arrêter
     l'import. Lève OSError / ValueError si le fichier est illisible."""
+    from .agent_names import resolve as resolve_agent_name
+    by = resolve_agent_name(by, db=db, operation="session_bindings.import_file")
     with open(os.path.expanduser(path), encoding="utf-8") as fh:
         data = json.load(fh)
     if not isinstance(data, dict) or not isinstance(data.get("sessions"), dict):

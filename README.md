@@ -97,10 +97,17 @@ scripts are untouched. The switch is described step by step, with rollback, in
 ```bash
 scripts/pg-up.sh                    # container ameesh-pg, postgres:17, 127.0.0.1:55432
 # several agents on one host: AMEESH_PG_NAME=<agent>-pgtest AMEESH_PG_PORT=…
+# AMEESH_PG_DISPOSABLE=1 declares a lot bench disposable: housekeeping may reap
+# its <name>-data volume after 24 h without a container (conservation by
+# default; the shared ameesh-pg volume is never declared disposable)
 # (its volume is then <name>-data; a volume already mounted is refused)
 export PYTHONPATH=src
 # Aucun secret n'est codé dans le dépôt : le mot de passe du banc vient de
 # PGPASSWORD ou de ~/.pgpass (mode 600) ; sinon donnez le DSN complet.
+# scripts/test.sh crée des bases jetables (agent_mesh_test_*, #1992) : il
+# dérive du profil une entrée éphémère (0600, supprimée à la sortie) pour les
+# bases du banc (#2170) ; une entrée 127.0.0.1:55432:*:agent_mesh couvre aussi
+# le banc si vous préférez.
 export AMEESH_DSN=postgresql://agent_mesh@127.0.0.1:55432/agent_mesh
 
 python3 -m ameesh migrate       # versioned migrations, idempotent
@@ -136,10 +143,10 @@ Repo-local wrappers: `bin/ameesh`, `bin/agent-mail`, `bin/agent-runner`, `bin/am
 
 ```
 agent-mail send <dest> <texte…> [--from NOM] [--lot ID [--assign]] [--kind request|reply|notify|event] [--urgent]
-               [--ack] [--cc NOM[,NOM…]]       # dest = nom ou "all" ; L125 : courrier regroupé
-                                               # (90 s), --urgent sans délai, --ack et --cc sans réveil
-                                               # --lot : étiquette de fil ; confie un lot libre (historique
-                                               # L94, ou --assign #964), jamais un lot tenu par un agent (#1066)
+               [--ack] [--cc NOM[,NOM…]]       # dest = name or "all"; L125: batched mail
+                                               # (90 s), --urgent without delay, --ack and --cc without waking
+                                               # --lot: thread label; hands over a free lot (L94
+                                               # history, or --assign #964), never one held by an agent (#1066)
 agent-mail list                                # nom, outil, âge, non lus, dossier, hôte, bail
 agent-mail inbox [NOM]                         # non lus, sans les marquer lus
 agent-mail whoami                              # identité liée (nom + source : runner, explicit,
@@ -166,7 +173,8 @@ une diffusion à « all » sont lus au tour suivant, sans réveil. Les
 **événements** (`--kind event`) réveillent l'agent comme un message, mais un
 lot d'événements n'en réveille qu'un par `AMEESH_EVENT_COALESCE` secondes
 (défaut 120) ; `--urgent` perce le regroupement. Un `--urgent` venu d'un
-expéditeur habilité (`AMEESH_INTERRUPT_SENDERS`, demain une capacité du canon)
+expéditeur habilité (l'owner, un événement de CI vérifié en base, ou
+`AMEESH_INTERRUPT_SENDERS` ; demain une capacité du canon)
 **interrompt le tour en cours** : le harnais est arrêté, la consigne repart en
 attente et le message passe en tête. La **rotation de session** (résumé de
 reprise puis session neuve, seuils `AMEESH_SESSION_MAX_TOKENS` /
@@ -328,8 +336,19 @@ agent-runner [--host H] [--runner-id ID] [--agents a,b] [--once [--wait S]]
 agent-runner register <nom> <claude|codex|deepseek> [--cwd DIR] [--prompt TEXTE]
              [--session ID] [--chantier C] [--model M] [--budget USD]
 agent-runner stop <nom>
-ameesh attach <agent> [--wait] [--ttl S]      # session interactive sur le bail (C9)
+ameesh attach <agent> [--wait] [--ttl S] [--max 2h]  # bounded native session (L82)
 ```
+
+`attach` is for native harness features such as login, settings and debugging.
+The runner finishes its turn (`--wait`), puts the resident to sleep, then
+hands over the lease. A second attach is refused. Closing the native session
+returns the lease; pending inputs wake the resident on the same session.
+The interactive session ends after two hours by default; `--max 30m` or
+`--max 4h` changes that limit. A notice precedes expiry (exit code 124), and
+inputs waiting more than ten minutes produce an alert without being consumed.
+`adopt` and an unleased `resume` refuse a session still open in another
+process or modified in the last minute: close it and let its journal settle.
+The existing audited `adopt --force` override remains available.
 
 ## Language choice
 
@@ -448,7 +467,7 @@ src/ameesh/
   identity.py     v0 alias/name resolution (shared aliases.tsv)
 tests/            unittest suite, fakebin/ fake harnesses and gh, webauthn_soft.py and
                   banc_v1.py (software passkey and canon PR: tests and demo only)
-scripts/          pg-up.sh, test.sh, demo-v1.sh
+scripts/          pg-up.sh, pgpass-banc.py, test.sh, demo-v1.sh
 ```
 
 ## License

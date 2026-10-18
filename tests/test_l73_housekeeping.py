@@ -29,11 +29,15 @@ def _sans_processus(test: unittest.TestCase) -> None:
     retrait. Un démon non « dumpable » (gpg-agent, `ameesh-offload`) ou un
     zombie laisse un doute qui retient tout retrait : la décision testée ici
     est celle des garde-fous git (propre, poussé, âge), pas celle des
-    processus — `worktree_in_use` et `platform.user_paths` ont leurs propres
-    tests."""
-    patcher = mock.patch.object(platform, "user_paths", lambda *a, **k: platform.UserPaths())
-    patcher.start()
-    test.addCleanup(patcher.stop)
+    processus — la lecture réelle (`platform.user_paths`, `platform.holders`)
+    a ses propres tests (`tests/test_l63_platform.py`). #1805 : les deux
+    entrées de la couche plateforme sont neutralisées, pas seulement
+    `user_paths` (`worktree_in_use` lit `holders`)."""
+    for name, answer in (("user_paths", lambda *a, **k: platform.UserPaths()),
+                         ("holders", lambda *a, **k: [])):
+        patcher = mock.patch.object(platform, name, answer)
+        patcher.start()
+        test.addCleanup(patcher.stop)
 
 
 class _Cfg:
@@ -320,6 +324,109 @@ class WorktreeEtatTest(_Tmp):
         self.assertIsNone(menage.cited_lot("agent/nx-compute-runner-n-n"))
         self.assertIsNone(menage.cited_lot(""))
 
+    def test_cited_lots_are_tried_in_order(self):
+        """#1694: a branch citing several numeric groups lists its candidates
+        in trial order — last group first under agent/review, first group
+        first under lot/work."""
+        self.assertEqual(menage.cited_lots("review/claude2-t3-unit-459-460-r2"),
+                         [460, 459])
+        self.assertEqual(menage.cited_lots("agent/mty-nxl-impl-04-1229-x"), [1229])
+        self.assertEqual(menage.cited_lots("lot/1665-menage-worktrees"), [1665])
+        self.assertEqual(menage.cited_lots("main"), [])
+        # cited_lot keeps its single-candidate role: the first candidate.
+        self.assertEqual(menage.cited_lot("review/claude2-t3-unit-459-460-r2"), 460)
+
+    def test_le_chiffre_du_nom_d_agent_n_est_pas_un_lot(self):
+        """#2182 N2: under `agent/`/`review/`, the number an agent name carries
+        (`mty-amh-impl-02`) is not a cited lot — dropped with the agent name
+        when it is known, and never read from a zero-padded group (`-02`);
+        #1694's real candidates are unchanged."""
+        self.assertEqual(
+            menage.branch_agent("review/mty-amh-impl-02-1234",
+                                ("mty-amh", "mty-amh-impl-02")), "mty-amh-impl-02")
+        self.assertEqual(
+            menage.branch_agent("agent/mty-nxl-impl-04-1229-x",
+                                ("mty-nxl-impl-04",)), "mty-nxl-impl-04")
+        self.assertEqual(menage.branch_agent("review/mty-amh-impl-02-1234",
+                                             ("mty-amh-impl-01",)), "")
+        self.assertEqual(menage.branch_agent("lot/2182-x", ("mty-amh-impl-02",)), "")
+        self.assertEqual(
+            menage.cited_lots("review/mty-amh-impl-02-1234",
+                              agent="mty-amh-impl-02"), [1234])
+        self.assertEqual(menage.cited_lots("review/mty-amh-impl-02-1234"), [1234])
+        self.assertEqual(menage.cited_lots("review/mty-nxl-rel-01-571-ota"), [571])
+        self.assertEqual(menage.cited_lots("review/paquet-h-0115-correctif-508"), [508])
+        # #1694 survives: several real lots are still tried, last one first.
+        self.assertEqual(
+            menage.cited_lots("review/claude2-t3-unit-459-460-r2", agent="claude2"),
+            [460, 459])
+
+    def test_the_agent_number_is_not_a_lot_to_attach_to(self):
+        """#2182 N2: `lot_of_worktree` must not attach a review copy to the
+        lot numbered like its agent (`review/reviewer-02-999` is not #2), even
+        when #2 is assigned to that agent."""
+        class _Registre:
+            ROWS = {999: {"assignee": "a2"}, 2: {"assignee": "reviewer-02"}}
+
+            def get(self, ident):
+                return self.ROWS.get(ident)
+
+        class _Base:
+            work = _Registre()
+
+        with mock.patch.object(menage.storage, "of", return_value=_Base()):
+            self.assertIsNone(menage.lot_of_worktree(
+                None, "reviewer-02", "/tmp/reviewer-02-999", "review/reviewer-02-999",
+                branch_owner="reviewer-02"))
+
+        class _RegistreSansZero:
+            ROWS = {999: {"assignee": "a2"}, 2: {"assignee": "a1"}}
+
+            def get(self, ident):
+                return self.ROWS.get(ident)
+
+        class _BaseSansZero:
+            work = _RegistreSansZero()
+
+        with mock.patch.object(menage.storage, "of", return_value=_BaseSansZero()):
+            # without the branch's agent, the zero-padded `-02` is still not
+            # a lot: nothing attaches this copy of #999 to #2.
+            self.assertIsNone(menage.lot_of_worktree(
+                None, "a1", "/tmp/a1-999", "review/reviewer-02-999"))
+            # but a plain second group is a candidate (#1694): #2 wins here.
+            self.assertEqual(menage.lot_of_worktree(
+                None, "a1", "/tmp/a1-999", "review/reviewer-2-999"), "2")
+
+    def test_the_right_lot_wins_among_the_candidates(self):
+        """#1694: the first candidate owned by the agent wins; a candidate
+        owned by another agent proves nothing, and the folder name is only
+        read when the branch cites no number (#1665)."""
+        class _Registre:
+            ROWS = {460: {"assignee": "a2"}, 459: {"assignee": "a1"},
+                    12: {"assignee": "a1"}, 999: {"assignee": "a2"}}
+
+            def get(self, ident):
+                return self.ROWS.get(ident)
+
+        class _Base:
+            work = _Registre()
+
+        branche = "review/claude2-t3-unit-459-460-r2"
+        with mock.patch.object(menage.storage, "of", return_value=_Base()):
+            self.assertEqual(
+                menage.lot_of_worktree(None, "a1", "/tmp/a1-459", branche), "459")
+            # both candidates are the agent's: the trial order decides (460).
+            _Registre.ROWS[460] = {"assignee": "a1"}
+            self.assertEqual(
+                menage.lot_of_worktree(None, "a1", "/tmp/a1-459", branche), "460")
+            # a cited lot of another agent does not fall back to the folder.
+            self.assertIsNone(
+                menage.lot_of_worktree(None, "a1", "/tmp/a1-459", "lot/999-x"))
+            # no number cited: the folder names the lot, as in #1665.
+            self.assertEqual(menage.lot_of_worktree(None, "a1", "/tmp/a1-12", ""), "12")
+            self.assertEqual(menage.lot_of_worktree(None, "a1", "/tmp/a1-12", "main"),
+                             "12")
+
     def test_registre_illisible_ne_prouve_rien(self):
         """#1665 : un registre des lots illisible ne rattache rien (None),
         sans faire échouer le ménage."""
@@ -333,12 +440,20 @@ class WorktreeEtatTest(_Tmp):
             self.assertIsNone(menage.lot_of_worktree(None, "a1", "/tmp/a1-12", ""))
 
     def test_processus_dans_le_worktree(self):
+        """#1805 : la table des processus est injectée (déterministe) ; la
+        lecture réelle de /proc a ses tests (`tests/test_l63_platform.py`).
+        Le cas d'un processus vivant dans le worktree reste couvert."""
         wt = os.path.join(self.base, "wt")
         os.makedirs(wt)
+        vus: list[dict] = []
+        patcher = mock.patch.object(platform, "holders", lambda *a, **k: list(vus))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.assertFalse(menage.worktree_in_use(wt))
         proc = subprocess.Popen(["sleep", "30"], cwd=wt)
         self.addCleanup(proc.wait)
         self.addCleanup(proc.kill)
+        vus.append({"pid": proc.pid, "why": "working directory", "cmd": "sleep 30"})
         self.assertTrue(menage.worktree_in_use(wt))
 
     def test_processus_dans_le_worktree_os_muet(self):
@@ -350,6 +465,22 @@ class WorktreeEtatTest(_Tmp):
         muet = platform.NotAvailable("détenteurs d'un fichier", "test", "macos")
         with mock.patch.object(platform, "holders", side_effect=muet):
             self.assertTrue(menage.worktree_in_use(wt))
+
+    def test_processus_illisible_nomme_par_l_hote_n_est_pas_un_doute(self):
+        """L230/#1807 : un processus illisible que l'hôte nomme dans
+        `unreadable_ok` n'est plus un doute ; sans allow, la réponse reste OUI
+        (fail-closed)."""
+        wt = os.path.join(self.base, "wt-allow")
+        os.makedirs(wt)
+
+        def holders(path, **kw):
+            if "gpg-agent" in (kw.get("allow") or ()):
+                return []
+            raise platform.NotAvailable("détenteurs d'un fichier", "test", "linux")
+
+        with mock.patch.object(platform, "holders", side_effect=holders):
+            self.assertTrue(menage.worktree_in_use(wt))
+            self.assertFalse(menage.worktree_in_use(wt, allow=("gpg-agent",)))
 
 
 # ==========================================================================
@@ -527,6 +658,57 @@ class MenageDbTest(PgTestCase):
         menage.Turn.begin(self.cfgl, pol, "a1", main, new_session=False, base_env={})
         self.assertTrue(os.path.exists(os.path.join(mine, "garde-pour-la-session")))
 
+    def test_worktree_a_la_racine_du_tmp_d_un_autre_mesh_n_est_jamais_supprime(self):
+        """#2326 : un worktree créé par un agent à la racine partagée du tmp
+        (nom inconnu de CE registre, sans fichier de propriétaire à nous) n'est
+        jamais supprimé, même très ancien : un registre vide, partiel ou ancien
+        ne doit rien détruire."""
+        pol = menage.Policy()
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        root = os.path.join(troot, "nexlink-dev1-0123abcd-review")
+        os.makedirs(root)
+        _write(os.path.join(root, ".git"), 10)
+        _write(os.path.join(root, "notes.txt"), 10)
+        loin = time.time() + 30 * 24 * 3600
+        rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t", now=loin)
+        self.assertTrue(os.path.isdir(root), rapport["skipped"])
+        self.assertIn("tmp %s kept: not owned by this mesh" % root, rapport["skipped"])
+        self.assertNotIn(root, [p["path"] for p in rapport["plan"]
+                                if p.get("action") == "suppression"])
+
+    def test_dossier_tmp_d_un_agent_absent_mais_a_nous_est_encore_supprime(self):
+        """#2326 : le nettoyage légitime reste — un dossier créé par ce mesh
+        pour un agent qui n'est plus au registre part après l'inactivité."""
+        pol = menage.Policy()
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        root = os.path.join(troot, "ancien-agent")
+        os.makedirs(root)
+        menage._write_owner(troot, "ancien-agent", menage.mesh_key(self.cfgl),
+                            menage.ORIGIN_CREATED)
+        _write(os.path.join(root, "reste.txt"), 10)
+        loin = time.time() + 30 * 24 * 3600
+        menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t", now=loin)
+        self.assertFalse(os.path.exists(root))
+
+    def test_dossier_de_repli_avec_une_copie_git_n_est_pas_supprime(self):
+        """#2326 : même à nous, un dossier de repli qui porte une copie git
+        (worktree créé dans le dossier temporaire) est gardé et dit."""
+        pol = menage.Policy()
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        root = os.path.join(troot, "a1+abcd1234")
+        os.makedirs(root)
+        menage._write_owner(troot, "a1+abcd1234", menage.mesh_key(self.cfgl),
+                            menage.ORIGIN_CREATED)
+        _write(os.path.join(root, ".git"), 10)
+        loin = time.time() + 30 * 24 * 3600
+        rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t", now=loin)
+        self.assertTrue(os.path.isdir(root), rapport["skipped"])
+        self.assertIn("tmp %s kept: contains a Git worktree or clone" % root,
+                      rapport["skipped"])
+
     def _suivi(self, main: str, nom: str, lot: int | None) -> str:
         wt = os.path.join(self.tmp, nom)
         _git("worktree", "add", "-q", wt, "-b", nom, cwd=main)
@@ -536,6 +718,7 @@ class MenageDbTest(PgTestCase):
         return wt
 
     def test_fin_de_lot_retire_le_propre_garde_le_reste(self):
+        _sans_processus(self)
         main = _repo(self.tmp)
         fini, ouvert = self._lot("fini"), self._lot("ouvert")
         propre = self._suivi(main, "propre", fini)
@@ -563,6 +746,32 @@ class MenageDbTest(PgTestCase):
                    if a["type"] == "worktree_kept"]
         self.assertEqual([a["path"] for a in alertes], [sale])
         self.assertIn("untracked", alertes[0]["detail"])
+
+    def test_unreadable_ok_de_l_hote_est_passe_au_garde_fou_processus(self):
+        """L230/#1807 : le plan des worktrees passe `policy.unreadable_ok` à
+        `worktree_in_use` — un processus illisible déclaré par l'hôte ne
+        retient plus un worktree de lot fini ; sans allow, il attend
+        (fail-closed)."""
+        _sans_processus(self)
+        main = _repo(self.tmp)
+        fini = self._lot("fini")
+        propre = self._suivi(main, "propre", fini)
+        work.close(self.db, fini, abandoned=True)
+        plus_tard = time.time() + 2 * 3600   # garde d'âge d'une heure franchie
+
+        def holders(path, **kw):
+            if "gpg-agent" in (kw.get("allow") or ()):
+                return []
+            raise platform.NotAvailable("détenteurs d'un fichier", "test", "linux")
+
+        with mock.patch.object(platform, "holders", side_effect=holders):
+            garde = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc",
+                                    actor="t", dry_run=True, now=plus_tard)
+            permis = menage.run_pass(self.cfgl, self.db,
+                                     menage.Policy(unreadable_ok=("gpg-agent",)),
+                                     host="pc", actor="t", dry_run=True, now=plus_tard)
+        self.assertEqual({p["path"]: p["action"] for p in garde["plan"]}[propre], "attend")
+        self.assertEqual({p["path"]: p["action"] for p in permis["plan"]}[propre], "retrait")
 
     def test_worktree_d_un_autre_agent_orphelin_garde_puis_retire(self):
         """L73b/#1665, cas réel : un agent crée un worktree de relecture
@@ -660,6 +869,7 @@ class MenageDbTest(PgTestCase):
         """#1665 : un worktree déjà suivi « non attribué » dont la branche
         nomme un lot assigné à l'agent suit la fin de ce lot (il est retiré
         s'il est propre et intégré), et le journal porte le lot."""
+        _sans_processus(self)
         main = _repo(self.tmp)
         registry.upsert(self.db, "a1", harness="claude", host="pc",
                         cwd=os.path.join(self.tmp, "a1"))
@@ -682,6 +892,137 @@ class MenageDbTest(PgTestCase):
         self.assertEqual(rows[0]["status"], "removed")
         journal = storage.of(self.db).housekeeping.recent("pc", 3600)
         self.assertIn(str(fini), [str(r.get("lot")) for r in journal])
+
+    def test_worktrees_suivis_sans_plafond_pour_le_menage(self):
+        """#2174 : `limit=None` rend tous les worktrees suivis de l'hôte (le
+        ménage), le plafond par défaut reste pour les autres lectures."""
+        hk = storage.of(self.db).housekeeping
+        for i in range(3):
+            hk.register_worktree(host="pc", path=os.path.join(self.tmp, "w%d" % i),
+                                 repo="r", agent="a1", lot=None, turn_id="t",
+                                 branch="b%d" % i, head="")
+        self.assertEqual(len(hk.worktrees("pc", ("active",), limit=2)), 2)
+        self.assertEqual(len(hk.worktrees("pc", ("active",), limit=None)), 3)
+
+    def test_lot_nomme_d_un_autre_agent_fini_suit_la_regle_des_orphelins(self):
+        """#2174 : un worktree dont la branche nomme le lot d'un AUTRE agent
+        (copie de relecture, lot réassigné) n'est plus gardé à vie une fois ce
+        lot fini : il part comme un orphelin (24 h d'inactivité, propre,
+        poussé) ; sale, il reste ; lot encore ouvert, il reste gardé."""
+        _sans_processus(self)
+        main = _repo(self.tmp)
+        registry.upsert(self.db, "a1", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a1"))
+        registry.upsert(self.db, "a2", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a2"))
+        fini, ouvert = self._lot("fini de a2"), self._lot("ouvert de a2")
+        work.assign(self.db, fini, "a2")
+        work.assign(self.db, ouvert, "a2")
+        propre = self._orphelin(main, "relecture-propre", "lot/%d-relecture" % fini)
+        sale = self._orphelin(main, "relecture-sale", "lot/%d-relecture-b" % fini)
+        _write(os.path.join(sale, "wip.txt"), 3)
+        encours = self._orphelin(main, "relecture-ouverte", "lot/%d-relecture" % ouvert)
+        work.close(self.db, fini, abandoned=True)
+
+        def plan(**kw):
+            rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc",
+                                      actor="t", dry_run=True, **kw)
+            return {p["path"]: p for p in rapport["plan"] if p.get("kind") == "worktree"}
+
+        tot = plan(now=time.time() + 2 * 3600)
+        self.assertEqual(tot[propre]["action"], "attend")       # moins de 24 h
+        self.assertIn("24 h", tot[propre]["detail"])
+        loin = time.time() + 30 * 24 * 3600
+        p = plan(now=loin)
+        self.assertEqual(p[propre]["action"], "retrait")
+        self.assertEqual(p[propre]["lot"], str(fini))
+        self.assertIn("assigned to another agent", p[propre]["detail"])
+        self.assertEqual(p[sale]["action"], "garde")
+        self.assertEqual(p[encours]["action"], "garde")
+        self.assertIn("not attributable", p[encours]["detail"])
+        menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc", actor="t", now=loin)
+        self.assertFalse(os.path.exists(propre))
+        self.assertTrue(os.path.isdir(sale))
+        self.assertTrue(os.path.isdir(encours))
+        self.assertIn("lot/%d-relecture" % fini,
+                      _git("branch", "--list", "lot/%d-relecture" % fini, cwd=main))
+
+    def test_copie_etrangere_non_poussee_est_signalee(self):
+        """#2182 N1: a foreign copy whose HEAD is not pushed is never removed,
+        but it is recorded `kept` — the `worktree_kept` alert then names that
+        unpushed work (before, it only appeared in the pass plan)."""
+        _sans_processus(self)
+        main = _repo(self.tmp)
+        registry.upsert(self.db, "a1", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a1"))
+        registry.upsert(self.db, "a2", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a2"))
+        fini = self._lot("fini de a2")
+        work.assign(self.db, fini, "a2")
+        wt = self._orphelin(main, "relecture-non-poussee", "lot/%d-relecture" % fini)
+        _write(os.path.join(wt, "travail.txt"), 3)
+        _git("add", ".", cwd=wt)
+        _git("commit", "-q", "-m", "travail non poussé", cwd=wt)
+        work.close(self.db, fini, abandoned=True)
+        loin = time.time() + 30 * 24 * 3600
+
+        essai = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc", actor="t",
+                                dry_run=True, now=loin)
+        plan = {p["path"]: p for p in essai["plan"] if p.get("kind") == "worktree"}
+        self.assertEqual(plan[wt]["action"], "garde")
+        self.assertIn("commits not pushed", plan[wt]["detail"])
+        self.assertEqual(  # a dry run writes nothing
+            [r["status"] for r in storage.of(self.db).housekeeping.worktrees("pc")],
+            ["active"])
+
+        menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc", actor="t", now=loin)
+        self.assertTrue(os.path.isdir(wt))
+        row = storage.of(self.db).housekeeping.worktrees("pc")[0]
+        self.assertEqual(row["status"], "kept")
+        self.assertIn("commits not pushed", row["detail"])
+        alertes = [a for a in exploitation.alerts(self.cfg, self.db)
+                   if a["type"] == "worktree_kept"]
+        self.assertEqual([a["path"] for a in alertes], [wt])
+        self.assertIn("commits not pushed", alertes[0]["detail"])
+        journal = storage.of(self.db).housekeeping.recent("pc", 3600)
+        self.assertIn(("worktree", "kept"), {(r["kind"], r["action"]) for r in journal})
+
+    def test_review_d_un_agent_a_chiffre_ne_cite_pas_son_numero(self):
+        """#2182 N2: `review/<agent>-<lot>` must not read the number carried by
+        the agent's name (`reviewer-07`) as a cited lot. An open lot numbered
+        like that agent used to keep the copy of a FINISHED lot forever; the
+        copy now follows the orphan rule (24 h, clean, pushed). A branch that
+        genuinely cites a second, still-open lot is still kept (#1694)."""
+        _sans_processus(self)
+        main = _repo(self.tmp)
+        registry.upsert(self.db, "a1", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a1"))
+        fini, ouvert = self._lot("fini de reviewer"), self._lot("ouvert de reviewer")
+        nom = "reviewer-%02d" % ouvert   # son nom porte le numéro du lot ouvert
+        registry.upsert(self.db, nom, harness="deepseek", host="pc",
+                        cwd=os.path.join(self.tmp, nom))
+        work.assign(self.db, fini, nom)
+        work.assign(self.db, ouvert, nom)
+        copie = self._orphelin(main, "relecture-a-chiffre", "review/%s-%d" % (nom, fini))
+        # une branche qui cite VRAIMENT le lot ouvert en plus du lot fini
+        deux = self._orphelin(main, "relecture-deux-lots",
+                              "review/%s-%d-%d" % (nom, fini, ouvert))
+        work.close(self.db, fini, abandoned=True)
+        loin = time.time() + 30 * 24 * 3600
+
+        def plan(**kw):
+            rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc",
+                                      actor="t", dry_run=True, **kw)
+            return {p["path"]: p for p in rapport["plan"] if p.get("kind") == "worktree"}
+
+        p = plan(now=loin)
+        self.assertEqual(p[copie]["action"], "retrait")
+        self.assertEqual(p[copie]["lot"], str(fini))
+        self.assertEqual(p[deux]["action"], "garde")
+        self.assertIn("not attributable", p[deux]["detail"])
+        menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc", actor="t", now=loin)
+        self.assertFalse(os.path.exists(copie))
+        self.assertTrue(os.path.isdir(deux))
 
     def test_orphelin_propre_pousse_inactif_24h_puis_retire(self):
         """#1665 : propre, poussé et inactif depuis 24 h, un orphelin part ;
@@ -748,6 +1089,7 @@ class MenageDbTest(PgTestCase):
         self.assertIn("fini-non-integre", _git("branch", "--list", "fini-non-integre", cwd=main))
 
     def test_garde_fous_age_tour_en_cours_verrou_et_integration(self):
+        _sans_processus(self)
         main = _repo(self.tmp)
         fini = self._lot("fini")
         jeune = self._suivi(main, "jeune", fini)

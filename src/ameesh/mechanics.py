@@ -4,7 +4,12 @@
 Le canon (`processus/mecanique.yaml`, manaty/home) déclare, un bloc par règle
 mécanique, ce que l'outillage exécute sans agent :
 
-- `cutoffs` et `timezone` : les coupures du train, en heure locale IANA ;
+- `cutoffs` et `timezone` : les coupures de release du train, en heure locale
+  IANA ;
+- `packets.cutoffs` : la cadence des paquets horaires (#1467, §11 bis horaire),
+  distincte des coupures de release ; bloc absent = aucune cadence, tuple vide
+  explicite et `last_packet`/`next_packet` refusés, jamais un repli sur
+  `cutoffs` ni sur une durée locale (#1757) ;
 - `build.max_in_build` : le plafond de lots en développement par agent ;
 - `ci.packet`, `ci.incident_label`, `ci.environment_red`, `ci.faulty_lot` :
   une suite par paquet, l'étiquette qui autorise exceptionnellement la CI d'un
@@ -37,6 +42,8 @@ from . import canon, review
 
 #: version du contrat `processus/mecanique.yaml`
 SCHEMA = "ameesh-mechanics/1"
+#: version du contrat portant le bloc optionnel `prevalidation` (#1770)
+SCHEMA_PREVALIDATION = "ameesh-mechanics/2"
 #: chemin du document dans le canon
 PATH = "processus/mecanique.yaml"
 #: déclaration des politiques de revue, lue au même commit
@@ -56,8 +63,14 @@ _TIME = re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])$")
 _LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _SHA = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
 
-_DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "build", "ci", "reviews", "merge", "projects")
-_OVERRIDE_KEYS = ("timezone", "cutoffs", "build", "ci")
+_DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "reviews",
+                  "merge", "prevalidation", "projects")
+_OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci")
+_PACKETS_KEYS = ("cutoffs",)
+#: classes du plan L161f qu'un bloc `prevalidation` peut sélectionner
+PREVALIDATION_CLASSES = ("P0", "P1", "P2", "P3")
+_PREVALIDATION_KEYS = ("classes", "contracts", "hosts", "parts_script",
+                       "timeout_seconds")
 _BUILD_KEYS = ("max_in_build",)
 _CI_KEYS = ("packet", "incident_label", "environment_red", "faulty_lot")
 _REVIEWS_KEYS = ("families", "exclude_author_family", "distinct_families")
@@ -79,11 +92,42 @@ class ProjectOverride:
     name: str
     timezone: str | None = None
     cutoffs: tuple[str, ...] | None = None
+    packet_cutoffs: tuple[str, ...] | None = None
     max_in_build: int | None = None
     ci_packet: str | None = None
     ci_incident_label: str | None = None
     ci_environment_red: str | None = None
     ci_faulty_lot: str | None = None
+
+
+@dataclass(frozen=True)
+class Prevalidation:
+    """Le bloc optionnel `prevalidation` du canon (#1770).
+
+    Absent (`None`), le consommateur explicite refuse et l'accroche automatique
+    reste inactive : aucune valeur ne se suppose. Présent, il porte exactement
+    les paramètres relus — classes du plan L161f retenues, contrats toujours
+    inclus, hôtes d'exécution autorisés, délai du run distant, et le lanceur de
+    part du dépôt quand le bloc le nomme (`parts_script`, `None` sinon : la
+    convention du schéma reste au consommateur, jamais au lecteur).
+    """
+
+    classes: tuple[str, ...]
+    contracts: tuple[str, ...]
+    hosts: tuple[str, ...]
+    timeout_seconds: int
+    parts_script: str | None = None
+
+    def to_dict(self) -> dict:
+        out = {
+            "classes": list(self.classes),
+            "contracts": list(self.contracts),
+            "hosts": list(self.hosts),
+            "timeout_seconds": self.timeout_seconds,
+        }
+        if self.parts_script is not None:
+            out["parts_script"] = self.parts_script
+        return out
 
 
 @dataclass(frozen=True)
@@ -105,7 +149,10 @@ class Document:
     merge_repeat_freeze: bool
     merge_on_green_packet: bool
     merge_post_merge_red: str
+    #: cadence des paquets horaires (`packets.cutoffs`) ; `()` = aucune cadence
+    packet_cutoffs: tuple[str, ...] = ()
     overrides: tuple[ProjectOverride, ...] = ()
+    prevalidation: Prevalidation | None = None
 
     def override(self, project: str) -> ProjectOverride | None:
         for item in self.overrides:
@@ -114,10 +161,11 @@ class Document:
         return None
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "schema": self.schema,
             "timezone": self.timezone,
             "cutoffs": list(self.cutoffs),
+            "packets": {"cutoffs": list(self.packet_cutoffs)},
             "build": {"max_in_build": self.max_in_build},
             "ci": {"packet": self.ci_packet,
                    "incident_label": self.ci_incident_label,
@@ -132,6 +180,10 @@ class Document:
                       "post_merge_red": self.merge_post_merge_red},
             "projects": sorted(item.name for item in self.overrides),
         }
+        if self.prevalidation is not None:
+            # absent, la clé n'existe pas : le document sans bloc compile à l'identique
+            payload["prevalidation"] = self.prevalidation.to_dict()
+        return payload
 
 
 @dataclass(frozen=True)
@@ -160,6 +212,7 @@ class Mechanics:
     project: str
     timezone: str
     cutoffs: tuple[str, ...]
+    packet_cutoffs: tuple[str, ...]
     max_in_build: int
     ci_packet: str
     ci_incident_label: str
@@ -174,6 +227,7 @@ class Mechanics:
     merge_post_merge_red: str
     review_policy: review.ReviewPolicy
     rules: tuple[ReviewRule, ...]
+    prevalidation: Prevalidation | None = None
     source: str = ""
 
     # -- coupures -----------------------------------------------------------
@@ -211,6 +265,58 @@ class Mechanics:
                 return min(after)
         raise MechanicsError("no cutoff declared after %.3f" % now)
 
+    # -- paquets horaires ---------------------------------------------------
+
+    def packets_on(self, day: date) -> tuple[tuple[float, str], ...]:
+        """Les paquets d'un jour local, `(epoch UTC, libellé HH:MM)`.
+
+        La cadence est celle déclarée (`packets.cutoffs`), jamais une durée
+        locale ni un repli sur les coupures de release : sans bloc, la liste
+        est vide (#1757). Une heure absente (passage à l'heure d'été) est
+        sautée ; une heure répétée (passage à l'heure d'hiver) donne ses deux
+        occurrences, distinguées par leur epoch, sans doublon d'epoch.
+        """
+        zone = self.zone()
+        out: list[tuple[float, str]] = []
+        for label in self.packet_cutoffs:
+            naive = datetime(day.year, day.month, day.day,
+                             int(label[:2]), int(label[3:]))
+            stamps: list[float] = []
+            for fold in (0, 1):
+                stamp = naive.replace(tzinfo=zone, fold=fold).timestamp()
+                back = datetime.fromtimestamp(stamp, zone).replace(tzinfo=None)
+                if back == naive and stamp not in stamps:
+                    stamps.append(stamp)
+            out.extend((stamp, label) for stamp in stamps)
+        out.sort(key=lambda item: item[0])
+        return tuple(out)
+
+    def last_packet(self, now: float) -> float:
+        """Dernier paquet local à `now` ou avant ; refuse sans cadence déclarée."""
+        if not self.packet_cutoffs:
+            raise MechanicsError("no packet cadence declared")
+        local = datetime.fromtimestamp(now, self.zone())
+        # deux jours en arrière : une cadence dont la seule heure est sautée
+        # (02:00 au passage à l'heure d'été) n'a aucun paquet ce jour-là
+        for offset in (0, -1, -2):
+            before = [stamp for stamp, _ in self.packets_on(local.date() + timedelta(days=offset))
+                      if stamp <= now]
+            if before:
+                return max(before)
+        raise MechanicsError("no packet declared before %.3f" % now)
+
+    def next_packet(self, now: float) -> float:
+        """Premier paquet local strictement après `now` ; refuse sans cadence."""
+        if not self.packet_cutoffs:
+            raise MechanicsError("no packet cadence declared")
+        local = datetime.fromtimestamp(now, self.zone())
+        for offset in (0, 1, 2):  # même raison que `last_packet`
+            after = [stamp for stamp, _ in self.packets_on(local.date() + timedelta(days=offset))
+                     if stamp > now]
+            if after:
+                return min(after)
+        raise MechanicsError("no packet declared after %.3f" % now)
+
     # -- revue --------------------------------------------------------------
 
     def reviews_for(self, paths) -> ReviewNeed:
@@ -221,7 +327,12 @@ class Mechanics:
         """
         if isinstance(paths, (str, bytes)):
             raise MechanicsError("a list of repository paths is required")
-        paths = list(paths)
+        try:
+            paths = list(paths)
+        except TypeError as exc:
+            # une entrée non itérable (None, un nombre…) est un appel hors
+            # contrat : elle refuse par MechanicsError, jamais par TypeError
+            raise MechanicsError("a list of repository paths is required") from exc
         if not paths:
             # un changement sans fichier ne se classe pas : zéro avis serait un repli
             raise MechanicsError("no path to classify")
@@ -259,6 +370,7 @@ class Mechanics:
             "project": self.project,
             "timezone": self.timezone,
             "cutoffs": list(self.cutoffs),
+            "packets": {"cutoffs": list(self.packet_cutoffs)},
             "build": {"max_in_build": self.max_in_build},
             "ci": {"packet": self.ci_packet,
                    "incident_label": self.ci_incident_label,
@@ -274,6 +386,9 @@ class Mechanics:
             "review_rules": [{"paths": list(rule.paths), "reviews": rule.reviews}
                              for rule in self.rules],
         }
+        if self.prevalidation is not None:
+            # absent, la clé n'existe pas : le document sans bloc compile à l'identique
+            payload["prevalidation"] = self.prevalidation.to_dict()
         if self.source:
             payload["source"] = self.source
         return payload
@@ -307,6 +422,17 @@ def _cutoffs(value, where: str) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _packets(value, where: str) -> tuple[str, ...]:
+    """Le bloc `packets` (#1757) : cadence explicite, jamais une durée locale.
+
+    Bloc présent mais vide, clé inconnue, heure mal formée ou doublon : refus.
+    L'absence du bloc n'est pas un repli — `compile_document` la traduit en
+    tuple vide, et `last_packet`/`next_packet` refusent alors explicitement.
+    """
+    data = _mapping(value, where, _PACKETS_KEYS)
+    return _cutoffs(data.get("cutoffs"), where + ".cutoffs")
+
+
 def _positive_int(value, where: str) -> int:
     if type(value) is not int or value <= 0:
         raise MechanicsError("%s: a positive integer is required" % where)
@@ -316,6 +442,87 @@ def _positive_int(value, where: str) -> int:
 def _boolean(value, where: str) -> bool:
     if type(value) is not bool:
         raise MechanicsError("%s: a boolean is required" % where)
+    return value
+
+
+def _repository_path(value) -> bool:
+    """Un chemin de dépôt canonique : relatif, POSIX, qui ne sort pas du dépôt."""
+    if (not isinstance(value, str) or not value or value.startswith("/")
+            or "\\" in value or "\ufffd" in value or "\0" in value):
+        return False
+    depth = 0
+    for part in value.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            depth -= 1
+            if depth < 0:
+                return False
+        else:
+            depth += 1
+    return review.normalize_path(value) == value
+
+
+def _prevalidation(value, where: str) -> Prevalidation:
+    """Compile le bloc `prevalidation` : chaque paramètre est relu, jamais supposé."""
+    data = _mapping(value, where, _PREVALIDATION_KEYS)
+    classes = data.get("classes")
+    if not isinstance(classes, list) or not classes:
+        raise MechanicsError("%s.classes: a non-empty list of classes is required" % where)
+    seen: set[str] = set()
+    for item in classes:
+        if not isinstance(item, str) or item not in PREVALIDATION_CLASSES:
+            raise MechanicsError("%s.classes: unknown class %r (known: %s)"
+                                 % (where, item, ", ".join(PREVALIDATION_CLASSES)))
+        if item in seen:
+            raise MechanicsError("%s.classes: duplicate class %s" % (where, item))
+        seen.add(item)
+    # l'ordre du canon est canonique : P0 puis P1, quelle que soit la déclaration
+    ordered = tuple(name for name in PREVALIDATION_CLASSES if name in seen)
+    contracts = data.get("contracts")
+    if not isinstance(contracts, list):
+        raise MechanicsError("%s.contracts: a list of repository paths is required" % where)
+    out_contracts: list[str] = []
+    for item in contracts:
+        if not _repository_path(item):
+            raise MechanicsError("%s.contracts: not a repository path: %r" % (where, item))
+        if item in out_contracts:
+            raise MechanicsError("%s.contracts: duplicate path %s" % (where, item))
+        out_contracts.append(item)
+    hosts = data.get("hosts")
+    if not isinstance(hosts, list) or not hosts:
+        raise MechanicsError("%s.hosts: a non-empty list of hosts is required" % where)
+    out_hosts: list[str] = []
+    for item in hosts:
+        if not isinstance(item, str) or not _LABEL.fullmatch(item):
+            raise MechanicsError("%s.hosts: a host label is required, got %r" % (where, item))
+        if item in out_hosts:
+            raise MechanicsError("%s.hosts: duplicate host %s" % (where, item))
+        out_hosts.append(item)
+    # le lanceur de part est optionnel : absent, la convention du schéma
+    # s'applique chez le consommateur ; déclaré, il est relu comme un chemin
+    return Prevalidation(
+        classes=ordered,
+        contracts=tuple(out_contracts),
+        hosts=tuple(out_hosts),
+        timeout_seconds=_positive_int(data.get("timeout_seconds"),
+                                      where + ".timeout_seconds"),
+        parts_script=_parts_script(data, where),
+    )
+
+
+def _parts_script(data, where: str) -> str | None:
+    """Le lanceur de part déclaré (`None` : la convention du schéma).
+
+    Un `null` explicite refuse : la clé déclarée doit porter un chemin, comme
+    les contrats. Absente, la clé ne suppose rien — c'est le consommateur qui
+    applique `scripts/test-parts.py`."""
+    if "parts_script" not in data:
+        return None
+    value = data["parts_script"]
+    if not _repository_path(value):
+        raise MechanicsError("%s.parts_script: not a repository path: %r"
+                             % (where, value))
     return value
 
 
@@ -385,12 +592,16 @@ def _overrides(value, where: str) -> tuple[ProjectOverride, ...]:
         scope = "%s.%s" % (where, name)
         data = _mapping(block, scope, _OVERRIDE_KEYS)
         timezone = cutoffs = None
+        packet_cutoffs = None
         max_in_build = None
         packet = label = environment = faulty = None
         if "timezone" in data:
             timezone = _timezone(data["timezone"], scope + ".timezone")
         if "cutoffs" in data:
             cutoffs = _cutoffs(data["cutoffs"], scope + ".cutoffs")
+        if "packets" in data:
+            # bloc entier remplacé, comme `cutoffs` : jamais une fusion partielle
+            packet_cutoffs = _packets(data["packets"], scope + ".packets")
         if "build" in data:
             build = _mapping(data["build"], scope + ".build", _BUILD_KEYS)
             max_in_build = _positive_int(build.get("max_in_build"),
@@ -398,6 +609,7 @@ def _overrides(value, where: str) -> tuple[ProjectOverride, ...]:
         if "ci" in data:
             packet, label, environment, faulty = _ci(data["ci"], scope + ".ci")
         out.append(ProjectOverride(name=name, timezone=timezone, cutoffs=cutoffs,
+                                   packet_cutoffs=packet_cutoffs,
                                    max_in_build=max_in_build, ci_packet=packet,
                                    ci_incident_label=label,
                                    ci_environment_red=environment,
@@ -417,16 +629,28 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
     unknown = sorted(set(parsed) - set(_DOCUMENT_KEYS))
     if unknown:
         raise MechanicsError("%s: unknown key(s): %s" % (source, ", ".join(unknown)))
-    if parsed.get("schema") != SCHEMA:
+    schema = parsed.get("schema")
+    if schema not in (SCHEMA, SCHEMA_PREVALIDATION):
         raise MechanicsError("%s: schema %s is required, got %r"
-                             % (source, SCHEMA, parsed.get("schema")))
+                             % (source, SCHEMA, schema))
+    has_block = "prevalidation" in parsed
+    if schema == SCHEMA and has_block:
+        # le bloc change le contrat : un lecteur antérieur refuserait la clé
+        raise MechanicsError("%s: prevalidation requires schema %s"
+                             % (source, SCHEMA_PREVALIDATION))
+    if schema == SCHEMA_PREVALIDATION and not has_block:
+        raise MechanicsError("%s: schema %s requires the prevalidation block"
+                             % (source, SCHEMA_PREVALIDATION))
     build = _mapping(parsed.get("build"), source + ".build", _BUILD_KEYS)
     reviews = _mapping(parsed.get("reviews"), source + ".reviews", _REVIEWS_KEYS)
     packet, label, environment, faulty = _ci(parsed.get("ci"), source + ".ci")
     named_fire, repeat_freeze, on_green, post_merge = _merge(parsed.get("merge"),
                                                              source + ".merge")
+    # `packets` optionnel : absent = aucune cadence (tuple vide explicite), un
+    # bloc présent — même vide — est validé strictement et refusé s'il est mal formé.
+    packets = _packets(parsed["packets"], source + ".packets") if "packets" in parsed else ()
     return Document(
-        schema=SCHEMA,
+        schema=schema,
         timezone=_timezone(parsed.get("timezone"), source + ".timezone"),
         cutoffs=_cutoffs(parsed.get("cutoffs"), source + ".cutoffs"),
         max_in_build=_positive_int(build.get("max_in_build"),
@@ -444,7 +668,10 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
         merge_repeat_freeze=repeat_freeze,
         merge_on_green_packet=on_green,
         merge_post_merge_red=post_merge,
+        packet_cutoffs=packets,
         overrides=_overrides(parsed.get("projects"), source + ".projects"),
+        prevalidation=(_prevalidation(parsed["prevalidation"],
+                                      source + ".prevalidation") if has_block else None),
     )
 
 
@@ -586,6 +813,11 @@ def load(repo: str, commit: str, project: str) -> Mechanics:
                   else document.timezone),
         cutoffs=(override.cutoffs if override and override.cutoffs
                  else document.cutoffs),
+        # `packets` se remplace en bloc, présent ou absent : un override sans
+        # `packets` hérite du bloc global, il ne le vide jamais.
+        packet_cutoffs=(override.packet_cutoffs
+                        if override and override.packet_cutoffs is not None
+                        else document.packet_cutoffs),
         max_in_build=(override.max_in_build if override and override.max_in_build
                       else document.max_in_build),
         ci_packet=(override.ci_packet if override and override.ci_packet
@@ -607,5 +839,6 @@ def load(repo: str, commit: str, project: str) -> Mechanics:
         merge_post_merge_red=document.merge_post_merge_red,
         review_policy=policy,
         rules=rules,
+        prevalidation=document.prevalidation,
         source="%s@%s:%s" % (repo, commit, PATH),
     )

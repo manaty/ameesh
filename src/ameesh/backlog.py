@@ -14,10 +14,13 @@ et des capacités exigées. Pas de table neuve : le cycle, le journal, les
 jalons, la vue d'avancement et les alertes des lots s'appliquent tels quels.
 
 **Prise automatique** (`auto_take`, appelée à chaque passage d'`ameesh
-notify`) : un agent réveillable au repos sans lot depuis `idle_s` prend
-l'élément de plus forte valeur qui correspond à son équipe et à ses
-capacités. Le lot lui est assigné (attribution gardée de L37) et lui est
-annoncé par un courrier lié au lot (`--lot`), qui le réveille. Garde-fous :
+notify`, et par l'exécuteur de chaque hôte pour ses propres agents — #804) :
+un agent réveillable au repos sans lot depuis `idle_s` prend l'élément de
+plus forte valeur qui correspond à son équipe et à ses capacités. Le lot lui
+est assigné (attribution gardée de L37) et lui est annoncé par un courrier
+lié au lot (`--lot`), qui le réveille. `agents` restreint les **preneurs** à
+un ensemble de noms (ceux de l'exécuteur) : la liste du mesh reste entière
+pour les gardes et l'avertissement des orchestrateurs. Garde-fous :
 
 * **aucun lot ne l'attend** : l'agent n'a ni lot ouvert, ni courrier non lu,
   ni consigne en attente, ni lot de session encore ouvert ; et tant qu'un lot
@@ -44,6 +47,11 @@ annoncé par un courrier lié au lot (`--lot`), qui le réveille. Garde-fous :
   de sélection ; le graphe est revérifié dans la transaction de prise. Un
   interblocage de cette transaction avec une autre (#1496) vaut une prise
   perdue entre-temps : l'élément reste libre, le passage continue.
+* **§4 (owner 14/10/2026) : la prise refuse le troisième lot en `build`** —
+  le compte et l'écriture sont dans la même transaction sous le verrou de
+  l'agent (`assign_capped`), donc deux prises simultanées ne le franchissent
+  pas. Le surplus des lots déjà en `build` est rendu à la file par le
+  balayage (`ameesh work wip`, `ameesh.wip`).
 
 **Lots de l'équipe** (L165, avant la file) : un agent réveillable au repos
 sans lot en cours depuis `lot_idle_s` (15 min par défaut) prend lui-même le
@@ -61,6 +69,10 @@ l'attend, forfait d'abord, budget, hôte), et en plus :
   sans équipe connue n'est pas pris ;
 * l'agent sait le faire : les capacités exigées sont les siennes, et
   `harness:<nom>` désigne son harnais ;
+* un lot de relecture après fusion (`issue_ref` = `review-after-merge:#<lot>`,
+  #2377) n'est pris que par un agent de la famille opposée à celle de l'auteur
+  au gel (`review_lot.reviewer_family`) ; famille d'auteur inconnue : le lot
+  n'est pas pris au repos, il attend une attribution explicite ;
 * un lot dont le début prévu (`planned_start`) est après aujourd'hui attend
   sa date ;
 * un lot avec une dépendance explicite encore ouverte attend son amont ;
@@ -68,9 +80,13 @@ l'attend, forfait d'abord, budget, hôte), et en plus :
 * ordre : priorité, puis dates prévues (début, fin, livraison), puis
   ancienneté ; un lot créé il y a moins de 5 min est laissé à qui l'a créé
   (il le confie sans doute dans la foulée) ;
-* un orchestrateur ne se sert pas lui-même ; ceux de l'équipe (sinon tous)
-  reçoivent un courrier `event` lié au lot et peuvent le réassigner (`ameesh
-  work assign`) ;
+* un orchestrateur ne se sert pas lui-même ; ses candidats passent en dernier
+  et, quand un appel central (`agents` absent) ne trouve aucun autre preneur,
+  il peut prendre un lot faute d'autre preneur — la note d'attribution garde
+  la trace du repli (#1739) ; en prise locale (#804, `agents` fourni, même
+  vide), aucun repli : son orchestrateur reste exclu (L804) ; ceux de
+  l'équipe (sinon tous) reçoivent un courrier `event` lié au lot et peuvent
+  le réassigner (`ameesh work assign`) ;
 * au plus `lot_max_per_hour` prises par heure glissante, comptées à part de
   la file.
 * **L165b** (constat du 12/10 : 13 agents au repos, 10 lots sans agent, aucun
@@ -78,6 +94,9 @@ l'attend, forfait d'abord, budget, hôte), et en plus :
   `waiting_human`, `blocked`), ou dont le début prévu est après aujourd'hui,
   ne l'occupe pas ; il reste libre tant que son dernier tour n'a laissé ni
   courrier ni consigne en attente. Le lot qu'il prend, lui, l'occupe.
+* **§4** : un lot `build` sans assigné est un lot rendu à la file par la
+  limite d'en-cours — il reste prenable (avant les `intake` de même priorité),
+  avec sa branche et ses avis ; l'agent le reprend sans repartir de zéro.
 
 Le cœur reste générique : rien ici ne nomme un métier. La source d'un élément
 est un texte libre ; le circuit (relecture, vérifications, intégration) est
@@ -91,6 +110,7 @@ import time
 
 from . import storage
 from .db import Db, DbError, is_deadlock
+from .storage import interface
 
 ITEM_TYPE = "improvement"
 PRIORITIES = (1, 2, 3)
@@ -98,15 +118,26 @@ DEFAULT_PRIORITY = 2
 #: prise automatique : au repos depuis 30 min, au plus 2 prises par heure
 DEFAULT_TAKE_IDLE_S = 1800.0
 DEFAULT_TAKE_MAX_PER_HOUR = 2
-#: préfixe de la note de journal d'une prise automatique (compte du débit)
-AUTO_TAKE_NOTE = "prise automatique"
+#: préfixe de la note de journal d'une prise automatique (compte du débit) —
+#: texte défini dans `storage.interface.ASSIGN_NOTE_PREFIXES`, avec tous les
+#: débuts de note d'une attribution (une prise postérieure efface une exception
+#: pilote §4 antérieure)
+AUTO_TAKE_NOTE = interface.AUTO_TAKE_NOTE
 #: L165 : un lot non assigné de l'équipe est pris après 15 min de repos, au
 #: plus 6 par heure pour tout le mesh ; débit compté à part de la file
 DEFAULT_LOT_IDLE_S = 900.0
 DEFAULT_LOT_MAX_PER_HOUR = 6
-LOT_TAKE_NOTE = "lot de l'équipe pris de lui-même"
+LOT_TAKE_NOTE = interface.LOT_TAKE_NOTE
 #: âge minimal d'un lot pris : l'orchestrateur qui vient de le créer le confie
 LOT_MIN_AGE_S = 300.0
+#: #1677 (c) : quand aucun lot n'est prenable, la prise propose une relecture
+#: (lot en qa sans verdict) ou une correction (dernier verdict bloquant, auteur
+#: occupé) à un agent au repos d'une autre famille de modèles. Le débit est
+#: borné par heure comme les prises, et un lot n'est pas reproposé avant
+#: `REVIEW_PROPOSAL_WINDOW_S`.
+REVIEW_PROPOSAL_NOTE = "review proposal"
+REVIEW_PROPOSAL_MAX_PER_HOUR = 6
+REVIEW_PROPOSAL_WINDOW_S = 6 * 3600.0
 #: capacités exigées qui réservent un lot à une attribution explicite
 RESERVED_CAPABILITIES = ("decision", "production")
 #: capacités déclarées qui marquent la classe d'un lot (canon §1/#803) : un lot
@@ -446,37 +477,85 @@ def _default_budget_check(cfg, db):
 
 
 def lot_take_message(item: dict, orchestras: list) -> str:
+    branch = (item.get("branch") or "").strip()
+    head = (item.get("branch_head") or "").strip()
+    resumed = ("" if not branch else
+               "It comes back from the queue with its branch %s%s: resume it, "
+               "do not restart from scratch.\n" % (branch, " (%s)" % head[:12] if head else ""))
     return ("Lot #%d, taken on your own (L165): you were idle and this lot of your team "
             "had no taker: %s%s\n"
+            "%s"
             "%s can reassign it; if they give you something else, that comes first. "
             "Follow your project's normal flow (review, checks, integration "
             "by whoever has the right). Forbidden in this lot: any irreversible or "
             "production action (deployment, merge, data deletion, production "
             "server, committed spending): propose it to a human and stop there. "
             "If the lot is not for you (capability, context), say so right away "
-            "(ameesh work note %d, and a message to %s) rather than keeping it." % (
+            "(ameesh work note %d, and a message to %s) rather than keeping it."
+            % (
                 int(item["id"]), item["title"],
                 "\n%s" % item["body"] if (item.get("body") or "").strip() else "",
+                resumed,
                 ", ".join(orchestras) if orchestras else "The orchestrator",
                 int(item["id"]), ", ".join(orchestras) if orchestras else "the orchestrator"))
 
 
+def review_proposal_message(item: dict, agent: str, *, kind: str, family: str) -> str:
+    """#1677 (c) : le courrier qui propose une relecture — ou la correction d'un
+    lot à verdict bloquant — à un agent au repos, quand aucun lot n'est
+    prenable. `family` est l'autre famille de modèles que celle de l'auteur."""
+    lot = int(item["id"])
+    title = (item.get("title") or "").strip()
+    branch = (item.get("branch") or "").strip() or "(branche inconnue)"
+    head = (item.get("frozen_sha") or "").strip() or "(tête gelée inconnue)"
+    author = (item.get("assignee") or "?").strip()
+    if kind == "correction":
+        return ("Lot #%d \"%s\" is in qa with a blocking last verdict, and its author %s is "
+                "busy on other lots: the correction waits. You can take it over — branch %s, "
+                "frozen head %s — fix at the source, push on the branch, then the verdict is "
+                "given again (a correction stays on the lot's branch, never a new lot). "
+                "Coordinate with the author through the lot journal; if you cannot take it, "
+                "say so rather than leaving it waiting."
+                % (lot, title, author, branch, head))
+    return ("Lot #%d \"%s\" is in qa without a verdict: the review is due, and the author %s "
+            "does not review their own work. Your family is the other one (%s). The frozen "
+            "head is %s of branch %s: read it, then deliver your verdict —\n"
+            "  ameesh work milestone %d verdict ok|blocked --sha %s\n"
+            "Review comes before anything else (canon §2): a blocking defect (B, P1) blocks "
+            "the merge. The reviewer fixes a small defect himself on the branch and pushes; "
+            "a correction too big goes back to the author. If the lot is not for you, say so "
+            "rather than leaving it waiting."
+            % (lot, title, author, family, head, branch, lot, head))
+
+
 def lot_notice(item: dict, agent: str, idle_for_s: float) -> str:
-    return ("Automatic take (L165): %s, idle for %d min, took lot #%d of "
+    """L'avis aux orchestrateurs d'une prise L165. #1677 (b) : le motif est
+    « aucun lot actionnable », jamais le temps depuis le dernier tour (N9) —
+    `idle_for_s` reste en signature pour les appels existants, il ne décrit
+    plus la règle."""
+    return ("Automatic take (L165): %s, without an actionable lot, took lot #%d of "
             "team %s, which had no assignee: %s. To give it to someone else: "
             "ameesh work assign %d <agent>." % (
-                agent, int(idle_for_s // 60), int(item["id"]), item.get("lot_team"),
+                agent, int(item["id"]), item.get("lot_team"),
                 item["title"], int(item["id"])))
 
 
 def lot_takeable(item: dict, today: str | None = None) -> bool:
     """Un lot du projet peut-il être pris sans qu'on le confie ? Jamais un lot
-    qui attend un humain (seuls les lots `intake` sans assigné arrivent ici),
-    de décision (demande de décision en attente, jalon de décision ouvert,
-    capacité `decision` exigée) ni de production (capacité `production`
-    exigée) ; jamais un lot sans équipe connue, ni un lot dont le début prévu
-    est après `today` (« AAAA-MM-JJ »)."""
-    if item.get("state") != "intake" or (item.get("assignee") or "").strip():
+    qui attend un humain (seuls les lots `intake` ou `build` sans assigné
+    arrivent ici), de décision (demande de décision en attente, jalon de
+    décision ouvert, capacité `decision` exigée) ni de production (capacité
+    `production` exigée) ; jamais un lot sans équipe connue, ni un lot dont le
+    début prévu est après `today` (« AAAA-MM-JJ »).
+
+    §4 : un lot `build` sans assigné n'est prenable que s'il a été RENDU à la
+    file par la limite d'en-cours (`returned_to_queue` : la note de retour est
+    postérieure à la dernière attribution) — un lot en cours sans preneur
+    (prérequis, travail confié par courrier) n'est pas à la file."""
+    if item.get("state") not in ("intake", "build") \
+            or (item.get("assignee") or "").strip():
+        return False
+    if item.get("state") == "build" and not item.get("returned_to_queue"):
         return False
     start = str(item.get("planned_start") or "")[:10]
     if today and start and start > today:
@@ -488,17 +567,27 @@ def lot_takeable(item: dict, today: str | None = None) -> bool:
     return bool((item.get("lot_team") or "").strip())
 
 
+def _lot_project(item: dict) -> str:
+    """Le projet d'un lot pour le dossier de travail : son dépôt (`app`)
+    d'abord, son équipe ensuite — même clé que `lot_workdir.project` (#811 N2 :
+    `lot_fits` filtrait sur `lot_team`, le dossier se résout sur `app`)."""
+    return (item.get("app") or item.get("lot_team") or item.get("team") or "").strip()
+
+
 def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
-             others=None) -> bool:
+             others=None, db=None) -> bool:
     """Le lot vise-t-il un des projets de l'agent, et l'agent sait-il le faire ?
     Une capacité exigée `harness:<nom>` désigne le harnais de l'agent.
 
     `others` : les lignes du registre, pour la garde structurelle de classe
     (#803) — sans elles, un lot marqué n'est pas pris (doute -> sensible).
+    `db` : requis pour un lot de relecture après fusion (#2377) — sa famille
+    de preneur se relit sur le gel du lot d'origine ; sans base, un tel lot
+    n'est pas pris (doute -> refus).
     """
     if auditor and not auditor_may_take(item, agent["name"], card):
         return False
-    team = (item.get("lot_team") or "").strip()
+    team = _lot_project(item)
     from . import projects as projects_mod
     if not team or team not in projects_mod.agent_projects(agent):   # L243: membre
         return False
@@ -507,7 +596,10 @@ def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
         have.add("%s%s" % (HARNESS_PREFIX, agent["harness"]))
     if not set(item.get("required_capabilities") or ()) <= have:
         return False
-    return not declared_class(item) or other_family_available(agent, others)
+    if declared_class(item) and not other_family_available(agent, others):
+        return False
+    from . import review_lot
+    return review_lot.may_take(db, item, agent)
 
 
 def _primary_project(agent: dict) -> str:
@@ -515,6 +607,73 @@ def _primary_project(agent: dict) -> str:
     from . import projects as projects_mod
     names = projects_mod.agent_projects(agent)
     return names[0] if names else ""
+
+
+#: #1538 : marque d'un refus de dossier dans le journal d'un élément. La
+#: relecture se fait sur ce préfixe, jamais sur le texte complet : la note
+#: nomme l'agent qui l'a rencontré, mais elle est unique PAR ÉLÉMENT.
+#: #1900 N2 : c'est ce même préfixe que lit le relevé borné de la passe.
+DIRECTORY_NOTE_PREFIX = "L243-4:"
+
+
+class _DirNotes:
+    """Les éléments dont le refus de dossier a déjà été noté, lus une fois par
+    passe (#1900 N2), bornés aux candidats de la passe (#2162).
+
+    La lecture est paresseuse — aucun item ne manque de dossier, aucune
+    requête — et bornée au préfixe DIRECTORY_NOTE_PREFIX et aux ids candidats
+    (lots et améliorations, au plus 200 chacun) ; `has` répond ensuite en
+    mémoire, `add` retient l'élément que `_directory_ready` vient d'écrire.
+    Sans elle, chaque passe d'`auto_take` relisait les 100 derniers événements
+    de chaque lot dont le dossier manque, pour chaque agent candidat, et le
+    relevé non borné relisait tout le journal des lots clos."""
+
+    def __init__(self, store, ids):
+        self._store = store
+        # #2162 : déduplication exacte par id — le filtre porte sur les ids
+        # des candidats, jamais sur une fenêtre temporelle, sinon une note
+        # ancienne d'un vieux lot serait réécrite.
+        self._ids = sorted({int(item_id) for item_id in ids})
+        self._items: set[int] | None = None
+
+    def _load(self) -> set[int]:
+        if self._items is None:
+            self._items = {int(row["work_item_id"])
+                           for row in self._store.events_noted(
+                               DIRECTORY_NOTE_PREFIX, 0.0, ids=self._ids)}
+        return self._items
+
+    def has(self, item_id) -> bool:
+        return int(item_id) in self._load()
+
+    def add(self, item_id) -> None:
+        self._load().add(int(item_id))
+
+
+def _directory_ready(cfg, db, agent, item, project, *, canons, dry_run, notes=None):
+    from . import lot_workdir, work
+    reason = lot_workdir.problem(cfg, agent, project, canons=canons)
+    if reason is None:
+        return True
+    # #811 N1 : hors périmètre (raison vide) — aucune note ; #1538 : une raison
+    # réelle (dossier déclaré absent ou ambigu) est notée une fois PAR ÉLÉMENT,
+    # quel que soit l'agent qui bute dessus — pas une note par (agent, élément).
+    # `notes` (le relevé borné de la passe) retient les éléments déjà notés :
+    # le journal n'est pas relu pour chaque couple (agent, élément) du lot.
+    if not dry_run and reason:
+        note = "%s %s cannot pick up project %s: %s" % (
+            DIRECTORY_NOTE_PREFIX, agent["name"], project, reason)
+        if notes is not None:
+            # #1900 N2 : le relevé borné de la passe porte les éléments déjà
+            # notés (une requête), plus les 100 derniers événements du lot
+            # relus par élément tant que le dossier manque.
+            if not notes.has(item["id"]):
+                work.note(db, item["id"], note, actor=SENDER)
+                notes.add(item["id"])
+        elif not any((e.get("note") or "").startswith(DIRECTORY_NOTE_PREFIX)
+                     for e in work.events(db, item["id"])):
+            work.note(db, item["id"], note, actor=SENDER)
+    return False
 
 
 def _team_orchestrators(cfg, db, listing: list, team: str, orchestras=None) -> list:
@@ -530,8 +689,9 @@ def _team_orchestrators(cfg, db, listing: list, team: str, orchestras=None) -> l
 
 
 def _assign_ready(st, item: dict, assignee: str, note: str, take) -> dict | None:
-    """La prise conditionnelle d'un élément prêt (`assign`, `ready_only`), ou
-    None s'il a été pris, ou bloqué, entre-temps.
+    """La prise conditionnelle d'un élément prêt (`assign_capped`,
+    `ready_only`), ou None s'il a été pris, bloqué, ou si l'agent a atteint
+    le plafond §4 entre-temps.
 
     #1496 : la prise verrouille l'élément et ses amonts ; une transaction
     hors du graphe qui les verrouille dans l'autre ordre peut l'interbloquer.
@@ -539,13 +699,165 @@ def _assign_ready(st, item: dict, assignee: str, note: str, take) -> dict | None
     perdue entre-temps, comme une course perdue, et non une panne du passage.
     L'élément reste libre et le prochain passage le revérifie en entier ;
     toute autre erreur remonte."""
+    from . import work
     try:
-        return st.work.assign(int(item["id"]), assignee, current=None, note=note,
-                              actor=SENDER, take=take, ready_only=True)
+        return st.work.assign_capped(int(item["id"]), assignee, current=None, note=note,
+                                     actor=SENDER, max_build=work.BUILD_LIMIT,
+                                     take=take, ready_only=True)
     except DbError as exc:
         if not is_deadlock(exc):
             raise
         return None
+
+
+def _propose_reviews(db, st, listing, *, pool, room, dry_run=False, canons=(),
+                     skip=(), within_budget=None, wakeable=None) -> list:
+    """#1677 (c) : apparie les lots en attente de relecture — ou de correction —
+    aux agents au repos. Une relecture va à l'autre famille de modèles que
+    l'auteur (canon §2) ; une correction peut aller à n'importe quel agent au
+    repos, du moment que l'auteur du lot est occupé (corps du lot #1677). Les
+    relectures passent avant les corrections.
+
+    L'appariement suit les mêmes gardes qu'une prise (B4, N1) : `lot_fits`
+    (équipe résolue comme `unassigned_lots`, capacités, garde de classe #803)
+    pour une correction comme pour une relecture — le canon §2 ajoute la
+    famille, il n'en dispense pas —, `may_take` de l'auditeur, plafond de
+    budget, agent réveillable (#1021), jamais un orchestrateur. L'auteur du
+    lot est écarté (B3) et sa famille se lit au tour du gel
+    (`review_lot._author_at_freeze`, #1053/#1777).
+
+    Rend les propositions dans la forme des prises (`item`, `agent`,
+    `message_id`, `kind` valant `review` ou `correction`, `notified`). Le lot
+    est marqué au journal (`REVIEW_PROPOSAL_NOTE`), ce qui l'écarte des
+    passages suivants le temps de `REVIEW_PROPOSAL_WINDOW_S` ; le contrôle de
+    la fenêtre et la note sont pris sous un verrou consultatif par lot
+    (#1738 N5), et une relecture désigne son relecteur (#705, #1738 N7) — la
+    double relecture est écartée et `stale_lot` sait à qui s'adresser."""
+    from . import mail, registry, review_lot
+    if room <= 0 or not pool:
+        return []
+    # N6 : lire plus large que la pièce demandée — l'appariement (famille,
+    # équipe, capacités) écarte en Python, un LIMIT trop court laisserait six
+    # lots non appariables bloquer tous les suivants.
+    rows = st.work.review_proposals(max(int(room) * 6, 24),
+                                    proposal_prefix=REVIEW_PROPOSAL_NOTE,
+                                    window_s=REVIEW_PROPOSAL_WINDOW_S)
+    if not rows:
+        return []
+    # relectures d'abord, corrections ensuite (l'ordre du SQL est conservé)
+    rows = sorted(rows, key=lambda r: 1 if (r.get("last_verdict") or "") == "blocked" else 0)
+    by_name = {row.get("name"): row for row in listing}
+    out: list = []
+    used: set = set()
+    for row in pool:
+        if len(out) >= room:
+            break
+        name = row["name"]
+        if name in skip:
+            continue
+        if within_budget is not None and not within_budget(row):
+            continue
+        if wakeable is not None:
+            # N1 : la garde d'attribution (#1021, agent retenu) vaut aussi pour
+            # une proposition — un courrier à un agent sans tour bloquerait le
+            # lot jusqu'à la fenêtre suivante.
+            name = wakeable(name)
+            if not name:
+                continue
+        reg = dict(row, **(registry.get(db, name) or {}))
+        mine = registry.live_harness(reg).strip().lower()
+        if not mine:
+            continue
+        from . import auditor as auditor_mod
+        if not auditor_mod.may_take(reg, canons):
+            continue
+        auditors = auditor_mod.cards([reg], canons)
+        for item in rows:
+            lot = int(item["id"])
+            if lot in used:
+                continue
+            author = (item.get("assignee") or "").strip()
+            if name == author:
+                continue                  # B3 : on ne relit pas son propre lot
+            # B4 : la prise d'un lot exige son équipe, ses capacités et la
+            # garde de classe (#803) ; une proposition suit la même règle.
+            if not lot_fits(item, reg, auditor=name in auditors,
+                            card=auditors.get(name), others=listing, db=db):
+                continue
+            correction = (item.get("last_verdict") or "") == "blocked"
+            family = ""
+            if correction:
+                author_row = by_name.get(author)
+                # auteur occupé : il a un autre lot actionnable que celui-ci
+                if author_row is not None and int(author_row.get("actionable_lots") or 0) <= 1:
+                    continue
+            else:
+                # relecture : l'autre famille que celle de l'auteur (canon §2),
+                # lue au tour du gel (#1053/#1777 : l'assigné courant ne prouve
+                # pas la production) ; famille d'auteur inconnue, toute famille
+                # connue fait l'affaire
+                author_info = review_lot._author_at_freeze(db, lot, item)
+                want = review_lot.reviewer_family(author_info.get("harness"))
+                if want == review_lot.UNKNOWN_FAMILY:
+                    ok = mine in ("codex", "claude")
+                else:
+                    ok = mine == want
+                if not ok:
+                    continue
+                family = want
+            kind = "correction" if correction else "review"
+            payload = {"review_proposal": {"lot": lot, "agent": name, "kind": kind}}
+            message_id = None
+            if not dry_run:
+                # #1738 (N5/N7) : le contrôle de la fenêtre, la désignation du
+                # relecteur (#705, pour une relecture) et la note tiennent sous
+                # un verrou consultatif par lot — deux passages, même sur des
+                # hôtes distincts, ne proposent pas le même lot deux fois.
+                if not st.work.claim_review_proposal(
+                        lot, agent=name, kind=kind,
+                        proposal_prefix=REVIEW_PROPOSAL_NOTE,
+                        window_s=REVIEW_PROPOSAL_WINDOW_S, actor=SENDER):
+                    used.add(lot)     # pris par un autre passage : on n'y revient pas
+                    continue
+                message_id = mail.send(
+                    db, SENDER, name,
+                    review_proposal_message(item, name, kind=kind, family=family),
+                    kind="event", work_item_id=str(lot), payload=payload)
+            used.add(lot)
+            out.append({"item": item, "agent": name, "message_id": message_id,
+                        "kind": kind, "notified": []})
+            break
+    return out
+
+
+def _still_free(st, item_id) -> bool:
+    """Le lot est-il encore prenable (sans assigné, dans un état de prise) ?
+
+    `assign_capped` rend None pour des refus distincts — le plafond §4 atteint
+    (le lot n'a pas bougé : le garder pour un autre preneur), une prise
+    concurrente (le lot a bougé : le retirer) ou un refus sous verrou (une
+    dépendance est apparue depuis la sélection, L165 : le lot reste prenable
+    mais plus pour cette passe) : cette relecture et `_cap_reached` les
+    distinguent."""
+    item = st.work.get(int(item_id))
+    if item is None:
+        return False
+    return (not (item.get("assignee") or "").strip()
+            and item.get("state") in ("intake", "build"))
+
+
+def _cap_reached(st, agent: str) -> bool:
+    """§4 : l'agent est-il au plafond d'en-cours ?
+
+    Distingue, après un refus `None` de `assign_capped` sur un lot encore
+    prenable, le plafond (arrêter cet agent : il ne peut plus rien prendre) du
+    refus sous verrou — dépendance apparue (L165) : passer au lot suivant.
+    Relecture hors du verrou de la prise : un agent redescendu entre-temps fait
+    seulement retenter la prise, un agent remonté au plafond est refusé de
+    nouveau par `assign_capped`."""
+    from . import work
+
+    return st.work.count_builds(agent) >= work.BUILD_LIMIT
 
 
 def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE_IDLE_S,
@@ -553,27 +865,56 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
               alerts: list | None = None, listing: list | None = None, paid=None,
               budget_check=None, dry_run: bool = False,
               lot_idle_s: float = DEFAULT_LOT_IDLE_S,
-              lot_max_per_hour: int = DEFAULT_LOT_MAX_PER_HOUR, orchestras=None) -> list:
+              lot_max_per_hour: int = DEFAULT_LOT_MAX_PER_HOUR,
+              review_max_per_hour: int = REVIEW_PROPOSAL_MAX_PER_HOUR,
+              orchestras=None,
+              agents: set[str] | None = None) -> list:
     """Un passage de prise automatique ; rend les prises faites (ou prévues
     en `dry_run`) : `[{item, agent, message_id, kind, notified}]`, `kind`
-    valant `lot` (lot non assigné de l'équipe, L165) ou `backlog` (file
-    d'amélioration, L119). Les lots de l'équipe passent d'abord ; tant qu'un
-    lot du projet attend, personne ne prend d'amélioration. Un seuil nul
-    désactive la prise correspondante.
+    valant `lot` (lot non assigné de l'équipe, L165), `review`/`correction`
+    (#1677 : relecture d'un lot en qa sans verdict, correction d'un lot à
+    verdict bloquant, proposées à un agent au repos d'une autre famille quand
+    aucun lot n'est prenable) ou `backlog` (file d'amélioration, L119). Les
+    lots de l'équipe passent d'abord ; tant qu'un lot du projet attend,
+    personne ne prend d'amélioration. Un seuil nul désactive la prise
+    correspondante — `review_max_per_hour` à 0 coupe les propositions
+    (#1738 N3). Une proposition faite passe avant la file d'amélioration du
+    même passage (« du travail réel sur des lots en cours ») ; propositions
+    coupées, la file reprend la main.
 
     Les candidats sont triés forfaits d'abord : chaque agent au forfait prend
     ce qui lui va, puis les agents payés au token prennent ce qu'il reste
     dans le même passage (#754, owner 13/10). Un agent en pause budget ou
     au-dessus de son plafond ne prend rien et ne bloque personne ; un agent
-    au token ne prend jamais sous une alerte `balance_low`."""
+    au token ne prend jamais sous une alerte `balance_low`.
+
+    `agents`, quand il est donné, borne les preneurs à ces noms (l'exécuteur
+    de leurs hôtes, #804) sans rétrécir `listing` : les gardes et les
+    orchestrateurs prévenus restent ceux du mesh entier."""
     from . import mail, registry, sous_utilisation, work
 
     now = time.time() if now is None else float(now)
     st = storage.of(db)
+
+    # #804 : la place restante est relue avant **chaque** prise, pas une fois
+    # par passe. Les compteurs sont en base et partagés par tous les
+    # exécuteurs ; avec plusieurs passes simultanées (un exécuteur par hôte),
+    # une lecture unique laissait chacune consommer la même place. La relecture
+    # ramène la fenêtre à la durée d'une attribution ; la place reste une
+    # lecture hors de la transaction d'écriture, donc deux passes strictement
+    # simultanées peuvent encore se dépasser de leur nombre — les passes
+    # suivantes, elles, voient le compteur à jour.
+    def lot_place() -> int:
+        return int(lot_max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S,
+                                                                LOT_TAKE_NOTE)
+
+    def place() -> int:
+        return int(max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S,
+                                                            AUTO_TAKE_NOTE)
+
     lot_room = 0
     if lot_idle_s > 0 and lot_max_per_hour > 0:
-        lot_room = int(lot_max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S,
-                                                                    LOT_TAKE_NOTE)
+        lot_room = lot_place()
     lots = st.work.unassigned_lots(200) if lot_room > 0 else []
     # un lot tout juste créé va sans doute être confié : on lui laisse le temps
     today = time.strftime("%Y-%m-%d", time.localtime(now))
@@ -584,7 +925,20 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         room = int(max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S, AUTO_TAKE_NOTE)
     queue = st.work.backlog(open_only=True, limit=200, ready_only=True) if room > 0 else []
     if not lots and not queue:
-        return []
+        # #1677 (c) : même sans lot prenable, un lot en qa sans verdict (ou à
+        # correction due) peut occuper un agent au repos — la sonde est bon
+        # marché, le reste du passage ne se paie que s'il y a de quoi proposer.
+        # #1738 (N3) : propositions coupées, ce passage n'a plus rien à faire.
+        if review_max_per_hour <= 0 \
+                or not st.work.review_proposals(1, proposal_prefix=REVIEW_PROPOSAL_NOTE,
+                                                window_s=REVIEW_PROPOSAL_WINDOW_S):
+            return []
+    # #1900 N2 / #2162 : une lecture paresseuse des notes de dossier pour toute
+    # la passe (les deux boucles ci-dessous la partagent), bornée aux ids
+    # candidats — `unassigned_lots(200)` et `backlog(limit=200)` bornent chaque
+    # liste à 200, soit au plus 400 ids ; le journal des lots clos n'est plus lu.
+    dir_notes = _DirNotes(st.work, [item["id"] for item in lots]
+                                   + [item["id"] for item in queue])
     listing = st.operations.listing() if listing is None else listing
     from . import auditor as auditor_mod
     try:
@@ -621,7 +975,12 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     def candidates(threshold: float, skip=(), waiting_free: bool = False) -> list:
         out = []
         for row in sous_utilisation.idle_agents(listing, now, threshold,
-                                                waiting_free=waiting_free):
+                                                waiting_free=waiting_free,
+                                                actionable_idle=True):
+            # #804 : un exécuteur ne fait prendre que ses propres agents ; les
+            # autres restent dans `listing` pour les gardes et l'avertissement.
+            if agents is not None and row["name"] not in agents:
+                continue
             if row["name"] in skip or row["name"] in held \
                     or _awaited(row, waiting_free=waiting_free) or row.get("host") in blocked:
                 continue
@@ -639,19 +998,38 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             return False
 
     taken: list = []
+    # un orchestrateur répartit : il ne se sert pas lui-même, ni d'un lot ni
+    # d'une proposition de relecture (#1677)
+    if orchestras is None:
+        try:
+            orchestras = sous_utilisation.orchestrators(cfg, db, listing)
+        except Exception:
+            orchestras = []
     if lots:
-        # un orchestrateur répartit : il ne se sert pas lui-même
-        if orchestras is None:
-            try:
-                orchestras = sous_utilisation.orchestrators(cfg, db, listing)
-            except Exception:
-                orchestras = []
         # L165b : un agent dont tous les lots attendent un autre est libre
         pool = candidates(lot_idle_s, skip=set(orchestras), waiting_free=True)
-        for row in pool:
-            if len(taken) >= lot_room or not lots:
+        # #1739 : plus aucun autre preneur ? un orchestrateur peut se servir,
+        # mais ses candidats passent en dernier : il ne prend que les lots que
+        # les autres ont laissés, et la note d'attribution garde la trace.
+        # L804 : la prise locale d'un exécuteur (`agents` fourni, même vide)
+        # garde son périmètre et n'offre jamais ce repli à son orchestrateur —
+        # le repli ne vaut que pour les appels centraux (`agents is None`).
+        taker_count = len(pool)
+        if lots and agents is None:
+            seen = {row["name"] for row in pool}
+            pool += [row for row in candidates(lot_idle_s, skip=(), waiting_free=True)
+                     if row["name"] not in seen]
+        for index, row in enumerate(pool):
+            fallback = index >= taker_count
+            # #804 : place relue avant chaque prise (compteur partagé)
+            if not lots or len(taken) >= lot_room or lot_place() <= 0:
                 break
             if not within_budget(row):
+                continue
+            # §4 canon : au plus 2 lots en build par agent — la prise
+            # automatique refuse le troisième (le témoin concurrent est dans
+            # le stockage : `assign_capped` recompte sous le verrou de l'agent)
+            if st.work.count_builds(row["name"]) >= work.BUILD_LIMIT:
                 continue
             agent = registry.get(db, row["name"])
             if agent is None:
@@ -660,41 +1038,54 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             if not auditor_mod.may_take(agent, canons):
                 continue
             auditors = auditor_mod.cards([agent], canons)
-            # L243 : tant que le dossier de travail par lot n'existe pas
-            # (#811), la prise automatique reste sur le projet primaire — un
-            # lot d'un autre projet ne s'attribue qu'explicitement.
-            primary = _primary_project(agent)
             for item in list(lots):
                 if not lot_fits(item, agent, auditor=row["name"] in auditors,
-                                card=auditors.get(row["name"]), others=listing):
+                                card=auditors.get(row["name"]), others=listing, db=db):
                     continue
-                if (item.get("lot_team") or "").strip() != primary:
+                if not _directory_ready(cfg, db, agent, item, _lot_project(item),
+                                        canons=canons, dry_run=dry_run, notes=dir_notes):
                     continue
-                notified = _team_orchestrators(cfg, db, listing, item["lot_team"],
-                                               orchestras)
+                # un orchestrateur qui se sert ne se prévient pas lui-même
+                notified = [name for name in _team_orchestrators(
+                    cfg, db, listing, item["lot_team"], orchestras) if name != row["name"]]
                 if dry_run:
                     taken.append({"item": item, "agent": row["name"], "message_id": None,
-                                  "kind": "lot", "notified": notified})
+                                  "kind": "lot", "notified": notified,
+                                  "fallback": fallback})
                     lots.remove(item)
+                    break
+                # #804 : la place est relue juste avant l'écriture — une passe
+                # concurrente a pu consommer la place depuis la sélection.
+                if lot_place() <= 0:
                     break
                 try:
                     check = work.check_assignee(db, row["name"], cfg=cfg)
                 except work.WorkError:
                     break                   # agent non réveillable : au suivant
+                note = "%s par %s, au repos" % (LOT_TAKE_NOTE, check["assignee"])
+                if fallback:
+                    note += " (aucun autre preneur ; orchestrateur)"
                 try:
                     # #540 : sous le verrou de l'agent, pas de second lot
                     # non démarré (il en a reçu un depuis sa sélection).
                     # #1242 (L165) : la prise ne vise qu'un lot intake dont
                     # toutes les dépendances sont satisfaites.
-                    done = _assign_ready(st, item, check["assignee"],
-                                         "%s par %s, au repos" % (LOT_TAKE_NOTE,
-                                                                  check["assignee"]),
+                    done = _assign_ready(st, item, check["assignee"], note,
                                          work.takes_rule(check))
                 except storage.PendingLot:
                     break                   # le lot reste à l'agent suivant
-                lots.remove(item)
                 if done is None:
-                    continue                # pris entre-temps : lot suivant
+                    # refus sous le verrou de l'agent : plafond §4 (rien n'a
+                    # bougé : le lot reste à prendre par un autre agent), lot
+                    # devenu non prenable (dépendance apparue, L165) ou pris
+                    # entre-temps
+                    if not _still_free(st, item["id"]):
+                        lots.remove(item)
+                        continue        # pris entre-temps : lot suivant
+                    if _cap_reached(st, check["assignee"]):
+                        break           # agent au plafond : au suivant
+                    continue            # refus sous verrou : lot suivant
+                lots.remove(item)
                 done = dict(done, lot_team=item["lot_team"])
                 payload = {"lot_take": {"lot": int(done["id"]), "agent": check["assignee"],
                                         "team": item["lot_team"]}}
@@ -706,20 +1097,46 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                     mail.send(db, SENDER, name, lot_notice(done, check["assignee"], idle_for),
                               kind="event", work_item_id=str(done["id"]), payload=payload)
                 taken.append({"item": done, "agent": check["assignee"],
-                              "message_id": message_id, "kind": "lot", "notified": notified})
+                              "message_id": message_id, "kind": "lot",
+                              "notified": notified, "fallback": fallback})
                 break
+    # #1677 (c) : aucun lot n'a été pris — proposer aux agents au repos une
+    # relecture (lot en qa sans verdict courant, autre famille que l'auteur),
+    # puis une correction (verdict courant bloquant, auteur occupé). Ces
+    # propositions passent avant la file d'améliorations : du travail réel sur
+    # des lots en cours. Elles suivent les mêmes gardes qu'une prise (B4, N1).
+    if not taken and review_max_per_hour > 0:
+        proposal_room = max(0, int(review_max_per_hour)
+                            - st.work.auto_takes_since(TAKE_WINDOW_S, REVIEW_PROPOSAL_NOTE))
+
+        def wakeable(name):
+            try:
+                return work.check_assignee(db, name, cfg=cfg)["assignee"]
+            except work.WorkError:
+                return None
+
+        taken.extend(_propose_reviews(
+            db, st, listing,
+            pool=candidates(idle_s, skip=set(orchestras), waiting_free=True),
+            room=proposal_room, dry_run=dry_run, canons=canons,
+            skip=set(orchestras), within_budget=within_budget, wakeable=wakeable))
     if not queue:
         return taken
     # un lot du projet attend un preneur (ou vient d'être pris) : il passe
-    # avant toute amélioration
+    # avant toute amélioration ; un lot qu'une attente planifiée retient
+    # (dépendance, engagement, date) n'attend pas un agent (#1625)
     if taken or sous_utilisation.waiting_project_lots(
-            st.operations.open_lots_activity(500), db=db):
+            st.operations.open_lots_activity(500), db=db, now=now):
         return taken
     pool = candidates(idle_s)
     for row in pool:
-        if len(taken) >= room or not queue:
+        # #804 : place relue avant chaque prise (compteur partagé)
+        if not queue or len(taken) >= room or place() <= 0:
             break
         if not within_budget(row):
+            continue
+        # §4 : le plafond de lots en build vaut aussi pour la file
+        if st.work.count_builds(row["name"]) >= work.BUILD_LIMIT:
             continue
         agent = registry.get(db, row["name"])
         if agent is None:
@@ -728,20 +1145,21 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         if not auditor_mod.may_take(agent, canons):
             continue
         auditors = auditor_mod.cards([agent], canons)
-        primary = _primary_project(agent)
         for item in list(queue):
             if not fits(item, agent, auditor=row["name"] in auditors,
                         card=auditors.get(row["name"]), others=listing):
                 continue
-            # L243 : même règle que les lots — un élément d'un autre projet
-            # attend une attribution explicite (#811).
-            team = (item.get("team") or "").strip()
-            if team and team != primary:
+            if not _directory_ready(cfg, db, agent, item, _lot_project(item),
+                                    canons=canons, dry_run=dry_run, notes=dir_notes):
                 continue
             if dry_run:
                 taken.append({"item": item, "agent": row["name"], "message_id": None,
                               "kind": "backlog", "notified": []})
                 queue.remove(item)
+                break
+            # #804 : la place est relue juste avant l'écriture — une passe
+            # concurrente a pu consommer la place depuis la sélection.
+            if place() <= 0:
                 break
             try:
                 check = work.check_assignee(db, row["name"], cfg=cfg)
@@ -755,9 +1173,16 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                                      work.takes_rule(check))
             except storage.PendingLot:
                 break                       # #540 : l'élément reste au suivant
-            queue.remove(item)
             if done is None:
-                continue                    # pris entre-temps : élément suivant
+                # idem lots d'équipe : plafond (garder), élément devenu non
+                # prenable (dépendance apparue) ou pris entre-temps
+                if not _still_free(st, item["id"]):
+                    queue.remove(item)
+                    continue                # pris entre-temps : élément suivant
+                if _cap_reached(st, check["assignee"]):
+                    break                   # agent au plafond : au suivant
+                continue                    # refus sous verrou : élément suivant
+            queue.remove(item)
             message_id = mail.send(db, SENDER, check["assignee"], take_message(done),
                                    kind="event", work_item_id=str(done["id"]),
                                    payload={"backlog": {"lot": int(done["id"]),

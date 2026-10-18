@@ -30,6 +30,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -151,12 +152,20 @@ class NoClaimAfterStaleTest(unittest.TestCase):
         )
         fake._gate_settled.set()
         fake.expire_delegations_once = lambda: None
+        # #508 : `sweep` publie la preuve de vie avant la moisson ; ce témoin
+        # L790 n'a ni horloge ni registre, la doublure la neutralise.
+        fake.report_liveness = lambda *args, **kwargs: None
         # L85 (#373) : `sweep` prune le journal d'événements après la moisson
         # des baux — la doublure doit fournir le point d'entrée, borné ici.
         fake.prune_events_once = lambda *args, **kwargs: None
+        # #1425 (N2, suite #753) : le dessaisissement des agents arrêtés vient
+        # APRÈS les gardes — sous code périmé, l'exécuteur ne touche pas la
+        # file. Seule la reprise est arrêtée ici, et le dessaisissement aussi.
+        fake.release_stopped_lots_once = mock.Mock(return_value=[])
         with mock.patch.object(registry, "reap", return_value=[]), \
                 mock.patch.object(registry, "claimable") as claimable:
             runner_mod.Runner.sweep(fake)
+        fake.release_stopped_lots_once.assert_not_called()
         claimable.assert_not_called()
 
 
@@ -170,9 +179,26 @@ class SelectedTurnRefusedTest(unittest.TestCase):
     def test_run_turn_remet_la_consigne_et_refuse(self):
         runner = types.SimpleNamespace(
             draining=threading.Event(), restart_for_stale=True, runner_id="runner-1")
+        # #290 : `run_turn` refuse l'attach et prend le verrou de session
+        # avant le tour ; la doublure les satisfait sans E/S (le refus périmé
+        # testé reste dans `_run_guarded_turn`).
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
         worker = types.SimpleNamespace(
-            runner=runner, db=object(), name="perime", epoch=1, fast_failure=True)
+            runner=runner, db=object(), name="perime", epoch=1, fast_failure=True,
+            _attach_pending=lambda: False, _session_lock=mock.Mock(),
+            resident=object(), state_dir=state_dir.name,
+            # #2096 : `run_turn` rend la mémoire du tour dans son `finally` ;
+            # la doublure n'a pas d'allocateur, le rappel est inerte.
+            _release_turn_memory=lambda *a, **k: None)
+        # #290 a séparé l'enveloppe (`run_turn`) du tour (`_run_guarded_turn`) :
+        # la doublure porte la vraie logique de tour et une enveloppe inerte.
+        worker._run_guarded_turn = types.MethodType(
+            runner_mod.AgentWorker._run_guarded_turn, worker)
+        # #1462 : run_turn lit d’abord la pause opérateur dans le registre —
+        # agent non pausé ici, la doublure de base ne porte pas de requêtes.
         with mock.patch.object(registry, "restore_prompt", return_value=True) as restore, \
+                mock.patch.object(registry, "get", return_value={}), \
                 mock.patch.object(registry, "set_status") as set_status:
             self.assertFalse(runner_mod.AgentWorker.run_turn(worker, {}))
         restore.assert_called_once_with(worker.db, "perime", "runner-1", 1)

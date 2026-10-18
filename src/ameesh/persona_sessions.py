@@ -23,6 +23,8 @@ def record_start(db, persona: str, session_id: str, *, account: str | None = Non
     # One statement keeps replacement and insertion atomic on both drivers.
     # Lock and read only the accepted registry session: an external hook may
     # supply an ID that L36/L46 deliberately refuses to install.
+    from .agent_names import resolve as resolve_agent_name
+    persona = resolve_agent_name(persona, db=db, operation="persona_sessions.record_start")
     # #1037 : le harnais de l'historique est celui de la SESSION (0384,
     # `session_harness`, tenu égal à `session_origin` par déclencheur), pas le
     # harnais déclaré de l'agent — L242b fait tourner un agent sous un harnais
@@ -51,6 +53,8 @@ def record_start(db, persona: str, session_id: str, *, account: str | None = Non
 
 def record_end(db, persona: str, session_id: str | None, reason: str,
                *, best_effort: bool = False) -> None:
+    from .agent_names import resolve as resolve_agent_name
+    persona = resolve_agent_name(persona, db=db, operation="persona_sessions.record_end")
     if not session_id:
         return
     _write(db, best_effort,
@@ -107,6 +111,8 @@ def track_change(reason: str, *, returns_none: bool = False):
 
 
 def sessions(db, persona: str, limit: int = 50) -> list[dict]:
+    from .agent_names import resolve as resolve_agent_name
+    persona = resolve_agent_name(persona, db=db, operation="persona_sessions.sessions")
     return db.query(
         "SELECT session_id, harness, host, account, work_item, started_at, ended_at, end_reason "
         "FROM persona_sessions WHERE persona = %s ORDER BY started_at DESC, id DESC LIMIT %s",

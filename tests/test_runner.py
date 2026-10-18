@@ -722,16 +722,42 @@ class RunnerTest(PgTestCase):
                        AMEESH_HOST_GATE_ACK=os.path.join(self.tmp, "gate-ack", "ack.json"),
                        AMEESH_HOST_GATE_FALLBACK="available")
         proc = self.runner_popen("--agents", "perdu", "--lease-ttl", "3", "--poll", "2", env=env)
+        # Le tuyau est lu en continu : un tampon plein ne bloque plus
+        # l'exécuteur, et le témoin peut nommer sa sortie au refus.
+        sortie_lignes: list[str] = []
+        lecteur = threading.Thread(target=lambda: sortie_lignes.extend(proc.stdout or ()),
+                                   daemon=True)
+        lecteur.start()
+
+        def arreter() -> None:
+            if proc.poll() is None:
+                proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            lecteur.join(timeout=5)
+            if proc.stdout is not None:
+                proc.stdout.close()
+
         try:
-            self.wait_for(lambda: len(self.turns()) == 1, timeout=20)
+            self.wait_for(lambda: len(self.turns()) == 1, timeout=30)
             self.db.execute(
                 "UPDATE agent_registry SET lease_expires_at = now() - interval '1 second' "
                 "WHERE name = 'perdu'")
+            # Le harnais dort 120 s : un arrêt manqué à la perte du bail échoue
+            # donc encore dans cette borne. Sous charge CI, l'ordonnancement
+            # peut retarder le battement : 90 s, et la sortie nomme la cause.
             self.wait_for(
-                lambda: registry.get(self.db, "perdu")["pending_prompt"] is not None, timeout=60)
+                lambda: registry.get(self.db, "perdu")["pending_prompt"] is not None, timeout=90)
+        except AssertionError as exc:
+            arreter()
+            self.fail("%s\nsortie de l'exécuteur :\n%s"
+                      % (exc, "".join(sortie_lignes[-60:])))
         finally:
-            proc.terminate()
-            sortie, _ = proc.communicate(timeout=10)
+            arreter()
+        sortie = "".join(sortie_lignes)
         # pas de mort par signal à l'arrêt (SIGABRT du fil `journal`, 2026-10-05)
         self.assertGreaterEqual(proc.returncode, 0, "code %r\n%s" % (proc.returncode, sortie))
         self.assertNotIn("exiting immediately", sortie)
@@ -881,6 +907,11 @@ class RunnerTest(PgTestCase):
 
         Ici l'ordre est instrumenté : sur une échéance atteinte, le premier
         événement doit être le signal, pas une écriture de journal.
+
+        #971 : `log_async` (le journal du chemin d'arrêt) est instrumenté à
+        part, et les vidages tardifs du fil « journal » — messages mis en file
+        par un test précédent — sont ignorés : l'ordre observé ne dépend plus
+        de l'ordonnancement.
         """
         proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
         runner = Runner(self.cfg, self.db, once=True)
@@ -899,12 +930,21 @@ class RunnerTest(PgTestCase):
             vrai_signal(pgid, cible, sig)
 
         def log_trace(message):
+            # #971 : le fil « journal » peut vider ici un message mis en file
+            # par un test précédent (le puits est un singleton de module) :
+            # ce vidage tardif ne compte pas dans l'ordre de CE chemin d'arrêt.
+            if threading.current_thread().name == "journal":
+                return
             ordre.append(("log", message))
+
+        def journal_trace(message):
+            ordre.append(("journal", message))
 
         try:
             with mock.patch.object(AgentWorker, "_signal_group",
                                    staticmethod(signal_trace)), \
-                    mock.patch("ameesh.runner.log", side_effect=log_trace):
+                    mock.patch("ameesh.runner.log", side_effect=log_trace), \
+                    mock.patch("ameesh.runner.log_async", side_effect=journal_trace):
                 self.assertFalse(worker.renew())
             self.assertTrue(worker.lease_lost.is_set())
             self.assertTrue(ordre, "l'arrêt doit être tracé")
@@ -921,6 +961,11 @@ class RunnerTest(PgTestCase):
 
         Un journal bloqué ne doit pas retarder l'arrêt : ici l'ordre est
         instrumenté, le premier événement doit être le signal.
+
+        #971 : `log_async` (le journal du chemin d'arrêt) est instrumenté à
+        part, et les vidages tardifs du fil « journal » — messages mis en file
+        par un test précédent — sont ignorés : l'ordre observé ne dépend plus
+        de l'ordonnancement.
         """
         proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
         runner = Runner(self.cfg, self.db, once=True)
@@ -940,12 +985,21 @@ class RunnerTest(PgTestCase):
             vrai_signal(pgid, cible, sig)
 
         def log_trace(message):
+            # #971 : le fil « journal » peut vider ici un message mis en file
+            # par un test précédent (le puits est un singleton de module) :
+            # ce vidage tardif ne compte pas dans l'ordre de CE chemin d'arrêt.
+            if threading.current_thread().name == "journal":
+                return
             ordre.append(("log", message))
+
+        def journal_trace(message):
+            ordre.append(("journal", message))
 
         try:
             with mock.patch.object(AgentWorker, "_signal_group",
                                    staticmethod(signal_trace)), \
                     mock.patch("ameesh.runner.log", side_effect=log_trace), \
+                    mock.patch("ameesh.runner.log_async", side_effect=journal_trace), \
                     mock.patch.object(registry, "renew",
                                       side_effect=db_mod.DbError("base injoignable")):
                 self.assertFalse(worker.renew())
@@ -1045,7 +1099,7 @@ class RunnerTest(PgTestCase):
         worker = AgentWorker(
             runner,
             {"name": "yankee", "harness": "claude"},
-            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.25},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.6},
         )
         worker.proc = proc
         worker.pgid = proc.pid
@@ -1053,7 +1107,7 @@ class RunnerTest(PgTestCase):
             worker.ensure_watchdog()
             time.sleep(0.1)
             worker.lease_deadline = time.time() + 1.5  # renouvellement réussi
-            time.sleep(0.4)  # bien au-delà de l'ancienne échéance
+            time.sleep(0.6)  # bien au-delà de l'ancienne échéance
             self.assertFalse(worker.lease_lost.is_set(), "un bail renouvelé a été tué")
             self.assertIsNone(proc.poll(), "le harnais doit rester vivant")
         finally:

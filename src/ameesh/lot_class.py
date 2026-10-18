@@ -111,6 +111,15 @@ def default_base(cfg, item: dict, repo: str) -> Optional[str]:
         return None
 
 
+def _doubtful_files(paths) -> list:
+    """Les chemins d'un diff lu mais inclassable, tous sensibles (doute) : la
+    politique manque, pas le diff, et les motifs de secours de la porte
+    (`merge_queue.CRITICAL_SCOPE`) doivent encore y voir SQL, la sécurité ou la
+    prod (revue #2394 : un doute à un avis ne tait pas un chemin critique)."""
+    return [{"path": str(path), "class": SENSITIVE, "rule": None}
+            for path in paths or () if str(path or "")]
+
+
 def class_of_paths(canons, project: Optional[str], paths) -> dict:
     """La classe des `paths` pour `project`, lue dans tous les canons.
 
@@ -121,6 +130,8 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
     celui-ci : il est ignoré, pas compté comme un doute.
     """
     worst, why, files, ref = LIGHT, "", [], ""
+    critical_paths = set()
+    files_by_path = {}
     covered = False
     for canon in canons or ():
         root = str(getattr(canon, "root", "") or "")
@@ -131,7 +142,8 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
             # Ce canon ne couvre pas ce projet : sa politique n'en parle pas.
             continue
         if errors:
-            return {"class": SENSITIVE, "files": [], "policy_ref": _ref(canon),
+            return {"class": SENSITIVE, "files": _doubtful_files(paths),
+                    "policy_ref": _ref(canon),
                     "doubt": True,
                     "why": "review policy unreadable (%s): %s"
                            % (root or "canon", errors[0][2])}
@@ -139,29 +151,49 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
         try:
             result = review_mod.classify(policy, paths)
         except review_mod.ReviewError as exc:
-            return {"class": SENSITIVE, "files": [], "policy_ref": _ref(canon),
-                    "doubt": True, "why": "cannot classify the change: %s" % exc}
+            return {"class": SENSITIVE, "files": _doubtful_files(paths),
+                    "policy_ref": _ref(canon), "doubt": True,
+                    "why": "cannot classify the change: %s" % exc}
         if not ref:
             ref = _ref(canon)
-        if RANK[result["class"]] > RANK[worst]:
+        critical_paths.update(entry["path"] for entry in result["files"]
+                              if entry.get("critical") is True)
+        for entry in result["files"]:
+            previous = files_by_path.get(entry["path"])
+            if previous is None or RANK[entry["class"]] > RANK[previous["class"]]:
+                files_by_path[entry["path"]] = entry
+        # #2374 : un diff entièrement léger garde ses chemins. Sans eux, la
+        # porte des avis (et l'ouverture de la relecture après fusion) ne peut
+        # pas constater un chemin critique que le canon a classé `light`.
+        if not files or RANK[result["class"]] > RANK[worst]:
             worst, files = result["class"], result["files"]
             why = "policy of %s" % (root or "canon")
     if not covered:
-        return {"class": SENSITIVE, "files": [], "policy_ref": "", "doubt": True,
+        return {"class": SENSITIVE, "files": _doubtful_files(paths), "policy_ref": "",
+                "doubt": True,
                 "why": "project %r is not declared by any canon (no fallback policy)"
                        % (project,)}
+    # Le maximum du lot ne suffit pas : une exception de la porte (Markdown
+    # léger) doit lire la classe la plus haute de chaque fichier, tous canons.
+    files = [files_by_path[entry["path"]] for entry in files]
+    for entry in files:
+        if entry["path"] in critical_paths:
+            entry["critical"] = True
     return {"class": worst, "why": why, "files": files, "policy_ref": ref,
             "doubt": False}
 
 
 def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
            repo: Optional[str] = None, base: Optional[str] = None,
-           head: Optional[str] = None) -> dict:
+           head: Optional[str] = None, milestones: Optional[list] = None,
+           canons=None) -> dict:
     """La classe du lot `lot` ; ne lève jamais (tout doute rend `sensitive`).
 
     `item` évite une lecture de la base ; `repo`, `base` et `head` sont ceux
     que l'appelant a déjà résolus (la file de fusion connaît la tête gelée et
-    le dépôt du clone). Rend aussi `files`, `policy_ref`, `target`, `frozen_sha`,
+    le dépôt du clone). `milestones` et `canons` (liste ou lecteur différé)
+    réutilisent les lectures groupées de l'appelant. Rend aussi `files`,
+    `policy_ref`, `target`, `frozen_sha`,
     `why` et `doubt` (vrai quand la classe vient d'une lecture impossible, pas
     d'une politique) pour la trace.
     """
@@ -183,7 +215,8 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
         out["why"] = "no repository known for the lot"
         return out
     if not head:
-        freeze = plan_git.latest_freeze(work.milestones(db, lot))
+        freeze = plan_git.latest_freeze(work.milestones(db, lot) if milestones is None
+                                        else milestones)
         if not freeze or not str(freeze.get("sha") or "").strip():
             out["why"] = "lot #%d is not frozen" % lot
             return out
@@ -220,8 +253,12 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
         out.update({"class": LIGHT, "why": "no file changed since %s" % base,
                     "doubt": False})
         return out
-    canons = work.configured_canons(cfg)
+    if canons is None:
+        canons = work.configured_canons(cfg)
+    elif callable(canons):
+        canons = canons()
     if not canons:
+        out["files"] = _doubtful_files(paths)
         out["why"] = "no readable canon: review policy unknown"
         return out
     result = class_of_paths(canons, row.get("app"), paths)

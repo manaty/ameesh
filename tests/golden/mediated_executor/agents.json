@@ -50,6 +50,41 @@
    }
   },
   {
+   "name": "agents.runner_seen/ok",
+   "op": "agents.runner_seen",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "7ff6752f-9ccb-514b-9d29-c12d55634080"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.runner_seen",
+     "args": [
+      "anna-portable",
+      "exec:7f3a9c2e4b1d6058:anna-portable:4121",
+      [
+       "inge-front"
+      ]
+     ],
+     "kwargs": {}
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": null,
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
    "name": "agents.get/ok",
    "op": "agents.get",
    "request": {
@@ -85,6 +120,66 @@
       "lease_epoch": 41,
       "lease_expires_ts": null
      },
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "name": "agents.resolve_name/ok",
+   "op": "agents.resolve_name",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.resolve_name",
+     "args": [
+      "inge-front"
+     ],
+     "kwargs": {}
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": "inge-front",
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "name": "agents.resolve_name/session",
+   "op": "agents.resolve_name",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/session/op",
+    "headers": {
+     "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+     "Content-Type": "application/json"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.resolve_name",
+     "args": [
+      "inge-front"
+     ],
+     "kwargs": {}
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": "inge-front",
      "server_ts": 1791640000.12
     }
    }

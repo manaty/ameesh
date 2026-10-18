@@ -16,7 +16,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 64 opérations et la liste des 347 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 66 opérations et la liste des 393 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -59,12 +59,12 @@ Les portées :
 - **S** : l'agent et l'epoch sont tirés du jeton de session.
 - **aggregate** : une donnée agrégée.
 
-Comptes : 64 opérations, dont 25 lectures et 39 écritures. 54 passent par
-`op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Six
-lignes de `op` sont marquées `session: true` (contrats 1.1 et 1.2) : elles
-sont servies aussi par `session/op`. Le test
+Comptes : 66 opérations, dont 26 lectures et 40 écritures. 56 passent par
+`op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Sept
+lignes de `op` sont marquées `session: true` (contrats 1.1, 1.2 et #423) :
+elles sont servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (411
+signature et les mêmes types. Il vérifie aussi que l'interface entière (459
 opérations) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
@@ -90,6 +90,13 @@ l'attente de pression de l'hôte affichée dans `ameesh show`) sont refusées de
 même. Sur un exécuteur médié, l'attente de pression ne s'affiche pas, et une
 pause critique n'est pas levée d'elle-même quand la pression retombe,
 comme avant L31b.
+
+`leases.adopt_session_origin` (#1900 B1 : noter l'origine d'une session sans
+origine sous un bail vivant, en n'écrivant que l'origine, le dossier et le
+harnais quand la session et le lot n'ont pas changé) est refusée aussi : le
+client la refuse avant tout appel, `registry` la traite comme une écriture
+impossible et garde la bascule forcée d'avant #1900. L'adoption d'une session
+sans origine reste donc l'affaire d'un runner à pilote local.
 
 Les huit opérations `work.*` de L118 (lots liés au courrier, branches des
 lots : `open_by_ref`, `open_for`, `set_branch`, `open_with_branch`,
@@ -250,8 +257,9 @@ table : aucun écart n'est toléré d'un côté seulement.
   `fil.member`) ; le nom nu reste admis.
 - **`HostInfo.limits`** (`GET /host`) : `{"max_agents": int|null,
   "resources": {"min_mem_available", "max_swap_used", "max_load",
-  "min_disk_free"}}`, tiré du canon (`resources.host_limits`). Un seuil
-  absent prend son défaut prudent côté exécuteur.
+  "min_disk_free", "max_mem_pressure"}}`, tiré du canon
+  (`resources.host_limits`). Un seuil absent prend son défaut prudent côté
+  exécuteur (`max_mem_pressure` : 10 %, #2296).
 - **Porte.** `GateAck.from_json` lève `ValueError` pour tout corps faux.
   Un état illisible vaut `stopped` pour un hôte médié. `max_concurrent`
   vaut 1 par défaut.
@@ -764,3 +772,15 @@ Reste à faire pour un essai sur une vraie machine Windows ou Mac :
 - l'image signée (`deploy/executor-image`, dsh épinglé par empreinte), et
   sa taille (1,3 Go avec dsh par npm) ;
 - le hook `agent-mail` de dsh : l'essai n'a fait aucun appel `session/op`.
+
+
+## Agent name aliases (#423, L243b step 1)
+
+The compatible `agents.resolve_name(name, operation="lookup")` operation is
+served on `/op` and `/session/op`. It returns only the primary spelling (or the
+unchanged unknown name), with a server-side alias audit. It grants no access.
+The dispatcher resolves named agents and lease envelopes before checking scope
+and fencing; executor allowlists can use aliases. The agent's name, owner,
+epoch and host still have to satisfy the same authority checks. See
+[Agent aliases](AGENT-ALIASES.md) for collisions, signed mail and the deferred
+renaming/rollback migration.

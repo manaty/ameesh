@@ -20,7 +20,7 @@ from ameesh import runner as runner_mod
 from ameesh.runner import AgentWorker, Runner
 
 from .support import PgTestCase
-from .test_l75_resident import claude_doc
+from .test_l75_resident import acp_doc, claude_doc, codex_doc
 
 
 def _group_gone(pgid: int, timeout: float = 5.0) -> bool:
@@ -188,6 +188,97 @@ class TurnFileTest(unittest.TestCase):
         self.assertEqual(resident_runner.current_turn({"AMEESH_TURN_ID": "t"}), "t")
 
 
+class UsageEventTest(unittest.TestCase):
+    """L80a: the event a resident Codex/ACP turn leaves for the ledger."""
+
+    def test_refusal_accepts_the_counted_protocols(self):
+        self.assertEqual(set(resident_runner.PROTOCOLS),
+                         {"claude-stream-json", "codex-app-server", "acp"})
+        for protocol in ("codex-app-server", "acp"):
+            adapter = mock.Mock()
+            adapter.descriptor.resident = {"protocol": protocol}
+            with mock.patch.object(resident_runner, "binary_version", return_value="9.9.9"), \
+                    mock.patch.object(resident_runner.resident, "availability", return_value=""):
+                self.assertEqual(resident_runner.refusal(adapter), "", protocol)
+        adapter = mock.Mock()
+        adapter.descriptor.resident = {"protocol": "telnet"}
+        self.assertIn("not counted", resident_runner.refusal(adapter))
+
+    def test_claude_stream_needs_no_event(self):
+        result = resident.TurnResult(status=resident.COMPLETED, session="s1",
+                                     usage={"input_tokens": 10})
+        self.assertIsNone(resident_runner.usage_event("claude-stream-json", result))
+
+    def test_codex_event_carries_the_turn_and_the_thread_total(self):
+        result = resident.TurnResult(
+            status=resident.COMPLETED, session="thr-1",
+            usage={"input_tokens": 100, "cache_read_input_tokens": 200,
+                   "output_tokens": 9},
+            usage_total={"input_tokens": 300, "cached_input_tokens": 200,
+                         "output_tokens": 9})
+        event = resident_runner.usage_event("codex-app-server", result, turn="t-1")
+        self.assertEqual(event, {
+            "type": resident.USAGE_EVENT, "protocol": "codex-app-server",
+            "usage": {"input_tokens": 100, "cache_read_input_tokens": 200,
+                      "output_tokens": 9},
+            "session": "thr-1", "turn": "t-1", "status": resident.COMPLETED,
+            "usage_total": {"input_tokens": 300, "cached_input_tokens": 200,
+                            "output_tokens": 9}})
+
+    def test_acp_event_carries_the_usd_cost(self):
+        result = resident.TurnResult(
+            status=resident.COMPLETED, session="sess-1",
+            usage={"input_tokens": 1234}, cost=0.02, cost_total=0.04)
+        event = resident_runner.usage_event("acp", result, turn="t-2")
+        self.assertEqual((event["cost"], event["cost_total"]), (0.02, 0.04))
+        self.assertNotIn("usage_total", event)
+
+    def test_write_appends_one_line_and_never_raises(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "events.jsonl")
+        self.assertFalse(resident_runner.write_usage_event(path, None))
+        self.assertFalse(os.path.exists(path))
+        first = {"type": resident.USAGE_EVENT, "usage": {"input_tokens": 1}}
+        second = {"type": resident.USAGE_EVENT, "usage": {"input_tokens": 2}}
+        self.assertTrue(resident_runner.write_usage_event(path, first))
+        self.assertTrue(resident_runner.write_usage_event(path, second))
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual([json.loads(line) for line in fh], [first, second])
+        # an unwritable path is a lost event, never a failed turn
+        self.assertFalse(resident_runner.write_usage_event(tempfile.mkdtemp(), first))
+
+    def test_a_partial_write_is_truncated_and_the_repair_stays_readable(self):
+        # #2453: ENOSPC mid-line must not leave a fragment the repaired event
+        # would be glued to; a fragment already there gets a newline first.
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "events.jsonl")
+        first = {"type": resident.USAGE_EVENT, "usage": {"input_tokens": 1}}
+        turn = {"type": resident.USAGE_EVENT, "usage": {"input_tokens": 2}}
+        self.assertTrue(resident_runner.write_usage_event(path, first))
+        real_write = os.write
+
+        def partial(fd, buf):
+            real_write(fd, bytes(buf[:5]))
+            raise OSError(28, "No space left on device")
+
+        with mock.patch.object(resident_runner.os, "write", side_effect=partial):
+            self.assertFalse(resident_runner.write_usage_event(path, turn))
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual([json.loads(line) for line in fh], [first])
+        # the repair after the failure is a readable line of its own
+        self.assertTrue(resident_runner.write_usage_event(path, turn))
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual([json.loads(line) for line in fh], [first, turn])
+        # a fragment left by a crash (no truncation possible) is isolated
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write('{"type": "resi')
+        self.assertTrue(resident_runner.write_usage_event(path, turn))
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        self.assertEqual(lines[2], '{"type": "resi')
+        self.assertEqual(json.loads(lines[3]), turn)
+
+
 class ResidentRunnerTest(PgTestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -199,22 +290,32 @@ class ResidentRunnerTest(PgTestCase):
         self.adapter = adapters.HarnessAdapter(harnesses.load(path, source="test"),
                                                sys.executable)
         for patch in (mock.patch.dict(os.environ, {"FAKE_RESIDENT_LOG": self.log}),
+                      # permissive version: each case may load a Codex/ACP
+                      # descriptor with another pinned minimum
                       mock.patch.object(resident_runner, "binary_version",
-                                        return_value="2.1.286")):
+                                        return_value="99.0.0")):
             patch.start()
             self.addCleanup(patch.stop)
 
-    def _worker(self, name: str = "res1", **local):
+    def _worker(self, name: str = "res1", doc: dict | None = None,
+                harness: str = "claude", **local):
         runner = Runner(self.cfg, self.db, once=False)
         cwd = os.path.join(self.tmp, "work", name)
         os.makedirs(cwd, exist_ok=True)
-        self.register(name, "claude", cwd=cwd)
+        adapter = self.adapter
+        if doc is not None:
+            path = os.path.join(self.tmp, "fake-%s.json" % name)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(doc, fh)
+            adapter = adapters.HarnessAdapter(harnesses.load(path, source="test"),
+                                              sys.executable)
+        self.register(name, harness, cwd=cwd)
         lease = registry.claim(self.db, name, runner.runner_id, 3600)
         self.assertIsNotNone(lease)
         worker = AgentWorker(runner, registry.get(self.db, name), lease)
         self.addCleanup(worker.watchdog_stop.set)
         self.addCleanup(worker._close_resident, "end of test")
-        worker._adapter = lambda: self.adapter
+        worker._adapter = lambda: adapter
         self._set(worker, resident="on", **local)
         return runner, worker
 
@@ -261,6 +362,194 @@ class ResidentRunnerTest(PgTestCase):
         # the hook: no turn between two turns
         with open(worker._path(resident_runner.TURN_FILE), encoding="utf-8") as fh:
             self.assertEqual(fh.read(), "")
+
+    def _usage_events(self, worker) -> list[dict]:
+        with open(worker._path("events.jsonl"), encoding="utf-8") as fh:
+            events = [json.loads(line) for line in fh if line.strip()]
+        return [e for e in events if e.get("type") == resident.USAGE_EVENT]
+
+    def test_codex_resident_usage_is_counted_once_per_turn(self):
+        # L80a: Codex reports usage in `thread/tokenUsage/updated`, which the
+        # raw JSON-RPC stream does not give the ledger. Each logical turn
+        # leaves one `resident.turn` event: the turn from `last`, the thread
+        # total for the next baseline. Two turns on one process must not
+        # count the same tokens twice.
+        _runner, worker = self._worker(doc=codex_doc(), harness="codex")
+        self.assertTrue(self._turn(worker, "premier"))
+        rp = worker.resident
+        self.assertIsNotNone(rp)
+        self.assertTrue(self._turn(worker, "second"))
+        self.assertIs(worker.resident, rp)
+        self.assertEqual(len(self._starts()), 1)
+        events = self._usage_events(worker)
+        self.assertEqual(len(events), 2)
+        for event in events:
+            self.assertEqual(
+                {key: event["usage"][key] for key in
+                 ("input_tokens", "cache_read_input_tokens",
+                  "cache_creation_input_tokens", "output_tokens")},
+                {"input_tokens": 100, "cache_read_input_tokens": 200,
+                 "cache_creation_input_tokens": 0, "output_tokens": 9})
+        self.assertEqual([e["usage_total"]["input_tokens"] for e in events],
+                         [300, 600])
+        self.assertEqual([e["usage_total"]["cached_input_tokens"] for e in events],
+                         [200, 400])
+        self.assertEqual([e["usage_total"]["output_tokens"] for e in events],
+                         [9, 18])
+        self.assertEqual(len({e["session"] for e in events}), 1)
+        self.assertTrue(all(e["session"] for e in events))
+        # the ledger: each turn's own measure, and the thread's cumulative
+        # reading as the next baseline (never the turn alone)
+        rows = self.db.query(
+            "SELECT input_tokens, cached_input_tokens, output_tokens, "
+            "cum_input_tokens, cum_cached_input_tokens, cum_output_tokens "
+            "FROM turn_costs WHERE agent = 'res1' ORDER BY id")
+        self.assertEqual([(r["input_tokens"], r["cached_input_tokens"],
+                           r["output_tokens"]) for r in rows],
+                         [(300, 200, 9), (300, 200, 9)])
+        self.assertEqual([(r["cum_input_tokens"], r["cum_cached_input_tokens"],
+                           r["cum_output_tokens"]) for r in rows],
+                         [(300, 200, 9), (600, 400, 18)])
+
+    def test_acp_resident_usage_and_cost_are_counted_once_per_turn(self):
+        # L80a: ACP reports usage in `session/update`; its `TurnResult` also
+        # carries the USD delta when the harness publishes a cumulative cost.
+        # The event is the ledger's only source for the turn.
+        _runner, worker = self._worker(doc=acp_doc(), harness="deepseek")
+        with mock.patch.dict(os.environ, {"FAKE_ACP_MODE": "normal",
+                                          "FAKE_ACP_COST_STEP": "0.02"}):
+            self.assertTrue(self._turn(worker, "un"))
+            rp = worker.resident
+            self.assertIsNotNone(rp)
+            self.assertTrue(self._turn(worker, "deux"))
+        self.assertIs(worker.resident, rp)   # one ACP agent served both
+        events = self._usage_events(worker)
+        self.assertEqual(len(events), 2)
+        self.assertEqual([e["cost"] for e in events], [0.02, 0.02])
+        self.assertEqual([e["cost_total"] for e in events], [0.02, 0.04])
+        rows = self.db.query("SELECT usd::float8 AS usd, input_tokens "
+                             "FROM turn_costs WHERE agent = 'res1' ORDER BY id")
+        self.assertEqual([round(r["usd"], 6) for r in rows], [0.02, 0.02])
+        self.assertEqual([r["input_tokens"] for r in rows], [1234, 1234])
+
+    def test_acp_resident_cost_base_survives_a_process_restart(self):
+        # L80a B1: sleep, changed settings or a worker restart close the process;
+        # the resumed ACP session has no in-memory cost base. The durable ledger
+        # reading of the same session (0.04) makes the first prompt of the new
+        # process carry its delta (0.06 - 0.04), not its whole history nor a
+        # token-tariff estimate.
+        _runner, worker = self._worker(doc=acp_doc(), harness="deepseek")
+        with mock.patch.dict(os.environ, {"FAKE_ACP_MODE": "normal",
+                                          "FAKE_ACP_COST": "0.04",
+                                          "FAKE_ACP_LOG": self.log}):
+            self.assertTrue(self._turn(worker, "avant"))
+        self.assertIsNotNone(worker.resident)
+        worker._close_resident("test: process restart")
+        self.assertIsNone(worker.resident)
+        with mock.patch.dict(os.environ, {"FAKE_ACP_MODE": "resume",
+                                          "FAKE_ACP_COST": "0.06",
+                                          "FAKE_ACP_LOG": self.log}):
+            self.assertTrue(self._turn(worker, "après"))
+        methods = [e.get("method") for e in self._trace()]
+        self.assertEqual(methods.count("session/new"), 1)
+        self.assertEqual(methods.count("session/resume"), 1)
+        events = self._usage_events(worker)
+        self.assertEqual(len(events), 2)
+        # the driver was restarted on the durable base, so it carries the delta
+        self.assertEqual([round(e["cost"], 6) for e in events], [0.04, 0.02])
+        self.assertEqual([round(e["cost_total"], 6) for e in events], [0.04, 0.06])
+        rows = self.db.query(
+            "SELECT usd::float8 AS usd, input_tokens, cum_usd::float8 AS cum_usd "
+            "FROM turn_costs WHERE agent = 'res1' ORDER BY id")
+        self.assertEqual([round(r["usd"], 6) for r in rows], [0.04, 0.02])
+        self.assertEqual([r["input_tokens"] for r in rows], [1234, 1234])
+        self.assertEqual([round(r["cum_usd"], 6) for r in rows], [0.04, 0.06])
+
+    def test_a_lost_resident_usage_event_is_repaired_not_settled_at_zero(self):
+        # L80a B2: the Codex JSON-RPC stream carries no `turn.completed`; if the
+        # `resident.turn` event cannot be written, settling the marker would
+        # book 0. The measurement goes to the durable marker first, the turn is
+        # not settled, and the repair writes the event then the ledger line
+        # before the next turn is authorised.
+        _runner, worker = self._worker(doc=codex_doc(), harness="codex")
+        with mock.patch.object(resident_runner, "write_usage_event",
+                               return_value=False):
+            self.assertFalse(self._turn(worker, "perdu"))
+            marker = registry.pending_spend_get(self.db, "res1")
+            self.assertIsNotNone(marker)
+            self.assertIsInstance(marker["resident_usage"], dict)
+            self.assertEqual(marker["resident_usage"]["usage"]["input_tokens"], 100)
+            # no next turn before the measurement is durable
+            self.assertFalse(worker.budget_ok())
+            self.assertIsNotNone(registry.pending_spend_get(self.db, "res1"))
+        self.assertTrue(worker._compta_en_echec)
+        self.assertEqual(worker._resident_usage_pending, [])
+        self.assertEqual(self.db.query(
+            "SELECT count(*)::int AS n FROM turn_costs")[0]["n"], 0)
+        # repair: the marker's event is written, then the accounting marker replays
+        self.assertTrue(worker.budget_ok())
+        self.assertIsNone(registry.pending_spend_get(self.db, "res1"))
+        self.assertEqual(worker._resident_usage_pending, [])
+        rows = self.db.query(
+            "SELECT usd::float8 AS usd, input_tokens, cached_input_tokens, "
+            "output_tokens, cum_input_tokens FROM turn_costs "
+            "WHERE agent = 'res1' ORDER BY id")
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["usd"],
+                               (100 * 1.25 + 200 * 0.125 + 9 * 10.0) / 1e6,
+                               places=9)
+        self.assertEqual((rows[0]["input_tokens"], rows[0]["cached_input_tokens"],
+                          rows[0]["output_tokens"], rows[0]["cum_input_tokens"]),
+                         (300, 200, 9, 300))
+        self.assertEqual(len(self._usage_events(worker)), 1)
+
+    def test_a_new_worker_repairs_the_resident_usage_left_in_the_marker(self):
+        # L80a B2: the durable state must survive the worker that served the
+        # turn. A replacement worker has no `_resident_usage_pending`; it finds
+        # the event in the accounting marker, refuses to settle while the event
+        # cannot be written, then repairs it and books the real usage.
+        runner, worker = self._worker(doc=codex_doc(), harness="codex")
+        with mock.patch.object(resident_runner, "write_usage_event",
+                               return_value=False):
+            self.assertFalse(self._turn(worker, "perdu"))
+        marker = registry.pending_spend_get(self.db, "res1")
+        self.assertIsNotNone(marker)
+        self.assertIsInstance(marker["resident_usage"], dict)
+        worker2 = AgentWorker(runner, registry.get(self.db, "res1"), {
+            "lease_epoch": worker.epoch,
+            "lease_expires_ts": time.time() + 3600,
+        })
+        self.addCleanup(worker2.watchdog_stop.set)
+        self.assertEqual(worker2._resident_usage_pending, [])
+        with mock.patch.object(resident_runner, "write_usage_event",
+                               return_value=False):
+            self.assertFalse(worker2.budget_ok())
+            self.assertIsNotNone(registry.pending_spend_get(self.db, "res1"))
+        self.assertTrue(worker2.budget_ok())
+        self.assertIsNone(registry.pending_spend_get(self.db, "res1"))
+        self.assertEqual(worker2._resident_usage_pending, [])
+        rows = self.db.query(
+            "SELECT usd::float8 AS usd, input_tokens, cached_input_tokens, "
+            "output_tokens FROM turn_costs WHERE agent = 'res1' ORDER BY id")
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["usd"],
+                               (100 * 1.25 + 200 * 0.125 + 9 * 10.0) / 1e6,
+                               places=9)
+        self.assertEqual((rows[0]["input_tokens"], rows[0]["cached_input_tokens"],
+                          rows[0]["output_tokens"]), (300, 200, 9))
+
+    def test_a_new_turn_marker_drops_the_previous_resident_usage(self):
+        # L80a: the marker is replaced before each turn; a payload left by a
+        # failed repair must never attach to the next turn.
+        self.assertTrue(registry.pending_spend_put(self.db, "res1", 0, "un", "m"))
+        self.assertTrue(registry.pending_spend_set_resident_usage(
+            self.db, "res1", {"type": resident.USAGE_EVENT,
+                              "usage": {"input_tokens": 1}}))
+        self.assertIsInstance(
+            registry.pending_spend_get(self.db, "res1")["resident_usage"], dict)
+        self.assertTrue(registry.pending_spend_put(self.db, "res1", 1, "deux", "m"))
+        self.assertIsNone(
+            registry.pending_spend_get(self.db, "res1")["resident_usage"])
 
     def test_changed_settings_restart_on_the_session(self):
         _runner, worker = self._worker()
@@ -338,7 +627,7 @@ class ResidentRunnerTest(PgTestCase):
         self.assertIsNone(worker.resident)
         self.assertEqual(len(launched), 1)        # the turn's own harness
         self.assertGreater(worker._resident_refused_until, time.monotonic())
-        self.assertIn("resident start failed",
+        self.assertIn("resident failed recently",
                       worker._resident_refusal(self.adapter, False))
 
     def test_a_relayed_turn_never_uses_the_resident(self):
@@ -429,6 +718,86 @@ class ResidentRunnerTest(PgTestCase):
         self.assertEqual(len(self._starts()), 2)
         self.assertEqual(worker.resident.driver.extra_env["AMEESH_TURN_MAIL_MAX"], "1")
 
+    # T2
+
+    def test_failures_double_the_wait_and_a_turn_resets_it(self):
+        _runner, worker = self._worker()
+        attentes = []
+        for _ in range(3):
+            avant = time.monotonic()
+            worker._resident_failed("test")
+            attentes.append(round(worker._resident_refused_until - avant))
+        self.assertEqual(attentes, [60, 120, 240])
+        for _ in range(10):
+            worker._resident_failed("test")
+        self.assertLessEqual(worker._resident_refused_until - time.monotonic(),
+                             runner_mod.RESIDENT_RETRY_MAX_S)
+        worker._resident_refused_until = 0.0
+        self.assertTrue(self._turn(worker, "un"))
+        self.assertEqual(worker._resident_failures, 0)
+
+    def test_a_death_counts_and_falls_back(self):
+        _runner, worker = self._worker()
+        self.assertFalse(self._turn(worker, "CRASH"))
+        self.assertEqual(worker._resident_failures, 1)
+        self.assertIn("1 in a row", worker._resident_refusal(self.adapter, False))
+        # between turns too
+        worker._resident_refused_until = 0.0
+        self.assertTrue(self._turn(worker, "un"))
+        rp = worker.resident
+        rp.kill_now()
+        deadline = time.monotonic() + 5
+        while rp.alive and time.monotonic() < deadline:
+            time.sleep(0.05)
+        worker._resident_between_turns()
+        self.assertIsNone(worker.resident)
+        self.assertEqual(worker._resident_failures, 1)   # reset by the turn, then 1
+
+    def test_dormant_after_sleep_and_under_pressure(self):
+        runner, worker = self._worker(resident_sleep="60")
+        self.assertTrue(self._turn(worker, "un"))
+        worker.resident.last_used -= 61
+        worker._resident_between_turns()
+        self.assertIsNone(worker.resident)
+        agent = registry.get(self.db, "res1")
+        self.assertEqual(agent["status"], "idle")
+        self.assertTrue(agent["status_text"].startswith("dormant: asleep after 60s"))
+        self.assertEqual(worker._resident_failures, 0)     # a sleep is no failure
+        self.assertTrue(self._turn(worker, "deux"))
+        rp = worker.resident
+        with mock.patch.object(runner, "host_pressure", return_value={"blocked": True}):
+            worker._resident_between_turns()
+        self.assertIsNone(worker.resident)
+        self.assertTrue(_group_gone(rp.pgid))
+        self.assertIn("host under pressure", registry.get(self.db, "res1")["status_text"])
+
+    def test_dormant_never_hides_a_blocked_agent(self):
+        _runner, worker = self._worker()
+        registry.set_status(self.db, "res1", "blocked", status_text="turn failed")
+        worker._note_dormant("asleep")
+        self.assertEqual(registry.get(self.db, "res1")["status_text"], "turn failed")
+
+    def test_dormant_never_resumes_a_stopped_agent_nor_without_the_lease(self):
+        # codex r1 (#422): one conditional write, no read-then-write window
+        _runner, worker = self._worker()
+        registry.set_status(self.db, "res1", "stopped", status_text="stopped by owner",
+                            stop_reason=registry.STOP_REASONS[0])
+        worker._note_dormant("asleep")
+        agent = registry.get(self.db, "res1")
+        self.assertEqual((agent["status"], agent["status_text"]),
+                         ("stopped", "stopped by owner"))
+        registry.set_status(self.db, "res1", "idle", status_text="")
+        worker.epoch += 1                          # no longer our lease
+        worker._note_dormant("asleep")
+        self.assertEqual(registry.get(self.db, "res1")["status_text"] or "", "")
+
+    def test_many_failures_never_overflow(self):
+        _runner, worker = self._worker()
+        worker._resident_failures = 5000           # codex r1 (#422), P3
+        worker._resident_failed("test")
+        self.assertLessEqual(worker._resident_refused_until - time.monotonic(),
+                             runner_mod.RESIDENT_RETRY_MAX_S)
+
     def test_resident_off_stops_it_between_turns(self):
         _runner, worker = self._worker()
         self.assertTrue(self._turn(worker, "un"))
@@ -437,6 +806,119 @@ class ResidentRunnerTest(PgTestCase):
         worker._resident_between_turns()
         self.assertIsNone(worker.resident)
         self.assertTrue(_group_gone(rp.pgid))
+
+    # T3
+
+    def _probe_due(self, rp) -> None:
+        """Comme si la dernière preuve de vie datait d'avant la cadence."""
+        rp.probed_at -= resident_runner.PROBE_EVERY_S + 1
+
+    def test_an_idle_resident_that_answers_the_probe_is_kept(self):
+        _runner, worker = self._worker()
+        self.assertTrue(self._turn(worker, "un"))
+        rp = worker.resident
+        self._probe_due(rp)
+        worker._resident_between_turns()          # la sonde répond
+        self.assertIs(worker.resident, rp)
+        self.assertFalse(rp.probe_due())          # preuve de vie rafraîchie
+        self.assertEqual(len(self._starts()), 1)  # aucun processus neuf
+        self.assertEqual(worker._resident_failures, 0)
+
+    def test_a_silent_resident_is_stopped_between_turns(self):
+        # T3 (#285): the process lives, its protocol no longer answers (DEAF);
+        # the bounded probe, outside any turn, stops it and counts a failure
+        _runner, worker = self._worker()
+        self.assertTrue(self._turn(worker, "DEAF"))
+        rp = worker.resident
+        self.assertTrue(rp.alive)
+        self._probe_due(rp)
+        with mock.patch.object(resident_runner, "PROBE_TIMEOUT_S", 0.3):
+            worker._resident_between_turns()
+        self.assertIsNone(worker.resident)
+        self.assertTrue(_group_gone(rp.pgid))
+        self.assertEqual(storage.of(self.db).turn_resources.get(rp.life_id)["status"],
+                         "done")
+        self.assertEqual(worker._resident_failures, 1)
+        self.assertIn("resident failed recently",
+                      worker._resident_refusal(self.adapter, False))
+
+    def test_a_probed_resident_still_serves_the_next_turn(self):
+        _runner, worker = self._worker()
+        self.assertTrue(self._turn(worker, "un"))
+        rp = worker.resident
+        self._probe_due(rp)
+        self.assertTrue(self._turn(worker, "deux"))
+        self.assertIs(worker.resident, rp)
+        self.assertEqual(len(self._starts()), 1)
+        controles = [e["control"] for e in self._trace() if "control" in e]
+        self.assertEqual(controles.count("initialize"), 2)   # démarrage + sonde
+
+    def test_a_push_of_the_probe_never_enters_the_next_turn(self):
+        # #1337 (#1780, dev2) : le CLI pousse sa liste de commandes
+        # (`system/commands_changed`) de façon asynchrone après la réponse à
+        # `initialize` — donc après le drain qui précède l'envoi, quand le
+        # tour est déjà ouvert. Cette poussée n'est pas un événement du tour :
+        # elle n'entre pas dans le flux (le faux harnais trace qu'il a poussé).
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_PUSH_AFTER": "0.4"}):
+            _runner, worker = self._worker()
+            self.assertTrue(self._turn(worker, "un"))
+            rp = worker.resident
+            self._probe_due(rp)
+            self.assertTrue(self._turn(worker, "SLOW deux"))
+        self.assertIs(worker.resident, rp)
+        self.assertTrue([e for e in self._trace() if e.get("push")],
+                        "the fake harness pushed nothing")
+        with open(worker._path("events.jsonl"), encoding="utf-8") as fh:
+            flux = fh.read()
+        self.assertNotIn("commands_changed", flux)
+        self.assertIn("ECHO:SLOW deux", flux)
+
+    def test_a_silent_resident_before_a_turn_serves_it_one_per_event(self):
+        # T3 (#285): probed before the turn; silent -> stopped, T2 failure
+        # series, and the turn runs on its own harness (no fresh resident)
+        _runner, worker = self._worker()
+        self.assertTrue(self._turn(worker, "DEAF"))
+        rp = worker.resident
+        self.assertTrue(rp.alive)
+        self._probe_due(rp)
+        launched = []
+        real_popen = runner_mod.subprocess.Popen
+
+        def popen(argv, **kwargs):
+            if list(argv[:1]) != [sys.executable]:   # psql, git…: as they are
+                return real_popen(argv, **kwargs)
+            launched.append(list(argv))
+            return real_popen([sys.executable, "-c", "pass"], **kwargs)
+        with mock.patch.object(resident_runner, "PROBE_TIMEOUT_S", 0.3), \
+                mock.patch.object(runner_mod.subprocess, "Popen", side_effect=popen):
+            self._turn(worker, "deux")
+        self.assertIsNone(worker.resident)
+        self.assertTrue(_group_gone(rp.pgid))
+        self.assertEqual(len(launched), 1)        # the turn's own harness
+        self.assertEqual(len(self._starts()), 1)  # no fresh resident
+        self.assertEqual(worker._resident_failures, 1)
+
+    def test_the_life_resource_of_a_resident_is_reviewed_after_a_reboot(self):
+        # T3 (#285): the resource row of a resident LIFE (opened when the
+        # process starts, under its `life_id`) is covered by the boot review
+        # (L106/L147) exactly as a turn's: after a simulated reboot, nothing
+        # survives — it is settled, never left `running`
+        from ameesh import resources as resources_mod
+        runner, worker = self._worker()
+        self.assertTrue(self._turn(worker, "un"))
+        rp = worker.resident
+        rp.kill_now()
+        self.assertTrue(_group_gone(rp.pgid))
+        turns = storage.of(self.db).turn_resources
+        self.assertEqual(turns.get(rp.life_id)["status"], "running")
+        self.db.execute("UPDATE turn_resources SET started_at = now() - interval '2 hours'"
+                        " WHERE turn_id = %s", (rp.life_id,))
+        with mock.patch.object(resources_mod, "boot_time",
+                               return_value=time.time() - 3600), \
+                mock.patch.object(runner_mod, "log"):
+            restes = [r["turn_id"] for r in runner.report_boot_orphans()]
+        self.assertNotIn(rp.life_id, restes)      # rien ne survit : pas d'orphelin
+        self.assertEqual(turns.get(rp.life_id)["status"], "done")
 
 
 if __name__ == "__main__":

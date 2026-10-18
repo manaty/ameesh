@@ -54,6 +54,7 @@ import subprocess
 import time
 
 from . import storage
+from .canon import NO_LAZY_FETCH
 
 PHASES = ("agent", "ci", "review", "human")
 #: priority of the phases when they overlap (first wins)
@@ -208,18 +209,23 @@ def size_class(changed_lines: int | None) -> str | None:
     return "m" if changed_lines <= SIZE_M_MAX else "l"
 
 
-def _git(repo: str, *args: str) -> str | None:
+def _git(repo: str, *args: str, env_extra: dict | None = None) -> str | None:
+    env = {**os.environ, **env_extra} if env_extra else None
     try:
         proc = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
-                              timeout=CALL_TIMEOUT_S)
+                              timeout=CALL_TIMEOUT_S, env=env)
     except (OSError, subprocess.SubprocessError):
         return None
     return proc.stdout if proc.returncode == 0 else None
 
 
 def has_commit(repo: str, sha: str) -> bool:
+    # #1749 : sonde de présence — pas de fetch paresseux dans un clone
+    # partiel (chaque échec laissait un `git <defunct>` adopté par
+    # l'exécuteur).
     return bool(sha and _SHA_RE.match(sha)
-                and _git(repo, "cat-file", "-e", "%s^{commit}" % sha) is not None)
+                and _git(repo, "cat-file", "-e", "%s^{commit}" % sha,
+                         env_extra=NO_LAZY_FETCH) is not None)
 
 
 def parse_shortstat(text: str) -> dict:
@@ -231,19 +237,22 @@ def parse_shortstat(text: str) -> dict:
 
 
 def _parents(repo: str, sha: str) -> list[str]:
-    out = _git(repo, "rev-list", "--parents", "-n", "1", sha)
+    out = _git(repo, "rev-list", "--parents", "-n", "1", sha,
+               env_extra=NO_LAZY_FETCH)
     return out.split()[1:] if out else []
 
 
 def _is_ancestor(repo: str, a: str, b: str) -> bool:
-    return _git(repo, "merge-base", "--is-ancestor", a, b) is not None
+    return _git(repo, "merge-base", "--is-ancestor", a, b,
+                env_extra=NO_LAZY_FETCH) is not None
 
 
 def _target(repo: str, target: str | None) -> str | None:
     from . import plan_git
 
     for name in (target, plan_git.default_target(repo)):
-        if name and _git(repo, "rev-parse", "--verify", "-q", "%s^{commit}" % name):
+        if name and _git(repo, "rev-parse", "--verify", "-q", "%s^{commit}" % name,
+                         env_extra=NO_LAZY_FETCH):
             return name
     return None
 
@@ -269,17 +278,63 @@ def diff_range(repo: str, sha: str, target: str | None = None) -> tuple[str, str
     tgt = _target(repo, target)
     if tgt and _is_ancestor(repo, sha, tgt):
         merges = (_git(repo, "rev-list", "--ancestry-path", "--merges", "--reverse",
-                       "%s..%s" % (sha, tgt)) or "").split()
+                       "%s..%s" % (sha, tgt), env_extra=NO_LAZY_FETCH) or "").split()
         for merge in merges:
             first = _parents(repo, merge)[:1]
             if first and not _is_ancestor(repo, sha, first[0]):
                 return first[0], merge
         return (parents[0] if parents else empty), sha
     if tgt:
-        base = (_git(repo, "merge-base", tgt, sha) or "").strip()
+        base = (_git(repo, "merge-base", tgt, sha,
+                     env_extra=NO_LAZY_FETCH) or "").strip()
         if base:
             return base, sha
     return (parents[0] if parents else empty), sha
+
+
+def lot_diff_range(repo: str, sha: str, target: str | None = None) -> tuple[str, str] | None:
+    """The (base, head) of the **lot's own** change brought by `sha` (#2374).
+
+    `diff_range` reads what the merge made enter the target: a merge whose tree
+    equals its first parent has no diff there, even though the lot changed
+    files that another commit had already carried (a rebase, a cherry-pick, an
+    adaptation merged first). Classifying that empty diff would say « light »
+    without ever reading the lot.
+
+    The lot's delta is `merge-base(first parent, lot head)..lot head`: the
+    commit the merge brought in (its second parent), or `sha` itself when the
+    merge record is the branch tip. None without a merge commit to anchor it —
+    never a guess."""
+    if not has_commit(repo, sha):
+        return None
+    merge = ""
+    if len(_parents(repo, sha)) >= 2:
+        merge = sha
+    else:
+        tgt = _target(repo, target)
+        if tgt and _is_ancestor(repo, sha, tgt):
+            merges = (_git(repo, "rev-list", "--ancestry-path", "--merges", "--reverse",
+                           "%s..%s" % (sha, tgt), env_extra=NO_LAZY_FETCH) or "").split()
+            for candidate in merges:
+                first = _parents(repo, candidate)[:1]
+                if first and not _is_ancestor(repo, sha, first[0]):
+                    merge = candidate
+                    break
+    parents = _parents(repo, merge) if merge else []
+    if len(parents) < 2:
+        return None
+    base = (_git(repo, "merge-base", parents[0], parents[1],
+                 env_extra=NO_LAZY_FETCH) or "").strip()
+    return (base or parents[0], parents[1])
+
+
+def diff_paths(repo: str, base: str, head: str) -> list[str] | None:
+    """The paths changed between two commits, or None when the diff is not
+    readable (the caller then doubts, never concludes « light »)."""
+    text = _git(repo, "diff", "--name-only", "--no-renames", base, head)
+    if text is None:
+        return None
+    return [line for line in text.splitlines() if line]
 
 
 def diff_stat(repo: str, sha: str, target: str | None = None) -> dict | None:

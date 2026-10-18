@@ -12,10 +12,11 @@ import os
 import threading
 import time
 import unittest
+from unittest import mock
 
 from ameesh import db as db_mod
-from ameesh import (canon, canon_sync, plan, plan_git, plan_github, progress, registry,
-                    stagnation, storage, work)
+from ameesh import (canon, canon_sync, plan, plan_git, plan_github, progress,
+                    registry, review_lot, stagnation, storage, work)
 
 from .fake_github import FakeGh
 from .support import FAKEBIN, PgTestCase
@@ -482,6 +483,28 @@ class GithubTest(_PlanDb):
                              if (e["note"] or "").startswith("stage merged")), 1)
         self.assertEqual({c[0] + " " + c[1] for c in self.gh.calls()},
                          {"pr list", "api --paginate"})
+
+    def test_sync_github_ouvre_le_lot_de_relecture_l539(self):
+        # #1104 : une fusion constatée par GitHub est une fusion enregistrée
+        # comme une autre ; elle ouvre le lot de relecture (L539). Une fusion
+        # GitHub n'a pas de dépôt local, donc pas d'intervalle de fusion
+        # prouvé : la classe est doublée ici (R1 #1104 P2-1 : sans intervalle
+        # prouvé, `class_at_merge` ne classe jamais) ; la lecture de classe a
+        # ses propres témoins (test_1104…). Non couvert ici (N2 de la R1,
+        # assumé) : la route GitHub `repo=None` → `_repo_of_agent` puis
+        # `lot_class.repository`, qui exige un dépôt local sur l'agent.
+        a = work.add(self.db, title="léger", package="cat-recherche")
+        work.milestone(self.db, a["id"], "frozen", sha=SHA, actor="alice")
+        self.merged_pr(1, "lot/cat-recherche-index")
+        with mock.patch.object(review_lot, "class_at_merge",
+                               return_value={"class": "light", "why": "policy"}):
+            report = plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual({r["work_item"]: r["result"] for r in report["results"]},
+                         {a["id"]: "merged"})
+        rows = storage.of(self.db).work.by_issue_ref(review_lot.ref_of(a["id"]))
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["state"], "intake")
+        self.assertIsNone(rows[0]["assignee"])
 
     def test_sync_github_branche_lot_numero_et_pr_partielle(self):
         # L118b : lot/<id>-… sans fiche de ce nom ferme le lot <id> ; une PR
@@ -1072,6 +1095,92 @@ class ContentMergeTest(_PlanDb):
         self.assertNotIn(other["id"], self.run_sync())
         self.assertEqual(work.get(self.db, other["id"])["state"], "closed")
 
+    def test_2399_gel_d_origine_verdict_ferme_quand_le_contenu_est_dans_la_cible(self):
+        """Cas #2366 : un avis `ok` sur la tête vaut gel effectif
+        (`freeze.origin=verdict`) ; sans jalon `frozen`, `sync-merges` ferme
+        dès que le contenu relu est dans la cible (#2399)."""
+        git(self.repo, "checkout", "-q", "-b", "agent/lot-2366")
+        sha = self.commit("src/recu.py", "recu = 1\n", "lot 2366")
+        item = work.add(self.db, title="#2366", branch="agent/lot-2366")
+        for state in ("build", "qa"):
+            work.move(self.db, item["id"], state)
+        work.milestone(self.db, item["id"], "verdict", verdict="ok", sha=sha,
+                       actor="relecteur")
+        self.assertEqual(
+            plan_git.freeze_candidate(work.milestones(self.db, item["id"]),
+                                      self.repo, "main")["origin"], "verdict")
+        # avis rendu mais contenu pas encore dans la cible : rien ne ferme
+        self.assertEqual(self.run_sync()[item["id"]]["result"], "open")
+        git(self.repo, "checkout", "-q", "main")
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet 64", "agent/lot-2366")
+        result = self.run_sync()[item["id"]]
+        self.assertEqual((result["result"], result["how"], result["freeze_origin"]),
+                         ("merged", "ancestor", "verdict"))
+        self.assertEqual(work.get(self.db, item["id"])["state"], "merged")
+        self.assertEqual(self.run_sync(), {})
+
+    def test_2399_un_avis_sur_une_autre_tete_ne_ferme_pas(self):
+        """Le gel d'origine verdict n'est retenu que si le SHA est la tête :
+        un avis sur un commit que la branche a dépassé ne ferme pas."""
+        git(self.repo, "checkout", "-q", "-b", "agent/lot-avance")
+        reviewed = self.commit("src/a.py", "a = 1\n", "relu")
+        item = work.add(self.db, title="avance", branch="agent/lot-avance")
+        for state in ("build", "qa"):
+            work.move(self.db, item["id"], state)
+        work.milestone(self.db, item["id"], "verdict", verdict="ok", sha=reviewed,
+                       actor="relecteur")
+        self.commit("src/a.py", "a = 2\n", "après l'avis")   # tête non relue
+        git(self.repo, "checkout", "-q", "main")
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet", "agent/lot-avance")
+        result = self.run_sync()[item["id"]]
+        self.assertEqual(result["result"], "no-commit")
+        self.assertIsNone(result["freeze_origin"])
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+
+    def _verdict_lot(self, branch):
+        git(self.repo, "checkout", "-q", "-b", branch)
+        reviewed = self.commit("src/%s.py" % branch.split("/")[-1], "x = 1\n", "relu")
+        item = work.add(self.db, title=branch, branch=branch)
+        for state in ("build", "qa"):
+            work.move(self.db, item["id"], state)
+        work.milestone(self.db, item["id"], "verdict", verdict="ok", sha=reviewed,
+                       actor="relecteur")
+        return item, reviewed
+
+    def test_2444_la_tete_publiee_prime_sur_la_locale(self):
+        """#2444 : la tête confrontée à l'avis est `origin/<branche>` d'abord ;
+        une locale restée sur le commit relu ne masque pas une forge avancée."""
+        item, reviewed = self._verdict_lot("agent/lot-publie")
+        ahead = self.commit("src/lot-publie.py", "x = 2\n", "poussé après l'avis")
+        git(self.repo, "update-ref", "refs/remotes/origin/agent/lot-publie", ahead)
+        git(self.repo, "checkout", "-q", "main")
+        git(self.repo, "branch", "-f", "--no-track", "agent/lot-publie", reviewed)
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet", reviewed)
+        result = self.run_sync()[item["id"]]
+        self.assertEqual((result["result"], result["freeze_origin"]), ("no-commit", None))
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+
+    def test_2444_une_branche_disparue_ne_vaut_pas_controle_de_la_tete(self):
+        """#2444 : sans tête lisible, le gel d'origine verdict n'est pas retenu."""
+        item, reviewed = self._verdict_lot("agent/lot-disparu")
+        git(self.repo, "checkout", "-q", "main")
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet", "agent/lot-disparu")
+        git(self.repo, "branch", "-q", "-D", "agent/lot-disparu")
+        result = self.run_sync()[item["id"]]
+        self.assertEqual((result["result"], result["freeze_origin"]), ("no-commit", None))
+        self.assertIn("branch head not found", result["detail"])
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+
+    def test_2444_un_gel_apparu_sans_gel_examine_refuse(self):
+        """#2444 : fermeture par gel d'origine verdict (`unfrozen`) — un gel
+        déclaré entre la lecture et l'écriture rend `refrozen`."""
+        item, reviewed = self._verdict_lot("agent/lot-regel")
+        work.milestone(self.db, item["id"], "frozen", sha=reviewed, actor="auteur")
+        done = work.close_merged(self.db, item["id"], sha=reviewed, actor="git:main",
+                                 source="content (ancestor)", unfrozen=True)
+        self.assertEqual(done["result"], "refrozen")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+
     # -- revue codex1 (750c221), sondes reprises telles quelles -----------------
     def test_seul_le_dernier_gel_compte(self):
         """P2-1 : un gel antérieur déjà fusionné ne ferme pas un lot regelé
@@ -1152,7 +1261,9 @@ class ContentMergeTest(_PlanDb):
                 tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
                          (item["id"],))
                 thread.start()
-                self._wait_lock("FOR UPDATE")
+                # Le verrou de ligne précède désormais l'UPDATE pour respecter
+                # l'ordre dépôt -> lot des réservations de migration (#711).
+                self._wait_lock("SELECT migration_repo FROM work_items WHERE id =")
                 tx.query("INSERT INTO work_item_milestones (work_item_id, kind, sha)"
                          " VALUES (%s, 'frozen', %s) RETURNING id", (item["id"], "d" * 40))
             thread.join(10)

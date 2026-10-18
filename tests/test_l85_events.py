@@ -395,6 +395,45 @@ class EventLogPgTest(PgTestCase):
                 events.prune(self.db, days=365, max_s=1.0)
             self.assertLess(time.monotonic() - start, 5.0)
 
+    def test_two_overlapping_prunes_both_progress(self):
+        """#1711 (Codex N1 of #928): two pruners chose the same first batch;
+        the second waited on the first's rows, then found them gone and
+        deleted nothing — the runner said "expired event(s) left, none
+        deleted" while the other progressed. Locked when chosen, the batch
+        of the second skips the deleted rows and takes the next ones."""
+        self._empty()
+        for name in ("alert:pa", "alert:pb"):
+            self._old_event(name)
+        other = db_mod.connect(self.cfg)
+        self.addCleanup(other.close)
+        probe = db_mod.connect(self.cfg)
+        self.addCleanup(probe.close)
+        result = {}
+
+        def second():
+            try:
+                result["n"] = storage.of(self.db).events.prune(365, 1, 10.0)
+            except Exception as exc:  # noqa: BLE001 - reported below
+                result["error"] = exc
+
+        with other.transaction() as tx:
+            # the first pruner, its batch deleted and not yet committed
+            tx.execute("delete from ameesh_events where object = 'alert:pa'")
+            # the waiter is whoever this backend blocks (the psql driver
+            # opens a backend per statement: its pid is not known ahead)
+            first = int(tx.query("select pg_backend_pid() as p")[0]["p"])
+            worker = threading.Thread(target=second, daemon=True)
+            worker.start()
+            deadline = time.monotonic() + 10.0
+            while not probe.query("select 1 from pg_stat_activity"
+                                  " where %s = any(pg_blocking_pids(pid))", (first,)):
+                self.assertLess(time.monotonic(), deadline, "the second pruner never waited")
+                time.sleep(0.05)
+        worker.join(15.0)
+        self.assertNotIn("error", result)
+        self.assertEqual(result.get("n"), 1)
+        self.assertEqual(self._kept(), [])
+
     def test_prune_is_not_stopped_by_a_kept_event_and_raises_the_watermark(self):
         """Codex P2 r5: a first row (in (tx, id) order) that never expires
         stopped a prefix retention for good. By `created_at`, and the
