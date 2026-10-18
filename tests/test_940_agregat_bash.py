@@ -53,6 +53,7 @@ def scenario(**over: str) -> str:
         "needs.psycopg.result": "success",
         "needs.psql.result": "success",
         "needs.platform-macos.result": "success",
+        "needs.fs-class.result": "success",
         "needs.version.result": "success",
         "github.event_name": "pull_request",
     }
@@ -81,6 +82,13 @@ class AggregateGuardTest(unittest.TestCase):
 
     def test_vert_quand_tout_reussit(self):
         self.assertEqual(run_script(scenario()).returncode, 0)
+
+    def test_autre_fs_accepte_seulement_reussite_ou_saut_legitime(self):
+        for result in ("success", "skipped", "failure", "cancelled"):
+            with self.subTest(result=result):
+                done = run_script(scenario(**{"needs.fs-class.result": result}))
+                self.assertEqual(done.returncode == 0, result in ("success", "skipped"),
+                                 done.stdout)
 
     def test_psql_en_echec_rougit_le_job(self):
         done = run_script(scenario(**{"needs.psql.result": "failure"}))

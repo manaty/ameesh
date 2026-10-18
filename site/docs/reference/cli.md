@@ -111,6 +111,9 @@ gets an `event`, without being woken) and a `send all` announcement without
 agent-runner [--host H] [--runner-id ID] [--agents a,b] [--once [--wait S]]
              [--dry-run] [--max-turns N] [--lease-ttl S] [--poll S]
              [--idle-nudge S] [--migrate]
+             [--take-idle S] [--take-max-per-hour N]
+             [--take-lot-idle S] [--take-lot-max-per-hour N] [--take-interval S]
+             [--balance-hours H] [--balance-min USD] [--balance-window S]
 agent-runner register <name> <claude|codex|deepseek> [--cwd DIR] [--prompt TEXT]
              [--session ID] [--chantier C] [--model M] [--budget USD]
 agent-runner stop <name>
@@ -129,6 +132,20 @@ agent-runner stop <name>
 | `--poll` | fallback poll interval in seconds (default 5) |
 | `--idle-nudge` | nudge after N seconds of inactivity (default 1200) |
 | `--migrate` | apply migrations before starting |
+| `--take-idle` | take a backlog item for an idle agent after S seconds (default 1800; 0 turns it off) |
+| `--take-max-per-hour` | backlog takes per rolling hour, for the whole mesh (default 2) |
+| `--take-lot-idle` | take the best unassigned lot of an idle agent's team after S seconds (default 900; 0 turns it off) |
+| `--take-lot-max-per-hour` | team lots taken per rolling hour, for the whole mesh (default 6) |
+| `--take-interval` | seconds between two takes by this runner (default 60; 0 turns the runner's take off) |
+| `--balance-hours`, `--balance-min`, `--balance-window` | thresholds of the `balance_low` alert (runway in hours, USD floor, averaging window), the same as `ameesh alerts`; a pay-per-token agent never takes under that alert |
+
+Since #804 the runner triggers the take itself, for the agents it serves, on
+the host where they run: the same `backlog.auto_take` and the same safeguards
+as `ameesh notify` (idle, budget, hosts on hold, `balance_low`, hourly caps
+counted in the database), with the same `AMEESH_TAKE_*` settings. The remaining
+place is re-read before each take, so simultaneous passes no longer consume
+the same place. Distribution no longer depends on a central notifier;
+`ameesh notify` keeps its own take where it runs.
 
 `register` registers an agent in the registry; `stop` marks it stopped (no new
 lease; the current turn finishes).
@@ -335,8 +352,8 @@ ameesh work list [--state S] [--assignee A] [--limit N] [--stale-after S] [--jso
 ameesh work show <id> [--json]
 ameesh work move <id> <intake|build|qa|merged|promoted|blocked|waiting_human> [--note N] [--actor A]
 ameesh work move <id> merged --correct REASON [--actor A]
-ameesh work merged <id> --sha SHA [--note N] [--actor A]
-ameesh work assign <id> <agent> [--externe] [--actor A] [--branch agent/…] [--target BRANCH]
+ameesh work merged <id> --sha SHA [--migration-landed N] [--note N] [--actor A]
+ameesh work assign <id> <agent> [--externe] [--actor A] [--claim] [--branch agent/…] [--target BRANCH]
 ameesh work dependencies <id> [--add ID|--remove ID] [--actor A]   # blocking prerequisites (L385)
 ameesh work migration <id> [--number N] [--release] [--repo R]   # reserve a migration number (L122)
 ameesh work set-app <id> <project> [--actor A] | backfill-app [--dry-run]
@@ -349,6 +366,9 @@ ameesh work project-github --app PROJECT [--repo R] [--dry-run]   # one issue pe
 ameesh work resolve <lot> --with <other> [--json]     # prepare a conflict resolution (L160d)
 ameesh work queue add <id> | remove <id> | show [--target BRANCH] [--json]   # merge queue (L160e)
 ameesh work land <id> [--project P] [--json]          # land the queue head (L160e2)
+ameesh release open <id> --base SHA                   # freeze the release perimeter (L750)
+ameesh release check <id> [--repo R] [--json]         # moved base, full suite on the head (L756)
+ameesh release reason <id> --text "…"                 # record why the release base moved after the freeze
 ameesh work sync-branches [--host H | --all-hosts] [--dry-run] [--json]
 ameesh work delegate <id> <agent> --within 30m|2h|1d|SECONDS [--actor A]
 ameesh work expire-delegations [--dry-run] [--json]
@@ -365,7 +385,12 @@ ameesh work unrecorded [--since 24h|2h|7d|ISO-DATE] [--limit N] [--json]
 prerequisites between lots (L385). `work migration` reserves the next free
 migration number for the lot, per repository, **before** the file is written
 (L122); `--number` reserves an exact one, `--release` gives it back. It is
-idempotent and visible in `work show`. `work set-app` corrects a
+idempotent and visible in `work show`. `work merged --migration-landed N`
+records the number that actually landed when the landing renumbered the
+reservation (a packet takes the target's max+1, #1567); the option also
+corrects an already merged lot, so `work show` names the landed number (its
+file, and the reservation when it differs) instead of showing only the
+reservation. `work set-app` corrects a
 lot's project and `work backfill-app` fills the uniquely inferred ones, both
 with a journal entry (#333). `work link` attaches a lot to a WorkPackage card
 (`--none` detaches it),
@@ -438,6 +463,14 @@ deadline: if the delegate has not worked on it by then, the lot goes back to
 the delegator (`--actor`, else the current assignee). The runner processes
 deadlines at every pass; `expire-delegations` does it by hand. See
 [Operate agents](../guides/operate-agents.md#guarded-assignment-and-delegation).
+
+`--claim` assigns only a lot that has **no assignee**: a lot already taken is
+refused (exit 1) naming its holder, and the write is conditional on the
+assignee still being empty, so two concurrent claims produce a single
+assignment and the other is refused without changing hands (#1026). The
+`stale_lot` (unassigned lot) and `idle_capacity` (lots without an agent)
+briefs carry that command; a deliberate reassignment of a lot already held
+stays `work assign` without `--claim`.
 
 **Branch of a lot (L118).** `--branch` records the lot's branch, `--target`
 its target (default: `git config ameesh.target` in the repository, else

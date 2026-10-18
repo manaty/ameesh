@@ -38,6 +38,10 @@ _ITEM_COLUMNS = ", ".join([
     "w.estimate_minutes", "w.estimate_source", "w.estimate_by",
     "extract(epoch from w.estimate_at)::float8 AS estimate_ts",
     "extract(epoch from w.started_at)::float8 AS started_ts",
+    # #2204/N5 : la frise porte les relecteurs comme progress/list (lot_state
+    # ne doit pas diverger entre les deux lectures).
+    "coalesce(to_jsonb(w)->>'reviewer', '') AS reviewer",
+    "to_jsonb(w)->'reviewers' AS reviewers",
 ])
 
 _COMMITMENT_COLUMNS = ", ".join([
@@ -53,12 +57,13 @@ _COMMITMENT_COLUMNS = ", ".join([
 _ITEMS_SQL = """
 SELECT __COLS__, count(*) OVER ()::bigint AS total
   FROM work_items w
- WHERE w.state NOT IN (__DONE__)
+ WHERE (w.state NOT IN (__DONE__)
     OR w.planned_start IS NOT NULL OR w.planned_end IS NOT NULL
     OR w.planned_delivery IS NOT NULL
     OR w.updated_at >= to_timestamp(%s)
     OR EXISTS (SELECT 1 FROM commitments c
-                WHERE c.work_item_id = w.id AND c.status IN ('proposed', 'open'))
+                WHERE c.work_item_id = w.id AND c.status IN ('proposed', 'open')))
+ __PROJECT__
  ORDER BY (w.state NOT IN (__DONE__)) DESC, w.created_at, w.id
  LIMIT %s
 """
@@ -68,7 +73,8 @@ _WRITABLE = ("what", "due_on", "kind", "status", "owner", "project", "work_item_
              "package_id", "source_kind", "source_ref", "depends_on", "note", "created_by",
              "proposal_key")
 #: colonnes que `set_commitment` peut changer
-_SETTABLE = ("status", "due_on", "note", "owner", "project", "work_item_id", "depends_on")
+_SETTABLE = ("what", "kind", "status", "due_on", "note", "owner", "project",
+             "work_item_id", "package_id", "source_kind", "source_ref", "depends_on")
 
 
 def _row(row: dict) -> dict:
@@ -143,12 +149,15 @@ class Roadmap(interface.Roadmap):
             tuple(params) + (ident,))
         return rows[0] if rows else None
 
-    def items(self, *, since_ts, limit, done_states) -> list[dict]:
+    def items(self, *, since_ts, limit, done_states, project=None) -> list[dict]:
         done = list(done_states) or [""]
         sql = _ITEMS_SQL.replace("__COLS__", _ITEM_COLUMNS).replace(
-            "__DONE__", ", ".join(["%s"] * len(done)))
-        return self.db.query(sql, tuple(done) + (float(since_ts),) + tuple(done)
-                             + (int(limit),))
+            "__DONE__", ", ".join(["%s"] * len(done))).replace(
+                "__PROJECT__", "AND (w.app = %s OR w.workstream = %s)" if project else "")
+        params = tuple(done) + (float(since_ts),)
+        if project:
+            params += (project, project)
+        return self.db.query(sql, params + tuple(done) + (int(limit),))
 
     def commitments(self, *, statuses=None, ids=None) -> list[dict]:
         where, params = [], []
@@ -197,7 +206,7 @@ class Roadmap(interface.Roadmap):
         rows = self._insert(row, on_conflict="ON CONFLICT (proposal_key) DO NOTHING")
         return _row(rows[0]) if rows else None
 
-    def set_commitment(self, ident, *, current, values) -> dict | None:
+    def set_commitment(self, ident, *, current, values, expect=None) -> dict | None:
         sets, params = [], []
         for key in _SETTABLE:
             if key not in values:
@@ -215,8 +224,16 @@ class Roadmap(interface.Roadmap):
         if values.get("status") in ("done", "cancelled"):
             sets.append("closed_at = now()")
         current = list(current)
+        checks, expected = [], []
+        if expect is not None:
+            for key in _SETTABLE:
+                if key not in expect:
+                    continue
+                cast = "::date" if key == "due_on" else "::jsonb" if key == "depends_on" else ""
+                checks.append(" AND %s IS NOT DISTINCT FROM %%s%s" % (key, cast))
+                expected.append(json.dumps(expect[key]) if key == "depends_on" else expect[key])
         rows = self.db.query(
-            "UPDATE commitments SET %s WHERE id = %%s AND status IN (%s) RETURNING %s" % (
-                ", ".join(sets), ", ".join(["%s"] * len(current)), _COMMITMENT_COLUMNS),
-            tuple(params) + (int(ident),) + tuple(current))
+            "UPDATE commitments SET %s WHERE id = %%s AND status IN (%s)%s RETURNING %s" % (
+                ", ".join(sets), ", ".join(["%s"] * len(current)), "".join(checks), _COMMITMENT_COLUMNS),
+            tuple(params) + (int(ident),) + tuple(current) + tuple(expected))
         return _row(rows[0]) if rows else None

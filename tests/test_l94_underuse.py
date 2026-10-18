@@ -9,7 +9,8 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import exploitation, mail, notify, registry, storage, sous_utilisation, work
+from ameesh import (exploitation, mail, notify, plan, registry, roadmap, storage, sous_utilisation,
+                    work, work_dependencies)
 
 from .support import PgTestCase
 
@@ -128,6 +129,17 @@ class PlanUnderusedTest(_Base):
         self.jauge("claude", "seven_day", 0.95, 2 * JOUR, 7 * JOUR, account="primaire")
         self.assertEqual(self.alertes(), [])
 
+    def test_seau_de_modele_au_seuil_ne_bloque_pas_la_fenetre_generale(self):
+        """#1789/N6 : un seau propre à un modèle (#1580, clé `seven_day@fable`)
+        au seuil ne rend pas la capacité **générale** du compte inutilisable —
+        l'alerte de fin de fenêtre de la fenêtre de 5 h reste due."""
+        self.jauge("claude", "five_hour", 0.10, 30 * 60, 5 * HEURE, account="primaire")
+        self.jauge("claude", "seven_day@fable", 0.95, 2 * JOUR, 7 * JOUR,
+                   account="primaire")
+        out = self.alertes()
+        self.assertEqual([(a["gauge"], a["reason"]) for a in out],
+                         [("five_hour", "fin_de_fenetre")])
+
     def test_releve_echu_et_releves_sans_compte(self):
         # fenêtre échue : la suivante ne court qu'au premier usage
         self.jauge("codex", "codex-300min", 0.0, -60, 5 * HEURE, account="secondaire")
@@ -197,6 +209,33 @@ class IdleCapacityTest(_Base):
         return _types(exploitation.alerts(self.cfg, self.db, now=self.now, **_seuils(**kw)),
                       "idle_capacity", "orchestrator_held")
 
+    def test_lot_planifie_suit_l_horloge_de_l_alerte(self):
+        from ameesh import plan
+        self.agent("claude1")
+        lot = work.add(self.db, title="lot planifie")
+        libre = work.add(self.db, title="libre")
+        jour = time.strftime("%Y-%m-%d", time.localtime(self.now + 3 * JOUR))
+        self.db.execute("UPDATE work_items SET planned_start = %s WHERE id = %s",
+                        (jour, lot["id"]))
+        debut = plan.day_start_ts(jour)
+        listing = self.listing()
+        # L'horloge du passage franchit la date, celle du poste reste avant :
+        # le lot est retenu par son début prévu (#1625), donc pas démarrable ;
+        # #1608 : l'alerte le dit et nomme l'attente au lieu de se taire.
+        with mock.patch("ameesh.planned_waits.time.time", return_value=debut - JOUR):
+            avant = sous_utilisation.idle_capacity(
+                self.db, listing, debut - JOUR, [], paid=("deepseek",))
+            # #2337 B1 : le lot planifié n'est pas démarrable, mais `libre`
+            # l'est — l'alerte se lève sur le seul lot à confier.
+            self.assertEqual(sorted(avant[0]["lots"]), sorted([lot["id"], libre["id"]]))
+            self.assertEqual(avant[0]["startable_lots"], [libre["id"]])
+            self.assertEqual(avant[0]["blocked_lots"],
+                             {str(lot["id"]): {"what": "scheduled", "start": jour}})
+            out = sous_utilisation.idle_capacity(
+                self.db, listing, debut, [], paid=("deepseek",))
+        self.assertEqual(sorted(out[0]["startable_lots"]), sorted([lot["id"], libre["id"]]))
+        self.assertEqual(out[0]["blocked_lots"], {})
+
     def test_lots_sans_assigne(self):
         self.agent("claude1")
         self.agent("codex2", "codex")
@@ -218,6 +257,155 @@ class IdleCapacityTest(_Base):
         work.assign(self.db, lot["id"], "claude1")
         self.assertEqual(self.alertes(), [])
         self.assertEqual(self.alertes(idle_capacity_s=0), [])
+
+    def test_lots_tous_bloques_ne_levent_pas(self):
+        """#2337 B1 : des lots sans assigné tous retenus par une dépendance ne
+        sont pas du travail à confier ; sans lot démarrable, pas d'alerte (les
+        bloqués restent le détail d'une alerte levée autrement)."""
+        self.agent("claude1")
+        self.agent("claude2", status="running", since_s=60)
+        bloqueur = work.add(self.db, title="bloqueur")
+        work.assign(self.db, bloqueur["id"], "claude2")
+        for i in range(3):
+            lot = work.add(self.db, title="bloqué %d" % i)
+            work_dependencies.add(self.db, lot["id"], bloqueur["id"], actor="test")
+        self.assertEqual(sous_utilisation.idle_capacity(
+            self.db, self.listing(), self.now, [], paid=()), [])
+
+    def test_lot_d_un_autre_projet_ne_leve_pas(self):
+        """#2337 B4 : cinq agents Nexlink au repos ne sont pas une capacité
+        pour un lot ameesh ; l'alerte ne se lève que sur un couple possible
+        (projet du lot dans ceux d'un agent au repos)."""
+        self.agent("claude1")
+        self.db.execute("UPDATE agent_registry SET team = 'nexlink' WHERE name = 'claude1'")
+        lot = work.add(self.db, title="lot ameesh", app="ameesh")
+        self.assertEqual(sous_utilisation.idle_capacity(
+            self.db, self.listing(), self.now, [], paid=()), [])
+        # contre-épreuve : un agent du projet du lot rend le couple possible
+        self.agent("claude2")
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = 'claude2'")
+        alerte = sous_utilisation.idle_capacity(
+            self.db, self.listing(), self.now, [], paid=())[0]
+        self.assertEqual(alerte["startable_lots"], [lot["id"]])
+
+    def test_cle_stable_quand_forfait_bascule(self):
+        """#2337 B2 : `aggravating` bascule à chaque début/fin de tour d'un
+        agent payé ; la raison ne change pas la clé — un seul courrier."""
+        self.agent("claude1")
+        self.agent("deepseek1", "deepseek", status="running", since_s=60)
+        work.add(self.db, title="à prendre")
+        avec = sous_utilisation.idle_capacity(
+            self.db, self.listing(), self.now, [], paid=("deepseek",))[0]
+        self.assertEqual(avec["reason"], "forfait_au_repos")
+        envois = []
+
+        class Faux:
+            def send(self, channel, message):
+                envois.append(message)
+
+        ncfg = notify.parse_config({"default": ["desktop"]})
+        notifier = notify.Notifier(self.cfg, ncfg, sender=Faux(), log=lambda t: None,
+                                   clock=lambda: self.now)
+        records = notifier.run_pass(self.db, thresholds=_seuils())
+        self.assertEqual([(r["type"], r["event"]) for r in records
+                          if r["type"] == "idle_capacity"],
+                         [("idle_capacity", "raised")])
+        # fin de tour de l'agent payé : `aggravating` devient faux ; la
+        # situation des agents au repos, elle, n'a pas changé.
+        self.db.execute("UPDATE agent_registry SET status = 'idle', status_since = now()"
+                        " - interval '2 hours' WHERE name = 'deepseek1'")
+        sans = sous_utilisation.idle_capacity(
+            self.db, self.listing(), self.now, [], paid=("deepseek",))[0]
+        self.assertEqual(sans["reason"], "travail_en_attente")
+        self.assertEqual(notify.key_of(avec), notify.key_of(sans))
+        records = notifier.run_pass(self.db, thresholds=_seuils())
+        self.assertEqual([r for r in records if r["type"] == "idle_capacity"], [])
+
+    def test_lot_bloque_n_est_pas_propose_au_dispatch(self):
+        """#1608 : un lot sans assigné qui attend une dépendance n'est pas
+        proposé ; le brief nomme le bloqueur et ne propose que le démarrable."""
+        self.agent("claude1")
+        self.agent("claude2")
+        self.agent("orch")
+        bloqueur = work.add(self.db, title="bloqueur")
+        work.assign(self.db, bloqueur["id"], "claude2")      # hors des lots à confier
+        attente = work.add(self.db, title="à prendre")
+        work_dependencies.add(self.db, attente["id"], bloqueur["id"], actor="test")
+        libre = work.add(self.db, title="libre")
+        alerte = _types(self.alertes(), "idle_capacity")[0]
+        self.assertEqual(sorted(alerte["lots"]), sorted([attente["id"], libre["id"]]))
+        self.assertEqual(alerte["startable_lots"], [libre["id"]])
+        self.assertEqual(alerte["blocked_lots"][str(attente["id"])],
+                         {"what": "dependency", "lots": [bloqueur["id"]]})
+        self.assertIn("#%d waits on #%d" % (attente["id"], bloqueur["id"]), alerte["detail"])
+        self.assertIn("1 startable now: #%d" % libre["id"], alerte["detail"])
+
+        briefs = sous_utilisation.orchestrator_briefs(
+            {**alerte, "orchestrators": ["orch"]}, self.listing(),
+            {attente["id"]: "à prendre", libre["id"]: "libre"})
+        texte = briefs["orch"]
+        self.assertIn('Open lots without an agent: #%d "libre"' % libre["id"], texte)
+        self.assertNotIn('#%d "à prendre"' % attente["id"], texte)
+        self.assertIn("Waiting for a prerequisite: #%d waits on #%d"
+                      % (attente["id"], bloqueur["id"]), texte)
+        self.assertIn("Give them work tied to a lot", texte)
+        # #2337 B3 : le brief ne promet plus une durée de repos (le repos se
+        # lit sur les lots actionnables depuis #1677).
+        self.assertIn("without an actionable lot", texte)
+        self.assertNotIn("for more than", texte)
+
+    def test_aucun_lot_demarrable_le_dit(self):
+        """#1608 : sans lot démarrable, le brief le dit et écarte le dispatch.
+        #2337 B1 : l'alerte ne se lève plus pour un lot bloqué seul — ici le
+        forfait au repos la lève, et le brief garde le texte sans dispatch."""
+        self.agent("claude1")
+        self.agent("claude2")
+        self.agent("orch")
+        self.agent("deepseek1", "deepseek", status="running", since_s=60)
+        bloqueur = work.add(self.db, title="bloqueur")
+        work.assign(self.db, bloqueur["id"], "claude2")
+        attente = work.add(self.db, title="à prendre")
+        work_dependencies.add(self.db, attente["id"], bloqueur["id"], actor="test")
+        alerte = _types(self.alertes(), "idle_capacity")[0]
+        self.assertEqual(alerte["lots"], [attente["id"]])
+        self.assertEqual(alerte["startable_lots"], [])
+        self.assertNotIn("ameesh work assign", alerte["detail"])
+        briefs = sous_utilisation.orchestrator_briefs(
+            {**alerte, "orchestrators": ["orch"]}, self.listing(),
+            {attente["id"]: "à prendre"})
+        texte = briefs["orch"]
+        self.assertIn("No startable open lot without an agent: #%d waits on #%d"
+                      % (attente["id"], bloqueur["id"]), texte)
+        self.assertIn("Do not assign a lot that waits", texte)
+        self.assertNotIn("Give them work tied to a lot", texte)
+
+    def test_bloqueur_de_feuille_de_route_hors_liste_affichee(self):
+        """La liste bornée des candidats ne borne pas la vérité des dépendances."""
+        self.agent("claude1")
+        self.agent("deepseek1", "deepseek", status="running", since_s=60)
+        attente = work.add(self.db, title="à prendre")
+        bloqueur = work.add(self.db, title="hors de la liste affichée")
+        roadmap.add_commitment(self.db, "release", due="2999-01-01", lot=attente["id"],
+                               depends_on=["#%d" % bloqueur["id"]])
+        # #2337 B1 : le lot bloqué ne lève plus l'alerte à lui seul ; le forfait
+        # au repos la lève, et le détail garde le bloqueur hors liste.
+        alerte = sous_utilisation.idle_capacity(
+            self.db, self.listing(), self.now, [], paid=("deepseek",),
+            lots=[attente])[0]
+        self.assertEqual(alerte["startable_lots"], [])
+        self.assertEqual(alerte["blocked_lots"][str(attente["id"])]["lots"], [bloqueur["id"]])
+        self.assertNotIn("ameesh work assign", alerte["detail"])
+
+    def test_demarrage_planifie_suit_l_instant_evalue(self):
+        self.agent("claude1")
+        attente = work.add(self.db, title="planifié")
+        storage.of(self.db).roadmap.plan_item(
+            attente["id"], {"start": "2999-01-01"}, source="test", actor="test")
+        debut = plan.day_start_ts("2999-01-01")
+        with mock.patch("ameesh.planned_waits.time.time", return_value=debut - 1):
+            alerte = sous_utilisation.idle_capacity(
+                self.db, self.listing(), debut, [], lots=[attente])[0]
+        self.assertEqual(alerte["startable_lots"], [attente["id"]])
 
     def test_forfait_au_repos_pendant_que_le_token_travaille(self):
         self.agent("claude1")
@@ -272,6 +460,54 @@ class IdleCapacityTest(_Base):
         work.assign(self.db, autre["id"], "orch", actor="orch")
         self.assertEqual(sous_utilisation.orchestrators(self.cfg, self.db, self.listing()),
                          ["orch"])
+
+    def test_destinataires_d_alerte_sans_role_par_historique(self):
+        # #1114 : l'historique des lots confiés (30 j) ne confère pas le rôle
+        # de destinataire d'alerte ; le modèle de rôle (`orchestrators`) le
+        # garde pour l'autorité (correction, plan, analyse).
+        self.agent("claude1")
+        self.agent("autre")
+        self.agent("orch", status="running", owner="attach:proprio@poste", since_s=3 * HEURE)
+        lot = work.add(self.db, title="lot")
+        work.assign(self.db, lot["id"], "autre", actor="agent:orch")
+        work.add(self.db, title="à prendre")       # lot ouvert sans agent : idle_capacity
+
+        class Fiche:
+            def __init__(self, data):
+                self.data = data
+
+        class Agent:
+            def __init__(self, title, roles):
+                self.title, self.fiche = title, Fiche({"roles": roles})
+
+        class Canon:
+            agents = [Agent("orch", ["implementation"])]
+
+        class CanonOrch:
+            agents = [Agent("orch", ["orchestrateur"])]
+
+        # L242c (#424 r1) : un rôle déclaré (même non orchestrateur) coupe la
+        # déduction par l'historique des lots confiés.
+        self.assertEqual(sous_utilisation.orchestrators(self.cfg, self.db, self.listing(),
+                                                        canons=[Canon()]), [])
+        # sans aucun rôle déclaré, le modèle de rôle garde l'historique (L94) ;
+        # le chemin d'alerte ne le fait pas (#1114).
+        self.assertEqual(sous_utilisation.orchestrators(self.cfg, self.db, self.listing(),
+                                                        canons=[]), ["orch"])
+        self.assertEqual(sous_utilisation.alert_orchestrators(
+            self.cfg, self.db, self.listing(), canons=[]), [])
+        self.assertEqual(sous_utilisation.alert_orchestrators(
+            self.cfg, self.db, self.listing(), canons=[Canon()]), [])
+        # le rôle déclaré au canon, lui, reste admis
+        self.assertEqual(sous_utilisation.alert_orchestrators(
+            self.cfg, self.db, self.listing(), canons=[CanonOrch()]), ["orch"])
+        # claude1 est au repos sans lot : l'alerte ne prend pas l'assigneur
+        repos = _types(self.alertes(), "idle_capacity")
+        self.assertEqual(len(repos), 1)
+        self.assertEqual(repos[0]["orchestrators"], [])
+        # déclaré explicitement (hub sans équipe) : destinataire, et pas par historique
+        repos = _types(self.alertes(orchestrators_declared=("orch",)), "idle_capacity")
+        self.assertEqual(repos[0]["orchestrators"], ["orch"])
 
 
 class HostUnderusedTest(_Base):

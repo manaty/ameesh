@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Bounded process-local cache of journal observations, never budget decisions."""
 from collections import OrderedDict
+from copy import copy
 from threading import Lock
 
 
@@ -11,6 +12,12 @@ class GaugeCache:
     number of journals and account observations per journal; removed agent
     directories therefore cannot cause unlimited retention. No transcript
     text, credentials, registry entries or budget decisions are retained.
+
+    Une observation est `(estampille, production, gauges)` (#1132) : le cache
+    en garde une copie et `get` en rend une autre (#1702 N5) — un appelant ne
+    peut pas muter l'observation partagée par un autre CostBook, l'invariant
+    n'est plus porté par un commentaire. La copie garde le TYPE de la liste
+    (son `overage` pour `Gauges`) sans recopier ses éléments, qui sont gelés.
     """
 
     def __init__(self, max_entries=128, max_accounts=64):
@@ -22,9 +29,16 @@ class GaugeCache:
     def get(self, path):
         with self._lock:
             value = self._entries.get(path)
-            if value is not None:
-                self._entries.move_to_end(path)
-            return value
+            if value is None:
+                return None
+            self._entries.move_to_end(path)
+            signature, readings = value
+            # #1702 (N5) : copie défensive à la lecture. `copy` à l'insertion
+            # ne protégeait que la mutation du producteur ; `get` rendait la
+            # liste interne, et l'invariant « un appelant ne mute pas » n'était
+            # qu'un commentaire. La liste rendue est propre à l'appelant.
+            return signature, {account: (stamp, produced, copy(gauges))
+                               for account, (stamp, produced, gauges) in readings.items()}
 
     def __setitem__(self, path, value):
         signature, readings = value
@@ -32,8 +46,15 @@ class GaugeCache:
             self._entries.pop(path, None)
             if len(readings) > self.max_accounts:
                 return
-            frozen = {account: (stamp, tuple(gauges))
-                      for account, (stamp, gauges) in readings.items()}
+            # #1132 : un relevé est (estampille, production, Gauges) ; le cache
+            # en garde une copie — la lecture partagée ne doit pas être mutée
+            # par un appelant — avec l'overage porté par les `Gauges` (#1649).
+            # #1661 : jamais l'objet mutable du producteur ; `copy` rend un
+            # `Gauges` neuf (type et overage conservés), les fenêtres étant
+            # gelées (`replace`) par le producteur, et `_claude_gauges_of`
+            # rend une copie fraîche à chaque appelant.
+            frozen = {account: (stamp, produced, copy(gauges))
+                      for account, (stamp, produced, gauges) in readings.items()}
             self._entries[path] = (signature, frozen)
             while len(self._entries) > self.max_entries:
                 self._entries.popitem(last=False)

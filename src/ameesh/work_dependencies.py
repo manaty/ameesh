@@ -2,7 +2,10 @@
 """L385: explicit prerequisites, service validation and work CLI."""
 from __future__ import annotations
 
+import datetime
 import json
+import os
+import time
 
 from . import storage, work
 
@@ -46,8 +49,160 @@ def grouped(db, item_ids):
 
 
 # --------------------------------------------------------------------------
+# #1945 : atterrissage planifié sur un véhicule de paquet
+# --------------------------------------------------------------------------
+
+#: #2171 N4 : une déclaration reste une échéance courte et finie. Une borne
+#: haute empêche un `--until 2099-12-31` de parquer un lot sans terme crédible.
+#: C'est un terme d'EXPLOITATION, pas une règle de processus neuve : le défaut
+#: est réglable par `AMEESH_LANDING_MAX_DAYS`, comme le seuil stale
+#: (`AMEESH_STALE_AFTER`, `stagnation.py`). Le canon §7 refuse un paramètre
+#: mécanique codé en dur ; le geste lit donc son terme dans l'environnement.
+DEFAULT_MAX_DAYS = 90
+LANDING_MAX_ENV = "AMEESH_LANDING_MAX_DAYS"
+
+
+def max_days(env=None):
+    """Le terme maximal d'une déclaration, en jours : env, sinon 90."""
+    env = os.environ if env is None else env
+    raw = (env.get(LANDING_MAX_ENV) or "").strip()
+    if not raw:
+        return DEFAULT_MAX_DAYS
+    try:
+        value = int(raw)
+    except ValueError:
+        raise work.WorkError("unreadable %s: %r (whole days ahead)"
+                             % (LANDING_MAX_ENV, raw))
+    if value <= 0:
+        raise work.WorkError("%s must be positive" % LANDING_MAX_ENV)
+    return value
+
+
+def _require_frozen_with_verdict(db, item_id):
+    """#2171 N3 : on ne parque qu'un lot gelé, au verdict ok ACQUIS.
+
+    Même vérité que l'étiquette de `stagnation` (`progress._jalons_de_lot`) :
+    le verdict retenu doit porter sur le dernier gel. Sans cette garde, le geste
+    masquerait stale pour un lot encore en cours (build) ou en attente de
+    relecture. L'absence de lot est laissée au stockage (`unknown_lot`)."""
+    from . import progress
+    item = work.get(db, item_id)
+    if item is None:
+        return
+    if item.get("state") != "qa":
+        raise work.WorkError("the landing lot must be in review (qa) before it "
+                             "can be parked")
+    st = storage.of(db)
+    jalons = progress._jalons_de_lot(
+        item, st.progress.lot_transitions([item_id]),
+        st.progress.lot_actions([item_id]),
+        st.progress.lot_milestones([item_id]))
+    if not jalons.get("last_frozen"):
+        raise work.WorkError("the landing lot must be frozen (qa) before it can "
+                             "be parked")
+    if jalons.get("verdict_kind") != "ok" or not jalons.get("verdict_current"):
+        raise work.WorkError("the landing lot needs an acquired ok verdict on its "
+                             "last freeze")
+
+
+def land(db, item_id, vehicle_id, *, until_on, actor):
+    """Déclare (ou renouvelle) l'atterrissage planifié du lot sur un véhicule.
+
+    Le lot et le véhicule doivent être ouverts et distincts ; l'échéance est
+    une journée ISO, fin de journée incluse, bornée à [aujourd'hui, +90 j]
+    (#2171 N4). Le lot parké doit être en revue (qa), gelé, avec un verdict ok
+    acquis sur son dernier gel (#2171 N3). L'admission est ÉPINGLÉE au gel
+    du véhicule : il doit porter une tête gelée et ne pas être `blocked`. Un
+    simple geste, aucun texte libre ; l'étape et la tête épinglée sont relues
+    à chaque passe, un nouveau gel exige un renouvellement explicite."""
+    _id(item_id)
+    _id(vehicle_id)
+    if not isinstance(actor, str) or not actor.strip():
+        raise work.WorkError("a landing declaration needs an identified actor")
+    try:
+        day = datetime.date.fromisoformat(str(until_on)[:10])
+    except (TypeError, ValueError, OverflowError):
+        raise work.WorkError("--until expects an ISO day (YYYY-MM-DD)")
+    # #2171 N4 : bornes de la déclaration — ni un jour déjà passé, ni une
+    # échéance invraisemblable (le résolveur ne lit que des journées finies).
+    today = datetime.date.today()
+    if day < today:
+        raise work.WorkError("--until %s is already past: the deadline must be "
+                             "today or later" % day.isoformat())
+    limit = max_days()
+    if (day - today).days > limit:
+        raise work.WorkError("--until %s is too far: at most %d days ahead"
+                             % (day.isoformat(), limit))
+    with db.transaction() as tx:
+        result = storage.of(tx).work_dependencies.set_landing(
+            item_id, vehicle_id, until_on=day.isoformat(), actor=actor)
+        # The storage call retains the graph and endpoint locks until this
+        # outer transaction ends. Recheck under those locks; a refused verdict
+        # rolls back both the declaration and its journal before any commit.
+        if not result.get("error"):
+            _require_frozen_with_verdict(tx, item_id)
+    errors = {"self_landing": "a lot cannot land on itself",
+              "unknown_lot": "landing endpoints must be existing lots",
+              "not_in_review": "the landing lot must be in review (qa)",
+              "finished_lot": "the landing lot must still be open",
+              "finished_vehicle": "the vehicle must still be open",
+              "no_freeze": "the vehicle has no frozen head: freeze it before "
+                           "declaring the landing",
+              "blocked_vehicle": "the vehicle is blocked: unblock it or wait for "
+                                 "its next freeze"}
+    if result.get("error"):
+        raise work.WorkError(errors[result["error"]])
+    return result["landed"]
+
+
+def clear_landing(db, item_id, *, actor):
+    """Retire la déclaration d'atterrissage (rend le signal stale)."""
+    _id(item_id)
+    if not isinstance(actor, str) or not actor.strip():
+        raise work.WorkError("a landing declaration needs an identified actor")
+    return storage.of(db).work_dependencies.clear_landing(item_id, actor=actor)
+
+
+def landings(db, item_ids):
+    """`{lot: ligne}` des atterrissages déclarés (lecture groupée)."""
+    return {int(row["work_item_id"]): row
+            for row in storage.of(db).work_dependencies.landings_for(item_ids)}
+
+
+def landing_head(db, vehicle_id):
+    """Dernier gel du véhicule (sha), ou None : la tête exacte, lue en base.
+
+    #2171 N2 : même départage que `set_landing` et `_with_heads` — `(at, id)`
+    le plus grand, jamais l'ordre de lecture."""
+    from .planned_waits import latest_freeze
+    row = latest_freeze(storage.of(db).progress.lot_milestones([int(vehicle_id)]))
+    return row["sha"].strip() if row else None
+
+
+def landing_label(landing, head=None):
+    """Libellé d'une attente d'atterrissage : véhicule, étape, tête, échéance."""
+    label = "landing on vehicle #%d" % int(landing["vehicle"])
+    step = landing.get("step")
+    if step or head:
+        details = [d for d in (step, "head %s" % head[:12] if head else None) if d]
+        label += " (%s)" % ", ".join(details)
+    if landing.get("until"):
+        label += " until %s" % landing["until"]
+    return label
+
+
+# --------------------------------------------------------------------------
 # L385 suite : réveiller l'agent d'un dépendant quand sa dernière attente tombe
 # --------------------------------------------------------------------------
+
+def _pinned(row) -> bool:
+    """Le lot est-il pinné sur une révision Process (colonne 0452) ?
+
+    Lu dans la ligne d'activité (`open_lots_activity` porte `workflow_ref` par
+    `to_jsonb`, '' sur une base d'avant la migration), jamais par une sonde de
+    colonne ni un SELECT brut (#1922/B5)."""
+    return bool(str(row.get("workflow_ref") or ""))
+
 
 def released_by(db, blocker_id) -> list[dict]:
     """Lots ouverts dont la fermeture de `blocker_id` lève l'attente.
@@ -65,6 +220,12 @@ def released_by(db, blocker_id) -> list[dict]:
     vérité que `planned_wait`. Les lots fermés, fusionnés ou sans arête vers
     `blocker_id` n'en font jamais partie.
 
+    #1922/N13 : un lot pinné sur une révision Process n'est pas libéré par la
+    fermeture — seul un `release` du registre, vérifié par C, lève sa retenue.
+    Il est donc écarté ici, à la source : la réouverture `intake` des
+    dépendants non assignés (B4) comme le courrier de réveil à leur agent
+    promettraient une reprise que le registre seul peut autoriser.
+
     C'est le caractère « dernière attente » qui rend le réveil idempotent :
     tant qu'un autre bloqueur tient, la fermeture ne rend personne ; la
     fermeture qui suit, sérialisée par le verrou de graphe, est la seule à
@@ -73,7 +234,8 @@ def released_by(db, blocker_id) -> list[dict]:
     st = storage.of(db)
     blocker_id = int(blocker_id)
     open_items = st.operations.open_lots_activity(None)
-    rows = [r for r in open_items if int(r["id"]) != blocker_id]
+    rows = [r for r in open_items
+            if int(r["id"]) != blocker_id and not _pinned(r)]
     ids = [int(r["id"]) for r in rows]
     if not ids:
         return []
@@ -107,9 +269,10 @@ def _released_text(row, blocker_id, blocker_state, blocker_reason=""):
     lot = int(row["id"])
     title = (row.get("title") or "").strip()[:60]
     title = " \"%s\"" % title if title else ""
-    if blocker_state == "merged":
-        return ("Dependency released: lot #%d is merged; lot #%d%s no longer waits on "
-                "any lot. Resume it when you are ready." % (int(blocker_id), lot, title))
+    if blocker_state in ("merged", "promoted"):
+        return ("Dependency released: lot #%d is %s; lot #%d%s no longer waits on "
+                "any lot. Resume it when you are ready."
+                % (int(blocker_id), blocker_state, lot, title))
     why = " (%s)" % blocker_reason if blocker_reason else ""
     return ("Dependency released: lot #%d was closed%s, not merged; lot #%d%s no longer "
             "waits on any lot. Reassess the prerequisite before resuming."
@@ -133,10 +296,20 @@ def notify_released(db, blocker_id, *, blocker_state, blocker_reason="",
     Ne rattrape AUCUNE erreur : avaler l'échec ici committerait la fermeture
     sans son réveil, précisément le défaut que ce chemin doit exclure. Le fil
     lisible est écrit après le commit (`after_commit`, appelé par l'appelant).
+
+    #1668 : un dépendant NON ASSIGNÉ n'a pas de destinataire ; s'il est encore
+    `blocked` alors que plus rien ne le retient, il repasse `intake` dans la
+    même transaction — il redevient démarrable au self-service sans geste
+    d'agent, au lieu d'attendre une alerte stale (jusqu'à 14 h).
+
     Rend une ligne par courrier déposé (`lot`, `to`, `message_id`)."""
     from . import mail
     out: list[dict] = []
     rows = released_by(db, blocker_id)
+    unassigned = [int(r["id"]) for r in rows if not (r.get("assignee") or "").strip()]
+    if unassigned:
+        storage.of(db).work_dependencies.release_unassigned(
+            unassigned, actor=work.SYSTEM_SENDER)
     for row in rows:
         to = (row.get("assignee") or "").strip()
         if not to or to.startswith(work.HUMAN_PREFIX):
@@ -158,6 +331,27 @@ def wait_label(wait):
         return None
     if wait["what"] == "scheduled":
         return "planned start %s" % wait["start"]
+    if wait["what"] == "hold":
+        if wait.get("gate"):
+            return "external hold until %s (%s)" % (wait.get("until"), wait.get("gate"))
+        # #1664 : le hold déclaré, avec son auteur et sa date (le pilote juge
+        # sur pièce s'il tient toujours).
+        label = "hold"
+        if wait.get("by"):
+            label += " by %s" % wait["by"]
+        if wait.get("since"):
+            label += " since %s" % time.strftime("%Y-%m-%d %H:%M",
+                                                 time.localtime(float(wait["since"])))
+        return label
+    if wait["what"] == "packet":
+        # #2335 : le lot n'attend pas un exécuteur de lot mais la fusion du
+        # porteur `integration/**` (le composeur/pilote la porte).
+        label = "waiting for packet merge #%s" % wait.get("vehicle")
+        if wait.get("branch"):
+            label += " (%s)" % wait["branch"]
+        return label
+    if wait["what"] == "landing":
+        return landing_label(wait, wait.get("head"))
     return "waiting on lots %s" % ", ".join("#%d" % i for i in wait["lots"])
 
 
@@ -194,4 +388,49 @@ def run(db, args):
                 "blocking" if edge["blocking"] else "satisfied"))
         if not edges:
             print("lot #%d: no explicit prerequisites" % args.id)
+    return 0
+
+
+def add_landing_parser(sub, func):
+    parser = sub.add_parser(
+        "landing", help="#1945: declare (or clear) the planned landing on a package vehicle")
+    parser.add_argument("id", type=int, help="landing lot (done, waiting for the vehicle)")
+    parser.add_argument("--vehicle", type=int, metavar="LOT",
+                        help="open lot that carries the composition (the vehicle)")
+    parser.add_argument("--until", metavar="YYYY-MM-DD",
+                        help="finite deadline: the alert returns after that day")
+    parser.add_argument("--clear", action="store_true", help="withdraw the declaration")
+    parser.add_argument("--actor", default="")
+    parser.add_argument("--json", action="store_true")
+    parser.set_defaults(func=func)
+
+
+def run_landing(db, args):
+    _id(args.id)
+    if work.get(db, args.id) is None:
+        raise work.WorkError("lot #%d not found" % args.id)
+    changed = None
+    if args.clear:
+        changed = clear_landing(db, args.id, actor=args.actor)
+    else:
+        if args.vehicle is None or not args.until:
+            raise work.WorkError("a landing declaration needs --vehicle and --until "
+                                 "(or --clear)")
+        changed = land(db, args.id, args.vehicle, until_on=args.until, actor=args.actor)
+    row = landings(db, [args.id]).get(args.id)
+    if args.json:
+        print(json.dumps({"id": args.id, "changed": changed, "landing": row},
+                         ensure_ascii=False, indent=2))
+        return 0
+    if changed is not None:
+        print("lot #%d: landing %s" % (args.id, "updated" if changed else "unchanged"))
+    if row:
+        wait = {"what": "landing", "vehicle": int(row["vehicle_id"]),
+                "step": row.get("vehicle_state"), "until": row.get("until_on")}
+        # la tête affichée est celle de l'admission (épinglée), pas la courante
+        print("#%d: %s" % (args.id,
+                           landing_label(wait, row.get("pinned_sha")
+                                         or landing_head(db, int(row["vehicle_id"])))))
+    else:
+        print("lot #%d: no planned landing" % args.id)
     return 0

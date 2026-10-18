@@ -86,6 +86,39 @@ class MailLinksLotsTest(_Base):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev1")
 
+    def test_branche_citee_d_un_autre_lot_n_est_pas_reprise(self):
+        """#1646 : la branche du parent d'un lot empilé, citée par un courrier,
+        ne devient pas la branche du lot — sa fusion le clorait sans son delta."""
+        parent = work.add(self.db, title="parent empilé", assignee="dev1",
+                          branch="agent/dev1-parent")
+        enfant = work.add(self.db, title="suite empilée", assignee="dev2")
+        proc = self.send("dev2", "Reprends sur agent/dev1-parent puis pousse.", "--from",
+                         "orch", "--lot", str(enfant["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("branch agent/dev1-parent already belongs to lot #%d" % parent["id"],
+                      proc.stderr)
+        self.assertIsNone(work.get(self.db, enfant["id"])["branch"])
+        self.assertEqual(work.get(self.db, parent["id"])["branch"], "agent/dev1-parent")
+        # une branche que personne ne porte reste posée (inchangé)
+        proc = self.send("dev2", "Ta branche : agent/dev2-enfant.", "--from", "orch",
+                         "--lot", str(enfant["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(work.get(self.db, enfant["id"])["branch"], "agent/dev2-enfant")
+
+    def test_branche_citee_d_un_autre_lot_sur_new_lot(self):
+        """#1646 : même garde à la création par courrier."""
+        parent = work.add(self.db, title="parent empilé", assignee="dev1",
+                          branch="agent/dev1-parent")
+        proc = self.send("dev2", "Nouveau lot, base agent/dev1-parent.", "--from", "orch",
+                         "--new-lot", "suite du parent", "--estimate", "1h", "--app", "p",
+                         "--new-project")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = work.list_items(self.db, assignee="dev2")
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["branch"])
+        self.assertIn("branch agent/dev1-parent already belongs to lot #%d" % parent["id"],
+                      proc.stderr)
+
     def test_lot_d_un_autre_agent_jamais_repris(self):
         lot = work.add(self.db, title="implémentation", assignee="dev1")
         proc = self.send("dev2", "Relis le lot de dev1.", "--from", "orch", "--lot",
@@ -180,6 +213,20 @@ class MailLinksLotsTest(_Base):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["work_item_id"], str(lot["id"]))
 
+    def test_profil_divergue_depot_differe_n_avertit_pas_sans_lot(self):
+        """#1614 (#1407) : un `--lot` résolu puis déposé en mode différé
+        (profil divergé, #858) est un rattachement effectif — l'avertissement
+        « has no open lot » ne doit pas apparaître (condition `item is None`
+        de b85c5e5ef), seule la raison du différé est dite."""
+        lot = work.add(self.db, title="RT-9 : cercle de confiance")
+        self.diverge("dev1")
+        proc = self.send("dev1", "À toi : reprends ce lot.", "--from", "orch",
+                         "--lot", str(lot["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("has no open lot", proc.stderr)
+        self.assertIn("lot #%d not assigned to dev1" % lot["id"], proc.stderr)
+        self.assertEqual(self.unread("dev1")[0]["work_item_id"], str(lot["id"]))
+
     def test_new_lot_pour_un_destinataire_non_reveillable_cree_sans_assigne(self):
         """#858 : `--new-lot` vers un agent non réveillable crée le lot sans
         assigné au lieu de perdre le message et la demande."""
@@ -219,7 +266,7 @@ class MailLinksLotsTest(_Base):
         """#858/R1 : un lot fermé/fusionné n'est pas un destinataire non
         réveillable ; le rattachement refuse avant tout dépôt."""
         lot = work.add(self.db, title="RT-9 : cercle de confiance")
-        work.merged(self.db, lot["id"], sha="a" * 40)
+        work.close_merged(self.db, lot["id"], sha="a" * 40)
         proc = self.send("dev1", "Reprends ce lot.", "--from", "orch",
                          "--lot", str(lot["id"]))
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
@@ -247,6 +294,98 @@ class MailLinksLotsTest(_Base):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("matches no open lot", proc.stderr)
         self.assertEqual(self.unread("dev1")[-1]["work_item_id"], "SUJET-LIBRE")
+
+    def test_assign_explicite_attribue(self):
+        # #964: `--assign` is the explicit gesture that hands a FREE lot over
+        # even from a sender the orchestrator detection does not recognise
+        # (no distribution history); without it, its --lot stays a thread
+        # label (invariant #859/#1066 kept).
+        self.agent("dev3")
+        self.assertFalse(assignments.is_orchestrator(self.cfg, self.db, "dev3"))
+        lot = work.add(self.db, title="relecture à confier")
+        proc = self.send("dev1", "Pour information.", "--from", "dev3", "--lot",
+                         str(lot["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+        proc = self.send("dev1", "À toi : relis puis gèle.", "--from", "dev3",
+                         "--lot", str(lot["id"]), "--assign")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("lot #%d assigned to dev1" % lot["id"], proc.stdout)
+        item = work.get(self.db, lot["id"])
+        self.assertEqual(item["assignee"], "dev1")
+        self.assertEqual(self.unread("dev1")[-1]["work_item_id"], str(lot["id"]))
+
+    def test_assign_ne_prend_pas_le_lot_d_un_autre(self):
+        # even with --assign, another agent's lot is not taken over:
+        # handing over goes through `ameesh work assign` (module invariant)
+        self.agent("dev3")
+        lot = work.add(self.db, title="implémentation", assignee="dev3")
+        proc = self.send("dev1", "Relis le lot de dev3.", "--from", "dev2",
+                         "--lot", str(lot["id"]), "--assign")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("belongs to dev3: not reassigned", proc.stderr)
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev3")
+
+    def test_assign_exige_le_lot_et_refuse_l_accuse(self):
+        proc = self.send("dev1", "Coucou.", "--from", "dev2", "--assign")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("--assign requires --lot", proc.stderr)
+        proc = self.send("dev1", "Coucou.", "--from", "dev2", "--lot", "X", "--assign",
+                         "--ack")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("contradict", proc.stderr)
+        self.assertEqual(self.unread("dev1"), [])
+
+    def test_assign_garde_l_assignataire(self):
+        # #1701 N3: an unknown name is refused by `undeliverable.check_send`
+        # before `link_message` (nothing is deposited), not by the L37 guard;
+        # the recipient's assignment guard is covered by the diverged-profile
+        # witness below.
+        lot = work.add(self.db, title="libre")
+        proc = self.send("inconnu", "Travail pour toi.", "--from", "dev2",
+                         "--lot", str(lot["id"]), "--assign")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("message not delivered", proc.stderr)
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+        self.assertEqual(self.unread("inconnu"), [])
+
+    def test_assign_reference_sans_lot_refusee(self):
+        """#1701 N1: `--assign` names the lot to assign, so a reference that
+        matches no open lot is refused before any deposit instead of becoming
+        a plain thread label."""
+        proc = self.send("dev1", "Coucou.", "--from", "dev2", "--lot", "INCONNU",
+                         "--assign")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("message not delivered", proc.stderr)
+        self.assertIn("matches no open lot", proc.stderr)
+        self.assertEqual(self.unread("dev1"), [])
+
+    def test_assign_differe_l_attribution_d_un_profil_diverge(self):
+        """#858/#1701 N3: `--assign` does not bypass the recipient's
+        assignment guard — a diverged profile leaves the lot free, the message
+        goes out and the warning says why."""
+        lot = work.add(self.db, title="RT-9 : cercle de confiance")
+        self.diverge("dev1")
+        proc = self.send("dev1", "À toi : reprends ce lot.", "--from", "dev2",
+                         "--lot", str(lot["id"]), "--assign")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("lot #%d not assigned to dev1" % lot["id"], proc.stderr)
+        self.assertIn("profile diverged", proc.stderr)
+        self.assertIn("delivered to dev1", proc.stdout)
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+        self.assertEqual(self.unread("dev1")[0]["work_item_id"], str(lot["id"]))
+
+    def test_assign_ne_consulte_pas_la_detection_d_orchestrateur(self):
+        """#1701 N2: `--assign` decides alone; the orchestrator detection (a
+        canon read) is not consulted at all."""
+        lot = work.add(self.db, title="libre")
+        with mock.patch.object(assignments, "is_orchestrator",
+                               side_effect=AssertionError("must not be consulted")):
+            linked = assignments.link_message(self.cfg, self.db, sender="dev2",
+                                              recipient="dev1", lot=str(lot["id"]),
+                                              assign=True)
+        self.assertTrue(linked["assigned"])
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev1")
 
     def test_reference_ambigue_refusee(self):
         work.add(self.db, title="DUP : un")
@@ -324,6 +463,20 @@ class BranchMergeTest(_Base):
         self.assertEqual(report["results"][0]["how"], "vu-ancestor")
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
 
+    def test_show_etiquette_la_tete_vue_au_balayage(self):
+        """#1899 : la tête en avance affichée vient du dernier balayage, pas de
+        la forge — deux triages faux le 16/10 l'ont lue comme la tête réelle."""
+        self.branch("agent/dev1-cache", "c1")
+        lot = self.lot("agent/dev1-cache")
+        self.assertEqual(self.sync()["results"][0]["result"], "open")
+        tete = work.get(self.db, lot["id"])["branch_head"]
+        self.assertTrue(tete)
+        proc = self.mesh("work", "show", str(lot["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("tête en avance vue au dernier balayage : %s" % tete[:12], proc.stdout)
+        self.assertIn("vérifier à la forge", proc.stdout)
+        self.assertNotIn("last commit seen ahead", proc.stdout)
+
     def test_squash_puis_branche_supprimee(self):
         self.branch("agent/dev1-sq", "s1", "s2")
         lot = self.lot("agent/dev1-sq")
@@ -385,6 +538,102 @@ class BranchMergeTest(_Base):
         self.assertEqual(plan_git.cited_branch("voir agent/a-b."), "agent/a-b")
 
 
+class CloneRefreshTest(_Base):
+    """#2302 : le relevé rafraîchit le clone de l'assigné et lit le dépôt du
+    projet, pas n'importe quel dépôt posé dans son dossier de travail."""
+
+    def setUp(self):
+        super().setUp()
+        self.origin = os.path.join(self.tmp, "manaty", "ameesh.git")
+        os.makedirs(os.path.dirname(self.origin))
+        _git(self.tmp, "init", "-q", "--bare", "--initial-branch=main", self.origin)
+        self.repo = os.path.join(self.tmp, "clone")
+        _git(self.tmp, "clone", "-q", self.origin, self.repo)
+        self.write(self.repo, "README.md", "base\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "base")
+        _git(self.repo, "push", "-q", "-u", "origin", "main")
+
+    def write(self, repo, name, text):
+        path = os.path.join(repo, name)
+        os.makedirs(os.path.dirname(path) or repo, exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(text)
+
+    def lot_in_another_clone(self, branch):
+        """La branche du lot naît dans un AUTRE clone, puis est fusionnée dans
+        `main` distante : le clone de l'assigné ne voit ni l'une ni l'autre
+        sans fetch."""
+        other = os.path.join(self.tmp, "other-" + branch.replace("/", "-"))
+        _git(self.tmp, "clone", "-q", self.origin, other)
+        _git(other, "checkout", "-q", "-b", branch, "origin/main")
+        self.write(other, "lot.txt", branch + "\n")
+        _git(other, "add", "-A")
+        _git(other, "commit", "-qm", branch)
+        _git(other, "push", "-q", "origin", branch)
+        _git(other, "checkout", "-q", "main")
+        _git(other, "merge", "-q", "--no-ff", "-m", "merge %s" % branch, branch)
+        _git(other, "push", "-q", "origin", "main")
+        return other
+
+    def test_a_stale_clone_is_fetched_before_the_probe(self):
+        branch = "lot/2302-stale"
+        stale = _git(self.repo, "rev-parse", "origin/main")
+        merged = self.lot_in_another_clone(branch)
+        self.assertNotEqual(stale, _git(merged, "rev-parse", "main"))
+        self.agent("dev1", cwd=self.repo)
+        lot = work.add(self.db, title="clone en retard", assignee="dev1",
+                       branch=branch, branch_target="main")
+        report = plan_git.sync_branches(self.db, host=self.cfg.host)
+        entry = report["results"][0]
+        self.assertEqual(entry["result"], "merged", entry)
+        self.assertEqual(entry["target"], "origin/main")     # ref publiée lue
+        self.assertEqual(entry["how"], "ancestor")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    def test_the_project_repo_wins_over_the_assignee_wrong_repo(self):
+        wrong_origin = os.path.join(self.tmp, "manaty", "nexlink.git")
+        _git(self.tmp, "init", "-q", "--bare", "--initial-branch=main", wrong_origin)
+        wrong = os.path.join(self.tmp, "nexlink-clone")
+        _git(self.tmp, "clone", "-q", wrong_origin, wrong)
+        self.write(wrong, "README.md", "nexlink\n")
+        _git(wrong, "add", "-A")
+        _git(wrong, "commit", "-qm", "base")
+        _git(wrong, "push", "-q", "-u", "origin", "main")
+        branch = "lot/2302-wrong-repo"
+        self.lot_in_another_clone(branch)
+        self.agent("dev1", cwd=wrong)
+        self.agent("dev2", cwd=self.repo)
+        lot = work.add(self.db, title="dépôt du projet", assignee="dev1",
+                       branch=branch, branch_target="main",
+                       issue_ref="manaty/ameesh#1692")
+        report = plan_git.sync_branches(self.db, host=self.cfg.host)
+        entry = report["results"][0]
+        self.assertEqual(entry["result"], "merged", entry)
+        self.assertEqual(entry["repo"], self.repo)
+        self.assertIn("working directory", entry["repo_note"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    def test_a_wrong_repo_without_a_local_clone_is_reported(self):
+        wrong_origin = os.path.join(self.tmp, "manaty", "nexlink.git")
+        _git(self.tmp, "init", "-q", "--bare", "--initial-branch=main", wrong_origin)
+        wrong = os.path.join(self.tmp, "nexlink-clone")
+        _git(self.tmp, "clone", "-q", wrong_origin, wrong)
+        self.write(wrong, "README.md", "nexlink\n")
+        _git(wrong, "add", "-A")
+        _git(wrong, "commit", "-qm", "base")
+        _git(wrong, "push", "-q", "-u", "origin", "main")
+        self.agent("dev1", cwd=wrong)
+        lot = work.add(self.db, title="mauvais dépôt", assignee="dev1",
+                       branch="lot/2302-absente", branch_target="main",
+                       issue_ref="manaty/ameesh#1692")
+        report = plan_git.sync_branches(self.db, host=self.cfg.host)
+        entry = report["results"][0]
+        self.assertEqual(entry["result"], "wrong-repo", entry)
+        self.assertIn("manaty/ameesh", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+
+
 class IdleCapacityToOrchestratorTest(_Base):
     """`idle_capacity` part aussi à l'orchestrateur, par courrier `event`."""
 
@@ -427,7 +676,7 @@ class IdleCapacityToOrchestratorTest(_Base):
         rows = self.unread("orch")
         self.assertEqual(len(rows), 1, rows)
         self.assertEqual(rows[0]["kind"], "event")
-        self.assertIn("without a lot", rows[0]["body"])
+        self.assertIn("without an actionable lot", rows[0]["body"])
         notifier.run_pass(self.db, thresholds=seuils)       # même alerte : pas de doublon
         self.assertEqual(len(self.unread("orch")), 1)
 

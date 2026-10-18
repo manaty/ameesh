@@ -1,0 +1,1078 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#1374 : le feu du pilote au gel — atterrissage automatique à la CI verte.
+
+Le feu se donne sur la tête exacte du gel (`ameesh work fire <lot> --sha S`),
+se retire (`--withdraw`), et ne vaut jamais pour un autre gel. Le passage
+(`fire.run_pass`) franchit **d'abord la porte des verdicts** (avis comptés par
+classe, indépendants, sans blocage non levé), puis ouvre la PR ou entre en file,
+puis fusionne au geste effectif sous `--match-head-commit` — jamais en laissant
+une auto-fusion GitHub armée entre deux passages.
+
+Témoins demandés par le lot : lot sans feu, mauvaise tête, feu retiré, CI
+incomplète ou rouge, événement de fusion terminal ; témoins du gel corrigé :
+verdicts avant PR/file/CI, avis indépendants et blocages non masqués, sortie de
+file et garde de `land` après retrait, jalons relus sous bail, bail renouvelé,
+et autorité pilote déclarée. Tests sans base (routage, jalons, GitHub simulé),
+puis sur Postgres (règles de `give`/`withdraw`, bail, CLI, garde de `land`)."""
+from __future__ import annotations
+
+import types
+import unittest
+from unittest import mock
+
+from ameesh import fire, land, lot_class, merge_queue, packet_guard, review, storage, work
+
+from .support import PgTestCase
+
+A = "a" * 40
+B = "b" * 40
+
+#: familles simulées pour la porte des avis (le registre est lu en vrai, ou
+#: remplacé par ce dictionnaire dans les tests sans base).
+FAM = {"author": "deepseek", "rev1": "codex", "rev2": "claude", "rev3": "codex",
+       "ghost": "", "other": "deepseek"}
+
+
+def _mark(kind, sha="", **extra):
+    row = {"kind": kind, "sha": sha, "actor": "pilote", "at_ts": 0.0, "id": 0}
+    row.update(extra)
+    return row
+
+
+def _marks(*rows):
+    return [dict(row, at_ts=float(i), id=i) for i, row in enumerate(rows, start=1)]
+
+
+def _verdict(actor, sha=A, verdict="ok", **extra):
+    return _mark("verdict", sha, verdict=verdict, actor=actor, **extra)
+
+
+def _status(**extra):
+    row = {"number": 7, "state": "OPEN", "head": A, "base": "main", "draft": False,
+           "ci": "green", "merged": False, "merge_commit": "", "armed": False,
+           "url": "https://forge/pr/7"}
+    row.update(extra)
+    return row
+
+
+def _info(**extra):
+    row = {"slug": "manaty/ameesh", "allow_auto_merge": True, "default_branch": "main",
+           "private": True, "merge": True, "squash": True, "rebase": True}
+    row.update(extra)
+    return row
+
+
+def _family(db, name):
+    return FAM.get(str(name or "").strip(), "")
+
+
+class MarkersTest(unittest.TestCase):
+    """Les jalons du feu : le dernier `fire` non suivi d'un `unfire`."""
+
+    def test_active_and_given(self):
+        rows = _marks(_mark("frozen", A), _mark("fire", A, actor="pilote"))
+        self.assertEqual(fire.active(rows)["sha"], A)
+        self.assertEqual(fire.given(rows)["actor"], "pilote")
+        withdrawn = _marks(_mark("frozen", A), _mark("fire", A), _mark("unfire", A))
+        self.assertIsNone(fire.active(withdrawn))
+        self.assertEqual(fire.given(withdrawn)["sha"], A)
+        again = _marks(_mark("frozen", B), _mark("fire", A), _mark("unfire", A),
+                       _mark("fire", B))
+        self.assertEqual(fire.active(again)["sha"], B)
+
+    def test_same_commit_without_repository(self):
+        self.assertTrue(fire.same_commit(A, A.upper()))
+        self.assertFalse(fire.same_commit(A, B))
+        self.assertFalse(fire.same_commit("", A))
+
+    def test_state_covered_and_withdrawn(self):
+        item = {"id": 3, "title": "t", "state": "build", "branch": "lot/3-x"}
+        covered = _marks(_mark("frozen", A), _mark("fire", A))
+        with mock.patch.object(fire.work, "get", return_value=item), \
+                mock.patch.object(fire.work, "milestones", return_value=covered):
+            now = fire.state(None, 3)
+        self.assertTrue(now["active"])
+        self.assertTrue(now["covered"])
+        moved = _marks(_mark("frozen", B), _mark("fire", A))
+        with mock.patch.object(fire.work, "get", return_value=item), \
+                mock.patch.object(fire.work, "milestones", return_value=moved):
+            now = fire.state(None, 3)
+        self.assertTrue(now["active"])
+        self.assertFalse(now["covered"])
+        gone = _marks(_mark("frozen", A), _mark("fire", A), _mark("unfire", A))
+        with mock.patch.object(fire.work, "get", return_value=item), \
+                mock.patch.object(fire.work, "milestones", return_value=gone):
+            now = fire.state(None, 3)
+        self.assertFalse(now["active"])
+        self.assertTrue(now["withdrawn"])
+
+
+class ReviewGateTest(unittest.TestCase):
+    """La porte des avis (#1374, P1-1) : comptés par classe et par domaine
+    (SQL/sécurité/prod = deux avis), indépendants, aucun blocage masqué par un
+    `ok` plus récent d'un AUTRE relecteur."""
+
+    ITEM = {"assignee": "author"}
+    #: un fichier sensible hors SQL/sécurité/prod : un avis d'une autre famille
+    PLAIN = {"path": "docs/design/notes.md", "class": "sensitive", "rule": ["docs/**"]}
+    #: un fichier SQL : deux avis, familles distinctes
+    SQL = {"path": "src/ameesh/migrations/0437_x.sql", "class": "sensitive",
+           "rule": ["src/ameesh/migrations/**", "**/*.sql"]}
+    #: la porte de fusion est de la sécurité : deux avis
+    GATE = {"path": "src/ameesh/merge_queue.py", "class": "sensitive",
+            "rule": ["src/ameesh/merge_queue.py"]}
+
+    def gate(self, marks, klass=None, frozen=A, item=None):
+        if isinstance(klass, str):
+            klass = {"class": klass, "doubt": False}
+            if klass["class"] == "sensitive":
+                klass["files"] = [self.PLAIN]
+        with mock.patch.object(merge_queue, "actor_family", side_effect=_family):
+            return merge_queue.review_gate(None, marks, frozen,
+                                           klass=klass or {"class": "sensitive",
+                                                           "doubt": False,
+                                                           "files": [self.PLAIN]},
+                                           item=item or self.ITEM)
+
+    def test_light_needs_no_verdict(self):
+        out = self.gate(_marks(_mark("frozen", A)), klass="light")
+        self.assertTrue(out["ok"], out["why"])
+        self.assertEqual(out["required"], 0)
+
+    def test_blocked_blocks_even_a_light_lot(self):
+        out = self.gate(_marks(_mark("frozen", A), _verdict("rev1", verdict="blocked")),
+                        klass="light")
+        self.assertFalse(out["ok"])
+        self.assertIn("blocked verdict", out["why"])
+        self.assertIn("rev1", out["why"])
+
+    def test_normal_needs_one_reviewer_that_is_not_the_author(self):
+        out = self.gate(_marks(_mark("frozen", A)), klass="normal")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["required"], 1)
+        out = self.gate(_marks(_mark("frozen", A), _verdict("author")), klass="normal")
+        self.assertFalse(out["ok"], "l'auteur ne relit pas son propre travail")
+        out = self.gate(_marks(_mark("frozen", A), _verdict("ghost")), klass="normal")
+        self.assertTrue(out["ok"], out["why"])
+
+    def test_sensitive_outside_critical_domains_needs_one_other_family(self):
+        out = self.gate(_marks(_mark("frozen", A)))
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["required"], 1)
+        out = self.gate(_marks(_mark("frozen", A), _verdict("rev1")))
+        self.assertTrue(out["ok"], out["why"])
+        unknown = self.gate(_marks(_mark("frozen", A), _verdict("ghost")))
+        self.assertFalse(unknown["ok"], "une famille inconnue ne prouve pas l'indépendance")
+        same = self.gate(_marks(_mark("frozen", A), _verdict("other")))
+        self.assertFalse(same["ok"], "la famille de l'auteur ne compte pas")
+
+    def test_grouped_rule_does_not_add_unchanged_critical_files(self):
+        # #2218 : le canon regroupe runner et porte de fusion dans une règle.
+        policy, problems = review.parse({"default": "light", "rules": [{
+            "paths": ["src/ameesh/runner.py", "src/ameesh/merge_queue.py",
+                      "src/ameesh/land.py"], "class": "sensitive"}]})
+        self.assertEqual(problems, [])
+        klass = review.classify(policy, ["src/ameesh/runner.py", "tests/test_runner.py"])
+        one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
+        self.assertEqual(one["required"], 1)
+        self.assertTrue(one["ok"], one["why"])
+        for actor in ("author", "other", "ghost"):
+            with self.subTest(actor=actor):
+                self.assertFalse(self.gate(
+                    _marks(_mark("frozen", A), _verdict(actor)), klass=klass)["ok"])
+
+    def test_changed_critical_file_keeps_two_reviews_in_a_grouped_rule(self):
+        for path in ("src/ameesh/merge_queue.py", "src/ameesh/land.py",
+                     "src/ameesh/migrations/0460_overview_runner_seen.sql",
+                     "src/ameesh/authority.py", "src/ameesh/approve_check.py",
+                     "src/ameesh/approve_client.py", "src/ameesh/config.py",
+                     "deploy/mise-a-jour/poste.sh"):
+            with self.subTest(path=path):
+                policy, _ = review.parse({"default": "light", "rules": [{
+                    "paths": ["src/ameesh/runner.py", path], "class": "sensitive"}]})
+                klass = review.classify(policy, ["src/ameesh/runner.py", path])
+                one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
+                self.assertEqual(one["required"], 2)
+                self.assertFalse(one["ok"])
+                two = self.gate(_marks(_mark("frozen", A), _verdict("rev1"),
+                                       _verdict("rev2")), klass=klass)
+                self.assertTrue(two["ok"], two["why"])
+
+    def test_sensitive_without_changed_paths_keeps_two_reviews(self):
+        for files in ([], [{"class": "sensitive", "rule": ["src/ameesh/runner.py"]}]):
+            with self.subTest(files=files):
+                klass = {"class": "sensitive", "doubt": False, "files": files}
+                one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
+                self.assertEqual(one["required"], 2)
+                self.assertFalse(one["ok"])
+
+    def test_sql_and_merge_gate_need_two_distinct_families(self):
+        for entry in (self.SQL, self.GATE):
+            klass = {"class": "sensitive", "files": [entry]}
+            one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
+            self.assertFalse(one["ok"], entry["path"])
+            self.assertEqual(one["required"], 2, entry["path"])
+            two = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev2")),
+                            klass=klass)
+            self.assertTrue(two["ok"], two["why"])
+            same = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev3")),
+                             klass=klass)
+            self.assertFalse(same["ok"], "deux avis de la même famille ne comptent qu'une fois")
+            unknown = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("ghost")),
+                                klass=klass)
+            self.assertFalse(unknown["ok"], "une famille inconnue ne prouve pas l'indépendance")
+
+    def test_class_and_off_api_merge_need_two_families(self):
+        # #2249 : la classe du lot, son classement et la fusion hors API sont
+        # la porte de fusion, comme merge_queue et land.
+        for path in ("src/ameesh/merge_pr.py", "src/ameesh/lot_class.py",
+                     "src/ameesh/review.py"):
+            with self.subTest(path=path):
+                klass = {"class": "sensitive", "files": [
+                    {"path": path, "class": "sensitive", "rule": [path]}]}
+                one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
+                self.assertEqual(one["required"], 2)
+                self.assertFalse(one["ok"])
+        near = {"class": "sensitive", "files": [
+            {"path": "src/ameesh/preview.py", "class": "sensitive",
+             "rule": ["src/ameesh/preview.py"]}]}
+        self.assertEqual(merge_queue.required_verdicts(near), 1, "motif ancré au nom")
+
+    #: le canon synthétique du témoin de bout en bout (#2264) : les trois
+    #: chemins que la porte de fusion doit voir (#1629), puis fire.py, qui
+    #: tombe dans la portée critique « prod » (deux avis).
+    GATE_CANON_PATHS = ("src/ameesh/merge_pr.py", "src/ameesh/lot_class.py",
+                        "src/ameesh/review.py")
+    CRITICAL_CANON_PATH = "src/ameesh/fire.py"
+
+    def canon(self, paths=(), default="light", root="canon"):
+        """Un canon minimal, de la même forme que celui de `test_review`."""
+        rules = [{"paths": [path], "class": "sensitive"} for path in paths]
+        return types.SimpleNamespace(
+            root=root, sources=[],
+            federation={"review_policies": {"risk_classes": {
+                "projects": {"ameesh": {"default": default, "rules": rules}}}}})
+
+    def test_the_canon_chain_drives_the_required_verdicts(self):
+        """#2264 : le témoin de #2249 forçait `klass` — il serait resté vert si
+        le canon ne classait plus ces chemins. Ici la classe est lue par
+        `lot_class.class_of_paths` sur un canon synthétique, puis la porte en
+        déduit les avis ; le contrôle négatif (même canon sans règle) retombe
+        à `light`, tout en gardant la ceinture critique de #2265."""
+        canon = self.canon(self.GATE_CANON_PATHS + (self.CRITICAL_CANON_PATH,))
+        for path in self.GATE_CANON_PATHS:
+            klass = lot_class.class_of_paths([canon], "ameesh", [path])
+            self.assertEqual(klass["class"], "sensitive", (path, klass))
+            self.assertFalse(klass["doubt"], (path, klass))
+        critical = lot_class.class_of_paths(
+            [canon], "ameesh", [self.CRITICAL_CANON_PATH])
+        self.assertEqual(critical["class"], "sensitive", critical)
+        self.assertEqual(merge_queue.required_verdicts(critical), 2, critical)
+        together = lot_class.class_of_paths(
+            [canon], "ameesh", self.GATE_CANON_PATHS + (self.CRITICAL_CANON_PATH,))
+        self.assertEqual(merge_queue.required_verdicts(together), 2, together)
+        two = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev2")),
+                        klass=together)
+        self.assertTrue(two["ok"], two["why"])
+        one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=together)
+        self.assertFalse(one["ok"], "la classe lue exige bien deux avis")
+        # Sans règle, la classe devient légère ; #2265 garde deux avis sur
+        # les chemins critiques oubliés du canon, indépendamment de la classe.
+        bare = self.canon()
+        light = lot_class.class_of_paths(
+            [bare], "ameesh", self.GATE_CANON_PATHS + (self.CRITICAL_CANON_PATH,))
+        self.assertEqual(light["class"], "light", light)
+        self.assertEqual(merge_queue.required_verdicts(light), 2, light)
+
+    def test_author_family_never_counts(self):
+        klass = {"class": "sensitive", "files": [self.SQL]}
+        out = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("other")),
+                        klass=klass)
+        self.assertFalse(out["ok"], "l'avis de la famille de l'auteur ne compte pas")
+        self.assertEqual([a["actor"] for a in out["accepted"]], ["rev1"])
+
+    def test_a_doubt_never_supposes_a_family_and_needs_two(self):
+        # B/P1 cx1 (57812f9b..979f2e2b) : un doute (politique ou diff illisible)
+        # peut cacher SQL/la sécurité/la prod ; il garde donc les deux avis des
+        # domaines critiques et l'indépendance ne s'y suppose jamais.
+        klass = {"class": "sensitive", "doubt": True, "files": []}
+        out = self.gate(_marks(_mark("frozen", A)), klass=klass)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["required"], 2)
+        one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
+        self.assertFalse(one["ok"], "un avis ne suffit pas sur un doute")
+        ghost = self.gate(_marks(_mark("frozen", A), _verdict("ghost"), _verdict("rev1")),
+                          klass=klass)
+        self.assertFalse(ghost["ok"], "une famille inconnue ne prouve pas l'indépendance")
+        two = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev2")),
+                        klass=klass)
+        self.assertTrue(two["ok"], two["why"])
+        out = self.gate(_marks(_mark("frozen", A), _verdict("author")), klass=klass)
+        self.assertFalse(out["ok"], "l'auteur ne relit pas son propre travail")
+
+    def test_an_unknown_author_family_never_proves_independence(self):
+        # B/P1 cx1 : quand la famille de l'auteur n'est pas connue, l'ancien
+        # code sautait la comparaison et acceptait n'importe quelle famille.
+        klass = {"class": "sensitive", "files": [self.SQL]}
+        item = {"assignee": "inconnu"}       # famille absente du registre simulé
+        out = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev2")),
+                        klass=klass, item=item)
+        self.assertFalse(out["ok"], "l'indépendance ne se suppose jamais")
+        self.assertIn("no known model family", out["why"])
+        self.assertEqual(out["required"], 2)
+        plain = {"class": "sensitive", "doubt": False, "files": [self.PLAIN]}
+        one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")),
+                        klass=plain, item=item)
+        self.assertFalse(one["ok"], "même un avis unique exige une famille d'auteur connue")
+
+    def test_a_human_author_has_no_model_family_to_compare(self):
+        # un auteur humain n'a pas de famille de modèle : il n'y a rien à
+        # comparer, seules les familles des relecteurs comptent (l'exemption
+        # ne vaut que pour `human:`, jamais pour un agent au registre muet).
+        klass = {"class": "sensitive", "files": [self.SQL]}
+        item = {"assignee": "human:alice"}
+        one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass, item=item)
+        self.assertFalse(one["ok"], "deux avis restent requis pour SQL")
+        two = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev2")),
+                        klass=klass, item=item)
+        self.assertTrue(two["ok"], two["why"])
+        same = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev3")),
+                         klass=klass, item=item)
+        self.assertFalse(same["ok"], "deux avis de la même famille ne comptent qu'une fois")
+
+    def test_normal_lot_keeps_a_verdict_without_a_family(self):
+        # hors classe sensible, un lot normal garde un avis d'un autre agent,
+        # même de famille inconnue : la famille n'y est pas exigée.
+        out = self.gate(_marks(_mark("frozen", A), _verdict("ghost")),
+                        klass="normal", item={"assignee": "inconnu"})
+        self.assertTrue(out["ok"], out["why"])
+
+    def test_a_newer_ok_from_another_reviewer_does_not_mask_a_block(self):
+        klass = {"class": "sensitive", "files": [self.SQL]}
+        marks = _marks(_mark("frozen", A), _verdict("rev1", verdict="blocked"),
+                       _verdict("rev2", verdict="ok"))
+        out = self.gate(marks, klass=klass)
+        self.assertFalse(out["ok"])
+        self.assertIn("rev1", out["why"])
+        lifted = _marks(_mark("frozen", A), _verdict("rev1", verdict="blocked"),
+                        _verdict("rev2"), _verdict("rev1", verdict="ok"))
+        out = self.gate(lifted, klass=klass)
+        self.assertTrue(out["ok"], out["why"])
+
+    def test_verdict_on_another_freeze_is_ignored(self):
+        out = self.gate(_marks(_mark("frozen", B), _verdict("rev1", sha=B),
+                               _verdict("rev2", sha=B)))
+        self.assertFalse(out["ok"], "un avis sur un autre gel n'autorise rien")
+
+    def test_release_keeps_the_verdict_in_the_queue_gate(self):
+        # la file garde un avis pour une release (jamais légère, L160e) ; c'est
+        # le **feu** qui refuse une release (test_release_is_refused, ReadyTest).
+        out = self.gate(_marks(_mark("frozen", A)), klass="release")
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["required"], 1)
+        self.assertIn("class: release", out["why"])
+        ok = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass="release")
+        self.assertTrue(ok["ok"], ok["why"])
+
+    def test_pilot_waiver_lifts_the_verdicts_but_never_a_block(self):
+        # #2281 : `work reviewer --no-verdict` (#1979) marque la dispense de
+        # re-verdict (`reviewer = -none`) ; la porte partagée la respecte,
+        # sans changer la classe ni lever un verdict bloquant courant.
+        for item in ({"assignee": "author", "reviewer": work.REVIEWER_NONE},
+                     {"assignee": "author", "reviewers": [work.REVIEWER_NONE]}):
+            out = self.gate(_marks(_mark("frozen", A)),
+                            klass={"class": "sensitive", "files": [self.SQL]}, item=item)
+            self.assertTrue(out["ok"], out["why"])
+            self.assertTrue(out["waived"])
+            self.assertEqual(out["required"], 2, "la dispense ne change pas la classe")
+        named = self.gate(_marks(_mark("frozen", A)),
+                          klass={"class": "sensitive", "files": [self.SQL]},
+                          item={"assignee": "author", "reviewer": work.REVIEWER_NONE,
+                                "events": [{"note": "verdict not required: no re-verdict "
+                                                    "due (#1979)", "actor": "pilote-x"}]})
+        self.assertEqual(named["waived_by"], "pilote-x")
+        blocked = self.gate(_marks(_mark("frozen", A),
+                                   _verdict("rev1", verdict="blocked")),
+                            klass={"class": "sensitive", "files": [self.SQL]},
+                            item={"assignee": "author", "reviewer": work.REVIEWER_NONE})
+        self.assertFalse(blocked["ok"], "une dispense ne lève jamais une correction due")
+        self.assertIn("blocked verdict", blocked["why"])
+
+    def test_a_stale_waiver_row_does_not_cover_a_new_freeze(self):
+        # #2281/B1 cx1 : la ligne passée à la porte peut être antérieure au
+        # gel ; le stockage a périmé la dispense en base mais la copie la
+        # porte encore. La porte relit la marque après les jalons : un gel B
+        # sans avis reste refusé, même avec une ligne A en main.
+        stale = {"id": 9, "assignee": "author", "reviewer": work.REVIEWER_NONE}
+        fresh = {"id": 9, "assignee": "author", "reviewer": "", "reviewers": []}
+        with mock.patch.object(merge_queue.work, "get", return_value=fresh):
+            out = self.gate(_marks(_mark("frozen", B)),
+                            klass={"class": "sensitive", "files": [self.SQL]},
+                            frozen=B, item=stale)
+        self.assertFalse(out["ok"])
+        self.assertFalse(out["waived"])
+        self.assertIn("no review verdict ok", out["why"])
+
+    def test_the_waiver_actor_comes_from_the_lot_journal(self):
+        # #2281/N1 cx1 : `work.get` ne rend pas les événements ; en usage réel
+        # la note de file doit citer le pilote, lu dans la table du journal.
+        fresh = {"id": 9, "assignee": "author", "reviewer": work.REVIEWER_NONE}
+        ops = mock.Mock()
+        ops.work.events_noted.return_value = [
+            {"note": "verdict not required: no re-verdict due (#1979)",
+             "actor": "pilote-x"}]
+        with mock.patch.object(merge_queue.work, "get", return_value=fresh), \
+                mock.patch.object(merge_queue.storage, "of", return_value=ops):
+            out = self.gate(_marks(_mark("frozen", A)),
+                            klass={"class": "sensitive", "files": [self.SQL]},
+                            item={"id": 9, "assignee": "author",
+                                  "reviewer": work.REVIEWER_NONE})
+        self.assertTrue(out["ok"], out["why"])
+        self.assertEqual(out["waived_by"], "pilote-x")
+
+
+class ReadyTest(unittest.TestCase):
+    """Les portes du feu : verdicts d'abord (sans PR), puis PR/CI."""
+
+    ROW = {"id": 42, "title": "t", "branch": "lot/42-x", "assignee": "author"}
+
+    def _verdicts(self, marks, klass, *, repo=None, project=None, target="main"):
+        with mock.patch.object(fire.lot_class, "of_lot", return_value=klass), \
+                mock.patch.object(merge_queue, "actor_family", side_effect=_family):
+            return fire.ready_verdicts(None, None, self.ROW, marks, repo=repo,
+                                       project=project, target=target)
+
+    def test_light_passes_without_a_pr(self):
+        ok, why, klass = self._verdicts(_marks(_mark("frozen", A)), {"class": "light"})
+        self.assertTrue(ok, why)
+        self.assertEqual(klass["class"], "light")
+
+    def test_sensitive_requires_a_family_before_any_pr(self):
+        marks = _marks(_mark("frozen", A))
+        klass = {"class": "sensitive", "doubt": False, "files": [
+            {"path": "docs/x.md", "class": "sensitive", "rule": ["docs/**"]}]}
+        ok, why, _ = self._verdicts(marks, klass)
+        self.assertFalse(ok)
+        self.assertIn("independent review", why)
+        good = _marks(_mark("frozen", A), _verdict("rev1"))
+        ok, why, _ = self._verdicts(good, klass)
+        self.assertTrue(ok, why)
+
+    def test_sql_needs_two_families_before_any_pr(self):
+        klass = {"class": "sensitive", "files": [
+            {"path": "src/ameesh/migrations/0437_x.sql", "class": "sensitive",
+             "rule": ["**/*.sql"]}]}
+        ok, why, _ = self._verdicts(_marks(_mark("frozen", A), _verdict("rev1")), klass)
+        self.assertFalse(ok)
+        self.assertIn("2 independent review", why)
+        ok, why, _ = self._verdicts(_marks(_mark("frozen", A), _verdict("rev1"),
+                                           _verdict("rev2")), klass)
+        self.assertTrue(ok, why)
+
+    def test_release_is_refused(self):
+        ok, why, _ = self._verdicts(_marks(_mark("frozen", A), _verdict("rev1")),
+                                    {"class": "release"})
+        self.assertFalse(ok)
+        self.assertIn("release", why)
+
+    def test_pr_gates_need_a_green_ci_on_the_frozen_head(self):
+        # #2271 : la protection de la cible est lue à la forge ; ce témoin
+        # isole les autres portes de la PR avec une exigence vide.
+        for ci in ("pending", "red"):
+            ok, why = fire.ready_pr(_status(ci=ci), target="main", project=None,
+                                    frozen=A, required=())
+            self.assertFalse(ok)
+            self.assertIn(ci, why)
+        ok, why = fire.ready_pr(_status(draft=True), target="main", project=None,
+                                frozen=A, required=())
+        self.assertFalse(ok)
+        self.assertIn("draft", why)
+        ok, why = fire.ready_pr(_status(base="develop"), target="main", project=None,
+                                frozen=A, required=())
+        self.assertFalse(ok)
+        self.assertIn("targets", why)
+        ok, why = fire.ready_pr(_status(), target="main", project=None,
+                                frozen=A, required=())
+        self.assertTrue(ok, why)
+
+
+class TargetKeyTest(unittest.TestCase):
+    def test_branch_aliases_share_the_target_lease(self):
+        project = types.SimpleNamespace(name="ameesh")
+        for target in ("main", "origin/main", "refs/heads/main", "refs/remotes/origin/main"):
+            with self.subTest(target=target):
+                self.assertEqual(land.lock_key(project, target), "ameesh:main")
+
+    def test_target_lease_takes_the_train_ttl(self):
+        """Le bail de cible se prend sous `land.LOCK_TTL_S` (le TTL du train),
+        pas sous le TTL court du bail de feu."""
+        seen = []
+
+        class Ops:
+            def land_lock(self, key, owner, ttl, *, epoch=None):
+                seen.append((key, ttl, epoch))
+                return 7
+
+        ops = Ops()
+        project = types.SimpleNamespace(name="ameesh")
+        with mock.patch.object(fire.storage, "of", return_value=mock.Mock(work=ops)):
+            handle, blocked = fire._target_lock(mock.Mock(), project, "main")
+        self.assertFalse(blocked)
+        self.assertEqual(seen[0], ("ameesh:main", land.LOCK_TTL_S, None))
+        self.assertTrue(fire._renew(handle, land.LOCK_TTL_S))
+        self.assertEqual(seen[1], ("ameesh:main", land.LOCK_TTL_S, 7))
+        if land.LOCK_TTL_S != fire.LOCK_TTL_S:
+            self.assertNotEqual(seen[0][1], fire.LOCK_TTL_S)
+
+
+class ActTest(unittest.TestCase):
+    """Le routage d'un passage : verdicts avant PR/file/CI, fusion au geste
+    effectif, jamais d'auto-fusion laissée armée, jamais deux gestes
+    concurrents."""
+
+    ROW = {"id": 42, "title": "un lot", "branch": "lot/42-x", "assignee": "author",
+           "app": "ameesh", "branch_target": "main", "state": "build"}
+
+    def _act(self, marks, status, *, gate=(True, "", {"class": "light"}), pr_gate=(True, ""),
+             info=None, project=None, dry_run=False, opened=None, fresh=None, renew=True,
+             statuses=None, merge=(True, "PR merged"), target_blocked=False,
+             packet_refusal=None):
+        names = ("_repo_of", "_slug", "_project", "_pr_status", "_repo_info", "_target",
+                 "ready_verdicts", "ready_pr", "_merge_pr", "_disarm_auto", "_reconcile",
+                 "_invalidate", "_disarm", "_open_pr", "_queue", "_passive", "_wake",
+                 "_leave_queue", "_fresh", "_renew", "_target_lock", "_unlock")
+        packet_patch = (
+            mock.patch.object(fire.packet_guard, "check_merge",
+                              side_effect=packet_guard.PacketGuardError(packet_refusal))
+            if packet_refusal else
+            mock.patch.object(fire.packet_guard, "check_merge",
+                              return_value={"allowed": True}))
+        with mock.patch.multiple(fire, **{name: mock.DEFAULT for name in names}) as patched, \
+                packet_patch:
+            patched["_repo_of"].return_value = None
+            patched["_slug"].return_value = "manaty/ameesh"
+            patched["_project"].return_value = project
+            if statuses is not None:
+                patched["_pr_status"].side_effect = list(statuses)
+            else:
+                patched["_pr_status"].return_value = status
+            patched["_repo_info"].return_value = info if info is not None else _info()
+            patched["_target"].return_value = "main"
+            patched["ready_verdicts"].return_value = gate
+            patched["ready_pr"].return_value = pr_gate
+            patched["_merge_pr"].return_value = merge
+            patched["_disarm_auto"].return_value = (True, "auto-merge disarmed")
+            patched["_reconcile"].return_value = {"lot": 42, "result": "merged"}
+            patched["_invalidate"].return_value = {"lot": 42, "result": "invalidated"}
+            patched["_disarm"].return_value = {"lot": 42, "result": "disarmed"}
+            patched["_open_pr"].return_value = opened
+            patched["_queue"].return_value = {"lot": 42, "result": "queued"}
+            patched["_leave_queue"].return_value = False
+            patched["_fresh"].return_value = fresh if fresh is not None else (self.ROW, marks)
+            patched["_renew"].return_value = renew
+            patched["_target_lock"].return_value = ((None, True) if target_blocked
+                                                    else (mock.sentinel.cible, False))
+            out = fire._act(None, None, self.ROW, marks, gh=lambda *a, **k: None,
+                            dry_run=dry_run, repo=None, cache={})
+        return out, patched
+
+    def test_lot_without_fire_is_idle(self):
+        out, calls = self._act([], None)
+        self.assertEqual(out["result"], "idle")
+        calls["_merge_pr"].assert_not_called()
+        calls["_disarm"].assert_not_called()
+        calls["_reconcile"].assert_not_called()
+
+    def test_withdrawn_fire_disarms_and_leaves_the_queue(self):
+        out, calls = self._act(_marks(_mark("frozen", A), _mark("fire", A),
+                                      _mark("unfire", A)), _status(armed=True))
+        self.assertEqual(out["result"], "disarmed")
+        calls["_disarm"].assert_called_once()
+        self.assertIn("no active fire", calls["_disarm"].call_args.args[3])
+        calls["_leave_queue"].assert_called_once()
+        calls["_merge_pr"].assert_not_called()
+
+    def test_merged_pr_is_terminal(self):
+        out, calls = self._act(_marks(_mark("frozen", A), _mark("fire", A)),
+                               _status(state="MERGED", merged=True, merge_commit=B))
+        self.assertEqual(out["result"], "merged")
+        calls["_reconcile"].assert_called_once()
+        calls["_merge_pr"].assert_not_called()
+        calls["_invalidate"].assert_not_called()
+
+    def test_wrong_freeze_invalidates(self):
+        out, calls = self._act(_marks(_mark("frozen", B), _mark("fire", A)), _status())
+        self.assertEqual(out["result"], "invalidated")
+        calls["_invalidate"].assert_called_once()
+        self.assertIn("the freeze is", calls["_invalidate"].call_args.args[4])
+        calls["_merge_pr"].assert_not_called()
+
+    def test_moved_head_invalidates(self):
+        out, calls = self._act(_marks(_mark("frozen", A), _mark("fire", A)),
+                               _status(head=B))
+        self.assertEqual(out["result"], "invalidated")
+        calls["_invalidate"].assert_called_once()
+        self.assertIn("the PR head moved", calls["_invalidate"].call_args.args[4])
+        calls["_merge_pr"].assert_not_called()
+
+    def test_packet_guard_refuses_before_any_pr_or_queue(self):
+        """#2333 : un feu de lot hors paquet est refusé avant la PR et la file."""
+        out, calls = self._act(
+            _marks(_mark("frozen", A), _mark("fire", A)), _status(),
+            packet_refusal="direct merge of lot/42-x into main refused: canon §11 bis")
+        self.assertEqual(out["result"], "not-ready")
+        self.assertIn("§11 bis", out["detail"])
+        calls["_open_pr"].assert_not_called()
+        calls["_queue"].assert_not_called()
+        calls["_merge_pr"].assert_not_called()
+
+    def test_verdicts_gate_before_opening_the_pr(self):
+        """L'ordre du gel corrigé (B) : sans avis, aucune PR, donc aucune CI."""
+        out, calls = self._act(
+            _marks(_mark("frozen", A), _mark("fire", A)), None,
+            gate=(False, "2 independent review verdict(s) ok required", {"class": "sensitive"}))
+        self.assertEqual(out["result"], "not-ready")
+        self.assertIn("independent review", out["detail"])
+        calls["_open_pr"].assert_not_called()
+        calls["_merge_pr"].assert_not_called()
+        calls["_queue"].assert_not_called()
+
+    def test_verdicts_gate_before_the_merge_queue(self):
+        project = types.SimpleNamespace(name="nexlink", land="queue", merge_method="merge",
+                                        ci_required=False)
+        out, calls = self._act(
+            _marks(_mark("frozen", A), _mark("fire", A)), _status(), project=project,
+            gate=(False, "blocked verdict(s) on the freeze a not lifted: rev1",
+                  {"class": "sensitive"}))
+        self.assertEqual(out["result"], "not-ready")
+        calls["_queue"].assert_not_called()
+        calls["_merge_pr"].assert_not_called()
+
+    def test_gate_failure_disarms_an_armed_pr(self):
+        out, calls = self._act(_marks(_mark("frozen", A), _mark("fire", A)),
+                               _status(armed=True),
+                               gate=(False, "blocked verdict(s)", {"class": "sensitive"}))
+        self.assertEqual(out["result"], "disarmed")
+        calls["_disarm"].assert_called_once()
+        calls["_merge_pr"].assert_not_called()
+        calls["_open_pr"].assert_not_called()
+
+    def test_ready_merges_now_on_the_exact_head(self):
+        marks = _marks(_mark("frozen", A), _mark("fire", A))
+        out, calls = self._act(marks, _status())
+        self.assertEqual(out["result"], "merged")
+        calls["_merge_pr"].assert_called_once()
+        self.assertEqual(calls["_merge_pr"].call_args.args[2], A)
+        calls["_open_pr"].assert_not_called()
+
+    def test_direct_merge_yields_to_the_target_lease(self):
+        """#1467 : le train tient la cible sous le même bail -> aucun geste."""
+        marks = _marks(_mark("frozen", A), _mark("fire", A))
+        out, calls = self._act(marks, _status(), target_blocked=True)
+        self.assertEqual(out["result"], "busy")
+        calls["_merge_pr"].assert_not_called()
+        calls["_disarm"].assert_not_called()
+        calls["_reconcile"].assert_not_called()
+
+    def test_direct_merge_renews_the_target_lease_at_the_train_ttl(self):
+        """Le bail de cible, renouvelé juste avant le geste, l'est au TTL du
+        train (`land.LOCK_TTL_S`) ; le TTL court du feu ne vaut que pour
+        `fire:<lot>`."""
+        marks = _marks(_mark("frozen", A), _mark("fire", A))
+        out, calls = self._act(marks, _status())
+        self.assertEqual(out["result"], "merged")
+        self.assertEqual(calls["_renew"].call_args_list[-1].args,
+                         (mock.sentinel.cible, land.LOCK_TTL_S))
+        calls["_unlock"].assert_called_once_with(mock.sentinel.cible)
+
+    def test_stale_auto_merge_is_disarmed_before_merging(self):
+        marks = _marks(_mark("frozen", A), _mark("fire", A))
+        out, calls = self._act(marks, None,
+                               statuses=[_status(armed=True), _status(), _status()])
+        self.assertEqual(out["result"], "merged")
+        calls["_disarm"].assert_called_once()
+        calls["_merge_pr"].assert_called_once()
+        self.assertIn("outside the fire", calls["_disarm"].call_args.args[3])
+
+    def test_ci_pending_does_not_merge(self):
+        out, calls = self._act(_marks(_mark("frozen", A), _mark("fire", A)), _status(),
+                               pr_gate=(False, "the CI of PR #7 is pending on the freeze a"))
+        self.assertEqual(out["result"], "not-ready")
+        calls["_merge_pr"].assert_not_called()
+
+    def test_dry_run_touches_nothing(self):
+        out, calls = self._act(_marks(_mark("frozen", A), _mark("fire", A)), None,
+                               dry_run=True)
+        self.assertEqual(out["result"], "would-open-pr")
+        calls["_open_pr"].assert_not_called()
+        calls["_merge_pr"].assert_not_called()
+        out, calls = self._act(_marks(_mark("frozen", A), _mark("fire", A)), _status(),
+                               dry_run=True)
+        self.assertEqual(out["result"], "would-merge")
+        calls["_merge_pr"].assert_not_called()
+
+    def test_land_project_enters_the_queue_after_the_gate(self):
+        project = types.SimpleNamespace(name="nexlink", land="queue", merge_method="merge",
+                                        ci_required=False)
+        out, calls = self._act(_marks(_mark("frozen", A), _mark("fire", A)), _status(),
+                               project=project)
+        self.assertEqual(out["result"], "queued")
+        calls["_queue"].assert_called_once()
+        calls["_merge_pr"].assert_not_called()
+
+    def test_lost_lease_before_the_merge_is_busy(self):
+        out, calls = self._act(_marks(_mark("frozen", A), _mark("fire", A)), _status(),
+                               renew=False)
+        self.assertEqual(out["result"], "busy")
+        calls["_merge_pr"].assert_not_called()
+
+    def test_merge_refused_and_head_moved_invalidates(self):
+        marks = _marks(_mark("frozen", A), _mark("fire", A))
+        out, calls = self._act(marks, None, statuses=[_status(), _status(head=B)],
+                               merge=(False, "head moved"))
+        self.assertEqual(out["result"], "invalidated")
+        calls["_merge_pr"].assert_called_once()
+        calls["_invalidate"].assert_called_once()
+
+    def test_missing_pr_is_opened_only_after_the_gate_then_merged(self):
+        marks = _marks(_mark("frozen", A), _mark("fire", A))
+        out, calls = self._act(marks, None, opened=(_status(), "opened"))
+        self.assertEqual(out["result"], "merged")
+        calls["_open_pr"].assert_called_once()
+        calls["_merge_pr"].assert_called_once()
+
+    def test_unpublishable_pr_is_not_opened(self):
+        out, calls = self._act(_marks(_mark("frozen", A), _mark("fire", A)), None,
+                               opened=(None, "title not publishable (secret)"))
+        self.assertEqual(out["result"], "no-pr")
+        calls["_merge_pr"].assert_not_called()
+
+    def test_closed_pr_is_not_reopened(self):
+        out, calls = self._act(_marks(_mark("frozen", A), _mark("fire", A)),
+                               _status(state="CLOSED"))
+        self.assertEqual(out["result"], "pr-closed")
+        calls["_merge_pr"].assert_not_called()
+
+
+class LandGuardCallTest(unittest.TestCase):
+    """La garde de `land` au dernier geste (#1374, P1-2)."""
+
+    def test_land_refuses_when_the_fire_is_gone(self):
+        ejected = {}
+
+        def eject(reason, todo, **extra):
+            ejected.update(reason=reason, todo=todo)
+            return {"lot": 7, "result": "ejected"}
+
+        landing = types.SimpleNamespace(db=None, lot=7, row={"frozen_sha": A, "branch": "integration/p",
+                                             "target": "main"},
+                                        project=types.SimpleNamespace(repo="/r"), eject=eject)
+        with mock.patch.object(fire, "land_guard", return_value=(False, "fire withdrawn")):
+            out = land._fire_guard(landing)
+        self.assertEqual(out["result"], "ejected")
+        self.assertIn("fire withdrawn", ejected["reason"])
+        self.assertIn("queue remove", ejected["todo"])
+
+    def test_land_continues_without_fire_markers(self):
+        landing = types.SimpleNamespace(db=None, lot=7, row={"frozen_sha": A, "branch": "integration/p",
+                                             "target": "main"},
+                                        project=types.SimpleNamespace(repo="/r"),
+                                        eject=lambda *a, **k: {"result": "ejected"})
+        with mock.patch.object(fire, "land_guard", return_value=(True, "")):
+            self.assertIsNone(land._fire_guard(landing))
+
+
+class FireDbTest(PgTestCase):
+    """Le feu en base : `give`/`withdraw`, bail, passage, CLI, garde de land."""
+
+    def _frozen_lot(self, sha=A):
+        lot = work.add(self.db, title="un lot", branch="lot/1-un-lot")["id"]
+        work.milestone(self.db, lot, "frozen", sha=sha, actor="pilote")
+        # #2333 : ces témoins-ci portent sur le mécanisme du feu ; l'exception
+        # incident déclarée au journal les autorise hors paquet. Les refus de
+        # la garde ont leurs propres témoins ci-dessous.
+        packet_guard.declare(self.db, lot, "incident", "test: fire fixture", sha,
+                             actor="pilote")
+        return lot
+
+    def _bare_frozen_lot(self, sha=A, branch="lot/1-un-lot"):
+        """Un gel sans exception : la garde du paquet doit refuser le feu."""
+        lot = work.add(self.db, title="un lot", branch=branch)["id"]
+        work.milestone(self.db, lot, "frozen", sha=sha, actor="pilote")
+        return lot
+
+    def test_packet_guard_refuses_a_direct_fire_on_the_target(self):
+        """#2333 : hors paquet, le feu d'une branche de lot est refusé, sans jalon."""
+        lot = self._bare_frozen_lot()
+        with self.assertRaises(fire.FireError) as caught:
+            fire.give(self.db, lot, sha=A, actor="pilote")
+        self.assertIn("§11 bis", str(caught.exception))
+        self.assertFalse(fire.state(self.db, lot)["active"])
+        self.assertEqual([e for e in work.events(self.db, lot)
+                          if (e.get("note") or "").startswith("packet-exception")], [])
+
+    def test_packet_guard_exception_is_journaled_on_the_fire(self):
+        """#2333 : l'exception motivée passe et laisse sa marque au journal."""
+        lot = self._bare_frozen_lot()
+        row = fire.give(self.db, lot, sha=A, actor="pilote",
+                        exception="incident", reason="cible rouge 18/10")
+        self.assertEqual(row["kind"], "fire")
+        notes = [e["note"] for e in work.events(self.db, lot)
+                 if (e.get("note") or "").startswith("packet-exception")]
+        self.assertEqual(notes, ["packet-exception incident sha=%s reason=cible rouge 18/10"
+                                 % A])
+
+    def test_packet_guard_exception_requires_a_reason(self):
+        """#2333 : une exception sans motif n'est pas une déclaration."""
+        lot = self._bare_frozen_lot()
+        with self.assertRaises(fire.FireError) as caught:
+            fire.give(self.db, lot, sha=A, actor="pilote", exception="incident")
+        self.assertIn("requires a reason", str(caught.exception))
+        self.assertFalse(fire.state(self.db, lot)["active"])
+
+    def test_packet_head_passes_without_an_exception(self):
+        """#2333 : la tête d'un paquet (`integration/**`) a le droit de fusionner."""
+        lot = self._bare_frozen_lot(branch="integration/paquet-2333")
+        row = fire.give(self.db, lot, sha=A, actor="pilote")
+        self.assertEqual(row["kind"], "fire")
+
+    def _landing(self, lot, *, branch="lot/1-un-lot", target="main", sha=A):
+        """Le dernier geste de `land` : une ligne de file et son éjection."""
+        ejected: dict = {}
+
+        def eject(reason, todo, **extra):
+            ejected.update(reason=reason, todo=todo)
+            return {"lot": lot, "result": "ejected", "reason": reason, "todo": todo}
+
+        landing = types.SimpleNamespace(
+            db=self.db, lot=lot,
+            row={"branch": branch, "target": target, "frozen_sha": sha},
+            project=types.SimpleNamespace(repo=".", name="ameesh"), eject=eject)
+        return landing, ejected
+
+    def test_land_guard_refuses_a_queued_lot_head_without_a_packet(self):
+        """#2333 : une ligne de file déjà posée ne contourne pas le paquet, sans feu."""
+        lot = self._bare_frozen_lot()
+        landing, ejected = self._landing(lot)
+        out = land._fire_guard(landing)
+        self.assertEqual(out["result"], "ejected")
+        self.assertIn("§11 bis", ejected["reason"])
+        self.assertIn("queue remove", ejected["todo"])
+
+    def test_land_guard_passes_a_declared_exception_on_that_head(self):
+        """#2333 : l'exception déclarée au journal vaut au dernier geste de land."""
+        lot = self._bare_frozen_lot()
+        packet_guard.declare(self.db, lot, "incident", "cible rouge 18/10", A)
+        landing, _ejected = self._landing(lot)
+        self.assertIsNone(land._fire_guard(landing))
+
+    def test_land_guard_refuses_a_declaration_on_another_head(self):
+        """#2333 : une déclaration d'une autre tête ne couvre pas ce gel."""
+        lot = self._bare_frozen_lot()
+        packet_guard.declare(self.db, lot, "incident", "ancienne tête", B)
+        landing, ejected = self._landing(lot)
+        out = land._fire_guard(landing)
+        self.assertEqual(out["result"], "ejected")
+        self.assertIn("§11 bis", ejected["reason"])
+
+    def test_land_guard_passes_an_integration_packet(self):
+        """#2333 : une ligne de file dont la tête est integration/** passe."""
+        lot = self._bare_frozen_lot(branch="integration/paquet-2333")
+        landing, _ejected = self._landing(lot, branch="integration/paquet-2333")
+        self.assertIsNone(land._fire_guard(landing))
+
+    def test_give_refuses_without_a_freeze(self):
+        lot = work.add(self.db, title="un lot", branch="lot/1-un-lot")["id"]
+        with self.assertRaises(fire.FireError) as caught:
+            fire.give(self.db, lot, sha=A, actor="pilote")
+        self.assertIn("not frozen", str(caught.exception))
+
+    def test_give_refuses_a_head_other_than_the_freeze(self):
+        lot = self._frozen_lot(A)
+        with self.assertRaises(fire.FireError) as caught:
+            fire.give(self.db, lot, sha=B, actor="pilote")
+        self.assertIn("the fire names", str(caught.exception))
+        with self.assertRaises(fire.FireError):
+            fire.give(self.db, lot, sha="not-a-commit", actor="pilote")
+
+    def test_give_then_withdraw(self):
+        lot = self._frozen_lot(A)
+        row = fire.give(self.db, lot, sha=A, actor="pilote")
+        self.assertEqual(row["kind"], "fire")
+        now = fire.state(self.db, lot)
+        self.assertTrue(now["active"])
+        self.assertTrue(now["covered"])
+        gone = fire.withdraw(self.db, lot, actor="pilote")
+        self.assertEqual(gone["kind"], "unfire")
+        now = fire.state(self.db, lot)
+        self.assertFalse(now["active"])
+        self.assertTrue(now["withdrawn"])
+        with self.assertRaises(fire.FireError) as caught:
+            fire.withdraw(self.db, lot, actor="pilote")
+        self.assertIn("no active fire", str(caught.exception))
+
+    def test_give_refuses_a_closed_lot(self):
+        lot = self._frozen_lot(A)
+        work.close(self.db, lot, abandoned=True, actor="pilote")
+        with self.assertRaises(fire.FireError) as caught:
+            fire.give(self.db, lot, sha=A, actor="pilote")
+        self.assertIn("no fire to give", str(caught.exception))
+
+    def test_give_and_withdraw_take_the_fire_lease(self):
+        lot = self._frozen_lot(A)
+        ops = storage.of(self.db).work
+        key = "fire:%d" % lot
+        epoch = ops.land_lock(key, "another-host", 60.0)
+        self.assertIsNotNone(epoch)
+        try:
+            with self.assertRaises(fire.FireError) as caught:
+                fire.give(self.db, lot, sha=A, actor="pilote")
+            self.assertIn("another fire operation", str(caught.exception))
+        finally:
+            ops.land_unlock(key, "another-host", epoch)
+        fire.give(self.db, lot, sha=A, actor="pilote")
+        epoch = ops.land_lock(key, "another-host", 60.0)
+        try:
+            with self.assertRaises(fire.FireError) as caught:
+                fire.withdraw(self.db, lot, actor="pilote")
+            self.assertIn("another fire operation", str(caught.exception))
+        finally:
+            ops.land_unlock(key, "another-host", epoch)
+
+    def test_pass_skips_a_lot_without_fire(self):
+        lot = work.add(self.db, title="un lot", branch="lot/1-un-lot")["id"]
+        self.assertEqual(fire.run_pass(self.cfg, self.db, only_lot=lot), [])
+
+    def test_pass_reports_an_unknown_repository(self):
+        lot = self._frozen_lot(A)
+        fire.give(self.db, lot, sha=A, actor="pilote")
+        out = fire.run_pass(self.cfg, self.db, only_lot=lot, dry_run=True)
+        self.assertEqual([e["result"] for e in out], ["no-repository"])
+
+    def test_pass_yields_to_another_host_holding_the_lease(self):
+        lot = self._frozen_lot(A)
+        fire.give(self.db, lot, sha=A, actor="pilote")
+        ops = storage.of(self.db).work
+        key = "fire:%d" % lot
+        epoch = ops.land_lock(key, "another-host", 60.0)
+        self.assertIsNotNone(epoch)
+        try:
+            out = fire.run_pass(self.cfg, self.db, only_lot=lot)
+            self.assertEqual(out, [{"lot": lot, "result": "busy"}])
+        finally:
+            ops.land_unlock(key, "another-host", epoch)
+
+    def test_target_lease_is_shared_with_the_merge_train(self):
+        """#1467 : la fusion directe prend le bail de cible du train, ou cede."""
+        project = types.SimpleNamespace(name="ameesh")
+        ops = storage.of(self.db).work
+        key = land.lock_key(project, "origin/main")
+        epoch = ops.land_lock(key, "train:runner", 60.0)
+        self.assertIsNotNone(epoch)
+        try:
+            self.assertEqual(fire._target_lock(self.db, project, "main"), (None, True))
+        finally:
+            ops.land_unlock(key, "train:runner", epoch)
+        handle, blocked = fire._target_lock(self.db, project, "main")
+        self.assertFalse(blocked)
+        self.assertIsNotNone(handle)
+        fire._unlock(handle)
+
+    def test_one_rereads_the_milestones_under_the_lease(self):
+        """P1-3 : les jalons lus avant le bail ne servent pas au geste."""
+        lot = self._frozen_lot(A)
+        fire.give(self.db, lot, sha=A, actor="pilote")
+        stale = []          # ce que le relevé avait lu avant de prendre le bail
+        seen = {}
+
+        def act(cfg, db, row, marks, **kwargs):
+            seen["marks"] = marks
+            return {"lot": lot, "result": "idle"}
+
+        with mock.patch.object(fire, "_act", side_effect=act):
+            out = fire._one(self.cfg, self.db, work.get(self.db, lot), stale,
+                            gh=lambda *a, **k: None, dry_run=False, repo=None, cache={},
+                            lock=True)
+        self.assertEqual(out["result"], "idle")
+        self.assertTrue(fire.active(seen["marks"]),
+                        "le passage doit relire le feu sous le bail")
+        self.assertTrue(any(m["kind"] == "frozen" for m in seen["marks"]))
+
+    def test_land_guard_without_fire_is_open(self):
+        lot = self._frozen_lot(A)
+        ok, why = fire.land_guard(self.db, lot, A)
+        self.assertTrue(ok, why)
+
+    def test_land_guard_requires_an_active_fire_covering_the_freeze(self):
+        lot = self._frozen_lot(A)
+        fire.give(self.db, lot, sha=A, actor="pilote")
+        ok, why = fire.land_guard(self.db, lot, A)
+        self.assertTrue(ok, why)
+        ok, why = fire.land_guard(self.db, lot, B)
+        self.assertFalse(ok)
+        self.assertIn("covers", why)
+        fire.withdraw(self.db, lot, actor="pilote")
+        ok, why = fire.land_guard(self.db, lot, A)
+        self.assertFalse(ok)
+        self.assertIn("withdrawn or invalidated", why)
+
+    def test_land_guard_refuses_an_unlifted_block(self):
+        lot = self._frozen_lot(A)
+        fire.give(self.db, lot, sha=A, actor="pilote")
+        work.milestone(self.db, lot, "verdict", sha=A, actor="rev1", verdict="blocked")
+        ok, why = fire.land_guard(self.db, lot, A)
+        self.assertFalse(ok)
+        self.assertIn("blocked verdict", why)
+        work.milestone(self.db, lot, "verdict", sha=A, actor="rev1", verdict="ok")
+        ok, why = fire.land_guard(self.db, lot, A)
+        self.assertTrue(ok, why)
+
+    def test_cli_state_and_fire_flags(self):
+        lot = self._frozen_lot(A)
+        shown = self.mesh("work", "fire", str(lot))
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertIn("no active fire", shown.stdout)
+        refused = self.mesh("work", "milestone", str(lot), "fire", "--sha", A)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("invalid choice", refused.stderr)
+        both = self.mesh("work", "fire", str(lot), "--sha", A, "--withdraw")
+        self.assertEqual(both.returncode, 2)
+        self.assertIn("exclusive", both.stderr)
+
+    def test_cli_gives_and_withdraws(self):
+        lot = self._frozen_lot(A)
+        given = self.mesh("work", "fire", str(lot), "--sha", A, "--actor", "human:pilote")
+        self.assertEqual(given.returncode, 0, given.stderr)
+        self.assertIn("fire given", given.stdout)
+        self.assertTrue(fire.state(self.db, lot)["active"])
+        withdrawn = self.mesh("work", "fire", str(lot), "--withdraw",
+                              "--actor", "human:pilote")
+        self.assertEqual(withdrawn.returncode, 0, withdrawn.stderr)
+        self.assertIn("fire withdrawn", withdrawn.stdout)
+        self.assertFalse(fire.state(self.db, lot)["active"])
+
+    def test_cli_refuses_an_executor_whose_only_authority_is_history(self):
+        """P1-5 : avoir confié des lots récemment ne donne pas le feu."""
+        lot = self._frozen_lot(A)
+        operations = storage.of(self.db).operations
+        with mock.patch.object(operations.__class__, "assigners", return_value=["impl1"]):
+            self.assertIn("impl1", operations.assigners(since_s=0))
+            refused = self.mesh("work", "fire", str(lot), "--sha", A,
+                                env=self.env(AGENT_MAIL_NAME="impl1",
+                                             AMEESH_ALERT_ORCHESTRATORS=""))
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("pilot's gesture", refused.stderr)
+        self.assertFalse(fire.state(self.db, lot)["active"])
+
+    def test_cli_authority_accepts_a_declared_orchestrator(self):
+        """Le même exécutant, déclaré orchestrateur, donne le feu."""
+        lot = self._frozen_lot(A)
+        given = self.mesh("work", "fire", str(lot), "--sha", A,
+                          env=self.env(AGENT_MAIL_NAME="impl1",
+                                       AMEESH_ALERT_ORCHESTRATORS="impl1"))
+        self.assertEqual(given.returncode, 0, given.stderr)
+        self.assertTrue(fire.state(self.db, lot)["active"])
+
+
+if __name__ == "__main__":
+    unittest.main()

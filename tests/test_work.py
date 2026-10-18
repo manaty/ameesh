@@ -85,6 +85,41 @@ class WorkTest(PgTestCase):
         with self.assertRaises(work.WorkError):
             work.note(self.db, self._add()["id"], "  ")
 
+    def test_once_note_serializes_concurrent_importers_without_deduplicating_regular_notes(self):
+        item = self._add("journal index fixture")
+        dbs = [self.connect(), self.connect()]
+        for connection in dbs:
+            self.addCleanup(connection.close)
+        barrier = threading.Barrier(2, timeout=10)
+        get = work.get
+        errors = []
+
+        def both_read(db, item_id):
+            value = get(db, item_id)
+            barrier.wait()
+            return value
+
+        def record(index):
+            try:
+                work.note(dbs[index], item["id"], "same immutable projection", actor=str(index), once=True)
+            except Exception as exc:
+                errors.append(exc)
+
+        with mock.patch.object(work, "get", side_effect=both_read):
+            threads = [threading.Thread(target=record, args=(index,)) for index in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=15)
+                self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        rows = work.events(self.db, item["id"])
+        self.assertEqual(sum(row["note"] == "same immutable projection" for row in rows), 1)
+        for _ in range(2):
+            work.note(self.db, item["id"], "ordinary repeated note", actor="fixture")
+        self.assertEqual(sum(row["note"] == "ordinary repeated note"
+                             for row in work.events(self.db, item["id"])), 2)
+
     def test_assignation_et_budget(self):
         # L37 (0030) : l'assigné d'un lot doit exister (attribution gardée)
         registry.upsert(self.db, "deepseek7", harness="deepseek")
@@ -119,7 +154,8 @@ class WorkTest(PgTestCase):
         def get_puis_attendre(db, item_id):
             row = vrai_get(db, item_id)
             lectures.append(item_id)
-            lus.wait(timeout=10)  # les deux appels tiennent le même état
+            if len(lectures) <= 2:
+                lus.wait(timeout=10)  # les deux lectures d'entrée tiennent le même état
             return row
 
         def bouger(index: int, db, state: str) -> None:
@@ -141,8 +177,12 @@ class WorkTest(PgTestCase):
                 self.assertFalse(any(thread.is_alive() for thread in threads))
                 # le témoin garde son sens : si `move` cesse de lire par
                 # `work.get`, la barrière ne sert plus et le test redevient
-                # une course d'ordonnancement — on le dit ici, pas en flaky
-                self.assertEqual(len(lectures), 2, "les deux move doivent lire par work.get")
+                # une course d'ordonnancement — on le dit ici, pas en flaky.
+                # 3 lectures : une par move, plus la relecture du perdant
+                # (#1922/N14), qui distingue l'adoption concurrente du lot
+                # (workflow_ref) du simple changement d'état avant de rendre
+                # son refus.
+                self.assertEqual(len(lectures), 3, "les deux move doivent lire par work.get")
         finally:
             db1.close()
             db2.close()

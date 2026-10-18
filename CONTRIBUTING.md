@@ -40,6 +40,13 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   `tests/parts/lecteurs-doc.txt` ; `tests/test_l161a_ci_sans_code.py` le
   vérifie. Sur `main`, la suite complète tourne à chaque fusion et n'est
   jamais annulée par la fusion suivante.
+- **Release : la suite sur une autre classe de système de fichiers** (#748) :
+  la PR de release (branche `release/**` en tête ou en base) rejoue les parts
+  psycopg avec les racines temporaires sur l'autre classe que celle du runner
+  (tmpfs ↔ disque, lue à l'exécution) ; ce job compte alors dans le check
+  « tests ». Un test qui ne tient que sur la classe ordinaire s'y révèle : le
+  corriger à la source (horodatages, renommage entre périphériques, `TMPDIR`),
+  jamais en le relançant.
 - **Concurrence par hôte de la CI** (#899, pilote, 2026-10-13) : l'occupation
   d'un hôte de la flotte `ameesh-ci` est bornée par le nombre de runners de cet
   hôte, fixé par une mesure de capacité (CPU, RAM, disque, PSI ; lot #824), et
@@ -58,12 +65,14 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   `AGENT_MESH_CONFIG` vers un fichier **vide mais existant** (`{}`) : ni
   `~/.config/ameesh/config.json` ni l'ancienne config agent-mesh ne sont lus,
   et un chemin explicite absent est refusé avant toute connexion (#1127).
-  `HOME` reste celui du poste (le banc lit `~/.pgpass`). Les caches de
-  gestionnaires de paquets du poste (`npm_config_*`, `pnpm_config_*`,
-  `YARN_CACHE_FOLDER`, `XDG_CACHE_HOME`) sont retirés de même (L73) : le
-  ménage les redirige et respecte un choix déjà posé, donc la suite ne doit
-  pas les hériter. Un test qui a besoin d'une config, d'un canon ou d'une
-  variable la pose lui-même ;
+  `HOME` reste celui du poste (le banc lit `~/.pgpass`) ; les bases jetables
+  (`agent_mesh_test_*`, #1992) sont couvertes par une entrée éphémère dérivée
+  de ce profil par `scripts/pgpass-banc.py`, sans modifier le fichier
+  (#2170). Les caches de gestionnaires de paquets du poste
+  (`npm_config_*`, `pnpm_config_*`, `YARN_CACHE_FOLDER`, `XDG_CACHE_HOME`)
+  sont retirés de même (L73) : le ménage les redirige et respecte un choix
+  déjà posé, donc la suite ne doit pas les hériter. Un test qui a besoin
+  d'une config, d'un canon ou d'une variable la pose lui-même ;
   `tests/test_l142_env_isole.py` vérifie qu'un poste « pollué » voit la même
   chose qu'un poste propre. Tout module de test qui touche à l'environnement
   importe donc `tests.support`.
@@ -98,6 +107,15 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   nouveaux fichiers source.
 
 La conception (décisions, exigences, spécification) est dans `docs/design/`.
+
+Undecided ideas go to the [exploration inbox](docs/design/explorations/index.md):
+one file per idea, `type: Exploration`, `status: exploration`, with a problem,
+intuitions and open questions. No proposed lots, no dates, no estimates, no
+"done" criterion; no lot, WorkPackage, backlog entry or roadmap line is
+derived from an exploration. Only an explicit owner decision, recorded in
+`docs/design/decisions/`, allows promotion to a study and then to lots. Plan
+and lot cards point to the decided study. The `tests.test_l1124_explorations`
+guard verifies this separation in the repository.
 
 ## Numérotation des versions
 

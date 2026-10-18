@@ -1018,9 +1018,12 @@ The `installer` step follows the same practice.
 
 1. `poste.sh verifier`: target databases (without password), runners, SSH
    access to the server. Nothing is modified.
-2. `poste.sh sauvegarder`: `pg_dump -Fc` of the mesh database (the
-   server's) from the workstation, server backup (`ameesh-sauvegarde`), and
-   `pg_dump` of the old database, into `~/backups/ameesh/`.
+2. `poste.sh sauvegarder`: the server backup (`ameesh-sauvegarde`) dumps the
+   mesh database on the VM into its guarded local copy, then `poste.sh`
+   retrieves that dump compressed over SSH into `~/backups/ameesh/`, checking
+   its size and SHA-256 before publishing it. `pg_dump` of the old database
+   follows. The retrieval is bounded and reports a timeout with the bytes
+   already written: a slow WireGuard link no longer fails silently.
 3. `poste.sh installer [REF]`: snapshot of commit REF, installed with its
    dependencies (psycopg). The previous version is recorded for rollback.
    Running runners keep the old code in memory: continue without
@@ -1036,9 +1039,11 @@ The `installer` step follows the same practice.
    exists**. On the server, as local superuser, over SSH. A missing
    role is not created: that is a separate decision.
 6. `poste.sh redemarrer`: each active `ameesh-runner-agent@<p>` is
-   restarted **one by one**, as soon as `ameesh show <p>` no longer says `running`.
-   A persona in a long turn does not block the others: the script goes back
-   over the list (at most `ATTENTE_MAX`, 2 h). Then `ameesh-notify`, then the
+   restarted **one by one**: the unit is stopped first (SIGTERM closes
+   admission; the turn in progress drains, bounded by `TimeoutStopSec`), the
+   safe point is proven (`ActiveState=inactive` and `MainPID=0`), then it is
+   started. No idle window is awaited: a persona in a long turn no longer
+   blocks or starves the update. Then `ameesh-notify`, then the
    runners of the old database (`UNITES_RESTE`), read with its configuration.
    A unit that does not stay active stops the script. So does a runner that
    held its persona's lease before the restart and does not take it again
@@ -1243,19 +1248,37 @@ code would have to check for the presence of each new column on every
 query, in every future lot: a single omission is enough to bring the outage back,
 and these guards would never be removed. The repository's migrations, for
 their part, are almost always additive (nullable columns or with a default, new
-tables, replaced constraints): the previous code runs without error on a
-migrated database, which every update since L60 already verifies. So we migrate
-**first**, then install, then restart.
+tables, replaced constraints). Compatibility must also hold on long-lived
+connections: adding a column changes the result type of `SELECT *`. Psycopg's
+automatically prepared statements can then fail with SQLSTATE `0A000`
+(`cached plan must not change result type`), even though the same old query
+works on a fresh connection. Automatic preparation is disabled in `db.py`
+(#2339); parameters remain bound normally. See the
+[Psycopg prepared statement documentation](https://www.psycopg.org/psycopg3/docs/advanced/prepare.html).
+We migrate **first**, then install, then restart.
 
 **Order of steps, workstation side** (the previous sections remain valid
 for the content of each version):
 
 1. `poste.sh verifier`, `poste.sh sauvegarder`.
-2. `poste.sh migrer [REF]`: extracts the `src-<sha>` snapshot of REF and runs
+2. `poste.sh migrer [REF]` (REF defaults to HEAD, as for `installer`, #1245;
+   the L232b release controller always migrates the snapshot of its pinned
+   commit): extracts the `src-<sha>` snapshot of REF and runs
    **its** `ameesh migrate --additive-only`, without installing it
    (`PYTHONPATH=<instantané>/src`, with the venv's Python). Mesh database, only
    once, then the old database. `migrate --dry-run` first displays each
    missing migration, "additive" or "NON additive" (NOT additive) with the reason.
+   Both preview and execution retain `--additive-only` even if REF is installed.
+   After each database migration and the target code's `doctor --probe`,
+   `auto-take-probe.py` runs with the **installed** interpreter in isolated mode
+   (`python -I`), using the installed auto-take code in dry-run mode and a
+   database connection forced read-only. It also reads review proposals even
+   when other work is available. A failure stops the update before any host
+   installation: the database is already migrated, so prepare a compatible
+   fix before continuing; do not undo migrations or wait for ordinary rollout.
+   This fresh-connection probe cannot inspect prepared plans held by existing
+   runners. The connection policy above and the warm-connection migration
+   regression test cover that case. Proceed promptly to installation and restart.
 3. `poste.sh installer [REF]`: refuses as long as `doctor --probe` of the new
    code reports a missing migration, on the mesh database or the old one.
 4. `poste.sh role`, `poste.sh redemarrer`, then `vm.sh installer [REF]` and
@@ -1278,18 +1301,76 @@ migrations delivered up to 0051 are additive (verified by
 `tests/test_migrations_additives.py`).
 
 **Non-additive migration: separate procedure.** `poste.sh migrer` stops
-before writing. We then go back to the old order, in one go and without delay,
-knowing the window during which the agents' commands fail:
-`MIGRER_APRES=1 poste.sh installer REF`, `poste.sh migrer REF` (REF installed:
-all its migrations apply), `poste.sh redemarrer`. Such a migration
-is prepared and proposed to the owner (orchestrator prompt,
-"Livraison et déploiements" (Delivery and deployments)); rollback then requires
-the database backup.
+before writing, even when REF is installed or `MIGRER_APRES=1` is set.
+A separate owner-approved migration plan must name its exact commit, backup,
+drain and recovery procedure. An installed symlink cannot authorise a
+non-additive migration; this command never disables its additive guard.
+Rollback of such a separately approved operation requires the database backup.
 
 **New dependency.** The new code is run with the packages of the venv
 in place. If REF adds a dependency that `ameesh migrate` needs,
 `migrer` fails at import: first install that dependency in the venv
 (`pip install <paquet>`), then resume at `migrer`.
+
+## Atomic venv switch (#1969)
+
+`poste.sh installer` and `vm.sh installer` (server and agents) no longer run
+`pip` in the **live** venv: they prepare a **versioned** venv next to it
+(`venv-<sha7>`, with its own pip, dependencies and controls), then switch in a
+single rename. A concurrent command (`agent-mail send`, `ameesh work`, a
+runner's import) therefore sees either the whole old code or the whole new
+code — never the incomplete state of the 16/10 incident
+(`ModuleNotFoundError ameesh.platform.process`, missing `ameesh`/code 127).
+Controls run **before** the switch: imports (`psycopg`, `ameesh`),
+`ameesh --version`, and the console script's shebang (direct, or pip's
+`/bin/sh` preamble when the venv path exceeds 127 bytes) pointing at the
+versioned venv's Python.
+The shebang is checked before executing the script, with a limit of 8192
+bytes per preamble line. A refusal identifies the offending line and cause,
+including an unexpected interpreter in the `exec` line. Apostrophes work in
+direct shebangs and quoted shell executables. If pip emits a shell preamble
+with an unquoted apostrophe (a long path without spaces), preparation refuses
+it with a quoting diagnostic; use a venv path without apostrophes in that case.
+
+The live `venv` is **not** a venv that a switch rewrites under running
+processes: it holds stable **launchers** (`bin/python`, `bin/ameesh`, and a
+refusing `bin/pip`). Each launcher reads the `venv-courant` symlink at start
+and `exec`s the versioned venv's binary, so the interpreter sees a concrete
+path (`venv-<sha7>/lib/pythonX/site-packages`) — a process already running
+keeps importing from **its** version, whatever a later switch does (review
+B1 of 16/10: a process launched through a symlinked venv kept the symlink
+path and could mix old and new submodules).
+
+`activer` only replaces the `venv-courant` symlink (temp + `rename()`), so
+there is no window without a live version. The **first** conversion of a real
+venv does not move or rewrite it: its `lib/` is reused by link as the
+previous version `venv-<sha7>` (adopted without pip), only the Python interpreters in `bin/` and
+`bin/ameesh` become launchers — a running process imports from `lib/`, not
+from `bin/`. `retour` points the symlink back to the recorded previous
+version, **without pip**, including that first conversion (review B2: the
+agents' rollback used to re-run `preparer`/pip); it is idempotent, and a
+rollback before any switch is a no-op. A preparation failure removes its
+partial directory and leaves the active version untouched. `src-current` and
+`previous-sha` keep their meaning. The helper is
+`deploy/mise-a-jour/bascule.py` (`preparer`, `activer --precedent`, `retour`,
+`etat`), copied to the VM (server and agents) so that install and rollback use
+the same version whatever commit is deployed.
+When writing a launcher fails, its temporary file is removed on a best effort
+basis and the previous destination stays intact; a cleanup error preserves the
+original write error.
+
+Launcher bookkeeping follows `bin/` itself (#2230). An activation that writes
+the new launchers and then fails before the switch (full disk, read-only
+`bin/`) leaves the marker naming the new version; the next successful
+activation still removes every launcher of ours that the live version no longer
+provides, so an orphan does not survive an interrupted switch. A script that
+exists only in the new version may still be absent for the moment between the
+launcher writes and the symlink rename (accepted window: it exits 127 with a
+clear message). `retour` renames the symlink **first** and rewrites the
+launchers best-effort, so a full disk or a read-only `bin/` cannot block a
+manual rollback. A script adopted from the previous version becomes a launcher
+when returning, and disappears at the next activation of a version that does
+not provide it — by design.
 
 ## Update to 1.10.0 (path B, mediated executor)
 

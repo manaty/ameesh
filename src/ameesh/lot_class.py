@@ -121,6 +121,8 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
     celui-ci : il est ignoré, pas compté comme un doute.
     """
     worst, why, files, ref = LIGHT, "", [], ""
+    critical_paths = set()
+    files_by_path = {}
     covered = False
     for canon in canons or ():
         root = str(getattr(canon, "root", "") or "")
@@ -143,25 +145,42 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
                     "doubt": True, "why": "cannot classify the change: %s" % exc}
         if not ref:
             ref = _ref(canon)
-        if RANK[result["class"]] > RANK[worst]:
+        critical_paths.update(entry["path"] for entry in result["files"]
+                              if entry.get("critical") is True)
+        for entry in result["files"]:
+            previous = files_by_path.get(entry["path"])
+            if previous is None or RANK[entry["class"]] > RANK[previous["class"]]:
+                files_by_path[entry["path"]] = entry
+        # Même un diff entièrement léger garde ses chemins : la porte des
+        # avis doit pouvoir constater un chemin critique oublié du canon.
+        if not files or RANK[result["class"]] > RANK[worst]:
             worst, files = result["class"], result["files"]
             why = "policy of %s" % (root or "canon")
     if not covered:
         return {"class": SENSITIVE, "files": [], "policy_ref": "", "doubt": True,
                 "why": "project %r is not declared by any canon (no fallback policy)"
                        % (project,)}
+    # Le maximum du lot ne suffit pas : une exception de la porte (Markdown
+    # léger) doit lire la classe la plus haute de chaque fichier, tous canons.
+    files = [files_by_path[entry["path"]] for entry in files]
+    for entry in files:
+        if entry["path"] in critical_paths:
+            entry["critical"] = True
     return {"class": worst, "why": why, "files": files, "policy_ref": ref,
             "doubt": False}
 
 
 def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
            repo: Optional[str] = None, base: Optional[str] = None,
-           head: Optional[str] = None) -> dict:
+           head: Optional[str] = None, milestones: Optional[list] = None,
+           canons=None) -> dict:
     """La classe du lot `lot` ; ne lève jamais (tout doute rend `sensitive`).
 
     `item` évite une lecture de la base ; `repo`, `base` et `head` sont ceux
     que l'appelant a déjà résolus (la file de fusion connaît la tête gelée et
-    le dépôt du clone). Rend aussi `files`, `policy_ref`, `target`, `frozen_sha`,
+    le dépôt du clone). `milestones` et `canons` (liste ou lecteur différé)
+    réutilisent les lectures groupées de l'appelant. Rend aussi `files`,
+    `policy_ref`, `target`, `frozen_sha`,
     `why` et `doubt` (vrai quand la classe vient d'une lecture impossible, pas
     d'une politique) pour la trace.
     """
@@ -183,7 +202,8 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
         out["why"] = "no repository known for the lot"
         return out
     if not head:
-        freeze = plan_git.latest_freeze(work.milestones(db, lot))
+        freeze = plan_git.latest_freeze(work.milestones(db, lot) if milestones is None
+                                        else milestones)
         if not freeze or not str(freeze.get("sha") or "").strip():
             out["why"] = "lot #%d is not frozen" % lot
             return out
@@ -220,7 +240,10 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
         out.update({"class": LIGHT, "why": "no file changed since %s" % base,
                     "doubt": False})
         return out
-    canons = work.configured_canons(cfg)
+    if canons is None:
+        canons = work.configured_canons(cfg)
+    elif callable(canons):
+        canons = canons()
     if not canons:
         out["why"] = "no readable canon: review policy unknown"
         return out

@@ -4,8 +4,13 @@
   ameesh work plan <task|package> [--start D] [--end D] [--delivery D] [--source S]
   ameesh plan add "what" --due D [--project P] [--owner X] [--lot N] [--card F]
                   [--source-type conversation|decision|thread|task|other] [--source S]
-                  [--depends-on REF ...] [--decision]
-  ameesh plan list [--all] [--json]
+                  [--depends-on REF ...] [--decision] [--proposed] [--key KEY]
+  ameesh plan get <eN|N> [--json]
+  ameesh plan update <eN|N> [--what TEXT] [--due D] [--note-file FILE|-] [...]
+  ameesh plan list [--project P] [--all] [--json]
+  ameesh plan export [--project P] [--all] [--output FILE|-]
+  ameesh plan import FILE|- [--apply] [--update] [--json]
+  ameesh plan validate [FILE|-] [--project P] [--json]
   ameesh plan accept <id> [--due D] | done <id> | cancel <id> [--note ...]
   ameesh plan propose [--from DIR] [--no-canon] [--no-tasks] [--record] [--json]
   ameesh plan show [--json] [--project P] [--width N]
@@ -32,18 +37,23 @@ the NEXT one).
   submitted, verdict, delivered), the today line, delays, and the source of
   each item.
 
-JSON follows the `ameesh-roadmap/1` schema (docs/PROGRESS.md).
+Gantt JSON follows `ameesh-roadmap/1`; editable JSON follows `ameesh-plan/1`.
+Import previews changes unless --apply is passed. See docs/EXPLOITATION.md.
 """
 from __future__ import annotations
 
 import argparse
 import datetime as _dt
 import json
+import os
+from pathlib import Path
 import re
 import shutil
 import sys
+import tempfile
 import textwrap
 import time
+from typing import Iterable
 
 from . import config as config_mod
 from . import db as db_mod
@@ -335,7 +345,7 @@ def accept(db, ident, *, due=None, actor: str = "", now: float | None = None) ->
         values["note"] = (row.get("note") + "; " if row.get("note") else "") + \
             "accepted by %s" % actor
     out = storage.of(db).roadmap.set_commitment(int(ident), current=("proposed",),
-                                                values=values)
+                                                values=values, expect=row)
     if out is None:
         raise RoadmapError("commitment %s changed meanwhile: retry" % ident)
     return out
@@ -351,7 +361,7 @@ def settle(db, ident, status: str, *, note: str = "", actor: str = "") -> dict:
     text = "; ".join(t for t in (row.get("note"), note.strip() if note else "",
                                  "by %s" % actor if actor else "") if t)
     out = storage.of(db).roadmap.set_commitment(
-        int(ident), current=LIVE_STATUSES, values={"status": status, "note": text})
+        int(ident), current=LIVE_STATUSES, values={"status": status, "note": text}, expect=row)
     if out is None:
         raise RoadmapError("commitment %s changed meanwhile: retry" % ident)
     return out
@@ -375,13 +385,15 @@ def _source_view(kind: str | None, ref: str | None, label: str | None = None) ->
 
 
 def real_milestones(item: dict, events: list[dict], actions: list[dict],
-                    declared: list[dict] | None) -> dict:
+                    declared: list[dict] | None, *,
+                    agents: Iterable[str] | None = None) -> dict:
     """Les jalons RÉELS génériques d'une tâche, depuis ce qu'ameesh mesure
     déjà (journal, table des jalons, actions) : `{demandee, debut, soumise,
-    verdict, verdict_kind, livree}` en secondes epoch (None si pas atteint)."""
+    verdict, verdict_kind, livree}` en secondes epoch (None si pas atteint).
+    `agents` : le registre, pour la correspondance `seb` / `human:seb` (#2346)."""
     from . import progress  # import tardif : progress importe ce module
 
-    jalons = progress._jalons_de_lot(item, events, actions, declared)
+    jalons = progress._jalons_de_lot(item, events, actions, declared, agents=agents)
     started = next((e.get("created_ts") for e in events if dev.en_cours(e.get("state"))), None)
     out = {key: jalons.get(dev.jalon(key)) for key in ("demandee", "soumise", "verdict",
                                                        "livree")}
@@ -502,14 +514,18 @@ def build(db, *, now: float | None = None, project: str | None = None,
     now = time.time() if now is None else float(now)
     base = today(now)
     st = storage.of(db)
+    # #2346 : un nom nu du registre reste un agent ; `human:<nom>` est l'autre
+    # acteur, pour que `lot_state` ne diverge pas de progress.
+    agents = {r["name"] for r in st.progress.agents(None) if r.get("name")}
     done_states = (dev.CORRESPONDANCES["etats_livres"]
                    + dev.CORRESPONDANCES["etats_abandonnes"])
-    rows = st.roadmap.items(since_ts=now - recent_s, limit=max_items, done_states=done_states)
-    if project:
-        rows = [r for r in rows if project in (r.get("app"), r.get("workstream"))]
+    filters = {"project": project} if project else {}
+    rows = st.roadmap.items(since_ts=now - recent_s, limit=max_items,
+                            done_states=done_states, **filters)
     ids = [int(r["id"]) for r in rows]
     events: dict = {}
-    for ev in st.progress.lot_events(ids):
+    # #1647 : les jalons réels ne lisent que les transitions, jamais les notes.
+    for ev in st.progress.lot_transitions(ids):
         events.setdefault(int(ev["work_item_id"]), []).append(ev)
     actions: dict = {}
     for act in st.progress.lot_actions(ids):
@@ -532,8 +548,7 @@ def build(db, *, now: float | None = None, project: str | None = None,
             items_by_id[int(extra["id"])] = extra
     commitments = [_commitment_view(c, base, items_by_id) for c in commitment_rows]
     if project:
-        commitments = [c for c in commitments if c["project"] in (None, project)
-                       or (c["lot"] in items_by_id)]
+        commitments = [c for c in commitments if c["project"] in (None, project)]
     by_item: dict = {}
     for c in commitments:
         if c["lot"]:
@@ -543,8 +558,9 @@ def build(db, *, now: float | None = None, project: str | None = None,
     for item in rows:
         iid = int(item["id"])
         evs, acts = events.get(iid, []), actions.get(iid, [])
-        real = real_milestones(item, evs, acts, declared.get(iid))
-        jalons = progress._jalons_de_lot(item, evs, acts, declared.get(iid))
+        real = real_milestones(item, evs, acts, declared.get(iid), agents=agents)
+        jalons = progress._jalons_de_lot(item, evs, acts, declared.get(iid),
+                                         agents=agents)
         shown = progress.lot_state(item.get("state") or "", jalons)
         tasks.append(build_task(item, real, base=base,
                                 epic=plan_mod.epic_of(item.get("package_id"), by_pkg),
@@ -637,6 +653,14 @@ def overdue(db, *, now: float | None = None) -> list[dict]:
     ligne : `{reason, what, due, days, commitment, lot, package, owner,
     assignee, responsible}` — `reason` : `engagement` ou `date_prevue`.
 
+    Une date prévue ne lève que si une personne l'a posée et si le lot est
+    encore piloté par son porteur : les dates calculées par la table de
+    référence (`planned_source` « reference p80… ») sont re-datées à la passe
+    suivante de `work schedule --apply`, jamais alertées ; un lot en attente
+    (bloqué, en relecture, ou retenu par une attente planifiée) ne l'est pas
+    non plus. Un lot daté et engagé ne produit qu'une alerte : l'engagement
+    explicite l'emporte sur la date.
+
     Lecture légère (aucun journal) : l'alerte tourne à chaque passe."""
     now = time.time() if now is None else float(now)
     base = today(now)
@@ -664,11 +688,31 @@ def overdue(db, *, now: float | None = None) -> list[dict]:
                     "days": (base - due).days, "commitment": row["id"], "lot": lot,
                     "package": row.get("package_id"), "owner": row.get("owner"),
                     "assignee": (item or {}).get("assignee"), "project": row.get("project")})
+    # #2342 : un lot daté et engagé est une seule alerte (l'engagement est la
+    # promesse explicite) ; sinon la date posée par une personne reste la sienne.
+    engaged = {r["lot"] for r in out if r["reason"] == "engagement" and r["lot"] is not None}
+    from .lot_schedule import SOURCE  # lot_schedule imports work, not this module
+    dated = []
     for item in rows:
         key = "planned_delivery" if item.get("planned_delivery") else (
             "planned_end" if item.get("planned_end") else None)
         due = _date(item.get(key)) if key else None
-        if not due or base <= due:
+        if not due or base <= due or int(item["id"]) in engaged:
+            continue
+        # a date computed by the schedule is re-dated by its next pass; a lot
+        # waiting (held, under review, waiting for its package or a dependency)
+        # has no gesture on its date, so it is not a date-driven alert
+        if not dev.active(item.get("state")):
+            continue
+        if str(item.get("planned_source") or "").startswith(SOURCE):
+            continue
+        dated.append((item, key, due))
+    waits = {}
+    if dated:
+        from . import planned_waits
+        waits = planned_waits.read(db, [item for item, _, _ in dated], now=now)
+    for item, key, due in dated:
+        if int(item["id"]) in waits:
             continue
         out.append({"reason": "date_prevue", "what": "%s of task #%d \"%s\"" % (
             LABELS["delivery" if key == "planned_delivery" else "end"], int(item["id"]),
@@ -996,22 +1040,70 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("--source", dest="source_ref", default=None,
                        help="source identifier or link (conversation, decision, message)")
     p_add.add_argument("--depends-on", dest="depends_on", action=UniqueAppend, default=[],
-                       help="dependency (task #N, commitment eN, lot Lxx); repeatable")
+                       help="dependency (task #N, commitment eN, lot Lxx); "
+                            "gate:<name> holds the lot (L368) until the due day; repeatable")
     p_add.add_argument("--depend-de", dest="depends_on", action=DeprecatedAlias,
                        canonical="--depends-on", append=True, default=argparse.SUPPRESS,
                        help=argparse.SUPPRESS)
     p_add.add_argument("--decision", action="store_true",
                        help="decision milestone: an open question waiting for a human")
-    p_add.add_argument("--note", default="")
+    p_add.add_argument("--proposed", action="store_true",
+                       help="record a proposal, without activating it; date optional")
+    p_add.add_argument("--key", default=None, help="stable key for idempotent creation")
+    notes = p_add.add_mutually_exclusive_group()
+    notes.add_argument("--note", default="")
+    notes.add_argument("--note-file", metavar="FILE", help="UTF-8 note; - reads stdin")
     p_add.add_argument("--actor", default="")
     p_add.add_argument("--json", action="store_true")
 
     p_list = sub.add_parser("list", help="open commitments and proposals")
     p_list.add_argument("--all", action="store_true", help="also kept and cancelled ones")
+    p_list.add_argument("--project", default=None, help="project and global commitments")
     p_list.add_argument("--json", action="store_true")
 
+    p_get = sub.add_parser("get", help="read one commitment, its complete note and editing token")
+    p_get.add_argument("id", help="e18 or 18")
+    p_get.add_argument("--json", action="store_true")
+
+    p_update = sub.add_parser("update", help="edit a proposal or open commitment")
+    p_update.add_argument("id", help="e18 or 18")
+    for option in ("what", "due", "owner", "project", "lot", "card", "source"):
+        p_update.add_argument("--" + option, default=argparse.SUPPRESS,
+                             help="new value; - clears a nullable field")
+    p_update.add_argument("--kind", choices=KINDS, default=argparse.SUPPRESS)
+    p_update.add_argument("--source-type", choices=SOURCE_KINDS, default=argparse.SUPPRESS)
+    deps = p_update.add_mutually_exclusive_group()
+    deps.add_argument("--depends-on", action=UniqueAppend, default=argparse.SUPPRESS,
+                      help="replace dependencies with these references; repeatable")
+    deps.add_argument("--clear-dependencies", action="store_true")
+    notes = p_update.add_mutually_exclusive_group()
+    notes.add_argument("--note", default=argparse.SUPPRESS)
+    notes.add_argument("--note-file", metavar="FILE", help="UTF-8 note; - reads stdin")
+    p_update.add_argument("--if-match", metavar="ETAG", help="editing token from plan get")
+    p_update.add_argument("--json", action="store_true")
+
+    p_export = sub.add_parser("export", help="export editable ameesh-plan/1 JSON")
+    p_export.add_argument("--project", default=None)
+    p_export.add_argument("--all", action="store_true", help="include terminal commitments")
+    p_export.add_argument("--output", default="-", metavar="FILE", help="default: stdout")
+
+    p_import = sub.add_parser("import", help="preview a JSON import; --apply writes atomically")
+    p_import.add_argument("file", metavar="FILE", help="ameesh-plan/1 JSON; - reads stdin")
+    mode = p_import.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true", help="apply the complete validated file")
+    mode.add_argument("--dry-run", dest="apply", action="store_false", help="preview (default)")
+    p_import.set_defaults(apply=False)
+    p_import.add_argument("--update", action="store_true", help="allow edits to existing keys")
+    p_import.add_argument("--actor", default="")
+    p_import.add_argument("--json", action="store_true")
+
+    p_validate = sub.add_parser("validate", help="validate stored dependencies or an import file")
+    p_validate.add_argument("file", nargs="?", metavar="FILE", help="optional JSON; - reads stdin")
+    p_validate.add_argument("--project", default=None, help="stored commitments of a project")
+    p_validate.add_argument("--json", action="store_true")
+
     p_acc = sub.add_parser("accept", help="accept a proposal")
-    p_acc.add_argument("id", type=int)
+    p_acc.add_argument("id", help="e18 or 18")
     p_acc.add_argument("--due", dest="due", default=None, metavar="DAY")
     p_acc.add_argument("--pour", dest="due", action=DeprecatedAlias, canonical="--due",
                        default=argparse.SUPPRESS, help=argparse.SUPPRESS)
@@ -1019,7 +1111,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name, help_ in (("done", "commitment kept"),
                         ("cancel", "commitment dropped, or proposal rejected")):
         p = sub.add_parser(name, help=help_)
-        p.add_argument("id", type=int)
+        p.add_argument("id", help="e18 or 18")
         p.add_argument("--note", default="")
         p.add_argument("--actor", default="")
 
@@ -1050,22 +1142,70 @@ def _print_commitment(c: dict) -> None:
                                c["source_ref"]) if c.get("source_ref") else ""))
 
 
+def _read_plan_text(filename: str) -> str:
+    """Bound file/stdin reads before taking any database locks."""
+    from .roadmap_edit import MAX_BYTES
+    try:
+        if filename == "-":
+            text = sys.stdin.read(MAX_BYTES + 1)
+        else:
+            # Universal newlines would rewrite CRLF notes to LF: a note is data.
+            with Path(filename).open(encoding="utf-8", newline="") as stream:
+                text = stream.read(MAX_BYTES + 1)
+        if len(text.encode("utf-8")) > MAX_BYTES:
+            raise RoadmapError("file exceeds 10 MiB")
+        return text
+    except (OSError, UnicodeError) as exc:
+        raise RoadmapError("cannot read %s: %s" % (filename, exc)) from None
+
+
+def _write_atomic(filename: str, text: str) -> None:
+    """Write the export beside its target, then replace it in one step."""
+    target = Path(filename)
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp",
+                                   dir=str(target.parent))
+    except OSError as exc:
+        raise RoadmapError("cannot write %s: %s" % (filename, exc)) from None
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if target.exists():
+            shutil.copymode(target, tmp)
+        os.replace(tmp, target)
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise RoadmapError("cannot write %s: %s" % (filename, exc)) from None
+
+
 def run(db, args, *, cfg=None, now: float | None = None) -> int:
+    from . import roadmap_edit as edit
+
     command = args.plan_command
     if command == "add":
-        row = add_commitment(
-            db, args.what, due=args.due, decision=args.decision, owner=args.owner,
-            project=args.project, lot=args.lot, package=args.package,
-            source_kind=args.source_kind, source_ref=args.source_ref,
-            depends_on=args.depends_on, note=args.note, actor=args.actor, now=now)
+        fields = dict(what=args.what, due=args.due, kind="decision" if args.decision else "commitment",
+                      status="proposed" if args.proposed else "open", owner=args.owner,
+                      project=args.project, lot=args.lot, card=args.package,
+                      source_type=args.source_kind, source=args.source_ref,
+                      depends_on=args.depends_on, note=_read_plan_text(args.note_file)
+                      if args.note_file else args.note)
+        if args.key is not None:
+            fields["key"] = args.key
+        row = edit.create(db, fields, actor=args.actor, now=now)
         if args.json:
             print(json.dumps(row, ensure_ascii=False, indent=2))
         else:
-            print("commitment e%d recorded: %s%s" % (
-                row["id"], row["what"], " due %s" % row["due_on"] if row["due_on"] else ""))
+            print("commitment e%d %s: %s%s" % (
+                row["id"], "unchanged" if row.get("unchanged") else "recorded", row["what"],
+                " due %s" % row["due_on"] if row["due_on"] else ""))
         return 0
     if command == "list":
-        rows = storage.of(db).roadmap.commitments(statuses=None if args.all else LIVE_STATUSES)
+        rows = edit.listing(db, project=args.project, statuses=None if args.all else LIVE_STATUSES)
         if args.json:
             print(json.dumps(rows, ensure_ascii=False, indent=2))
             return 0
@@ -1074,13 +1214,76 @@ def run(db, args, *, cfg=None, now: float | None = None) -> int:
         for row in rows:
             _print_commitment(row)
         return 0
+    if command in ("get", "update"):
+        if command == "get":
+            row = edit.get(db, args.id)
+        else:
+            fields = {name: getattr(args, name) for name in edit.EDITABLE_FIELDS if hasattr(args, name)}
+            for key in ("due", "owner", "project", "lot", "card", "source"):
+                if fields.get(key) == "-":
+                    fields[key] = None
+            if args.clear_dependencies:
+                fields["depends_on"] = []
+            if args.note_file:
+                fields["note"] = _read_plan_text(args.note_file)
+            warnings = []
+            row = edit.update(db, args.id, fields, if_match=args.if_match, now=now,
+                              warnings=warnings)
+            for warning in warnings:
+                print("warning: " + json.dumps(warning, ensure_ascii=False), file=sys.stderr)
+        if args.json:
+            print(json.dumps(row, ensure_ascii=False, indent=2))
+        else:
+            _print_commitment(row)
+            for key in ("owner", "project", "package_id", "source_kind", "source_ref", "proposal_key", "etag"):
+                print("%s: %s" % (key, row.get(key) or "—"))
+            print("depends_on: %s" % ", ".join(row.get("depends_on") or []))
+            print("note:\n%s" % row["note"])
+        return 0
+    if command == "export":
+        text = json.dumps(edit.export(db, project=args.project, all_states=args.all), ensure_ascii=False, indent=2) + "\n"
+        if args.output == "-":
+            print(text, end="")
+        else:
+            _write_atomic(args.output, text)
+        return 0
+    if command in ("import", "validate"):
+        if command == "validate" and not args.file:
+            report = edit.validate(db, project=args.project)
+        elif command == "validate":
+            try:
+                if args.project:
+                    raise RoadmapError("--project applies to stored commitments; omit it with a file")
+                body = edit.document(_read_plan_text(args.file))
+                preview = edit.import_plan(db, body, update_existing=True)
+                report = dict(preview, schema="ameesh-plan-validation/1", valid=True, errors=[])
+            except RoadmapError as exc:
+                detail = exc.report if isinstance(exc, edit.InvalidDependencies) else {
+                    "valid": False, "errors": [{"code": "invalid_plan", "message": str(exc)}], "warnings": []}
+                report = dict(detail, schema="ameesh-plan-validation/1")
+        else:
+            body = edit.document(_read_plan_text(args.file))
+            report = edit.import_plan(db, body, apply=args.apply, update_existing=args.update, actor=args.actor)
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        elif command == "validate":
+            print("dependencies valid" if report.get("valid", True) else "invalid dependencies")
+            for issue in report.get("errors", []) + report.get("warnings", []):
+                print(json.dumps(issue, ensure_ascii=False))
+        else:
+            print("import applied" if report["applied"] else "import preview (no writes; use --apply)")
+            for change in report["changes"]:
+                print("%s %s" % (change["action"], change["key"]))
+            for warning in report["warnings"]:
+                print("warning: " + json.dumps(warning, ensure_ascii=False))
+        return 0 if report.get("valid", True) else 1
     if command == "accept":
-        row = accept(db, args.id, due=args.due, actor=args.actor, now=now)
+        row = accept(db, edit.ident(args.id), due=args.due, actor=args.actor, now=now)
         print("proposal e%d accepted: %s%s" % (row["id"], row["what"], " due %s"
                                                % row["due_on"] if row["due_on"] else ""))
         return 0
     if command in ("done", "cancel"):
-        row = settle(db, args.id, "done" if command == "done" else "cancelled",
+        row = settle(db, edit.ident(args.id), "done" if command == "done" else "cancelled",
                      note=args.note, actor=args.actor)
         print("commitment e%d %s" % (row["id"], "kept" if row["status"] == "done"
                                      else "cancelled"))

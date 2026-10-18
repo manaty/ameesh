@@ -167,7 +167,8 @@ policy:
   max_agents: 12
   resources:                     # seuils de pression (L31, 0028)
     min_mem_available: 1GiB
-    max_swap_used: 8GiB
+    max_swap_used: 8GiB          # stock : avec pression mémoire (#2296) ; repli 8GiB sans PSI si absent (#2354)
+    max_mem_pressure: 10%        # PSI mémoire some 60 s ; défaut 10 % (#2296)
     max_load: 24
     min_disk_free: 2GiB
     min_btrfs_unallocated: 10GiB         # #246 : btrfs seulement
