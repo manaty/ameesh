@@ -246,7 +246,9 @@ def released_by(db, blocker_id) -> list[dict]:
         return []
     from . import planned_waits  # import tardif : plan importe les attentes
     candidates = [r for r in rows if int(r["id"]) in linked]
-    waits = planned_waits.read(db, candidates, open_items=open_items, dependencies=edges)
+    # #2378 : une demande de décision ne retient pas le réveil d'un lot libéré
+    waits = planned_waits.read(db, candidates, open_items=open_items, dependencies=edges,
+                               decisions=())
     return [r for r in candidates if int(r["id"]) not in waits]
 
 
@@ -352,6 +354,10 @@ def wait_label(wait):
         return label
     if wait["what"] == "landing":
         return landing_label(wait, wait.get("head"))
+    if wait["what"] == "decision":
+        # #2378 : la demande de décision ouverte, son décideur et son échéance
+        return "decision #%d for %s until %s" % (
+            wait["decision"], wait.get("owner") or "any human", wait.get("until"))
     return "waiting on lots %s" % ", ".join("#%d" % i for i in wait["lots"])
 
 
