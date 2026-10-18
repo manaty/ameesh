@@ -359,6 +359,7 @@ ameesh work migration <id> [--number N] [--release] [--repo R]   # reserve a mig
 ameesh work set-app <id> <project> [--actor A] | backfill-app [--dry-run]
 ameesh work link <id> [CARD] [--none] [--actor A] | close <id> (--abandoned | --superseded-by ID | --delivered --sha SHA | --done)
 ameesh work sync-merges [--target T] [--dry-run] [--json]   # close frozen lots whose content is merged (L29)
+ameesh work sync-packets [--target T] [--dry-run] [--json] # close the units of merged packages (manifest, #2426)
 ameesh work sync-github [--dry-run] [--json]          # close lots whose PR is merged (read-only)
 ameesh work schedule [--apply] [--json]               # planned dates at the p80 (L157c)
 ameesh work measure [<id>…] [--no-ci] [--json]        # actual time per phase, merged diff size (L157c)

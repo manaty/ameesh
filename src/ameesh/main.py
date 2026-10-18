@@ -77,6 +77,11 @@
                                         the owner holds a host on purpose: its
                                         agents' alerts stay quiet (#254);
   ameesh housekeeping [--apply] [--json]  cleanup of what agents create (L73);
+  ameesh identity verify [JETON|-] [--issuer U --client-id C] [--domain D]
+                         [--binding subject|email]
+        vérifie un jeton d'identité OIDC et le rattache au canon (le couple
+        `{issuer, subject}` d'une fiche Member par défaut, `emails` sur choix
+        explicite) : L86, lot #377 ; sortie 3 si aucun membre ne correspond ;
   ameesh import-v0            import from the v0 file mailbox;
   ameesh interrupt <agent> <message…>   direct interruption (authorized senders);
   ameesh key …                public keys (owner / agent);
@@ -342,6 +347,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "session":
         from . import session_backup
         return session_backup.main(rest)
+    if command == "identity":
+        # L86 (0033 §4) : identité des humains par OIDC et rattachement au canon
+        from . import oidc
+        return oidc.main(rest)
     if command == "chat":
         # L123 : l'agent de conversation du propriétaire
         from . import chat

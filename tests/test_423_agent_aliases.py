@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 from ameesh import agent_names, authority, canon, canon_sync, exploitation, identity, mail, placement
-from ameesh import registry, reprise, runner, session_bindings, work
+from ameesh import fil, registry, reprise, runner, session_bindings, work
 from .support import PgTestCase
 from .test_canon import _TmpMixin, codes, fiche, write
 from .test_l39_adoption_reprise import SID, _dossier, _rollout
@@ -403,6 +403,24 @@ class SessionCommandAliasTest(PgTestCase):
         self.assertTrue(self.db.query(
             "SELECT 1 FROM agent_name_resolutions WHERE supplied_name = 'another-name' "
             "AND primary_name = 'worker' AND operation = 'exploitation.restart'"))
+
+    def test_stop_by_alias_reports_and_traces_primary(self):
+        """N2 de #423 (#1955) : `stop` résout l'alias à l'entrée ; le champ
+        rendu et le texte du fil nomment le primaire, jamais l'orthographe
+        fournie."""
+        out = exploitation.stop(self.cfg, self.db, "another-name", "raison d'arrêt",
+                                actor="human:proprio")
+        self.assertEqual((out["agent"], out["changed"], out["stop_reason"]),
+                         ("worker", True, "manuel"))
+        row = self._ligne()
+        self.assertEqual((row["status"], row["stop_reason"]), ("stopped", "manuel"))
+        entries = fil.transport_for(self.cfg).read(fil.ThreadRef(fil.project_for(self.cfg)))
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].text, "worker stopped by human:proprio: raison d'arrêt")
+        self.assertNotIn("another-name", entries[0].text)
+        self.assertTrue(self.db.query(
+            "SELECT 1 FROM agent_name_resolutions WHERE supplied_name = 'another-name' "
+            "AND primary_name = 'worker' AND operation = 'exploitation.stop'"))
 
 
 class CanonAliasTest(_TmpMixin, unittest.TestCase):

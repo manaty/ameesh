@@ -4,9 +4,11 @@
 `review_designation` does the **selection** without any I/O; this module is the
 real `Port`: it reads the lot's milestones, re-reads the idempotent mark of the
 freeze and writes the designation in **one** transaction (lock of the lot row,
-mark in the journal, mails in the mailbox). The readable thread is written only
-after the commit (`mail.send(..., after_commit=…)`, pattern #315 of
-`deep_analysis`): a cancelled send leaves no trace in the external thread.
+mark in the journal, mails in the mailbox). A reviewer mail is a `request`
+linked to the lot (#2478): the reviewer's runner opens a turn on it; the
+capacity notification to the pilot stays a `notify`. The readable thread is
+written only after the commit (`mail.send(..., after_commit=…)`, pattern #315
+of `deep_analysis`): a cancelled send leaves no trace in the external thread.
 
 Two uses, depending on who holds the transaction:
 
@@ -318,6 +320,7 @@ class PgPort:
         for row in messages:
             recipient = str(row.get("to") or "").strip()
             mail.send(db, self.sender, recipient, str(row.get("body") or ""),
+                      kind=str(row.get("kind") or "notify"),
                       work_item_id=str(lot),
                       payload={"review_designation": {
                           "lot": lot, "freeze": freeze_id, "sha": sha,

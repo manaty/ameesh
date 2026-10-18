@@ -189,7 +189,8 @@ class _ActivationFixture:
 
     def mailbox(self):
         return self.db.query(
-            "SELECT recipient, body, payload FROM agent_mailbox ORDER BY id")
+            "SELECT recipient, body, payload, kind, work_item_id"
+            " FROM agent_mailbox ORDER BY id")
 
     def marks(self):
         return [row["note"] for row in self.db.query(
@@ -225,6 +226,11 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertEqual([r["name"] for r in out["reviewers"]], ["r1", "r2"])
         self.assertEqual([r["family"] for r in out["reviewers"]], ["claude", "codex"])
         self.assertEqual([m["recipient"] for m in self.mailbox()], ["r1", "r2"])
+        # #2478: the designation is a request linked to the lot, active mail
+        # for the reviewer's runner.
+        self.assertEqual([m["kind"] for m in self.mailbox()], ["request", "request"])
+        self.assertEqual([m["work_item_id"] for m in self.mailbox()],
+                         [str(self.lot), str(self.lot)])
         self.assertIn(self.frozen, self.mailbox()[0]["body"])
         self.assertEqual(len(self.marks()), 1)
         self.assertEqual(pg.designation_of(self.marks()[0])["state"], rd.DESIGNATED)
