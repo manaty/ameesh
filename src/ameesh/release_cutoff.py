@@ -32,6 +32,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -137,6 +138,51 @@ def next_version(current: str, *, bump: str = "level",
     if floor == "minor":
         return version_text(bump_minor(triple))
     return version_text(bump_patch(triple))
+
+
+_RANK = {"patch": 0, "minor": 1, "major": 2}
+
+
+def version_level(previous: str, version: str) -> str:
+    """The level a version takes from the previous one: patch, minor or major."""
+    old, new = version_tuple(previous), version_tuple(version)
+    if new[0] != old[0]:
+        return "major"
+    if new[1] != old[1]:
+        return "minor"
+    return "patch"
+
+
+def validate_version(previous: dict | None, version: str, floor: str,
+                     bump: str) -> None:
+    """Refuse a version below the content's floor (B4), whatever chose it.
+
+    `next_version` validates the computed path; an explicit `--version` or an
+    untagged version bump read from `main` bypassed that check before this.
+    A major floor always needs the owner's go, unknown is never guessed.
+    """
+    triple = version_tuple(version)
+    if previous is not None:
+        if triple <= version_tuple(previous["version"]):
+            raise ReleaseError("version %s is not greater than the previous tag %s"
+                               % (version, previous["tag"]))
+    if bump != "level":
+        # Explicit `version_bump=patch` is an operator override; it never
+        # authorises a major release, which is the owner's decision.
+        if floor == "major":
+            raise ReleaseError("a major version needs the owner's go (content is major)")
+        return
+    if floor == "unknown":
+        raise ReleaseError("the content's version level is unknown "
+                           "(scripts/version-level.py): no release")
+    if floor == "major":
+        raise ReleaseError("a major version needs the owner's go (content is major)")
+    if previous is not None and version_level(previous["version"], version) == "major":
+        raise ReleaseError("a major version needs the owner's go")
+    if previous is not None and _RANK[version_level(previous["version"], version)] \
+            < _RANK[floor]:
+        raise ReleaseError("version %s is below the content's %s floor"
+                           % (version, floor))
 
 
 def version_at(repo: str, ref: str) -> str:
@@ -335,8 +381,13 @@ def recent_tag(repo: str, target: str, cutoff: float, now: float) -> dict | None
 
 
 def remote_tag(repo: str, remote: str, tag: str) -> str | None:
-    proc = _git(repo, "ls-remote", "--tags", remote, "refs/tags/%s" % tag,
-                timeout=120.0)
+    """The commit a remote tag names (its peeled line for an annotated tag).
+
+    `ls-remote` is read without a refspec: filtering on `refs/tags/T` drops
+    `refs/tags/T^{}`, and the unpeeled line is the tag object, not the commit
+    (B3). The commit is what `git rev-parse T^{commit}` gives locally.
+    """
+    proc = _git(repo, "ls-remote", "--tags", remote, timeout=120.0)
     if proc.returncode:
         detail = " ".join((proc.stderr or proc.stdout or "").split())[-200:]
         raise TransientReleaseError("git ls-remote %s: %s" % (remote, detail))
@@ -380,9 +431,9 @@ def _release_commit(repo: str, sha: str) -> bool:
 
 
 def commit_is_green(repo: str, project: "ProjectRelease", sha: str,
-                    depth: int = 4) -> bool:
+                    depth: int = 4, reading: dict | None = None) -> bool:
     """The exact commit is green; a release commit inherits its parent."""
-    reading = ci_reading(project, sha)
+    reading = ci_reading(project, sha) if reading is None else reading
     if reading.get("green"):
         return True
     if depth > 0 and _release_commit(repo, sha):
@@ -392,17 +443,33 @@ def commit_is_green(repo: str, project: "ProjectRelease", sha: str,
     return False
 
 
-def last_green(repo: str, head: str, project: "ProjectRelease", limit: int = 10) -> str | None:
-    """The first first-parent ancestor whose exact commit CI is green."""
+def last_green(repo: str, head: str, project: "ProjectRelease", limit: int = 20) -> str | None:
+    """The green content of the first-parent chain, or the latest release tag.
+
+    A red landing merge `M = merge(main, V)` carries the published release V as
+    its second parent; the first-parent walk reaches the older green B, but V
+    is the green content that was actually released and must be the next base
+    (B1). A tag V is preferred only when it descends from that first-parent
+    green commit, so a genuinely newer green commit still wins.
+    """
     cursor = head
+    first = None
     for _ in range(limit):
         if commit_is_green(repo, project, cursor):
-            return cursor
+            first = cursor
+            break
         parent = _git(repo, "rev-parse", "--verify", "%s^1" % cursor)
         if parent.returncode:
-            return None
+            break
         cursor = (parent.stdout or "").strip()
-    return None
+    latest = latest_tag(repo, head)
+    if latest and latest["commit"] != first and _release_commit(repo, latest["commit"]):
+        parent = _git(repo, "rev-parse", "--verify", "%s^1" % latest["commit"])
+        if parent.returncode == 0 and commit_is_green(
+                repo, project, (parent.stdout or "").strip()) \
+                and (first is None or is_ancestor(repo, first, latest["commit"])):
+            return latest["commit"]
+    return first
 
 
 def version_floor(repo: str, since: str, target: str) -> tuple[str, str]:
@@ -560,8 +627,9 @@ def packets_between(repo: str, since: str, target: str) -> tuple[list[Packet], l
             units = sorted({int(n) for n in _LOT_REF.findall(body)})
             manifest = _manifest_for(repo, target, branch)
             parsed = parse_manifest(_manifest_text(repo, target, manifest))
-            if not units:
-                units = parsed["included"]
+            # The merge body may omit units; the manifest composition is the
+            # complete list. Union, never prefer the shorter body (N1).
+            units = sorted(set(units) | set(parsed["included"]))
             packets.append(Packet(pr=pr, branch=branch, package=branch.split("/", 1)[-1],
                                   units=units, manifest=manifest,
                                   excluded=parsed["excluded"]))
@@ -589,7 +657,8 @@ def generate_notes(*, project: "ProjectRelease", repo: str, since: str, target: 
                    version: str, cutoff_label: str, cutoff_at: float, rules,
                    previous: dict | None, floor: str, floor_reason: str,
                    packets: list[Packet], direct: list[dict], migrations: list[str],
-                   runs: list[str] | None = None) -> tuple[str, list[int], list[tuple[int, str]]]:
+                   runs: list[str] | None = None,
+                   version_bump: str = "level") -> tuple[str, list[int], list[tuple[int, str]]]:
     """The markdown notes of a release, generated from the merged packets."""
     included: set[int] = set()
     excluded: list[tuple[int, str]] = []
@@ -625,11 +694,19 @@ def generate_notes(*, project: "ProjectRelease", repo: str, since: str, target: 
     ]
     if migrations:
         lines += ["Migrations: %s." % ", ".join("`%s`" % name for name in migrations), ""]
-    if floor != "patch":
-        lines += ["**Version level** : the content since the previous tag is `%s` "
-                  "(version-level.py: %s). The number above is a patch by the "
-                  "build/beta rhythm; the auditor can read this note as the "
-                  "reason." % (floor, _clean(floor_reason, 500)), ""]
+    if floor == "minor" and version_bump == "level":
+        lines += ["**Version level** : the content since the previous tag is `minor` "
+                  "(version-level.py: %s); the number above follows that floor."
+                  % _clean(floor_reason, 500), ""]
+    elif floor == "minor":
+        lines += ["**Version level** : the content since the previous tag is `minor` "
+                  "(version-level.py: %s). The number above is a patch chosen by an "
+                  "explicit `version_bump=patch` override; the auditor can read this "
+                  "note as the reason." % _clean(floor_reason, 500), ""]
+    elif floor in ("major", "unknown"):
+        lines += ["**Version level** : the content's floor is `%s` "
+                  "(version-level.py: %s); no automatic release."
+                  % (floor, _clean(floor_reason, 500)), ""]
     if packets:
         lines += ["**Packets**"]
         for packet in packets:
@@ -803,7 +880,7 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
     fetch(project.repo, project.remote, project.target)
     head = commit_of(project.repo, "%s/%s" % (project.remote, project.target))
     reading = ci_reading(project, head)
-    green = bool(reading.get("green")) or commit_is_green(project.repo, project, head)
+    green = commit_is_green(project.repo, project, head, reading=reading)
     if not green:
         green_commit = last_green(project.repo, head, project)
     else:
@@ -819,13 +896,20 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
         floor, floor_reason = version_floor(project.repo, previous["tag"], base)
     if version is None:
         if previous and version_tuple(current) > version_tuple(previous["version"]):
-            version = current  # an untagged version bump left by a crashed run
+            # An untagged version bump left by a crashed run: keep it only if
+            # it still satisfies the floor of the content it carries.
+            if project.version_bump == "level" \
+                    and _RANK[version_level(previous["version"], current)] \
+                    < _RANK.get(floor, 0):
+                version = next_version(previous["version"], bump="level", floor=floor)
+            else:
+                validate_version(previous, current, floor, project.version_bump)
+                version = current
         else:
             version = next_version(current, bump=project.version_bump, floor=floor)
+    else:
+        validate_version(previous, version, floor, project.version_bump)
     version_tuple(version)
-    if previous and version_tuple(version) <= version_tuple(previous["version"]):
-        raise ReleaseError("version %s is not greater than the previous tag %s"
-                           % (version, previous["tag"]))
     since = previous["commit"] if previous else base
     packets, direct = packets_between(project.repo, since, base)
     migrations = migrations_between(project.repo, since, base)
@@ -833,7 +917,7 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
         project=project, repo=project.repo, since=since, target=base, version=version,
         cutoff_label=cutoff_label, cutoff_at=cutoff_at, rules=rules, previous=previous,
         floor=floor, floor_reason=floor_reason, packets=packets, direct=direct,
-        migrations=migrations)
+        migrations=migrations, version_bump=project.version_bump)
     return Plan(project=project, rules=rules, canon_commit=source.commit,
                 cutoff_at=cutoff_at, cutoff_label=cutoff_label, head=head, ci=reading,
                 green=green, last_green=green_commit, base=base, current_version=current,
@@ -1135,6 +1219,14 @@ def staging_summary(events: list[dict], sha: str) -> list[dict]:
     return out
 
 
+def _kill_group(proc, sig=signal.SIGTERM) -> None:
+    """Kill the process group of a timed-out staging run (its ssh children)."""
+    try:
+        os.killpg(os.getpgid(proc.pid), sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
                 *, state_dir: str, timeout_s: float | None = None) -> dict:
     """Run `staging.sh` from a worktree of the release commit, under its lock."""
@@ -1158,21 +1250,36 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
         since_iso = _dt.datetime.fromtimestamp(started, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         with open(log_path, "w", encoding="utf-8") as log:
             try:
-                proc = subprocess.run(args, stdout=subprocess.PIPE,
-                                      stderr=subprocess.STDOUT, text=True,
-                                      timeout=timeout_s or project.staging_timeout_s,
-                                      env=dict(os.environ))
+                proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, text=True,
+                                        env=dict(os.environ), start_new_session=True)
+            except OSError as exc:
+                raise ReleaseError("staging could not start: %s" % exc) from exc
+            try:
+                output, _ = proc.communicate(
+                    timeout=timeout_s or project.staging_timeout_s)
             except subprocess.TimeoutExpired as exc:
-                log.write(exc.stdout or "")
+                partial = exc.output or ""
+                if isinstance(partial, bytes):
+                    partial = partial.decode("utf-8", "replace")
+                log.write(partial)
+                # `communicate` kills bash only; the sequence's ssh/vm.sh
+                # children would survive and keep the worktree/flock. Kill the
+                # whole session started for this run, then wait for it.
+                _kill_group(proc, signal.SIGTERM)
+                try:
+                    output, _ = proc.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    _kill_group(proc, signal.SIGKILL)
+                    output, _ = proc.communicate()
+                log.write(output or "")
                 raise TransientReleaseError(
                     "staging timed out after %ss (log %s)"
                     % (timeout_s or project.staging_timeout_s, log_path)) from exc
-            except OSError as exc:
-                raise ReleaseError("staging could not start: %s" % exc) from exc
-            log.write(proc.stdout or "")
+            log.write(output or "")
         return {"exit": proc.returncode, "duration_s": round(time.time() - started, 1),
                 "log": log_path,
-                "output_tail": "\n".join((proc.stdout or "").splitlines()[-20:]),
+                "output_tail": "\n".join((output or "").splitlines()[-20:]),
                 "summary": staging_summary(read_journal(since_iso), release_sha),
                 "attestation": read_attestation(release_sha)}
     finally:
@@ -1347,7 +1454,8 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
                 project=project, repo=project.repo, since=since, target=release_sha,
                 version=version_out, cutoff_label=label, cutoff_at=at, rules=rules,
                 previous=previous, floor="patch", floor_reason="reconciled release",
-                packets=packets, direct=direct, migrations=migrations)
+                packets=packets, direct=direct, migrations=migrations,
+                version_bump=project.version_bump)
         ensure_github_release(project, recent["tag"], version_out, notes)
         staging = (None if no_staging else
                    _staging_step(project, release_sha, included, cfg.state_dir))

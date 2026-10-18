@@ -231,9 +231,12 @@ class ReleaseFixture(unittest.TestCase):
         release_sha = report["release_sha"]
         self.assertEqual(self.git(self.clone, "rev-parse", "origin/main"), release_sha)
         self.assertEqual(self.git(self.clone, "rev-parse", "v1.11.8^{commit}"), release_sha)
+        self.assertEqual(release_cutoff.remote_tag(self.clone, "origin", "v1.11.8"),
+                         release_sha)
         notes = self.git(self.clone, "show", "origin/main:docs/versions/1.11.8.md")
         self.assertIn("#2000", notes)
         self.assertIn("#2002", notes)
+        self.assertIn("#2003", notes)
         self.assertIn("#2001", notes)
         self.assertNotIn("#2212", notes)
         self.assertNotIn("#2004", notes)
@@ -314,6 +317,34 @@ class ReleaseFixture(unittest.TestCase):
             "actif-%s.json" % report["release_sha"][:12])
         self.assertTrue(attestation.exists(), report)
 
+    def test_red_landing_next_cutoff_uses_the_published_green_content(self):
+        """B1: a red landing must not make the next cutoff replay v1.11.8."""
+        green = self.head
+        self.write("red.txt", "red\n")
+        self.commit("red change")
+        self.git(self.seed, "push", "-q", "origin", "main")
+
+        def reading(project, sha):
+            return {"green": sha == green}
+
+        with mock.patch.dict(os.environ,
+                             {"GIT_COMMITTER_DATE": "2026-10-18T11:04:00+0200"}), \
+             mock.patch.object(release_cutoff, "ci_reading", side_effect=reading):
+            first = release_cutoff.execute(self.cfg, None, self.project,
+                                           now=_paris(11, 5))
+        self.assertEqual(first["result"], "released", first)
+        with mock.patch.dict(os.environ,
+                             {"GIT_COMMITTER_DATE": "2026-10-18T23:04:00+0200"}), \
+             mock.patch.object(release_cutoff, "ci_reading", side_effect=reading):
+            second = release_cutoff.execute(self.cfg, None, self.project,
+                                            now=_paris(23, 5))
+        self.assertEqual(second["result"], "released", second)
+        self.assertEqual(second["version"], "1.11.9")
+        self.assertEqual(self.git(self.clone, "rev-parse", "%s^" % second["release_sha"]),
+                         first["release_sha"])
+        self.assertEqual(self.git(self.clone, "rev-parse", "origin/main"),
+                         second["landing_sha"])
+
     def test_red_head_without_green_refuses(self):
         with mock.patch.object(release_cutoff, "ci_reading",
                                return_value={"green": False}), \
@@ -335,6 +366,27 @@ class ReleaseFixture(unittest.TestCase):
         self.assertEqual(plan.floor, "minor", plan.floor_reason)
         self.assertEqual(plan.version, "1.12.0")
 
+    def test_untagged_patch_is_raised_to_the_minor_floor(self):
+        """B4: an untagged version bump cannot bypass the content's floor."""
+        self.write("src/ameesh/migrations/0499_test.sql",
+                   "alter table example add column extra integer;\n")
+        self.write("pyproject.toml", '[project]\nname = "x"\nversion = "1.11.8"\n')
+        self.commit("patch bump with a migration")
+        self.git(self.seed, "push", "-q", "origin", "main")
+        with mock.patch.object(release_cutoff, "ci_reading",
+                               return_value={"green": True}):
+            plan = release_cutoff.build_plan(self.cfg, self.project, now=_paris(11, 5))
+            self.assertEqual(plan.floor, "minor", plan.floor_reason)
+            self.assertEqual(plan.version, "1.12.0")
+            self.assertIn("follows that floor", plan.notes)
+            self.assertNotIn("patch by the build/beta rhythm", plan.notes)
+            with self.assertRaises(release_cutoff.ReleaseError):
+                release_cutoff.build_plan(self.cfg, self.project, now=_paris(11, 5),
+                                          version="1.11.8")
+            with self.assertRaises(release_cutoff.ReleaseError):
+                release_cutoff.build_plan(self.cfg, self.project, now=_paris(11, 5),
+                                          version="2.0.0")
+
     def test_manifest_parser_keeps_composition_and_drops_non_exclusions(self):
         parsed = release_cutoff.parse_manifest(MANIFEST)
         self.assertEqual(parsed["included"], [2000, 2002, 2003])
@@ -349,6 +401,49 @@ class ReleaseFixture(unittest.TestCase):
         self.assertIn("#2001", plan.notes)
         self.assertNotIn("#2212", plan.notes)
         self.assertEqual(plan.packets[0].package, "paquet-h-test")
+
+
+class StagingTimeoutTest(unittest.TestCase):
+    def test_timeout_accepts_bytes_and_kills_the_process_group(self):
+        """B2: partial bytes output must not break the report, children die."""
+        tmp = tempfile.TemporaryDirectory(prefix="ameesh-2448-timeout-")
+        self.addCleanup(tmp.cleanup)
+        worktree = Path(tmp.name) / "worktree"
+        script = worktree / "deploy/mise-a-jour/staging.sh"
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/usr/bin/env bash\n")
+
+        class FakeProc:
+            pid = 424242
+            returncode = -15
+
+            def __init__(self):
+                self.calls = 0
+
+            def communicate(self, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired("bash", timeout,
+                                                    output=b"partial output\n")
+                return "", ""
+
+        proc = FakeProc()
+        project = release_cutoff.ProjectRelease(
+            name="ameesh", repo=str(Path(tmp.name) / "repo"), target="main",
+            staging="deploy/mise-a-jour/staging.sh", github="manaty/ameesh")
+        with mock.patch.object(release_cutoff, "_worktree",
+                               return_value=(tmp.name, str(worktree))), \
+             mock.patch.object(release_cutoff, "_drop_worktree"), \
+             mock.patch.object(release_cutoff.subprocess, "Popen",
+                               return_value=proc) as popen, \
+             mock.patch.object(release_cutoff, "_kill_group") as kill:
+            with self.assertRaises(release_cutoff.TransientReleaseError):
+                release_cutoff.run_staging(project, "a" * 40, [],
+                                           state_dir=tmp.name, timeout_s=1)
+        self.assertGreaterEqual(kill.call_count, 1)
+        self.assertTrue(popen.call_args.kwargs.get("start_new_session"))
+        log = next((Path(tmp.name) / "release").glob("staging-*.log"))
+        self.assertIn("partial output", log.read_text())
 
 
 class PureReleaseTest(unittest.TestCase):
