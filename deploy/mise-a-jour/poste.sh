@@ -14,7 +14,11 @@
 #                (UNE fois), puis ancienne
 #                base ; refusé si l'une n'est pas additive (voir MIGRER_APRES) ;
 #                --additif-seulement garde ce refus même quand REF est déjà
-#                installé (staging : des VM tournent encore le code précédent)
+#                installé (staging : des VM tournent encore le code précédent) ;
+#                si la sonde d'auto-prise du code installé échoue après la
+#                migration, installe REF et redémarre aussitôt (#2357) ;
+#                MIGRER_SANS_REDEMARRAGE=1 (staging) laisse la séquence par
+#                hôte faire cette installation/redémarrage, VM d'abord
 #   installer    instantané du code REF dans ~/.local/share/ameesh/src-<sha>,
 #                venv versionné préparé à l'écart (dépendance psycopg comprise)
 #                puis bascule atomique du venv (#1969) ; refusé tant qu'une
@@ -231,11 +235,31 @@ installer() {
   echo "installé : src-$court. Les exécuteurs tournent encore l'ancien code : redemarrer, sans tarder."
 }
 
+# #2357: emergency restart after a failed compatibility probe. Launched from an
+# agent's own runner, a direct « redemarrer » would stop that runner before the
+# following units (docs/AUDITEUR.md): throw the restart into a transient unit
+# when the user manager accepts it, and only fall back to the direct call in a
+# plain shell or where systemd-run is unavailable (tests, CI).
+redemarrer_urgence() {
+  local unite="ameesh-maj-urgence-$$" env_args=()
+  [ -n "${BASCULE_ENV:-}" ] && env_args+=(--setenv=BASCULE_ENV="$BASCULE_ENV")
+  [ -n "${AMEESH_CONFIG:-}" ] && env_args+=(--setenv=AMEESH_CONFIG="$AMEESH_CONFIG")
+  if command -v systemd-run >/dev/null 2>&1 \
+     && systemd-run --user --collect --wait --unit "$unite" \
+          ${env_args[@]+"${env_args[@]}"} \
+          /bin/sh -c '"$0" redemarrer' "$ICI/poste.sh"; then
+    echo "redémarrage terminé dans l'unité transitoire $unite ; journalctl --user -u $unite" >&2
+    return 0
+  fi
+  echo "unité transitoire indisponible ou en échec : redémarrage direct (un agent lancé depuis son propre exécuteur serait interrompu)." >&2
+  redemarrer
+}
+
 # Migrations du commit REF (défaut HEAD, comme installer) : garde additive même
 # si ce code est déjà installé. Le lien src-current n'accorde aucune autorité de
 # migration. --additif-seulement reste accepté pour les appels de staging (#1155).
 migrer() {
-  local ref cible d garde=(--additive-only) sha
+  local ref cible d garde=(--additive-only) sha incompatible=0
   if [ "${1:-}" = "--additif-seulement" ]; then
     shift
   fi
@@ -247,16 +271,47 @@ migrer() {
   dsn_part d "$CONFIG" dsn || return
   echo "base : $d"
   ameesh_de "$cible" migrate --dry-run --additive-only
-  migrer_base "$cible" ${garde[@]+"${garde[@]}"}
+  migrer_base "$cible" ${garde[@]+"${garde[@]}"} || incompatible=1
   if ancienne; then
     etape "ancienne base (ses exécuteurs prennent le même code)"
     dsn_part d "$CONFIG_RESTE" dsn || return
     echo "base : $d"
-    AMEESH_CONFIG="$CONFIG_RESTE" migrer_base "$cible" ${garde[@]+"${garde[@]}"}
+    AMEESH_CONFIG="$CONFIG_RESTE" migrer_base "$cible" ${garde[@]+"${garde[@]}"} || incompatible=1
+  fi
+  # #2357: after a failed compatibility probe the OLD code can no longer serve
+  # the migrated schema. The target snapshot already passed doctor --probe,
+  # so install it and restart at once instead of stopping and leaving the
+  # incident window open (72 min of DbError auto-take on 18/10).
+  if [ "$incompatible" = 1 ]; then
+    if [ "${MIGRER_SANS_REDEMARRAGE:-0}" = 1 ]; then
+      # staging.sh runs this step before its per-host sequence (VMs first,
+      # poste last, canon §14): it continues at once and does the installation
+      # and restart itself, in that order, instead of being stopped here.
+      echo "sonde d'auto-prise en échec : la séquence staging poursuit sans s'arrêter (installation/redémarrage des hôtes, VM d'abord, poste en dernier)." >&2
+      return 0
+    fi
+    etape "sonde d'auto-prise en échec : installation et redémarrage immédiats (base déjà migrée)"
+    if installe "$cible"; then
+      # The venv already holds REF (re-run, or MIGRER_APRES=1): do not touch
+      # the recorded previous version, only load REF into the runners.
+      echo "code de $cible déjà installé : redémarrage immédiat sans réinstallation." >&2
+    elif ! installer "$sha"; then
+      echo "ÉCHEC de l'installation immédiate : l'ancien code sert encore le schéma migré." >&2
+      echo "Traiter tout de suite (installer/redémarrer à la main, correction compatible)." >&2
+      return 1
+    fi
+    if ! redemarrer_urgence; then
+      echo "ÉCHEC du redémarrage immédiat : l'ancien code tourne encore sur le schéma migré." >&2
+      echo "Redémarrer à la main sans délai, puis vérifier l'auto-prise." >&2
+      return 1
+    fi
+    echo "Code ${cible##*/src-} installé et exécuteurs du poste redémarrés sans attendre." >&2
+    echo "La base est migrée pour tout le mesh : installer et redémarrer les autres hôtes sans délai (vm.sh, ou la séquence staging)." >&2
   fi
 }
 migrer_base() {
-  local cible=$1 code=0; shift
+  local cible=$1 court code=0; shift
+  court=${cible##*/src-}
   ameesh_de "$cible" migrate "$@" || code=$?
   if [ "$code" = 3 ]; then
     echo "migration non additive : le code en place casserait sur la base migrée." >&2
@@ -265,10 +320,12 @@ migrer_base() {
   [ "$code" = 0 ] || exit "$code"
   ameesh_de "$cible" doctor --probe
   # #2339: run the INSTALLED code, not the migration snapshot, read-only.
-  # A failed compatibility check stops before installation on every host.
+  # #2357: a failure no longer stops the update; migrer installs the target
+  # code and restarts immediately (the database is already migrated).
   etape "auto-prise du code installé sur la base migrée (lecture seule)"
   "$VENV/bin/python" -I "$ICI/auto-take-probe.py" || {
-    echo "ancien code incompatible : arrêter la mise à jour ; préparer un correctif compatible avant de poursuivre (base déjà migrée)." >&2
+    echo "ancien code incompatible avec le schéma migré (sonde en échec)." >&2
+    echo "La base est DÉJÀ migrée : la mise à jour doit enchaîner tout de suite sur l'installation et le redémarrage du code $court." >&2
     return 1
   }
 }
