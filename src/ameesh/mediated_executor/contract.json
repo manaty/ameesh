@@ -4090,6 +4090,7 @@
    "nonces": "autorité (0012)",
    "operations": "hors du sous-ensemble de l'exécuteur médié",
    "packages": "canon et paquets : serveur seulement",
+   "pending_spend": "usage résident : hôte local seulement (L80a), le chemin médié refuse le résident",
    "placements": "placement : serveur seulement",
    "prevalidation": "hors du sous-ensemble de l'exécuteur médié",
    "progress": "vue des humains (/api/v1)",
@@ -4369,6 +4370,9 @@
     "lock_sync",
     "retire",
     "upsert"
+   ],
+   "pending_spend": [
+    "set_resident_usage"
    ],
    "placements": [
     "recorded"

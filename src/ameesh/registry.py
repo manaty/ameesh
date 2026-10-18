@@ -445,6 +445,16 @@ def pending_spend_set_model(db: Db, name: str, model: str | None) -> bool:
     return storage.of(db).pending_spend.set_model(name, model)
 
 
+def pending_spend_set_resident_usage(db: Db, name: str, usage: dict | None,
+                                     created_ts: float | None = None) -> bool:
+    """Pose (ou efface avec None) l'événement `resident.turn` du marqueur (L80a).
+
+    L'état durable du tour incomplet : un worker de remplacement y retrouve la
+    mesure et peut écrire l'événement puis la ligne du grand livre. `created_ts`
+    borne l'écriture au marqueur de ce tour, jamais celui d'un remplaçant."""
+    return storage.of(db).pending_spend.set_resident_usage(name, usage, created_ts)
+
+
 def pending_spend_get(db: Db, name: str) -> dict | None:
     """Le marqueur comptable en attente, ou None (aucun travail suspendu)."""
     from .agent_names import resolve as resolve_agent_name
@@ -465,6 +475,8 @@ def _pending_spend_row(row: dict | None) -> dict | None:
         "work_item_id": row.get("work_item_id"),
         # #796 : l'identifiant du tour, pour relier la ligne à ses ressources
         "turn_id": row.get("turn_id"),
+        # L80a : mesure durable d'un tour résident non encore réglé
+        "resident_usage": row.get("resident_usage"),
     }
 
 

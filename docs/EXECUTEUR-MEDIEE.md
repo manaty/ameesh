@@ -16,7 +16,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 66 opérations et la liste des 392 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 66 opérations et la liste des 393 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -64,7 +64,7 @@ Comptes : 66 opérations, dont 26 lectures et 40 écritures. 56 passent par
 lignes de `op` sont marquées `session: true` (contrats 1.1, 1.2 et #423) :
 elles sont servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (458
+signature et les mêmes types. Il vérifie aussi que l'interface entière (459
 opérations) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
