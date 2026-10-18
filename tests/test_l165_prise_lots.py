@@ -64,6 +64,43 @@ class PriseDeLotTest(_Lots):
                         (amonts[1]["id"],))
         self.assertEqual([t["item"]["id"] for t in self.take()], [lot["id"]])
 
+    def test_2252_dependance_en_qa_meme_jugee_ne_rend_pas_le_lot_prenable(self):
+        """#2252 : le cas réel #667/#661 (17/10).
+
+        À 13:45:52 le bloqueur #661 reçoit un `ok`, à 13:45:57 le dépendant
+        #667 est pris, à 13:46:07 le verdict devient `blocked` : la tête de
+        base a changé sous l'agent. L165 n'accepte donc plus une dépendance en
+        `qa`, même jugée favorablement : la règle de `work show` et de
+        « planned: waiting on lots » est « fusionnée seulement »."""
+        from ameesh import planned_waits
+        self.agent("claude1", team="nexlink")
+        amont = self.lot("amont juge", assignee="human:proprio")
+        self.db.execute("UPDATE work_items SET state = 'qa', branch = 'lot/amont'"
+                        " WHERE id = %s", (amont["id"],))
+        sha = "a" * 40
+        work.milestone(self.db, amont["id"], "frozen", sha=sha, actor="test")
+        work.milestone(self.db, amont["id"], "verdict", verdict="ok", sha=sha, actor="test")
+        bloque = self.lot("depend d'un lot en qa", priority=1)
+        storage.of(self.db).work_dependencies.add(bloque["id"], amont["id"], actor="test")
+
+        # Même vérité que `work show` : l'arête est bloquante, l'attente est
+        # planifiée, et le lot n'est ni offert ni attribuable par la prise.
+        edge = storage.of(self.db).work_dependencies.for_items([bloque["id"]])[0]
+        self.assertTrue(edge["blocking"], "une dépendance en qa est bloquante")
+        waits = planned_waits.read(self.db, [work.get(self.db, bloque["id"])])
+        self.assertEqual(waits[bloque["id"]]["lots"], [amont["id"]])
+        self.assertEqual(storage.of(self.db).work.unassigned_lots(5), [])
+        self.assertIsNone(storage.of(self.db).work.assign(
+            bloque["id"], "claude1", current=None, note="test", actor="test",
+            ready_only=True))
+        self.assertEqual(self.take(), [])
+        self.assertIsNone(work.get(self.db, bloque["id"])["assignee"])
+
+        # La fusion du bloqueur libère la prise.
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s",
+                        (amont["id"],))
+        self.assertEqual([t["item"]["id"] for t in self.take()], [bloque["id"]])
+
     def test_dependance_ajoutee_apres_selection_refuse_la_prise(self):
         self.agent("claude1", team="nexlink")
         amont = self.lot("amont", assignee="human:proprio")

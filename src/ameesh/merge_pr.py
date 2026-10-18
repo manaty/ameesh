@@ -39,7 +39,16 @@ The gesture, and its guards (all checked BEFORE any write):
    head is the given frozen SHA, its `mergeStateStatus` is `CLEAN`/`HAS_HOOKS`
    and all its checks are concluded and green (`radar.ci_green`) — nothing is
    weakened: a blocked PR, behind (`BEHIND`) or with a non-green check is
-   refused;
+   refused; the target's **required checks** (#2273) are read like the fire
+   does (`fire.required_checks`: branch protection completed by
+   `radar.projects.<p>.required_checks`) and must be present and `SUCCESS` on
+   the frozen head — an absent `tests` check is not proven by a green
+   `couverture`, and a `SKIPPED` check proves nothing; when the protection
+   imposes an application, the check runs of the exact head are read for
+   their source, so a same-named check from another application or a commit
+   status does not satisfy it; an unreadable protection without a
+   declaration refuses. This path writes outside the API, so it never
+   bypasses the protection it cannot see;
 5. **the diff** is computed locally (`merge-base` then `diff --name-only`):
    the PR must touch at least one `.github/workflows/**` path — this path
    therefore never replaces the API merge for the other PRs;
@@ -94,7 +103,8 @@ import shutil
 import tempfile
 import time
 
-from . import land, merge_queue, migrations, packet_reservation, plan_git, radar, resolutions, work
+from . import (fire, land, merge_queue, migrations, packet_reservation, plan_git, radar,
+               resolutions, work)
 from .canon import FETCH_TIMEOUT, GitError
 
 #: the path that makes the API refuse the merge
@@ -227,21 +237,75 @@ def _project_of(cfg, repo: str):
             from exc
 
 
-def _admission(db, cfg, lot: int, repo: str, project, owner: str, view: dict) -> dict:
+def _required_refusal(slug: str, target: str, project, rollup, *, head: str = "",
+                      gh=None) -> str:
+    """Le refus opposé par les checks requis de la cible sur cette tête
+    (#2273), ou "" quand ils sont tous présents et `SUCCESS`.
+
+    La lecture est celle du feu (`fire.required_checks` : protection de la
+    branche lue à la forge, complétée — jamais affaiblie — par
+    `radar.projects.<p>.required_checks`) et la comparaison celle de
+    `fire._required_gap` : un check absent, non conclu ou `SKIPPED` ne prouve
+    rien. Quand la protection impose une application (`checks[].app_id`), la
+    provenance se lit sur la tête exacte (`fire._head_check_runs`) : le rollup
+    de `gh pr view` ne porte ni application ni source, donc un statut de commit
+    ou un homonyme d'une autre application ne satisfait pas l'exigence. Une
+    protection ou une source illisible sans déclaration refuse : le geste hors
+    API n'est jamais plus faible que la file. Un transport local n'a pas de
+    protection de branche, il n'y a donc rien à exiger."""
+    if not slug or not _GITHUB_KEY.match(slug):
+        return ""
+    if not target:
+        return "the required checks of the target cannot be proven: no target branch"
+    try:
+        required = fire.required_checks(slug, target, project, gh=gh)
+        pairs = fire._required_pairs(required)
+    except land.LandError as exc:
+        return "the required checks of %s cannot be proven: %s" % (target, exc)
+    provenance = None
+    if any(app_id is not None for _, app_id in pairs):
+        try:
+            provenance = fire._head_check_runs(slug, head, gh=gh)
+        except land.LandError as exc:
+            return ("the source of the required checks of %s cannot be proven: %s"
+                    % (target, exc))
+    gaps = fire._required_gap(pairs, rollup, provenance)
+    if gaps:
+        return "the required checks of %s are not proven: %s" % (target, ", ".join(gaps))
+    return ""
+
+
+def _admission(db, cfg, lot: int, repo: str, project, owner: str, view: dict, *,
+               slug: str = "", target: str = "", head: str = "",
+               gh=None) -> dict:
     """The merge queue admission, replayed as is (#1003 B1): freeze, `ok`
     verdict on the head (class read from the frozen diff), non-protected
     target, green CI of the PR on that head, the project's `ci_required`. The
     radar clone is this gesture's working repository: `readiness` reads the
-    lot's branch there on the remote, never in the author's checkout."""
+    lot's branch there on the remote, never in the author's checkout.
+
+    #2273 : la tête doit aussi prouver les checks requis de la cible (même
+    lecture que `fire.ready_pr`) — ce chemin pousse hors API et ne peut donc
+    pas s'en remettre à la protection qu'il contourne. `head` est le gel
+    relu ; à défaut, la tête de la vue (déjà contrôlée par `_pr_guards`)."""
     branch = (view.get("headRefName") or "").strip()
+    rollup = view.get("statusCheckRollup") or []
+    base = (view.get("baseRefName") or "").strip()
+    head = (head or (view.get("headRefOid") or "")).strip()
+    # la cible de la commande fait foi ; la vue ne sert qu'à défaut (#2273 :
+    # une vue sans base ne doit pas vider la lecture des checks requis)
+    refusal = _required_refusal(slug, (target or "").strip() or base, project, rollup,
+                                head=head, gh=gh)
+    if refusal:
+        raise MergePrError("PR #%s on the freeze %s: %s"
+                           % (view.get("number"), head[:12] or "?", refusal))
 
     def ci_status(name: str):
         if not branch or name != branch:
             return None
         return {"number": view.get("number"), "url": view.get("url") or "",
-                "head": (view.get("headRefOid") or "").lower(),
-                "green": radar.ci_green(view.get("statusCheckRollup") or [],
-                                        radar.required_statuses(project, branch)),
+                "head": head.lower(),
+                "green": radar.ci_green(rollup, radar.required_statuses(project, branch)),
                 "draft": bool(view.get("isDraft"))}
 
     clone = resolutions.Replayer(repo, owner)
@@ -546,7 +610,8 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
                     "PR #%d: auto-merge armed and not disarmed (%s): nothing written; disarm "
                     "it (gh pr merge --disable-auto %d) and retry" % (pr, error, pr))
         _pr_guards(view, pr, head, target, project)
-        ready = _admission(db, cfg, lot, repo, project, owner, view)
+        ready = _admission(db, cfg, lot, repo, project, owner, view,
+                           slug=slug, target=target, head=head, gh=gh)
         if not _same(ready.get("frozen_sha"), head):
             raise MergePrError("lot #%d is admitted on %s, not on the freeze %s: refreeze and "
                                "re-review" % (lot, (ready.get("frozen_sha") or "?")[:12],
@@ -652,7 +717,8 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         # the merge commit was built stops without writing.
         fresh = pr_view(slug, pr, gh=gh)
         _pr_guards(fresh, pr, head, target, project)
-        ready = _admission(db, cfg, lot, repo, project, owner, fresh)
+        ready = _admission(db, cfg, lot, repo, project, owner, fresh,
+                           slug=slug, target=target, head=head, gh=gh)
         if not _same(ready.get("frozen_sha"), head) \
                 or _branch_name(ready.get("target")) != _branch_name(target):
             raise MergePrError("lot #%d moved during the gesture (admission now %s on %s): "

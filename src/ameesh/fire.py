@@ -730,6 +730,75 @@ def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
     return tuple(dict.fromkeys(forged + declared))
 
 
+def _head_statuses(slug: str | None, sha: str, *, gh) -> list:
+    """Les statuts de commit de la tête **exacte** `sha`, sous la forme d'une
+    entrée de `statusCheckRollup` (`context`, `state`).
+
+    L'endpoint `status` rend le dernier statut de chaque contexte ; un nom
+    exact traverse tel quel. Une lecture impossible, malformée ou tronquée
+    lève `land.LandError` : une source absente ne prouve rien."""
+    if not slug:
+        raise land.LandError("no GitHub repository known: the statuses of %s "
+                             "cannot be read" % (sha or "the head"))
+    if gh is None:
+        raise land.LandError("no GitHub reader: the statuses of %s cannot be read"
+                             % (sha or "the head"))
+    if not sha:
+        raise land.LandError("no frozen head: the statuses of the required checks "
+                             "cannot be read")
+    path = "repos/%s/commits/%s/status" % (slug, quote(sha, safe=""))
+    proc = gh(["api", path + "?per_page=100"])
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:300]
+        raise land.LandError("gh api %s: %s" % (path, detail or "exit %d" % proc.returncode))
+    data = land._json(proc, "gh api %s" % path, dict)
+    statuses = data.get("statuses")
+    total = data.get("total_count")
+    if not isinstance(statuses, list) or type(total) is not int \
+            or total != len(statuses) or total >= 100:
+        raise land.LandError("gh api %s: malformed or truncated statuses" % path)
+    out = []
+    for status in statuses:
+        if not isinstance(status, dict) or not isinstance(status.get("context"), str) \
+                or not status["context"].strip() \
+                or status.get("state") not in ("success", "pending", "failure", "error"):
+            raise land.LandError("gh api %s: invalid commit status" % path)
+        out.append({"__typename": "StatusContext", "context": status["context"],
+                    "state": status["state"]})
+    return out
+
+
+def required_on_head(project, target: str, sha: str, *, gh) -> list:
+    """#2286 : les checks requis de la cible que la tête **exacte** `sha` ne
+    prouve pas, pour la voie file de fusion (`land`).
+
+    La source est la déclaration `radar.projects.<p>.required_checks` du
+    projet, complétée par la protection de la forge quand elle se lit (mêmes
+    règles que `required_checks`) : un projet qui ne déclare aucun check n'a
+    rien à prouver ici, et la protection seule reste portée par la forge au
+    moment de la fusion d'une PR. Sans déclaration, cette garde ne retire
+    jamais rien au comportement existant ; avec une déclaration, elle
+    s'applique à **tout** atterrissage de la file, `ci_required` ou non —
+    c'est le trou de la voie file (Nexlink n'a pas de protection de branche).
+
+    Rend la liste des manques (`tests (absent)`, `coverage (FAILURE)`…) ;
+    lève `land.LandError` quand les checks ou leur source ne peuvent pas être
+    lus : un vert ne se suppose jamais."""
+    from . import radar
+    declared = tuple(getattr(project, "required_checks", ()) or ())
+    if not declared:
+        return []
+    slug = radar.github_slug(project)
+    required = required_checks(slug, target, project, gh=gh)
+    if not required:
+        return []
+    runs = _head_check_runs(slug, sha, gh=gh)
+    statuses = _head_statuses(slug, sha, gh=gh)
+    rollup = ([{"__typename": "CheckRun", "name": run["name"], "status": run["status"],
+                "conclusion": run["conclusion"]} for run in runs] + statuses)
+    return _required_gap(required, rollup, runs)
+
+
 def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
              slug: str | None = None, gh=None) -> tuple:
     """Les portes qui dépendent de la PR : brouillon, cible, CI verte sur la
@@ -1384,16 +1453,28 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
 # le dernier geste de l'atterrissage
 # --------------------------------------------------------------------------
 
-def land_guard(db, lot: int, frozen_sha: str, *, repo: str | None = None) -> tuple:
+def land_guard(db, lot: int, frozen_sha: str, *, repo: str | None = None,
+               project=None, target: str = "", gh=None) -> tuple:
     """Le dernier contrôle avant le geste d'atterrissage (#1374, P1-2) : un lot
     qui a porté un feu ne s'atterrit que sous un feu actif couvrant la tête
     gelée de sa file, et jamais sous un blocage non levé.
+
+    #2286 : pour un atterrissage **local** (`project.land == "local"`, la voie
+    file de Nexlink), les checks requis **déclarés** du projet
+    (`radar.projects.<p>.required_checks`) sont aussi exigés sur le gel : la
+    poussée directe ne passe par aucune protection de branche, et cette
+    déclaration est la seule source de la cible (Nexlink n'en a pas). La garde
+    vaut pour tout atterrissage, `ci_required` ou non ; un projet qui ne
+    déclare aucun check garde le comportement d'avant, et la voie `pr` reste
+    tenue par la forge (et par `ready_pr` au feu) : ses checks de PR vivent
+    sur la ref de fusion, pas sur le commit gelé.
 
     Rend `(ok, raison)`. La garde est appelée par `land` juste avant la poussée
     ou la fusion de la PR, sous son propre bail : la ligne de file peut avoir
     été retirée par le passage du feu, mais la course entre les deux reste
     fermée ici. Sans aucun jalon de feu, la file d'équipe garde son cours : la
-    garde ne concerne que les lots que le feu a autorisés.
+    garde du feu ne concerne que les lots que le feu a autorisés (les checks
+    requis, eux, valent pour tout atterrissage local).
     """
     lot = int(lot)
     try:
@@ -1401,21 +1482,31 @@ def land_guard(db, lot: int, frozen_sha: str, *, repo: str | None = None) -> tup
     except Exception as exc:  # noqa: BLE001 - lecteur illisible : on refuse
         return False, ("cannot read the fire of lot #%d (%s: %s): landing refused"
                        % (lot, type(exc).__name__, str(exc)[:120]))
-    if not markers(marks):
-        return True, ""
-    fire = active(marks)
-    if fire is None:
-        return False, ("the fire of lot #%d was withdrawn or invalidated: no automatic landing"
-                       % lot)
-    if not same_commit(fire.get("sha"), frozen_sha, repo):
-        return False, ("the fire of lot #%d covers %s, not the queued freeze %s: freeze and "
-                       "fire again" % (lot, _norm(fire.get("sha"))[:12],
-                                       str(frozen_sha or "")[:12] or "—"))
-    blocked = merge_queue.blocked_verdicts(marks, frozen_sha, repo=repo)
-    if blocked:
-        return False, ("blocked verdict(s) on the freeze %s not lifted: %s: no automatic landing"
-                       % (str(frozen_sha or "")[:12],
-                          ", ".join(sorted(str(m.get("actor") or "?") for m in blocked))))
+    if markers(marks):
+        fire = active(marks)
+        if fire is None:
+            return False, ("the fire of lot #%d was withdrawn or invalidated: no automatic "
+                           "landing" % lot)
+        if not same_commit(fire.get("sha"), frozen_sha, repo):
+            return False, ("the fire of lot #%d covers %s, not the queued freeze %s: freeze and "
+                           "fire again" % (lot, _norm(fire.get("sha"))[:12],
+                                           str(frozen_sha or "")[:12] or "—"))
+        blocked = merge_queue.blocked_verdicts(marks, frozen_sha, repo=repo)
+        if blocked:
+            return False, ("blocked verdict(s) on the freeze %s not lifted: %s: no automatic "
+                           "landing" % (str(frozen_sha or "")[:12],
+                                        ", ".join(sorted(str(m.get("actor") or "?")
+                                                         for m in blocked))))
+    if project is not None and target and getattr(project, "land", "") == "local":
+        sha = _norm(frozen_sha)
+        try:
+            gaps = required_on_head(project, target, sha, gh=gh)
+        except land.LandError as exc:
+            return False, ("the required checks of %s on %s cannot be proven: %s: landing "
+                           "refused" % (target, sha[:12] or "—", exc))
+        if gaps:
+            return False, ("the required checks of %s are not proven on %s: %s: landing "
+                           "refused" % (target, sha[:12] or "—", ", ".join(gaps)))
     return True, ""
 
 
