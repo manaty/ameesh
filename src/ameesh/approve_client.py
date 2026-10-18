@@ -35,7 +35,11 @@ du compte).
 
 Le jeton ne quitte ce module que dans l'en-tête `Authorization` d'une
 requête vers l'URL configurée — jamais affiché, journalisé, écrit dans un
-fil ni dans un message d'erreur. Pour qu'il n'aille nulle part ailleurs :
+fil ni dans un message d'erreur. La clôture technique d'un défi exige EN
+PLUS la capacité `close_token` rendue à sa création (N3, #2178) : le jeton
+global ne permet pas de fermer le défi d'un autre gardien, et la capacité
+ne quitte jamais le corps de la requête de clôture. Pour qu'il n'aille nulle
+part ailleurs :
 
 * l'URL est `https://…`, ou `http://` sur la boucle locale seulement
   (127.0.0.1, ::1, localhost : ameesh-approve n'écoute que là) ; ni
@@ -63,6 +67,9 @@ from .config import Config
 
 REQUEST_ID_RE = re.compile(r"^req_[0-9a-z]{26}$")
 LOGIN_ID_RE = re.compile(r"^lgn_[0-9a-z]{26}$")
+#: capacité de clôture d'un défi (N3) : 256 bits en base64url, remise au seul
+#: créateur du défi ; le jeton global ne suffit plus à clore celui d'un autre
+CLOSE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _TLS_NAME_RE = re.compile(
     r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$")
 TIMEOUT = 15.0
@@ -334,15 +341,20 @@ def fetch_login_receipt(cfg: Config, login_id: str) -> tuple[str, bytes | dict]:
     raise _refusal(status, payload)
 
 
-def close_login_request(cfg: Config, login_id: str) -> dict:
+def close_login_request(cfg: Config, login_id: str, close_token: str) -> dict:
     """`POST /login-close/<id>` (L232d) : clôture TECHNIQUE du défi demandée
-    par le superviseur (jeton dédié de l'API des défis). Le service efface
-    l'URL et le code, libère la réservation et refuse lien/assertion tardifs ;
-    il n'écrit jamais de reçu humain."""
+    par le superviseur (jeton dédié de l'API des défis) et par la CAPACITÉ de
+    clôture rendue à la création de CE défi (N3) : le jeton global ne permet
+    pas de fermer le défi d'un autre gardien. Le service efface l'URL et le
+    code, libère la réservation et refuse lien/assertion tardifs ; il n'écrit
+    jamais de reçu humain. Le jeton de clôture ne sort que dans ce corps de
+    requête, jamais dans un journal ni un message d'erreur."""
     if not LOGIN_ID_RE.fullmatch(login_id or ""):
         raise ApproveClientError("format", "login id \"lgn_...\" expected")
-    status, payload = _call(cfg, "POST", "/login-close/" + login_id, {},
-                            credential="login")
+    if not CLOSE_TOKEN_RE.fullmatch(close_token or ""):
+        raise ApproveClientError("format", "close token missing for this challenge")
+    status, payload = _call(cfg, "POST", "/login-close/" + login_id,
+                            {"close_token": close_token}, credential="login")
     if status != 200:
         raise _refusal(status, payload)
     return _json(payload)

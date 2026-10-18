@@ -88,9 +88,9 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    grants          register reserve release live_reservations candidates
                    revoke get
    placements      recorded
-   progress        lots lot_events lot_transitions lot_event_last lot_milestones
-                   lot_actions actions agents costs packages package_items
-                   lot_messages
+   progress        lots lot_events lot_transitions lot_event_last lot_hold_events
+                   lot_milestones lot_actions actions agents costs packages
+                   package_items lot_messages
    projects        board
    decisions       create get pending history pending_for_lot close register_chat
    roadmap         plan_item item_plans plan_package items commitments
@@ -159,9 +159,12 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
 from __future__ import annotations
 
 from .conversations import Conversations
+from .provenance import Provenance
 from .work_dependencies import WorkDependencies
 
 import abc
+import re
+from datetime import datetime
 from typing import Any, Callable, Protocol, Sequence, TypedDict
 
 #: #1654 : observation NON fournie au CAS `set_issue_ref` — le contrôle de la
@@ -1484,11 +1487,25 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def queue_add(self, item_id: int, *, target: str, frozen_sha: str, note: str,
-                  actor: str, source: str = "", frozen_id: int | None = None) -> dict | None:
+                  actor: str, source: str = "", frozen_id: int | None = None,
+                  packet: dict | None = None, packet_initial: bool = False,
+                  lease: tuple | None = None) -> dict | None:
         """L160e (0058): puts (or puts back) the lot in the merge queue of
         `target`, state `queued`, with a journal line; `source`: the
         repository it was queued from (`merge_queue.source_of`). None if the
-        lot is no longer open."""
+        lot is no longer open. `packet` (#1467) is the expected QA item
+        snapshot (app, branch, branch_target, type, resolved_target): create only, with a real
+        expected freeze. A replay returns its same queued generation; an
+        existing different entry, withdrawal, or changed snapshot refuses.
+        Packet allocation/withdrawal receipts survive in typed train storage,
+        separate from free-text work notes (including legacy receipt notes);
+        they never certify historical reviews or CI. These adapter write
+        paths do not isolate receipts from a trusted role's arbitrary SQL.
+        A first insertion also needs `packet_initial=True` from the caller's qualified history
+        provider: absence of a queue row cannot prove never-withdrawn for
+        historical lots. It cannot override a recorded withdrawal.
+        `lease` (#1467): optional `(target key, owner, epoch)`, locked after
+        the lot and checked live before allocation/replay, in this transaction."""
 
     @abc.abstractmethod
     def queue_update(self, item_id: int, *, state: str | None = None,
@@ -1512,7 +1529,10 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def queue_remove(self, item_id: int, *, note: str, actor: str) -> bool:
-        """L160e (0058): takes the lot out of the queue, with a journal line."""
+        """L160e (0058): takes the lot out of the queue, with a journal line.
+        Locks the lot before its queue row and records a typed `removed`
+        receipt for the deleted row's freeze in the same transaction.
+        A free-text journal note cannot write this receipt."""
 
     @abc.abstractmethod
     def land_lock(self, key: str, owner: str, ttl_s: float, *,
@@ -1526,6 +1546,45 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def land_unlock(self, key: str, owner: str, epoch: int) -> bool:
         """L160e2 (0058): frees the lease, if still held at that epoch."""
+
+    @abc.abstractmethod
+    def train_read(self, key: str) -> dict | None:
+        """#1467: durable train document and its revision, or None."""
+
+    @abc.abstractmethod
+    def train_save(self, key: str, document: dict, *, revision: int,
+                   owner: str, epoch: int) -> dict | None:
+        """#1467: compare-and-swap train state under the existing land lease.
+
+        revision=0 creates it. Every write locks and then rechecks the lease
+        against wall time, and compares the previous document revision.
+        A stale holder cannot overwrite a newer train. No remote API grant.
+        """
+
+    @abc.abstractmethod
+    def train_fire_read(self, key: str, plan_id: str) -> dict | None:
+        """#1467: latest persisted fire receipt, including withdrawn history."""
+
+    @abc.abstractmethod
+    def train_fire_give(self, key: str, document: dict) -> dict | None:
+        """#1467: append a fire for the current exact persisted plan.
+
+        Locks the target; refuses replacement of an active/claimed fire.
+        Caller authenticates the pilot on a declared role, never history.
+        """
+
+    @abc.abstractmethod
+    def train_fire_change(self, key: str, fire_id: int, state: str, *, actor: str,
+                          owner: str | None = None, epoch: int | None = None) -> dict | None:
+        """#1467: serialized revoke, promotion claim, or completion.
+
+        Claim requires the live train lease and persisted promotion intent.
+        It commits BEFORE any external effect; an uncertain claim never
+        becomes revocable or active again automatically. Completion requires
+        a live holder; a restarted holder first observes the exact remote
+        head in business code. A failed transition returns None.
+        No mediated operation or authority is granted by this interface.
+        """
 
     @abc.abstractmethod
     def queue(self, target: str | None = None) -> list[dict]:
@@ -1587,8 +1646,52 @@ class WorkItems(Domain):
         connexion d'exécuteur médié."""
 
     @abc.abstractmethod
-    def items(self, *, state: str | None, assignee: str | None, limit: int) -> list[dict]:
-        """Lots, du plus récemment modifié au plus ancien."""
+    def items(self, *, state: str | None, assignee: str | None, limit: int | None) -> list[dict]:
+        """Lots, du plus récemment modifié au plus ancien ; None sans limite."""
+
+    @abc.abstractmethod
+    def items_missing_ref(self, *, states: Sequence[str], ref_prefix: str,
+                          limit: int, attempt_prefix: str = "",
+                          retry_s: float = 0, terminal_prefix: str = "",
+                          max_attempts: int = 0, since: datetime | None = None) -> list[dict]:
+        """L539 (#1104) : les lots de `states` dont **aucun** lot ne porte la
+        référence `ref_prefix + <id>` (celui qui leur correspond), du plus
+        récemment modifié au plus ancien, `limit` au plus.
+
+        La borne porte sur les lots **manquants rendus**, jamais sur un
+        balayage préalable : un lot ancien encore manquant n'est pas caché par
+        `limit` lots plus récents déjà pourvus (R2 #1104 P2-2). `states` est un
+        seul ensemble ordonné, donc un `promoted` n'est pas affamé par des
+        `merged` plus récents. Lecture pure : ni verrou ni écriture.
+
+        `attempt_prefix`/`retry_s` (binôme mesh-design, 14/10) : excluent aussi
+        **avant** la borne les lots dont le journal porte une tentative
+        `attempt_prefix<id>` plus récente que `retry_s` secondes (voir
+        `log_review_attempt`) — sinon les mêmes candidats sans ouverture
+        affameraient les plus anciens. Le délai écoulé, ils redeviennent
+        sélectionnables (délai, pas suppression).
+
+        `since` (arbitrage pilote du 15/10 sur le P2 de la R2 #1104) : ne rend
+        que les lots dont le jalon `merged` est à `since` ou après — la borne
+        d'activation (`review_catch_up_bound`), jamais un balayage historique.
+        Un lot sans jalon `merged` lisible est exclu (jamais deviné).
+
+        `terminal_prefix`/`max_attempts` (même arbitrage) : un lot dont le
+        journal porte une marque terminale `terminal_prefix<id>` est exclu
+        **toujours** (non-light confirmé, doute épuisé) ; un lot dont le
+        journal porte `max_attempts` tentatives `attempt_prefix<id>` ou plus
+        est exclu de même (le traitement d'un doute est borné, jamais horaire
+        à perpétuité)."""
+
+    @abc.abstractmethod
+    def review_catch_up_bound(self) -> str | None:
+        """L539 (#1104) : la borne d'activation du rattrapage des relectures
+        après fusion — la ligne unique écrite par la migration 0438 au moment
+        de l'activation du lot. Commune aux exécuteurs (base partagée),
+        conservée après redémarrage ; `None` si elle manque, et le rattrapage
+        est alors fail-closed (aucun balayage historique). Rendue en ISO-8601
+        (identique quel que soit le pilote), utilisable en paramètre SQL.
+        Lecture pure : ni verrou ni écriture."""
 
     @abc.abstractmethod
     def move(self, item_id: int, state: str, *, current: str, loops: int, note: str,
@@ -1603,18 +1706,18 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def designate_reviewer(self, item_id: int, reviewer: str, *, actor: str,
-                           event: str | None = None) -> dict | None:
-        """#705 : pose (ou change) le relecteur désigné d'un lot **en `qa`**,
+                           event: str | None = None, remove: bool = False) -> dict | None:
+        """#2076 : ajoute un relecteur désigné (ou le retire explicitement),
         et journalise ; None (rien d'écrit) si le lot n'est plus en `qa` ou si
-        son assigné est devenu le relecteur (la règle est relue dans
+        son assigné est devenu le relecteur à ajouter (la règle est relue dans
         l'écriture, pas seulement avant : #705 r2, B1).
 
-        #1979 : `reviewer` vide efface la désignation et `event` remplace la
+        #1979 : `reviewer` vide efface toutes les désignations et `event` remplace la
         ligne de journal par défaut (« reviewer X designated ») — il porte
         alors le retrait, ou la marque « verdict non requis » de
         `work.waive_review` (`work.REVIEWER_NONE`).
 
-        La colonne vient de la migration 0421 : avant elle, la lecture s'en
+        Les colonnes viennent des migrations 0421 et 0456 : avant elles, la lecture s'en
         passe (`item_columns`) et l'écriture est refusée avec la marche à
         suivre. Un exécuteur médié ne désigne jamais de relecteur (opération
         refusée au contrat L107/L109) : la désignation est un geste
@@ -1630,8 +1733,20 @@ class WorkItems(Domain):
         state was set without a journal line)."""
 
     @abc.abstractmethod
-    def note(self, item_id: int, state: str, text: str, actor: str) -> None:
-        """Journalise une note et rafraîchit `updated_at`."""
+    def note(self, item_id: int, state: str, text: str, actor: str, *, once: bool = False) -> None:
+        """Journalise une note et rafraîchit `updated_at`.
+
+        `once` sérialise sur le lot et n'insère pas un texte déjà présent.
+        """
+
+    @abc.abstractmethod
+    def log_review_attempt(self, item_id: int, state: str, text: str, actor: str) -> None:
+        """L539 (#1104) : journalise une tentative de rattrapage sans création.
+
+        Le texte commence par le marqueur `<attempt_prefix><id>` (premier mot),
+        que `items_missing_ref` reconnaît ; le journal seul est écrit,
+        `updated_at` reste intact (une tentative de fond ne réordonne pas la
+        sélection et ne rend pas le lot actif)."""
 
     @abc.abstractmethod
     def lock_deep_analysis(self, item_id: int) -> None:
@@ -1721,29 +1836,44 @@ class WorkItems(Domain):
         """Délégations rendues au délégant depuis `since_ts`."""
 
     @abc.abstractmethod
-    def events(self, item_id: int, limit: int) -> list[dict]:
+    def events(self, item_id: int, limit: int | None) -> list[dict]:
         """Journal du lot, du plus récent au plus ancien."""
 
     @abc.abstractmethod
-    def events_noted(self, prefix: str, since_ts: float) -> list[dict]:
-        """L317c : les lignes de journal, tous lots, dont la note commence par
-        `prefix`, écrites depuis `since_ts` (les plus anciennes d'abord)."""
+    def events_noted(self, prefix: str, since_ts: float, *,
+                     ids: Sequence[int] | None = None) -> list[dict]:
+        """L317c : les lignes de journal dont la note commence par `prefix`,
+        écrites depuis `since_ts` (les plus anciennes d'abord).
+
+        `ids` borne la lecture à ces éléments (#2162, `backlog._DirNotes`) :
+        sans lui, tous les lots ; avec lui, l'historique des lots clos n'est
+        pas lu. Le filtre porte sur les ids, jamais sur une fenêtre
+        temporelle : une note ancienne d'un élément candidat reste lue, donc
+        dédupliquée exactement."""
 
     @abc.abstractmethod
-    def milestones(self, item_id: int, limit: int) -> list[dict]:
-        """Les jalons d'un lot (0013), du plus récent au plus ancien."""
+    def milestones(self, item_id: int, limit: int | None) -> list[dict]:
+        """Les jalons d'un lot (0013), du plus récent au plus ancien.
+        `None` lit tout l'historique, notamment les anciens blocages du train."""
 
     @abc.abstractmethod
     def add_milestone(self, item_id: int, kind: str, *, sha: str, actor: str,
                       verdict: str | None, note: str, on_frozen=None,
-                      after_commit: list | None = None) -> dict:
+                      after_commit: list | None = None,
+                      proof: dict | None = None) -> dict:
         """Écrit un jalon déclaré (`frozen`, `verdict`) et le rend.
 
         `on_frozen` (facultatif, #1617) : callback du gel, appelé dans la
         transaction du jalon `frozen` avec `(tx, milestone, after_commit)` ;
         `after_commit` reçoit les écritures de fil différées, que **l'appelant**
         vide après le commit qu'il tient (un `with` imbriqué ne commite pas).
-        Absents, rien ne change."""
+        Absents, rien ne change.
+
+        `proof` (facultatif, #1465) : l'identité exacte du tour qui déclare
+        (`actor`, `session`, `turn`, `harness`, `sha` complet), écrite DANS LA
+        MÊME TRANSACTION que le jalon sous le sujet `milestone:<id>`. Absent,
+        le jalon s'écrit sans preuve : l'origine reste inconnue, jamais
+        devinée. Les deux options sont indépendantes et se composent."""
 
     @abc.abstractmethod
     def delays(self, limit: int, *, ids: Sequence[int] | None = None) -> list[dict]:
@@ -2453,6 +2583,28 @@ class Placements(Domain):
 # vue d'avancement (`ameesh progress`, L24) : lectures seules
 # --------------------------------------------------------------------------
 
+# Blancs de `str.strip`/`re` Unicode, explicites pour le lecteur ARE : sa
+# classe `\s` dépend de la locale et omet notamment l'espace insécable.
+HOLD_NOTE_WHITESPACE = ("\t\n\v\f\r\x1c\x1d\x1e\x1f \x85\xa0\u1680"
+                        "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+                        "\u2028\u2029\u202f\u205f\u3000")
+
+
+def _transitions(events) -> list[dict]:
+    """Lignes où l'état d'un lot change (la première de chaque lot en fait
+    partie), texte des notes écarté : la règle de `lot_transitions`, partagée
+    avec le repli de `lot_hold_events` (#1647, #1664)."""
+    out: list[dict] = []
+    previous: dict[int, str] = {}
+    for ev in events or ():
+        lot = int(ev["work_item_id"])
+        state = ev.get("state")
+        if lot not in previous or previous[lot] != state:
+            out.append({key: value for key, value in ev.items() if key != "note"})
+        previous[lot] = state
+    return out
+
+
 class Progress(Domain):
     """Lectures de la vue d'avancement (décision 0024) : lots et leur
     journal, actions, état des agents et grand livre des coûts. Aucune
@@ -2485,15 +2637,7 @@ class Progress(Domain):
         Lecture DÉRIVÉE (pas une opération du contrat médié) : le stockage
         peut l'optimiser — agrégation SQL — sans changer ce que reçoit
         l'appelant ; le repli ci-dessous lit `lot_events`."""
-        out: list[dict] = []
-        previous: dict[int, str] = {}
-        for ev in self.lot_events(item_ids):
-            lot = int(ev["work_item_id"])
-            state = ev.get("state")
-            if lot not in previous or previous[lot] != state:
-                out.append({key: value for key, value in ev.items() if key != "note"})
-            previous[lot] = state
-        return out
+        return _transitions(self.lot_events(item_ids))
 
     def lot_event_last(self, item_ids: Sequence[int]) -> list[dict]:
         """Dernier instant d'événement de chacun de ces lots (work_item_id,
@@ -2507,6 +2651,43 @@ class Progress(Domain):
             if ts is not None:
                 last[lot] = max(last.get(lot, float("-inf")), float(ts))
         return [{"work_item_id": lot, "last_ts": last[lot]} for lot in sorted(last)]
+
+    def lot_hold_events(self, item_ids: Sequence[int],
+                        patterns: Sequence[str]) -> list[dict]:
+        """Événements utiles à la lecture des retenues (#1664) : les
+        transitions d'état (une retenue tombe au changement d'état) et les
+        lignes dont la note correspond à l'un des motifs `patterns` (notes
+        hold/levée ; mêmes motifs que `planned_waits`), fusionnées par
+        identifiant — la ligne à note l'emporte, elle seule porte le texte —
+        et rendues dans l'ordre d'écriture (`id`), comme `lot_transitions`.
+        Une note portée par une transition est donc rendue avec elle, et le
+        texte des notes ordinaires n'est jamais lu ni transmis. Un motif vide
+        est refusé (`ValueError`) : il ferait sortir toutes les notes.
+
+        Les motifs suivent la syntaxe des deux lecteurs (repli Python `re`,
+        pilote PostgreSQL ARE : `^`, `\\s`, `(?:…)`) et s'appliquent à la note
+        débarrassée de ses blancs de bord. Lecture DÉRIVÉE (pas une opération
+        du contrat médié) : le pilote PostgreSQL ne transfère que ces lignes ;
+        le repli ci-dessous lit `lot_events` une fois. Un appelant qui a déjà
+        lu `lot_transitions` paie une seconde lecture bornée des transitions
+        (`max_lots`) — le contrat reste inchangé."""
+        ids = [int(i) for i in item_ids]
+        if not ids:
+            return []
+        wanted = tuple(str(pattern) for pattern in patterns)
+        if any(not pattern for pattern in wanted):
+            raise ValueError("empty hold pattern")
+        compiled = tuple(re.compile(pattern, re.I) for pattern in wanted)
+        events = list(self.lot_events(ids))
+        merged: dict[tuple[int, int], dict] = {}
+        for ev in _transitions(events):
+            merged[(int(ev["work_item_id"]), int(ev["id"]))] = ev
+        if compiled:
+            for ev in events:
+                note = str(ev.get("note") or "").strip()
+                if note and any(rx.match(note) for rx in compiled):
+                    merged[(int(ev["work_item_id"]), int(ev["id"]))] = dict(ev)
+        return sorted(merged.values(), key=lambda e: int(e["id"]))
 
     @abc.abstractmethod
     def lot_milestones(self, item_ids: Sequence[int]) -> list[dict]:
@@ -3261,8 +3442,9 @@ class Housekeeping(Domain):
     def register_worktree(self, *, host: str, path: str, repo: str, agent: str,
                           lot: str | None, turn_id: str | None, branch: str,
                           head: str) -> dict | None:
-        """Enregistre un worktree apparu pendant un tour ; None s'il est déjà
-        suivi (vivant ou gardé) sur cet hôte."""
+        """Enregistre un worktree apparu pendant un tour ou découvert dans un
+        dépôt local ; None s'il est déjà suivi (vivant ou gardé). Un chemin
+        auparavant removed/gone reçoit un nouveau cycle, sans ancien lot."""
 
     @abc.abstractmethod
     def worktrees(self, host: str | None, statuses: Sequence[str] | None = None,
@@ -3360,7 +3542,7 @@ class LotSessions(Domain):
     HOLD_PREFIX = "hold:"
 
     @abc.abstractmethod
-    def switch(self, name: str, owner: str, epoch: int, *, to_lot: str,
+    def switch(self, name: str, owner: str, epoch: int, *, to_lot: str | None,
                harness: str | None, account: str | None, cwd: str | None,
                current: str | None = None) -> dict | None:
         """Change le lot de la session active, **fencé par le bail**, en une
@@ -3373,6 +3555,9 @@ class LotSessions(Domain):
         l'agent et qu'elle a été ouverte sous les harnais `harness`, compte
         `account` (celui du prochain tour) et dossier `cwd` (sinon elle est
         écartée et la session active est vide : une session neuve s'ouvrira).
+        `to_lot=None` : la session active est mise de côté pour son lot et
+        AUCUNE ne devient active (`session_work_item` remis à NULL) — le tour
+        part dans une session sans lot (#2055).
         Rend `{resumed, parked, discarded, discard_reason}` (identifiants ou
         None ; raison `origin` ou `lot`), ou None si le bail n'est plus le
         nôtre (rien n'est écrit)."""
@@ -3685,6 +3870,7 @@ class Storage(abc.ABC):
     nonces: Nonces
     work: WorkItems
     work_dependencies: WorkDependencies
+    provenance: Provenance
     lot_sessions: LotSessions
     packages: WorkPackages
     actions: Actions

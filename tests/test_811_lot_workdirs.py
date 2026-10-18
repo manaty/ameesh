@@ -450,9 +450,9 @@ class PickupTest(consumers.PriseMultiProjetsTest):
         lues = []
         vrai = work_store.WorkItems.events_noted
 
-        def notes(store, prefix, since_ts):
-            lues.append(prefix)
-            return vrai(store, prefix, since_ts)
+        def notes(store, prefix, since_ts, ids=None):
+            lues.append((prefix, ids))
+            return vrai(store, prefix, since_ts, ids=ids)
 
         def interdit(*args, **kwargs):
             raise AssertionError('work.events relu par lot à chaque passe')
@@ -461,10 +461,62 @@ class PickupTest(consumers.PriseMultiProjetsTest):
                 mock.patch.object(work, 'events', interdit):
             self.assertEqual(self.take(), [])
             self.assertEqual(self.take(), [])
-        self.assertEqual(lues, [backlog.DIRECTORY_NOTE_PREFIX] * 2)
+        self.assertEqual([prefix for prefix, _ in lues],
+                         [backlog.DIRECTORY_NOTE_PREFIX] * 2)
+        self.assertEqual([ids for _, ids in lues], [[item['id']]] * 2)
         raisons = [e['note'] for e in work.events(self.db, item['id'])
                    if (e.get('note') or '').startswith('L243-4:')]
         self.assertEqual(len(raisons), 1)
+
+    def test_notes_read_is_bounded_to_candidates_not_to_journal(self):
+        """#2162 : la lecture des notes L243-4 est bornée aux ids candidats de
+        la passe, pas au journal des lots clos ; la déduplication reste
+        exacte — une note ancienne du candidat est reconnue (pas de fenêtre
+        temporelle), donc pas de seconde note."""
+        self.multi()
+        item = self.lot('secondary', app='nexlink')
+        closed = self.lot('closed elsewhere', app='ameesh')
+        work.note(self.db, closed['id'],
+                  '%s autre agent cannot pick up project ameesh: gone'
+                  % backlog.DIRECTORY_NOTE_PREFIX, actor='test')
+        work.close(self.db, closed['id'], abandoned=True)
+        from ameesh.storage.postgres import work as work_store
+        ids_lus = []
+        vrai = work_store.WorkItems.events_noted
+
+        def notes(store, prefix, since_ts, ids=None):
+            ids_lus.append(ids)
+            return vrai(store, prefix, since_ts, ids=ids)
+
+        with mock.patch.object(work_store.WorkItems, 'events_noted', notes):
+            self.assertEqual(self.take(), [])
+            # la note du candidat vieillit de 90 jours : sans fenêtre
+            # temporelle, elle reste reconnue et n'est pas réécrite.
+            self.db.execute(
+                "UPDATE work_item_events SET created_at = now() - interval '90 days'"
+                " WHERE work_item_id = %s", (item['id'],))
+            self.assertEqual(self.take(), [])
+        self.assertEqual(ids_lus, [[item['id']], [item['id']]])
+        raisons = [e['note'] for e in work.events(self.db, item['id'])
+                   if (e.get('note') or '').startswith('L243-4:')]
+        self.assertEqual(len(raisons), 1)
+
+    def test_events_noted_bounds_the_storage_read_to_ids(self):
+        """#2162 : le filtre `ids` de la lecture de stockage exclut les autres
+        éléments ; sans lui, la lecture reste celle de tous les lots."""
+        a = work.add(self.db, title='a', app='ameesh')
+        b = work.add(self.db, title='b', app='ameesh')
+        for item in (a, b):
+            work.note(self.db, item['id'],
+                      '%s x cannot pick up project ameesh: gone'
+                      % backlog.DIRECTORY_NOTE_PREFIX, actor='test')
+        store = storage.of(self.db).work
+        borne = store.events_noted(backlog.DIRECTORY_NOTE_PREFIX, 0.0, ids=[a['id']])
+        self.assertEqual([row['work_item_id'] for row in borne], [a['id']])
+        self.assertEqual(store.events_noted(backlog.DIRECTORY_NOTE_PREFIX, 0.0, ids=[]), [])
+        tout = store.events_noted(backlog.DIRECTORY_NOTE_PREFIX, 0.0)
+        self.assertEqual(sorted(row['work_item_id'] for row in tout),
+                         sorted([a['id'], b['id']]))
 
     def test_two_agents_note_the_refusal_once(self):
         """#1538 : le refus de dossier se note une fois par ÉLÉMENT, pas une
@@ -492,9 +544,9 @@ class PickupTest(consumers.PriseMultiProjetsTest):
         lues = []
         vrai = work_store.WorkItems.events_noted
 
-        def notes(store, prefix, since_ts):
+        def notes(store, prefix, since_ts, ids=None):
             lues.append(prefix)
-            return vrai(store, prefix, since_ts)
+            return vrai(store, prefix, since_ts, ids=ids)
 
         with mock.patch.object(work_store.WorkItems, 'events_noted', notes), \
                 mock.patch('ameesh.lot_workdir.problem',

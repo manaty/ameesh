@@ -48,8 +48,9 @@ def canonical(thresholds: dict) -> str:
 
 
 def default_thresholds() -> dict:
-    """The perimeter of the API and of a CLI without options: the `alerts`
-    parser's defaults, environment included."""
+    """The perimeter of the API, of a CLI without options and of a notify pass
+    that observes without thresholds (#2105): the `alerts` parser's defaults,
+    environment included."""
     from . import exploitation
     return exploitation.thresholds(exploitation.build_parser().parse_args(["alerts"]))
 

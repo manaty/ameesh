@@ -279,6 +279,74 @@ class RoadmapEditingPgTest(PgTestCase):
         self.assertEqual({c["what"] for c in self.cli_json("list", "--project", "acme")}, {"Acme", "Global"})
         self.assertEqual({c["what"] for c in edit.export(self.db, project="acme")["commitments"]}, {"Acme", "Global"})
 
+    def test_stale_references_warn_instead_of_locking_an_edit(self):
+        legacy = roadmap.add_commitment(self.db, "Legacy", due="2026-12-01",
+                                        depends_on=["e999", "missing-package", "task #999"])
+        out = self.mesh("plan", "update", str(legacy["id"]), "--note", "edited")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(edit.get(self.db, legacy["id"])["note"], "edited")
+        reported = [json.loads(line[len("warning: "):]) for line in out.stderr.splitlines()
+                    if line.startswith("warning: ")]
+        self.assertEqual({w["code"] for w in reported},
+                         {"unknown_dependency", "unknown_package", "unknown_task"})
+        self.assertTrue(all(w.get("stale") for w in reported))
+        # A newly introduced broken reference still refuses the write.
+        refused = self.mesh("plan", "update", str(legacy["id"]), "--depends-on", "e998")
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("unknown_dependency", refused.stderr)
+        self.assertEqual(edit.get(self.db, legacy["id"])["note"], "edited")
+
+    def test_import_of_own_export_warns_on_stale_references(self):
+        roadmap.add_commitment(self.db, "Legacy", due="2026-12-01", depends_on=["e999"])
+        body = edit.export(self.db)
+        preview = edit.import_plan(self.db, body)
+        self.assertFalse(preview["applied"])
+        self.assertEqual([c["action"] for c in preview["changes"]], ["unchanged"])
+        self.assertEqual([(w["code"], w.get("stale")) for w in preview["warnings"]],
+                         [("unknown_dependency", True)])
+        applied = edit.import_plan(self.db, body, apply=True)
+        self.assertTrue(applied["applied"])
+        self.assertEqual([c["action"] for c in applied["changes"]], ["unchanged"])
+
+    def test_stale_project_and_package_warn_instead_of_locking_an_edit(self):
+        item = work.add(self.db, title="Acme planning", app="acme")
+        legacy = roadmap.add_commitment(self.db, "Legacy", due="2026-12-01",
+                                        lot=item["id"], project="other")
+        self.db.execute("UPDATE commitments SET package_id = 'gone' WHERE id = %s",
+                        (legacy["id"],))
+        out = self.mesh("plan", "update", str(legacy["id"]), "--note", "kept")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        codes = {json.loads(line[len("warning: "):])["code"] for line in out.stderr.splitlines()
+                 if line.startswith("warning: ")}
+        self.assertEqual(codes, {"stale_project_conflict", "stale_package"})
+        # Introducing the conflict is still refused: the stored pair is the legacy one.
+        refused = self.mesh("plan", "update", str(legacy["id"]), "--project", "third")
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("project conflicts", refused.stderr)
+
+    def test_note_files_keep_crlf_line_endings(self):
+        path = Path(self.tmp) / "note.md"
+        path.write_bytes(b"line one\r\nline two\r\n")
+        row = self.cli_json("add", "CRLF note", "--proposed", "--key", "crlf",
+                            "--note-file", str(path))
+        self.assertEqual(row["note"], "line one\r\nline two\r\n")
+        path.write_bytes(b"other\r\nbody\r\n")
+        edited = self.cli_json("update", "e%d" % row["id"], "--note-file", str(path))
+        self.assertEqual(edited["note"], "other\r\nbody\r\n")
+
+    def test_export_output_is_replaced_atomically(self):
+        roadmap.add_commitment(self.db, "Atomic", due="2026-12-01")
+        outfile = Path(self.tmp) / "export.json"
+        self.assertEqual(self.mesh("plan", "export", "--output", str(outfile)).returncode, 0)
+        original = outfile.read_text(encoding="utf-8")
+        self.assertEqual(json.loads(original)["schema"], edit.SCHEMA)
+        with mock.patch("ameesh.roadmap.os.replace", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(roadmap.RoadmapError, "cannot write"):
+                roadmap._write_atomic(str(outfile), "new content")
+        self.assertEqual(outfile.read_text(encoding="utf-8"), original)
+        self.assertEqual([p.name for p in Path(self.tmp).iterdir()
+                          if p.name.startswith("export.json")], ["export.json"])
+
     def test_validation_reports_stored_unknown_references_and_warnings(self):
         a = roadmap.add_commitment(self.db, "A", due="2026-12-02")
         roadmap.add_commitment(self.db, "B", due="2026-12-01", depends_on=["e%d" % a["id"]])

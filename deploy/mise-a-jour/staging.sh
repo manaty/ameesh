@@ -26,8 +26,9 @@
 #
 # Options lues dans BASCULE_ENV : SONDE_<HOTE> (cible de la sonde de courrier,
 # par defaut la premiere persona menee de l'hote), ATTENTE_COURRIER (300 s),
-# SOUFFRANCE_COURRIER (900 s), NOTIF_STAGING (mesh-design), ATTENTE_MAX
-# (vm.sh/poste.sh), LOTS_VERIF et RAPPORTEURS_VERIF (voir le signal ci-dessous).
+# SOUFFRANCE_COURRIER (900 s), NOTIF_STAGING (mesh-design), DRAIN_ATTENTE
+# (vm.sh, 0 = jamais, > 0 = pause immédiate), LOTS_VERIF et RAPPORTEURS_VERIF
+# (voir le signal ci-dessous).
 #
 # --hotes limite la sequence a un sous-ensemble, dans l'ordre canonique. Les
 # noms sont normalises : un seul exemplaire par hote, quel que soit le

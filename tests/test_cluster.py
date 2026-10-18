@@ -101,6 +101,17 @@ CONTENUS = {
 #: listée ici, fait échouer le test : une migration oblige à trancher.
 #: colonnes fermées en attendant leur classement (aucun GRANT modifié)
 FERMEES = {
+    # #1467 (0442): plans and replayable admission/fire receipts stay closed
+    # to both supervisor roles. No new grants accompany this classification.
+    "integration_trains": {"target_key", "revision", "document", "updated_at"},
+    "integration_train_fires": {"id", "target_key", "plan_id", "document", "state",
+                                "changed_by", "owner", "epoch", "created_at", "updated_at"},
+    "integration_train_queue_receipts": {"id", "work_item_id", "generation", "frozen_id",
+                                         "kind", "created_at"},
+    # #1465 (0445), required by #1467: exact provenance receipts also keep
+    # their existing closed rights; this does not qualify their producers.
+    "provenance_receipts": {"subject", "sha", "actor", "session", "turn", "harness",
+                            "work_item_id", "at"},
     # #373 (L85) : rôles des agents dans la vue d'ensemble — fermés tant que le
     # contrat des rôles superviseur ne les accorde pas (paquet horaire du 15/10)
     "agent_mesh_overview": {"roles"},
@@ -114,6 +125,10 @@ FERMEES = {
     # fermé tant que le contrat des rôles superviseur ne le classe pas (paquet du 16/10)
     "work_items": {"workflow_ref", "workflow_stage", "workflow_version"},
     "work_item_events": {"command_id", "evidence", "workflow_stage", "workflow_version"},
+    # #1104 (0438) : la borne d'activation du rattrapage des relectures après
+    # fusion est un état interne, lu par les exécuteurs et non par le rôle
+    # superviseur externe ; classement fermé, aucun GRANT modifié.
+    "review_catch_up": {"id", "bound_at", "actor"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).

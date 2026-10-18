@@ -288,7 +288,11 @@ class PosteDsnTest(unittest.TestCase):
         os.chmod(python, 0o755)
         self.env = dict(os.environ, HOME=home, FAKE_STATE=self.state,
                         PATH=bin_dir + os.pathsep + os.environ["PATH"])
-        for name in ("PGPASSWORD", "PGSERVICE", "BASCULE_ENV", "UNITES_RESTE"):
+        # the host's credential channels are not what this test measures: a
+        # bench's PGPASSFILE (scripts/test.sh, #2170) would otherwise reach
+        # the fake tools even when the DSN itself carries no password
+        for name in ("PGPASSWORD", "PGPASSFILE", "PGSERVICE", "BASCULE_ENV",
+                     "UNITES_RESTE"):
             self.env.pop(name, None)
 
     def configure(self, mesh, old=None):
