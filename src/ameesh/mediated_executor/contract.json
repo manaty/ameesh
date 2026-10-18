@@ -4414,6 +4414,7 @@
     "backlog_add",
     "by_issue_ref",
     "by_package",
+    "claim_review_proposal",
     "close",
     "close_merged",
     "count_builds",
