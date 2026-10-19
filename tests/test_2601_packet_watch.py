@@ -100,7 +100,7 @@ class Check(unittest.TestCase):
         self.watch = packet_watch.projects(self.cfg)["ameesh"]
         self.sent = []
         free = mock.patch.object(packet_watch, "carriers",
-                                 return_value={"open": [], "recent": []})
+                                 return_value={"open": [], "recent": [], "served": []})
         self.carriers = free.start()
         self.addCleanup(free.stop)
 
@@ -127,11 +127,11 @@ class Check(unittest.TestCase):
 
     def test_grace_busy_and_nothing_ready_stay_silent(self):
         self.assertEqual(self.run_check(at(4, 5), {})["result"], "grace")
-        self.carriers.return_value = {"open": [2608], "recent": []}
+        self.carriers.return_value = {"open": [2608], "recent": [], "served": []}
         self.assertEqual(self.run_check(at(4, 20), {})["result"], "busy")
-        self.carriers.return_value = {"open": [], "recent": [2604]}
+        self.carriers.return_value = {"open": [], "recent": [2604], "served": []}
         self.assertEqual(self.run_check(at(4, 20), {})["result"], "busy")
-        self.carriers.return_value = {"open": [], "recent": []}
+        self.carriers.return_value = {"open": [], "recent": [], "served": []}
         self.assertEqual(self.run_check(at(4, 20), {}, ready=())["result"], "nothing-ready")
         self.assertEqual(self.sent, [])
 
@@ -170,10 +170,69 @@ class Carriers(unittest.TestCase):
                         "app": "ameesh", "updated_at": old}],
         }
         work = types.SimpleNamespace(
-            items=lambda state, assignee, limit: rows.get(state, []))
+            items=lambda state, assignee, limit: rows.get(state, []),
+            delays=lambda limit, ids: [{"work_item_id": 2590, "merged_ts": now - 300},
+                                       {"work_item_id": 2580, "merged_ts": old.timestamp()}])
         with mock.patch("ameesh.storage.of", return_value=types.SimpleNamespace(work=work)):
-            found = packet_watch.carriers(object(), "ameesh", now, 900)
-        self.assertEqual(found, {"open": [2608], "recent": [2590]})
+            found = packet_watch.carriers(object(), "ameesh", now, 900, slot_at=at(4))
+        self.assertEqual(found, {"open": [2608], "recent": [2590], "served": [2590]})
+
+
+class ServedSlot(unittest.TestCase):
+    def test_early_merge_silences_whole_slot_but_not_the_next(self):
+        rows = {"merged": [{"id": 2639, "branch": "integration/paquet-h-20261019-0600",
+                            "app": "ameesh", "updated_ts": at(6, 20)}]}
+        store = types.SimpleNamespace(
+            items=lambda state, assignee, limit: rows.get(state, []),
+            delays=lambda limit, ids: [{"work_item_id": 2639, "merged_ts": at(6, 20)}])
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch("ameesh.storage.of", return_value=types.SimpleNamespace(work=store)):
+            cfg = cfg_with(tmp)
+            watch = packet_watch.projects(cfg)["ameesh"]
+            inventory, send = mock.Mock(return_value=payload()), mock.Mock()
+            for now in (at(6, 20), at(6, 35), at(6, 59)):
+                # Empty state also covers starting the watcher after the merge.
+                result = packet_watch.check(cfg, None, watch, Hourly(), now=now, state={},
+                                            inventory=inventory, send=send)
+                self.assertEqual(result["result"], "served")
+            inventory.assert_not_called()
+            send.assert_not_called()
+            result = packet_watch.check(cfg, None, watch, Hourly(), now=at(7, 15), state={},
+                                        inventory=inventory, send=send)
+            self.assertEqual(result["result"], "alerted")
+            self.assertEqual(send.call_count, 2)
+
+    def test_only_an_effective_merge_in_the_slot_serves_it(self):
+        for merged, expected in ((at(6), [2639]), (at(5, 59), []),
+                                 (at(6, 37), []), (None, [])):
+            with self.subTest(merged=merged):
+                rows = {"merged": [{"id": 2639, "branch": "integration/paquet-h-x",
+                                    "app": "ameesh", "updated_ts": at(6, 20)}]}
+                store = types.SimpleNamespace(
+                    items=lambda state, assignee, limit: rows.get(state, []),
+                    delays=lambda limit, ids: [{"work_item_id": 2639, "merged_ts": merged}])
+                with mock.patch("ameesh.storage.of", return_value=types.SimpleNamespace(work=store)):
+                    found = packet_watch.carriers(None, "ameesh", at(6, 36), 900,
+                                                  slot_at=at(6))
+                self.assertEqual(found["served"], expected)
+                self.assertEqual(found["recent"], [])
+
+    def test_open_carrier_disappearing_without_merge_still_alerts(self):
+        rows = {"build": [{"id": 2639, "branch": "integration/paquet-h-x", "app": "ameesh"}]}
+        store = types.SimpleNamespace(items=lambda state, assignee, limit: rows.get(state, []))
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch("ameesh.storage.of", return_value=types.SimpleNamespace(work=store)):
+            cfg = cfg_with(tmp)
+            watch = packet_watch.projects(cfg)["ameesh"]
+            send = mock.Mock()
+            state = {}
+            def check(now):
+                return packet_watch.check(cfg, None, watch, Hourly(), now=now, state=state,
+                                          inventory=lambda: payload(), send=send)
+            self.assertEqual(check(at(6, 20))["result"], "busy")
+            rows.clear()  # abandonment is not a served slot
+            self.assertEqual(check(at(6, 36))["result"], "alerted")
+            self.assertEqual(send.call_count, 2)
 
 
 class Cli(unittest.TestCase):
