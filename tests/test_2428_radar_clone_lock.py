@@ -139,7 +139,8 @@ class BusyTrialTest(_Land):
         with mock.patch.object(merge_queue, "stack",
                                side_effect=resolutions.CloneBusy("worktree busy")), \
                 mock.patch.object(merge_queue, "fetch_fresh",
-                                  side_effect=lambda repo, names, clone: (dict(tips), repo)):
+                                  side_effect=lambda repo, names, clone, base=None:
+                                  (dict(tips), repo)):
             out = merge_queue.run_pass(self.cfg, None, self.project, {}, cache=cache)
         self.assertEqual(self.fake.queue_rows[4]["state"], "queued", out)
         self.assertEqual([(one["lot"], one["state"]) for one in out["targets"]["main"]],

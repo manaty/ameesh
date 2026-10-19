@@ -486,8 +486,8 @@ class EntryTest(_Base):
         real = merge_queue.fetch_fresh
         raced = {"done": False}
 
-        def concurrent(repo, names, clone=None):
-            tips, where = real(repo, names, clone)
+        def concurrent(repo, names, clone=None, base=None):
+            tips, where = real(repo, names, clone, base=base)
             if not raced["done"] and where != repo \
                     and any(merge_queue._remote_branch(n) == "main" for n in names):
                 raced["done"] = True
@@ -1352,7 +1352,7 @@ class PassTest(_Base):
         by_branch = {self.fake.lots[n]["branch"]: tips[n] for n in (1, 2, 3)}
         with mock.patch.object(merge_queue, "stack", return_value=trial), \
                 mock.patch.object(merge_queue, "fetch_fresh",
-                                  side_effect=lambda repo, names, clone: (
+                                  side_effect=lambda repo, names, clone, base=None: (
                                       dict(by_branch, main="f" * 40), repo)):
             out = merge_queue.run_pass(self.cfg, None, self.project, report,
                                        replayer=mock.Mock())
