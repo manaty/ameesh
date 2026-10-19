@@ -24,17 +24,19 @@ remote issue states have separate contracts; their equal spelling does not
 make them interchangeable with work-item states.
 
 `tests/test_generic_core.py` scans Python literals and identifiers outside
-`modules/`, plus `progress_page.html`. It also detects direct imports of module
-implementations, including relative and aliased imports. Python docstrings and
-comments are excluded. The existing generic module storage adapter imports
-remain counted until that interface is exposed through the registry.
+`modules/`, plus `progress_page.html`. Python docstrings and comments are
+excluded. Run `PYTHONPATH=src python -m tests.test_generic_core --report` to
+print current counts per file and motif. This lexical report is non-blocking;
+concurrent changes to vocabulary do not require updating an exact baseline.
+The scanners and their unit tests remain useful for inspecting the transition.
 
-`tests/generic_core_exceptions.txt` records a count and a reason for each
-existing file/motif pair. Increasing a count or adding a pair fails the test;
-removing coupling requires reducing the corresponding allowance. An exception
-does not exempt a whole file. Baseline edits require review, including cases
-where a new occurrence replaces an unrelated removed occurrence with the same
-motif. This lexical check cannot replace an architectural review.
+Only direct imports of module implementations are blocking, including relative
+and aliased imports. The test lists two legacy storage adapter exceptions in
+`mesh_cli.py` and `work.py` until those interfaces use the registry. New imports
+fail, and removing an adapter requires removing its exception from the test.
+The blocking vocabulary boundary will be introduced with L98 through module
+imports and the registry, rather than word counts. Architectural review remains
+necessary.
 
 The boundary check preserves the current runtime behavior. Module activation,
 renamed persisted states, validation as a stored state, extraction of development
