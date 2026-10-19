@@ -178,6 +178,10 @@ def required_verdicts(klass) -> int:
     le canon l'a omis ou classé léger ; sinon le plancher déclaré pour un lot
     léger (`light_reviews`, §2 : un avis, #2642), 1 pour normal et 1 pour
     sensible hors SQL, sécurité et prod.
+    Un lot peut aussi déclarer un nombre d'avis par chemin (`train_reviews`,
+    #2696) : le classement le lit et le porte (`train_reviews`), la porte
+    l'applique comme la désignation au gel ; un chemin léger déclaré à deux
+    avis les exige sans être reclassé, et le doute ne l'efface pas.
     Un lot léger **sans chemin changé** n'a rien à relire : 0. Le plancher est
     lu par le lecteur de classe (`lot_class`), donc le même que la désignation
     au gel et `paquet-candidats` ; il ne reclasse jamais la classe.
@@ -193,19 +197,20 @@ def required_verdicts(klass) -> int:
     from . import lot_class
     klass = klass or {}
     cls = str(klass.get("class") or lot_class.SENSITIVE)
+    declared = int(klass.get("train_reviews") or 0)
     if klass.get("doubt"):
         # canon §8 : « en cas de doute, le lot est sensible » — jamais léger,
         # jamais critique par le seul doute (#2394).
         cls = lot_class.SENSITIVE
     if klass.get("files") and critical_scope(klass):
-        return CRITICAL_REVIEWS
+        return max(CRITICAL_REVIEWS, declared)
     if cls == lot_class.LIGHT:
         if not klass.get("files"):
             return 0
-        return int(klass.get("light_reviews") or 0)
+        return max(int(klass.get("light_reviews") or 0), declared)
     if cls in (lot_class.NORMAL, lot_class.RELEASE):
-        return 1
-    return SENSITIVE_REVIEWS
+        return max(1, declared)
+    return max(SENSITIVE_REVIEWS, declared)
 
 
 def _mark_order(mark: dict) -> tuple:

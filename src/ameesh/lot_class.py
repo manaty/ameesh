@@ -22,6 +22,7 @@ la tête gelée, les portes et le bail.
 from __future__ import annotations
 
 import os
+import re
 from typing import Optional
 
 from . import canon as canon_mod
@@ -204,29 +205,89 @@ def _light_reviews(canons) -> tuple[int, str]:
     return value, ""
 
 
+def _train_reviews(federation, project: Optional[str], paths) -> tuple[int, str]:
+    """Le nombre d'avis déclaré par chemin (`train_reviews`, PR85).
+
+    Lu dans le **même document** que la politique de classe, donc au même
+    commit : la désignation au gel, la porte de fusion et `paquet-candidats`
+    lisent le même nombre (#2696, canon §7). Le maximum des règles applicables
+    l'emporte ; un avis déclaré 2 sur un chemin léger ne reclasse pas le
+    chemin, il exige le second avis.
+
+    Un bloc absent (canon antérieur) ou un projet absent du bloc ne disent
+    rien : 0, sans doute. Un bloc ou une règle illisible rend un problème que
+    `class_of_paths` traduit en doute, jamais en zéro rassurant.
+    """
+    if not isinstance(federation, dict):
+        return 0, ""
+    policies = federation.get("review_policies")
+    if not isinstance(policies, dict):
+        return 0, ""
+    block = policies.get("train_reviews")
+    if block is None:
+        return 0, ""
+    if not isinstance(block, dict) \
+            or block.get("schema") != "ameesh-train-reviews-policy/1":
+        return 0, "review_policies.train_reviews: unknown schema"
+    projects = block.get("projects")
+    if not isinstance(projects, dict):
+        return 0, "review_policies.train_reviews.projects: not a mapping"
+    declaration = projects.get(project)
+    if declaration is None:
+        return 0, ""            # ce canon ne déclare pas les avis de ce projet
+    rules = declaration.get("rules") if isinstance(declaration, dict) else None
+    if not isinstance(rules, list):
+        return 0, ("review_policies.train_reviews.projects.%s.rules: not a list"
+                   % project)
+    wanted = [str(path) for path in paths or () if str(path or "")]
+    value = 0
+    for index, rule in enumerate(rules):
+        where = ("review_policies.train_reviews.projects.%s.rules[%d]"
+                 % (project, index))
+        if not isinstance(rule, dict) or set(rule) != {"paths", "reviews"}:
+            return 0, "%s: expected {paths, reviews}" % where
+        count = rule["reviews"]
+        if type(count) is not int or count not in (1, 2):
+            return 0, "%s.reviews: expected 1 or 2" % where
+        patterns = rule["paths"]
+        if (not isinstance(patterns, list) or not patterns
+                or any(not isinstance(p, str) or not p.strip() for p in patterns)):
+            return 0, "%s.paths: nonempty strings required" % where
+        try:
+            compiled = tuple(review_mod.compile_glob(pattern) for pattern in patterns)
+        except re.error as exc:
+            return 0, "%s.paths: invalid pattern (%s)" % (where, exc)
+        if any(rx.fullmatch(path) for path in wanted for rx in compiled):
+            value = max(value, count)
+    return value, ""
+
+
 def class_of_paths(canons, project: Optional[str], paths) -> dict:
     """La classe des `paths` pour `project`, lue dans tous les canons.
 
-    Rend `{class, why, files, policy_ref, doubt, light_reviews}` ; une
-    politique illisible, un projet que **aucun** canon ne déclare (sans repli
-    déclaré) ou des chemins inclassables rendent `sensitive` avec `doubt` —
-    jamais une classe rassurante par défaut. Un canon qui déclare d'autres
-    projets sans repli ne dit rien de celui-ci : il est ignoré, pas compté
-    comme un doute. `light_reviews` est le plancher d'avis de la classe légère
-    (#2642), lu au même commit ; la classe reste `light`, le plancher ne
-    reclasse pas.
+    Rend `{class, why, files, policy_ref, doubt, light_reviews, train_reviews}` ;
+    une politique illisible, un projet que **aucun** canon ne déclare (sans
+    repli déclaré) ou des chemins inclassables rendent `sensitive` avec
+    `doubt` — jamais une classe rassurante par défaut. Un canon qui déclare
+    d'autres projets sans repli ne dit rien de celui-ci : il est ignoré, pas
+    compté comme un doute. `light_reviews` est le plancher d'avis de la classe
+    légère (#2642), lu au même commit ; la classe reste `light`, le plancher ne
+    reclasse pas. `train_reviews` est le plus grand nombre d'avis déclaré par
+    chemin (`train_reviews`, #2696) : la porte et `paquet-candidats` lisent le
+    même nombre que la désignation au gel.
     """
     canons = tuple(canons or ())
     light_reviews, light_problem = _light_reviews(canons)
     if light_problem:
         return {"class": SENSITIVE, "files": _doubtful_files(paths),
                 "policy_ref": "", "doubt": True,
-                "light_reviews": light_reviews,
+                "light_reviews": light_reviews, "train_reviews": 0,
                 "why": "review light floor unreadable: %s" % light_problem}
     worst, why, files, ref = LIGHT, "", [], ""
     critical_paths = set()
     files_by_path = {}
     covered = False
+    train_reviews = 0
     for canon in canons or ():
         root = str(getattr(canon, "root", "") or "")
         federation = getattr(canon, "federation", None)
@@ -239,6 +300,7 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
             return {"class": SENSITIVE, "files": _doubtful_files(paths),
                     "policy_ref": _ref(canon), "doubt": True,
                     "light_reviews": light_reviews,
+                    "train_reviews": train_reviews,
                     "why": "review policy unreadable (%s): %s"
                            % (root or "canon", errors[0][2])}
         covered = True
@@ -248,7 +310,18 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
             return {"class": SENSITIVE, "files": _doubtful_files(paths),
                     "policy_ref": _ref(canon), "doubt": True,
                     "light_reviews": light_reviews,
+                    "train_reviews": train_reviews,
                     "why": "cannot classify the change: %s" % exc}
+        declared, declared_problem = _train_reviews(
+            federation, project, [entry["path"] for entry in result["files"]])
+        if declared_problem:
+            return {"class": SENSITIVE, "files": _doubtful_files(paths),
+                    "policy_ref": _ref(canon), "doubt": True,
+                    "light_reviews": light_reviews,
+                    "train_reviews": train_reviews,
+                    "why": "review train counts unreadable (%s): %s"
+                           % (root or "canon", declared_problem)}
+        train_reviews = max(train_reviews, declared)
         if not ref:
             ref = _ref(canon)
         critical_paths.update(entry["path"] for entry in result["files"]
@@ -266,6 +339,7 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
     if not covered:
         return {"class": SENSITIVE, "files": _doubtful_files(paths), "policy_ref": "",
                 "doubt": True, "light_reviews": light_reviews,
+                "train_reviews": 0,
                 "why": "project %r is not declared by any canon (no fallback policy)"
                        % (project,)}
     # Le maximum du lot ne suffit pas : une exception de la porte (Markdown
@@ -275,7 +349,8 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
         if entry["path"] in critical_paths:
             entry["critical"] = True
     return {"class": worst, "why": why, "files": files, "policy_ref": ref,
-            "doubt": False, "light_reviews": light_reviews}
+            "doubt": False, "light_reviews": light_reviews,
+            "train_reviews": train_reviews}
 
 
 def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
