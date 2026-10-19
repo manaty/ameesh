@@ -61,6 +61,10 @@ class Requirement:
     #: paths need two distinct families) instead of trusting the count alone.
     files: tuple = ()
 
+    def klass(self) -> dict:
+        """La classe et les chemins classés, lus par la porte des avis (#2681)."""
+        return {"class": self.risk, "files": list(self.files)}
+
     def check(self, row, base):
         if (self.lot, self.base, self.head) != (row["work_item_id"], base, row["frozen_sha"]):
             raise TrainError("review policy covers another lot, base or frozen head")
@@ -144,7 +148,8 @@ class Admissions:
         if not isinstance(requirement, Requirement):
             raise TrainError("trusted policy returned no structured review requirement")
         requirement.check(row, base)
-        historical = self.history.qualify(row, base, required=requirement.reviews)
+        historical = self.history.qualify(row, base, required=requirement.reviews,
+                                          klass=requirement.klass())
         proof = dict(admission=identity(row), policy=asdict(requirement), history=historical)
         if mode == "targeted":
             ci = self.targeted_ci(row) if self.targeted_ci is not None else None

@@ -42,6 +42,57 @@ class Repository:
         self.clone.ensure()
         return land.fresh_target(self.clone, self.project, target)
 
+    def _ancestor(self, sha, base):
+        proc = resolutions._run(self.clone.path, "merge-base", "--is-ancestor", sha, base)
+        if proc.returncode not in (0, 1):
+            raise TrainError("cannot compare main with the target base")
+        return proc.returncode == 0
+
+    def _fresh_main(self):
+        try:
+            tips, _ = merge_queue.fetch_fresh(self.project.repo, ["main"], self.clone)
+        except merge_queue.QueueError as exc:
+            raise TrainError(str(exc)) from exc
+        sha = tips.get("main")
+        if not sha:
+            raise TrainError("main sync source missing: origin has no main branch")
+        return sha
+
+    @staticmethod
+    def _sync_shape(sync):
+        if not isinstance(sync, dict) or sync.get("ref") != "main" \
+                or not isinstance(sync.get("sha"), str) \
+                or not merge_queue._HEX.fullmatch(sync["sha"]) \
+                or len(sync["sha"]) not in (40, 64):
+            raise TrainError("mechanical main sync requires ref=main and an exact commit")
+        return sync["sha"]
+
+    def main_sync(self, target, base):
+        """The mechanical ``main`` member of a packet, or None (#2727).
+
+        A target other than ``main`` receives the commits main has that it
+        lacks, before every admitted member. The decision is read fresh here;
+        the caller persists the exact sha and :meth:`compose` replays that sha,
+        so a later move of main cannot rewrite a persisted intent.
+        """
+        branch = self._guard(target)
+        if branch == "main":
+            return None
+        sha = self._fresh_main()
+        if self._ancestor(sha, base):
+            return None
+        return dict(ref="main", sha=sha)
+
+    def validate_sync(self, sync):
+        """The persisted main sha is still on main; a force-push refuses."""
+        if sync is None:
+            return None
+        sha = self._sync_shape(sync)
+        tip = self._fresh_main()
+        if sha != tip and not self._ancestor(sha, tip):
+            raise TrainError("persisted main sync %s is no longer on main (%s)" % (sha, tip))
+        return sync
+
     def check_members(self, target, rows):
         branch = self._guard(target)
         if not rows or any(r["source"] != self.source or
@@ -82,19 +133,69 @@ class Repository:
             self._transport(plan["target"], members[lot], receipt.get("base"), expected=receipt)
         return list(receipts.values())
 
+    def _merge_sync(self, base, sha):
+        """The clean tree of ``main`` merged into ``base``, or a named refusal.
+
+        Generated files are never taken from the merge: a conflict on them is
+        not a refusal, they are regenerated on the merged tree like
+        :func:`land.merge` does. Any other conflict still refuses the packet.
+        """
+        generated = tuple(getattr(self.project, "generated", ()))
+        paths = {item.path for item in generated}
+        resolutions._check(resolutions._run(
+            self.clone.path, "checkout", "-q", "-f", "--detach", base),
+            "checkout main sync base")
+        proc = resolutions._run(
+            self.clone.path, "-c", "rerere.enabled=false", "-c", "rerere.autoUpdate=false",
+            "merge", "--no-ff", "--no-commit", "--quiet", sha)
+        if proc.returncode:
+            files = resolutions.unmerged(self.clone.path)
+            resolutions.exclude_generated(self.clone.path, files, paths)
+            others = [name for name in files if name not in paths]
+            if not files or others:
+                resolutions._run(self.clone.path, "merge", "--abort")
+                raise TrainError("main sync conflict main=%s base=%s files=%s" % (
+                    sha, base, ", ".join(others or files) or "unknown"))
+        if paths:
+            made = land._regenerate(self.clone.path, generated, paths)
+            if not made["ok"]:
+                resolutions._run(self.clone.path, "merge", "--abort")
+                raise TrainError("main sync generated file %s: %s" % (
+                    made["file"], made["output"]))
+        tree = plan_git._out(self.clone.path, "write-tree")
+        if not tree:
+            raise TrainError("cannot write the main sync tree")
+        return tree
+
     def compose(self, target, base, rows, nonce="", *, transports=None,
-                migrations=None):
+                migrations=None, sync=None):
         branch = self._guard(target)
         if not rows or self.target(branch) != base:
             raise TrainError("composition requires members and the exact current base")
         self.check_members(branch, rows)
         if transports is not None and not isinstance(transports, list):
             raise TrainError("persisted transport list required for reconstruction")
+        if sync is not None:
+            sha = self._sync_shape(sync)
+            if sync.get("base") not in (None, base):
+                raise TrainError("persisted main sync belongs to another base")
+            self.validate_sync(sync)
+            sync = dict(sync, base=base)
         pending = list(transports or [])
         pending_migrations = list(migrations) if migrations is not None else None
         migration_layout = train_migrations.layout(self.project)
         recorded_migrations = []
         head, receipts = base, []
+        if sync is not None:
+            tree = self._merge_sync(base, sync["sha"])
+            sync_head = self._commit(tree, [base, sync["sha"]],
+                "Train main sync\n\n" + json.dumps(dict(ref="main", base=base,
+                    sha=sync["sha"]), sort_keys=True))
+            if sync.get("head") not in (None, sync_head) \
+                    or sync.get("tree") not in (None, tree):
+                raise TrainError("reconstructed main sync differs from persisted intent")
+            sync = dict(sync, head=sync_head, tree=tree)
+            head = sync_head
         for row in rows:
             expected = next((r for r in pending if isinstance(r, dict) and
                              digest(r.get("admission")) == digest(identity(row))), None)
@@ -165,6 +266,8 @@ class Repository:
         message = "Integration train\n\n" + json.dumps(
             dict(source=self.source, target=branch, base=base, nonce=nonce,
                  members=[identity(r) for r in rows]), sort_keys=True) + "\n\n"
+        if sync is not None:
+            message += "ameesh-sync: main %s\n" % sync["sha"]
         if receipts:
             message += "transport-proof: " + digest(receipts) + "\n\n"
         if migration_layout is not None and self.migrations is not None:
@@ -173,9 +276,12 @@ class Repository:
             entry["work_item_id"], entry["reserved"], entry["landed"])
             for entry in recorded_migrations)
         message += "".join("ameesh-work: %d\n" % r["work_item_id"] for r in rows)
-        parents = list(dict.fromkeys([base] + [r["frozen_sha"] for r in rows]
+        parents = list(dict.fromkeys([base] + ([sync["sha"]] if sync is not None else [])
+                                     + [r["frozen_sha"] for r in rows]
                                      + [r["head"] for r in receipts]))
         result = dict(head=self._commit(tree, parents, message), tree=tree)
+        if sync is not None:
+            result["sync"] = sync
         if receipts:
             result["transports"] = receipts
         if recorded_migrations:
@@ -207,11 +313,19 @@ class Repository:
         if not plan["branch"].startswith("integration/train-"):
             raise TrainError("publication outside the train namespace")
         plan_git.check_ref(ref, "train branch")
+        sync = plan.get("sync")
+        self.validate_sync(sync)
         receipts = self.validate_transports(plan)
         if not plan_git._commit(self.clone.path, plan["head"]):
             rebuilt = self.compose(branch, plan["base"], plan["members"], plan.get("nonce", ""),
                                    transports=receipts,
-                                   migrations=plan.get("migrations", []))
+                                   migrations=plan.get("migrations", []),
+                                   sync=sync)
+            if "sync" in plan:
+                if digest(rebuilt.get("sync")) != digest(plan["sync"]):
+                    raise TrainError("reconstructed main sync differs from persisted intent")
+            elif rebuilt.get("sync") is not None:
+                raise TrainError("reconstructed composition added an unplanned main sync")
             rebuilt = {key: rebuilt[key] for key in ("head", "tree")}
             if rebuilt != {"head": plan["head"], "tree": plan["tree"]}:
                 raise TrainError("reconstructed train differs from persisted intent")
@@ -225,6 +339,8 @@ class Repository:
                    or "").split()[1:]
         if any(receipt["head"] not in parents for receipt in receipts):
             raise TrainError("packet lost a qualified transport parent")
+        if sync is not None and sync["sha"] not in parents:
+            raise TrainError("packet lost its mechanical main parent")
         return branch, ref
 
     def _lease(self, plan, key, epoch, owner):
