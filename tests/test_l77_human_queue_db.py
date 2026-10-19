@@ -98,3 +98,45 @@ class PickHumanFirstTest(PgTestCase):
         again = worker._pick()
         self.assertIsNotNone(again)
         self.assertEqual(again["ids"], spec["ids"])
+
+
+class EndOfTurnServiceTest(PgTestCase):
+    """L77 : le message humain n'est soldé qu'à la FIN du tour."""
+
+    def _reserve(self, worker, sender, payload):
+        from ameesh import mail
+        mail.send(self.db, sender, worker.name, "body of the message", payload=payload)
+        mid = int(self.db.query(
+            "SELECT id FROM agent_mailbox WHERE recipient = %s ORDER BY id DESC LIMIT 1",
+            (worker.name,))[0]["id"])
+        token = mail.new_token()
+        reserves = mail.reserve(self.db, worker.name, worker.runner.runner_id,
+                                worker.epoch, token, ids=[mid], porteur="consigne",
+                                ttl_seconds=mail.RESERVATION_TTL)
+        self.assertTrue(reserves)
+        return mid, token, reserves
+
+    def _delivered_at(self, mid):
+        return self.db.query("SELECT delivered_at FROM agent_mailbox WHERE id = %s",
+                             (mid,))[0]["delivered_at"]
+
+    def test_human_is_settled_only_at_the_end_of_the_turn(self):
+        from ameesh import conversation
+        name = "worker-serve"
+        worker = _make_worker(self, name)
+        mid, token, reserves = self._reserve(worker, "human:alice", {"human": True})
+        spec = {"human": True, "ids": [mid], "jeton": token, "rows": list(reserves)}
+        worker._livre_courrier(spec)
+        self.assertIsNone(self._delivered_at(mid))  # pas soldé au lancement
+        worker._solde_humains(spec)
+        self.assertIsNotNone(self._delivered_at(mid))  # soldé à la fin du tour
+        page = conversation.history(self.db, name, limit=10)
+        self.assertIn("human_message", [e["kind"] for e in page["entries"]])
+
+    def test_non_human_mail_is_still_settled_at_launch(self):
+        name = "worker-agent-mail"
+        worker = _make_worker(self, name)
+        mid, token, reserves = self._reserve(worker, "agent:bob", {})
+        spec = {"ids": [mid], "jeton": token, "rows": list(reserves)}
+        worker._livre_courrier(spec)
+        self.assertIsNotNone(self._delivered_at(mid))

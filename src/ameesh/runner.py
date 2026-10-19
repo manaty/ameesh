@@ -4925,7 +4925,11 @@ class AgentWorker(threading.Thread):
         try:
             return self._run_turn(spec)
         finally:
-            if not self._courrier_lance:
+            if spec.get("human") and self._courrier_lance:
+                # L77 : le tour est fini, le message humain a été servi — soldé
+                # maintenant seulement (jamais au lancement).
+                self._solde_humains(spec)
+            elif not self._courrier_lance:
                 # Le harnais n'a pas été lancé : rien n'a été vu, rien n'est livré.
                 try:
                     mail.release(self.db, self.name, jeton, ids)
@@ -4945,6 +4949,12 @@ class AgentWorker(threading.Thread):
         if not spec.get("jeton"):
             return
         self._courrier_lance = True
+        if spec.get("human"):
+            # L77 : un message humain n'est soldé qu'à la FIN du tour
+            # (`_solde_humains`), jamais au lancement. Un plantage en cours de
+            # tour laisse la réservation expirer : le message est re-livré,
+            # signalé comme peut-être déjà remis (au moins une fois).
+            return
         ids = list(spec["ids"])
         try:
             livres = mail.deliver(self.db, self.name, self.runner.runner_id, self.epoch,
@@ -4952,18 +4962,46 @@ class AgentWorker(threading.Thread):
         except db_mod.DbError as exc:
             livres = []
             log("[%s] mail delivery not settled (%s)" % (self.name, exc))
+        self._remise_incertaine(ids, livres)
+
+    def _remise_incertaine(self, ids, livres) -> None:
+        """Signale les messages montrés au harnais mais non soldés (bail perdu,
+        base indisponible) : ils seront re-livrés en le disant."""
         incertains = sorted(set(ids) - set(livres))
-        if incertains:
-            log("[%s] uncertain delivery: message(s) %s shown to the harness but not "
-                "settled (lease lost or database unavailable); they will be redelivered, "
-                "flagged as possibly redelivered" % (self.name, ", ".join(map(str, incertains))))
-            self._fil_note(
-                "Uncertain delivery: %d message(s) put in the instruction of a started "
-                "turn could not be marked delivered (lease lost or database "
-                "unavailable). They will be delivered again, flagged as possibly redelivered."
-                % len(incertains),
-                meta={"action": "remise-incertaine", "messages": incertains})
-        if livres and spec.get("human"):
+        if not incertains:
+            return
+        log("[%s] uncertain delivery: message(s) %s shown to the harness but not "
+            "settled (lease lost or database unavailable); they will be redelivered, "
+            "flagged as possibly redelivered" % (self.name, ", ".join(map(str, incertains))))
+        self._fil_note(
+            "Uncertain delivery: %d message(s) put in the instruction of a started "
+            "turn could not be marked delivered (lease lost or database "
+            "unavailable). They will be delivered again, flagged as possibly redelivered."
+            % len(incertains),
+            meta={"action": "remise-incertaine", "messages": incertains})
+
+    def _solde_humains(self, spec: dict) -> None:
+        """L77 : solde la réservation humaine à la FIN du tour (servi).
+
+        Appelé par `run_turn` dans son `finally`, que le tour réussisse ou
+        échoue : le harnais a lu sa consigne. Si le bail est perdu ou la base
+        indisponible, rien n'est soldé et le message sera re-livré. Le journal
+        L78 n'est écrit qu'ici, avec la remise effective (idempotent).
+        """
+        jeton = spec.get("jeton")
+        ids = list(spec.get("ids") or ())
+        self._courrier_lance = False
+        if not jeton or not ids:
+            return
+        try:
+            livres = mail.deliver(self.db, self.name, self.runner.runner_id, self.epoch,
+                                  jeton, ids)
+        except db_mod.DbError as exc:
+            log("[%s] human delivery not settled at the end of the turn (%s)"
+                % (self.name, exc))
+            return
+        self._remise_incertaine(ids, livres)
+        if livres:
             # L77/L78 : la trace lisible des messages humains servis. Idempotente
             # (`event_id = mail:<id>`) : une remise incertaine rejouée ne duplique
             # pas l'entrée ; le journal ne porte aucun état servi/ack.
