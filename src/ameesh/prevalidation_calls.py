@@ -20,6 +20,10 @@ classes, contrats, hôtes, délai, lanceur de part) :
   arrête la publication, une indisponibilité est journalisée et la CI reste
   la preuve finale.
 
+Les hôtes viennent du bloc canon ; un hôte **local déclaré au canon** est
+admis (décision pilote 19/10 06:03, pour que les accroches tournent depuis
+`ameesh-agents-1`), un poste local non déclaré reste refusé.
+
 Le plan L161f n'est jamais deviné. Il est calculé par le
 ``scripts/test-plan.py`` du **commit candidat** (arbre détaché), avec la carte
 mesurée fournie par l'appelant quand elle existe, sinon la dernière carte
@@ -377,13 +381,16 @@ def run(cfg, db, lot: int, *, repo: str, head: str, base: str, project: str,
     if not repo:
         raise prevalidation.PrevalidationError(
             "selection-unsafe", "aucun arbre ne porte la tête %s" % (head or "?")[:12])
-    #: décision pilote 19/10 : la VM doit être **différente de l'appelante**.
-    #: Refuser tôt évite de calculer un plan et de télécharger une carte pour
-    #: un run qui ne peut pas partir.
-    if not any(prevalidation.host_allowed(host)[0] for host in params.hosts):
+    #: décision pilote 19/10 06:03 : un hôte local **déclaré au canon** est
+    #: admis (agents-1), un poste non déclaré reste refusé. Refuser tôt évite
+    #: de calculer un plan et de télécharger une carte pour un run qui ne peut
+    #: pas partir.
+    declared = params.hosts
+    if not any(prevalidation.host_allowed(host, declared=declared)[0]
+               for host in declared):
         raise prevalidation.PrevalidationError(
-            "no-vm", "aucun hôte de prévalidation distinct de l'appelant (%s)"
-            % ", ".join(params.hosts))
+            "no-vm", "aucun hôte de prévalidation autorisé (%s)"
+            % ", ".join(declared))
     carte, cleanup = map_for(repo_slug, repo, explicit=map_path)
     prepared = None
     try:
@@ -586,10 +593,12 @@ def gate_train(cfg, *, repo: str, head: str, base: str, canon_repo: str = "",
     try:
         params = parameters(cfg, project, canon_repo=canon_repo,
                             canon_commit=canon_commit)
-        if not any(prevalidation.host_allowed(host)[0] for host in params.hosts):
+        declared = params.hosts
+        if not any(prevalidation.host_allowed(host, declared=declared)[0]
+                   for host in declared):
             return {"state": "unavailable", "cause": "no-vm",
-                    "why": "aucun hôte de prévalidation distinct de l'appelant (%s)"
-                           % ", ".join(params.hosts)}
+                    "why": "aucun hôte de prévalidation autorisé (%s)"
+                           % ", ".join(declared)}
         carte, cleanup = map_for(repo_slug, repo, explicit=map_path)
         prepared = None
         try:

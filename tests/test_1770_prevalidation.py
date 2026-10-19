@@ -517,6 +517,17 @@ class HostTest(unittest.TestCase):
         ok, cause = pv.host_allowed("vm-agents-1", local="pc-smichea")
         self.assertTrue(ok, cause)
 
+    def test_hote_local_declare_au_canon_est_une_vm(self):
+        # Décision pilote 19/10 06:03 (#2644) : l'hôte local déclaré au canon
+        # est une VM d'agents ; un poste local non déclaré reste refusé.
+        ok, cause = pv.host_allowed("ameesh-agents-1", local="ameesh-agents-1",
+                                    declared=("ameesh-agents-1",))
+        self.assertTrue(ok, cause)
+        ok, cause = pv.host_allowed("ameesh-agents-1", local="ameesh-agents-1",
+                                    declared=("ameesh-agents-2",))
+        self.assertFalse(ok)
+        self.assertEqual(cause, "no-vm")
+
 
 if __name__ == "__main__":
     unittest.main()

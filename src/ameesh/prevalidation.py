@@ -371,20 +371,28 @@ def selection(plan: dict, *, head: str, base: str = "", plan_path: str = "") -> 
                      causes=tuple(unique), why=" ; ".join(why), plan_path=plan_path)
 
 
-def host_allowed(host: str, *, local: str | None = None, deny: Sequence[str] = ()) -> tuple[bool, str]:
-    """L'hôte est-il une VM d'agents (jamais le poste local, jamais un déni) ?
+def host_allowed(host: str, *, local: str | None = None, deny: Sequence[str] = (),
+                 declared: Sequence[str] = ()) -> tuple[bool, str]:
+    """L'hôte est-il une VM d'agents (jamais le poste local non déclaré) ?
 
     `local` : nom de l'hôte courant ; `deny` : motifs d'hôtes interdits
-    (configuration, `AMEESH_PREVALIDATION_DENY`). Une chaîne vide est
-    refusée : sans hôte, l'offload retomberait localement."""
+    (configuration, `AMEESH_PREVALIDATION_DENY`) ; `declared` : les hôtes du
+    bloc canon. Un hôte local **déclaré au canon** est une VM d'agents (le
+    mesh) et reste admis : décision pilote du 19/10 (#2644) pour que les
+    accroches puissent tourner depuis `ameesh-agents-1` ; un poste non déclaré
+    reste refusé. Une chaîne vide est refusée : sans hôte, l'offload
+    retomberait localement."""
     name = (host or "").strip()
     if not name:
         return False, "no-vm"
     bare = name.rsplit("@", 1)[-1].split(":", 1)[0].strip().lower()
     if not bare:
         return False, "no-vm"
+    allowed_local = {str(item).rsplit("@", 1)[-1].split(":", 1)[0].strip().lower()
+                     for item in (declared or ())}
     here = (local if local is not None else (os.uname().nodename or "")).strip().lower()
-    if here and (bare == here or here.startswith(bare + ".") or bare.startswith(here + ".")):
+    if here and (bare == here or here.startswith(bare + ".") or bare.startswith(here + ".")) \
+            and bare not in allowed_local:
         return False, "no-vm"
     for pattern in deny:
         motif = (pattern or "").strip().lower()
@@ -795,7 +803,8 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
     name = (host or "").strip()
     if name not in tuple(getattr(params, "hosts", ()) or ()):
         raise PrevalidationError("no-vm", "hôte %r hors des hôtes déclarés au canon" % name)
-    allowed, why = host_allowed(name, local=local)
+    allowed, why = host_allowed(name, local=local,
+                                declared=tuple(getattr(params, "hosts", ()) or ()))
     if not allowed:
         raise PrevalidationError("no-vm", why)
     # Les contrats et le contenu exécuté viennent du même SHA, jamais du disque.
