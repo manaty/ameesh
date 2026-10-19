@@ -1406,9 +1406,11 @@ class AgentWorker(threading.Thread):
     def _preempt_resident(self) -> bool:
         """L77 : préempte un tour résident sans tuer le process.
 
-        `steer` du message prioritaire si le pilote le propose, sinon
-        `interrupt()`. Rend False quand aucun résident ne porte le tour : le
-        chemin 0018 « un tour par événement » reste alors inchangé.
+        Rang 1 humain : `steer` au point sûr, avec réservation de la remise et
+        solde immédiat si le pilote accepte (le hook et le `pick` suivants ne
+        la rejouent pas). Rang 3 agent/système : `interrupt()` seulement,
+        jamais `steer` (étude §2). Rend False quand aucun résident ne porte le
+        tour : le chemin 0018 « un tour par événement » reste alors inchangé.
         """
         with self.lock:
             rp = self.resident
@@ -1430,16 +1432,12 @@ class AgentWorker(threading.Thread):
             return True
         row = getattr(self, "_preempt_row", None)
         self._preempt_row = None
-        if row is not None:
-            try:
-                texte = self._urgent_steer_text(row)
-                if texte and driver.steer(texte) is not None:
-                    log_async("[%s] priority message steered into the resident "
-                              "turn" % self.name)
-                    return True
-            except Exception as exc:  # InputRefused, ResidentBusy, protocole muet
-                log_async("[%s] resident steer refused (%s): interrupting"
-                          % (self.name, " ".join(str(exc).split())[:120]))
+        if row is not None and self._from_human(row):
+            if self._steer_human(row, driver):
+                # Le steer a remis le message : le tour continue, le message
+                # n'est plus à redélivrer et le latch de préemption retombe.
+                self.preempting.clear()
+                return True
         try:
             if driver.interrupt():
                 log_async("[%s] resident turn interrupted (preemption)"
@@ -1453,6 +1451,53 @@ class AgentWorker(threading.Thread):
         log_async("[%s] resident preemption deferred: message kept for the next "
                   "turn" % self.name)
         return True
+
+    def _steer_human(self, row: dict, driver) -> bool:
+        """L77/B8 : remet un message humain au point sûr, réservé puis soldé.
+
+        Réserve AVANT le steer (id du message, porteur consigne) : une remise
+        acceptée est soldée tout de suite, donc le hook et le `pick` suivants ne
+        la rejouent pas ; un refus libère la réservation et laisse le chemin
+        d'interruption décider. Rend True seulement si le steer est accepté.
+        """
+        try:
+            ident = int(row.get("id"))
+        except (KeyError, TypeError, ValueError):
+            return False
+        jeton = mail.new_token()
+        try:
+            reserves = mail.reserve(
+                self.db, self.name, self.runner.runner_id, self.epoch, jeton,
+                ids=[ident], porteur="consigne",
+                ttl_seconds=mail.human_reservation_ttl(self.turn_max_seconds()))
+        except db_mod.DbError as exc:
+            log_async("[%s] steer reservation failed (%s)" % (self.name, exc))
+            return False
+        if not reserves:
+            return False
+        try:
+            texte = self._urgent_steer_text(row)
+            if texte and driver.steer(texte) is not None:
+                try:
+                    livres = mail.deliver(self.db, self.name, self.runner.runner_id,
+                                          self.epoch, jeton, [ident])
+                except db_mod.DbError as exc:
+                    livres = []
+                    log_async("[%s] steered message not settled (%s)"
+                              % (self.name, exc))
+                self._remise_incertaine([ident], livres)
+                log_async("[%s] priority message steered into the resident turn"
+                          % self.name)
+                return True
+        except Exception as exc:  # InputRefused, ResidentBusy, protocole muet
+            log_async("[%s] resident steer refused (%s): interrupting"
+                      % (self.name, " ".join(str(exc).split())[:120]))
+        try:
+            mail.release(self.db, self.name, jeton, [ident])
+        except db_mod.DbError as exc:
+            log_async("[%s] steer reservation not released (%s)"
+                      % (self.name, exc))
+        return False
 
     def _urgent_steer_text(self, row: dict) -> str:
         """Le texte remis au point sûr : l'enveloppe ameesh, puis le corps
@@ -1476,6 +1521,11 @@ class AgentWorker(threading.Thread):
         while not done.wait(0.1):
             if self.preempting.is_set():
                 if self._preempt_resident():
+                    # Un steer accepté a remis le message et retombé le latch :
+                    # le moniteur continue de veiller sur les urgents suivants
+                    # et sur `restart`. Une interruption, elle, termine le tour.
+                    if not self.preempting.is_set():
+                        continue
                     return
                 self.stop_group_now("preemption", grace=1.0)
                 return
@@ -4993,15 +5043,19 @@ class AgentWorker(threading.Thread):
             mail.release(self.db, self.name, jeton, hors)
         spec = dict(spec, prompt=prompt, rows=inclus, ids=ids, jeton=jeton)
         self._courrier_lance = False
+        result = False
         try:
-            return self._run_turn(spec)
+            result = self._run_turn(spec)
+            return result
         finally:
-            if spec.get("human") and self._courrier_lance:
-                # L77 : le tour est fini, le message humain a été servi — soldé
-                # maintenant seulement (jamais au lancement).
+            if spec.get("human") and self._courrier_lance and result:
+                # L77/B9 : le message humain n'est soldé que sur une fin
+                # EFFECTIVE du tour. Une mort du harnais après `send` laisse la
+                # réservation repartir en livraison (au moins une fois).
                 self._solde_humains(spec)
-            elif not self._courrier_lance:
-                # Le harnais n'a pas été lancé : rien n'a été vu, rien n'est livré.
+            elif not self._courrier_lance or not result:
+                # Pas lancé, ou lancé puis mort/échec avant la fin : rien n'est
+                # tenu pour servi ; la réservation est libérée et sera reprise.
                 try:
                     mail.release(self.db, self.name, jeton, ids)
                 except db_mod.DbError as exc:

@@ -279,10 +279,16 @@ class ActionsPgTest(PostMixin, PgTestCase):
                                     {"text": "x"}, key="key-0000000006")
         self.assertEqual((status, out["error"]), (404, "not_found"))
 
-    def test_interrupt_needs_the_senders_list(self):
+    def test_interrupt_from_the_api_is_human_and_unproven(self):
+        """B7 : l'API marque l'entrée humaine, sans preuve avant OIDC."""
         status, _h, out = self.post("/api/v1/agents/a1/interrupt", {"text": "stop"})
-        self.assertEqual((status, out["error"]), (403, "forbidden"))
-        self.assertEqual(self.mailbox(), [])
+        self.assertEqual(status, 200, out)
+        [row] = self.mailbox()
+        self.assertEqual(row["sender"], "human:owner")
+        payload = json.loads(row["payload"])
+        self.assertTrue(payload.get("human"))
+        self.assertTrue(payload.get("urgent"))
+        self.assertNotIn("human_account", payload)
 
     def test_stop_with_a_reason_traced(self):
         status, _h, out = self.post("/api/v1/agents/a1/stop", {"reason": "boucle"})

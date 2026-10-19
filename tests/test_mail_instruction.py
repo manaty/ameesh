@@ -304,15 +304,18 @@ class CourrierDansLaConsigneTest(PgTestCase):
         self.assertIsNone(self._ligne(mid)["delivered_ts"])
         self.assertIsNone(self._ligne(mid)["consigne_runner"])
 
-    def test_tour_en_echec_apres_lancement_reste_livre(self):
+    def test_tour_en_echec_apres_lancement_est_repris(self):
+        """B9 : une mort du harnais avant la fin ne solde pas le message humain."""
         _runner, worker = self._worker("echoue")
-        mid = mail.send(self.db, "orch", "echoue", "vu puis échec")
+        mid = mail.send(self.db, "human:alice", "echoue", "vu puis échec",
+                        payload={"human": True, "human_account": "alice@pc"})
         spec = worker.pick()
         with self._env_harnais(AMEESH_TEST_EXIT="3"):
             self.assertFalse(worker.run_turn(spec))
-        # le harnais a reçu la consigne : livré, pas re-servi
-        self.assertIsNotNone(self._ligne(mid)["delivered_ts"])
-        self.assertIsNone(worker.pick())
+        ligne = self._ligne(mid)
+        self.assertIsNone(ligne["delivered_ts"])
+        self.assertIsNone(ligne["consigne_runner"])   # réservation libérée
+        self.assertTrue(mail.unread(self.db, "echoue"))
 
     # -- bail, epoch, reprise après panne ---------------------------------------
     def _reserve(self, name, owner, epoch, ids=None, *, db=None, porteur="consigne",

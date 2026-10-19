@@ -223,8 +223,11 @@ def _interrupt(ctx, db, params, body) -> dict:
     from . import exploitation
     text = _text(body, "text")
     try:
+        # L77/B7 : l'API a authentifié l'humain ; l'entrée est marquée
+        # humaine (pas un nom nu confondu avec un agent de interrupt_senders),
+        # sans preuve locale tant que L86/OIDC ne la fournit pas.
         message_id = exploitation.interrupt(ctx.cfg, db, params["agent"], text,
-                                            sender=bare_name(ctx))
+                                            sender=ctx.human, human=True)
     except exploitation.InterruptRefused as exc:
         raise ActionError(403 if exc.code == "not_allowed" else 404,
                           "forbidden" if exc.code == "not_allowed" else "not_found",
