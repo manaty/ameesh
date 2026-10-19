@@ -1444,7 +1444,7 @@ def work_rows(db, *, state: str | None = None, assignee: str | None = None,
     `target` (défaut : la cible du lot, sinon `origin/main`) permettent en plus
     de porter un avis sur un gel republié quand le delta du lot est
     mécaniquement constant (#1905) ; sans `repo`, le champ est inchangé."""
-    from . import plan, plan_git, stagnation
+    from . import merge_queue, plan, plan_git, stagnation
     if threshold is None:
         threshold = stagnation.DEFAULT_THRESHOLD_S
 
@@ -1468,7 +1468,8 @@ def work_rows(db, *, state: str | None = None, assignee: str | None = None,
             for row in rows:
                 row["freeze"] = plan_git.freeze_candidate(
                     marks.get(int(row["id"]), []), repo=repo,
-                    target=target or row.get("branch_target") or plan_git.DEFAULT_TARGET)
+                    target=target or row.get("branch_target") or plan_git.DEFAULT_TARGET,
+                    waived=merge_queue.is_waived(row))
         return rows
 
     # L61 : lectures regroupées — deux allers-retours en tout
@@ -1489,7 +1490,8 @@ def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
         from . import plan_git
         item["freeze"] = plan_git.freeze_candidate(
             item["milestones"], repo=repo,
-            target=target or item.get("branch_target") or plan_git.DEFAULT_TARGET)
+            target=target or item.get("branch_target") or plan_git.DEFAULT_TARGET,
+            waived=merge_queue.is_waived(item))
         from .modules.storage import ModuleStore
         item["module_milestones"] = ModuleStore(db).milestones(lot_id)
         item["delays"] = work.timeline(db, lot_id)

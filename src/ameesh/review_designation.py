@@ -21,8 +21,9 @@ What the module deliberately does not do:
   source is the session's real family (`registry.live_harness`, #1037 / L242b);
 - it neither counts nor requalifies verdicts: the required number comes from
   the maximum of the rules per path, the independence of the rendered opinions
-  remains that of #1465/#1467 (`train_review.qualify`), and a new freeze
-  invalidates the stale designation instead of reusing it.
+  remains that of the merge gate (`merge_queue.review_gate`) and its authors
+  reading (`review_authors`, #2681), and a new freeze invalidates the stale
+  designation instead of reusing it.
 
 Idempotence: the designation is tied to the **`frozen` milestone** (its
 identifier and its exact SHA), not to the lot. The same freeze replayed returns

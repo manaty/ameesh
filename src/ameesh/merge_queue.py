@@ -282,6 +282,17 @@ def blocked_verdicts(marks, frozen, *, repo: str | None = None) -> list[dict]:
                   key=_mark_order)
 
 
+def is_waived(item) -> bool:
+    """La dispense de re-verdict du pilote (`-none`, #1979) sur cette ligne.
+
+    Une seule lecture de la dispense (#2681) : la porte, le gel effectif
+    (`plan_git.freeze_candidate`), `paquet-candidats` et le train lisent la
+    même marque. Elle couvre la tête gelée, jamais une remise (#2496)."""
+    row = item or {}
+    return (str(row.get("reviewer") or "").strip() == work.REVIEWER_NONE
+            or work.REVIEWER_NONE in tuple(row.get("reviewers") or ()))
+
+
 def _waiver(db, item) -> tuple:
     """#2281/B1 : la dispense de re-verdict lue **à la porte**, après les jalons.
 
@@ -300,8 +311,7 @@ def _waiver(db, item) -> tuple:
     """
     row = item or {}
     lot = row.get("id")
-    waived = (str(row.get("reviewer") or "").strip() == work.REVIEWER_NONE
-              or work.REVIEWER_NONE in tuple(row.get("reviewers") or ()))
+    waived = is_waived(row)
     if waived and lot is not None:
         # Seule une ligne qui *réclame* la dispense peut périmer dans le
         # mauvais sens : relire la base après les jalons ferme la course. Une
@@ -314,8 +324,7 @@ def _waiver(db, item) -> tuple:
             row = dict(row, reviewer="", reviewers=[])
         else:
             row = fresh
-        waived = (str(row.get("reviewer") or "").strip() == work.REVIEWER_NONE
-                  or work.REVIEWER_NONE in tuple(row.get("reviewers") or ()))
+        waived = is_waived(row)
     waived_by = ""
     if waived and lot is not None:
         try:
@@ -336,24 +345,33 @@ def _waiver(db, item) -> tuple:
 
 
 def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
-                item=None, families=None) -> dict:
+                item=None, families=None, required=None, family_of=None) -> dict:
     """Les avis requis sur la tête gelée `frozen`, et eux seuls (#1374).
 
     Un verdict ne compte que s'il a été rendu **sur cette tête** (le `sha` du
     jalon est résolu, jamais une ref). Parmi ces verdicts, seul le **dernier de
     chaque relecteur** compte : un `ok` plus récent du même relecteur lève son
     blocage, celui d'un autre relecteur ne le masque pas. Un blocage encore en
-    vigueur refuse la porte, quelle que soit la classe.
+    vigueur refuse la porte, quelle que soit la classe. Un blocage posé sur une
+    **tête antérieure** ne compte pas : la nouvelle tête a ses propres avis
+    (canon §2, #2681 ; la règle de levée est celle de la porte).
 
     Le nombre d'avis dépend de la classe (`required_verdicts`) : le plancher
     déclaré pour un lot léger (#2642), 1 pour un lot normal et pour un lot
     sensible hors SQL/sécurité/prod — un doute de classe reste sensible —,
-    2 pour un lot sensible qui touche ces domaines. Les avis comptés sont
-    **indépendants** : jamais le travail de l'auteur ; pour un lot léger à
-    plancher déclaré et pour une classe sensible, une famille de modèle connue
-    et autre que celle de l'auteur ; pour deux avis, deux familles distinctes.
-    L'indépendance ne se suppose jamais : une famille d'auteur inconnue refuse
-    la porte (canon §2, décision 18855a).
+    2 pour un lot sensible qui touche ces domaines. `required` (#2681) permet
+    à un appelant qui lit une politique versionnée plus stricte (le train) de
+    passer son compte : la porte garde le **maximum** et ne s'affaiblit jamais.
+    Les avis comptés sont **indépendants** : jamais le travail de l'auteur ;
+    pour un lot léger à plancher déclaré et pour une classe sensible, une
+    famille de modèle connue et autre que celle de l'auteur ; pour deux avis,
+    deux familles distinctes. L'indépendance ne se suppose jamais : une famille
+    d'auteur inconnue refuse la porte (canon §2, décision 18855a).
+
+    `family_of` (#2681) est la source historique de famille du train : le même
+    code de porte, mais les familles des reçus/tours à la date des faits au
+    lieu du registre courant. Un appelant qui le fournit ne lit ni le registre
+    ni le canon compilé.
 
     #2664 : les familles viennent du canon compilé (`families`, sinon lues par
     `review_lot.compiled_families` au dernier commit audité). Un canon
@@ -390,7 +408,16 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     if not frozen:
         out["why"] = "no freeze to review: the fire names the exact frozen head"
         return out
-    required = required_verdicts(klass)
+    floor = required_verdicts(klass)
+    if required is None:
+        required = floor
+    elif type(required) is not int or required not in (0, 1, 2):
+        out["error"] = "explicit review requirement expected"
+        out["why"] = ("no review verdict ok on the freeze %s (class: %s): an explicit"
+                      " review requirement of 0, 1 or 2 is required, not %r"
+                      % (frozen[:12], cls, required))
+        return out
+    required = max(required, floor)
     out["required"] = required
     on_freeze = [m for m in (marks or ()) if m.get("kind") == "verdict"
                  and _same_sha(m.get("sha"), frozen, repo)]
@@ -416,7 +443,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     if required == 0:
         out["ok"] = True
         return out
-    if families is None and db is not None:
+    if family_of is None and families is None and db is not None:
         from . import review_lot
         try:
             families = review_lot.compiled_families(db)
@@ -429,8 +456,15 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                           "independent (canon §2: independence is never assumed)"
                           % (frozen[:12], cls, exc))
             return out
+
+    def _family_of(name):
+        if family_of is not None:
+            value = family_of(name)
+            return "" if value is None else str(value)
+        return _actor_family(db, name, families)
+
     try:
-        author_family = _actor_family(db, author, families)
+        author_family = _family_of(author)
     except RegistryReadError as exc:
         # #2521 : le registre est illisible, ce n'est pas « famille inconnue ».
         # La porte refuse toujours (l'indépendance ne se suppose pas) mais le
@@ -466,7 +500,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         if author and actor and actor.lower() == author.lower():
             continue                      # on ne relit pas son propre travail
         try:
-            family = _actor_family(db, actor, families)
+            family = _family_of(actor)
         except RegistryReadError as exc:
             out["error"] = str(exc)
             out["why"] = ("no review verdict ok on the freeze %s (class: %s): the agent "
