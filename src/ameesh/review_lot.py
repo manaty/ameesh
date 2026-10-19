@@ -39,11 +39,12 @@ relit les tours de l'assigné.
 l'atterrissage (`land`), et toute fusion **enregistrée** ailleurs l'ouvre par
 `open_for_merge` — le point d'entrée de `work.close_merged`, donc du relevé
 des branches (L118), de `sync-merges`, de `sync-github`, de la porte
-`git-merge` et de `ameesh work merged`. La classe est alors relue sur le diff
-que la fusion a fait entrer (`class_at_merge`, `lot_measures.diff_range`) —
-jamais `cible..gel`, vide dès que le gel est un ancêtre de la cible — avec les
-indices de l'appelant ; seule `light` ouvre, un doute n'ouvre rien, et
-l'idempotence reste celle de `open_after_merge`.
+`git-merge` et de `ameesh work merged`. La classe est alors relue sur le delta
+**du lot** (`class_at_merge`, `lot_measures.lot_diff_range`) — celui de son
+gel, jamais le diff du paquet qui l'a porté ni `cible..gel`, vide dès que le
+gel est un ancêtre de la cible — avec les indices de l'appelant ; seule
+`light` ouvre, un doute n'ouvre rien, et l'idempotence reste celle de
+`open_after_merge`.
 
 #1280 (R codex3 B2) : un avis (`review-after-merge:#P`, `REVUE #N` ou mission
 `R1`/`R2`) n'ouvre **jamais** la relecture d'un avis — la garde est posée ici,
@@ -997,12 +998,13 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
                    sha: str = "") -> dict:
     """La classe du lot au moment d'une fusion constatée (L539, canon §8).
 
-    Le diff lu est celui que la fusion a fait entrer : `sha` (le commit de la
-    fusion constatée, le gel à défaut) est ramené à son intervalle de
-    changement par `lot_measures.diff_range` — commit de fusion, fusion qui a
-    introduit le gel, ou gel hors cible. Lire `cible..gel` serait un piège :
-    une fois la fusion faite, le gel est un ancêtre de la cible, ce diff est
-    vide et toute classe y serait « light ».
+    Le diff lu est celui du **lot** : `sha` (le commit de la fusion constatée)
+    ou, à défaut, son gel, ramené au delta du lot par
+    `lot_measures.lot_diff_range` — la fusion d'un paquet est lue sur le gel
+    du lot, pas sur le diff du paquet (#2702), et une cible locale périmée
+    n'élargit plus le diff à l'historique entre les deux. Lire `cible..gel`
+    serait un piège : une fois la fusion faite, le gel est un ancêtre de la
+    cible, ce diff est vide et toute classe y serait « light ».
 
     Un merge sans delta (arbre identique à son premier parent, le contenu du
     lot ayant été porté par un autre commit de la cible) a lui aussi un diff
@@ -1013,7 +1015,7 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
     `repo` est le dépôt où la fusion a été constatée (le relevé des branches
     le connaît), sinon le dossier de travail de l'assigné au registre, sinon
     le dépôt du projet (`lot_class.repository`) — toujours pour y lire le diff
-    de la fusion, jamais `cible..gel`. `target` la cible déjà résolue.
+    du lot. `target` la cible déjà résolue.
 
     Sans intervalle **prouvé** (diff illisible, commit de fusion absent du
     dépôt, ni gel ni commit), la classe n'est pas demandée à `of_lot` : son
@@ -1036,7 +1038,7 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
         if where:
             freeze = plan_git.latest_freeze(work.milestones(db, int(lot)))
             frozen = str((freeze or {}).get("sha") or "").strip()
-        tips = [t for t in ((sha or "").strip(), frozen) if t]
+        tips = list(dict.fromkeys(t for t in ((sha or "").strip(), frozen) if t))
         if not where:
             why = "dépôt inconnu : aucun intervalle de fusion lisible"
         elif not tips:
@@ -1044,7 +1046,14 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
         # le commit de la fusion constatée d'abord ; à défaut le gel (fusion
         # déclarée sans commit lisible, `ameesh work merged` à la main)
         for tip in tips:
-            rng = lot_measures.diff_range(where, tip, target or None)
+            # #2702 : lire le delta **du lot** d'abord — une fusion de paquet
+            # ne classe pas ses lots sur le diff du paquet, et une cible
+            # locale périmée n'élargit pas le diff à l'historique entre les
+            # deux ; l'intervalle de la fusion reste le repli (#2374).
+            rng = lot_measures.lot_diff_range(where, tip, target or None,
+                                              frozen=frozen or None)
+            if rng is None:
+                rng = lot_measures.diff_range(where, tip, target or None)
             if not rng:
                 why = "le dépôt %s ne contient pas le commit %s" % (where, tip[:12])
                 continue
@@ -1056,18 +1065,10 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
                 base, head = rng
                 proven = True
                 break
-            # #2374 (2e cas, #2340) : un merge dont l'arbre égale son premier
-            # parent a un diff vide — un delta déjà porté par un autre commit
-            # de la cible (rebase, adaptation). Classer ce vide dirait « light »
-            # sans jamais lire le lot : on relit le delta propre au lot
-            # (`merge-base(premier parent, tête du lot)..tête du lot`).
-            alt = lot_measures.lot_diff_range(where, tip, target or None)
-            alt_paths = lot_measures.diff_paths(where, *alt) if alt else None
-            if alt_paths:
-                base, head = alt
-                proven = True
-                why = "diff de fusion vide : classe lue sur le diff du lot"
-                break
+            # #2374 (2e cas, #2340) : un intervalle vide — arbre du merge égal
+            # à son premier parent, ou gel déjà porté par la cible — n'est pas
+            # une preuve. Classer ce vide dirait « light » sans jamais lire le
+            # lot : on doute.
             why = ("diff de fusion vide et aucun delta du lot lisible pour %s"
                    % tip[:12])
             break
@@ -1103,8 +1104,8 @@ def open_for_merge(db, lot: int, *, merged_sha: str = "", pr=None,
 
     Toute voie qui enregistre une fusion (`work.close_merged`) passe ici : le
     relevé des branches (L118), `sync-merges`, `sync-github`, la porte
-    `git-merge` et `ameesh work merged`. La classe est relue sur le diff de la
-    fusion constatée (`class_at_merge`) avec les indices de l'appelant ; seule
+    `git-merge` et `ameesh work merged`. La classe est relue sur le delta du
+    lot (`class_at_merge`) avec les indices de l'appelant ; seule
     `light` ouvre, un doute n'ouvre rien, et un `light` qui touche un chemin
     critique ouvre une relecture sensible à deux avis (#2374). Idempotent : un
     lot de relecture déjà écrit, **quel que soit son état**, est rendu sans
