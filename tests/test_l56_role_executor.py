@@ -261,6 +261,11 @@ class RoleExecutorTest(PgTestCase):
                     "SELECT has_table_privilege('ameesh_canon_sync', %s,"
                     " 'INSERT,UPDATE,DELETE') AS p",
                     ("%s.review_catch_up" % q(self.schema),))[0]["p"])
+                # #2481: a full work row projects its reserved migration slots;
+                # the isolated QA writer reads the lot through that projection.
+                self.assertTrue(self.db.query(
+                    "SELECT has_table_privilege('ameesh_it_qa', %s, 'SELECT') AS p",
+                    ("%s.work_migration_reservations" % q(self.schema),))[0]["p"])
                 # This class has a private database: never mutate shared bench ACLs.
                 for grantee in (*names, "PUBLIC"):
                     with self.subTest(temp_grantee=grantee):

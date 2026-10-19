@@ -2,7 +2,8 @@
 
 Base : `main` **`f70ce01b61aa`** (paquet h-0400, PR #1970, fusionné en
 `f70ce01b6`). Branche `integration/paquet-h-20261019-0500`, cible `main`.
-Une seule suite complète est demandée sur la tête de ce manifeste.
+Une seule suite complète est demandée sur la tête finale, après les correctifs
+CI ci-dessous.
 
 Demandes : composeur, paquet horaire §11 bis — main a bougé à `f70ce01b`
 (h-0400 fusionné, paquet h-0500 dû) ; liste calculée `paquet-candidats.py`.
@@ -55,6 +56,35 @@ Chaque commit de composition a le lot en second parent, son sujet nomme le lot
 et son SHA, et il porte un trailer `ameesh-work: <lot>`. Aucun conflit de
 composition rencontré, aucune résolution ni adaptation.
 
+## Correctifs CI (#2481, droits de lecture)
+
+Le run complet `39193274744` sur `fcd424ae70` a rougi deux contrôles du rôle QA
+isolé (`tests.test_420_qa_role.QaEvidenceTest`, psycopg 6/8) :
+`permission denied for table work_migration_reservations` à l'appel de
+`it.record_qa` → `work.get`. #2481 fait projeter à la ligne complète du lot ses
+créneaux de migration (`work_migration_reservations`), mais
+`deploy/sql/role-module-writers.sql` ne donnait pas SELECT sur cette table à
+`ameesh_it_proof`/`ameesh_it_qa` ; la sonde positive de `has_migration_slots`,
+mise en cache sur la connexion partagée du banc, faisait ensuite lire la table
+au rôle isolé.
+
+Correctif en droits seuls, sans code produit :
+
+- `deploy/sql/role-module-writers.sql` : GRANT SELECT conditionnel sur
+  `work_migration_reservations` aux deux rôles d'écriture isolés (table absente
+  sur une base d'avant 0419 → aucun geste).
+- `tests/test_420_qa_role.py` : le rôle isolé du banc reçoit le même droit (il
+  miroite le script de déploiement).
+- `tests/test_l56_role_executor.py` : garde de contrat — le script appliqué
+  donne bien SELECT à `ameesh_it_qa` sur la table.
+
+Vérifications locales : `tests.test_420_qa_role.QaEvidenceTest` (les deux
+contrôles rouges) **2 OK** ;
+`test_module_writer_role_contract_and_executor_separation` **1 OK** (script
+appliqué deux fois, audit compris). Une suite complète unique est redemandée
+sur la tête de ce correctif ; l'ancienne tête `fcd424ae70` et son run sont
+abandonnés.
+
 ## Contrôles
 
 - Liste calculée `scripts/paquet-candidats.py` à 03:11 (Europe/Paris), base
@@ -65,8 +95,8 @@ composition rencontré, aucune résolution ni adaptation.
   (hors #2466, écarté).
 - `paquet-inclusion` (tête de ce manifeste, `--ready-file` + admissions) :
   **rc 0** — 11 lots attendus, 11 compositions, 0 défaut.
-- `git diff --check` vert ; aucune migration SQL (43 fichiers, +4369/−535
+- `git diff --check` vert ; aucune migration SQL (46 fichiers, +4381/−537
   hors manifeste).
-- Suite complète unique demandée sur la tête de ce manifeste
+- Suite complète unique demandée sur la tête finale de ce manifeste
   (`ci-full-<sha>`), avec la revue unitaire du paquet pour seul avis de la
   demande de CI (§12, `--full --avis 0`).
