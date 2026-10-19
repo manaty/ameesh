@@ -67,7 +67,14 @@ ameesh work close <id> --abandoned                 lot that will not be done
 ameesh work close <id> --superseded-by <id2>       lot replaced or absorbed by another
 ameesh work close <id> --delivered --sha <head>    lot delivered outside the target (#988)
 ameesh work close <id> --done                      delivered without a merge (no branch)
+ameesh work packet record <carrier> [--repo R]     link its composition units (#2443)
+ameesh work packet show <lot|carrier> [--json]     recorded package composition
 ```
+
+`package` on `work add`/`work link` is the **plan card** (`work_packages`).
+The package-composition link of #2443 is separate: `work packet record` reads
+the carrier's `integration/**` composition commits (`ameesh-work:` trailers,
+never the manifest), and `work show` then prints `package : #<carrier> …`.
 
 `close` moves the lot to the terminal state `closed` and records a `closed` milestone:
 nothing stays open by oversight. A closed lot is **never reopened** by a
