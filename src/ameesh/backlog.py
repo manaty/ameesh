@@ -408,6 +408,14 @@ def review_origin(*, title: str = "", source: str = "") -> int | None:
     return None
 
 
+def sensitive_p2(*, title: str = "", source: str = "", app: str = "") -> bool:
+    """Canon §2 : « sauf P2 sensible ameesh » — sur ameesh, un P2 de la classe
+    sensible bloque encore : ni panier, ni seuil, ni refus de suite d'avis ;
+    il garde son lot."""
+    return (str(app or "").strip().lower() == "ameesh"
+            and bool(SENSITIVE_P2.search(" ".join([str(title or ""), str(source or "")]))))
+
+
 def is_basket(item: dict) -> bool:
     """Le lot est-il un panier de chantier (#2584) ?"""
     return (item.get("type") == ITEM_TYPE
@@ -420,11 +428,14 @@ def is_review_followup(item: dict) -> bool:
     Un panier ; un élément du backlog né d'une relecture (marque `review-of:#`,
     ou origine lisible sur sa source ou son titre, `review_origin`) ; un lot
     marqué comme suite non bloquante (N, P2, P3 : `followup_hint`). Un lot de
-    relecture après fusion n'en est pas une : il relit le lot d'origine."""
+    relecture après fusion n'en est pas une : il relit le lot d'origine ; un
+    P2 sensible d'ameesh non plus (`sensitive_p2`), même né d'une relecture."""
     item = item or {}
     if is_basket(item):
         return True
     title, source = str(item.get("title") or ""), str(item.get("source") or "")
+    if sensitive_p2(title=title, source=source, app=item.get("app") or ""):
+        return False
     if followup_hint(title=title, source=source, issue_ref=item.get("issue_ref") or "",
                      app=item.get("app") or ""):
         return True
@@ -532,7 +543,8 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
     devient une ligne du panier de son chantier (`chantier`, sinon la fiche,
     sinon le lot relu, sinon le projet) : le lot rendu est alors le panier,
     avec `basket` vrai, `basket_lines` et `basket_opened`. `review_of` nomme
-    le lot relu ; au seuil, il est gardé en tête de la source (`review-of:#N`)."""
+    le lot relu ; au seuil, il est gardé en tête de la source (`review-of:#N`).
+    Un P2 sensible d'ameesh (`sensitive_p2`) garde la route historique."""
     title = (title or "").strip()
     if not title:
         raise BacklogError("title required")
@@ -569,6 +581,8 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
     team = (team or "").strip() or None
     capabilities = _capabilities(required_capabilities) or None
     rule = rules(cfg, project)
+    if rule is not None and sensitive_p2(title=title, source=source, app=project):
+        rule = None                     # canon §2 : le P2 sensible d'ameesh garde son lot
     reviewed = _reviewed_lot(db, review_of, title=title, source=source)
     if rule is not None and reviewed is not None and is_review_followup(reviewed):
         raise BacklogError(followup_refusal(reviewed))
@@ -868,7 +882,8 @@ def roadmap_first(db: Db, item: dict, *, cfg=None, now: float | None = None) -> 
         return []
     project = str(item.get("app") or item.get("team") or "").strip()
     rule = rules(cfg, project)
-    if rule is None:
+    if rule is None or sensitive_p2(title=item.get("title") or "",
+                                    source=item.get("source") or "", app=project):
         return []
     try:
         score = int(item.get("value_score") or 0)

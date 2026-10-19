@@ -289,6 +289,25 @@ class ReviewFollowupRefusalTest(_Base):
         self.assertEqual(work.get(self.db, line["id"])["source"],
                          "backlog-basket:ameesh:#%d:2026-10-19" % roadmap["id"])
 
+    def test_a_sensitive_p2_of_ameesh_keeps_its_lot(self):
+        # canon §2 « sauf P2 sensible ameesh » : relire ce lot n'est pas
+        # relire une suite d'avis, et le P2 sensible né d'une suite garde son
+        # lot, sous le seuil comme au-dessus
+        p2 = self.element("P2 sensible : garde de placement", 40,
+                          source="relecture #%d (N1)" % self.lot("Roadmap : placement")["id"])
+        self.assertNotIn("basket", p2)
+        self.assertFalse(backlog.is_review_followup(p2))
+        line = self.element("N : libellé", 5, review_of=p2["id"])
+        self.assertTrue(line["basket"])
+        suite = self.lot("#2452 N2 : train_reviews hors des classes")
+        lot = self.element("P2 sensible : verrou perdu", 5, review_of=suite["id"])
+        self.assertNotIn("basket", lot)
+        self.assertEqual(backlog.roadmap_first(self.db, lot, cfg=self.cfg), [])
+        with self.assertRaises(backlog.BacklogError):
+            self.element("P2 : libellé", 5, review_of=suite["id"])
+        # ailleurs qu'ameesh, la règle générale s'applique
+        self.assertFalse(backlog.sensitive_p2(title="P2 sensible : x", app="nexlink"))
+
     def test_unknown_review_of_is_refused(self):
         with self.assertRaises(backlog.BacklogError):
             self.element("N : x", 5, review_of=999999)
