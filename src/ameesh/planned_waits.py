@@ -235,7 +235,7 @@ def _dry_pass(db) -> bool:
 def _carrier_ref(repo, carrier):
     """La ref lisible de la branche du porteur, sans fetch.
 
-    La branche locale d'abord, puis `origin/`, puis la tête observée
+    La branche publiée d'abord, puis la branche locale, puis la tête observée
     (`branch_head`) : un clone qui n'a pas la branche peut quand même avoir
     le commit du dernier relevé. Aucune ref : None."""
     from . import plan_git
@@ -243,7 +243,8 @@ def _carrier_ref(repo, carrier):
     branch = str(carrier.get("branch") or "").strip()
     refs = []
     if branch:
-        refs += [branch, "refs/remotes/origin/" + branch, "refs/heads/" + branch]
+        refs += [plan_git.published_target(repo, branch), branch,
+                 "refs/remotes/origin/" + branch, "refs/heads/" + branch]
     head = str(carrier.get("branch_head") or "").strip()
     if head:
         refs.append(head)
@@ -269,6 +270,7 @@ def packet_trailers(repo, carrier, target=None):
         return None
     rev = ref
     if target:
+        target = plan_git.published_target(repo, target)
         base = plan_git._out(repo, "merge-base", ref, target)
         if not base:
             return None

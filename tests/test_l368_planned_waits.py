@@ -74,6 +74,24 @@ class PacketTrailersTest(unittest.TestCase):
         self.assertIsNone(W.packet_trailers(
             self.repo, {"branch": "integration/absente"}, "main"))
 
+    def test_published_target_excludes_history_when_local_main_is_stale(self):
+        head = self.packet_branch()
+        self.git("remote", "add", "origin", self.repo)
+        self.git("update-ref", "refs/remotes/origin/main", "main")
+        # Le clone partagé a fetché main sans déplacer sa branche locale.
+        self.git("branch", "-f", "main", "main~1")
+        carrier = {"branch": "integration/paquet-test", "branch_head": head}
+        self.assertEqual(W.packet_trailers(self.repo, carrier, "main"), {1234, 5678})
+
+    def test_published_carrier_excludes_units_dropped_since_local_branch(self):
+        head = self.packet_branch()
+        self.git("remote", "add", "origin", self.repo)
+        self.git("checkout", "-q", "-b", "recomposed", "main")
+        self.commit("vehicule : #5678 abcdef0\n\nameesh-work: 5678")
+        self.git("update-ref", "refs/remotes/origin/integration/paquet-test", "HEAD")
+        carrier = {"branch": "integration/paquet-test", "branch_head": head}
+        self.assertEqual(W.packet_trailers(self.repo, carrier, "main"), {5678})
+
     def test_attachments_come_from_the_project_repo(self):
         head = self.packet_branch()
         cfg = types.SimpleNamespace(radar={"projects": {
