@@ -1984,6 +1984,11 @@ def conflicts_of(report: dict) -> dict:
             "kind": "unreserved", "lots": [one["work_item"]], "files": [one["path"]],
             "target": one["target"], "number": one["number"], "repo": one["repo"],
             "holder": one.get("holder")}
+    for conflict in out.values():
+        if "fingerprint" not in conflict:
+            conflict["fingerprint"] = json.dumps(
+                [[(lot, (heads.get(lot) or {}).get("tip")) for lot in conflict["lots"]],
+                 conflict["files"], conflict.get("holder")], sort_keys=True)
     return out
 
 
@@ -2149,20 +2154,26 @@ def send_mail(cfg, db, project: Project, report: dict, *, ci="github") -> list[d
     for key, conflict in sorted(current.items()):
         done = dict(before.get(key) or {})
         fingerprint = conflict.get("fingerprint")
-        if done.pop("dormant", False) and done.get("fp") != fingerprint:
-            # #2238: back on other inputs than the notice already sent
+        done.pop("dormant", False)
+        if done.get("fp") != fingerprint:
+            # #2602: changed heads are new inputs, even without an absent pass.
             done = {}
         for lot in conflict["lots"]:
             one = branches.get(lot) or {}
             to = one.get("assignee")
             if not to or to.startswith(work.HUMAN_PREFIX):
                 continue
+            recipient_key = "%s:%s" % (lot, to)
+            # Upgrade the old per-lot ledger without resending existing mail.
+            previous = done.get(recipient_key, done.get(str(lot)))
             level, status = "passive", None
-            if conflict["kind"] == "target" and done.get(str(lot)) != "blocking" and ci:
+            if conflict["kind"] == "target" and previous != "blocking" and ci:
                 status = ci(one["branch"])
                 if status and status.get("green"):
                     level = "blocking"
-            if done.get(str(lot)) in (level, "blocking"):
+            if previous in (level, "blocking"):
+                done[recipient_key] = previous
+                done.pop(str(lot), None)
                 continue
             if conflict["kind"] == "target" and "merged" not in done:
                 # les lots fusionnés d'où vient le conflit, notés à sa première
@@ -2182,19 +2193,21 @@ def send_mail(cfg, db, project: Project, report: dict, *, ci="github") -> list[d
                     payload={"radar_blocking" if level == "blocking" else "radar": data})
             except Exception:  # noqa: BLE001 - réessayé au passage suivant
                 continue
-            done[str(lot)] = level
+            done[recipient_key] = level
+            done.pop(str(lot), None)
             sent.append({"key": key, "lot": lot, "to": to, "level": level,
                          "message_id": message_id})
         if done:
             if fingerprint is not None:
                 done["fp"] = fingerprint
+            done["lots"] = conflict["lots"]
             keys[key] = done
     # #2238: a conflict absent from this pass whose lots all stay on the
     # radar keeps its notice, dormant, instead of being forgotten.
     for key, done in before.items():
         if key in current or "fp" not in done:
             continue
-        lots = _key_lots(key)
+        lots = done.get("lots") or _key_lots(key)
         if lots and all(n in branches for n in lots):
             keys[key] = dict(done, dormant=True)
     if keys != before:
