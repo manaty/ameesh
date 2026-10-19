@@ -10,6 +10,7 @@ gardes et leurs réponses ne changent pas.
 from __future__ import annotations
 
 import os
+import shlex
 import time
 import unittest
 from unittest import mock
@@ -116,7 +117,7 @@ class CopiesOnceTest(PgTestCase):
             self.assertEqual(menage.tmp_git_work(path, report=report),
                              "copies not fully inspected (budget épuisé)")
             self.assertEqual(menage.tmp_recovery_command(path, report=report),
-                             "ls -la -- %s" % path)
+                             "ls -la -- %s" % shlex.quote(path))
             ok, error, repos = menage.recover_tmp_git_copies(path, report=report)
         self.assertFalse(ok)
         self.assertIn("not fully inspected", error)
