@@ -96,7 +96,7 @@ class Recorded:
             reference = review_authors.reference_author(
                 self.db, item, freeze, self.families,
                 provider=self.provider, strict=True)
-            authors, unknown = review_authors.authors(
+            authors, unknown, correctors = review_authors.attribution(
                 self.db, item, freeze, commits, self.path, self.families,
                 reference=reference, provider=self.provider, strict=True)
             if unknown:
@@ -122,7 +122,7 @@ class Recorded:
             str(reference.get("family") or "")
         gate = merge_queue.review_gate(
             self.db, marks, head, repo=self.path, klass=klass, item=historical,
-            required=required, authors=authors,
+            required=required, authors=authors, fixers=correctors,
             family_of=lambda name: family_of.get(str(name or "").strip().lower(), ""))
         if gate.get("error"):
             raise TrainError(gate["error"])

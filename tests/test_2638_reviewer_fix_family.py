@@ -79,7 +79,9 @@ class ReviewerFixFamilyTest(_ActivationFixture, PgTestCase):
         # The exact #2602 sequence with one review: dev1 (Claude) reviews,
         # pushes its small fix, then a later freeze designates dev5 (DeepSeek)
         # and retires dev1 from the column. Both corrections are in the range
-        # of the third freeze, where the old code forbade all three families.
+        # of the third freeze: their families remain eligible, but the exact
+        # correctors are never designated again (#2758) — another agent of
+        # dev1's family takes the seat.
         self.one_review_canon()
         _, first = self.freeze()
         self.assertEqual([r["name"] for r in first["reviewers"]], ["r1"])
@@ -90,25 +92,64 @@ class ReviewerFixFamilyTest(_ActivationFixture, PgTestCase):
         self.assertEqual([r["name"] for r in second["reviewers"]], ["r2"])
         self.commit("r2", "codex", "lot\nr1 small fix\nr2 small fix\n")
         self.status("r1", "idle")              # dev1 is back for the third freeze
+        registry.upsert(self.db, "r3", harness="claude", host=self.cfg.host,
+                        cwd=self.repo.root, status="idle")
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = 'r3'")
         _, third = self.freeze()
         self.assertEqual(third["state"], rd.DESIGNATED, third)
-        self.assertEqual([r["name"] for r in third["reviewers"]], ["r1"])
+        self.assertEqual([r["name"] for r in third["reviewers"]], ["r3"])
         self.assertEqual(self.authors(), {"author": "deepseek"})
 
     def test_2602_three_families_with_small_reviewer_fixes_still_designate(self):
         # #2602: cx2 (Codex) authors, dev1 (Claude) then dev5 (DeepSeek) push
         # their first-round correction; the next freeze must still designate.
+        # #2758: the exact correctors are excluded, another agent of each
+        # family takes the seats.
         self.first_freeze()
         self.commit("r1", "claude", "lot\nr1 small fix\n")
         self.commit("r2", "codex", "lot\nr1 small fix\nr2 small fix\n")
+        for name, harness in (("r3", "claude"), ("r4", "codex")):
+            registry.upsert(self.db, name, harness=harness, host=self.cfg.host,
+                            cwd=self.repo.root, status="idle")
+            self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
+                            (name,))
         _, out = self.freeze()
         self.assertEqual(out["state"], rd.DESIGNATED, out)
-        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1", "r2"])
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r3", "r4"])
         # the three families are in the range, but only the lot author is one
         self.assertEqual(self.authors(), {"author": "deepseek"})
-        # the same reviewer-correctors are designated again on the new head
         self.assertEqual([r["family"] for r in out["reviewers"]],
                          ["claude", "codex"])
+
+    def test_a_corrector_without_another_agent_of_its_family_waits_and_alerts(self):
+        # #2680/#2692 witness: no other agent of the corrector's family is
+        # available. The designation waits and the pilot is notified; the
+        # corrector never receives the seat back.
+        self.first_freeze()
+        self.commit("r1", "claude", "lot\nr1 small fix\n")
+        self.commit("r2", "codex", "lot\nr1 small fix\nr2 small fix\n")
+        before = len(self.mailbox())
+        _, out = self.freeze()
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.assertEqual(out["reviewers"], [])
+        self.assertIn("corrector(s) excluded: r1, r2", out["why"])
+        sent = self.mailbox()[before:]
+        self.assertEqual([m["recipient"] for m in sent], ["pilot"])
+        self.assertEqual(sent[0]["kind"], "notify")
+
+    def test_2692_another_codex_agent_takes_the_corrector_seat(self):
+        # Witness #2692: the author is DeepSeek, r2 (Codex) pushed a small
+        # correction. Codex stays eligible, r2 is not designated, another
+        # Codex agent takes the seat.
+        self.first_freeze()
+        self.commit("r2", "codex", "lot\nr2 small fix\n")
+        registry.upsert(self.db, "r4", harness="codex", host=self.cfg.host,
+                        cwd=self.repo.root, status="idle")
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = 'r4'")
+        _, out = self.freeze()
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1", "r4"])
+        self.assertNotIn("r2", [r["name"] for r in out["reviewers"]])
 
     def test_a_reviewer_fix_over_fifty_lines_makes_that_family_an_author(self):
         self.first_freeze()

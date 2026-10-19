@@ -11,7 +11,9 @@ auteurs, avec les mêmes exceptions du canon §2 :
 * chaque commit du contenu est attribué par son reçu exact (#1465) ;
 * un correctif de premier tour d'un **relecteur désigné** sous le seuil du §2
   (`REVIEWER_FIX_LINES`, pas de conception) ne fait pas de son auteur un auteur
-  de la tête : sa famille reste éligible, et il peut être redésigné (#2638) ;
+  de la tête : sa famille reste éligible (#2638) ; l'agent lui-même est rendu
+  comme **correcteur**, pour que la désignation et la porte écartent son nom
+  sans exclure sa famille (#2758) ;
 * quand le reçu exact manque (commit restauré par rebase, correction poussée
   hors du hook), le commit est attribué à la famille de session de son
   committer, lue au journal des tours (`turn_costs`, `_turns_harness`) : un
@@ -238,11 +240,11 @@ def actor_family(db, actor: str, at_ts: float, families) -> str:
     return _family(harness, families)
 
 
-def authors(db, item: Mapping, milestone: Optional[Mapping],
-            commits: Sequence[str], repo: str = "", families=(),
-            *, reference: Optional[Mapping] = None, provider=None,
-            strict: bool = False) -> tuple[list, list]:
-    """`(auteurs, inconnus)` de la plage gelée, même lecture pour tous.
+def attribution(db, item: Mapping, milestone: Optional[Mapping],
+                commits: Sequence[str], repo: str = "", families=(),
+                *, reference: Optional[Mapping] = None, provider=None,
+                strict: bool = False) -> tuple[list, list, list]:
+    """`(auteurs, inconnus, correcteurs)` de la plage gelée, même lecture.
 
     `reference` est l'auteur de référence déjà lu (`reference_author`) : la
     désignation et le train la partagent. `provider` est le fournisseur exact
@@ -254,6 +256,11 @@ def authors(db, item: Mapping, milestone: Optional[Mapping],
     correctif de relecture ; un tiers non relecteur reste inconnu. Au-delà du
     seuil (ou pour une conception), le relecteur devient auteur de sa
     correction, avec sa famille de session.
+
+    `correctors` sont les relecteurs désignés dont la correction de premier
+    tour reste sous le seuil du §2 : leur **famille** reste éligible (#2638),
+    mais l'agent lui-même a écrit un commit de la plage. La désignation et la
+    porte l'excluent par son nom, jamais par sa famille (#2758).
     """
     item = dict(item or {})
     if reference is None:
@@ -321,13 +328,37 @@ def authors(db, item: Mapping, milestone: Optional[Mapping],
             for _sha, proven in entries:
                 if proven:
                     by_name[actor].add(proven)
+    correctors = []
+    for actor in sorted(review_commits):
+        if actor in by_name:
+            # above the threshold (or a design change): already an author,
+            # their family is forbidden (#2638)
+            continue
+        proven = {value for _sha, value in review_commits[actor] if value}
+        # an ambiguity of families does not matter here: only the name excludes
+        family = next(iter(proven)) if len(proven) == 1 else ""
+        correctors.append({"name": actor, "family": family})
     out = []
     for actor in sorted(by_name):
         proven = {value for value in by_name[actor] if value}
         # un acteur à deux familles prouvées est ambigu : jamais deviné
         family = next(iter(proven)) if len(proven) == 1 else ""
         out.append({"name": actor, "family": family})
-    return out, unknown
+    return out, unknown, correctors
+
+
+def authors(db, item: Mapping, milestone: Optional[Mapping],
+            commits: Sequence[str], repo: str = "", families=(),
+            *, reference: Optional[Mapping] = None, provider=None,
+            strict: bool = False) -> tuple[list, list]:
+    """`(auteurs, inconnus)`, la lecture `attribution` sans les correcteurs.
+
+    Les lecteurs qui n'ont pas besoin de la liste des correcteurs gardent cette
+    forme ; la désignation, la porte et le train lisent `attribution` (#2758)."""
+    found, unknown, _correctors = attribution(
+        db, item, milestone, commits, repo, families, reference=reference,
+        provider=provider, strict=strict)
+    return found, unknown
 
 
 def verdict_families(db, marks, families, *, provider=None,

@@ -125,6 +125,11 @@ class _Base(unittest.TestCase):
                                   side_effect=lambda db, n, *a, **kw: list(self.lot_marks)),
                 mock.patch.object(work, "note", side_effect=self._note),
                 mock.patch.object(work, "events", side_effect=self._events),
+                # #2758 : ce banc simule le stockage ; la lecture de la plage
+                # gelée par la porte a ses témoins réels dans
+                # test_2758_reviewer_corrector.
+                mock.patch.object(merge_queue, "_attribution_on_freeze",
+                                  return_value=None),
                 mock.patch.object(merge_queue, "actor_family",
                                   side_effect=lambda db, n, **_: self.FAMILIES.get(
                                       str(n or "").strip(), ""))):

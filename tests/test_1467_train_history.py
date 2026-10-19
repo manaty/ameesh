@@ -88,7 +88,8 @@ class HistoryFixture:
                                              target="main")
         self.base = self.commit("base", path="base.txt")
         for name, harness in (("author", "deepseek"), ("r1", "claude"),
-                              ("r2", "codex"), ("third", "claude")):
+                              ("r2", "codex"), ("r3", "claude"),
+                              ("third", "claude")):
             registry.upsert(self.db, name, harness=harness, host=self.cfg.host,
                             cwd=self.repo, status="idle")
         self.item = work.add(self.db, title="train history", app=self.project.name,
@@ -114,6 +115,9 @@ class HistoryFixture:
         self.turn("author", "deepseek")
         self.r1 = self.verdict(self.head, "r1", "claude")
         self.r2 = self.verdict(self.head, "r2", "codex")
+        # #2758: r1 wrote the small correction on this head; its own verdict
+        # does not count. r3 (same family) proves the family stays eligible.
+        self.r3 = self.verdict(self.head, "r3", "claude")
         self.history = train_history.Recorded(
             self.db, self.repo, provider=review_provenance,
             review_rules=types.SimpleNamespace(
@@ -153,6 +157,9 @@ class RecordedHistoryTest(HistoryFixture, PgTestCase):
         self.assertEqual(reviews["head"], self.head)
         self.assertTrue(reviews["gate"]["ok"], reviews["gate"])
         self.assertEqual(reviews["gate"]["required"], 2)
+        self.assertEqual(reviews["gate"]["corrections"], ["r1"])
+        self.assertEqual([entry["actor"] for entry in reviews["gate"]["accepted"]],
+                         ["r2", "r3"])
         self.assertEqual({row["name"] for row in reviews["authors"]},
                          {"author"})
 
@@ -178,15 +185,20 @@ class RecordedHistoryTest(HistoryFixture, PgTestCase):
         self.assertTrue(proof["reviews"]["gate"]["ok"], proof["reviews"]["gate"])
 
     def test_missing_receipt_of_a_designated_reviewer_small_fix_is_not_an_author(self):
-        # #2638 : correction de premier tour de r1 (sans reçu) : sa famille
-        # reste éligible, le train ne la traite pas comme un auteur inconnu.
-        authors, unknown = review_authors.authors(
+        # #2638/#2758 : correction de premier tour de r1 (sans reçu) : sa
+        # famille reste éligible, le train ne la traite pas comme un auteur
+        # inconnu ; son propre avis ne compte pas, r3 (même famille) admet.
+        authors, unknown, correctors = review_authors.attribution(
             self.db, self.item, self.frozen,
             [self.first, self.review_fix, self.head], self.repo,
             ("claude", "codex", "deepseek"))
         self.assertEqual(unknown, [])
         self.assertEqual({row["name"] for row in authors}, {"author"})
-        self.assertTrue(self.qualify()["reviews"]["gate"]["ok"])
+        self.assertEqual([row["name"] for row in correctors], ["r1"])
+        proof = self.qualify()
+        self.assertTrue(proof["reviews"]["gate"]["ok"], proof["reviews"]["gate"])
+        self.assertNotIn("r1", [entry["actor"]
+                                for entry in proof["reviews"]["gate"]["accepted"]])
 
     def test_a_coauthor_cannot_admit_its_own_verdict_with_one_review(self):
         # #2681 B (dev1/cx2) : un tiers avec reçu exact est un auteur de la

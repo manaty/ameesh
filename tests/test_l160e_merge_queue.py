@@ -1435,6 +1435,13 @@ class QueueWithoutRadarTest(PgTestCase):
         # banc simule l'auteur (`a1`) et deux relecteurs de familles distinctes
         # (`rev1`, `rev2`), comme les bancs sans base plus haut.
         self.db.execute("UPDATE work_items SET assignee = 'a1' WHERE id = %d" % lot)
+        # #2758 : la porte relit la plage gelée ; ce banc Git réel fournit les
+        # reçus exacts que le runner écrit pour chaque commit.
+        for commit in _git(origin, "rev-list", "--no-merges",
+                           "main..lot/1-a").split():
+            storage.of(self.db).provenance.add(
+                "commit:" + commit, commit, "a1", "s-deepseek", "t", "deepseek",
+                work_item_id=lot)
         work.milestone(self.db, lot, "frozen", sha=fresh, actor="a1")
         work.milestone(self.db, lot, "verdict", verdict="ok", sha=fresh, actor="rev1")
         work.milestone(self.db, lot, "verdict", verdict="ok", sha=fresh, actor="rev2")

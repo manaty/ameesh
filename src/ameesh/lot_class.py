@@ -291,14 +291,15 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     reste son nom dans la trace, et le diff se lit depuis ce commit — une ref
     peut bouger entre la lecture et la classification. `milestones` et
     `canons` (liste ou lecteur différé) réutilisent les lectures groupées de
-    l'appelant. Rend aussi `files`, `policy_ref`, `target`, `frozen_sha`,
-    `why` et `doubt` (vrai quand la classe vient d'une lecture impossible, pas
-    d'une politique) et `light_reviews` (le plancher d'avis d'un lot léger,
-    #2642) pour la trace.
+    l'appelant. Rend aussi `files`, `policy_ref`, `target`, `base_sha` (la
+    révision exacte du diff, quand elle est connue), `frozen_sha`, `why` et
+    `doubt` (vrai quand la classe vient d'une lecture impossible, pas d'une
+    politique) et `light_reviews` (le plancher d'avis d'un lot léger, #2642)
+    pour la trace.
     """
     out: dict = {"lot": int(lot), "class": SENSITIVE, "why": "", "files": [],
                  "policy_ref": "", "repo": repo or "", "target": base or "",
-                 "frozen_sha": head or "", "doubt": True}
+                 "base_sha": "", "frozen_sha": head or "", "doubt": True}
     row = item if item is not None else work.get(db, lot)
     if row is None:
         out["why"] = "lot #%d not found" % lot
@@ -340,6 +341,7 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     if not base:
         base = landing
     out["target"] = base or ""
+    out["base_sha"] = str(base or "")
     reason = release_reason(row, base)
     if reason:
         out.update({"class": RELEASE, "why": reason, "doubt": False})
@@ -348,6 +350,7 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     if not revision:
         out["why"] = "no target branch: freeze the lot or name its target"
         return out
+    out["base_sha"] = str(revision)
     try:
         paths = canon_mod.git_range_paths(repo, revision, head)
     except canon_mod.GitError as exc:

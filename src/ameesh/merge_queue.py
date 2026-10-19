@@ -345,9 +345,42 @@ def _waiver(db, item) -> tuple:
     return waived, waived_by, row
 
 
+def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=None):
+    """Les auteurs et correcteurs d'une tête gelée depuis la plage exacte (#2758).
+
+    Lit les commits exacts de la plage gelée et leur provenance, la même
+    lecture que la désignation (#2681) : l'auteur de référence et les coauteurs
+    sont des auteurs, un correctif de premier tour de relecteur sous le seuil
+    (#2638) est un correcteur — son nom est écarté, sa famille reste éligible.
+    Rend `None` quand aucune lecture n'est possible (pas de base, pas de dépôt,
+    pas de ligne de lot) : la porte garde alors son comportement historique.
+    Lève quand une lecture était possible et a échoué : une porte qui ne peut
+    pas prouver l'absence de correcteur ne compte pas son avis (l'indépendance
+    ne se suppose pas).
+    """
+    base = str((klass or {}).get("base_sha")
+               or (klass or {}).get("target") or "").strip()
+    if db is None or not hasattr(db, "query") or not repo or not base or not item:
+        return None
+    from . import review_designation_activation as act
+    freeze = plan_git.latest_freeze(marks or ())
+    milestone = None
+    if freeze is not None and _same_sha(freeze.get("sha"), frozen, repo):
+        milestone = {"id": int(freeze.get("id") or 0),
+                     "sha": str(freeze.get("sha") or ""),
+                     "actor": freeze.get("actor") or "",
+                     "at_ts": freeze.get("at_ts")}
+    authors, unknown, correctors = act.attribution_of_head(
+        db, item, milestone, repo, base, frozen, families=families or ())
+    if unknown:
+        raise ValueError("author provenance unknown for frozen commit(s): %s"
+                         % ", ".join(unknown))
+    return authors, correctors
+
+
 def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 item=None, families=None, required=None, family_of=None,
-                authors=None) -> dict:
+                authors=None, fixers=None) -> dict:
     """Les avis requis sur la tête gelée `frozen`, et eux seuls (#1374).
 
     Un verdict ne compte que s'il a été rendu **sur cette tête** (le `sha` du
@@ -371,14 +404,25 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     famille d'auteur inconnue refuse la porte (canon §2, décision 18855a).
 
     `authors` (#2681) est l'ensemble des auteurs **reconnus** de la tête, tel
-    que l'appelant l'a lu (`review_authors.authors`) : `{name, family}`. La
+    que l'appelant l'a lu (`review_authors.attribution`) : `{name, family}`. La
     porte ne compare plus seulement à l'assigné : un coauteur — tiers avec
     reçu exact, correcteur de relecteur au-delà du seuil du §2 — ne relit ni
     lui-même ni sa famille. Un petit correctif de relecteur n'est pas un auteur
     (#2638) et sa famille reste éligible. La famille de l'assigné historique
     reste celle de la trace du gel (`family_of`) : le reçu d'un autre commit du
-    même nom ne la remplace pas. Sans `authors`, la porte garde son
-    comportement historique : seul l'assigné est connu.
+    même nom ne la remplace pas. Sans `authors`, la porte lit elle-même la
+    plage gelée quand le dépôt, la base et la ligne du lot sont connus
+    (`attribution_of_head`) : tous les auteurs reconnus en sont exclus, comme
+    la désignation ; une plage illisible échoue fermé. Sans lecture possible,
+    elle garde son comportement historique (seul l'assigné est connu).
+
+    `fixers` (#2758) nomme les agents auteurs d'un petit correctif de relecteur
+    tenu hors des auteurs (#2638) : leur avis **ne compte pas** sur cette tête,
+    par leur nom seulement — un autre agent de leur famille reste éligible.
+    `None` (l'appelant ne l'a pas lu) fait lire la plage gelée par la porte
+    elle-même (`attribution_of_head`) quand le dépôt, la base et la ligne du lot
+    sont connus ; une plage illisible échoue fermé. Une liste vide dit que
+    l'appelant a lu la plage et n'a trouvé aucun correcteur (le train).
 
     `family_of` (#2681) est la source historique de famille du train : le même
     code de porte, mais les familles des reçus/tours à la date des faits au
@@ -399,7 +443,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     n'est jamais levé par la dispense : la correction reste due.
 
     Rend `{ok, why, class, required, accepted, blocked, waived, author,
-    author_family, authors, on_freeze}` ; ne lève jamais.
+    author_family, authors, corrections, on_freeze}` ; ne lève jamais.
     """
     from . import lot_class
     klass = klass or {}
@@ -416,7 +460,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     author = str(row.get("assignee") or "").strip()
     out = {"ok": False, "why": "", "error": "", "class": cls, "required": 0,
            "accepted": [], "blocked": [], "waived": waived, "waived_by": waived_by,
-           "author": author, "author_family": "", "authors": [], "on_freeze": 0}
+           "author": author, "author_family": "", "authors": [],
+           "corrections": [], "on_freeze": 0}
     if not frozen:
         out["why"] = "no freeze to review: the fire names the exact frozen head"
         return out
@@ -488,11 +533,32 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                       % (frozen[:12], cls, exc))
         return out
     out["author_family"] = author_family
+    # #2758 : même lecture que la désignation pour la plage gelée. L'appelant
+    # qui n'a pas lu les auteurs (la porte courante) les reçoit d'ici ; le
+    # train les fournit avec sa source historique et garde sa lecture.
+    if authors is None or fixers is None:
+        try:
+            attribution = _attribution_on_freeze(db, marks, frozen, repo=repo,
+                                                 klass=klass, item=item,
+                                                 families=families)
+        except Exception as exc:  # noqa: BLE001 - une plage illisible ne conclut pas
+            out["error"] = str(exc)
+            out["why"] = ("no review verdict ok on the freeze %s (class: %s): the frozen "
+                          "range cannot be read (%s), so an author's own verdict cannot "
+                          "be excluded (canon §2: independence is never assumed)"
+                          % (frozen[:12], cls, exc))
+            return out
+        if attribution is not None:
+            range_authors, range_correctors = attribution
+            if authors is None:
+                authors = range_authors
+            if fixers is None:
+                fixers = range_correctors
     # #2681 : les auteurs **reconnus** de la tête, quand l'appelant les a lus
     # (`review_authors.authors`). L'assigné historique passé dans `item` en
     # fait toujours partie ; un tiers avec reçu exact ou un correcteur au-delà
     # du seuil du §2 s'y ajoute. Un petit correctif de relecteur n'y est pas
-    # (#2638) : sa famille reste éligible.
+    # (#2638) : sa famille reste éligible, seul son nom est écarté (#2758).
     recognized: dict = {}
     if author:
         recognized[author.lower()] = {"name": author, "family": author_family}
@@ -554,12 +620,20 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                           % (frozen[:12], cls, entry["name"]))
             return out
     author_families = {entry["family"] for entry in recognized.values() if entry["family"]}
+    corrections = set()
+    for entry in fixers or ():
+        name = str(entry.get("name") if isinstance(entry, Mapping) else entry or "").strip()
+        if name:
+            corrections.add(name.lower())
+    out["corrections"] = sorted(corrections)
     accepted = []
     for mark in sorted((m for m in latest.values() if (m.get("verdict") or "") == "ok"),
                        key=_mark_order):
         actor = str(mark.get("actor") or "").strip()
         if actor and actor.lower() in recognized:
             continue                      # on ne relit pas son propre travail
+        if actor and actor.lower() in corrections:
+            continue                      # l'auteur d'un correctif ne le relit pas (#2758)
         try:
             family = _family_of(actor)
         except RegistryReadError as exc:

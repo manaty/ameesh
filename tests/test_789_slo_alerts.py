@@ -253,6 +253,12 @@ class ReviewGateRepositoryTest(_Base):
         subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "gel"], check=True)
         sha = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
                              check=True, capture_output=True, text=True).stdout.strip()
+        # #2758: the gate reads the frozen range to exclude a corrector's own
+        # verdict; the fixture provides the author's exact receipt, as the
+        # runner does for a real freeze.
+        storage.of(self.db).provenance.add(
+            "commit:" + sha, sha, "dev1", "s-claude", "t", "claude",
+            work_item_id=self.lot["id"])
         subprocess.run(["git", "-C", repo, "checkout", "-q", "main"], check=True)
         return repo, sha
 
@@ -308,6 +314,9 @@ class ReviewGateRepositoryTest(_Base):
         subprocess.run(["git", "-C", repo, "commit", "-qam", "notes"], check=True)
         sha = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
                              check=True, capture_output=True, text=True).stdout.strip()
+        storage.of(self.db).provenance.add(
+            "commit:" + sha, sha, "dev1", "s-claude", "t", "claude",
+            work_item_id=self.lot["id"])
         registry.upsert(self.db, "orch", harness="claude", host=self.cfg.host,
                         cwd=repo)
         registry.upsert(self.db, "cx", harness="codex", host=self.cfg.host)
