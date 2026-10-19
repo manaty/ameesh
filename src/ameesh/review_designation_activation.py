@@ -148,6 +148,10 @@ class Inputs:
     candidates: list
     notify: str
     manual: list = field(default_factory=list)
+    #: the manual reviewers that prove an independent family (#2627)
+    manual_seats: list = field(default_factory=list)
+    #: the raw `-none` waiver of the lot (`work reviewer --no-verdict`)
+    waiver: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -214,6 +218,16 @@ def _policy(cfg, db, project: str, paths: Sequence[str]) -> Policy | Unavailable
             try:
                 loaded = mechanics.load(source.repo, commit, project)
                 need = loaded.reviews_for(paths)
+                # #2627 : le plancher critique de la porte de fusion
+                # (`merge_queue.required_verdicts`) fait partie du besoin. Un
+                # canon qui déclare un avis sur `exploitation.py` ou `db.py`
+                # n'abaisse pas les deux avis que la porte exigera au feu.
+                from . import merge_queue
+                classified = review.classify(loaded.review_policy, list(paths))
+                required = max(need.reviews, merge_queue.required_verdicts(classified))
+                # même classe que le lecteur compilé : le max des deux lectures
+                risk = max((need.risk, str(classified.get("class") or "light")),
+                           key=review.RANK.__getitem__)
             except (mechanics.MechanicsError, review.ReviewError,
                     canon_mod.CanonError) as exc:
                 errors.append("%s@%s: %s" % (source.repo, commit[:12],
@@ -226,7 +240,7 @@ def _policy(cfg, db, project: str, paths: Sequence[str]) -> Policy | Unavailable
                 errors.append("%s@%s: %s" % (source.repo, commit[:12], exc))
                 continue
             return Policy(rules=rules, families=tuple(loaded.families),
-                          risk=need.risk, required=need.reviews,
+                          risk=risk, required=required,
                           ref=str(getattr(loaded, "source", "") or
                                   "%s@%s" % (source.repo, commit)),
                           commit=commit, source=source.repo)
@@ -673,6 +687,69 @@ def _manual(db, item: Mapping) -> list:
     return [name for name in names if name not in automatic]
 
 
+def _waiver(item: Mapping) -> bool:
+    """The raw `-none` waiver of the lot, never overridden by a designation.
+
+    `work_reviewers.designated` filters `-none` out: the waiver is an authority
+    gesture (#1979), so it is read on the raw column here. A new freeze of
+    another head lapses it in storage before the hook (#2281); when it is still
+    there, no reviewer is added and no mail is sent (#2627).
+    """
+    from .storage.postgres.work import REVIEWER_NONE
+
+    item = item or {}
+    if str(item.get("reviewer") or "").strip() == REVIEWER_NONE:
+        return True
+    names = item.get("reviewers")
+    if names is None:
+        names = [item.get("reviewer")]
+    return any(str(name or "").strip() == REVIEWER_NONE for name in names or ())
+
+
+def _manual_seats(manual: Sequence[str], listing: Sequence[Mapping],
+                  authors: Sequence[Mapping], families) -> list:
+    """The manual reviewers that cover a required seat (#2627).
+
+    A manual reviewer is always kept in the column; this only says which ones
+    count: a known family of the compiled policy, distinct from every author's
+    family and from the other manual reviewers. An unknown family, or the
+    author's family, does not prove independence: the seat remains missing and
+    is designated automatically. The list is ordered like the column.
+    """
+    forbidden_names, forbidden_families = rd.families_of(authors)
+    rows = {str((row or {}).get("name") or ""): row for row in listing or ()}
+    covered = set(forbidden_families)
+    seats = []
+    for name in manual or ():
+        name = str(name or "").strip()
+        row = rows.get(name) or {}
+        family = rd.live_family(row, families=families)
+        if (not name or name in forbidden_names or not family
+                or family in covered):
+            continue
+        covered.add(family)
+        seats.append({"name": name, "family": family})
+    return seats
+
+
+def _manual_covers(inputs: Inputs) -> bool:
+    """Whether the manual reviewers alone prove every required opinion (#2627).
+
+    A manual reviewer of an unknown family does not count, and an unknown
+    author family or an unknown commit provenance means no independence can be
+    proven at all: the designation then goes through the normal waiting path
+    (and its capacity alert), never a manual no-op that would look sufficient.
+    """
+    if not inputs.manual:
+        return False
+    required = int(inputs.policy.required)
+    if required == 0:
+        return True
+    if len(inputs.manual_seats) < required or inputs.unknown_authors:
+        return False
+    return not rd.unknown_families(inputs.authors)
+
+
 # --------------------------------------------------------------------------
 # the inputs of one freeze
 # --------------------------------------------------------------------------
@@ -713,6 +790,8 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     if not project:
         return Unavailable("lot #%d declares no project: the review policy is unknown"
                            % int(lot))
+    manual = _manual(db, item)
+    waiver = _waiver(item)
     if not paths:
         # no changed file: no review is due, and no policy needs to be read
         return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=[],
@@ -720,15 +799,15 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                       policy=Policy(rules=(), families=(), risk="light", required=0,
                                     ref="", commit="", source=""),
                       authors=[], unknown_authors=[], candidates=[], notify="",
-                      manual=[])
+                      manual=manual, waiver=waiver)
     policy = _policy(cfg, db, project, paths)
     if isinstance(policy, Unavailable):
         return policy
     listing = registry.overview(db)
     notify = _notify(cfg, db, project, listing)
+    families = policy.families or rd.KNOWN_FAMILIES
     candidates = rd.candidates_from_registry(
-        listing, loads=_loads(db), project=project,
-        families=policy.families or rd.KNOWN_FAMILIES)
+        listing, loads=_loads(db), project=project, families=families)
     if notify:
         # the pilot receives the capacity alert; the review stays with the
         # project's agents, so the two roles never collapse into one mail
@@ -738,7 +817,8 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=paths,
                   commits=commits, policy=policy, authors=authors,
                   unknown_authors=unknown, candidates=candidates, notify=notify,
-                  manual=_manual(db, item))
+                  manual=manual, waiver=waiver,
+                  manual_seats=_manual_seats(manual, listing, authors, families))
 
 
 # --------------------------------------------------------------------------
@@ -1120,7 +1200,8 @@ def _selection(inputs: Inputs, port, *, force: bool = False) -> dict:
         authors=inputs.authors, candidates=inputs.candidates,
         risk=inputs.policy.risk, base=inputs.base, policy_ref=inputs.policy.ref,
         notify=inputs.notify, unknown_authors=inputs.unknown_authors,
-        families=inputs.policy.families or rd.KNOWN_FAMILIES)
+        families=inputs.policy.families or rd.KNOWN_FAMILIES,
+        already=inputs.manual_seats, required=inputs.policy.required)
 
 
 def carried_plan(cfg, db, lot: int, sha: str) -> Optional[dict]:
@@ -1217,6 +1298,32 @@ def _carried_in_transaction(tx, item: Mapping, freeze: Mapping,
     return out
 
 
+def _manual_outcome(db, item: Mapping, freeze: Mapping, manual: Sequence[str], *,
+                    waiver: bool = False) -> dict:
+    """The explicit manual no-op: keep the manual reviewers, add nobody (#2627).
+
+    The note says why no automatic reviewer was added. The column is synced
+    with an empty selection so a previous freeze's automatic names are retired
+    while the manual names survive (`_sync_reviewers` never removes a name that
+    no mark carries) and a `-none` waiver is never overridden.
+    """
+    lot = int((item or {}).get("id") or 0)
+    if waiver:
+        text = ("automatic reviewer designation skipped at freeze %s: manual"
+                " waiver (-none) is not overridden" % _freeze_label(freeze))
+        why = "manual waiver (-none)"
+    else:
+        text = ("automatic reviewer designation skipped at freeze %s: manual"
+                " reviewer(s) already cover the required review(s) (%s); the"
+                " manual designation remains the journaled exception"
+                % (_freeze_label(freeze), ", ".join(manual)))
+        why = "manual reviewer designation"
+    storage.of(db).work.note(lot, str((item or {}).get("state") or ""), text, SENDER)
+    _sync_reviewers(db, item, freeze, [])
+    return {"state": "manual", "reviewers": [], "freeze": dict(freeze or {}),
+            "why": why}
+
+
 def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
                              threads: list, carried: Optional[Mapping] = None) -> dict:
     """The `on_frozen` body: all writes stay in the freeze's transaction.
@@ -1226,10 +1333,14 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
     courrier). Il est calculé avant le gel par `carried_plan` — la transaction
     ne fait aucune lecture réseau — et absent pour tout gel non réaligné.
 
-    A manual reviewer already designated makes the automatic path an explicit
-    no-op (the manual exception is journaled by its own command). Every
-    expected data problem is journaled and notified, never raised: a freeze is
-    a fact of the lot's timeline and must not be lost to a designation input.
+    The manual reviewers already designated are **kept** (#2627). The automatic
+    path completes them: it counts the manual seats that prove an independent
+    family, then designates only the missing ones with the same selection and
+    the same mail. It stays an explicit, journaled no-op only when the manual
+    reviewers already cover the required reviews, or when a `-none` waiver is
+    in force. Every expected data problem is journaled and notified, never
+    raised: a freeze is a fact of the lot's timeline and must not be lost to a
+    designation input.
 
     The selection writes inside a **savepoint**: an exception while the mails,
     the mark or the reviewer column are being written rolls the attempt back
@@ -1244,23 +1355,20 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
     freeze.setdefault("id", 0)
     freeze.setdefault("sha", "")
     manual = _manual(tx, item)
-    if manual:
-        storage.of(tx).work.note(
-            int(lot), str(item.get("state") or ""),
-            "automatic reviewer designation skipped at freeze %s: manual"
-            " reviewer(s) already designated (%s); the manual designation"
-            " remains the journaled exception"
-            % (_freeze_label(freeze), ", ".join(manual)), SENDER)
-        return {"state": "manual", "reviewers": [], "freeze": freeze,
-                "why": "manual reviewer designation"}
+    if _waiver(item):
+        return _manual_outcome(tx, item, freeze, manual, waiver=True)
     if carried:
         return _carried_in_transaction(tx, item, freeze, carried)
     try:
         # no network read inside the freeze transaction (see the docstring)
         inputs = prepare(cfg, tx, int(lot), freeze=freeze, fetch=False)
     except Exception as exc:  # noqa: BLE001 - recorded below, never guessed
+        if manual:
+            return _manual_outcome(tx, item, freeze, manual)
         return _internal_failure(cfg, tx, item, freeze, threads, exc)
     if isinstance(inputs, Unavailable):
+        if manual:
+            return _manual_outcome(tx, item, freeze, manual)
         if not inputs.silent:
             notify = _notify(cfg, tx, str(item.get("app") or ""),
                              registry.overview(tx))
@@ -1268,6 +1376,8 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
             _sync_reviewers(tx, item, freeze, [])
         return {"state": "unavailable", "reviewers": [], "freeze": freeze,
                 "why": inputs.why}
+    if _manual_covers(inputs):
+        return _manual_outcome(tx, item, freeze, inputs.manual)
     checkpoint = len(threads)
     _savepoint(tx)
     try:
@@ -1375,9 +1485,9 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                   "at_ts": row.get("at_ts"), "actor": row.get("actor") or ""}
     freeze = dict(freeze)
     manual = _manual(db, item)
-    if manual:
+    if _waiver(item):
         return {"state": "manual", "reviewers": [], "freeze": freeze,
-                "why": "manual reviewer(s) designated: %s" % ", ".join(manual)}
+                "why": "manual waiver (-none)"}
     if not force:
         effective = _effective_mark(db, int(lot), int(freeze.get("id") or 0),
                                     since_ts=float(freeze.get("at_ts") or 0.0))
@@ -1400,6 +1510,10 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     try:
         inputs = prepare(cfg, db, int(lot), freeze=freeze)
         if isinstance(inputs, Unavailable):
+            if manual:
+                return {"state": "manual", "reviewers": [], "freeze": freeze,
+                        "why": "manual reviewer(s) designated: %s"
+                               % ", ".join(manual)}
             if not inputs.silent:
                 notify = _notify(cfg, db, str(item.get("app") or ""),
                                  registry.overview(db))
@@ -1411,6 +1525,10 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                 _drain(db, threads)
             return {"state": "unavailable", "reviewers": [], "freeze": freeze,
                     "why": inputs.why}
+        if _manual_covers(inputs):
+            return {"state": "manual", "reviewers": [], "freeze": freeze,
+                    "why": "manual reviewer(s) already cover the required review(s): %s"
+                           % ", ".join(inputs.manual)}
         if not inputs.paths or inputs.policy.required == 0:
             why = LIGHT_WHY if inputs.paths else NO_PATH_WHY
             with db.transaction() as tx:
