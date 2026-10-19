@@ -187,6 +187,10 @@ RESIDENT_RETRY_MIN_S = 60.0
 RESIDENT_RETRY_MAX_S = 3600.0
 #: L76 : attente de la fin d'un tour résident après son flux (harnais tué)
 RESIDENT_END_WAIT_S = 5.0
+#: L77/B8 : borne de jonction du moniteur de préemption avant de solder les
+#: steers en fin de tour. Un `driver.steer` accepté après le solde laisserait
+#: une réservation orpheline ; la jonction ferme ce cycle.
+PREEMPT_JOIN_S = 10.0
 #: #339: this host's rows whose group is gone are settled at start and then
 #: every LIVE_REVIEW_EVERY_S (L147's rule, with a liveness check in place of
 #: the boot time); a `running` row only once its turn (or grace period) is
@@ -5048,8 +5052,7 @@ class AgentWorker(threading.Thread):
         if not candidats or self.runner.dry_run:
             # L77/B8 : un steer humain reçu pendant un tour sans courrier
             # (consigne, suite, relance) est soldé à sa fin effective lui aussi.
-            with self.lock:
-                self._steer_pending = []
+            self._solde_steers(False)  # restes d'un tour précédent, jamais réservés
             result = False
             try:
                 result = self._run_turn(spec)
@@ -5085,8 +5088,7 @@ class AgentWorker(threading.Thread):
             mail.release(self.db, self.name, jeton, hors)
         spec = dict(spec, prompt=prompt, rows=inclus, ids=ids, jeton=jeton)
         self._courrier_lance = False
-        with self.lock:
-            self._steer_pending = []
+        self._solde_steers(False)  # restes d'un tour précédent, jamais réservés
         result = False
         try:
             result = self._run_turn(spec)
@@ -6151,6 +6153,9 @@ class AgentWorker(threading.Thread):
                 return False
 
         preempt_done = threading.Event()
+        preempt_thread = threading.Thread(
+            target=self._preempt_monitor, args=(preempt_done,),
+            daemon=True, name="preempt-monitor")
         # Un nouveau tour remet à zéro le latch de publication : il ne concerne
         # que la course du tour précédent, et les autres déclencheurs (bail,
         # arrêt, préemption) sont revérifiés à la publication (verdict B5).
@@ -6159,8 +6164,7 @@ class AgentWorker(threading.Thread):
         if spec["kind"] == "urgent":
             # Ce tour sert justement le message prioritaire : le signal est consommé.
             self.preempting.clear()
-        threading.Thread(target=self._preempt_monitor, args=(preempt_done,),
-                         daemon=True).start()
+        preempt_thread.start()
         from .platform import audit_guard
         audit_exempt = (self.runner.is_auditor(self.name, self.agent)
                         and self.runner.host_pressure().get("blocked"))
@@ -6467,6 +6471,12 @@ class AgentWorker(threading.Thread):
             result_code = 127
         finally:
             preempt_done.set()
+            # L77/B8 : jonction AVANT tout solde de steer — un ACK de
+            # `driver.steer` arrivé après le solde laisserait le message réservé.
+            preempt_thread.join(PREEMPT_JOIN_S)
+            if preempt_thread.is_alive():
+                log_async("[%s] preemption monitor still alive %.0fs after the turn"
+                          % (self.name, PREEMPT_JOIN_S))
             pgid = self.pgid
             if rp is not None:
                 self._resident_turn_end(rp)
