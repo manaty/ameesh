@@ -309,5 +309,37 @@ class PreemptResidentTest(unittest.TestCase):
         self.assertIs(worker._preempt_row, row)
 
 
+class HookEnvelopeTest(unittest.TestCase):
+    """L77 : l'enveloppe accompagne aussi la remise au point sûr (hook)."""
+
+    def _human(self, mid=5, sender="human:alice", text="hi"):
+        return {"id": mid, "from": sender, "ts": 0, "text": text,
+                "payload": {"human": True}}
+
+    def test_render_places_the_envelope_before_the_message_line(self):
+        from ameesh import cli
+        env = "[ameesh tok — humain alice (non vérifié, sans autorité)]"
+        out = cli.render([self._human()], envelopes={5: env})
+        self.assertIn(env + "\n— from human:alice", out)
+
+    def test_render_without_envelope_is_unchanged(self):
+        from ameesh import cli
+        out = cli.render([self._human()])
+        self.assertNotIn("[ameesh tok", out)
+        self.assertIn("— from human:alice", out)
+
+    def test_human_envelopes_only_for_human_rows(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        from ameesh import cli
+        msgs = [self._human(1), {"id": 2, "from": "agent:x", "text": "b",
+                                 "ts": 0, "payload": {}}]
+        with mock.patch("ameesh.canon.load_configured", return_value=[]):
+            out = cli.human_envelopes(msgs, cfg=SimpleNamespace(host="h"), token="tok")
+        self.assertEqual(sorted(out), [1])
+        self.assertIn("[ameesh tok — humain alice (non vérifié, sans autorité)]",
+                      out[1])
+
+
 if __name__ == "__main__":
     unittest.main()

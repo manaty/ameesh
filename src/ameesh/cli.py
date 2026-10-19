@@ -125,15 +125,43 @@ def verdicts_for(bk, msgs: list[dict]) -> dict:
     return out
 
 
-def render(msgs: list[dict], verdicts: dict | None = None) -> str:
+def human_envelopes(msgs: list[dict], *, cfg, token: str = "") -> dict[int, str]:
+    """L77 : l'enveloppe ameesh des messages humains remis par le hook.
+
+    Le hook remet au point sûr, pendant un tour : un message humain y porte la
+    même enveloppe que dans la consigne d'un tour (`render` l'affiche avant sa
+    ligne, comme le bloc de courrier). Fail closed pour l'identité.
+    """
+    from . import resident_queue
+
+    out: dict[int, str] = {}
+    for msg in msgs:
+        try:
+            mid = int(msg.get("id"))
+        except (TypeError, ValueError):
+            continue
+        sender = str(msg.get("from") or "")
+        if not (mail.is_human(msg) or sender.startswith("human:")):
+            continue
+        ident = resident_queue.identity_for(sender, cfg=cfg)
+        out[mid] = resident_queue.envelope(ident, token)
+    return out
+
+
+def render(msgs: list[dict], verdicts: dict | None = None,
+           envelopes: dict[int, str] | None = None) -> str:
     """Le texte injecté par les hooks. Sans signature, il est identique à la v0.
 
     Trois états distincts, parce qu'une signature d'agent n'est pas l'autorité
     du propriétaire : non signé (message d'agent, comme en v0), signé par un
     agent (authentique, sans autorité), signé par le propriétaire (autorité
     prouvée) — plus le cas signature invalide ou expirée, toujours signalé.
+
+    `envelopes` (L77) : l'enveloppe écrite par ameesh pour un message humain,
+    placée sur sa propre ligne AVANT la ligne du message — jamais issue du corps.
     """
     verdicts = verdicts or {}
+    envelopes = envelopes or {}
     prouves = sum(1 for msg in msgs
                   if (verdicts.get(msg.get("id")) or _NO_PROOF).authority)
     agents_signes = sum(1 for msg in msgs
@@ -179,6 +207,12 @@ def render(msgs: list[dict], verdicts: dict | None = None) -> str:
         # L125 : un message passif (copie, accusé, diffusion) le dit ; un
         # message ordinaire garde la ligne de la v0, traduite (L156c)
         passif = mail.passive_label(msg)
+        try:
+            env = envelopes.get(int(msg.get("id")))
+        except (TypeError, ValueError):
+            env = None
+        if env:
+            lines.append(env)
         lines.append("— from %s at %s%s: %s%s" % (
             msg.get("from", "?"), moment, " (%s)" % passif if passif else "",
             msg.get("text", ""), suffixe))
@@ -1278,6 +1312,8 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                 msgs = remise.prendre_mi_tour(limite)
             else:
                 msgs = remise.prendre(limite)
+            # L77 : l'enveloppe ameesh des messages humains remis au point sûr.
+            envelopes = human_envelopes(msgs, cfg=cfg, token=remise.jeton)
             avis = ""
             if etat is not None and borne and msgs and etat["remis"] + len(msgs) >= borne:
                 attente = _attente(bk, name, msgs)
@@ -1304,7 +1340,7 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                 # Écrire d'abord : si le harnais a fermé son entrée, on ne
                 # consomme pas les messages pour autant.
                 if not _emit({"decision": "block",
-                              "reason": render(msgs, verdicts_for(bk, msgs)) + avis}):
+                              "reason": render(msgs, verdicts_for(bk, msgs), envelopes) + avis}):
                     return 0
                 remise.solder()
                 if etat is not None:
@@ -1316,7 +1352,7 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             if not _emit({
                 "hookSpecificOutput": {
                     "hookEventName": event,
-                    "additionalContext": render(msgs, verdicts_for(bk, msgs)) + avis,
+                    "additionalContext": render(msgs, verdicts_for(bk, msgs), envelopes) + avis,
                 }
             }):
                 return 0

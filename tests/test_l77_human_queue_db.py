@@ -16,18 +16,23 @@ from ameesh.runner import AgentWorker, Runner
 from .support import PgTestCase
 
 
+def _make_worker(test, name, prompt=None):
+    cwd = os.path.join(test.tmp, "work", name)
+    os.makedirs(cwd, exist_ok=True)
+    kwargs = {"prompt": prompt} if prompt is not None else {}
+    test.register(name, "claude", cwd=cwd, **kwargs)
+    runner = Runner(dataclasses.replace(test.cfg), test.db, once=True)
+    lease = registry.claim(test.db, name, runner.runner_id, 3600)
+    test.assertIsNotNone(lease)
+    worker = AgentWorker(runner, registry.get(test.db, name), lease)
+    test.addCleanup(worker.watchdog_stop.set)
+    test.addCleanup(worker._close_peek)
+    return worker
+
+
 class HumanJournalTest(PgTestCase):
     def _worker(self, name="worker"):
-        cwd = os.path.join(self.tmp, "work", name)
-        os.makedirs(cwd, exist_ok=True)
-        self.register(name, "claude", cwd=cwd, prompt="tour")
-        runner = Runner(dataclasses.replace(self.cfg), self.db, once=True)
-        lease = registry.claim(self.db, name, runner.runner_id, 3600)
-        self.assertIsNotNone(lease)
-        worker = AgentWorker(runner, registry.get(self.db, name), lease)
-        self.addCleanup(worker.watchdog_stop.set)
-        self.addCleanup(worker._close_peek)
-        return worker
+        return _make_worker(self, name)
 
     def _spec(self, mid=11, sender="human:alice", body="hello"):
         return {"human": True,
@@ -65,3 +70,31 @@ class HumanJournalTest(PgTestCase):
         spec["human"] = False
         worker._journal_humans(spec, [11])
         self.assertEqual(self._human_entries(name), [])
+
+
+class PickHumanFirstTest(PgTestCase):
+    """L77 : `_pick` sert l'humain d'abord et ne le consomme pas.
+
+    At-least-once : la construction du spec ne réserve ni ne remet rien ;
+    seule la remise (lancement du harnais) solde la réservation.
+    """
+
+    def test_pick_serves_human_first_without_delivering(self):
+        from ameesh import mail
+        name = "worker-pick"
+        worker = _make_worker(self, name)
+        mail.send(self.db, "human:alice", name, "from a human",
+                  payload={"human": True})
+        mail.send(self.db, "agent:bob", name, "from an agent", payload={})
+        spec = worker._pick()
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec["kind"], "mail")
+        self.assertTrue(spec.get("human"))
+        self.assertEqual(len(spec["ids"]), 1)
+        row = mail.get(self.db, spec["ids"][0])
+        self.assertEqual(row["sender"], "human:alice")
+        self.assertIsNone(row.get("delivered_at"))
+        # Re-pick : la construction du spec n'a rien consommé.
+        again = worker._pick()
+        self.assertIsNotNone(again)
+        self.assertEqual(again["ids"], spec["ids"])
