@@ -290,7 +290,7 @@ class SelectionTest(unittest.TestCase):
     def test_a_manual_reviewer_covers_only_its_own_seat(self):
         # #2627 : un manuel claude couvre un des deux avis ; le manque est le
         # codex, mail et selection inchanges.
-        picked = rd.select(
+        picked = rd.select(families=FAMILIES,
             required=2,
             authors=[{"name": "impl-02", "family": "deepseek"}],
             candidates=candidates(row("claude-one", harness="claude", session="claude"),
@@ -303,7 +303,7 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(picked["missing"], 0)
 
     def test_a_manual_reviewer_of_the_author_family_covers_no_seat(self):
-        picked = rd.select(
+        picked = rd.select(families=FAMILIES,
             required=1,
             authors=[{"name": "impl-02", "family": "deepseek"}],
             candidates=candidates(row("codex-one", harness="codex", session="codex")),
@@ -313,7 +313,7 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(picked["manual"], [])
 
     def test_two_manual_reviewers_of_one_family_cover_one_seat(self):
-        picked = rd.select(
+        picked = rd.select(families=FAMILIES,
             required=2,
             authors=[{"name": "impl-02", "family": "deepseek"}],
             candidates=candidates(row("claude-one", harness="claude", session="claude"),
@@ -325,7 +325,7 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual([r["name"] for r in picked["manual"]], ["manual-a"])
 
     def test_manual_reviewers_covering_the_need_designate_nobody(self):
-        picked = rd.select(
+        picked = rd.select(families=FAMILIES,
             required=2,
             authors=[{"name": "impl-02", "family": "deepseek"}],
             candidates=(),
