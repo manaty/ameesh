@@ -449,6 +449,18 @@ class BranchMergeTest(_Base):
         self.assertTrue(any("branch agent/dev1-a" in n for n in notes), notes)
         self.assertEqual(self.sync()["results"], [])          # lot livré : plus examiné
 
+    def test_2744_un_lot_blocked_n_est_pas_ferme_par_le_releve_des_branches(self):
+        """#2744 : la garde vaut aussi pour le relevé automatique des branches."""
+        self.branch("agent/dev1-bloque", "b1")
+        lot = self.lot("agent/dev1-bloque")
+        for state in ("build", "qa", "blocked"):
+            work.move(self.db, lot["id"], state)
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "merge agent/dev1-bloque",
+             "agent/dev1-bloque")
+        report = self.sync()
+        self.assertEqual(report["results"][0]["result"], "withheld")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "blocked")
+
     def test_branche_sans_travail_n_est_pas_une_fusion(self):
         self.branch("agent/dev1-vide")
         lot = self.lot("agent/dev1-vide")
