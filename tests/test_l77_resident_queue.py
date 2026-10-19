@@ -275,6 +275,9 @@ class PreemptResidentTest(unittest.TestCase):
         worker.agent = {}
         worker._preempt_row = None
         worker.preempting = threading.Event()
+        worker._preempt_seq = 0
+        worker._steer_pending = []
+        worker.wake = threading.Event()
         worker.cfg = SimpleNamespace(host="h")
         worker.db = object()
         worker.runner = SimpleNamespace(session_token_for=lambda *a: "tok",
@@ -381,8 +384,8 @@ class PreemptResidentTest(unittest.TestCase):
         worker.preempting = threading.Event()
         worker.preempting.set()
 
-    def test_steer_accepted_reserves_delivers_and_clears(self):
-        """B8 : la remise steer est réservée, soldée, et le latch retombe."""
+    def test_steer_accepted_reserves_and_holds_until_end(self):
+        """B8 : le steer réserve, ne solde pas, et retombe le latch."""
         from unittest import mock
         driver = _FakeDriver()
         worker = self._worker(driver)
@@ -390,14 +393,60 @@ class PreemptResidentTest(unittest.TestCase):
         worker._preempt_row = self._row()
         with mock.patch("ameesh.runner.mail.reserve",
                         return_value=[{"id": 3}]) as reserve, \
-                mock.patch("ameesh.runner.mail.deliver",
-                           return_value=[3]) as deliver, \
-                mock.patch("ameesh.runner.mail.release") as release:
-            self.assertTrue(worker._preempt_resident())
+                mock.patch("ameesh.runner.mail.deliver") as deliver, \
+                mock.patch("ameesh.runner.mail.release"):
+            self.assertEqual(worker._preempt_resident(), "steered")
         reserve.assert_called_once()
-        deliver.assert_called_once()
-        release.assert_not_called()
+        deliver.assert_not_called()          # soldé seulement à la fin du tour
         self.assertFalse(worker.preempting.is_set())
+        self.assertEqual(len(worker._steer_pending), 1)
+        with mock.patch("ameesh.runner.mail.deliver",
+                        return_value=[3]) as deliver:
+            worker._solde_steers(True)
+        deliver.assert_called_once()
+        self.assertEqual(worker._steer_pending, [])
+
+    def test_steer_released_when_the_turn_dies(self):
+        """B8 : une fin non effective libère la remise steer (reprise)."""
+        from unittest import mock
+        driver = _FakeDriver()
+        worker = self._worker(driver)
+        self._preempting(worker)
+        worker._preempt_row = self._row()
+        with mock.patch("ameesh.runner.mail.reserve",
+                        return_value=[{"id": 3}]), \
+                mock.patch("ameesh.runner.mail.deliver"), \
+                mock.patch("ameesh.runner.mail.release"):
+            self.assertEqual(worker._preempt_resident(), "steered")
+        with mock.patch("ameesh.runner.mail.release") as release:
+            worker._solde_steers(False)
+        release.assert_called_once()
+
+    def test_second_request_during_steer_is_kept(self):
+        """B10 : une demande arrivée pendant le steer n'est pas effacée."""
+        from unittest import mock
+        driver = _FakeDriver()
+        worker = self._worker(driver)
+        self._preempting(worker)
+        worker._preempt_row = self._row()
+        second = dict(self._row(), id=4)
+        real_steer = driver.steer
+        calls = []
+
+        def steer(text, input_id=None):
+            calls.append(text)
+            if len(calls) == 1:
+                worker.request_preempt(second)
+            return real_steer(text, input_id)
+
+        driver.steer = steer
+        with mock.patch("ameesh.runner.mail.reserve",
+                        return_value=[{"id": 3}]), \
+                mock.patch("ameesh.runner.mail.deliver"), \
+                mock.patch("ameesh.runner.mail.release"):
+            self.assertEqual(worker._preempt_resident(), "steered")
+        self.assertTrue(worker.preempting.is_set())   # la 2e demande reste vivante
+        self.assertIs(worker._preempt_row, second)
 
     def test_steer_refused_releases_then_interrupts(self):
         """B8 : un steer refusé libère la réservation puis interrompt."""
@@ -615,6 +664,13 @@ class StopAtPublicationTest(unittest.TestCase):
         with mock.patch.object(worker, "stop_group_now") as stop:
             self.assertTrue(worker.kill_if_stop_requested())
         stop.assert_called_once()
+
+
+def tearDownModule():
+    # L77 : les préemptions journalisent (`log_async`) ; fermer le fil borné
+    # avant la finalisation évite l'abort CPython sur le verrou stdout.
+    from ameesh import runner
+    runner._journal.close(2.0)
 
 
 if __name__ == "__main__":

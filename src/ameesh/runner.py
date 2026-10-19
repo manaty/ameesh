@@ -537,6 +537,11 @@ class AgentWorker(threading.Thread):
         self.watchdog_stop = threading.Event()
         #: message prioritaire : préempte le tour en cours (0018, R19)
         self.preempting = threading.Event()
+        #: L77/B10 : génération des demandes de préemption, pour ne pas effacer
+        #: un signal arrivé pendant le traitement du précédent.
+        self._preempt_seq = 0
+        #: L77/B8 : remises steer réservées, soldées à la fin effective du tour.
+        self._steer_pending: list[tuple[str, list[int]]] = []
         self._refus_vus: set[int] = set()
         #: arrêt demandé avant la publication du Popen (point de passage unique)
         self.stop_requested = threading.Event()
@@ -1399,50 +1404,57 @@ class AgentWorker(threading.Thread):
         interrompu sans tuer le process. Le message non remis est servi au tour
         suivant, sur la même session.
         """
-        self._preempt_row = row
-        self.preempting.set()
+        with self.lock:
+            self._preempt_row = row
+            self._preempt_seq += 1
+            self.preempting.set()
         self.wake.set()
 
-    def _preempt_resident(self) -> bool:
+    def _preempt_resident(self) -> str:
         """L77 : préempte un tour résident sans tuer le process.
 
-        Rang 1 humain : `steer` au point sûr, avec réservation de la remise et
-        solde immédiat si le pilote accepte (le hook et le `pick` suivants ne
-        la rejouent pas). Rang 3 agent/système : `interrupt()` seulement,
-        jamais `steer` (étude §2). Rend False quand aucun résident ne porte le
-        tour : le chemin 0018 « un tour par événement » reste alors inchangé.
+        Rang 1 humain : `steer` au point sûr, la remise restant réservée jusqu'à
+        la fin effective du tour (B8) ; rang 3 agent/système : `interrupt()`
+        seulement, jamais `steer` (étude §2). Rend "" quand aucun résident ne
+        porte le tour (chemin 0018 « un tour par événement »), sinon
+        "steered", "interrupted" ou "deferred" — le moniteur continue après un
+        steer et s'arrête après une interruption.
         """
         with self.lock:
             rp = self.resident
         if rp is None or not getattr(rp, "alive", False) \
                 or getattr(rp, "closing", False):
-            return False
+            return ""
         driver = getattr(rp, "driver", None)
         if driver is None:
             # Un résident vivant sans pilote reste vivant : le message attend
             # le tour suivant, jamais un `stop_group_now` de préemption (B5).
             log_async("[%s] preemption: resident alive without driver; message "
                       "kept for the next turn" % self.name)
-            return True
+            return "deferred"
         if not getattr(driver, "busy", False):
             # Course avant `send`/après la fin du tour : le résident est vivant,
             # le message reste en file ; on ne le tue pas pour préempter.
             log_async("[%s] preemption: resident alive between turns; message "
                       "kept for the next turn" % self.name)
-            return True
-        row = getattr(self, "_preempt_row", None)
-        self._preempt_row = None
+            return "deferred"
+        with self.lock:
+            row = self._preempt_row
+            seq = self._preempt_seq
+            self._preempt_row = None
         if row is not None and self._from_human(row):
             if self._steer_human(row, driver):
-                # Le steer a remis le message : le tour continue, le message
-                # n'est plus à redélivrer et le latch de préemption retombe.
-                self.preempting.clear()
-                return True
+                # B10 : ne retombe le latch que si aucune nouvelle demande n'est
+                # arrivée pendant le steer ; sinon le moniteur doit la servir.
+                with self.lock:
+                    if self._preempt_seq == seq:
+                        self.preempting.clear()
+                return "steered"
         try:
             if driver.interrupt():
                 log_async("[%s] resident turn interrupted (preemption)"
                           % self.name)
-                return True
+                return "interrupted"
         except Exception as exc:
             log_async("[%s] resident interrupt failed (%s)"
                       % (self.name, " ".join(str(exc).split())[:120]))
@@ -1450,15 +1462,15 @@ class AgentWorker(threading.Thread):
         # résident vivant est conservé (le tuer pour préempter est exclu).
         log_async("[%s] resident preemption deferred: message kept for the next "
                   "turn" % self.name)
-        return True
+        return "deferred"
 
     def _steer_human(self, row: dict, driver) -> bool:
-        """L77/B8 : remet un message humain au point sûr, réservé puis soldé.
+        """L77/B8 : réserve un message humain et le remet au point sûr.
 
-        Réserve AVANT le steer (id du message, porteur consigne) : une remise
-        acceptée est soldée tout de suite, donc le hook et le `pick` suivants ne
-        la rejouent pas ; un refus libère la réservation et laisse le chemin
-        d'interruption décider. Rend True seulement si le steer est accepté.
+        La réservation n'est **pas** soldée ici : le message est tenu jusqu'à
+        la fin effective du tour (`_solde_steers`), pour qu'une mort du harnais
+        ou une interruption le rende à la reprise au lieu de le perdre. La
+        réservation active le retire aussi du hook mid-tour (ACTIVE_SQL).
         """
         try:
             ident = int(row.get("id"))
@@ -1478,14 +1490,8 @@ class AgentWorker(threading.Thread):
         try:
             texte = self._urgent_steer_text(row)
             if texte and driver.steer(texte) is not None:
-                try:
-                    livres = mail.deliver(self.db, self.name, self.runner.runner_id,
-                                          self.epoch, jeton, [ident])
-                except db_mod.DbError as exc:
-                    livres = []
-                    log_async("[%s] steered message not settled (%s)"
-                              % (self.name, exc))
-                self._remise_incertaine([ident], livres)
+                with self.lock:
+                    self._steer_pending.append((jeton, [ident]))
                 log_async("[%s] priority message steered into the resident turn"
                           % self.name)
                 return True
@@ -1498,6 +1504,33 @@ class AgentWorker(threading.Thread):
             log_async("[%s] steer reservation not released (%s)"
                       % (self.name, exc))
         return False
+
+    def _solde_steers(self, result: bool) -> None:
+        """L77/B8 : solde les remises steer sur la fin effective du tour.
+
+        Tour achevé (`result` vrai) : la remise est soldée et tracée. Mort ou
+        échec avant la fin : la réservation est libérée, le message sera
+        re-servi (au moins une fois). La liste est vidée dans tous les cas.
+        """
+        with self.lock:
+            pending = self._steer_pending
+            self._steer_pending = []
+        for jeton, ids in pending:
+            if result:
+                try:
+                    livres = mail.deliver(self.db, self.name, self.runner.runner_id,
+                                          self.epoch, jeton, ids)
+                except db_mod.DbError as exc:
+                    livres = []
+                    log_async("[%s] steered message not settled (%s)"
+                              % (self.name, exc))
+                self._remise_incertaine(ids, livres)
+            else:
+                try:
+                    mail.release(self.db, self.name, jeton, ids)
+                except db_mod.DbError as exc:
+                    log_async("[%s] steer reservation not released (%s)"
+                              % (self.name, exc))
 
     def _urgent_steer_text(self, row: dict) -> str:
         """Le texte remis au point sûr : l'enveloppe ameesh, puis le corps
@@ -1520,12 +1553,12 @@ class AgentWorker(threading.Thread):
         """
         while not done.wait(0.1):
             if self.preempting.is_set():
-                if self._preempt_resident():
-                    # Un steer accepté a remis le message et retombé le latch :
-                    # le moniteur continue de veiller sur les urgents suivants
-                    # et sur `restart`. Une interruption, elle, termine le tour.
-                    if not self.preempting.is_set():
-                        continue
+                status = self._preempt_resident()
+                if status == "steered":
+                    # Un steer accepté n'arrête pas le tour : le moniteur
+                    # continue de veiller sur les urgents suivants et `restart`.
+                    continue
+                if status:
                     return
                 self.stop_group_now("preemption", grace=1.0)
                 return
@@ -5043,6 +5076,8 @@ class AgentWorker(threading.Thread):
             mail.release(self.db, self.name, jeton, hors)
         spec = dict(spec, prompt=prompt, rows=inclus, ids=ids, jeton=jeton)
         self._courrier_lance = False
+        with self.lock:
+            self._steer_pending = []
         result = False
         try:
             result = self._run_turn(spec)
@@ -5063,6 +5098,7 @@ class AgentWorker(threading.Thread):
                     # re-livré, signalé (aucune perte).
                     log("[%s] could not cancel the reservation (%s)"
                         % (self.name, exc))
+            self._solde_steers(result)
 
     def _livre_courrier(self, spec: dict) -> None:
         """Le harnais est lancé avec la consigne : la réservation est soldée.
