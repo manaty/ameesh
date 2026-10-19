@@ -388,9 +388,13 @@ diagnosis separates four facts:
   pilot's installation was 1.11.7 and only had the manual `work reviewer`. The
   unavailable mail now names the required version and keeps the manual path
   usable on every installation. The runner also replays the unavailable freezes
-  after a successful canon sync (`retry_pending`, bounded to 20 lots, same
-  frozen head; a waiting mark is retried, a designated/light outcome is skipped),
-  so the recovery command is optional.
+  after a successful canon sync (`retry_pending`, bounded to 20 lots per pass,
+  same frozen head; a waiting mark is retried, a designated/light outcome is
+  skipped). The pass resumes after a cursor in the host state directory and
+  wraps at the end of the queue: a resolved lot is skipped without spending an
+  attempt and the 200-note scan window is walked over successive passes, so a
+  backlog larger than one pass cannot starve the older freezes. The recovery
+  command is therefore optional.
 
 A remaining limit, not on the light path: the `pre-commit`/`post-commit`
 provenance hooks are installed at session open in the session's `cwd` repository

@@ -87,6 +87,11 @@ MAX_COMMITS = 500
 RETRY_SCAN = 200
 #: and retries at most this many lots
 RETRY_LIMIT = 20
+#: the retry queue's cursor, under the host state directory (#2561): the last
+#: unavailable note examined. A pass resumes after it and wraps at the end, so
+#: the same recent lots cannot take every pass's slots and starve the older
+#: ones (a resolved lot is skipped, not counted against the pass's budget).
+RETRY_CURSOR = "review-designation-retry.cursor"
 #: a missing frozen head is fetched from the lot's origin at most this often
 FETCH_TRIES = 2
 #: and each fetch is bounded (network is not allowed to hold the freeze)
@@ -1513,6 +1518,60 @@ def _retry_resolved(db, lot: int, freeze: Mapping) -> bool:
     return str((effective[2] or {}).get("state") or "") in (rd.DESIGNATED, rd.NONE)
 
 
+def _retry_cursor_path(cfg) -> str:
+    """The retry cursor file, under the host state directory (never a repo)."""
+    state = str(getattr(cfg, "state_dir", "") or "").strip()
+    return os.path.join(state, RETRY_CURSOR) if state else ""
+
+
+def _read_retry_cursor(cfg) -> int:
+    """The last unavailable note examined, or 0 when absent/unreadable."""
+    path = _retry_cursor_path(cfg)
+    if not path:
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            value = int(str(handle.read(64)).strip() or 0)
+    except (OSError, ValueError):
+        return 0
+    return max(0, value)
+
+
+def _write_retry_cursor(cfg, cursor: int) -> None:
+    """Atomically records the cursor; a state problem never fails the retry."""
+    path = _retry_cursor_path(cfg)
+    if not path:
+        return
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write("%d\n" % max(0, int(cursor)))
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _retry_notes(db, after: int, *, scan: int = RETRY_SCAN) -> list:
+    """The unavailable notes after `after`, oldest first (a bounded window).
+
+    Ordering oldest first is what gives the cursor a direction: a pass resumes
+    after the last examined note and pages forward, wrapping once. The window
+    is bounded, so a large backlog is walked over several passes instead of
+    reading the whole journal at once."""
+    return db.query(
+        "SELECT e.id, e.work_item_id, e.note FROM work_item_events e"
+        " JOIN work_items w ON w.id = e.work_item_id"
+        " WHERE e.note LIKE %s"
+        "   AND e.created_at >= now() - interval '30 days'"
+        "   AND w.state NOT IN ('merged', 'promoted', 'closed')"
+        "   AND e.id > %s"
+        " ORDER BY e.id ASC LIMIT %s",
+        (UNAVAILABLE_PREFIX + "%", int(after), int(scan)))
+
+
 def retry_pending(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
     """Retries the latest freeze of lots whose designation was journaled unavailable.
 
@@ -1523,56 +1582,88 @@ def retry_pending(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
     the caller (the runner after a successful canon sync) only logs the summary.
     A waiting mark is retried (capacity may be back); a designated or light
     outcome is skipped.
+
+    The pass is a **fair slice** of the queue, not the newest 20 notes again:
+    `RETRY_CURSOR` keeps the last note examined, the pass resumes after it and
+    wraps at the end. A resolved lot (manual, `none`, carried or designated) is
+    skipped without consuming an attempt, and a note that no longer matches the
+    lot's latest freeze is skipped too; neither can hold a slot forever. A
+    blocked or unavailable lot itself does not vanish: it is seen again on the
+    next turn of the cursor. A new freeze's note is a new id, so the cursor
+    reaches it on its next turn; the link to the freeze is re-read on every
+    pass, never stored in the cursor.
     """
     out = {"attempted": 0, "designated": 0, "waiting": 0, "none": 0,
            "unavailable": 0, "manual": 0, "stale": 0, "skipped": 0,
            "errors": [], "summary": ""}
     try:
-        rows = db.query(
-            "SELECT e.work_item_id, e.note FROM work_item_events e"
-            " JOIN work_items w ON w.id = e.work_item_id"
-            " WHERE e.note LIKE %s"
-            "   AND e.created_at >= now() - interval '30 days'"
-            "   AND w.state NOT IN ('merged', 'promoted', 'closed')"
-            " ORDER BY e.id DESC LIMIT %s",
-            (UNAVAILABLE_PREFIX + "%", RETRY_SCAN))
+        limit = max(0, int(limit))
+    except (TypeError, ValueError):
+        limit = RETRY_LIMIT
+    cursor = _read_retry_cursor(cfg)
+    try:
+        rows = _retry_notes(db, cursor)
+        if not rows and cursor:
+            # end of the queue: start the next turn at the oldest note
+            cursor = 0
+            rows = _retry_notes(db, 0)
     except Exception as exc:  # noqa: BLE001 - a retry never breaks the caller
         out["errors"].append("%s: %s" % (type(exc).__name__, str(exc)[:200]))
         out["summary"] = "no retry: journal unreadable"
         return out
     seen: set[int] = set()
+    last = cursor
+    attempted = 0
     for row in rows or ():
         try:
             lot = int(row.get("work_item_id") or 0)
+            note_id = int(row.get("id") or 0)
         except (TypeError, ValueError):
             continue
         match = _RETRY_NOTE.match(str(row.get("note") or ""))
         if not match or int(match.group(1)) != lot or lot in seen:
+            last = max(last, note_id)
             continue
         freeze_id = int(match.group(2))
         latest = _latest_freeze(db, lot)
         if latest is None or int(latest.get("id") or 0) != freeze_id:
             out["skipped"] += 1
+            last = max(last, note_id)
             continue
         seen.add(lot)
-        if len(seen) > int(limit):
-            break
         try:
-            if _retry_resolved(db, lot, latest):
-                out["skipped"] += 1
-                continue
+            resolved = _retry_resolved(db, lot, latest)
+        except Exception as exc:  # noqa: BLE001 - one lot never stops the pass
+            out["errors"].append("#%d: %s: %s"
+                                 % (lot, type(exc).__name__, str(exc)[:160]))
+            last = max(last, note_id)
+            continue
+        if resolved:
+            out["skipped"] += 1
+            last = max(last, note_id)
+            continue
+        if attempted >= limit:
+            # budget spent: this note stays for the next turn of the cursor
+            break
+        attempted += 1
+        out["attempted"] = attempted
+        last = max(last, note_id)
+        try:
             result = designate(cfg, db, lot, freeze=latest)
         except Exception as exc:  # noqa: BLE001 - one lot never stops the pass
             out["errors"].append("#%d: %s: %s"
                                  % (lot, type(exc).__name__, str(exc)[:160]))
             continue
         state = str((result or {}).get("state") or "")
-        out["attempted"] += 1
         if state in out:
             out[state] += 1
+    # Always move past what this pass examined, even when no lot was attempted:
+    # the next pass must not re-read the same resolved/stale notes.
+    if last > cursor or cursor == 0:
+        _write_retry_cursor(cfg, last)
     out["summary"] = ("%d attempted: %d designated, %d waiting, %d none,"
                       " %d unavailable, %d manual, %d stale, %d skipped"
-                      % (out["attempted"], out["designated"], out["waiting"],
+                      % (attempted, out["designated"], out["waiting"],
                          out["none"], out["unavailable"], out["manual"],
                          out["stale"], out["skipped"]))
     return out

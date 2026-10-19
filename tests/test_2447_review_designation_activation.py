@@ -673,6 +673,82 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertEqual(again["attempted"], 0, again)
         self.assertEqual(len(self.mailbox()), before)
 
+    # -- retry queue fairness (cx1 B1/P2 of #2561) -------------------------
+
+    def _retry_candidate(self, index: int, *, reviewer: str = "") -> int:
+        """An open lot with one frozen milestone and one unavailable note."""
+        item = work.add(self.db, title="retry %d" % index, app="ameesh",
+                        assignee="author")
+        lot = int(item["id"])
+        self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s", (lot,))
+        if reviewer:
+            # a manual reviewer is a final outcome: _retry_resolved skips it
+            self.db.execute(
+                "UPDATE work_items SET reviewers = ARRAY[%s] WHERE id = %s",
+                (reviewer, lot))
+        row = self.db.query(
+            "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor)"
+            " VALUES (%s, 'frozen', %s, 'author') RETURNING id",
+            (lot, ("%040x" % lot)))[0]
+        note = "%s%d:%d: retry witness" % (act.UNAVAILABLE_PREFIX, lot,
+                                           int(row["id"]))
+        self.db.execute(
+            "INSERT INTO work_item_events (work_item_id, state, note, actor)"
+            " VALUES (%s, 'qa', %s, 'ameesh')", (lot, note))
+        return lot
+
+    @staticmethod
+    def _waiting_designation(calls: list):
+        def fake(cfg, db, lot, *, freeze=None):
+            calls.append(int(lot))
+            return {"state": "waiting", "reviewers": [], "freeze": freeze,
+                    "why": "no capacity"}
+        return fake
+
+    def test_a_resolved_lot_does_not_consume_the_retry_budget(self):
+        # 21 unavailable freezes, the 20 oldest resolved but still in qa.
+        # Counting them in `seen` before `_retry_resolved` spent the whole
+        # budget on them and the 21st was never retried (cx1 B1/P2).
+        resolved = [self._retry_candidate(i, reviewer="r1")
+                    for i in range(1, 21)]
+        pending = self._retry_candidate(21)
+        self.assertEqual(len(resolved), 20)
+        calls: list = []
+        with mock.patch.object(act, "designate",
+                               side_effect=self._waiting_designation(calls)):
+            report = act.retry_pending(self.cfg, self.db, limit=20)
+        self.assertEqual(calls, [pending], (calls, report))
+        self.assertEqual(report["attempted"], 1, report)
+        self.assertEqual(report["skipped"], 20, report)
+
+    def test_a_starved_lot_is_reached_on_the_next_turn_of_the_cursor(self):
+        # 21 unresolved freezes, 20 retried per pass: the 21st must not wait
+        # forever behind the same 20 notes.
+        lots = [self._retry_candidate(i) for i in range(1, 22)]
+        calls: list = []
+        with mock.patch.object(act, "designate",
+                               side_effect=self._waiting_designation(calls)):
+            first = act.retry_pending(self.cfg, self.db, limit=20)
+            second = act.retry_pending(self.cfg, self.db, limit=20)
+        self.assertEqual(calls[:20], lots[:20], (calls, first))
+        self.assertEqual(calls[20:], [lots[20]], (calls, second))
+        self.assertEqual(first["attempted"], 20, first)
+        self.assertEqual(second["attempted"], 1, second)
+
+    def test_the_retry_walks_past_the_scan_window(self):
+        # RETRY_SCAN + 1 notes: only the oldest is unresolved, the 200 newer
+        # ones are resolved. The old DESC scan read the 200 newest and never
+        # reached the oldest; the cursor scan starts there.
+        first = self._retry_candidate(1)
+        for index in range(2, act.RETRY_SCAN + 2):
+            self._retry_candidate(index, reviewer="r1")
+        calls: list = []
+        with mock.patch.object(act, "designate",
+                               side_effect=self._waiting_designation(calls)):
+            report = act.retry_pending(self.cfg, self.db, limit=20)
+        self.assertEqual(calls, [first], (calls, report))
+        self.assertEqual(report["attempted"], 1, report)
+
     def test_the_runner_retries_after_a_successful_canon_sync(self):
         # The runner's periodic pass calls the bounded retry; a failure there
         # never fails the canon sync.
