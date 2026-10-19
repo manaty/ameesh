@@ -449,6 +449,33 @@ class ShadowPassageTest(PgTestCase):
         self.assertEqual([row["tail"] for row in opened], ["paquet-97-nexlink"])
         self.assertEqual(opened[0]["stamp"], "20261018-1045")
 
+    def test_numbered_packet_merged_after_cutoff_is_a_carrier(self):
+        state = self.state_with_members(11, 22)
+        self.numbered_packet([22], name="paquet-96-nexlink",
+                             branch_at=self.now - 900, merge_at=self.now + 120)
+        self.numbered_packet([11], branch_at=self.now + 180,
+                             merge_at=self.now + 240)
+        comparisons = self.shadow.compare(state, types.SimpleNamespace(
+            zone=lambda: ZoneInfo("Europe/Paris")))
+        comparison = next(row for row in comparisons
+                          if row["packet"]["tail"] == "paquet-97-nexlink")
+        self.assertEqual(comparison["extra"], [])
+        self.assertEqual(comparison["carried"],
+                         {"22": "integration/paquet-96-nexlink"})
+
+    def test_numbered_open_packet_enriched_after_cutoff_uses_prior_manifest(self):
+        state = self.state_with_members(11, 22, 33)
+        branch = self.numbered_packet([22], name="paquet-96-nexlink",
+                                      merge=False, branch_at=self.now - 900)
+        self.enrich_packet(branch, [22, 33], at=self.now + 120)
+        self.numbered_packet([11], branch_at=self.now + 180,
+                             merge_at=self.now + 240)
+        comparison = self.shadow.compare(state, types.SimpleNamespace(
+            zone=lambda: ZoneInfo("Europe/Paris")))[0]
+        self.assertEqual(comparison["extra"], [33])
+        self.assertEqual(comparison["carried"],
+                         {"22": "integration/paquet-96-nexlink"})
+
     def test_shadow_plan_is_read_only_and_compares_equal_to_the_composer(self):
         result, deadline = self.shadow.scheduled_step(self.db, self.now)
         self.assertEqual(result["result"], "shadow-plan", result)

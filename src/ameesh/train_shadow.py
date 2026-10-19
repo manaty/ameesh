@@ -493,7 +493,10 @@ def _in_flight(clone, plan, packets, open_packets, compared):
     stamp = plan["local_stamp"]
     cutoff = plan["cutoff"]
     for packet in packets:
-        if packet["sha"] == compared["sha"] or packet["stamp"] > stamp:
+        # A derived stamp dates the merge/head, not the composition cutoff.
+        # Only a stamp carried by the branch name can exclude this carrier.
+        if packet["sha"] == compared["sha"] or (
+                _STAMP.search(packet["tail"]) and packet["stamp"] > stamp):
             continue
         if packet["created_ts"] <= cutoff:
             continue  # already merged at the cutoff: the shadow saw it on target
@@ -504,7 +507,7 @@ def _in_flight(clone, plan, packets, open_packets, compared):
         for lot in lots:
             carried.setdefault(lot, packet["branch"])
     for packet in open_packets:
-        if packet["stamp"] > stamp:
+        if _STAMP.search(packet["tail"]) and packet["stamp"] > stamp:
             continue
         commit, written = _first_parent_before(clone, packet["sha"], cutoff)
         if commit is None:
