@@ -20,7 +20,7 @@
   agent-mesh work list [--state S] | work show <id> | work move <id> <state> | work note <id> "…"
   agent-mesh work assign <id> <agent> [--externe] [--actor A]   reassign (guarded assignment)
   agent-mesh work merged <id> --sha S [--note …]   merge done outside a PR: any open state → merged
-  agent-mesh work migration <id> [--number N | --release] [--skip-branch B]   reserve the work item's migration number (L122)
+  agent-mesh work migration <id> [--number N] [--release [--number N]] [--skip-branch B]   reserve one of the work item's migration numbers (L122, #2481)
   agent-mesh work issue-ref <id> owner/repo#N | --none   correct the issue reference, journaled (#1603)
   agent-mesh work resolve <id> --with <other> [--done | --abort]   prepared conflict resolution (L160d)
   agent-mesh work queue add|remove <id> | show [--target T]   merge queue per target (L160e)
@@ -1904,13 +1904,22 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                                           skip_branches=tuple(args.skip_branch or ()))
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
-            elif item.get("migration") is None:
+            elif not item.get("migration"):
                 print("lot #%d: no migration reserved" % item["id"])
-            else:
+            elif len(item.get("migrations") or ()) <= 1:
                 print("lot #%d: migration %s reserved in %s — file %s" % (
                     item["id"], item["migration_label"], item["migration_repo"],
                     item.get("migration_file") or "<migrations>/%s_<name>.sql"
                     % item["migration_label"]))
+            else:
+                rows = item["migrations"]
+                print("lot #%d: migrations %s reserved in %s" % (
+                    item["id"], ", ".join(row["label"] for row in rows),
+                    ", ".join(sorted({row["repo"] for row in rows}))))
+                for row in rows:
+                    print("  %s — file %s" % (
+                        row["label"], row.get("file")
+                        or "<migrations>/%s_<name>.sql" % row["label"]))
             return 0
         if args.work_command == "move":
             item = work.move(db, args.id, args.state, note=args.note or "", actor=args.actor,
@@ -2136,6 +2145,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                       % ", ".join(r.get("name") for r in outcome.get("reviewers") or ()))
             elif state == "unavailable":
                 print("review designation unavailable: %s" % (outcome.get("why") or ""))
+            elif state == "none":
+                # #2561: a light lot has no pre-merge reviewer; say why instead
+                # of printing nothing and letting "no reviewer" look like a failure
+                print("review: none — %s" % (outcome.get("why") or ""))
             if args.kind == "frozen":
                 # #2644 : le résultat de prévalidation s'attache au gel, après
                 # le jalon et la désignation. Il ne défait jamais le gel : le
@@ -3024,9 +3037,11 @@ def build_parser() -> argparse.ArgumentParser:
     pw_mig.add_argument("id", type=int)
     pw_mig.add_argument("--number", type=int, default=None,
                         help="reserve this exact number (refused if it already exists in the "
-                             "lot's repository or is reserved by another work item)")
+                             "lot's repository or is reserved by another work item); added to "
+                             "the lot's other reservations (#2481)")
     pw_mig.add_argument("--release", action="store_true",
-                        help="release the reservation (the work item no longer adds a migration)")
+                        help="release all the lot's reservations, or only --number when given "
+                             "(the work item no longer adds those migrations)")
     pw_mig.add_argument("--repo", default=None,
                         help="local clone of the lot's repository (that of its issue), whose "
                              "worktree and branches count (default: the clone declared in "
