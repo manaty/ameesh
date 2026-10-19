@@ -116,7 +116,7 @@ class DependanceNonFusionneeTest(_Prise):
         juge = self.lot("amont juge", assignee="human:proprio")
         self.db.execute("UPDATE work_items SET state = 'qa', branch = 'lot/juge'"
                         " WHERE id = %s", (juge["id"],))
-        self.juge(juge["id"], sha="")           # ok qui ne nomme aucune tête (B2)
+        self.juge(juge["id"])                   # ok sur un lot jamais gelé (B2)
         bloque = self.amont("blocked", branch="lot/bloque")
         empile = self.bloque(sans, title="empile trois qa", priority=3)
         for amont in (juge, bloque):

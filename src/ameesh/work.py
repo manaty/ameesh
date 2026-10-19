@@ -97,10 +97,6 @@ WAITING = {"blocked", "waiting_human"}
 CORRECTIONS = {("promoted", "merged"), ("merged", "build")}
 #: rôles d'une fiche Agent du canon admis à corriger un état (avec les humains)
 CORRECTOR_ROLES = ("orchestrateur", "orchestrator", "conception", "design")
-#: §4 canon (owner 14/10/2026) : au plus 2 lots en développement (`build`) par
-#: agent ; les lots en surplus retournent à la file d'équipe. Règle générique,
-#: pour tous les projets et tous les agents.
-BUILD_LIMIT = 2
 #: §4 : marqueur d'une exception pilote EXPLICITE à la limite d'en-cours,
 #: portée par la note de la dernière attribution du lot (jamais une exemption
 #: silencieuse de qui a assigné le lot).
@@ -1644,6 +1640,19 @@ def queue_warning(db: Db, item: dict, agent: str) -> str:
                 "it has no team: it waits for the orchestrator (%s)" % later))
 
 
+def build_limit(cfg) -> int:
+    """§4 canon : le plafond de lots en développement (`build`) par agent.
+
+    Lu au canon compilé (`build.max_in_build`, #2451), jamais une constante
+    locale ; les lots en surplus retournent à la file d'équipe. Règle
+    générique du document global, pour tous les projets et tous les agents.
+    Sans document lisible, `mechanics.MechanicsError` : l'appelant refuse
+    d'agir plutôt que de supposer un plafond.
+    """
+    from . import mechanics
+    return mechanics.configured(cfg).max_in_build
+
+
 def return_to_queue(db: Db, item_id: int, *, actor: str = "", cfg=None,
                     reason: str = "") -> dict:
     """§4 : rend un lot à la file d'équipe — l'assignation est retirée (CAS sur
@@ -1670,8 +1679,8 @@ def return_to_queue(db: Db, item_id: int, *, actor: str = "", cfg=None,
     if who != current and not who.startswith(HUMAN_PREFIX) and not is_pilot(cfg, db, who):
         raise WorkError("return refused: %s is neither the assignee (%s), a human, nor "
                         "an orchestrator/design agent" % (who or "nobody", current))
-    note = "%s by %s (§4: at most %d lots in build per agent)" % (
-        RETURN_NOTE, who or UNKNOWN_ACTOR, BUILD_LIMIT)
+    note = "%s by %s (§4: lots in build per agent, capped by the canon)" % (
+        RETURN_NOTE, who or UNKNOWN_ACTOR)
     if reason.strip():
         note += ": %s" % " ".join(str(reason).split())
     row = storage.of(db).work.unassign(item_id, current=current, note=note,
@@ -2010,13 +2019,14 @@ def _resume_review_after_merge(db, item_id, *, sha: str = "", pr_ref=None,
 def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source: str = "",
                  pr_ref: str | None = None, frozen_id: int | None = None,
                  declared: bool = False, extra: str = "", repo: str | None = None,
-                 landed: tuple[int, str] | None = None, unfrozen: bool = False) -> dict:
+                 landed: tuple[int, str] | None = None, unfrozen: bool = False,
+                 content_guard=None) -> dict:
     """Fusion constatée : le lot passe `merged` et son jalon `merged` est posé.
 
     Idempotent : un lot déjà fusionné reste tel quel (`already`). Jamais de
     réouverture silencieuse : un lot fermé (abandonné, remplacé) n'est pas
     touché, le constat est rendu (`refused`) pour être dit à l'appelant. Rend
-    `{id, result: merged|already|refused|refrozen, detail, item}`.
+    `{id, result: merged|already|refused|refrozen|withheld, detail, item}`.
 
     `frozen_id` (preuve par le contenu) : le jalon `frozen` examiné ; si ce
     n'est plus le dernier gel du lot au moment d'écrire, rien n'est fermé
@@ -2026,6 +2036,13 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
 
     `landed` (#1567) : `(numéro, dépôt)` du numéro réellement atterri, écrit
     dans la transaction de la fusion ; l'appelant l'a validé et réservé.
+
+    `content_guard` (#2744) : callable `(storage, row) -> retention | None`,
+    appelé **sous le verrou de ligne du lot**, juste avant la fermeture ; une
+    retenue rend `withheld` sans rien écrire. Le verrou est aussi pris par les
+    notes `hold:`/`unhold:` (`work.note` le prend avant `note`) et par les
+    transitions d'état : une retenue ne peut plus se glisser entre la lecture
+    du journal et la fermeture.
 
     La note du journal et du jalon dit comment la fusion est connue :
     « fusion constatée par <source> », ou « fusion déclarée par … »
@@ -2071,7 +2088,7 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             # fusionné avant l'activation n'est pas relu rétroactivement.
             review = _resume_review_after_merge(db, item_id, sha=sha, pr_ref=pr_ref, repo=repo)
             detail = "already %s" % state
-            if not review.get("id"):
+            if not review.get("id") and not review.get("already_reviewed"):
                 detail += " — relecture non ouverte : %s" % (review.get("why") or "?")
             return {"id": int(item_id), "result": "already", "item": item,
                     "detail": detail, "review_lot": review}
@@ -2088,6 +2105,19 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             from . import work_dependencies
             with db.transaction() as tx:
                 work_dependencies.lock(tx)
+                if content_guard is not None and not storage.is_remote(db):
+                    locked = storage.of(tx).work.lock(item_id)
+                    if locked is not None:
+                        retention = content_guard(storage.of(tx), locked)
+                        if retention is not None:
+                            if retention.get("what") == "unreadable":
+                                return {"id": int(item_id), "result": "error",
+                                        "item": locked, "retention": retention,
+                                        "detail": retention.get("motif")}
+                            return {"id": int(item_id), "result": "withheld",
+                                    "item": locked, "retention": retention,
+                                    "detail": "content merged, closure withheld: %s"
+                                              % retention.get("motif")}
                 row = storage.of(tx).work.close_merged(
                     item_id, current=state, sha=sha, actor=actor, note=note, pr_ref=pr_ref,
                     frozen_id=frozen_id, landed=landed, unfrozen=unfrozen)
@@ -2112,7 +2142,7 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             # dans le constat (`review_lot`), pour être repris (`review_lot.catch_up`).
             review = _review_after_merge(db, item_id, sha=sha, pr_ref=pr_ref, repo=repo)
             detail = "%s → merged" % state
-            if not review.get("id"):
+            if not review.get("id") and not review.get("already_reviewed"):
                 detail += " — relecture non ouverte : %s" % (review.get("why") or "?")
             return {"id": int(item_id), "result": "merged", "item": row,
                     "detail": detail, "review_lot": review}
@@ -2989,7 +3019,21 @@ def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False
                                            float(wake_ts))
     else:
         options = {"once": True} if once else {}
-        storage.of(db).work.note(item_id, item["state"], text, actor, **options)
+        from . import planned_waits
+        # #2744 : une retenue (hold/levée) prend le verrou de ligne avant son
+        # écriture, commun avec la fermeture par contenu (work.close_merged).
+        # Jamais sur une connexion médiée : `note` y est une opération du
+        # contrat, sans ce verrou (la fermeture par contenu est serveur).
+        if (planned_waits.is_hold_note(text) or planned_waits.is_lift_note(text)) \
+                and not storage.is_remote(db):
+            with db.transaction() as tx:
+                locked = storage.of(tx).work.lock(item_id)
+                if locked is None:
+                    raise WorkError("lot %s not found" % item_id)
+                storage.of(tx).work.note(item_id, locked["state"], text, actor,
+                                         **options)
+        else:
+            storage.of(db).work.note(item_id, item["state"], text, actor, **options)
     return True
 
 
@@ -3036,6 +3080,15 @@ MILESTONE_KINDS = ("requested", "frozen", "verdict", "fire", "unfire", "merged",
 MANUAL_KINDS = ("frozen", "verdict", "fire", "unfire")
 VERDICTS = ("ok", "blocked")
 
+#: #2674 : un verdict ne compte à la porte (`merge_queue.review_gate`) que
+#: s'il nomme la tête relue — un commit complet (40 ou 64 hexadécimaux), ou
+#: une abréviation d'au moins 12 caractères **résolue** dans un dépôt (ou,
+#: sans dépôt, dans la tête gelée courante). Un avis sans tête ne pouvait
+#: jamais compter et laissait le lot des heures en « verdicts-missing ».
+REVIEWED_HEAD_MIN = 12
+_FULL_HEAD = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+_REVIEWED_HEAD = re.compile(r"[0-9a-f]{%d,64}" % REVIEWED_HEAD_MIN)
+
 #: les jalons affichés, du plus récent au plus ancien : (nom, colonne d'instant,
 #: colonne de durée) — l'ordre est celui de la frise lue à l'envers. `delivered`
 #: (#988) est la fin d'un lot livré hors cible : il remplace la fusion.
@@ -3069,6 +3122,119 @@ def _in_transaction(db: Db) -> bool:
     return int(getattr(db, "_tx_depth", 0) or 0) > 0
 
 
+def _frozen_head(db: Db, item_id: int) -> str:
+    """Le SHA du dernier gel du lot, en minuscules ("" s'il n'est pas gelé)."""
+    from . import plan_git
+    freeze = plan_git.latest_freeze(milestones(db, item_id))
+    return str((freeze or {}).get("sha") or "").strip().lower()
+
+
+def _head_repos(db: Db, item: dict) -> list[str]:
+    """Les dépôts où résoudre l'abréviation d'un verdict, sans réseau.
+
+    Le répertoire courant est celui où `ameesh` est lancé (le plus souvent
+    l'arbre du relecteur) ; le dépôt du projet vient du radar ; le dossier de
+    travail de l'assigné, du registre. Aucun n'est autoritaire (seul `--repo`
+    l'est) : une abréviation résolue dans l'un suffit, et l'absence de dépôt
+    est dite par le refus."""
+    candidates: list = [os.getcwd()]
+    try:
+        from . import lot_class
+        candidates.append(lot_class.repository(getattr(db, "cfg", None), item))
+    except Exception:  # noqa: BLE001 - réglages illisibles : pas de dépôt
+        pass
+    try:
+        from . import fire
+        candidates.append(fire._repo_of(db, item))
+    except Exception:  # noqa: BLE001 - registre illisible : pas de dépôt
+        pass
+    seen: list[str] = []
+    for path in candidates:
+        path = str(path or "").strip()
+        if path and path not in seen and os.path.isdir(path):
+            seen.append(path)
+    return seen
+
+
+def _proposed_head(db: Db, item: dict, frozen: str, repo: str | None = None) -> str:
+    """La tête gelée proposée dans un refus, en abréviation valide (12+).
+
+    Un gel ancien peut porter moins de 12 caractères : on le complète dans un
+    dépôt quand l'un le connaît, sinon la proposition est vide (le refus dit
+    alors de geler de nouveau avec la tête complète)."""
+    head = frozen
+    if head and len(head) < REVIEWED_HEAD_MIN:
+        from . import freeze_checks
+        for where in ([repo] if repo else []) + _head_repos(db, item):
+            head = freeze_checks.commit_in(where, head) or head
+            if len(head) >= REVIEWED_HEAD_MIN:
+                break
+    return head[:12] if len(head) >= REVIEWED_HEAD_MIN else ""
+
+
+def _head_refusal(db: Db, item: dict, why: str, *, repo: str | None = None) -> WorkError:
+    """Le refus nommé d'un verdict sans tête, avec la tête gelée proposée."""
+    frozen = _frozen_head(db, item["id"])
+    proposed = _proposed_head(db, item, frozen, repo)
+    if proposed:
+        hint = ("the current frozen head is %s: pass it with `--sha %s`"
+                % (proposed, proposed))
+    elif frozen:
+        hint = ("the current frozen head %s is too short to name a commit: freeze "
+                "again with the full head" % frozen)
+    else:
+        hint = ("lot #%d has no frozen head yet: freeze it first "
+                "(`ameesh work milestone %d frozen --sha <commit>`)"
+                % (item["id"], item["id"]))
+    return WorkError("%s; %s" % (why, hint))
+
+
+def reviewed_head(db: Db, item: dict, sha: str, *, repo: str | None = None) -> str:
+    """Le `sha` d'un verdict, vérifié et normalisé (#2674).
+
+    Un avis ne compte à la porte (`merge_queue.review_gate`) que s'il nomme la
+    tête relue : un commit complet (40 ou 64 hexadécimaux), ou une abréviation
+    d'au moins [`REVIEWED_HEAD_MIN`] caractères **résolue** — dans `repo`
+    (nommé par `--repo`, alors autoritaire), sinon dans le répertoire courant,
+    le dépôt du projet ou celui de l'assigné, ou encore dans la tête gelée
+    courante. Un `sha` vide, trop court, non hexadécimal ou non résolu est
+    refusé avec la tête gelée proposée : le jalon n'est pas écrit, plutôt
+    qu'un avis qui ne pourrait jamais franchir la porte."""
+    text = str(sha or "").strip().lower()
+    if not text:
+        raise _head_refusal(
+            db, item,
+            "verdict refused (head-missing): a verdict must name the reviewed head — "
+            "the full commit id, or an abbreviation of at least %d hex characters "
+            "resolved in a repository (`--sha`)" % REVIEWED_HEAD_MIN)
+    if not _REVIEWED_HEAD.fullmatch(text):
+        raise _head_refusal(
+            db, item,
+            "verdict refused (head-missing): --sha %r is not a commit id: give the full "
+            "head, or an abbreviation of at least %d hex characters (`--sha`)"
+            % (sha, REVIEWED_HEAD_MIN), repo=repo)
+    if _FULL_HEAD.fullmatch(text):
+        return text
+    from . import freeze_checks
+    if repo:
+        if freeze_checks.commit_in(repo, text):
+            return text
+        raise _head_refusal(
+            db, item,
+            "verdict refused (head-unresolved): %s does not name a commit of %s"
+            % (text, repo), repo=repo)
+    for where in _head_repos(db, item):
+        if freeze_checks.commit_in(where, text):
+            return text
+    frozen = _frozen_head(db, item["id"])
+    if frozen and frozen.startswith(text):
+        return text
+    raise _head_refusal(
+        db, item,
+        "verdict refused (head-unresolved): %s does not resolve to a commit here and "
+        "does not name the current frozen head" % text, repo=repo)
+
+
 def milestone(
     db: Db,
     item_id: int,
@@ -3081,6 +3247,7 @@ def milestone(
     on_frozen=None,
     after_commit: list | None = None,
     outcome: dict | None = None,
+    repo: str | None = None,
 ) -> dict:
     """Déclare un jalon que la machine à états ne peut pas déduire.
 
@@ -3090,6 +3257,13 @@ def milestone(
     et `delivered` sont écrits automatiquement (transitions, fermeture et
     livraison hors cible : 0013, 0026, #988), les déclarer à la main serait un
     mensonge sur la frise.
+
+    `verdict` (#2674) exige une tête relue : le `sha` est vérifié par
+    [`reviewed_head`] avant toute écriture — complet, ou abréviation de 12
+    caractères au moins résolue dans un dépôt. Sans elle, le jalon est refusé
+    avec la tête gelée courante proposée ; un avis qui ne peut pas compter à
+    la porte n'est plus accepté en silence. `repo` (facultatif) est le dépôt
+    nommé par `--repo`, où une abréviation doit alors se résoudre.
 
     `on_frozen` (facultatif, #1617) : le callback du gel, appelé dans la
     transaction du jalon `frozen` avec `(tx, milestone, after_commit)`. Il
@@ -3131,8 +3305,12 @@ def milestone(
         raise WorkError("a verdict only makes sense for the `verdict` milestone")
     if on_frozen is not None and kind != "frozen":
         raise WorkError("a freeze callback only makes sense for the `frozen` milestone")
-    if get(db, item_id) is None:
+    item = get(db, item_id)
+    if item is None:
         raise WorkError("lot %s not found" % item_id)
+    if kind == "verdict":
+        # #2674 : refuser à l'écriture un avis qui ne nomme pas la tête relue.
+        sha = reviewed_head(db, item, sha, repo=repo)
     drain: list | None = None
     if kind == "frozen" and on_frozen is None:
         from . import review_designation_activation as activation

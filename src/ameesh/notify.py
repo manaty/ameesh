@@ -223,7 +223,9 @@ TYPE_LABELS = {
     "orphan_resource": "orphan resource",
     "tmpfs_full": "tmpfs almost full",
     "worktree_kept": "worktree kept at end of lot",
-    "tmp_orphan": "/tmp entry left by a turn",
+    # #2618 : le libellé dit l'apparition, pas l'imputation : le ménage ne
+    # supprime jamais une entrée qu'il n'a pas attribuée (#222, #234).
+    "tmp_orphan": "/tmp entry that appeared during a turn",
     "tmp_unowned": "temporary directory without owner file (kept)",
     "tmp_unremovable": "temporary directory over quota with files it cannot remove",
     "tmp_unscanned": "temporary directory too large to scan; nothing evicted",
@@ -1837,11 +1839,12 @@ class Notifier:
                 self.log("[%s] mail to agents not prepared (%s)" % (kind, exc))
                 continue
             if kind == "slo_breach" and "bureau" in (alert.get("targets") or ()) \
-                    and alert.get("project") != "home" and any(
+                    and any(
                         row.get("name") == "bureau" and row.get("mode") == "externe"
                         for row in listing):
                 # Keep the desk's copy in the readable lot thread, without
-                # growing a mailbox nobody wakes to read.
+                # growing a mailbox nobody wakes to read. No `home` project
+                # exception (#2640): canon lots are `app=ameesh` (#2511).
                 briefs["thread:bureau"] = alert_briefs._slo_breach(alert)
             if not briefs:
                 continue        # personne à prévenir : on réessaie au passage suivant
@@ -1905,7 +1908,11 @@ class Notifier:
                 if delivered:
                     sent[key] = {"type": kind, "sent_ts": now,
                                  "lot": alert.get("lot"), "lot_state": alert.get("lot_state"),
-                                 "agent": alert.get("agent"), "reminded": True,
+                                 # #2640: a human-assigned lot carries its holder in
+                                 # `responsible`, not `agent`; the ledger must keep the
+                                 # actual assignee or an absent pass resends.
+                                 "agent": alert.get("agent") or alert.get("responsible"),
+                                 "reminded": True,
                                  "to": sorted(set((entry or {}).get("to") or ()) | set(delivered))}
             elif entry is None:
                 sent[key] = {"type": kind, "sent_ts": now, "reminded": False,

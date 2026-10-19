@@ -14,6 +14,9 @@ import unittest
 
 from ameesh import review_designation as rd
 
+#: #2451 : familles explicites ; l'activation passe celles du canon compilé
+FAMILIES = ("claude", "codex", "deepseek")
+
 SHA_A = "a" * 40
 SHA_B = "b" * 40
 SHA_C = "c" * 40
@@ -34,7 +37,7 @@ def row(name, *, team="ameesh", harness="deepseek", session="", status="idle",
 
 
 def candidates(*rows, project="ameesh", loads=None):
-    return rd.candidates_from_registry(rows, project=project, loads=loads)
+    return rd.candidates_from_registry(rows, families=FAMILIES, project=project, loads=loads)
 
 
 class FakePort:
@@ -183,7 +186,7 @@ class SelectionTest(unittest.TestCase):
     """Familles réelles, indépendance, disponibilité, charge, attente."""
 
     def test_two_reviews_go_to_two_distinct_families_outside_the_author(self):
-        picked = rd.select(
+        picked = rd.select(families=FAMILIES,
             required=2,
             authors=[{"name": "mty-amh-impl-02", "family": "deepseek"}],
             candidates=candidates(
@@ -194,6 +197,7 @@ class SelectionTest(unittest.TestCase):
             ))
         self.assertEqual(picked["state"], rd.DESIGNATED)
         self.assertEqual([r["family"] for r in picked["reviewers"]], ["claude", "codex"])
+        self.assertEqual(picked["families"], ["claude", "codex"])
         self.assertNotIn("deepseek", {r["family"] for r in picked["reviewers"]})
 
     def test_corrector_become_author_is_never_designated(self):
@@ -206,19 +210,21 @@ class SelectionTest(unittest.TestCase):
             row("codex-one", harness="codex", session="codex"),
             row("deepseek-one", harness="deepseek", session="deepseek"),
         )
-        one = rd.select(required=1, authors=authors, candidates=pool)
+        one = rd.select(families=FAMILIES, required=1, authors=authors, candidates=pool)
         self.assertEqual(one["state"], rd.DESIGNATED)
         self.assertEqual([r["name"] for r in one["reviewers"]], ["codex-one"])
+        self.assertEqual(one["families"], ["codex"])
         # Deux avis hors claude et hors deepseek : la seule famille restante ne suffit pas.
-        two = rd.select(required=2, authors=authors, candidates=pool)
+        two = rd.select(families=FAMILIES, required=2, authors=authors, candidates=pool)
         self.assertEqual(two["state"], rd.WAITING)
         self.assertEqual(two["missing"], 1)
         self.assertEqual(two["reviewers"], [])
+        self.assertEqual(two["families"], ["codex"])
 
     def test_author_with_unknown_family_waits_instead_of_guessing(self):
         # codex-two est peut-être de la famille réelle de l'auteur : on attend.
         for family in ("", "unknown"):
-            picked = rd.select(
+            picked = rd.select(families=FAMILIES,
                 required=1,
                 authors=[{"name": "codex-one", "family": family}],
                 candidates=candidates(row("codex-one", harness="codex", session="codex"),
@@ -238,7 +244,7 @@ class SelectionTest(unittest.TestCase):
             row("deepseek-ok", harness="deepseek", session="deepseek", status="idle"),
             loads={"claude-stopped": 0, "codex-paused": 0, "claude-busy": 3,
                    "deepseek-ok": 0})
-        picked = rd.select(required=1,
+        picked = rd.select(families=FAMILIES, required=1,
                            authors=[{"name": "impl-02", "family": "deepseek"}],
                            candidates=pool)
         self.assertEqual([r["name"] for r in picked["reviewers"]], ["claude-busy"])
@@ -249,11 +255,11 @@ class SelectionTest(unittest.TestCase):
             row("claude-light", harness="claude", session="claude"),
             row("codex-light", harness="codex", session="codex"),
             loads={"claude-heavy": 7, "claude-light": 1, "codex-light": 1})
-        picked = rd.select(required=1,
+        picked = rd.select(families=FAMILIES, required=1,
                            authors=[{"name": "impl-02", "family": "deepseek"}],
                            candidates=pool)
         self.assertEqual([r["name"] for r in picked["reviewers"]], ["claude-light"])
-        two = rd.select(required=2,
+        two = rd.select(families=FAMILIES, required=2,
                         authors=[{"name": "impl-02", "family": "deepseek"}],
                         candidates=pool)
         self.assertEqual([r["name"] for r in two["reviewers"]], ["claude-light", "codex-light"])
@@ -266,7 +272,7 @@ class SelectionTest(unittest.TestCase):
             row("claude-bis", harness="other", session=""),
             row("veille", harness="deepseek", session="", status="running", team="ameesh"),
         )
-        picked = rd.select(required=1,
+        picked = rd.select(families=FAMILIES, required=1,
                            authors=[{"name": "impl-02", "family": "deepseek"}],
                            candidates=pool)
         # `codex3` tourne sous claude (L242b) : sa famille est claude, pas son nom.
@@ -274,20 +280,21 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(picked["reviewers"][0]["family"], "claude")
 
     def test_waiting_is_explicit(self):
-        picked = rd.select(
+        picked = rd.select(families=FAMILIES,
             required=2,
             authors=[{"name": "impl-02", "family": "deepseek"}],
             candidates=candidates(row("claude-one", harness="claude", session="claude"),
                                   row("claude-two", harness="claude", session="claude")))
         self.assertEqual(picked["state"], rd.WAITING)
         self.assertEqual(picked["missing"], 1)
+        self.assertEqual(picked["families"], ["claude"])
         self.assertIn("claude", picked["why"])
         self.assertIn("deepseek", picked["why"])
 
     def test_a_manual_reviewer_covers_only_its_own_seat(self):
         # #2627 : un manuel claude couvre un des deux avis ; le manque est le
         # codex, mail et selection inchanges.
-        picked = rd.select(
+        picked = rd.select(families=FAMILIES,
             required=2,
             authors=[{"name": "impl-02", "family": "deepseek"}],
             candidates=candidates(row("claude-one", harness="claude", session="claude"),
@@ -300,7 +307,7 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(picked["missing"], 0)
 
     def test_a_manual_reviewer_of_the_author_family_covers_no_seat(self):
-        picked = rd.select(
+        picked = rd.select(families=FAMILIES,
             required=1,
             authors=[{"name": "impl-02", "family": "deepseek"}],
             candidates=candidates(row("codex-one", harness="codex", session="codex")),
@@ -310,7 +317,7 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(picked["manual"], [])
 
     def test_two_manual_reviewers_of_one_family_cover_one_seat(self):
-        picked = rd.select(
+        picked = rd.select(families=FAMILIES,
             required=2,
             authors=[{"name": "impl-02", "family": "deepseek"}],
             candidates=candidates(row("claude-one", harness="claude", session="claude"),
@@ -322,7 +329,7 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual([r["name"] for r in picked["manual"]], ["manual-a"])
 
     def test_manual_reviewers_covering_the_need_designate_nobody(self):
-        picked = rd.select(
+        picked = rd.select(families=FAMILIES,
             required=2,
             authors=[{"name": "impl-02", "family": "deepseek"}],
             candidates=(),
@@ -336,7 +343,7 @@ class SelectionTest(unittest.TestCase):
     def test_required_must_be_zero_one_or_two(self):
         for value in (3, -1, True, "1"):
             with self.subTest(value=value), self.assertRaises(rd.DesignationError):
-                rd.select(required=value, authors=[], candidates=[])
+                rd.select(families=FAMILIES, required=value, authors=[], candidates=[])
 
     def test_project_restricts_to_the_team(self):
         rows = [row("am-1", team="ameesh", harness="claude", session="claude"),
@@ -364,7 +371,7 @@ class NexlinkPolicyTest(unittest.TestCase):
                 row("nx-codex", team="nexlink", harness="codex", session="codex"),
                 row("am-claude", team="ameesh", harness="claude", session="claude")]
         pool = candidates(*rows, project="nexlink")
-        picked = rd.select(required=2,
+        picked = rd.select(families=FAMILIES, required=2,
                            authors=[{"name": "nx-codex", "family": "codex"}],
                            candidates=pool)
         self.assertEqual({r["family"] for r in picked["reviewers"]},
@@ -387,11 +394,51 @@ class MessageTest(unittest.TestCase):
         self.assertIn("ameesh work milestone 1617 verdict ok|blocked --sha " + SHA_A, text)
         self.assertIn("git diff %s..%s" % (SHA_B[:12], SHA_A[:12]), text)
         self.assertIn("canon@deadbeef", text)
-        self.assertIn("you then become the author", text)
+        self.assertIn("you become the author of your fix", text)
         # #1534 N6 : le courrier de désignation couvre la règle home#81 entière
         self.assertIn("~50 lines", text)
         self.assertIn("second family", text)
         self.assertIn("ameesh provenance show", text)
+
+    def test_reviewer_message_refuses_a_fix_that_leaves_too_few_families(self):
+        # #2670, cas #2664 : deux avis requis, deux familles éligibles ; une
+        # correction qui fait du relecteur un auteur laisserait une seule
+        # famille et rendrait la porte insatisfaisable.
+        text = rd.reviewer_message(
+            LOT, freeze={"id": 42, "sha": SHA_A}, required=2, rank=2,
+            reviewer={"name": "rev-codex", "family": "codex"},
+            authors=[{"name": "mty-amh-impl-02", "family": "deepseek"}],
+            eligible_families=2)
+        self.assertIn("do not push a correction that makes you an author", text)
+        self.assertIn("1 independent family", text)
+        self.assertIn("2 required opinion", text)
+        self.assertIn("#2670", text)
+
+    def test_reviewer_message_allows_a_fix_with_a_spare_family(self):
+        # Trois familles pour deux avis : la correction laisse deux familles.
+        text = rd.reviewer_message(
+            LOT, freeze={"id": 42, "sha": SHA_A}, required=2, rank=2,
+            reviewer={"name": "rev-codex", "family": "codex"},
+            authors=[{"name": "mty-amh-impl-02", "family": "deepseek"}],
+            eligible_families=3)
+        self.assertIn("is allowed", text)
+        self.assertIn("2 independent families", text)
+        self.assertIn("#2670", text)
+
+    def test_reviewer_message_states_the_rule_without_a_count(self):
+        # Appel direct sans le compte : la règle est dite, jamais devinée.
+        text = rd.reviewer_message(
+            LOT, freeze={"id": 42, "sha": SHA_A}, required=2, rank=2,
+            reviewer={"name": "rev-codex", "family": "codex"},
+            authors=[{"name": "mty-amh-impl-02", "family": "deepseek"}])
+        self.assertIn("fewer independent families than required opinions", text)
+        self.assertIn("#2670", text)
+
+    def test_manual_reviewer_message_carries_the_family_rule(self):
+        text = rd.manual_reviewer_message({"id": 7, "title": "t"})
+        self.assertIn("fewer independent families", text)
+        self.assertIn("#2670", text)
+        self.assertIn("#2638", text)
 
     def test_capacity_message_refuses_implicit_admission(self):
         text = rd.capacity_message(LOT, freeze={"id": 42, "sha": SHA_A}, required=2,
@@ -419,7 +466,7 @@ class ApplyTest(unittest.TestCase):
             # l'appelant collecte ses entrées sur le dernier gel qu'il voit
             latest = self.port.latest_freeze(LOT["id"]) or {}
             args["freeze_sha"] = latest.get("sha") or SHA_A
-        return rd.apply(LOT, **args)
+        return rd.apply(LOT, **dict({"families": FAMILIES}, **args))
 
     def test_an_abbreviated_freeze_is_the_same_head(self):
         # #1775 N1 : un jalon frozen peut porter un SHA abrégé alors que le
@@ -444,6 +491,10 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual({m["to"] for m in out["messages"]}, {"claude-one", "codex-one"})
         for _to, body in self.port.messages:
             self.assertIn(SHA_A, body)
+            # #2670 : deux familles pour deux avis, une correction qui fait du
+            # relecteur un auteur laisserait la porte insatisfaisable.
+            self.assertIn("do not push a correction that makes you an author", body)
+            self.assertIn("1 independent family", body)
         self.assertEqual(len(self.port.commits), 1)
 
     def test_the_required_override_reads_the_critical_floor(self):
