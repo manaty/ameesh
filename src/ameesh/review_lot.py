@@ -69,6 +69,15 @@ source, une marque structurée (`requirement_mark`) que `work.close --delivered`
 relit (`guard_delivery`) : la clôture est refusée tant que les avis dus ne sont
 pas rendus sur le sha fusionné. Le nombre d'avis n'est donc plus seulement
 écrit dans le corps.
+
+#2585 : un lot léger peut déjà porter l'avis d'une autre famille sur la tête
+qui entre, rendu avant la fusion (gel relu, revue désignée). Ouvrir une seconde
+mission `REVUE #N` demanderait une relecture déjà faite. Quand assez d'avis
+`ok` d'une famille **connue et autre que celle de l'auteur** couvrent la tête
+fusionnée (le sha fusionné, ou le dernier gel que la fusion a fait entrer),
+l'ouverture est close sans création. Un avis bloquant, une famille inconnue,
+un sha différent ou une famille non prouvée ne dispensent de rien : la
+relecture reste due, et le doute n'ouvre jamais une dispense (§8).
 """
 from __future__ import annotations
 
@@ -78,7 +87,7 @@ import re
 from datetime import datetime
 from typing import Optional
 
-from . import lot_class, storage, work
+from . import lot_class, plan_git, storage, work
 
 #: la référence qui identifie le lot de relecture d'un lot fusionné
 PREFIX = "review-after-merge:"
@@ -91,7 +100,8 @@ ATTEMPT_PREFIX = "review-after-merge:attempt:#"
 ATTEMPT_RETRY_S = 3600
 #: le marqueur de journal d'un candidat **terminal** : un lot non-light
 #: confirmé (le canon §2 ne demande une relecture après fusion que pour un lot
-#: léger) ou un doute épuisé après `CATCH_UP_MAX_ATTEMPTS` tentatives. Le
+#: léger), une tête déjà relue par une autre famille (#2585) ou un doute épuisé
+#: après `CATCH_UP_MAX_ATTEMPTS` tentatives. Le
 #: premier mot de la note est `TERMINAL_PREFIX + <id>` ; la sélection l'exclut
 #: toujours — la marque reste au journal, visible, mais aucune tentative
 #: horaire perpétuelle (arbitrage pilote du 15/10 sur le P2 de la R2 #1104).
@@ -585,20 +595,118 @@ def _review_recursion(item: dict) -> str:
     return ""
 
 
+def _heads_on_merge(db, lot: int, merged: str) -> list:
+    """Les têtes qu'une fusion a fait entrer : le sha fusionné, le gel relu.
+
+    La file en mode `pr` nomme la tête du lot (`landing_sha`) ; une fusion
+    locale ou un relevé de branches nomme le commit de fusion sur la cible.
+    Dans ce second cas, l'avis est porté par le dernier gel, second parent du
+    commit de fusion : le lire est la preuve que le contenu relu est bien
+    celui qui est entré. Une lecture de jalon impossible ne rend que les têtes
+    connues, jamais une tête inventée."""
+    heads: list = []
+
+    def add(value) -> None:
+        text = str(value or "").strip()
+        if text and not any(plan_git.same_commit(text, head) for head in heads):
+            heads.append(text)
+
+    add(merged)
+    add(merged_sha(db, lot))
+    freezes = _freezes(db, lot)
+    if freezes:
+        add(freezes[-1].get("sha"))
+    return heads
+
+
+def _reviewed_on_head(db, item: dict, *, heads: list, required: int,
+                      author: Optional[dict] = None) -> dict:
+    """Les avis `ok` d'une **autre famille** qui couvrent déjà `heads` (#2585).
+
+    Rend `{done, accepted, blocked}`. `done` n'est vrai qu'avec assez d'avis
+    indépendants : dernier verdict de chaque relecteur, `ok`, sur une des
+    têtes, d'un acteur distinct de l'auteur, de famille connue et différente
+    de celle de l'auteur (un auteur humain n'a pas de famille). Un `blocked`
+    courant interdit la dispense : la correction puis un `ok` restent dus.
+
+    L'indépendance ne se suppose jamais (#1374) : une famille illisible ou
+    inconnue ne prouve pas « une autre famille », donc la relecture reste due.
+    C'est plus strict que `guard_delivery`, qui garde la règle de clôture de
+    la mission ; ici on décide de **ne pas ouvrir** une mission, jamais de
+    fermer une preuve manquante."""
+    out = {"done": False, "accepted": [], "blocked": []}
+    author = author or {}
+    name = str(author.get("name") or "").strip()
+    if not name or not heads:
+        return out
+    author_family = family_of(author.get("harness"))
+    author_human = name.lower().startswith(work.HUMAN_PREFIX)
+    try:
+        from . import merge_queue
+        rows = work.milestones(db, int(item["id"]), limit=200) or []
+    except Exception:  # noqa: BLE001 - lecture impossible : la relecture reste due
+        return out
+    latest: dict = {}
+    for mark in rows:
+        if str(mark.get("kind") or "") != "verdict":
+            continue
+        # `work.milestones` rend du plus récent au plus ancien : le premier
+        # verdict de chaque relecteur est son dernier.
+        latest.setdefault(str(mark.get("actor") or "").strip().lower() or "?", mark)
+    accepted, families, blocked = [], set(), []
+    for mark in latest.values():
+        kind = str(mark.get("verdict") or "")
+        if kind not in ("ok", "blocked"):
+            continue
+        if not any(plan_git.same_commit(mark.get("sha"), head) for head in heads):
+            continue
+        actor = str(mark.get("actor") or "").strip()
+        if kind == "blocked":
+            blocked.append(actor or "?")
+            continue
+        if actor and actor.lower() == name.lower():
+            continue                      # on ne relit pas son propre travail
+        try:
+            family = merge_queue.actor_family(db, actor)
+        except merge_queue.RegistryReadError:
+            family = ""                   # #2521 : lecture impossible, non prouvée
+        if not family:
+            continue                      # aucune preuve d'une autre famille
+        if not author_human:
+            if not author_family or family == author_family:
+                continue
+        if required >= 2 and family in families:
+            continue
+        families.add(family)
+        accepted.append({"actor": actor or "?", "family": family})
+    if blocked:
+        # Un avis bloquant n'est pas une relecture rendue : la relecture
+        # après fusion reste due (la correction suit son propre lot).
+        return {"done": False, "accepted": accepted, "blocked": blocked}
+    out.update({"done": len(accepted) >= int(required),
+                "accepted": accepted, "blocked": blocked})
+    return out
+
+
 def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
                      merged_sha: str = "", pr=None, target: str = "",
                      actor: str = work.SYSTEM_SENDER) -> dict:
     """Ouvre le lot de relecture du lot léger `lot`, s'il n'existe pas déjà.
 
-    Rend `{lot, id, created, class, merged_class, critical, reviews, why}` —
-    ne lève jamais. `klass` est la classe lue sur le diff fusionné ; seule
-    `light` ouvre un lot de relecture, un doute ou une classe supérieure
-    n'ouvre rien (le canon §2 ne demande une relecture après fusion que pour
-    les lots légers). Une classe `light` dont le diff touche pourtant un
-    chemin critique (porte de fusion, SQL, sécurité, prod : `CRITICAL_SCOPE`)
-    ouvre une relecture **sensible**, avec **deux** avis de familles
-    distinctes (#2374) : le classement du canon ne peut pas dispenser la
-    sécurité d'une seconde lecture quand il a omis le chemin.
+    Rend `{lot, id, created, class, merged_class, critical, reviews,
+    already_reviewed, reviewed_by, why}` — ne lève jamais. `klass` est la
+    classe lue sur le diff fusionné ; seule `light` ouvre un lot de relecture,
+    un doute ou une classe supérieure n'ouvre rien (le canon §2 ne demande une
+    relecture après fusion que pour les lots légers). Une classe `light` dont
+    le diff touche pourtant un chemin critique (porte de fusion, SQL, sécurité,
+    prod : `CRITICAL_SCOPE`) ouvre une relecture **sensible**, avec **deux**
+    avis de familles distinctes (#2374) : le classement du canon ne peut pas
+    dispenser la sécurité d'une seconde lecture quand il a omis le chemin.
+
+    #2585 : si assez d'avis `ok` d'une autre famille couvrent déjà la tête
+    fusionnée, rien n'est créé : `already_reviewed` est vrai et `reviewed_by`
+    nomme les avis retenus. Un avis bloquant, une famille inconnue ou un sha
+    différent laissent la relecture due.
 
     La création et la marque au journal de `lot` sont **une seule écriture**
     (revue #544 r1) : un échec de la marque annule la création, donc un nouvel
@@ -623,7 +731,8 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
                else LIGHT_REVIEWS if merged_class == lot_class.LIGHT else 0)
     out = {"lot": lot, "id": None, "created": False, "class": review_class,
            "merged_class": merged_class, "critical": critical,
-           "reviews": reviews, "why": ""}
+           "reviews": reviews, "already_reviewed": False, "reviewed_by": [],
+           "why": ""}
     if merged_class != lot_class.LIGHT:
         out["why"] = ("class %s: pas de lot de relecture après fusion (§2)"
                       % (merged_class or "?"))
@@ -651,6 +760,25 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
     author = _author_at_freeze(db, lot, item)
     family = reviewer_family(author.get("harness"))
     author_family = family_of(author.get("harness"))
+    # #2585 : la revue déjà rendue avant la fusion est la relecture due ; ne
+    # pas en ouvrir une seconde. `merged_sha` peut être le commit de fusion
+    # (voie locale) : `_heads_on_merge` relit aussi le dernier gel qu'il porte.
+    try:
+        reviewed = _reviewed_on_head(
+            db, item, heads=_heads_on_merge(db, lot, merged_sha),
+            required=reviews, author=author)
+    except Exception:  # noqa: BLE001 - lecture impossible : la relecture reste due
+        reviewed = {"done": False, "accepted": [], "blocked": []}
+    if reviewed["done"]:
+        out.update({
+            "already_reviewed": True,
+            "reviewed_by": reviewed["accepted"],
+            "why": ("avis déjà rendu sur la tête fusionnée : %s — pas de lot de "
+                    "relecture ouvert" % ", ".join(
+                        "%s (%s)" % (entry["actor"], entry["family"])
+                        for entry in reviewed["accepted"])),
+        })
+        return out
     mark = requirement_mark(lot, required=reviews, merged_sha=merged_sha,
                             author=author.get("name") or "",
                             author_family=author_family)
@@ -974,11 +1102,14 @@ def open_for_merge(db, lot: int, *, merged_sha: str = "", pr=None,
     critique ouvre une relecture sensible à deux avis (#2374). Idempotent : un
     lot de relecture déjà écrit, **quel que soit son état**, est rendu sans
     relire la classe. `merged_class` garde la classe du diff fusionné (pour le
-    rattrapage), `class` celle du lot de relecture ouvert. Ne lève jamais —
-    la fusion est un fait déjà enregistré."""
+    rattrapage), `class` celle du lot de relecture ouvert. #2585 : un avis
+    d'une autre famille déjà rendu sur la tête fusionnée donne
+    `already_reviewed` sans création. Ne lève jamais — la fusion est un fait
+    déjà enregistré."""
     lot = int(lot)
     out = {"lot": lot, "id": None, "created": False, "class": "",
-           "merged_class": "", "critical": False, "reviews": 0, "why": ""}
+           "merged_class": "", "critical": False, "reviews": 0,
+           "already_reviewed": False, "reviewed_by": [], "why": ""}
     try:
         item = work.get(db, lot)
         if item is None:
@@ -1008,6 +1139,8 @@ def open_for_merge(db, lot: int, *, merged_sha: str = "", pr=None,
                     "merged_class": opened.get("merged_class") or out["merged_class"],
                     "critical": bool(opened.get("critical")),
                     "reviews": int(opened.get("reviews") or 0),
+                    "already_reviewed": bool(opened.get("already_reviewed")),
+                    "reviewed_by": list(opened.get("reviewed_by") or []),
                     "why": opened.get("why") or ""})
         return out
     except Exception as exc:  # noqa: BLE001 - la fusion reste un fait
@@ -1064,12 +1197,17 @@ def catch_up(db, *, repo: str = "", target: str = "",
     (classe non confirmée) est réessayé au plus `max_attempts` fois, espacées de
     `retry_s`, puis marqué terminal à son tour — le journal garde la trace.
 
-    Ne lève jamais ; rend `{examined, missing, opened, already, attempted,
-    terminal, failed, bound}` (`attempted` : tentatives sans création marquées,
-    `already` : relecture ouverte entre la sélection et le geste, `terminal` :
+    #2585 : un candidat dont la tête est déjà relue par une autre famille
+    n'ouvre rien ; il reçoit la marque terminale (`reviewed`) au lieu d'être
+    retenté à chaque balayage — la relecture est rendue, pas manquante.
+
+    Ne lève jamais ; rend `{examined, missing, opened, already, reviewed,
+    attempted, terminal, failed, bound}` (`attempted` : tentatives sans
+    création marquées, `already` : relecture ouverte entre la sélection et le
+    geste, `reviewed` : avis déjà rendu sur la tête fusionnée, `terminal` :
     candidats clos par la marque terminale)."""
     out = {"examined": 0, "missing": 0, "opened": 0, "already": 0,
-           "attempted": 0, "terminal": 0, "failed": 0, "bound": ""}
+           "reviewed": 0, "attempted": 0, "terminal": 0, "failed": 0, "bound": ""}
     try:
         ops = storage.of(db).work
         bound = ops.review_catch_up_bound()
@@ -1128,6 +1266,18 @@ def catch_up(db, *, repo: str = "", target: str = "",
                                   target=target or str(row.get("branch_target") or ""))
             if done.get("created"):
                 out["opened"] += 1
+                continue
+            if done.get("already_reviewed"):
+                # #2585 : la relecture est déjà rendue sur la tête fusionnée ;
+                # aucune mission n'est due, et le candidat ne doit pas revenir
+                # à chaque balayage (marque terminale, pas une tentative).
+                out["reviewed"] += 1
+                out["terminal"] += 1
+                reviewed_by = ", ".join(
+                    "%s (%s)" % (entry.get("actor"), entry.get("family"))
+                    for entry in done.get("reviewed_by") or ()) or "?"
+                terminal(lot, state, "avis déjà rendu sur la tête fusionnée : %s"
+                         % reviewed_by)
                 continue
             if done.get("id") or "déjà" in str(done.get("why") or ""):
                 # un autre exécuteur a ouvert la relecture entre la sélection

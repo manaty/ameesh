@@ -1930,7 +1930,7 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             # fusionné avant l'activation n'est pas relu rétroactivement.
             review = _resume_review_after_merge(db, item_id, sha=sha, pr_ref=pr_ref, repo=repo)
             detail = "already %s" % state
-            if not review.get("id"):
+            if not review.get("id") and not review.get("already_reviewed"):
                 detail += " — relecture non ouverte : %s" % (review.get("why") or "?")
             return {"id": int(item_id), "result": "already", "item": item,
                     "detail": detail, "review_lot": review}
@@ -1971,7 +1971,7 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             # dans le constat (`review_lot`), pour être repris (`review_lot.catch_up`).
             review = _review_after_merge(db, item_id, sha=sha, pr_ref=pr_ref, repo=repo)
             detail = "%s → merged" % state
-            if not review.get("id"):
+            if not review.get("id") and not review.get("already_reviewed"):
                 detail += " — relecture non ouverte : %s" % (review.get("why") or "?")
             return {"id": int(item_id), "result": "merged", "item": row,
                     "detail": detail, "review_lot": review}
