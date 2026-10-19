@@ -292,6 +292,13 @@ class KeyCache:
                 # #1854 N2 : la relecture de rotation a déjà été tentée dans la
                 # fenêtre ; un `kid` inconnu ne relance pas le réseau à chaque jeton.
                 return cached[1]
+        if refresh:
+            # #1854 (relecture après fusion) : la TENTATIVE compte dans la
+            # fenêtre, même si la découverte ou le JWKS échoue ; sans cela, chaque
+            # jeton à `kid` inconnu relançait la paire de requêtes. Le premier
+            # échec reste rendu à l'appelant ; les suivants rendent le cache
+            # (fail closed, le `kid` demeure inconnu).
+            self._refreshed_at[issuer] = now
         fetch = self.fetch or _fetch_json
         discovery = fetch(issuer + "/.well-known/openid-configuration")
         if not isinstance(discovery, dict) or discovery.get("issuer") != issuer:
@@ -314,8 +321,6 @@ class KeyCache:
                 continue
             found[kid] = cle
         self._keys[issuer] = (now + self.ttl_s, found)
-        if refresh:
-            self._refreshed_at[issuer] = now
         return found
 
 

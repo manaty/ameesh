@@ -831,7 +831,10 @@ dette, alerte qui revient, évolution) va dans la file d'amélioration
 ([0037](design/decisions/0037-jamais-a-l-arret.md)) :
 `ameesh work backlog add --title … --value "valeur attendue" --score N
 --source auditeur --team ameesh --body "<gabarit du lot de cause>"`. Jamais un
-élément qui demanderait un geste irréversible ou de production.
+élément qui demanderait un geste irréversible ou de production. Sous le seuil
+de lot du canon (`backlog.lot_min_value`, #2584), l'élément devient une ligne du
+panier du jour de son chantier (`--chantier`, sinon la fiche, sinon le projet)
+au lieu d'un lot.
 
 L'auditeur reste un preneur possible de la file, comme tout agent au repos. Un
 élément qui lui est confié passe après ses passages : un bug d'ameesh suit le

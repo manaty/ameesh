@@ -12,15 +12,18 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import shutil
 import subprocess
+import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from ameesh import land, mail, merge_queue, radar, resolutions, review_lot, storage, work
 
 from .support import PgTestCase
-from .test_l160b_radar import MIG, _git
+from .test_l160b_radar import MIG, _git, git_env
 from .test_l160d_resolutions import RESOLVED, _manual_resolution
 from .test_l160e_merge_queue import _Base
 
@@ -1257,6 +1260,70 @@ class LeaseDbTest(PgTestCase):
         self.assertIsNone(result.get("row"))
         self.assertEqual([r["state"] for r in ops.queue() if r["work_item_id"] == lot],
                          ["queued"])
+
+
+class MergedBaseTest(unittest.TestCase):
+    """#2603 : une cible de travail déjà fusionnée dans la cible par défaut ne
+    reçoit plus de fusion (home#112/#113 après la fusion de canon/2452)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-2603-land-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.repo = os.path.join(self.tmp, "repo")
+        os.makedirs(self.repo)
+        _git(self.repo, "init", "-q", "-b", "main")
+        with open(os.path.join(self.repo, "base.txt"), "w", encoding="utf-8") as fh:
+            fh.write("base\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "base")
+        self.origin = os.path.join(self.tmp, "origin.git")
+        subprocess.run(["git", "clone", "-q", "--bare", self.repo, self.origin],
+                       check=True, capture_output=True, env=git_env())
+        _git(self.repo, "remote", "add", "origin", self.origin)
+        _git(self.repo, "push", "-q", "origin", "main")
+        _git(self.origin, "branch", "canon/2452", "main")
+        self.clone = os.path.join(self.tmp, "clone")
+        subprocess.run(["git", "clone", "-q", self.origin, self.clone],
+                       check=True, capture_output=True, env=git_env())
+        self.project = radar.Project(name="p", repo=self.repo, migrations=MIG,
+                                     land="pr", github="o/r")
+        self.replayer = SimpleNamespace(path=self.clone)
+
+    def test_a_base_already_merged_into_the_default_is_reported(self):
+        self.assertEqual(land.merged_base(self.replayer, self.project, "canon/2452"),
+                         "main")
+
+    def test_the_default_base_is_not_flagged(self):
+        self.assertEqual(land.merged_base(self.replayer, self.project, "main"), "")
+
+    def test_a_work_branch_not_yet_merged_is_not_flagged(self):
+        _git(self.clone, "checkout", "-q", "-b", "canon/2453", "origin/main")
+        with open(os.path.join(self.clone, "more.txt"), "w", encoding="utf-8") as fh:
+            fh.write("more\n")
+        _git(self.clone, "add", "-A")
+        _git(self.clone, "commit", "-q", "-m", "more")
+        _git(self.clone, "push", "-q", "origin", "canon/2453")
+        self.assertEqual(land.merged_base(self.replayer, self.project, "canon/2453"), "")
+
+    def test_unreadable_stacked_base_comparison_refuses(self):
+        for code in (1, 128):
+            with self.subTest(code=code), mock.patch.object(
+                    resolutions, "_run", return_value=subprocess.CompletedProcess(
+                        ["git"], code, b"", b"unreadable default")):
+                with self.assertRaises(land.LandError):
+                    land.merged_base(self.replayer, self.project, "canon/2452")
+
+    def test_failed_ancestry_probe_refuses(self):
+        with mock.patch.object(resolutions, "_run", side_effect=[
+                subprocess.CompletedProcess(["git"], 0, "", ""),
+                subprocess.CompletedProcess(["git"], 128, b"", b"bad object")]):
+            with self.assertRaises(land.LandError):
+                land.merged_base(self.replayer, self.project, "canon/2452")
+
+    def test_a_missing_configured_default_refuses(self):
+        _git(self.repo, "config", "ameesh.target", "origin/absent")
+        with self.assertRaises(land.LandError):
+            land.merged_base(self.replayer, self.project, "canon/2452")
 
 
 if __name__ == "__main__":

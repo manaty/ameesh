@@ -13,9 +13,9 @@ import types
 from datetime import datetime
 from unittest import mock
 
-from ameesh import (db as db_mod, radar, storage, train, train_ci, train_fire,
-                    train_candidates, train_git, train_policy, train_runner, train_transports,
-                    train_transport_journal, work)
+from ameesh import (db as db_mod, prevalidation_calls, radar, storage, train, train_ci,
+                    train_fire, train_candidates, train_git, train_policy, train_runner,
+                    train_transports, train_transport_journal, work)
 
 from .support import PgTestCase
 from .test_1467_train_review import author, verdict
@@ -114,6 +114,14 @@ class TrainRunnerTest(PgTestCase):
         self.mechanics = types.SimpleNamespace(MechanicsError=train.TrainError,
             load=mock.Mock(side_effect=FixtureMechanics))
         self.notices, self.api_calls = [], []
+        # #2644 : le canon du banc n'a pas de `processus/mecanique.yaml` et le
+        # port de prévalidation du train est couvert par
+        # test_2644_prevalidation_calls et test_1467_train_runtime ; ce banc
+        # reste hermétique (aucun plan ni hôte réel).
+        gate = mock.patch.object(prevalidation_calls, "gate_train",
+                                 return_value={"state": "green"})
+        gate.start()
+        self.addCleanup(gate.stop)
         self.key = self.project.name + ":main"
         self.now = datetime.fromisoformat("2026-10-15T11:00:00+02:00").timestamp()
         self.db.execute("UPDATE merge_queue SET queued_at=to_timestamp(%s)", [self.now - 3600])

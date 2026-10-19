@@ -439,6 +439,16 @@ class CommandTest(unittest.TestCase):
         self.assertEqual(args.work_command, "prevalidate")
         self.assertEqual(args.lot, 1770)
 
+    def test_lot_zero_refuse(self):
+        """Le lot 0 est réservé à la composition du train (#2644) ; la
+        commande explicite garde un lot positif, sinon le rapport persisté
+        n'aurait pas de clé."""
+        out = StringIO()
+        with redirect_stdout(out):
+            code = pv.run(None, None, self._args(lot=0))
+        self.assertEqual(code, 1)
+        self.assertIn("lot invalide", out.getvalue())
+
     def test_canon_absent_refuse_block_missing(self):
         out = StringIO()
         with redirect_stdout(out):

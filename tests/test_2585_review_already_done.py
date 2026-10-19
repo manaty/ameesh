@@ -26,7 +26,7 @@ from unittest import mock
 
 from ameesh import registry, review_lot, storage, work
 
-from .support import PgTestCase
+from .support import PgTestCase, patch_families
 
 
 class FakeOps:
@@ -74,6 +74,9 @@ class RuleTest(unittest.TestCase):
     """La règle : un avis d'une autre famille couvre la tête, une seule fois."""
 
     def setUp(self):
+        # #2664 : les familles viennent du canon compilé, jamais d'une liste
+        # locale ; ce banc sans canon Git épingle les trois familles connues.
+        patch_families(self)
         self.item = {"id": LOT, "title": "un chemin léger déjà relu", "app": "ameesh",
                      "assignee": "a1", "state": "merged", "branch_target": "main",
                      "type": "evolution"}

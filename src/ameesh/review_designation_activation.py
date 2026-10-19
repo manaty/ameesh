@@ -16,11 +16,19 @@ Inputs, all from machine sources (never a note, an assignment or a name):
   model families; a missing or malformed policy designates nobody — it is
   reported, never guessed;
 - **frozen diff**: `merge-base(target, frozen_sha)..frozen_sha`, target read
-  from `branch_target`, the project's configured target, then `origin/HEAD`;
+  from `branch_target`, the project's configured target, then `origin/HEAD`.
+  The repository is the assignee's checkout, the host's radar repository, the
+  process cwd, then (#2561) a worktree tracked by housekeeping or a sibling of
+  those paths named after the lot/agent — the freeze command may run from the
+  agent's session directory, another repository. The exact SHA and the issue's
+  repository origin decide;
 - **authors**: the lot's assignee at freeze (`review_lot._author_at_freeze`,
-  the historical turn trace) and every commit of the frozen range through its
-  exact provenance receipt (#1465). A commit without a receipt makes the
-  designation wait: an unknown family cannot prove independence;
+  the historical turn trace, the same reference family as the merge gate) and
+  every commit of the frozen range through its exact provenance receipt
+  (#1465), except a designated reviewer's first-round correction under the §2
+  threshold (#2638: ≤ ~50 changed lines, no design). A commit without a
+  receipt makes the designation wait: an unknown family cannot prove
+  independence;
 - **candidates**: the registry rows of the lot's project, real session family
   only (`registry.live_harness`), availability and open-lot load;
 - **pilot**: the project's `orchestrateur` in the canon, when registered; an
@@ -35,14 +43,24 @@ journaled exception. The adapter also catches unexpected selection errors and
 records them rather than losing a freeze to a designation bug; database
 errors still cancel the milestone with it (the transaction is the guarantee).
 
+A **light** lot has no pre-merge reviewer: canon §2 gives it tests and CI before
+merge, and the other-family review after merge. The freeze journals that
+outcome once (`review-designation-none:<lot>:<freeze>:`) so the absence of a
+reviewer is explained, never mistaken for a failed designation (#2561).
+
 Outside the hook, the same inputs feed the recovery path used by
 `ameesh work reviewers <lot> --apply`: it replays the latest freeze, so a
-capacity or canon problem fixed later can still designate the same head.
+capacity or canon problem fixed later can still designate the same head. The
+runner also retries the journaled unavailable freezes after a successful canon
+sync (`retry_pending`, bounded and idempotent), so the command is optional and
+an older pilot installation is no obstacle.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
 from dataclasses import dataclass, field
 from typing import Mapping, Optional, Sequence
 
@@ -56,8 +74,40 @@ from . import review_lot, review_provenance, storage, work
 SENDER = pg.SENDER
 #: journal prefix of a policy/evidence problem: one note per freeze
 UNAVAILABLE_PREFIX = "review-designation-unavailable:"
+#: journal prefix of a light/no-review outcome: one note per freeze (#2561)
+NONE_PREFIX = "review-designation-none:"
+#: the first release that carries `ameesh work reviewers` (#2447)
+RECOVERY_FROM = "1.12.0"
+#: why a light lot keeps no pre-merge reviewer (canon §2, full table)
+LIGHT_WHY = ("light lot: no pre-merge reviewer is due (the other-family review"
+             " happens after merge)")
+#: why an empty frozen diff keeps no reviewer
+NO_PATH_WHY = "no changed path: no review due"
 #: a frozen range longer than this is not read in one selection (bounded work)
 MAX_COMMITS = 500
+#: canon §2: a reviewer's first-round correction is a small fix up to ~50
+#: changed lines; beyond that (or for a design change) its author becomes an
+#: author of the head (#2638)
+REVIEWER_FIX_LINES = 50
+#: canon §2 "ou de conception": a design document is never a small fix
+DESIGN_PREFIXES = ("docs/design/",)
+
+#: a run of `retry_pending` reads at most this many unavailable notes
+RETRY_SCAN = 200
+#: and retries at most this many lots
+RETRY_LIMIT = 20
+#: the retry queue's cursor, under the host state directory (#2561): the last
+#: unavailable note examined. A pass resumes after it and wraps at the end, so
+#: the same recent lots cannot take every pass's slots and starve the older
+#: ones (a resolved lot is skipped, not counted against the pass's budget).
+RETRY_CURSOR = "review-designation-retry.cursor"
+#: a missing frozen head is fetched from the lot's origin at most this often
+FETCH_TRIES = 2
+#: and each fetch is bounded (network is not allowed to hold the freeze)
+FETCH_TIMEOUT = 10.0
+
+_RETRY_NOTE = re.compile(r"^review-designation-unavailable:(\d+):(\d+):")
+_SHA_TEXT = re.compile(r"^[0-9a-f]{40}$|^[0-9a-f]{64}$")
 
 
 def enabled(cfg) -> bool:
@@ -107,6 +157,10 @@ class Inputs:
     candidates: list
     notify: str
     manual: list = field(default_factory=list)
+    #: the manual reviewers that prove an independent family (#2627)
+    manual_seats: list = field(default_factory=list)
+    #: the raw `-none` waiver of the lot (`work reviewer --no-verdict`)
+    waiver: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -116,32 +170,14 @@ class Inputs:
 def _audited_commit(db, cfg, canon, source) -> str:
     """The exact commit to read for this canon: the host's last good one.
 
-    `canon_state.last_good_commit` is the commit the host audited; the
-    configured ref can be ahead of it (a fetch without a sync). Without a
-    recorded state (bench, first start) the source commit is the only exact
-    commit known; `mechanics.load` still refuses a non-commit.
+    The single implementation lives in `canon_sync.audited_commit` (moved for
+    #2664, which reads the same commit for the model families): a recorded
+    state is authoritative even when the current pass is invalid, and with no
+    state at all the exact source commit is the only one known.
     """
     from . import canon_sync
 
-    try:
-        key = canon_sync.state_key(db, canon, getattr(cfg, "host", ""))
-        state = storage.of(db).canon.state(getattr(cfg, "host", ""), key)
-    except Exception:  # noqa: BLE001 - unreadable state: no audited commit known
-        state = None
-    if state is not None:
-        # A recorded state is authoritative even when the CURRENT pass is
-        # invalid: `last_good_commit` is the last audited commit, while the
-        # configured ref may already point at an un-audited head (B2 of the
-        # Codex review cx2). Without a last good commit there is no audited
-        # policy to read: never fall back to the ref on a known host.
-        commit = str(state.get("last_good_commit") or "").strip().lower()
-        root = str(state.get("root") or "")
-        if commit and (not root or root == str(getattr(canon, "root", "") or "")):
-            return commit
-        return ""
-    # No state at all (bench, first start): the exact configured ref is the
-    # only commit known, and `mechanics.load` still refuses a non-commit.
-    return str(source.commit or "").strip().lower()
+    return canon_sync.audited_commit(db, cfg, canon, source)
 
 
 def _policy(cfg, db, project: str, paths: Sequence[str]) -> Policy | Unavailable:
@@ -166,13 +202,28 @@ def _policy(cfg, db, project: str, paths: Sequence[str]) -> Policy | Unavailable
                 errors.append("%s: canon under a sub-directory, mechanics are read"
                               " at the Git root only" % (source.repo,))
                 continue
-            commit = _audited_commit(db, cfg, canon, source)
+            try:
+                commit = _audited_commit(db, cfg, canon, source)
+            except Exception as exc:  # noqa: BLE001 - état illisible : refus, jamais de repli
+                errors.append("%s: cannot read the audited state: %s"
+                              % (source.repo, str(exc)[:240]))
+                continue
             if not commit:
                 errors.append("%s: no exact audited commit" % (source.repo,))
                 continue
             try:
                 loaded = mechanics.load(source.repo, commit, project)
                 need = loaded.reviews_for(paths)
+                # #2627 : le plancher critique de la porte de fusion
+                # (`merge_queue.required_verdicts`) fait partie du besoin. Un
+                # canon qui déclare un avis sur `exploitation.py` ou `db.py`
+                # n'abaisse pas les deux avis que la porte exigera au feu.
+                from . import merge_queue
+                classified = review.classify(loaded.review_policy, list(paths))
+                required = max(need.reviews, merge_queue.required_verdicts(classified))
+                # même classe que le lecteur compilé : le max des deux lectures
+                risk = max((need.risk, str(classified.get("class") or "light")),
+                           key=review.RANK.__getitem__)
             except (mechanics.MechanicsError, review.ReviewError,
                     canon_mod.CanonError) as exc:
                 errors.append("%s@%s: %s" % (source.repo, commit[:12],
@@ -185,7 +236,7 @@ def _policy(cfg, db, project: str, paths: Sequence[str]) -> Policy | Unavailable
                 errors.append("%s@%s: %s" % (source.repo, commit[:12], exc))
                 continue
             return Policy(rules=rules, families=tuple(loaded.families),
-                          risk=need.risk, required=need.reviews,
+                          risk=risk, required=required,
                           ref=str(getattr(loaded, "source", "") or
                                   "%s@%s" % (source.repo, commit)),
                           commit=commit, source=source.repo)
@@ -197,8 +248,8 @@ def _policy(cfg, db, project: str, paths: Sequence[str]) -> Policy | Unavailable
 # the repository, the target and the frozen diff
 # --------------------------------------------------------------------------
 
-def _repository(db, cfg, item: Mapping, frozen_sha: str) -> str:
-    """The repository holding the frozen head (assignee's worktree first)."""
+def _candidate_paths(db, cfg, item: Mapping) -> list[str]:
+    """Local paths the agent may have frozen from, in reading order."""
     candidates: list[str] = []
     assignee = str((item or {}).get("assignee") or "").strip()
     if assignee:
@@ -215,21 +266,253 @@ def _repository(db, cfg, item: Mapping, frozen_sha: str) -> str:
         candidates.append(os.getcwd())
     except OSError:
         pass
+    return candidates
+
+
+def _tracked_worktrees(db, cfg, item: Mapping) -> list[str]:
+    """The worktrees housekeeping already attributed to this lot on this host.
+
+    #2561: `managed_worktrees` is a machine source, cheaper and more exact than
+    scanning a directory; its absence (old schema, no pass yet) is not an error.
+    """
+    try:
+        lot = int((item or {}).get("id") or 0)
+    except (TypeError, ValueError):
+        return []
+    if not lot:
+        return []
+    try:
+        rows = db.query(
+            "SELECT path FROM managed_worktrees"
+            " WHERE host = %s AND lot = %s AND status = 'active'"
+            " ORDER BY id DESC",
+            (str(getattr(cfg, "host", "") or ""), str(lot)))
+    except Exception:  # noqa: BLE001 - no tracking table/readable row: next hint
+        return []
+    return [str(row.get("path") or "") for row in rows or ()
+            if str(row.get("path") or "").strip()]
+
+
+def _search_roots(paths: Sequence[str]) -> list[str]:
+    """The parent directories of candidate checkouts, de-duplicated.
+
+    A worktree created from another checkout lives beside it (the agent's
+    `~/work/<project>-<agent>-<lot>` convention). When the freeze command runs
+    from the agent's other repository, that sibling is the only local copy of
+    the frozen head.
+    """
+    roots: list[str] = []
+    for path in paths:
+        text = os.path.expanduser(str(path or "").strip())
+        if not text:
+            continue
+        real = os.path.realpath(text)
+        if not os.path.isdir(real):
+            continue
+        root = os.path.dirname(real)
+        if not root or root == real or root in roots:
+            continue
+        if root == os.path.dirname(root):  # never scan the filesystem root
+            continue
+        roots.append(root)
+    return roots
+
+
+def _neighbour_paths(roots: Sequence[str], needles: Sequence[str]) -> list[str]:
+    """Immediate children of `roots` whose name carries one of `needles`."""
+    out: list[str] = []
     seen = set()
-    for path in candidates:
+    wanted = [str(needle) for needle in needles if str(needle or "").strip()]
+    if not wanted:
+        return out
+    for root in roots:
+        try:
+            entries = list(os.scandir(root))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if not entry.is_dir():
+                    continue
+            except OSError:
+                continue
+            if not any(needle in entry.name for needle in wanted):
+                continue
+            real = os.path.realpath(entry.path)
+            if real in seen:
+                continue
+            seen.add(real)
+            out.append(real)
+    return out
+
+
+def _configured_origin(repo: str) -> str:
+    """The configured GitHub `owner/repo` of `repo`, without URL rewrites.
+
+    `git remote get-url` applies `url.<base>.insteadOf`, which can hide the
+    forge identity; the configuration value is what the issue reference names.
+    """
+    try:
+        from . import migrations
+    except Exception:  # noqa: BLE001 - no parser: no identity
+        return ""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, "config", "--get", "remote.origin.url"],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return migrations.github_repo(proc.stdout.strip()) or ""
+
+
+def _origin_matches(repo: str, slug: str) -> bool:
+    """A discovered neighbour is trusted only for the lot's own repository.
+
+    The exact SHA makes content forgery impossible, not a forged *target*: the
+    base refs are read from this checkout, so a sibling of another project (or a
+    local clone with no GitHub origin) must never be chosen. The issue reference
+    is the machine identity; without one, the fallback keeps the old hints only.
+    """
+    return bool(slug) and _configured_origin(repo) == slug
+
+
+def _valid_branch(branch: str) -> str:
+    """A branch name that is safe as a fetch refspec, or ""."""
+    branch = str(branch or "").strip()
+    if not branch or branch.startswith("-") or ".." in branch \
+            or any(ch.isspace() for ch in branch):
+        return ""
+    try:
+        proc = subprocess.run(["git", "check-ref-format", "refs/heads/" + branch],
+                              capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return branch if proc.returncode == 0 else ""
+
+
+def _fetch_frozen(repo: str, frozen_sha: str, branch: str) -> bool:
+    """Fetch the exact frozen head into a local clone of the lot's repository.
+
+    #2561: a freeze declared after a push can name a head that no *local*
+    checkout holds yet. The fetch is bounded, never shallow (canon §7), only
+    writes a private `refs/ameesh/frozen/<sha>` ref, and the exact commit id is
+    checked afterwards. The shallow option is never used.
+    """
+    refspecs: list[str] = []
+    if _SHA_TEXT.fullmatch(str(frozen_sha or "")):
+        refspecs.append(str(frozen_sha))
+    branch = _valid_branch(branch)
+    if branch and _SHA_TEXT.fullmatch(str(frozen_sha or "")):
+        refspecs.append("+refs/heads/%s:refs/ameesh/frozen/%s" % (branch, frozen_sha))
+    for refspec in refspecs:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", repo, "fetch", "--no-tags", "--quiet", "origin", refspec],
+                capture_output=True, timeout=FETCH_TIMEOUT)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode != 0:
+            continue
+        try:
+            if plan_git._commit(repo, frozen_sha):
+                return True
+        except Exception:  # noqa: BLE001 - unreadable clone: next refspec
+            continue
+    return False
+
+
+def _fetch_from_local_clone(paths: Sequence[str], slug: str, frozen_sha: str,
+                            branch: str, seen: set) -> str:
+    """The first local clone of `slug` into which the frozen head can be fetched."""
+    if not slug:
+        return ""
+    tries = 0
+    for path in paths:
         path = os.path.expanduser(str(path or "").strip())
         if not path or not os.path.isdir(path):
             continue
         repo = canon_mod.git_toplevel(path)
-        if not repo or repo in seen:
+        if not repo or repo in seen or not _origin_matches(repo, slug):
             continue
         seen.add(repo)
-        try:
-            if plan_git._commit(repo, frozen_sha):
-                return repo
-        except Exception:  # noqa: BLE001 - unreadable repository: next hint
-            continue
+        tries += 1
+        if _fetch_frozen(repo, frozen_sha, branch):
+            return repo
+        if tries >= FETCH_TRIES:
+            break
     return ""
+
+
+def _repo_holding(path: str, frozen_sha: str, seen: set) -> str:
+    """The git top level of `path` when it holds the exact frozen commit."""
+    path = os.path.expanduser(str(path or "").strip())
+    if not path or not os.path.isdir(path):
+        return ""
+    repo = canon_mod.git_toplevel(path)
+    if not repo or repo in seen:
+        return ""
+    seen.add(repo)
+    try:
+        return repo if plan_git._commit(repo, frozen_sha) else ""
+    except Exception:  # noqa: BLE001 - unreadable repository: next hint
+        return ""
+
+
+def _repository(db, cfg, item: Mapping, frozen_sha: str, *,
+                fetch: bool = True) -> str:
+    """The repository holding the frozen head (assignee's worktree first).
+
+    #2561: a freeze command often runs from the agent's *session* directory
+    (`~/work/nexlink-<agent>`), not from the lot's worktree. The first three
+    hints then all miss the ameesh commit even though the pushed head exists in
+    the agent's other checkout. The fallback reads the worktrees attributed by
+    housekeeping (a trusted machine source) and the siblings of the known paths
+    whose name cites the lot or its assignee; the exact commit id decides, and a
+    discovered sibling must also carry the lot's own GitHub origin.
+
+    `fetch=False` (the freeze transaction) never reaches the network: the head
+    found only on origin is journaled unavailable, then fetched by the retry
+    that runs outside any transaction (`retry_pending`).
+    """
+    candidates = _candidate_paths(db, cfg, item)
+    seen: set[str] = set()
+    for path in candidates:
+        repo = _repo_holding(path, frozen_sha, seen)
+        if repo:
+            return repo
+    try:
+        slug = work.lot_repository(dict(item or {}), cfg)
+    except Exception:  # noqa: BLE001 - no issue reference: no discovered clone
+        slug = ""
+    try:
+        lot = str(int((item or {}).get("id") or 0))
+    except (TypeError, ValueError):
+        lot = ""
+    hints = _tracked_worktrees(db, cfg, item)
+    for path in hints:
+        repo = _repo_holding(path, frozen_sha, seen)
+        if repo:
+            return repo
+    if not slug:
+        return ""
+    needles = [needle for needle in
+               (lot, str((item or {}).get("assignee") or "").strip())
+               if needle and needle != "0"]
+    roots = _search_roots(list(candidates) + list(hints))
+    neighbours = _neighbour_paths(roots, needles)
+    for path in neighbours:
+        repo = _repo_holding(path, frozen_sha, seen)
+        if repo and _origin_matches(repo, slug):
+            return repo
+    # The head may have been pushed but not fetched into any local clone
+    # (#2517); fetch it from the lot's own origin, bounded, and verify the SHA.
+    if not fetch:
+        return ""
+    return _fetch_from_local_clone(
+        list(candidates) + list(hints) + list(neighbours), slug, frozen_sha,
+        str((item or {}).get("branch") or "").strip(), set())
 
 
 def _resolve_base(repo: str, base: str) -> str:
@@ -277,13 +560,82 @@ def _range(repo: str, base: str, head: str) -> tuple[str, list, list]:
 # the authors: the assignee at freeze and each commit's exact receipt
 # --------------------------------------------------------------------------
 
-def _family(harness) -> str:
-    return review_lot.family_of(str(harness or ""))
+def _family(harness, families) -> str:
+    return review_lot.family_of(str(harness or ""), families)
+
+
+def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
+                          author: str) -> set[str]:
+    """The names designated as reviewers of the lot, automatic or manual.
+
+    The current column holds the previous freeze's automatic names and the
+    manual exception; the journal marks keep the names a later freeze retired.
+    A reviewer who pushed a first-round correction must stay recognizable after
+    the freeze that retired them (#2638). The lot author is never a reviewer.
+    """
+    names: list[str] = []
+    lot = int((item or {}).get("id") or 0)
+    freeze_id = int((milestone or {}).get("id") or 0)
+    try:
+        names.extend(_previous_reviewers(db, lot, freeze_id))
+    except Exception:  # noqa: BLE001 - unreadable journal: no automatic name
+        pass
+    try:
+        from .work_reviewers import designated
+
+        names.extend(designated(dict(item or {})))
+    except Exception:  # noqa: BLE001 - unreadable column: no manual name
+        pass
+    return {str(value).strip() for value in names
+            if str(value).strip() and str(value).strip() != author}
+
+
+def _change(repo: str, sha: str) -> Optional[tuple[int, bool]]:
+    """`(changed lines, touches a design path)` of one commit, or None.
+
+    `None` means the diff is unreadable: the caller must not guess a small fix.
+    A binary change is never a small fix, and neither is a design document
+    (canon §2: a correction "> ~50 lignes ou de conception" goes back to the
+    author, #2638)."""
+    if not repo:
+        return None
+    text = plan_git._out(repo, "show", "--numstat", "-z", "--format=", "--no-renames", sha)
+    if text is None:
+        return None
+    lines, design = 0, False
+    for row in str(text).split("\0"):
+        if not row:
+            continue
+        fields = row.split("\t", 2)
+        if len(fields) < 3:
+            return None
+        added, removed, path = fields
+        if added == "-" or removed == "-":
+            return REVIEWER_FIX_LINES + 1, design
+        try:
+            lines += int(added) + int(removed)
+        except ValueError:
+            return None
+        if path.startswith(DESIGN_PREFIXES):
+            design = True
+    return lines, design
 
 
 def _authors(db, item: Mapping, milestone: Optional[Mapping],
-             commits: Sequence[str]) -> tuple[list, list]:
-    """`(authors, unknown authors)` drawn from the freeze and exact receipts."""
+             commits: Sequence[str], repo: str = "", families=()) -> tuple[list, list]:
+    """`(authors, unknown authors)` drawn from the freeze and exact receipts.
+
+    The reference author is the lot's author at freeze (the assignee, exactly
+    as `merge_queue.review_gate` reads it). Every other commit counts as an
+    author, with one exception: a **designated reviewer's** first-round
+    correction under the §2 threshold (`REVIEWER_FIX_LINES`, no design change)
+    does not make its author an author of the head — their family stays
+    eligible, and the same reviewer may be designated again on the new head.
+    A larger or design change makes them an author like any other (#2638).
+
+    `families` are the compiled canon's model families (#2664), read at the
+    same audited commit as the policy: no local list is assumed.
+    """
     lot = int((item or {}).get("id") or 0)
     assignee = str((item or {}).get("assignee") or "").strip()
     author = {}
@@ -292,14 +644,14 @@ def _authors(db, item: Mapping, milestone: Optional[Mapping],
     except Exception:  # noqa: BLE001 - unreadable trace: unknown family
         author = {}
     name = str(author.get("name") or assignee).strip()
-    family = _family(author.get("harness"))
+    family = _family(author.get("harness"), families)
     if not family and milestone is not None:
         try:
             proof = review_provenance.receipt_for_milestone(db, int(milestone["id"]))
         except (review_provenance.ProvenanceError, KeyError, TypeError, ValueError):
             proof = None
         if proof and str(proof.get("actor") or "").strip() == name:
-            family = _family(proof.get("harness"))
+            family = _family(proof.get("harness"), families)
     if not family and name and (milestone is None
                                 or str(milestone.get("actor") or "").strip()
                                 in ("", name)):
@@ -308,13 +660,15 @@ def _authors(db, item: Mapping, milestone: Optional[Mapping],
             # the declared harness is not a session: only an opened session
             # proves the family that really ran (L242b, #1037)
             if row.get("session_id") or row.get("session_harness"):
-                family = _family(row.get("session_harness"))
+                family = _family(row.get("session_harness"), families)
         except Exception:  # noqa: BLE001 - no session: the family stays unknown
             family = ""
+    reviewers = _designated_reviewers(db, item, milestone, name)
     by_name: dict[str, set] = {}
     if name:
         by_name.setdefault(name, set()).add(family)
     unknown = []
+    review_commits: dict[str, list[tuple[str, str]]] = {}
     for sha in commits or ():
         try:
             receipt = review_provenance.receipt_for_commit(db, sha)
@@ -324,8 +678,26 @@ def _authors(db, item: Mapping, milestone: Optional[Mapping],
             unknown.append(str(sha)[:12])
             continue
         actor = str(receipt.get("actor") or "").strip()
-        if actor:
-            by_name.setdefault(actor, set()).add(_family(receipt.get("harness")))
+        if not actor:
+            continue
+        proven = _family(receipt.get("harness"), families)
+        if actor != name and actor in reviewers:
+            # held until the §2 threshold is known for their whole correction
+            review_commits.setdefault(actor, []).append((str(sha), proven))
+            continue
+        by_name.setdefault(actor, set()).add(proven)
+    for actor, entries in sorted(review_commits.items()):
+        total, design = 0, False
+        for sha, _proven in entries:
+            change = _change(repo, sha)
+            if change is None or change[1]:
+                design = True
+                break
+            total += change[0]
+        if design or total > REVIEWER_FIX_LINES:
+            # beyond the small first-round fix: they authored the head
+            by_name.setdefault(actor, set()).update(
+                proven for _sha, proven in entries if proven)
     authors = []
     for actor in sorted(by_name):
         families = {f for f in by_name[actor] if f}
@@ -400,12 +772,79 @@ def _manual(db, item: Mapping) -> list:
     return [name for name in names if name not in automatic]
 
 
+def _waiver(item: Mapping) -> bool:
+    """The raw `-none` waiver of the lot, never overridden by a designation.
+
+    `work_reviewers.designated` filters `-none` out: the waiver is an authority
+    gesture (#1979), so it is read on the raw column here. A new freeze of
+    another head lapses it in storage before the hook (#2281); when it is still
+    there, no reviewer is added and no mail is sent (#2627).
+    """
+    from .storage.postgres.work import REVIEWER_NONE
+
+    item = item or {}
+    if str(item.get("reviewer") or "").strip() == REVIEWER_NONE:
+        return True
+    names = item.get("reviewers")
+    if names is None:
+        names = [item.get("reviewer")]
+    return any(str(name or "").strip() == REVIEWER_NONE for name in names or ())
+
+
+def _manual_seats(manual: Sequence[str], listing: Sequence[Mapping],
+                  authors: Sequence[Mapping], families) -> list:
+    """The manual reviewers that cover a required seat (#2627).
+
+    A manual reviewer is always kept in the column; this only says which ones
+    count: a known family of the compiled policy, distinct from every author's
+    family and from the other manual reviewers. An unknown family, or the
+    author's family, does not prove independence: the seat remains missing and
+    is designated automatically. The list is ordered like the column.
+    """
+    forbidden_names, forbidden_families = rd.families_of(authors)
+    rows = {str((row or {}).get("name") or ""): row for row in listing or ()}
+    covered = set(forbidden_families)
+    seats = []
+    for name in manual or ():
+        name = str(name or "").strip()
+        row = rows.get(name) or {}
+        family = rd.live_family(row, families=families)
+        if (not name or name in forbidden_names or not family
+                or family in covered):
+            continue
+        covered.add(family)
+        seats.append({"name": name, "family": family})
+    return seats
+
+
+def _manual_covers(inputs: Inputs) -> bool:
+    """Whether the manual reviewers alone prove every required opinion (#2627).
+
+    A manual reviewer of an unknown family does not count, and an unknown
+    author family or an unknown commit provenance means no independence can be
+    proven at all: the designation then goes through the normal waiting path
+    (and its capacity alert), never a manual no-op that would look sufficient.
+    """
+    if not inputs.manual:
+        return False
+    required = int(inputs.policy.required)
+    if required == 0:
+        return True
+    if len(inputs.manual_seats) < required or inputs.unknown_authors:
+        return False
+    return not rd.unknown_families(inputs.authors)
+
+
 # --------------------------------------------------------------------------
 # the inputs of one freeze
 # --------------------------------------------------------------------------
 
-def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None) -> Inputs | Unavailable:
-    """Reads the machine inputs of a freeze; an expected refusal is `Unavailable`."""
+def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
+            fetch: bool = True) -> Inputs | Unavailable:
+    """Reads the machine inputs of a freeze; an expected refusal is `Unavailable`.
+
+    `fetch=False` keeps the read local (no `git fetch`), as the freeze
+    transaction requires."""
     item = work.get(db, int(lot))
     if item is None:
         return Unavailable("lot #%d not found" % int(lot))
@@ -421,7 +860,7 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None) -> Inputs | 
     frozen_sha = str(freeze.get("sha") or "").strip()
     if not frozen_sha:
         return Unavailable("freeze #%s names no commit" % (freeze.get("id"),))
-    repo = _repository(db, cfg, item, frozen_sha)
+    repo = _repository(db, cfg, item, frozen_sha, fetch=fetch)
     if not repo:
         return Unavailable("no repository holds the frozen head %s: cannot read the"
                            " frozen diff" % frozen_sha[:12])
@@ -436,6 +875,8 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None) -> Inputs | 
     if not project:
         return Unavailable("lot #%d declares no project: the review policy is unknown"
                            % int(lot))
+    manual = _manual(db, item)
+    waiver = _waiver(item)
     if not paths:
         # no changed file: no review is due, and no policy needs to be read
         return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=[],
@@ -443,25 +884,27 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None) -> Inputs | 
                       policy=Policy(rules=(), families=(), risk="light", required=0,
                                     ref="", commit="", source=""),
                       authors=[], unknown_authors=[], candidates=[], notify="",
-                      manual=[])
+                      manual=manual, waiver=waiver)
     policy = _policy(cfg, db, project, paths)
     if isinstance(policy, Unavailable):
         return policy
     listing = registry.overview(db)
     notify = _notify(cfg, db, project, listing)
+    families = policy.families or rd.KNOWN_FAMILIES
     candidates = rd.candidates_from_registry(
-        listing, loads=_loads(db), project=project,
-        families=policy.families or rd.KNOWN_FAMILIES)
+        listing, loads=_loads(db), project=project, families=families)
     if notify:
         # the pilot receives the capacity alert; the review stays with the
         # project's agents, so the two roles never collapse into one mail
         candidates = [candidate for candidate in candidates
                       if candidate.name != notify]
-    authors, unknown = _authors(db, item, freeze, commits)
+    authors, unknown = _authors(db, item, freeze, commits, repo,
+                                families=policy.families)
     return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=paths,
                   commits=commits, policy=policy, authors=authors,
                   unknown_authors=unknown, candidates=candidates, notify=notify,
-                  manual=_manual(db, item))
+                  manual=manual, waiver=waiver,
+                  manual_seats=_manual_seats(manual, listing, authors, families))
 
 
 # --------------------------------------------------------------------------
@@ -500,17 +943,20 @@ def _note_unavailable(db, item: Mapping, freeze: Mapping, why: str,
         "- Freeze: frozen milestone %s." % _freeze_label(freeze),
         "- Reason: %s" % why,
         "",
-        "Nothing is admitted implicitly. Fix the canon policy or the evidence, then",
-        "retry the designation for this same freeze:",
-        "  ameesh work reviewers %d --apply" % lot,
-        "The manual path remains available and journaled: ameesh work reviewer %d <agent>."
-        % lot,
+        "Nothing is admitted implicitly. If this lot is light, no pre-merge reviewer",
+        "is due (the other-family review happens after merge, canon §2). For a",
+        "normal or sensitive lot, fix the canon policy or the evidence, then retry",
+        "this same freeze:",
+        "  ameesh work reviewers %d --apply    (ameesh >= %s)" % (lot, RECOVERY_FROM),
+        "The manual path remains available and journaled on every installed version:",
+        "  ameesh work reviewer %d <agent>." % lot,
     ])
     mail.send(db, SENDER, notify, body, work_item_id=str(lot),
               payload={"review_designation": {
                   "lot": lot, "freeze": freeze_id,
                   "sha": str(freeze.get("sha") or ""), "state": "unavailable"}},
               after_commit=threads)
+
 
 
 def _marks(db, lot: int, *, freeze_id: Optional[int] = None,
@@ -572,6 +1018,44 @@ def _effective_mark(db, lot: int, freeze_id: int, *,
     return marks[-1] if marks else None
 
 
+
+def _note_none(db, item: Mapping, freeze: Mapping, why: str) -> None:
+    """Journal a light/no-review outcome once per freeze (#2561).
+
+    A light lot has no pre-merge reviewer (canon §2: the other family reviews
+    after merge). Without a mark the freeze kept no trace, and a pilot reading
+    "no reviewer" could take it for a failed designation and designate by hand.
+    The note is the explicit, machine-written explanation; no mail is sent
+    because nothing is expected from anyone.
+    """
+    lot = int((item or {}).get("id") or 0)
+    freeze_id = int(freeze.get("id") or 0)
+    since = float(freeze.get("at_ts") or 0.0)
+    prefix = "%s%d:%d:" % (NONE_PREFIX, lot, freeze_id)
+    if storage.of(db).work.events_noted(prefix, since, ids=[lot]):
+        return
+    storage.of(db).work.note(
+        lot, str((item or {}).get("state") or ""),
+        "%s automatic reviewer designation: none — %s" % (prefix, why), SENDER)
+
+
+def _none_outcome(db, lot: int, freeze: Mapping) -> Optional[dict]:
+    """The journaled light/no-review outcome of this freeze, or None."""
+    freeze_id = int((freeze or {}).get("id") or 0)
+    since = float((freeze or {}).get("at_ts") or 0.0)
+    prefix = "%s%d:%d:" % (NONE_PREFIX, int(lot), freeze_id)
+    try:
+        rows = storage.of(db).work.events_noted(prefix, since, ids=[int(lot)])
+    except Exception:  # noqa: BLE001 - unreadable journal: no recorded outcome
+        return None
+    if not rows:
+        return None
+    text = str((rows[-1] or {}).get("note") or "")
+    why = text.split("none — ", 1)[1] if "none — " in text else LIGHT_WHY
+    return {"state": rd.NONE, "required": 0, "reviewers": [], "why": why,
+            "freeze": dict(freeze or {})}
+
+
 def _previous_reviewers(db, lot: int, freeze_id: int) -> list:
     """The reviewers of the lot's automatic designations outside `freeze_id`.
 
@@ -627,12 +1111,13 @@ def _carried_shape(mark: Mapping) -> dict:
 
 
 def _latest_freeze(db, lot: int) -> Optional[dict]:
-    """The latest `frozen` milestone of the lot, as `{id, sha}`, or None."""
+    """The latest `frozen` milestone of the lot, or None."""
     row = plan_git.latest_freeze(
         storage.of(db).work.milestones(int(lot), pg.MILESTONES))
     if row is None:
         return None
-    return {"id": int(row["id"]), "sha": str(row.get("sha") or "").strip()}
+    return {"id": int(row["id"]), "sha": str(row.get("sha") or "").strip(),
+            "at_ts": row.get("at_ts"), "actor": row.get("actor") or ""}
 
 
 def _lock_current_freeze(db, lot: int, freeze: Mapping) -> bool:
@@ -801,7 +1286,8 @@ def _selection(inputs: Inputs, port, *, force: bool = False) -> dict:
         authors=inputs.authors, candidates=inputs.candidates,
         risk=inputs.policy.risk, base=inputs.base, policy_ref=inputs.policy.ref,
         notify=inputs.notify, unknown_authors=inputs.unknown_authors,
-        families=inputs.policy.families or rd.KNOWN_FAMILIES)
+        families=inputs.policy.families or rd.KNOWN_FAMILIES,
+        already=inputs.manual_seats, required=inputs.policy.required)
 
 
 def carried_plan(cfg, db, lot: int, sha: str) -> Optional[dict]:
@@ -898,6 +1384,32 @@ def _carried_in_transaction(tx, item: Mapping, freeze: Mapping,
     return out
 
 
+def _manual_outcome(db, item: Mapping, freeze: Mapping, manual: Sequence[str], *,
+                    waiver: bool = False) -> dict:
+    """The explicit manual no-op: keep the manual reviewers, add nobody (#2627).
+
+    The note says why no automatic reviewer was added. The column is synced
+    with an empty selection so a previous freeze's automatic names are retired
+    while the manual names survive (`_sync_reviewers` never removes a name that
+    no mark carries) and a `-none` waiver is never overridden.
+    """
+    lot = int((item or {}).get("id") or 0)
+    if waiver:
+        text = ("automatic reviewer designation skipped at freeze %s: manual"
+                " waiver (-none) is not overridden" % _freeze_label(freeze))
+        why = "manual waiver (-none)"
+    else:
+        text = ("automatic reviewer designation skipped at freeze %s: manual"
+                " reviewer(s) already cover the required review(s) (%s); the"
+                " manual designation remains the journaled exception"
+                % (_freeze_label(freeze), ", ".join(manual)))
+        why = "manual reviewer designation"
+    storage.of(db).work.note(lot, str((item or {}).get("state") or ""), text, SENDER)
+    _sync_reviewers(db, item, freeze, [])
+    return {"state": "manual", "reviewers": [], "freeze": dict(freeze or {}),
+            "why": why}
+
+
 def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
                              threads: list, carried: Optional[Mapping] = None) -> dict:
     """The `on_frozen` body: all writes stay in the freeze's transaction.
@@ -907,10 +1419,14 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
     courrier). Il est calculé avant le gel par `carried_plan` — la transaction
     ne fait aucune lecture réseau — et absent pour tout gel non réaligné.
 
-    A manual reviewer already designated makes the automatic path an explicit
-    no-op (the manual exception is journaled by its own command). Every
-    expected data problem is journaled and notified, never raised: a freeze is
-    a fact of the lot's timeline and must not be lost to a designation input.
+    The manual reviewers already designated are **kept** (#2627). The automatic
+    path completes them: it counts the manual seats that prove an independent
+    family, then designates only the missing ones with the same selection and
+    the same mail. It stays an explicit, journaled no-op only when the manual
+    reviewers already cover the required reviews, or when a `-none` waiver is
+    in force. Every expected data problem is journaled and notified, never
+    raised: a freeze is a fact of the lot's timeline and must not be lost to a
+    designation input.
 
     The selection writes inside a **savepoint**: an exception while the mails,
     the mark or the reviewer column are being written rolls the attempt back
@@ -925,22 +1441,20 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
     freeze.setdefault("id", 0)
     freeze.setdefault("sha", "")
     manual = _manual(tx, item)
-    if manual:
-        storage.of(tx).work.note(
-            int(lot), str(item.get("state") or ""),
-            "automatic reviewer designation skipped at freeze %s: manual"
-            " reviewer(s) already designated (%s); the manual designation"
-            " remains the journaled exception"
-            % (_freeze_label(freeze), ", ".join(manual)), SENDER)
-        return {"state": "manual", "reviewers": [], "freeze": freeze,
-                "why": "manual reviewer designation"}
+    if _waiver(item):
+        return _manual_outcome(tx, item, freeze, manual, waiver=True)
     if carried:
         return _carried_in_transaction(tx, item, freeze, carried)
     try:
-        inputs = prepare(cfg, tx, int(lot), freeze=freeze)
+        # no network read inside the freeze transaction (see the docstring)
+        inputs = prepare(cfg, tx, int(lot), freeze=freeze, fetch=False)
     except Exception as exc:  # noqa: BLE001 - recorded below, never guessed
+        if manual:
+            return _manual_outcome(tx, item, freeze, manual)
         return _internal_failure(cfg, tx, item, freeze, threads, exc)
     if isinstance(inputs, Unavailable):
+        if manual:
+            return _manual_outcome(tx, item, freeze, manual)
         if not inputs.silent:
             notify = _notify(cfg, tx, str(item.get("app") or ""),
                              registry.overview(tx))
@@ -948,14 +1462,16 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
             _sync_reviewers(tx, item, freeze, [])
         return {"state": "unavailable", "reviewers": [], "freeze": freeze,
                 "why": inputs.why}
+    if _manual_covers(inputs):
+        return _manual_outcome(tx, item, freeze, inputs.manual)
     checkpoint = len(threads)
     _savepoint(tx)
     try:
         if not inputs.paths or inputs.policy.required == 0:
             out = {"state": rd.NONE, "required": 0, "reviewers": [],
                    "freeze": freeze,
-                   "why": ("light lot: no review before merge" if inputs.paths
-                           else "no changed path: no review due")}
+                   "why": LIGHT_WHY if inputs.paths else NO_PATH_WHY}
+            _note_none(tx, item, freeze, out["why"])
             _sync_reviewers(tx, item, freeze, [])
         else:
             out = _selection(inputs, pg.PgPort(tx, after_commit=threads))
@@ -1055,9 +1571,9 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                   "at_ts": row.get("at_ts"), "actor": row.get("actor") or ""}
     freeze = dict(freeze)
     manual = _manual(db, item)
-    if manual:
+    if _waiver(item):
         return {"state": "manual", "reviewers": [], "freeze": freeze,
-                "why": "manual reviewer(s) designated: %s" % ", ".join(manual)}
+                "why": "manual waiver (-none)"}
     if not force:
         effective = _effective_mark(db, int(lot), int(freeze.get("id") or 0),
                                     since_ts=float(freeze.get("at_ts") or 0.0))
@@ -1080,6 +1596,10 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     try:
         inputs = prepare(cfg, db, int(lot), freeze=freeze)
         if isinstance(inputs, Unavailable):
+            if manual:
+                return {"state": "manual", "reviewers": [], "freeze": freeze,
+                        "why": "manual reviewer(s) designated: %s"
+                               % ", ".join(manual)}
             if not inputs.silent:
                 notify = _notify(cfg, db, str(item.get("app") or ""),
                                  registry.overview(db))
@@ -1091,15 +1611,19 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                 _drain(db, threads)
             return {"state": "unavailable", "reviewers": [], "freeze": freeze,
                     "why": inputs.why}
+        if _manual_covers(inputs):
+            return {"state": "manual", "reviewers": [], "freeze": freeze,
+                    "why": "manual reviewer(s) already cover the required review(s): %s"
+                           % ", ".join(inputs.manual)}
         if not inputs.paths or inputs.policy.required == 0:
+            why = LIGHT_WHY if inputs.paths else NO_PATH_WHY
             with db.transaction() as tx:
                 if not _lock_current_freeze(tx, int(lot), freeze):
                     return _stale(freeze)
+                _note_none(tx, item, freeze, why)
                 _sync_reviewers(tx, item, freeze, [])
             return {"state": rd.NONE, "required": 0, "reviewers": [],
-                    "freeze": freeze,
-                    "why": "light lot: no review before merge" if inputs.paths
-                    else "no changed path: no review due"}
+                    "freeze": freeze, "why": why}
         with db.transaction() as tx:
             out = _selection(inputs, pg.PgPort(tx, after_commit=threads,
                                                 at_freeze=False), force=force)
@@ -1154,6 +1678,196 @@ def reviewers(cfg, db, lot: int, *, apply: bool = False) -> dict:
         out["designation"] = (_carried_shape(effective[2])
                               if effective[1] == "carried"
                               else dict(effective[2]))
+    else:
+        # #2561: a light freeze has no mark; its journaled no-review outcome
+        # is the explanation the CLI and the pilot read.
+        none = _none_outcome(db, int(lot), freeze)
+        if none is not None:
+            out["designation"] = none
     if apply:
         out["applied"] = designate(cfg, db, int(lot), freeze=freeze)
+    return out
+
+
+def _retry_resolved(db, lot: int, freeze: Mapping) -> bool:
+    """True when this freeze already has a final outcome.
+
+    A manual designation, a `none` note or a designated/light mark is final. A
+    `waiting` mark is not: capacity or evidence may have returned, which is
+    exactly what a retry is for (#1617).
+    """
+    try:
+        item = work.get(db, int(lot))
+        if item is not None and _manual(db, item):
+            return True
+    except Exception:  # noqa: BLE001 - unreadable manual list: retry the freeze
+        pass
+    freeze_id = int((freeze or {}).get("id") or 0)
+    since = float((freeze or {}).get("at_ts") or 0.0)
+    try:
+        if storage.of(db).work.events_noted(
+                "%s%d:%d:" % (NONE_PREFIX, int(lot), freeze_id), since, ids=[int(lot)]):
+            return True
+    except Exception:  # noqa: BLE001 - unreadable journal: let `designate` decide
+        pass
+    # #2487: the effective mark of the freeze can be a carried one (verdicts
+    # reported from an earlier head); it is final too, exactly like a
+    # designation. A waiting selection is retried.
+    marks = _marks(db, int(lot), freeze_id=freeze_id, since_ts=since)
+    if not marks:
+        return False
+    effective = marks[-1]
+    if effective[1] == "carried":
+        return True
+    return str((effective[2] or {}).get("state") or "") in (rd.DESIGNATED, rd.NONE)
+
+
+def _retry_cursor_path(cfg) -> str:
+    """The retry cursor file, under the host state directory (never a repo)."""
+    state = str(getattr(cfg, "state_dir", "") or "").strip()
+    return os.path.join(state, RETRY_CURSOR) if state else ""
+
+
+def _read_retry_cursor(cfg) -> int:
+    """The last unavailable note examined, or 0 when absent/unreadable."""
+    path = _retry_cursor_path(cfg)
+    if not path:
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            value = int(str(handle.read(64)).strip() or 0)
+    except (OSError, ValueError):
+        return 0
+    return max(0, value)
+
+
+def _write_retry_cursor(cfg, cursor: int) -> None:
+    """Atomically records the cursor; a state problem never fails the retry."""
+    path = _retry_cursor_path(cfg)
+    if not path:
+        return
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write("%d\n" % max(0, int(cursor)))
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _retry_notes(db, after: int, *, scan: int = RETRY_SCAN) -> list:
+    """The unavailable notes after `after`, oldest first (a bounded window).
+
+    Ordering oldest first is what gives the cursor a direction: a pass resumes
+    after the last examined note and pages forward, wrapping once. The window
+    is bounded, so a large backlog is walked over several passes instead of
+    reading the whole journal at once."""
+    return db.query(
+        "SELECT e.id, e.work_item_id, e.note FROM work_item_events e"
+        " JOIN work_items w ON w.id = e.work_item_id"
+        " WHERE e.note LIKE %s"
+        "   AND e.created_at >= now() - interval '30 days'"
+        "   AND w.state NOT IN ('merged', 'promoted', 'closed')"
+        "   AND e.id > %s"
+        " ORDER BY e.id ASC LIMIT %s",
+        (UNAVAILABLE_PREFIX + "%", int(after), int(scan)))
+
+
+def retry_pending(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
+    """Retries the latest freeze of lots whose designation was journaled unavailable.
+
+    #2561: the policy and the frozen head can become readable *after* the freeze
+    (canon publication then sync; the worktree found once the agent's other
+    checkout exists). The freeze is kept, so the recovery replays the same head
+    — never a selection on a newer one. Bounded, idempotent, and it never raises:
+    the caller (the runner after a successful canon sync) only logs the summary.
+    A waiting mark is retried (capacity may be back); a designated or light
+    outcome is skipped.
+
+    The pass is a **fair slice** of the queue, not the newest 20 notes again:
+    `RETRY_CURSOR` keeps the last note examined, the pass resumes after it and
+    wraps at the end. A resolved lot (manual, `none`, carried or designated) is
+    skipped without consuming an attempt, and a note that no longer matches the
+    lot's latest freeze is skipped too; neither can hold a slot forever. A
+    blocked or unavailable lot itself does not vanish: it is seen again on the
+    next turn of the cursor. A new freeze's note is a new id, so the cursor
+    reaches it on its next turn; the link to the freeze is re-read on every
+    pass, never stored in the cursor.
+    """
+    out = {"attempted": 0, "designated": 0, "waiting": 0, "none": 0,
+           "unavailable": 0, "manual": 0, "stale": 0, "skipped": 0,
+           "errors": [], "summary": ""}
+    try:
+        limit = max(0, int(limit))
+    except (TypeError, ValueError):
+        limit = RETRY_LIMIT
+    cursor = _read_retry_cursor(cfg)
+    try:
+        rows = _retry_notes(db, cursor)
+        if not rows and cursor:
+            # end of the queue: start the next turn at the oldest note
+            cursor = 0
+            rows = _retry_notes(db, 0)
+    except Exception as exc:  # noqa: BLE001 - a retry never breaks the caller
+        out["errors"].append("%s: %s" % (type(exc).__name__, str(exc)[:200]))
+        out["summary"] = "no retry: journal unreadable"
+        return out
+    seen: set[int] = set()
+    last = cursor
+    attempted = 0
+    for row in rows or ():
+        try:
+            lot = int(row.get("work_item_id") or 0)
+            note_id = int(row.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        match = _RETRY_NOTE.match(str(row.get("note") or ""))
+        if not match or int(match.group(1)) != lot or lot in seen:
+            last = max(last, note_id)
+            continue
+        freeze_id = int(match.group(2))
+        latest = _latest_freeze(db, lot)
+        if latest is None or int(latest.get("id") or 0) != freeze_id:
+            out["skipped"] += 1
+            last = max(last, note_id)
+            continue
+        seen.add(lot)
+        try:
+            resolved = _retry_resolved(db, lot, latest)
+        except Exception as exc:  # noqa: BLE001 - one lot never stops the pass
+            out["errors"].append("#%d: %s: %s"
+                                 % (lot, type(exc).__name__, str(exc)[:160]))
+            last = max(last, note_id)
+            continue
+        if resolved:
+            out["skipped"] += 1
+            last = max(last, note_id)
+            continue
+        if attempted >= limit:
+            # budget spent: this note stays for the next turn of the cursor
+            break
+        attempted += 1
+        out["attempted"] = attempted
+        last = max(last, note_id)
+        try:
+            result = designate(cfg, db, lot, freeze=latest)
+        except Exception as exc:  # noqa: BLE001 - one lot never stops the pass
+            out["errors"].append("#%d: %s: %s"
+                                 % (lot, type(exc).__name__, str(exc)[:160]))
+            continue
+        state = str((result or {}).get("state") or "")
+        if state in out:
+            out[state] += 1
+    # Always move past what this pass examined, even when no lot was attempted:
+    # the next pass must not re-read the same resolved/stale notes.
+    if last > cursor or cursor == 0:
+        _write_retry_cursor(cfg, last)
+    out["summary"] = ("%d attempted: %d designated, %d waiting, %d none,"
+                      " %d unavailable, %d manual, %d stale, %d skipped"
+                      % (attempted, out["designated"], out["waiting"],
+                         out["none"], out["unavailable"], out["manual"],
+                         out["stale"], out["skipped"]))
     return out

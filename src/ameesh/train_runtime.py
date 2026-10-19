@@ -13,7 +13,8 @@ from .train import TrainError, digest, identity, ordered
 
 class Runtime:
     def __init__(self, *, ledger, repository, ci, fires, admissions, target,
-                 policy, notify, inventory=None, enrollment=None, migrations=None):
+                 policy, notify, inventory=None, enrollment=None, migrations=None,
+                 prevalidation=None):
         target = merge_queue._remote_branch(target)
         if ledger.key != land.lock_key(repository.project, target) or fires.ledger is not ledger:
             raise TrainError("runtime adapters must share the exact target reservation")
@@ -32,6 +33,11 @@ class Runtime:
         self.target_branch, self.policy, self.notify = target, policy, notify
         self.inventory, self.enrollment = inventory, enrollment
         self.migrations = migrations
+        #: #2644 : la prévalidation de la composition, appelée avant toute
+        #: publication ; None = pas d'accroche (banc, mode sans train).
+        if prevalidation is not None and not callable(prevalidation):
+            raise TrainError("explicit train prevalidation port required")
+        self.prevalidation = prevalidation
         self.enrollment_result = None
 
     def enroll(self, epoch):
@@ -124,6 +130,12 @@ class Runtime:
             self.validate_transports(plan)
 
     def publish(self, plan, epoch):
+        # #2644 : la prévalidation passe avant la publication, donc avant de
+        # tenir le bail et de renouveler la réservation : un run long ne fait
+        # pas expirer l'époque. Un rouge lève avant tout effet distant ; une
+        # indisponibilité est signalée par le port et la CI reste la preuve.
+        if self.prevalidation is not None:
+            self.prevalidation(plan["head"], plan["base"])
         self._current(plan)
         self._held(epoch)
         if hasattr(self.ledger, "before_publish"):

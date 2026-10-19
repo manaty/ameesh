@@ -19,8 +19,8 @@
   agent-mesh work add --title T [--type bug|evolution] [--app A] [--assignee N] …
   agent-mesh work list [--state S] | work show <id> | work move <id> <state> | work note <id> "…"
   agent-mesh work assign <id> <agent> [--externe] [--actor A]   reassign (guarded assignment)
-  agent-mesh work merged <id> --sha S [--note …]   merge done outside a PR: any open state → merged
-  agent-mesh work migration <id> [--number N | --release] [--skip-branch B]   reserve the work item's migration number (L122)
+  agent-mesh work merged <id> --sha S | --pr owner/repo#N [--note …]   merge done outside a PR: any open state → merged
+  agent-mesh work migration <id> [--number N] [--release [--number N]] [--skip-branch B]   reserve one of the work item's migration numbers (L122, #2481)
   agent-mesh work issue-ref <id> owner/repo#N | --none   correct the issue reference, journaled (#1603)
   agent-mesh work resolve <id> --with <other> [--done | --abort]   prepared conflict resolution (L160d)
   agent-mesh work queue add|remove <id> | show [--target T]   merge queue per target (L160e)
@@ -1904,13 +1904,22 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                                           skip_branches=tuple(args.skip_branch or ()))
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
-            elif item.get("migration") is None:
+            elif not item.get("migration"):
                 print("lot #%d: no migration reserved" % item["id"])
-            else:
+            elif len(item.get("migrations") or ()) <= 1:
                 print("lot #%d: migration %s reserved in %s — file %s" % (
                     item["id"], item["migration_label"], item["migration_repo"],
                     item.get("migration_file") or "<migrations>/%s_<name>.sql"
                     % item["migration_label"]))
+            else:
+                rows = item["migrations"]
+                print("lot #%d: migrations %s reserved in %s" % (
+                    item["id"], ", ".join(row["label"] for row in rows),
+                    ", ".join(sorted({row["repo"] for row in rows}))))
+                for row in rows:
+                    print("  %s — file %s" % (
+                        row["label"], row.get("file")
+                        or "<migrations>/%s_<name>.sql" % row["label"]))
             return 0
         if args.work_command == "move":
             item = work.move(db, args.id, args.state, note=args.note or "", actor=args.actor,
@@ -1984,6 +1993,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     print("warning: %s" % item["reviewer_request_warning"], file=sys.stderr)
             return 0
         if args.work_command == "merged":
+            if not (args.sha or args.pr):
+                print("ameesh work merged: --sha S or --pr owner/repo#N", file=sys.stderr)
+                return 2
+
             def _declare_constat(constat: dict) -> None:
                 # #1400 : le constat (lot/app/titre + sujet du commit, et la
                 # forme de la preuve) est montré AVANT l'écriture ; l'état du
@@ -1993,9 +2006,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("commit %s (%s): %s"
                       % (constat["sha"][:12], constat["how"], constat["subject"]))
 
-            done = work.merged(db, args.id, sha=args.sha, note=args.note or "",
-                               actor=args.actor, repo=args.repo, migration_landed=args.migration_landed,
-                               cfg=cfg, announce=_declare_constat)
+            done = work.merged(db, args.id, sha=args.sha or "", note=args.note or "",
+                               actor=args.actor, repo=args.repo,
+                               migration_landed=args.migration_landed,
+                               cfg=cfg, announce=_declare_constat, pr=args.pr)
             if done["result"] == "already":
                 print("lot #%d already %s: nothing to do" % (args.id, done["item"]["state"]))
             elif done["result"] == "landed":
@@ -2003,7 +2017,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     args.id, done["item"]["state"], done["detail"]))
             else:
                 print("lot #%d → merged (commit %s, declared by %s)" % (
-                    args.id, args.sha.strip().lower()[:12], args.actor))
+                    args.id, (done.get("sha") or args.sha or "?")[:12], args.actor))
                 print("%s: %s" % (done["item"].get("app") or "?", done["item"]["title"]))
             return 0
         if args.work_command == "note":
@@ -2093,8 +2107,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 note = freeze_checks.before_freeze(
                     cfg, db, args.id, args.sha or "", repo=args.repo,
                     skip=args.no_static_checks, note=note)
-            elif args.repo is not None or args.no_static_checks is not None:
-                raise work.WorkError("--repo and --no-static-checks only apply to a freeze")
+            elif args.repo is not None or args.no_static_checks is not None \
+                    or args.prevalidation_map:
+                raise work.WorkError("--repo, --no-static-checks and --prevalidation-map "
+                                     "only apply to a freeze")
             row = work.milestone(
                 db, args.id, args.kind, sha=args.sha or "", actor=args.actor or "",
                 verdict=args.verdict, note=note, outcome=outcome)
@@ -2134,6 +2150,20 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                       % ", ".join(r.get("name") for r in outcome.get("reviewers") or ()))
             elif state == "unavailable":
                 print("review designation unavailable: %s" % (outcome.get("why") or ""))
+            elif state == "none":
+                # #2561: a light lot has no pre-merge reviewer; say why instead
+                # of printing nothing and letting "no reviewer" look like a failure
+                print("review: none — %s" % (outcome.get("why") or ""))
+            if args.kind == "frozen":
+                # #2644 : le résultat de prévalidation s'attache au gel, après
+                # le jalon et la désignation. Il ne défait jamais le gel : le
+                # run peut être rouge, incomplet ou indisponible, la frise est
+                # déjà écrite et l'échec est journalisé.
+                from . import prevalidation_calls
+                prevalidation_calls.after_freeze(
+                    cfg, db, args.id, row.get("sha") or args.sha or "",
+                    repo=args.repo or "",
+                    map_path=args.prevalidation_map or "")
             return 0
         print(USAGE_HINT % "unknown work subcommand", file=sys.stderr)
         return 2
@@ -2808,6 +2838,13 @@ def build_parser() -> argparse.ArgumentParser:
                                "ran, none green (red or cancelled): explicit resumption")
     p_ci_run.add_argument("--repo", default="", help="owner/name (default: the lot's "
                           "issue_ref or github.projects)")
+    p_ci_run.add_argument("--prevalidation-repo", default="",
+                          help="#2644: the tree carrying the packet head (default: cwd, "
+                               "then the assignee's worktree, then the project repository)")
+    p_ci_run.add_argument("--prevalidation-map", default="",
+                          help="#2644: measured map (carte.json.gz) for the L161f plan; "
+                               "absent, the last carte artifact is used, or the prevalidation "
+                               "is reported unavailable (never blocking)")
     p_ci_run.add_argument("--dry-run", action="store_true",
                           help="decide and print, pose no label")
     p_ci_run.add_argument("--json", action="store_true", help="`ameesh-ci-gel/1` report")
@@ -3004,20 +3041,23 @@ def build_parser() -> argparse.ArgumentParser:
                           "before writing the file; idempotent, visible in work show")
     pw_mig.add_argument("id", type=int)
     pw_mig.add_argument("--number", type=int, default=None,
-                        help="reserve this exact number (refused if it already exists in the "
-                             "lot's repository or is reserved by another work item)")
+                        help="reserve this exact number (refused if it already exists on the "
+                             "lot's target branch or is reserved by another work item; branches "
+                             "not merged into the target do not count, #2620); added to the "
+                             "lot's other reservations (#2481)")
     pw_mig.add_argument("--release", action="store_true",
-                        help="release the reservation (the work item no longer adds a migration)")
+                        help="release all the lot's reservations, or only --number when given "
+                             "(the work item no longer adds those migrations)")
     pw_mig.add_argument("--repo", default=None,
                         help="local clone of the lot's repository (that of its issue), whose "
                              "worktree and branches count (default: the clone declared in "
                              "radar.projects, else the current git repository; its origin "
                              "must be the lot's repository)")
     pw_mig.add_argument("--skip-branch", action="append", default=None, metavar="BRANCH",
-                        help="also ignore this branch in the scan, in addition to the lot's own "
-                             "branch (repeatable): the integration branch of a package being "
-                             "composed, whose renumbered files must not count against the "
-                             "reservation (#1603)")
+                        help="also ignore this branch in the next-free scan, in addition to the "
+                             "lot's own branch (repeatable): the integration branch of a package "
+                             "being composed, whose renumbered files must not count against the "
+                             "reservation (#1603); an exact number reads the target only (#2620)")
     pw_mig.add_argument("--json", action="store_true")
     pw_mig.add_argument("--actor", default="",
                         help="default: the session's bound identity (AGENT_MAIL_NAME)")
@@ -3071,9 +3111,16 @@ def build_parser() -> argparse.ArgumentParser:
     pw_reviewers.set_defaults(func=cmd_work)
     pw_merged = work_sub.add_parser(
         "merged", help="declare a work item merged outside a PR and without freeze (local merge "
-                       "on the target): any open state → merged, merged milestone with the commit")
+                       "on the target), or by a merged PR of another repository: any open state "
+                       "→ merged, merged milestone with the commit")
     pw_merged.add_argument("id", type=int)
-    pw_merged.add_argument("--sha", required=True, help="the merge commit")
+    pw_merged.add_argument("--sha", default="",
+                           help="the merge commit (required without --pr; with --pr, an equality "
+                                "check on the reported merge commit)")
+    pw_merged.add_argument("--pr", default=None, metavar="OWNER/REPO#N",
+                           help="#2603: a merged PR outside the lot's repository (canon, home); "
+                                "its head must be the lot's freeze, and its merge commit must be "
+                                "in the repository's default branch")
     pw_merged.add_argument("--migration-landed", type=int, default=None, metavar="N",
                            help="the migration number that actually landed (L122/#1567), when "
                                 "the landing renumbered the reservation; recorded with the "
@@ -3193,6 +3240,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_ms.add_argument("--repo", default=None,
                        help="frozen: the repository holding --sha (default: the current "
                             "directory, then the lot's project repository)")
+    pw_ms.add_argument("--prevalidation-map", default="",
+                       help="#2644: measured map (carte.json.gz) for the freeze "
+                            "prevalidation; default: the last carte artifact")
     pw_ms.add_argument("--no-static-checks", dest="no_static_checks", default=None,
                        metavar="REASON",
                        help="frozen: freeze without the project's static checks "
@@ -3518,6 +3568,12 @@ def cmd_accounts(cfg: Config, args) -> int:
                 print("no account declared for %s (key `accounts` of the host "
                       "configuration)" % args.harness, file=sys.stderr)
                 return 1
+            # #2572 (#313 N2) : un compte refusé par la politique de partage
+            # (`account_sharing: strict`, `accounts_shared: refuse`) est refusé
+            # ici, avec sa raison, au lieu d'être forcé puis rendu sans
+            # placement au tour suivant.
+            from . import account_claims
+            items = account_claims.mark_refused(cfg, items, db=db)
             accounts_mod.force(db, cfg.host, args.harness, items, args.account, by=qui)
             texte = ("Account %s forced for %s on %s by %s: no automatic choice "
                      "until \"ameesh accounts auto\"." % (args.account, args.harness,

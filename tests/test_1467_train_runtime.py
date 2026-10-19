@@ -114,6 +114,41 @@ class TrainRuntimeTest(PgTestCase):
         self.assertEqual(self.repository.publish.call_args.kwargs["workflows"], self.ci.workflows)
         self.repository.promote.assert_called_once()
 
+    def test_prevalidation_runs_before_publication(self):
+        # #2644 : le port est appelé avant tout effet distant, donc avant le
+        # bail et la publication ; une indisponibilité est décidée par le port.
+        seen = []
+
+        def port(head, base):
+            seen.append((head, base, self.repository.publish.called))
+
+        self.runtime = self.runtime_for(prevalidation=port)
+        self.engine = self.engine_for(self.runtime)
+        plan, _fire = self.ready()
+        outcome = self.engine.step(3602)
+        self.assertEqual(outcome["result"], "landed", outcome)
+        self.assertEqual(seen, [(plan["head"], plan["base"], False)])
+        self.repository.publish.assert_called_once()
+
+    def test_prevalidation_red_prevents_publication(self):
+        # B1 dev1 : un rouge exécuté est un résultat, pas une publication
+        # incertaine ; le paquet est arrêté (paused, terminal) et la
+        # réservation rendue, sans rejouer la composition.
+        def port(head, base):
+            raise train.PrevalidationRed("run-red: tests.test_x")
+
+        self.runtime = self.runtime_for(prevalidation=port)
+        self.engine = self.engine_for(self.runtime)
+        outcome = self.engine.step(3600)
+        self.assertEqual(outcome["result"], "paused", outcome)
+        self.assertIn("tests.test_x", outcome.get("error") or "")
+        self.repository.publish.assert_not_called()
+        self.ci.start.assert_not_called()
+        state = self.ledger.load()
+        self.assertEqual(state["phase"], "paused")
+        self.assertEqual(state["diagnosis"],
+                         {"stage": "prevalidation", "why": "run-red: tests.test_x"})
+
     def test_migration_mapping_is_persisted_and_recorded_after_promotion(self):
         # #2400: composition reserves and the runtime records the landed
         # number only after a confirmed promotion, then frees it.
