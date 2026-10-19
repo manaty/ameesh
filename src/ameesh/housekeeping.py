@@ -3849,6 +3849,14 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                     skipped.append("tmp %s kept: changed during the pass" % full)
                     continue
                 if orphan:
+                    # #2704 : un dossier utilisé par un processus vivant
+                    # (AppImage extraite et lancée hors tour) n'est jamais
+                    # supprimé, même ancien et sans copie git : ses fichiers
+                    # projetés en mémoire (/proc/<pid>/maps) le trahissent.
+                    held = held_by_user(full)
+                    if held:
+                        skipped.append("tmp %s kept: %s" % (full, held))
+                        continue
                     size = size_of(full)          # avant tout retrait : total libéré
                     # #2493 (N2) : un dossier qui porte une copie git n'est
                     # supprimé qu'après la preuve qu'aucun travail n'y est à
@@ -3878,14 +3886,6 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                                 skipped.append("tmp %s kept: git worktree removal "
                                                "refused — %s" % (full, error))
                                 continue
-                    # #2704 : un dossier utilisé par un processus vivant
-                    # (AppImage extraite et lancée hors tour) n'est jamais
-                    # supprimé, même ancien et sans copie git : ses fichiers
-                    # projetés en mémoire (/proc/<pid>/maps) le trahissent.
-                    held = held_by_user(full)
-                    if held:
-                        skipped.append("tmp %s kept: %s" % (full, held))
-                        continue
                     plan.append({"kind": "tmp", "path": full, "agent": agent,
                                  "action": "suppression", "bytes": size,
                                  "detail": "agent not in the registry"})

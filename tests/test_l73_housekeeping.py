@@ -775,6 +775,29 @@ class MenageDbTest(PgTestCase):
         self.assertTrue(any("kept: held by process" in note
                             for note in rapport["skipped"]), rapport["skipped"])
 
+    def test_processus_tmp_verifie_avant_retrait_des_worktrees(self):
+        """#2704 : récupérer un worktree le supprime déjà ; la garde des
+        fichiers projetés doit donc précéder cette récupération."""
+        pol = menage.Policy()
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        root = os.path.join(troot, "ancien-agent")
+        os.makedirs(root)
+        menage._write_owner(troot, "ancien-agent", menage.mesh_key(self.cfgl),
+                            menage.ORIGIN_CREATED)
+        procs = platform.UserPaths()
+        procs.paths[os.path.join(root, "copie", "lib.node")] = "123 electron"
+        with mock.patch.object(platform, "user_paths", return_value=procs), \
+                mock.patch.object(menage, "_git_copies_report",
+                                  return_value=([os.path.join(root, "copie")], "")), \
+                mock.patch.object(menage, "tmp_git_work", return_value=""), \
+                mock.patch.object(menage, "recover_tmp_git_copies",
+                                  return_value=(True, "", [])) as recover:
+            menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t",
+                            now=time.time() + 30 * 24 * 3600)
+        recover.assert_not_called()
+        self.assertTrue(os.path.isdir(root))
+
     def test_dossier_tmp_tenu_par_un_processus_n_est_pas_evince(self):
         """#2704 : le quota ne libère pas les fichiers d'un dossier temporaire
         qu'un processus vivant utilise (AppImage extraite et lancée)."""
