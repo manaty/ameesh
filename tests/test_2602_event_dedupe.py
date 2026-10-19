@@ -19,7 +19,7 @@ class SloDeliveryTest(unittest.TestCase):
         self.store = mock.Mock()
         self.listing = [dict(name=n, team="ameesh", mode="execute")
                         for n in ("dev", "pilot", "auditeur", "bureau")]
-        self.listing[-1]["mode"] = "external"
+        self.listing[-1]["mode"] = "externe"
         self.store.operations.listing.side_effect = lambda: self.listing
         self.item = dict(state="build", assignee="dev")
         self.store.work.get.side_effect = lambda lot: self.item

@@ -448,14 +448,15 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         bureau = by_name.get("bureau") or {}
         # #2602: the external desk cannot read automatic mail; home host
         # operations are the exception, since they can require that desk.
+        # `registry.MODES`: a human-driven session is `externe` (0030).
         if "bureau" in roles and bureau and (
-                bureau.get("mode") != "external" or alert.get("project") == "home"):
+                bureau.get("mode") != "externe" or alert.get("project") == "home"):
             out.setdefault("bureau", text)
         if "auditeur" in roles:
             for name in auditor_names or ():
                 if name in by_name:
                     out.setdefault(name, text)
-        if bureau.get("mode") == "external" and alert.get("project") != "home":
+        if bureau.get("mode") == "externe" and alert.get("project") != "home":
             out.pop("bureau", None)  # also when listed as pilot or auditor
         return out
     else:

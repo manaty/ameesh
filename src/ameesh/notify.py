@@ -1838,7 +1838,7 @@ class Notifier:
                 continue
             if kind == "slo_breach" and "bureau" in (alert.get("targets") or ()) \
                     and alert.get("project") != "home" and any(
-                        row.get("name") == "bureau" and row.get("mode") == "external"
+                        row.get("name") == "bureau" and row.get("mode") == "externe"
                         for row in listing):
                 # Keep the desk's copy in the readable lot thread, without
                 # growing a mailbox nobody wakes to read.
