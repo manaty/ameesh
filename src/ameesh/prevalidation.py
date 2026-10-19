@@ -207,6 +207,11 @@ class Selection:
                 outcome = "run-red"
                 causes.append("run-red")
                 detail.append("parts rouges: %s" % ", ".join(red[:4]))
+                failed = [str(t) for t in (flow.get("failed") or ())]
+                if failed:
+                    detail.append("tests en échec: %s%s"
+                                  % (", ".join(failed[:6]),
+                                     " (+%d)" % (len(failed) - 6) if len(failed) > 6 else ""))
             elif unfinished:
                 outcome = "run-incomplete"
                 causes.append("run-incomplete")
@@ -237,6 +242,7 @@ class Selection:
             "tests": flow.get("tests"),
             "host": host, "outcome": outcome,
             "exit": run.get("exit"), "seconds": run.get("seconds"),
+            "failed": list(flow.get("failed") or ()),
             "causes": unique, "ok": not unique, "detail": detail,
         }
         if tree is not None:
@@ -365,20 +371,28 @@ def selection(plan: dict, *, head: str, base: str = "", plan_path: str = "") -> 
                      causes=tuple(unique), why=" ; ".join(why), plan_path=plan_path)
 
 
-def host_allowed(host: str, *, local: str | None = None, deny: Sequence[str] = ()) -> tuple[bool, str]:
-    """L'hôte est-il une VM d'agents (jamais le poste local, jamais un déni) ?
+def host_allowed(host: str, *, local: str | None = None, deny: Sequence[str] = (),
+                 declared: Sequence[str] = ()) -> tuple[bool, str]:
+    """L'hôte est-il une VM d'agents (jamais le poste local non déclaré) ?
 
     `local` : nom de l'hôte courant ; `deny` : motifs d'hôtes interdits
-    (configuration, `AMEESH_PREVALIDATION_DENY`). Une chaîne vide est
-    refusée : sans hôte, l'offload retomberait localement."""
+    (configuration, `AMEESH_PREVALIDATION_DENY`) ; `declared` : les hôtes du
+    bloc canon. Un hôte local **déclaré au canon** est une VM d'agents (le
+    mesh) et reste admis : décision pilote du 19/10 (#2644) pour que les
+    accroches puissent tourner depuis `ameesh-agents-1` ; un poste non déclaré
+    reste refusé. Une chaîne vide est refusée : sans hôte, l'offload
+    retomberait localement."""
     name = (host or "").strip()
     if not name:
         return False, "no-vm"
     bare = name.rsplit("@", 1)[-1].split(":", 1)[0].strip().lower()
     if not bare:
         return False, "no-vm"
+    allowed_local = {str(item).rsplit("@", 1)[-1].split(":", 1)[0].strip().lower()
+                     for item in (declared or ())}
     here = (local if local is not None else (os.uname().nodename or "")).strip().lower()
-    if here and (bare == here or here.startswith(bare + ".") or bare.startswith(here + ".")):
+    if here and (bare == here or here.startswith(bare + ".") or bare.startswith(here + ".")) \
+            and bare not in allowed_local:
         return False, "no-vm"
     for pattern in deny:
         motif = (pattern or "").strip().lower()
@@ -589,9 +603,11 @@ def parse_flow(text: str) -> dict:
     """Le flux `ameesh-test-event/1` lu dans la sortie distante.
 
     Rend les modules réellement exécutés (événements `test`), le nombre de
-    tests, les statuts de fin par part et les parts vues. Un part sans
-    événement `fin` reste visible : c'est un run incomplet, jamais un vert."""
+    tests, les tests en échec (nom complet, pour le refus nommé), les statuts
+    de fin par part et les parts vues. Un part sans événement `fin` reste
+    visible : c'est un run incomplet, jamais un vert."""
     modules: set = set()
+    failed: list[str] = []
     parts: list[str] = []
     fins: list[str] = []
     fins_par_part: dict = {}
@@ -619,6 +635,12 @@ def parse_flow(text: str) -> dict:
             tests += 1
             if event.get("module"):
                 modules.add(str(event["module"]))
+            if str(event.get("statut") or "") in ("echec", "erreur",
+                                                  "succes_inattendu") \
+                    and event.get("test"):
+                nom = str(event["test"])
+                if nom not in failed:
+                    failed.append(nom)
         elif kind == "fin":
             statut = str(event.get("statut") or "")
             fins.append(statut)
@@ -626,8 +648,8 @@ def parse_flow(text: str) -> dict:
                 fins_par_part[part] = statut
                 if part not in parts:
                     parts.append(part)
-    return {"modules": tuple(sorted(modules)), "tests": tests, "parts": tuple(parts),
-            "fins": tuple(fins), "fins_par_part": fins_par_part}
+    return {"modules": tuple(sorted(modules)), "failed": tuple(failed), "tests": tests,
+            "parts": tuple(parts), "fins": tuple(fins), "fins_par_part": fins_par_part}
 
 
 def parse_seconds(text: str) -> float | None:
@@ -774,12 +796,15 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
     Refuse avant tout run un hôte hors du canon, un contrat déclaré introuvable
     ou une sélection élargie ; aucun repli local, aucune écriture de jalon. Le
     rapport rendu n'est pas un verdict (#1617, #1756)."""
-    if not isinstance(lot, int) or lot <= 0:
+    #: lot 0 : une composition de train, sans lot de paquet (rapport non
+    #: persisté, cf. #2644) ; un identifiant négatif reste refusé.
+    if not isinstance(lot, int) or isinstance(lot, bool) or lot < 0:
         raise PrevalidationError("selection-unsafe", "lot invalide: %r" % (lot,))
     name = (host or "").strip()
     if name not in tuple(getattr(params, "hosts", ()) or ()):
         raise PrevalidationError("no-vm", "hôte %r hors des hôtes déclarés au canon" % name)
-    allowed, why = host_allowed(name, local=local)
+    allowed, why = host_allowed(name, local=local,
+                                declared=tuple(getattr(params, "hosts", ()) or ()))
     if not allowed:
         raise PrevalidationError("no-vm", why)
     # Les contrats et le contenu exécuté viennent du même SHA, jamais du disque.
@@ -875,6 +900,8 @@ def run(cfg, db, args) -> int:
     from . import mechanics  # refus nommé si le lecteur manque (load_parameters)
     from .db import SchemaMissing, explain as db_explain
     try:
+        if not isinstance(args.lot, int) or isinstance(args.lot, bool) or args.lot <= 0:
+            raise PrevalidationError("selection-unsafe", "lot invalide: %r" % (args.lot,))
         params = None
         if args.canon_commit:
             _, params = load_parameters(args.canon_repo or args.repo or ".",

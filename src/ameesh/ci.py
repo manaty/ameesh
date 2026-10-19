@@ -2586,6 +2586,7 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
              and r["conclusion"] == "success"]
     decision = {"schema": GEL_SCHEMA, "work_item": int(item_id), "repo": name,
                 "branch": branch, "target": target, "sha": frozen_sha, "base": base,
+                "head_ref": pr["head_ref"], "base_ref": pr["base_ref"],
                 "mode": mode, "label": label, "path": "pr-label", "pr": pr["number"],
                 "exception": exception, "reason": reason.strip(), "avis": avis,
                 "verdicts": sorted((m.get("actor") or "") for m in reviews),
@@ -3065,6 +3066,73 @@ def _render_gel(decision: dict) -> list[str]:
     return lines
 
 
+def _packet_prevalidation(cfg, db, item, decision, args) -> int:
+    """#2644 : la prévalidation d'un porteur `integration/**`, avant l'étiquette.
+
+    Rend 0 quand la demande peut être posée (verte, hors porteur, exception
+    déclarée, ou prévalidation indisponible), 1 seulement sur un rouge : aucun
+    appelant ne pose d'étiquette sur un retour non nul. Un incident déclaré
+    (`--exception` ou journal `packet-exception` de cette tête) ne bloque pas :
+    la porte de fusion reste la CI complète.
+    """
+    from . import packet_guard, prevalidation_calls, work
+    head_ref = str(decision.get("head_ref") or "")
+    if not head_ref.startswith("integration/"):
+        return 0
+    declared = str(decision.get("exception") or "")
+    if not declared:
+        found = packet_guard.declared(db, args.id, decision.get("sha") or "")
+        declared = str((found or {}).get("exception") or "")
+    if declared:
+        decision["prevalidation"] = {"state": "skipped", "exception": declared}
+        if not getattr(args, "json", False):
+            print("  prévalidation non bloquante : exception %s déclarée pour %s"
+                  % (declared, str(decision.get("sha") or "")[:12]))
+        return 0
+    result = prevalidation_calls.gate_packet(
+        cfg, db, item, decision,
+        repo=getattr(args, "prevalidation_repo", "") or "",
+        map_path=getattr(args, "prevalidation_map", "") or "")
+    if result.get("state") == "red":
+        #: décision pilote 19/10 : seul un rouge bloque la demande de CI.
+        why = result.get("why") or "run-red"
+        text = "prévalidation refusée (run-red) — %s ; aucune étiquette posée" % why
+        if getattr(args, "json", False):
+            print(json.dumps({"schema": GEL_SCHEMA, "ok": False, "work_item": args.id,
+                              "action": "refuse", "why": text},
+                             ensure_ascii=False, indent=1))
+        else:
+            print("ameesh ci run: " + text)
+        return 1
+    if result.get("state") == "unavailable":
+        #: une prévalidation indisponible ne bloque jamais : le motif est
+        #: journalisé pour être cité au manifeste du porteur.
+        cause = str(result.get("cause") or "unavailable")
+        why = str(result.get("why") or "")
+        text = "prevalidation-unavailable: %s%s" % (
+            cause, (" — " + why) if why else "")
+        try:
+            work.note(db, args.id, text, actor="ameesh", once=True)
+        except Exception:  # noqa: BLE001 - une note ne bloque pas la demande
+            pass
+        decision["prevalidation"] = {"state": "unavailable", "cause": cause,
+                                     "why": why}
+        if not getattr(args, "json", False):
+            print("  prévalidation indisponible (%s)%s : ci run continue, motif "
+                  "journalisé (à citer au manifeste)" % (cause, (" — " + why) if why else ""))
+        return 0
+    report = result.get("report") or {}
+    decision["prevalidation"] = {
+        "state": "green", "sha": report.get("sha"),
+        "host": report.get("host"), "seconds": report.get("seconds"),
+        "modules": len(report.get("modules") or ())}
+    if not getattr(args, "json", False):
+        print("  prévalidation verte : %s, %s module(s), %s s sur %s"
+              % (str(report.get("sha") or "")[:12], len(report.get("modules") or ()),
+                 report.get("seconds"), report.get("host")))
+    return 0
+
+
 def cmd_ci_run(cfg, args) -> int:
     """`ameesh ci run <lot>` : vérifie le gel et pose l'étiquette, une fois.
 
@@ -3118,6 +3186,10 @@ def cmd_ci_run(cfg, args) -> int:
         else:
             print("\n".join(_render_gel(decision)))
         return 0
+    # #2644 : la prévalidation #1770 passe avant l'étiquette d'un porteur
+    # `integration/**` ; un refus nommé ne pose rien (aucune étiquette).
+    if _packet_prevalidation(cfg, db, item, decision, args):
+        return 1
     # canon §3 : un run de la branche hors de la composition courante (autre
     # SHA, autre base) est périmé ; jamais celui de la composition demandée.
     # #2333 : l'exception est journalisée à la tête que le plan a retenue

@@ -2102,8 +2102,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 note = freeze_checks.before_freeze(
                     cfg, db, args.id, args.sha or "", repo=args.repo,
                     skip=args.no_static_checks, note=note)
-            elif args.repo is not None or args.no_static_checks is not None:
-                raise work.WorkError("--repo and --no-static-checks only apply to a freeze")
+            elif args.repo is not None or args.no_static_checks is not None \
+                    or args.prevalidation_map:
+                raise work.WorkError("--repo, --no-static-checks and --prevalidation-map "
+                                     "only apply to a freeze")
             row = work.milestone(
                 db, args.id, args.kind, sha=args.sha or "", actor=args.actor or "",
                 verdict=args.verdict, note=note, outcome=outcome)
@@ -2147,6 +2149,16 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # #2561: a light lot has no pre-merge reviewer; say why instead
                 # of printing nothing and letting "no reviewer" look like a failure
                 print("review: none — %s" % (outcome.get("why") or ""))
+            if args.kind == "frozen":
+                # #2644 : le résultat de prévalidation s'attache au gel, après
+                # le jalon et la désignation. Il ne défait jamais le gel : le
+                # run peut être rouge, incomplet ou indisponible, la frise est
+                # déjà écrite et l'échec est journalisé.
+                from . import prevalidation_calls
+                prevalidation_calls.after_freeze(
+                    cfg, db, args.id, row.get("sha") or args.sha or "",
+                    repo=args.repo or "",
+                    map_path=args.prevalidation_map or "")
             return 0
         print(USAGE_HINT % "unknown work subcommand", file=sys.stderr)
         return 2
@@ -2821,6 +2833,13 @@ def build_parser() -> argparse.ArgumentParser:
                                "ran, none green (red or cancelled): explicit resumption")
     p_ci_run.add_argument("--repo", default="", help="owner/name (default: the lot's "
                           "issue_ref or github.projects)")
+    p_ci_run.add_argument("--prevalidation-repo", default="",
+                          help="#2644: the tree carrying the packet head (default: cwd, "
+                               "then the assignee's worktree, then the project repository)")
+    p_ci_run.add_argument("--prevalidation-map", default="",
+                          help="#2644: measured map (carte.json.gz) for the L161f plan; "
+                               "absent, the last carte artifact is used, or the prevalidation "
+                               "is reported unavailable (never blocking)")
     p_ci_run.add_argument("--dry-run", action="store_true",
                           help="decide and print, pose no label")
     p_ci_run.add_argument("--json", action="store_true", help="`ameesh-ci-gel/1` report")
@@ -3208,6 +3227,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_ms.add_argument("--repo", default=None,
                        help="frozen: the repository holding --sha (default: the current "
                             "directory, then the lot's project repository)")
+    pw_ms.add_argument("--prevalidation-map", default="",
+                       help="#2644: measured map (carte.json.gz) for the freeze "
+                            "prevalidation; default: the last carte artifact")
     pw_ms.add_argument("--no-static-checks", dest="no_static_checks", default=None,
                        metavar="REASON",
                        help="frozen: freeze without the project's static checks "
