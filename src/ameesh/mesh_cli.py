@@ -1917,6 +1917,18 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 _fmt_moment(item.get("closed_ts"))))
             if item["delays"]:
                 _print_delays(item["delays"])
+            # #2786 : un gel qui ne nomme pas un commit hexadécimal (HEAD,
+            # une branche, un sha vide) n'est jamais une preuve de livraison :
+            # le balayage le tient pour un doute, jamais pour une fusion. Le
+            # dire une fois, sans noyer la frise.
+            from . import plan_git as _plan_git
+            last_freeze = _plan_git.latest_freeze(item["milestones"])
+            if last_freeze is not None and not _plan_git.commit_id(
+                    str(last_freeze.get("sha") or "")):
+                print("gel      : jalon non rattaché à un commit (%r) — le balayage "
+                      "des fusions ne le résout pas (doute, jamais fusion) ; regeler "
+                      "sur un SHA complet (`git rev-parse <ref>`)"
+                      % (str(last_freeze.get("sha") or "") or "sans sha",))
             # #2674 : les verdicts écrits avant la règle de la tête relue ne
             # comptent pas à la porte ; le dire une fois, sans noyer la frise.
             unattached = [m for m in item["milestones"]
@@ -2160,11 +2172,19 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             from . import review_designation_activation as activation
             outcome: dict = {}
             note = args.note or ""
+            sha = args.sha or ""
             if args.kind == "frozen":
+                # #2786 : la tête du gel est un commit complet, résolu dans le
+                # dépôt de l'auteur AVANT les contrôles statiques ; une ref
+                # symbolique (HEAD, branche) est refusée ici.
+                item = work.get(db, args.id)
+                if item is None:
+                    raise work.WorkError("lot %s not found" % args.id)
+                sha = work.freeze_head(db, item, sha, repo=args.repo)
                 # #2542 : un contrôle statique rouge refuse le gel, avant le paquet
                 from . import freeze_checks
                 note = freeze_checks.before_freeze(
-                    cfg, db, args.id, args.sha or "", repo=args.repo,
+                    cfg, db, args.id, sha, repo=args.repo,
                     skip=args.no_static_checks, note=note)
             elif args.no_static_checks is not None or args.prevalidation_map:
                 raise work.WorkError("--no-static-checks and --prevalidation-map "
@@ -2172,7 +2192,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # `--repo` vaut aussi pour un verdict (#2674) : il y résout
             # l'abréviation du SHA relu, et fait alors autorité.
             row = work.milestone(
-                db, args.id, args.kind, sha=args.sha or "", actor=args.actor or "",
+                db, args.id, args.kind, sha=sha, actor=args.actor or "",
                 verdict=args.verdict, note=note, outcome=outcome, repo=args.repo)
             print("milestone %s added to lot #%d%s" % (
                 row["kind"], args.id,
@@ -3313,9 +3333,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help="frozen (branch frozen) or verdict (review delivered); "
                             "the pilot's fire is `ameesh work fire`")
     pw_ms.add_argument("--sha", default="",
-                       help="the frozen or reviewed commit (verdict: the full head, or "
-                            "an abbreviation of at least 12 hex characters resolved in "
-                            "a repository)")
+                       help="the frozen or reviewed commit (frozen: the full 40-hex "
+                            "commit, or an abbreviation of at least 12 hex characters "
+                            "resolved in the author's repository; a symbolic ref is "
+                            "refused. verdict: the full head, or an abbreviation of at "
+                            "least 12 hex characters resolved in a repository)")
     # le verdict est un positionnel (`work milestone 1 verdict ok`), comme la
     # frise se lit ; `frozen` n'en prend pas
     pw_ms.add_argument("verdict", nargs="?", choices=list(work.VERDICTS), default=None,

@@ -133,6 +133,11 @@ def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=(),
     frozen = str(frozen or "").strip()
     if not frozen:
         return "", ""
+    # #2786 : un gel qui ne nomme pas un commit hexadécimal (`HEAD`, une
+    # branche) n'est jamais résolu dans le clone de l'hôte, qui lirait une
+    # tête que personne n'a gelée (#2712) ; la lecture reste en doute.
+    if not plan_git.commit_id(frozen):
+        return "", ""
     candidates = []
     assignee = str((item or {}).get("assignee") or "").strip()
     try:
@@ -328,6 +333,12 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
             out["why"] = "lot #%d is not frozen" % lot
             return out
         frozen = str(freeze["sha"]).strip()
+        # #2786 : jamais de ref symbolique résolue ici (le `HEAD` d'un autre
+        # clone a classé/fermé le mauvais commit, #2712).
+        if not plan_git.commit_id(frozen):
+            out["why"] = ("the freeze %r is not a commit id (the last freeze must "
+                          "name the full commit)" % (frozen[:24],))
+            return out
         try:
             head = plan_git._commit(repo, frozen)
         except canon_mod.GitError as exc:

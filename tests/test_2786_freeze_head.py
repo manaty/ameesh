@@ -1,0 +1,254 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#2786 — un gel nomme une tête immuable, jamais le `HEAD` d'un clone.
+
+Constat du 19/10 23:34 (#2712, Nexlink) : le premier gel a écrit la chaîne
+« HEAD » ; la désignation au gel a lu « no changed path », puis le balayage des
+fusions a résolu ce `HEAD` dans SON clone et passé le lot en `merged` alors que
+la PR nexlink#1809 (182b00d1) était ouverte.
+
+Correctif : à l'écriture, un gel résout une abréviation hexadécimale en commit
+complet dans le dépôt de l'auteur, et refuse une ref symbolique (`HEAD`, une
+branche). Le balayage des fusions et la désignation n'acceptent qu'un commit
+complet et ne résolvent jamais une ref dans leur clone ; un ancien gel « HEAD »
+vaut doute, jamais fusion. Les gels existants dont le sha n'est pas hexadécimal
+sont signalés par `work show` (recensement : voir la note du lot #2786).
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+from ameesh import plan_git, registry, review_designation as rd
+from ameesh import review_designation_activation as act
+from ameesh import storage, work
+
+from .support import PgTestCase
+
+HEAD = "a" * 40
+OTHER = "b" * 40
+ENV_GIT = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+
+
+def git(repo, *args):
+    proc = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
+                          env=ENV_GIT)
+    if proc.returncode != 0:
+        raise AssertionError("git %s: %s" % (" ".join(args), proc.stderr))
+    return proc.stdout.strip()
+
+
+def repo_with_commit(root):
+    os.makedirs(root, exist_ok=True)
+    git(root, "init", "-q", "-b", "main")
+    with open(os.path.join(root, "f"), "w", encoding="utf-8") as fh:
+        fh.write("x\n")
+    git(root, "add", "f")
+    git(root, "commit", "-qm", "un")
+    return git(root, "rev-parse", "HEAD")
+
+
+class FreezeHeadWriteTest(PgTestCase):
+    """Le jalon `frozen` n'écrit qu'un commit complet, ou refuse."""
+
+    def setUp(self):
+        super().setUp()
+        self.lot = work.add(self.db, title="un lot", app="ameesh",
+                            actor="auteur")["id"]
+        work.move(self.db, self.lot, "build")
+
+    def freeze(self, sha, **kw):
+        return work.milestone(self.db, self.lot, "frozen", sha=sha, actor="auteur", **kw)
+
+    def freezes(self):
+        return [m for m in work.milestones(self.db, self.lot)
+                if m["kind"] == "frozen"]
+
+    def test_head_est_refuse_a_l_ecriture(self):
+        with self.assertRaises(work.WorkError) as caught:
+            self.freeze("HEAD")
+        self.assertIn("freeze refused (head-missing)", str(caught.exception))
+        self.assertIn("HEAD", str(caught.exception))
+        self.assertEqual(self.freezes(), [])
+
+    def test_une_branche_est_refusee_a_l_ecriture(self):
+        with self.assertRaises(work.WorkError) as caught:
+            self.freeze("main")
+        self.assertIn("head-missing", str(caught.exception))
+        self.assertEqual(self.freezes(), [])
+
+    def test_un_gel_sans_tete_est_refuse(self):
+        with self.assertRaises(work.WorkError) as caught:
+            self.freeze("")
+        self.assertIn("head-missing", str(caught.exception))
+        self.assertEqual(self.freezes(), [])
+
+    def test_un_commit_complet_est_ecrit_normalise(self):
+        row = self.freeze(HEAD.upper())
+        self.assertEqual(row["sha"], HEAD)
+        self.assertEqual([m["sha"] for m in self.freezes()], [HEAD])
+
+    def test_une_abreviation_est_resolue_dans_le_depot_de_l_auteur(self):
+        repo = tempfile.mkdtemp(prefix="ameesh-2786-")
+        self.addCleanup(shutil.rmtree, repo, True)
+        head = repo_with_commit(repo)
+        row = self.freeze(head[:12], repo=repo)
+        self.assertEqual(row["sha"], head)
+
+    def test_une_abreviation_non_resolue_est_refusee(self):
+        with self.assertRaises(work.WorkError) as caught:
+            self.freeze("deadbeefdead")
+        self.assertIn("head-unresolved", str(caught.exception))
+        self.assertIn("deadbeefdead", str(caught.exception))
+        self.assertEqual(self.freezes(), [])
+
+    def test_la_cli_refuse_head_avant_les_controles_statiques(self):
+        proc = self.mesh("work", "milestone", str(self.lot), "frozen",
+                         "--sha", "HEAD", "--actor", "auteur")
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("head-missing", proc.stderr)
+        self.assertEqual(self.freezes(), [])
+
+    def test_work_show_signale_un_ancien_gel_head(self):
+        # Un gel écrit avant la règle (aucune écriture refusée alors) : il
+        # reste lisible, et la vue dit qu'il ne prouve pas une livraison.
+        storage.of(self.db).work.add_milestone(
+            self.lot, "frozen", sha="HEAD", actor="auteur", verdict=None, note="")
+        proc = self.mesh("work", "show", str(self.lot))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("non rattaché à un commit", proc.stdout)
+        self.assertIn("doute, jamais fusion", proc.stdout)
+
+
+class _SweepBase(PgTestCase):
+    """Un dépôt où le `HEAD` du clone EST la tête de la cible : la scène
+    dangereuse de #2712 (une résolution de `HEAD` y prouve la fusion)."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = os.path.join(self.tmp, "depot2786")
+        os.makedirs(self.repo)
+        git(self.repo, "init", "-q", "-b", "main")
+        self.commit("socle")
+        git(self.repo, "checkout", "-q", "-b", "develop")
+        self.frozen = self.commit("travail")
+        git(self.repo, "update-ref", "refs/remotes/origin/develop", self.frozen)
+        git(self.repo, "config", "ameesh.target", "origin/develop")
+        registry.upsert(self.db, "claude1", harness="claude", host=self.cfg.host,
+                        cwd=self.repo)
+        for state in (plan_git._pr_body_backoff, plan_git._pr_body_cache):
+            state.clear()
+            self.addCleanup(state.clear)
+
+    def commit(self, name):
+        with open(os.path.join(self.repo, name), "w", encoding="utf-8") as fh:
+            fh.write(name + "\n")
+        git(self.repo, "add", name)
+        git(self.repo, "commit", "-qm", "ajoute %s" % name)
+        return git(self.repo, "rev-parse", "HEAD")
+
+    def lot(self, sha):
+        item = work.add(self.db, title="lot sans branche", assignee="claude1",
+                        actor="orch")
+        for state in ("build", "qa"):
+            work.move(self.db, item["id"], state, actor="orch")
+        storage.of(self.db).work.add_milestone(
+            item["id"], "frozen", sha=sha, actor="auteur", verdict=None, note="")
+        return item
+
+    def entry(self, report, lot):
+        return next(r for r in report["results"] if r["work_item"] == lot["id"])
+
+
+class SweepDoubtTest(_SweepBase):
+    """Le balayage ne résout jamais une ref : un gel non conforme est un doute."""
+
+    def test_un_ancien_gel_head_ne_marque_pas_merged(self):
+        lot = self.lot("HEAD")
+        report = plan_git.sync_branches(self.db, host=self.cfg.host)
+        entry = self.entry(report, lot)
+        self.assertEqual(entry["result"], "doubt")
+        self.assertIn("not a full commit id", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_un_ancien_gel_head_ne_marque_pas_merged_par_le_contenu(self):
+        lot = self.lot("HEAD")
+        report = plan_git.sync_merges(self.db, self.repo, target="origin/develop")
+        entry = self.entry(report, lot)
+        self.assertEqual(entry["result"], "doubt")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_une_ancienne_abreviation_vaut_doute_au_balayage(self):
+        # Le gel existant de #1775 peut porter une abréviation : la lire est
+        # une chose, la tenir pour la tête relue en est une autre.
+        lot = self.lot(self.frozen[:12])
+        report = plan_git.sync_branches(self.db, host=self.cfg.host)
+        entry = self.entry(report, lot)
+        self.assertEqual(entry["result"], "doubt")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_un_gel_complet_reste_une_preuve_de_livraison(self):
+        # Contrôle : la même scène, gelée sur le SHA complet, ferme le lot.
+        lot = self.lot(self.frozen)
+        report = plan_git.sync_branches(self.db, host=self.cfg.host)
+        entry = self.entry(report, lot)
+        self.assertEqual(entry["result"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+
+class _Port:
+    """Le minimum du port de désignation : le gel lu, aucune écriture."""
+
+    def __init__(self, freeze):
+        self._freeze = freeze
+
+    def latest_freeze(self, lot):
+        return self._freeze
+
+    def recorded(self, lot, freeze_id):
+        return None
+
+    def write(self, **kw):  # pragma: no cover - le refus arrive avant
+        raise AssertionError("nothing may be written for a non-conforming freeze")
+
+
+class DesignationDoubtTest(PgTestCase):
+    """La désignation ne résout jamais une ref dans son propre clone."""
+
+    def test_prepare_refuse_un_gel_head(self):
+        lot = work.add(self.db, title="un lot", app="ameesh",
+                       actor="auteur")["id"]
+        storage.of(self.db).work.add_milestone(
+            lot, "frozen", sha="HEAD", actor="auteur", verdict=None, note="")
+        out = act.prepare(self.cfg, self.db, lot, fetch=False)
+        self.assertIsInstance(out, act.Unavailable)
+        self.assertIn("not a full commit id", out.why)
+        self.assertIn("resolves a ref", out.why)
+
+    def test_apply_refuse_un_gel_head(self):
+        port = _Port({"id": 13962, "sha": "HEAD"})
+        with self.assertRaises(rd.DesignationError) as caught:
+            rd.apply({"id": 2786, "title": "un lot", "app": "ameesh"},
+                     families=("claude", "codex", "deepseek"), policy=(),
+                     paths=[], port=port, freeze_sha="HEAD", authors=(),
+                     candidates=(), risk="light", base="c" * 40,
+                     policy_ref="canon@deadbeef", notify="")
+        self.assertIn("not a commit id", str(caught.exception))
+        self.assertIn("HEAD", str(caught.exception))
+
+    def test_designate_refuse_le_gel_head_avant_tout_report(self):
+        lot = work.add(self.db, title="un lot", app="ameesh",
+                       actor="auteur")["id"]
+        storage.of(self.db).work.add_milestone(
+            lot, "frozen", sha="HEAD", actor="auteur", verdict=None, note="")
+        out = act.designate(self.cfg, self.db, lot)
+        self.assertEqual(out["state"], "unavailable")
+        self.assertIn("not a full commit id", out["why"])
+        self.assertEqual(work.get(self.db, lot)["reviewer"], "")
+
+
+if __name__ == "__main__":
+    unittest.main()

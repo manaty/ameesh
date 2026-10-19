@@ -408,12 +408,26 @@ def latest_freeze(rows: list[dict]) -> dict | None:
 #: jusqu'à 4). La résolution en commit complet et unique reste au lecteur qui
 #: a le dépôt (#1756).
 _COMMIT_ID = re.compile(r"[0-9a-f]{4,64}")
+#: #2786 : une tête gelée lue par le balayage est un commit **complet** (40 ou
+#: 64 hexadécimaux) ; une abréviation ou une ref symbolique n'y est jamais
+#: résolue (le `HEAD` du clone du balayage a passé un lot en `merged`, #2712).
+_FULL_COMMIT_ID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 
 
 def commit_id(value) -> str:
     """L'identifiant de commit d'un jalon, en minuscules (`''` sinon)."""
     text = str(value or "").strip().lower()
     return text if _COMMIT_ID.fullmatch(text) else ""
+
+
+def full_commit_id(value) -> str:
+    """Le commit complet (40 ou 64 hexadécimaux) d'un jalon, en minuscules, ou ''.
+
+    #2786 : l'identifiant qu'un balayage ou une désignation accepte pour une
+    tête gelée ; une abréviation reste lisible par `commit_id` (compatibilité)
+    mais n'est jamais une preuve de livraison."""
+    text = str(value or "").strip().lower()
+    return text if _FULL_COMMIT_ID.fullmatch(text) else ""
 
 
 def same_commit(a, b) -> bool:
@@ -806,7 +820,11 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
     d'intégration reconnues (`develop`, `main`, `master`, `release/…`) sont
     essayées à leur tour et la fermeture nomme celle qui a livré. Une cible
     explicite ou déclarée garde le sens d'origine : seule elle ferme, et son
-    absence est une erreur (`target %r not found in …`)."""
+    absence est une erreur (`target %r not found in …`).
+
+    #2786 : le dernier gel examiné doit nommer un commit complet ; une ref
+    symbolique (`HEAD`, une branche) ou une abréviation vaut doute (`doubt`),
+    rien n'est résolu dans ce clone ni fermé."""
     st = storage.of(db)
     if target is not None:
         try:
@@ -857,7 +875,7 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
                 if head is None:
                     unchecked = "verdict freeze not checked: branch head not found"
                 elif same_commit(reviewed, head):
-                    sha, freeze_origin = reviewed, "verdict"
+                    sha, freeze_origin = head, "verdict"
         entry = {"work_item": lot, "package": row.get("package_id"),
                  "state": row["state"], "result": "no-commit", "how": None, "ref": None,
                  "target": None, "off_target": None, "freeze_origin": freeze_origin,
@@ -867,6 +885,18 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
         if not sha:
             results.append(entry)
             continue
+        # #2786 : le gel examiné doit nommer un commit complet. Un `HEAD`, une
+        # branche ou une abréviation n'est jamais résolu ici : le balayage
+        # d'un autre clone lirait un commit que personne n'a relu (#2712).
+        resolved_sha = full_commit_id(sha)
+        if not resolved_sha:
+            entry.update(result="doubt", how="unreadable",
+                         detail="last freeze %r is not a full commit id: doubt, "
+                                "nothing merged — freeze again on the full head "
+                                "(`git rev-parse <ref>`)" % sha[:24])
+            results.append(entry)
+            continue
+        sha = resolved_sha
         refs = _content_refs(row, target, declared_repo=declared_repo, default=default,
                              candidates=candidates)
         if not refs:
@@ -1816,10 +1846,17 @@ def _content_ancestor(repo: str, sha: str, target: str) -> bool:
     contenu la moins chère (une commande git), celle d'une fusion `--no-ff`
     (ou d'une avance rapide) poussée sur la branche d'intégration sans citer
     le lot. Le patch-id exact (rebase, cherry-pick, squash) reste au relevé de
-    contenu (`sync-merges`), dont c'est le travail et le coût assumé."""
+    contenu (`sync-merges`), dont c'est le travail et le coût assumé.
+
+    #2786 : seul un commit complet est résolu ; une ref symbolique (`HEAD`, une
+    branche) n'est jamais passée à `rev-parse`, dont le résultat dépendrait du
+    clone du balayage — le cas #2712, qui a fermé un lot sur le `HEAD` d'un
+    autre arbre."""
+    frozen = full_commit_id(sha)
+    if not frozen:
+        return False
     head = _commit(repo, target)
-    frozen = _commit(repo, sha)
-    if head is None or frozen is None:
+    if head is None:
         return False
     return _is_ancestor(repo, frozen, head)
 
@@ -2382,7 +2419,13 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
     la fusion de la cible) ; quand la limite de lecture est atteinte sans
     porteur connu, le lot reste ouvert. B1 : la fermeture est
     conditionnée au jalon `frozen` examiné (`frozen_id`) : un regel
-    concurrent, vu après la lecture, laisse le lot ouvert (`refrozen`)."""
+    concurrent, vu après la lecture, laisse le lot ouvert (`refrozen`).
+
+    #2786 : un dernier gel qui ne nomme pas un commit complet (`HEAD`, une
+    branche, une abréviation) est un doute (`doubt`) : aucune ref n'est
+    résolue dans ce clone, rien n'est fermé, et l'assigné est prévenu pour
+    regeler sur la tête complète. Un gel absent ne bloque pas : la branche ou
+    une citation peuvent encore prouver la livraison."""
     from . import fil, registry
 
     st = storage.of(db)
@@ -2433,6 +2476,24 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                 results.append(entry)
             continue
         if host is not None and (reg.get("host") or "") != host:
+            continue
+        # #2786 : un dernier gel qui ne nomme pas un commit complet (HEAD, une
+        # branche, une abréviation) vaut doute : rien n'est résolu dans ce
+        # clone ni fermé, et l'assigné est prévenu pour regeler sur la tête
+        # complète. Un gel absent ne bloque pas (la branche peut prouver).
+        freeze = freezes.get(lot)
+        frozen_sha = str((freeze or {}).get("sha") or "").strip()
+        if frozen_sha and not full_commit_id(frozen_sha):
+            detail = ("last freeze %r is not a full commit id: doubt, nothing merged — "
+                      "freeze again on the full head (`ameesh work milestone %d frozen "
+                      "--sha <commit>`)" % (frozen_sha[:24], lot))
+            entry.update(result="doubt", how="unreadable", detail=detail)
+            if not dry_run and assignee:
+                _signal_off_target(
+                    db, st, lot, assignee, reg, "merge sweep: %s" % detail,
+                    "non-full freeze %s" % frozen_sha[:12],
+                    actor=actor or "git:sweep")
+            results.append(entry)
             continue
         repo = os.path.expanduser(reg.get("cwd") or "")
         if not repo or not os.path.isdir(repo):

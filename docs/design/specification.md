@@ -318,6 +318,14 @@ celui de l'assigné) ou dans la tête gelée courante. Sans elle, le jalon est
 refusé et la tête gelée proposée ; les anciens verdicts sans SHA restent
 lisibles mais ne comptent pas à la porte, et `ameesh work show` les signale
 (« avis non rattaché à une tête »).
+Un `frozen` **exige** une tête immuable (#2786) : le commit complet (40 ou 64
+hexadécimaux), ou une abréviation d'au moins 12 caractères hexadécimaux
+résolue dans le dépôt de l'auteur (répertoire courant, `--repo`, dépôt du
+projet ou de l'assigné) et alors **écrite complète** ; une ref symbolique
+(`HEAD`, une branche) est refusée. Le balayage des fusions et la désignation
+automatique n'acceptent qu'un commit complet et ne résolvent jamais une ref
+dans leur propre clone : un gel « HEAD » vaut doute, jamais une livraison, et
+`ameesh work show` le signale (« jalon non rattaché à un commit »).
 Les durées `demande → gel`, `gel → revue`, `gel → fusion` et le nombre de
 verdicts bloqués se lisent dans `ameesh work list` (colonne DÉLAI), `ameesh work
 show` (frise complète) et le pied de `ameesh list` ; la forme complète est

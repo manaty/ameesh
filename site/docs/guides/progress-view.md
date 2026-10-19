@@ -69,6 +69,11 @@ ameesh work list         # column DELAY: phase and age
 ameesh work show <id>    # the full timeline: requested → frozen → review → merged
 ```
 
+A freeze names an immutable commit: the full 40-hex id, or a 12+ hex
+abbreviation resolved in the author's repository and written full. `HEAD` and
+branch names are refused (#2786): each reader would resolve them in its own
+clone, and a legacy non-full freeze is a doubt, never a merge.
+
 When a lot has no declared freeze or verdict, they are deduced from its
 transitions (first entry into `qa`, exit from `qa`, approval of its `git-merge`
 action…).

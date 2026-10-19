@@ -3089,6 +3089,14 @@ REVIEWED_HEAD_MIN = 12
 _FULL_HEAD = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 _REVIEWED_HEAD = re.compile(r"[0-9a-f]{%d,64}" % REVIEWED_HEAD_MIN)
 
+#: #2786 : un gel écrit nomme un commit complet (40 ou 64 hexadécimaux) —
+#: une abréviation hexadécimale d'au moins [`FROZEN_HEAD_MIN`] caractères est
+#: résolue **dans le dépôt de l'auteur** et écrite complète. Une ref
+#: symbolique (`HEAD`, une branche) est refusée : chaque lecteur la résolvait
+#: dans SON clone, et le balayage d'un hôte a passé un lot en `merged` sur le
+#: `HEAD` d'un autre arbre que celui gelé (#2712).
+FROZEN_HEAD_MIN = REVIEWED_HEAD_MIN
+
 #: les jalons affichés, du plus récent au plus ancien : (nom, colonne d'instant,
 #: colonne de durée) — l'ordre est celui de la frise lue à l'envers. `delivered`
 #: (#988) est la fin d'un lot livré hors cible : il remplace la fusion.
@@ -3235,6 +3243,54 @@ def reviewed_head(db: Db, item: dict, sha: str, *, repo: str | None = None) -> s
         "does not name the current frozen head" % text, repo=repo)
 
 
+def freeze_head(db: Db, item: dict, sha: str, *, repo: str | None = None) -> str:
+    """La tête d'un gel, écrite en commit complet (#2786).
+
+    Un gel est une tête **immuable** : il ne peut nommer qu'un commit
+    complet (40 ou 64 hexadécimaux), ou une abréviation hexadécimale d'au
+    moins [`FROZEN_HEAD_MIN`] caractères, résolue ici — dans `repo` quand
+    `--repo` le nomme (alors autoritaire), sinon dans le répertoire courant,
+    le dépôt du projet ou le dossier de travail de l'assigné — et rendue
+    complète pour être écrite. Tout le reste est refusé : une ref symbolique
+    (`HEAD`, une branche) n'est jamais résolue, parce que chaque lecteur la
+    résoudrait dans SON clone et que le balayage d'un autre arbre passerait
+    le lot en `merged` sur un commit que personne n'a relu (#2712). Le
+    `sha` rendu est donc toujours le commit complet à stocker."""
+    text = str(sha or "").strip().lower()
+    if _FULL_HEAD.fullmatch(text):
+        return text
+    if not text:
+        raise WorkError(
+            "freeze refused (head-missing): a freeze must name the frozen commit — "
+            "the full 40-hex commit id, or an abbreviation of at least %d hex "
+            "characters resolved in the author's repository (`--sha`)"
+            % FROZEN_HEAD_MIN)
+    if not _REVIEWED_HEAD.fullmatch(text):
+        raise WorkError(
+            "freeze refused (head-missing): --sha %r is not a commit id — a symbolic "
+            "ref (HEAD, a branch) is never resolved for a freeze: resolve it first "
+            "(`git rev-parse <ref>`) and pass the full commit id, or an abbreviation "
+            "of at least %d hex characters (`--sha`)" % (sha, FROZEN_HEAD_MIN))
+    from . import freeze_checks
+    if repo:
+        full = freeze_checks.commit_in(repo, text)
+        if full and full.lower().startswith(text):
+            return full.lower()
+        raise WorkError(
+            "freeze refused (head-unresolved): %s does not name a commit of %s; "
+            "freeze from the lot's worktree or pass --repo <the repository holding "
+            "the commit>" % (text, repo))
+    for where in _head_repos(db, item):
+        full = freeze_checks.commit_in(where, text)
+        if full and full.lower().startswith(text):
+            return full.lower()
+    raise WorkError(
+        "freeze refused (head-unresolved): %s does not resolve to a commit in the "
+        "author's repository (current directory, project repository, assignee's "
+        "worktree); freeze from the lot's worktree or pass --repo <the repository "
+        "holding the commit>" % text)
+
+
 def milestone(
     db: Db,
     item_id: int,
@@ -3264,6 +3320,12 @@ def milestone(
     avec la tête gelée courante proposée ; un avis qui ne peut pas compter à
     la porte n'est plus accepté en silence. `repo` (facultatif) est le dépôt
     nommé par `--repo`, où une abréviation doit alors se résoudre.
+
+    `frozen` (#2786) exige une tête **immuable** : le `sha` est vérifié par
+    [`freeze_head`] avant toute écriture — commit complet, ou abréviation
+    hexadécimale d'au moins 12 caractères résolue dans le dépôt de l'auteur
+    et alors écrite complète ; une ref symbolique (`HEAD`, une branche) est
+    refusée, parce que chaque lecteur la résoudrait dans son propre clone.
 
     `on_frozen` (facultatif, #1617) : le callback du gel, appelé dans la
     transaction du jalon `frozen` avec `(tx, milestone, after_commit)`. Il
@@ -3311,6 +3373,10 @@ def milestone(
     if kind == "verdict":
         # #2674 : refuser à l'écriture un avis qui ne nomme pas la tête relue.
         sha = reviewed_head(db, item, sha, repo=repo)
+    elif kind == "frozen":
+        # #2786 : écrire une tête immuable, jamais une ref que chaque lecteur
+        # résoudrait dans son clone.
+        sha = freeze_head(db, item, sha, repo=repo)
     drain: list | None = None
     if kind == "frozen" and on_frozen is None:
         from . import review_designation_activation as activation

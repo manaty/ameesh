@@ -370,6 +370,7 @@ _BRANCH_RESULTS = {"merged": "CLOSED (delivered)", "already": "already delivered
                    "refused": "work item closed", "would-merge": "would be closed",
                    "open": "open", "skipped": "skipped", "no-repo": "no repository",
                    "no-target": "no target", "error": "error",
+                   "doubt": "doubt (kept open; freeze again with the full head)",
                    "off-target": "delivered off target (kept open)"}
 
 
