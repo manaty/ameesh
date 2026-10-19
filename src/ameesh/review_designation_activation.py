@@ -325,15 +325,17 @@ def _change(repo: str, sha: str) -> Optional[tuple[int, bool]]:
     author, #2638)."""
     if not repo:
         return None
-    text = plan_git._out(repo, "show", "--numstat", "--format=", "--no-renames", sha)
+    text = plan_git._out(repo, "show", "--numstat", "-z", "--format=", "--no-renames", sha)
     if text is None:
         return None
     lines, design = 0, False
-    for row in str(text).splitlines():
-        fields = row.split("\t")
-        if len(fields) < 3:
+    for row in str(text).split("\0"):
+        if not row:
             continue
-        added, removed, path = fields[0], fields[1], "\t".join(fields[2:])
+        fields = row.split("\t", 2)
+        if len(fields) < 3:
+            return None
+        added, removed, path = fields
         if added == "-" or removed == "-":
             return REVIEWER_FIX_LINES + 1, design
         try:

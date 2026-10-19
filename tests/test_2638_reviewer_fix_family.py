@@ -11,13 +11,32 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import tempfile
+from unittest import TestCase
 
 from ameesh import registry
+from ameesh import review_designation_activation as act
 from ameesh import review_designation as rd
 from ameesh import review_designation_pg as pg
 
 from .support import PgTestCase
-from .test_2447_review_designation_activation import FEDERATION, _ActivationFixture, _Canon
+from .test_2447_review_designation_activation import (
+    FEDERATION, _ActivationFixture, _Canon, _Repo,
+)
+
+
+class DesignPathTest(TestCase):
+    def test_git_quoted_design_paths_still_count_as_design(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as root:
+            repo = _Repo(root)
+            repo.write("base", "base\n")
+            repo.commit("base")
+            for path in ("docs/design/étude.md", "docs/design/tab\tline\n.md"):
+                with self.subTest(path=path):
+                    repo.write(path, "design\n")
+                    sha = repo.commit("design")
+                    self.assertEqual(act._change(root, sha), (1, True))
+
 
 
 class ReviewerFixFamilyTest(_ActivationFixture, PgTestCase):
