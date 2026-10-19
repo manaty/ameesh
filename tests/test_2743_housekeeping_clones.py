@@ -4,6 +4,7 @@ import os
 import subprocess
 import time
 import unittest
+from unittest import mock
 
 from ameesh import housekeeping as hk, housekeeping_clones as clones, registry, storage, work
 from tests.support import PgTestCase
@@ -58,6 +59,93 @@ class CloneReapTest(PgTestCase):
         self.assertEqual(skipped, [])
         return next(row for row in plan if row["path"] == path)
 
+
+    def test_an_unknown_named_lot_keeps_the_clone(self):
+        _sans_processus(self)
+        lot = self.ended_lot()
+        path = self.clone("copy-%s-999999" % lot)
+        row = self.plan_for(path)
+        self.assertEqual(row["action"], "garde")
+        self.assertIn("#999999 unknown", row["detail"])
+        self.assertTrue(os.path.isdir(path))
+
+
+    def test_dependency_proof_does_not_depend_on_the_candidate_bound(self):
+        _sans_processus(self)
+        lot = self.ended_lot()
+        source = self.clone("a-%s-source" % lot)
+        nested = os.path.join(self.root, "container", "nested")
+        os.makedirs(nested)
+        subprocess.run(["git", "clone", "-q", "--shared", source,
+                        os.path.join(nested, "z-dependent")],
+                       check=True, capture_output=True, cwd=self.tmp)
+        with mock.patch.object(clones, "CLONE_LIMIT", 1):
+            copies, complete, why = clones._dependency_inventory(
+                self.cfg, (self.root,), self.agents, ())
+            self.assertTrue(complete, why)
+            dependents, doubt = clones._dependents(copies, [source])
+        self.assertEqual(doubt, "")
+        self.assertTrue(dependents[source])
+
+    def test_a_dependent_clone_nested_under_a_container_is_seen(self):
+        _sans_processus(self)
+        lot = self.ended_lot()
+        source = self.clone("copy-%s-source" % lot)
+        nested = os.path.join(self.root, "container", "nested")
+        os.makedirs(nested)
+        subprocess.run(["git", "clone", "-q", "--shared", source,
+                        os.path.join(nested, "dependent")],
+                       check=True, capture_output=True, cwd=self.tmp)
+        row = self.plan_for(source)
+        self.assertEqual(row["action"], "garde")
+        self.assertIn("alternate dependent", row["detail"])
+        self.assertTrue(os.path.isdir(source))
+
+    def test_a_bare_shared_repository_is_seen_as_a_dependent(self):
+        _sans_processus(self)
+        lot = self.ended_lot()
+        source = self.clone("copy-%s-source" % lot)
+        bare = os.path.join(self.root, "bare-%s.git" % lot)
+        subprocess.run(["git", "clone", "-q", "--bare", "--shared", source, bare],
+                       check=True, capture_output=True, cwd=self.tmp)
+        self.assertTrue(os.path.isfile(
+            os.path.join(bare, "objects", "info", "alternates")))
+        row = self.plan_for(source)
+        self.assertEqual(row["action"], "garde")
+        self.assertIn("alternate dependent", row["detail"])
+        self.assertTrue(os.path.isdir(source))
+
+
+    def test_an_unreadable_candidate_root_is_a_doubt(self):
+        with mock.patch.object(clones.os, "scandir", side_effect=OSError("denied")):
+            found, complete, why = clones._clones_under((self.root,))
+        self.assertEqual(found, [])
+        self.assertFalse(complete)
+        self.assertIn("unreadable root", why)
+
+    def test_a_bounded_candidate_inventory_removes_nothing(self):
+        _sans_processus(self)
+        lot = self.ended_lot()
+        source = self.clone("a-%s-source" % lot)
+        dependent = self.clone("z-dependent", source=source, shared=True)
+        with mock.patch.object(clones, "CLONE_LIMIT", 1):
+            entries, plan, skipped = self.reap(dry_run=False)
+        self.assertTrue(os.path.isdir(source))
+        self.assertTrue(os.path.isdir(dependent))
+        self.assertTrue(any("candidate inventory incomplete" in line for line in skipped))
+        self.assertEqual([e for e in entries if e["action"] in ("removed", "partial")], [])
+
+    def test_a_bounded_dependency_inventory_removes_nothing(self):
+        _sans_processus(self)
+        lot = self.ended_lot()
+        source = self.clone("copy-%s-source" % lot)
+        self.clone("z-dependent", source=source, shared=True)
+        with mock.patch.object(clones, "DEPENDENCY_LIMIT", 1):
+            entries, plan, skipped = self.reap(dry_run=False)
+        self.assertTrue(os.path.isdir(source))
+        self.assertTrue(any("dependency inventory incomplete" in line for line in skipped))
+        self.assertEqual([e for e in entries if e["action"] in ("removed", "partial")], [])
+
     def test_dry_run_lists_an_ended_lot_clone_and_writes_nothing(self):
         _sans_processus(self)
         lot = self.ended_lot()
@@ -101,7 +189,7 @@ class CloneReapTest(PgTestCase):
         unknown = self.clone("copy-999999-x")
         row = self.plan_for(unknown)
         self.assertEqual(row["action"], "garde")
-        self.assertIn("no lot named", row["detail"])
+        self.assertIn("unknown", row["detail"])
 
     def test_lot_ended_less_than_24_hours_ago_waits(self):
         _sans_processus(self)
@@ -181,6 +269,16 @@ class CloneReapTest(PgTestCase):
         self.assertEqual(row["action"], "retrait")
         self.assertEqual(row["lot"], str(lot))
 
+
+    def test_a_branch_slug_date_is_not_a_lot_id(self):
+        _sans_processus(self)
+        lot = self.ended_lot()
+        path = self.clone("adhoc-date")
+        _git("checkout", "-q", "-b", "lot/%s-roadmap-14-10" % lot, cwd=path)
+        row = self.plan_for(path)
+        self.assertEqual(row["action"], "retrait")
+        self.assertEqual(row["lot"], str(lot))
+
     def test_an_agent_number_and_a_registered_checkout_are_not_lots(self):
         _sans_processus(self)
         lot = self.ended_lot()
@@ -231,6 +329,7 @@ class NamedLotsTest(unittest.TestCase):
         self.assertEqual(clones.named_lots("ds6-2181-2176", agents), [2181, 2176])
         self.assertEqual(clones.named_lots("nexlink-665-reseed", agents), [665])
         self.assertEqual(clones.named_lots("a1", agents), [])
+        self.assertEqual(clones.named_lots("ameesh-deepseek4", agents), [])
         # a version is not a lot
         self.assertEqual(clones.named_lots("nexlink-0.2.10", agents), [])
         self.assertEqual(clones.named_lots("foo-2026.10.19-665", agents), [665])

@@ -10,10 +10,12 @@ worktrees and no turn recorded them.
 A clone is removed only when ALL of this is proved:
 
 * a lot is named by its **directory** (`<prefix>-<id>[-...]`) or by a
-  `lot/<id>` / `work/<id>` branch; every identified lot exists in ameesh
-  and ended (`merged`, `promoted`, `closed`) more than `CLONE_IDLE_S` ago.
-  An `agent/` or `review/` branch alone proves nothing: those names are
-  also the branches of long-lived agent checkouts;
+  `lot/<id>` / `work/<id>` branch; **every** identified lot exists in
+  ameesh (an unknown id is a doubt: `copy-2181-999999` is not proved for
+  #999999, so #2181 alone cannot justify a removal) and ended (`merged`,
+  `promoted`, `closed`) more than `CLONE_IDLE_S` ago. An `agent/` or
+  `review/` branch alone proves nothing: those names are also the branches
+  of long-lived agent checkouts;
 * no activity in it for `CLONE_IDLE_S` (mtime/ctime at any depth, Git
   metadata included); the walk must be complete;
 * its saved work is proved by [`housekeeping._git_copy_work`]: clean,
@@ -23,9 +25,19 @@ A clone is removed only when ALL of this is proved:
 * it contains no nested Git copy (a nested clone with its own work would
   go with it);
 * no other clone has an ``.git/objects/info/alternates`` entry pointing at
-  its object directory (#2738): deleting it would break that clone;
+  its object directory (#2738): deleting it would break that clone. The
+  dependency inventory walks the work roots and the radar/train trees
+  recursively — a dependent nested under a plain container or a **bare**
+  repository is seen — and reads the object directories of the registered
+  agent checkouts; it does not enter a Git copy's working tree (a nested
+  copy inside a candidate is already a blocking guard), nor build output and
+  cache directories. A bounded, mount-crossing or unreadable inventory is a
+  **doubt**: nothing is removed, and the reason is reported;
 * no process of the user works in it, and its name is not the name of a
-  registered agent's checkout.
+  registered agent's checkout;
+* the candidate inventory and the dependency inventory are both complete:
+  a hidden entry, an unreadable root/marker, a limit or a time budget makes
+  the pass report and remove nothing (`skipped` says why).
 
 Everything else is reported with the reason, never removed. The pass is a
 dry run by default: it returns the plan, writes nothing and removes
@@ -52,6 +64,12 @@ CLONE_IDLE_S = 24 * 3600.0
 CLONE_LIMIT = 2000
 #: bound of the whole clone pass (heavy Git checks included)
 CLONE_BUDGET_S = 60.0
+#: bound of the recursive Git-copy inventory that proves dependencies
+DEPENDENCY_LIMIT = 100_000
+DEPENDENCY_BUDGET_S = 30.0
+#: regenerable directories never entered by the dependency inventory
+DEPENDENCY_SKIP = (".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache",
+                   ".ruff_cache", ".tox", ".nox", "htmlcov", "_site")
 
 
 def _real(path: str) -> str:
@@ -75,6 +93,9 @@ def _strip_agents(name: str, agents) -> str:
             return ""
         if rest.startswith(agent + "-"):
             rest = rest[len(agent) + 1:]
+            continue
+        if rest.endswith("-" + agent):
+            rest = rest[:-len(agent) - 1]
             continue
         marker = "-" + agent + "-"
         if marker in rest:
@@ -116,14 +137,27 @@ def _branch_lots(path: str) -> list[int] | None:
         branches.append(current.stdout.strip())
     out: list[int] = []
     for branch in dict.fromkeys(branches):
-        if branch.split("/", 1)[0] not in ("lot", "work"):
+        prefix, _, rest = branch.partition("/")
+        if prefix not in ("lot", "work") or not rest:
             continue
-        out.extend(hk.cited_lots(branch))
+        # `lot/<id>-<slug>`: the ids are the leading numeric groups; the
+        # first non-numeric token starts the slug (`lot/1111-roadmap-14-10`
+        # names lot #1111, not #14 or #10) and ends the lot candidates.
+        for part in rest.split("-"):
+            if not part.isdigit():
+                break
+            out.append(int(part))
     return out
 
 
 def _attribution(db, path: str, agents=()) -> tuple[list[dict] | None, list[int], str]:
-    """Lots named by the clone itself: (rows, ids, reason). Rows None = doubt."""
+    """Lots named by the clone itself: (rows, missing ids, reason).
+
+    Every id the directory or a `lot/`/`work/` branch names must exist in
+    ameesh: an unknown id is a doubt, never silently dropped (`copy-2181-
+    999999` is not proved for #999999, so #2181 alone cannot justify a
+    removal). `rows` None = unreadable registry.
+    """
     ids = named_lots(os.path.basename(os.path.normpath(path)), agents)
     branches = _branch_lots(path)
     if branches is None:
@@ -131,14 +165,17 @@ def _attribution(db, path: str, agents=()) -> tuple[list[dict] | None, list[int]
     ids.extend(branches)
     unique = list(dict.fromkeys(ids))
     rows = []
+    missing = []
     try:
         for ident in unique:
             row = storage.of(db).work.get(ident)
-            if row is not None:
+            if row is None:
+                missing.append(ident)
+            else:
                 rows.append(row)
     except Exception:
         return None, unique, "lot state unreadable"
-    return rows, unique, ""
+    return rows, missing, ""
 
 
 def _lot_end(row: dict) -> float | None:
@@ -156,82 +193,201 @@ def _lot_end(row: dict) -> float | None:
         return None
 
 
-def _clones_under(roots) -> list[str]:
-    """Direct children of the work roots that are clones (`git` marker dir)."""
+def _clones_under(roots) -> tuple[list[str], bool, str]:
+    """Candidates directly under the work roots: (paths, complete, why).
+
+    The candidate list itself may be bounded: a host with more clones than
+    `CLONE_LIMIT` reports the first ones, and the pass says the inventory is
+    incomplete and removes nothing. An unreadable entry/marker is a doubt,
+    never silently skipped: it could hide a clone whose dependency we would
+    then fail to prove.
+    """
     found: list[str] = []
+    more = False
     for root in roots or ():
         root = hk._expand(root)
         if not os.path.isdir(root):
             continue
         try:
             with os.scandir(root) as children:
-                for child in sorted(children, key=lambda entry: entry.name):
-                    if len(found) >= CLONE_LIMIT:
-                        return found
+                try:
+                    entries = sorted(children, key=lambda entry: entry.name)
+                except OSError as exc:
+                    return found, False, "unreadable root %s (%s)" % (
+                        root, exc.strerror or exc)
+                for child in entries:
                     try:
                         is_dir = child.is_dir(follow_symlinks=False)
-                    except OSError:
-                        continue
+                    except OSError as exc:
+                        return found, False, "unreadable entry %s (%s)" % (
+                            child.path, exc.strerror or exc)
                     if not is_dir:
                         continue
                     path = os.path.join(root, child.name)
-                    if _marker(path) == "clone":
-                        found.append(path)
-        except OSError:
-            continue
-    return found
+                    kind = _marker(path)
+                    if kind == "clone":
+                        if len(found) < CLONE_LIMIT:
+                            found.append(path)
+                        else:
+                            more = True
+                    elif kind == "unsafe":
+                        return found, False, "unsafe Git marker: %s" % path
+        except OSError as exc:
+            return found, False, "unreadable root %s (%s)" % (
+                root, exc.strerror or exc)
+    if more:
+        return found, False, "more than %d candidate clones" % CLONE_LIMIT
+    return found, True, ""
 
 
-def _repository_copies(state_dir: str, roots, agents, known_clones=None) -> list[str]:
-    """Known clones on this host whose alternates can point at a candidate.
-
-    The shallow work-root inventory, the private radar/train clones under
-    the state directory (`git clone --shared`, #2738), and the registered
-    agents' checkouts. Reading one more file is cheap; a dependent outside
-    this perimeter would be a doubt we cannot see.
-    """
-    found: list[str] = []
-    seen: set[str] = set()
-
-    def add(path: str) -> None:
-        real = _real(path)
-        if real not in seen and _marker(real) == "clone":
-            seen.add(real)
-            found.append(real)
-
-    for path in (known_clones if known_clones is not None else _clones_under(roots)):
-        add(path)
-    for base in (os.path.join(state_dir, "radar"),
-                 os.path.join(state_dir, "trains"),
-                 os.path.join(state_dir, "trains", "shadow")):
-        try:
-            with os.scandir(base) as children:
-                for child in sorted(children, key=lambda entry: entry.name):
-                    try:
-                        if child.is_dir(follow_symlinks=False):
-                            add(child.path)
-                    except OSError:
-                        continue
-        except OSError:
-            continue
-    for cwd in (agents or {}).values():
-        if cwd:
-            add(cwd)
-    return found
-
-
-def _objects_dir(repo: str) -> str:
-    """Absolute object directory of a clone, or '' when it cannot be read."""
+def _linked_objects(path: str) -> tuple[str, str]:
+    """Object directory of a linked worktree at `path`: (objects, why)."""
+    marker = os.path.join(path, ".git")
     try:
-        st = os.lstat(os.path.join(repo, ".git"))
-    except OSError:
+        with open(marker, "r", encoding="utf-8", errors="surrogateescape") as stream:
+            text = stream.read(4096)
+    except OSError as exc:
+        return "", "gitdir file unreadable (%s)" % (exc.strerror or exc)
+    if not text.startswith("gitdir:"):
+        return "", "gitdir file without a gitdir line"
+    gitdir = text[len("gitdir:"):].strip()
+    if not os.path.isabs(gitdir):
+        gitdir = os.path.join(path, gitdir)
+    gitdir = _real(gitdir)
+    try:
+        with open(os.path.join(gitdir, "commondir"), "r",
+                  encoding="utf-8", errors="surrogateescape") as stream:
+            common = stream.read(4096).strip()
+    except FileNotFoundError:
+        common = os.path.dirname(os.path.dirname(gitdir))
+    except OSError as exc:
+        return "", "commondir unreadable (%s)" % (exc.strerror or exc)
+    if not os.path.isabs(common):
+        common = os.path.join(gitdir, common)
+    return _real(os.path.join(common, "objects")), ""
+
+
+def _git_objects(path: str) -> tuple[str, str]:
+    """Object directory of the Git copy at `path`, or ('', doubt)."""
+    if hk._bare_git_copy(path):
+        return _real(os.path.join(path, "objects")), ""
+    marker = os.path.join(path, ".git")
+    try:
+        mode = os.lstat(marker).st_mode
+    except FileNotFoundError:
+        return "", ""
+    except OSError as exc:
+        return "", "Git marker unreadable (%s)" % (exc.strerror or exc)
+    if stat.S_ISDIR(mode):
+        return _real(os.path.join(marker, "objects")), ""
+    if stat.S_ISREG(mode):
+        return _linked_objects(path)
+    return "", "Git marker is neither a file nor a directory"
+
+
+def _dependency_inventory(cfg, roots, agents, rules) -> tuple[list[tuple[str, str]], bool, str]:
+    """Every Git copy whose alternates could depend on a candidate: (copies, complete, why).
+
+    Perimeter: the work roots and the radar/train trees **recursively** (so a
+    dependent nested under a container or a bare repository is seen), plus
+    the common object directories of the registered agents' checkouts. Build
+    output directories are not entered (they are regenerable and never hold a
+    clone whose objects a candidate owns); symbolic links are not followed,
+    like the rest of the housekeeping. A bound, an unreadable directory or an
+    unreadable marker makes the inventory incomplete: the caller then removes
+    nothing.
+    """
+    seen: set[str] = set()
+    walked: set[str] = set()
+    copies: list[tuple[str, str]] = []
+    budget = build_artifacts.Budget(DEPENDENCY_BUDGET_S)
+    opened = 0
+
+    def add(path: str) -> str:
+        real = _real(path)
+        if real in seen:
+            return ""
+        seen.add(real)
+        objects, why = _git_objects(path)
+        if why:
+            return why
+        if objects:
+            copies.append((path, objects))
         return ""
-    if not stat.S_ISDIR(st.st_mode):
+
+    def walk(top: str) -> str:
+        nonlocal opened
+        stack = [top]
+        try:
+            device = os.lstat(top).st_dev
+        except OSError as exc:
+            return "unreadable root %s (%s)" % (top, exc.strerror or exc)
+        while stack:
+            current = stack.pop()
+            real = _real(current)
+            if real in walked:
+                continue
+            walked.add(real)
+            if budget.expired():
+                return "time budget of the dependency inventory reached"
+            opened += 1
+            if opened > DEPENDENCY_LIMIT:
+                return "more than %d directories in the dependency inventory" % DEPENDENCY_LIMIT
+            why = add(current)
+            if why:
+                return why
+            if _git_objects(current)[0]:
+                # A Git copy is a proof point (its alternates file is read);
+                # its working tree is not entered: source trees are huge, and
+                # a nested copy inside a candidate is already a blocking
+                # guard of `_git_copies_report`. Plain containers are walked,
+                # so a dependent nested under them is seen.
+                continue
+            try:
+                with os.scandir(current) as children:
+                    entries = sorted(children, key=lambda entry: entry.name)
+            except OSError as exc:
+                return "unreadable directory %s (%s)" % (current, exc.strerror or exc)
+            for entry in entries:
+                if entry.name == ".git":
+                    continue
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    return "unreadable entry %s (%s)" % (entry.path, exc.strerror or exc)
+                if not stat.S_ISDIR(st.st_mode):
+                    continue
+                if st.st_dev != device:
+                    return "mount point inside %s: %s" % (top, entry.path)
+                if entry.name in DEPENDENCY_SKIP:
+                    continue
+                if any(rule.matches(current, entry.name) for rule in rules):
+                    continue
+                stack.append(entry.path)
         return ""
-    return _real(os.path.join(repo, ".git", "objects"))
+
+    tops = [hk._expand(root) for root in roots or () if os.path.isdir(hk._expand(root))]
+    for base in (os.path.join(cfg.state_dir, "radar"),
+                 os.path.join(cfg.state_dir, "trains")):
+        if os.path.isdir(base):
+            tops.append(base)
+    for top in tops:
+        why = walk(top)
+        if why:
+            return copies, False, why
+    for cwd in (agents or {}).values():
+        if not cwd:
+            continue
+        objects, why = _git_objects(cwd)
+        if why:
+            return copies, False, "%s: %s" % (cwd, why)
+        if objects:
+            copies.append((cwd, objects))
+    return copies, True, ""
 
 
 def _alternate_paths(info: str, objects: str) -> list[str] | None:
+    """Paths of an alternates file, resolved like Git does (relative to objects)."""
     try:
         if os.stat(info).st_size > 1024 * 1024:
             return None
@@ -257,55 +413,64 @@ def _alternate_paths(info: str, objects: str) -> list[str] | None:
     return out
 
 
-def _dependent_objects(cfg, roots, agents, candidates, known_clones=None
-                       ) -> tuple[dict[str, set[str]], str]:
-    """candidate object dir -> repositories whose alternates point inside it.
+def _dependents(copies, candidates) -> tuple[dict[str, set[str]], str]:
+    """candidate path -> repositories whose alternates point inside its objects.
 
-    A doubt (unreadable alternates file) is returned as the second value:
-    the caller then removes nothing, rather than break a clone it could not
+    A doubt (unreadable alternates file) is returned as the second value: the
+    caller then removes nothing, rather than break a clone it could not
     inspect.
     """
-    objects = {}
+    by_objects = {}
     for path in candidates:
         obj = _objects_dir(path)
         if obj:
-            objects[path] = obj
-    by_objects = {obj: path for path, obj in objects.items()}
+            by_objects[obj] = path
     out: dict[str, set[str]] = {path: set() for path in candidates}
-    for repo in _repository_copies(cfg.state_dir, roots, agents,
-                                   known_clones=known_clones):
-        obj = _objects_dir(repo)
-        if not obj:
-            continue
-        info = os.path.join(obj, "info", "alternates")
+    for repo, objects in copies:
+        info = os.path.join(objects, "info", "alternates")
         try:
             st = os.lstat(info)
         except FileNotFoundError:
             continue
         except OSError as exc:
-            return out, "alternates unreadable (%s): %s" % (
-                repo, exc.strerror or exc)
+            return out, "alternates unreadable (%s): %s" % (repo, exc.strerror or exc)
         if not stat.S_ISREG(st.st_mode):
             return out, "alternate marker is not a file: %s" % info
-        paths = _alternate_paths(info, obj)
+        paths = _alternate_paths(info, objects)
         if paths is None:
             return out, "alternates unreadable: %s" % info
-        for path in paths:
-            target = _real(path)
+        for value in paths:
+            target = _real(value)
             for candidate_obj, candidate in by_objects.items():
                 if hk._under(target, candidate_obj):
                     out[candidate].add(repo)
     return out, ""
 
 
+def _objects_dir(repo: str) -> str:
+    """Absolute object directory of a clone, or '' when it cannot be read."""
+    objects, _why = _git_objects(repo)
+    return objects
+
+
 def _removal_check(path: str, cfg, rules, allow, roots, agents) -> str:
-    """Why the clone must stay, right before it is renamed ('' to go)."""
+    """Why the clone must stay, right before it is renamed ('' to go).
+
+    The dependency inventory is read again, whole: a bounded or unreadable
+    inventory is a doubt, never a proof that no clone depends on the
+    candidate.
+    """
     if hk.worktree_in_use(path, allow=allow):
         return "a process is working in it"
     saved = hk._git_copy_work(path, path, rules)
     if saved:
         return saved
-    dependents, doubt = _dependent_objects(cfg, roots, agents, [path])
+    if not _objects_dir(path):
+        return "candidate object directory unreadable"
+    copies, complete, why = _dependency_inventory(cfg, roots, agents, rules)
+    if not complete:
+        return "dependency inventory incomplete (%s)" % why
+    dependents, doubt = _dependents(copies, [path])
     if doubt:
         return doubt
     if dependents.get(path):
@@ -381,11 +546,39 @@ def reap(db, host: str, cfg, *, roots, agents: dict, protected, dry_run: bool,
     except Exception:
         skipped.append("clones: tracked worktrees unreadable, nothing removed")
         return [], [], skipped
-    inventory = _clones_under(roots)
+    inventory, inventory_complete, inventory_why = _clones_under(roots)
     if not inventory:
-        return [], [], []
-    dependents, alternates_doubt = _dependent_objects(
-        cfg, roots, agents, inventory, known_clones=inventory)
+        if not inventory_complete:
+            skipped.append("clones: candidate inventory incomplete (%s)" % inventory_why)
+        return [], [], skipped
+    if not inventory_complete:
+        skipped.append("clones: candidate inventory incomplete (%s); nothing removed"
+                       % inventory_why)
+    copies: list[tuple[str, str]] = []
+    dependencies_complete = True
+    dependencies_why = ""
+    if inventory_complete:
+        copies, dependencies_complete, dependencies_why = _dependency_inventory(
+            cfg, roots, agents, rules)
+        if not dependencies_complete:
+            skipped.append("clones: dependency inventory incomplete (%s); nothing "
+                           "removed" % dependencies_why)
+    dependents: dict[str, set[str]] = {path: set() for path in inventory}
+    alternates_doubt = ""
+    if dependencies_complete:
+        candidates = []
+        for path in inventory:
+            if not _objects_dir(path):
+                dependencies_complete = False
+                dependencies_why = "candidate object directory unreadable: %s" % path
+                skipped.append("clones: dependency inventory incomplete (%s); nothing "
+                               "removed" % dependencies_why)
+                break
+            candidates.append(path)
+        if dependencies_complete:
+            dependents, alternates_doubt = _dependents(copies, candidates)
+            if alternates_doubt:
+                skipped.append("clones: %s; nothing removed" % alternates_doubt)
     deadline = time.monotonic() + CLONE_BUDGET_S
     inspected = 0
     for path in inventory:
@@ -410,11 +603,18 @@ def reap(db, host: str, cfg, *, roots, agents: dict, protected, dry_run: bool,
                 entries.append(dict(base, action="signaled",
                                     detail="name of a registered agent checkout; kept"))
             continue
-        rows, _ids, why = _attribution(db, path, agents)
+        rows, missing, why = _attribution(db, path, agents)
         if rows is None:
             plan.append(dict(base, action="garde", detail="%s; kept" % why))
             if not dry_run:
                 entries.append(dict(base, action="signaled", detail="%s; kept" % why))
+            continue
+        if missing:
+            detail = "named lot(s) %s unknown; kept" % ", ".join(
+                "#%s" % ident for ident in missing[:5])
+            plan.append(dict(base, action="garde", detail=detail))
+            if not dry_run:
+                entries.append(dict(base, action="signaled", detail=detail))
             continue
         if not rows:
             detail = ("no lot named by the directory or a lot/work branch; never "
@@ -446,6 +646,18 @@ def reap(db, host: str, cfg, *, roots, agents: dict, protected, dry_run: bool,
         if now - age < CLONE_IDLE_S:
             detail = "lot %s ended %s ago; waits 24 h" % (
                 base["lot"], hk.fmt_idle(now - age))
+            plan.append(dict(base, action="garde", detail=detail))
+            if not dry_run:
+                entries.append(dict(base, action="signaled", detail=detail))
+            continue
+        if not inventory_complete:
+            detail = "candidate inventory incomplete (%s); kept" % inventory_why
+            plan.append(dict(base, action="garde", detail=detail))
+            if not dry_run:
+                entries.append(dict(base, action="signaled", detail=detail))
+            continue
+        if not dependencies_complete:
+            detail = "dependency inventory incomplete (%s); kept" % dependencies_why
             plan.append(dict(base, action="garde", detail=detail))
             if not dry_run:
                 entries.append(dict(base, action="signaled", detail=detail))
