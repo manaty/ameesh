@@ -91,6 +91,21 @@ class LotDiffRangeTest(unittest.TestCase):
             self.repo, self.leger, "main", frozen=self.leger)),
             ["docs/leger.md"])
 
+    def test_un_gel_merge_de_main_garde_le_delta_du_lot(self):
+        # Un gel après réalignement de main a lui-même deux parents.
+        _git(self.repo, "checkout", "-q", "-b", "lot/realigne", self.leger)
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "realigne main",
+             self.sensible)
+        frozen = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "update-ref", "refs/heads/main", self.base)
+        _git(self.repo, "checkout", "-q", "main")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "main avance",
+             "lot/sensible")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "integre lot",
+             "lot/realigne")
+        self.assertEqual(self.files(lot_measures.lot_diff_range(
+            self.repo, frozen, "main", frozen=frozen)), ["docs/leger.md"])
+
     def test_une_cible_locale_perimee_n_elargit_pas_le_diff(self):
         """#2556 : `main` local est resté au socle, `origin/main` porte la
         fusion. Sans la cible par défaut, le repli `merge-base(cible,

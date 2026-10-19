@@ -321,7 +321,9 @@ def lot_diff_range(repo: str, sha: str, target: str | None = None,
     if not has_commit(repo, sha):
         return None
     merge = ""
-    if len(_parents(repo, sha)) >= 2:
+    # A frozen lot may itself merge main for realignment. Its second parent
+    # is then main, not the lot: find the later integration merge instead.
+    if sha != (frozen or "").strip() and len(_parents(repo, sha)) >= 2:
         merge = sha
     else:
         tgt = _target(repo, target)
