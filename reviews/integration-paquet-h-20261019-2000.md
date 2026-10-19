@@ -18,7 +18,7 @@ composés ; deux remises officielles sont ajoutées (#2443 `848efe7a`, #2757
 | #2752 | `63e03bae6f42` (tête gelée) | prêt mécanique, porte OK (cx1 Codex + dev5 DeepSeek) ; sensible (mailbox PostgreSQL) |
 | #1022 | `c0d5a418064c` (tête gelée) | prêt mécanique, porte OK (cx3 Codex) ; léger (témoins de la migration 0420) |
 | #2660 | `bdbfab85e4ff` (tête gelée) | prêt mécanique, porte OK (auditeur Claude + cx1 Codex) ; sensible (cible de migration) |
-| #2443 | `848efe7a86f7` (remise sur `b59b9624`) | tête `4575e7fd`, verdict **dev4** (Claude) ok le 19/10 17:50 ; **admission manuelle** : le pilote mesh-design a acté le 19/10 09:06 qu'un avis d'une autre famille suffit pour ce lot (migration 0465 sans GRANT) alors que la porte calculée en exige deux et que les trois familles sont autrices du delta ; la remise `848efe7a` est l'arbre de la résolution `30225ea0` + delta main h-1900 (`git diff 30225ea0..7d047462` = `ab845adb..b59b9624`), aucun delta de contenu #2443 non relu |
+| #2443 | `848efe7a86f7` (remise sur `b59b9624`) | tête `4575e7fd`, verdict **dev4** (Claude) ok le 19/10 17:50 ; **admission manuelle** : le pilote mesh-design a acté le 19/10 09:06 qu'un avis d'une autre famille suffit pour ce lot (migration 0465 sans GRANT) alors que la porte calculée en exige deux et que les trois familles sont autrices du delta ; la remise `848efe7a` est l'arbre de la résolution `30225ea0` + delta main h-1900 (`git diff 30225ea0..7d047462` = `ab845adb..b59b9624`), aucun delta de contenu #2443 non relu ; 171 tests ciblés psql+psycopg verts sur la remise (impl-07, 20:01) |
 | #2757 | `97155ecc6f5d` (résolution mécanique) | tête `a605ff17`, porte OK (2 avis) ; résolution **jugée mécanique par mesh-design** (19/10), à reprendre telle quelle au prochain véhicule |
 
 ## Composition (6 unités)
@@ -75,8 +75,16 @@ la résolution mécanique de #2757.
 - `scripts/garde-mecanique.py --json` : **0 constat**, 0 exemption inutilisée
   (1 exemption utilisée, #2642).
 - `scripts/doc-links.py` : 171 fichiers, **0 lien cassé**.
-- Tests ciblés sur l'arbre composé : modules des 6 unités (psql + psycopg) —
-  à consigner au fil du run.
+- Tests ciblés sur l'arbre composé, **psql + psycopg, tous verts** :
+  modules neufs des unités #2739/#1022/#2443/#2757 (test_2739_review_correction,
+  test_1022_creneau_landed, test_2443_packet_members,
+  test_2757_underused_projection) — 36 tests, 72 passes ; régression
+  #2443/#2157/#l107/#l84/#1822 (test_2157_paquet_compose, test_plan_git,
+  test_l107_executor_contract, test_l84_serve, test_1822_classe_legere) — 112
+  tests, 224 passes ; témoins neufs #2752/#2660
+  (test_courriers_livres_du_lot_lus_sur_la_colonne_indexee,
+  test_numero_exact_ne_lit_pas_origin_head) — 2 tests, 4 passes. Total 150
+  tests, 300 passes, **0 échec**.
 - Suite complète unique demandée sur la tête finale (`ci-full-<sha>`), avec la
   revue unitaire du paquet pour seul avis de la demande de CI (§12,
   `--full --avis 0`).
