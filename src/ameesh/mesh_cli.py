@@ -1917,6 +1917,16 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 _fmt_moment(item.get("closed_ts"))))
             if item["delays"]:
                 _print_delays(item["delays"])
+            # #2674 : les verdicts écrits avant la règle de la tête relue ne
+            # comptent pas à la porte ; le dire une fois, sans noyer la frise.
+            unattached = [m for m in item["milestones"]
+                          if m.get("kind") == "verdict"
+                          and not str(m.get("sha") or "").strip()]
+            if unattached:
+                print("verdicts : avis non rattaché à une tête%s (anciens verdicts sans "
+                      "sha : ils ne comptent pas à la porte de fusion ; redonner l'avis "
+                      "sur la tête gelée)"
+                      % (" ×%d" % len(unattached) if len(unattached) > 1 else ""))
             for event in item["events"]:
                 print("  %s  %-14s %-12s %s" % (
                     _fmt_moment(event.get("created_ts")), event["state"],
@@ -2156,13 +2166,14 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 note = freeze_checks.before_freeze(
                     cfg, db, args.id, args.sha or "", repo=args.repo,
                     skip=args.no_static_checks, note=note)
-            elif args.repo is not None or args.no_static_checks is not None \
-                    or args.prevalidation_map:
-                raise work.WorkError("--repo, --no-static-checks and --prevalidation-map "
+            elif args.no_static_checks is not None or args.prevalidation_map:
+                raise work.WorkError("--no-static-checks and --prevalidation-map "
                                      "only apply to a freeze")
+            # `--repo` vaut aussi pour un verdict (#2674) : il y résout
+            # l'abréviation du SHA relu, et fait alors autorité.
             row = work.milestone(
                 db, args.id, args.kind, sha=args.sha or "", actor=args.actor or "",
-                verdict=args.verdict, note=note, outcome=outcome)
+                verdict=args.verdict, note=note, outcome=outcome, repo=args.repo)
             print("milestone %s added to lot #%d%s" % (
                 row["kind"], args.id,
                 " (%s)" % row["verdict"] if row.get("verdict") else ""))
@@ -3301,17 +3312,22 @@ def build_parser() -> argparse.ArgumentParser:
     pw_ms.add_argument("kind", choices=["frozen", "verdict"],
                        help="frozen (branch frozen) or verdict (review delivered); "
                             "the pilot's fire is `ameesh work fire`")
-    pw_ms.add_argument("--sha", default="", help="the frozen or reviewed commit")
+    pw_ms.add_argument("--sha", default="",
+                       help="the frozen or reviewed commit (verdict: the full head, or "
+                            "an abbreviation of at least 12 hex characters resolved in "
+                            "a repository)")
     # le verdict est un positionnel (`work milestone 1 verdict ok`), comme la
     # frise se lit ; `frozen` n'en prend pas
     pw_ms.add_argument("verdict", nargs="?", choices=list(work.VERDICTS), default=None,
                        help="for the verdict milestone: ok or blocked")
     pw_ms.add_argument("--note", default="")
     pw_ms.add_argument("--actor", default="")
-    # #2542 : les contrôles statiques du projet passent avant le gel
+    # #2542 : les contrôles statiques du projet passent avant le gel ;
+    # #2674 : pour un verdict, le dépôt où résoudre l'abréviation du SHA relu
     pw_ms.add_argument("--repo", default=None,
-                       help="frozen: the repository holding --sha (default: the current "
-                            "directory, then the lot's project repository)")
+                       help="frozen|verdict: the repository holding --sha (freeze default: "
+                            "the current directory, then the lot's project repository; "
+                            "verdict: the abbreviation must resolve there)")
     pw_ms.add_argument("--prevalidation-map", default="",
                        help="#2644: measured map (carte.json.gz) for the freeze "
                             "prevalidation; default: the last carte artifact")
