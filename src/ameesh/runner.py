@@ -4907,6 +4907,49 @@ class AgentWorker(threading.Thread):
                 "unavailable). They will be delivered again, flagged as possibly redelivered."
                 % len(incertains),
                 meta={"action": "remise-incertaine", "messages": incertains})
+        if livres and spec.get("human"):
+            # L77/L78 : la trace lisible des messages humains servis. Idempotente
+            # (`event_id = mail:<id>`) : une remise incertaine rejouée ne duplique
+            # pas l'entrée ; le journal ne porte aucun état servi/ack.
+            self._journal_humans(spec, livres)
+
+    def _journal_humans(self, spec: dict, delivered) -> None:
+        """Écrit une entrée `human_message` par message humain remis (L78)."""
+        if not spec.get("human") or not delivered:
+            return
+        from . import conversation
+
+        rows = {}
+        for row in spec.get("rows") or ():
+            try:
+                rows[int(row["id"])] = row
+            except (KeyError, TypeError, ValueError):
+                continue
+        cfg = getattr(self, "cfg", None)
+        first = None
+        for mid in delivered:
+            row = rows.get(int(mid))
+            if row is None:
+                continue
+            sender = str(row.get("sender") or "human:?")
+            author = sender if sender.startswith(("human:", "chat-")) \
+                else "human:" + sender
+            try:
+                entry = conversation.Log(self.db, cfg, agent=self.name,
+                                         lot=row.get("lot_id"))
+                entry.append("human_message", text=row.get("body") or "",
+                             author=author, event_id="mail:%d" % int(mid),
+                             meta={"messages": [int(mid)]})
+                first = first or entry
+            except Exception as exc:  # le tour part quand même, la trace est signalée
+                log("[%s] conversation journal: human message #%s not recorded (%s)"
+                    % (self.name, mid, exc))
+        if first is not None:
+            try:
+                first.drain_threads()
+            except Exception as exc:
+                log("[%s] conversation journal: readable thread not delivered (%s)"
+                    % (self.name, exc))
 
     def _github_env(self, env: dict, lot) -> None:
         """#1645 : journal des gestes gh et identité GitHub par rôle. Jamais
