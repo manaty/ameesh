@@ -209,6 +209,13 @@ class RunnerTest(PgTestCase):
         tuait le worker avant le `Popen` et le tour ne démarrait jamais. Le bail
         protège le tour entier : son renouvellement doit commencer avec la
         préparation, pas une fois le harnais publié.
+
+        Run 39181194843 (psql 6/16) : le tour démarrait et finissait, puis le
+        veilleur tuait le worker à l'échéance pendant les assertions — le
+        battement s'arrête avec le tour, mais ce témoin ne rend pas le bail
+        comme la boucle de service. Le battement doit donc être constaté vivant
+        *avant* la préparation (déterministe, sans horloge), et le veilleur
+        arrêté dès la fin du tour : son échéance ne juge plus rien ensuite.
         """
         cwd = self._cwd("lent")
         self.register("lent", "claude", cwd=cwd, prompt="tour préparé lentement")
@@ -222,13 +229,22 @@ class RunnerTest(PgTestCase):
         ouverture = AgentWorker._ouverture
 
         def lente(self_):
+            self.assertTrue(
+                self_.heartbeat_thread is not None
+                and self_.heartbeat_thread.is_alive(),
+                "le battement n'a pas démarré avant la préparation du tour")
             time.sleep(5.0)  # plus long que le bail : la préparation doit le couvrir
+            self.assertTrue(self_.heartbeat_thread.is_alive(),
+                            "le battement s'est arrêté pendant la préparation")
             return ouverture(self_)
 
         with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN,
                                           "AMEESH_TEST_LOG": self.turns_log}), \
                 mock.patch.object(AgentWorker, "_ouverture", lente):
             ok = worker.run_turn({"kind": "prompt", "prompt": "consigne", "ids": []})
+        # Le tour est fini : ce témoin ne rend pas le bail comme la boucle de
+        # service, donc le veilleur ne doit plus juger l'échéance ensuite.
+        worker.watchdog_stop.set()
         self.assertTrue(ok, "le tour n'a pas démarré : le bail n'a pas survécu "
                             "à la préparation")
         self.assertFalse(worker.lease_lost.is_set(),
