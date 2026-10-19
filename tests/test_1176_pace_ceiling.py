@@ -484,7 +484,9 @@ class ReportTest(_Sandbox):
         cfg = type("Cfg", (), {"host": "h", "accounts": {"claude": [
             {"name": "secondaire", "path": directory, "check_credentials": False,
              "pace_ceiling": 0.90, "pace_ceiling_end": 0.98}]}})()
-        gauge = _gauge(0.95, before_reset=3 * HOUR)
+        # #2648 : `report` applique la réserve des critiques, comme la pause.
+        # 80 % reste sous le plafond effectif relevé (98 %) moins la réserve.
+        gauge = _gauge(0.80, before_reset=3 * HOUR)
         book = _Book(claude=_reading([gauge], cost.Overage(capable)))
         return accounts.report(cfg, None, book, now=NOW, record=False)
 
@@ -505,7 +507,10 @@ class ReportTest(_Sandbox):
     def test_the_next_choice_explains_with_the_effective_cap(self):
         row = self._report(False)[0]
         self.assertTrue(row["next"])
-        self.assertIn("pace 98%", row["why"])
+        # #2648 : le plafond effectif (98 %) est relevé, la réserve des
+        # critiques (10 points) est déduite pour un non-critique → 88 %.
+        self.assertEqual(row["gauges"][0]["pace_ceiling"], 0.98)
+        self.assertIn("pace 88%", row["why"])
 
 
 if __name__ == "__main__":
