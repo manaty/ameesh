@@ -1489,7 +1489,10 @@ class WorkItems(Domain):
         des index uniques : deux réservations simultanées ne prennent jamais
         le même numéro ; la perdante réessaie avec une attente aléatoire
         croissante, dans un budget de temps (#478). `note` peut citer
-        `%(number)04d`. None si le lot n'est plus ouvert, ou si `issue_ref` —
+        `%(number)04d` pour une réservation ou une libération d'UN numéro ; une
+        libération totale nomme elle-même l'ensemble des numéros (un gabarit
+        y rend la liste, jamais le sentinelle 0). None si le lot n'est plus
+        ouvert, ou si `issue_ref` —
         la référence lue par l'appelant — a changé entre-temps (#1830 : NULL
         et chaîne vide confondus) ; DbError si `number` est pris par un autre
         lot ; `ReservationContention` si le budget du prochain libre est

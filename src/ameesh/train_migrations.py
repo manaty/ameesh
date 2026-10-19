@@ -371,11 +371,21 @@ def guard_transport(path: str, base: str, head: str, target: Layout, row: dict) 
 
 
 class Allocator:
-    """L122 side of the composition: move a reservation, release it at landing.
+    """L122 side of the composition: add the new slots, release all at landing.
 
     The caller must hold the target reservation. ``reserve`` runs before the
     train branch is published; a refusal names the member and defers it rather
     than publishing a package whose number is not reserved.
+
+    #2481 : a lot may hold several reservations, so ``reserve`` ADDS the
+    composition number to the lot's slots instead of replacing its previous
+    one. The old number stays reserved until landing (a failed or superseded
+    package therefore leaves its slots on the lot, and a retry can add more);
+    ``landed`` releases every slot at once, and the plan carries the
+    authoritative old -> new mapping. Releasing the previous number earlier
+    would require a batch release after all the lot's new numbers are taken,
+    which the one-number contract of ``work.reserve_migration`` does not
+    express.
     """
 
     def __init__(self, db, cfg=None, *, actor: str = "ameesh train"):
@@ -383,6 +393,14 @@ class Allocator:
 
     def reserve(self, row: dict, path: str, old: int, number: int,
                 target: Layout) -> None:
+        """Reserve ``number`` for the member, keeping its previous slots.
+
+        The reservation is added before the rewritten tree is published; a
+        refusal is a member deferral, never a package with an unreserved
+        number. The previous number (``old``) is not released here: the plan's
+        mapping keeps it meaningful until the lot lands and ``landed`` frees
+        the whole set.
+        """
         from . import work
 
         try:

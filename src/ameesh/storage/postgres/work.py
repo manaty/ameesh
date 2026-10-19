@@ -109,9 +109,12 @@ def item_columns(db, ref: str | None = None) -> str:
 
     #2481 : `migrations` est la liste des créneaux réservés du lot (JSONB),
     lue dans `work_migration_reservations` par une sous-requête corrélée —
-    une seule requête, pas d'aller-retour par lot. Sur une base d'avant
-    0419, la liste est vide et `work.migration_line` se replie sur le champ
-    scalaire."""
+    une seule requête, pas d'aller-retour par lot. La liste n'est lue que sur
+    la ligne complète (sans `ref`) : le chemin `ref` est celui des lectures à
+    budget L61, et la sonde de table y coûterait justement l'aller-retour
+    qu'il économise. Ces vues rendent `[]` et se replient sur le scalaire
+    (`work.migration_line`), jamais sur une erreur : sur une base d'avant
+    0419, la liste est de toute façon vide."""
     if ref:
         reviewer = "coalesce(to_jsonb(%s)->>'reviewer', '') AS reviewer" % ref
     elif has_reviewer(db):
@@ -121,15 +124,16 @@ def item_columns(db, ref: str | None = None) -> str:
     # to_jsonb keeps reads compatible with schemas predating 0456, without
     # another catalogue round trip (including bounded progress/list reads).
     reviewers = "to_jsonb(%s)->'reviewers' AS reviewers" % (ref or "work_items")
-    target = ref or "work_items"
-    if has_migration_slots(db):
+    if ref:
+        migrations = "'[]'::jsonb AS migrations"
+    elif has_migration_slots(db):
         migrations = (
             "coalesce((SELECT jsonb_agg(jsonb_build_object("
             "'number', r.number, 'repo', r.target_repo, 'slot', r.slot)"
             " ORDER BY r.number, r.slot)"
             " FROM work_migration_reservations r"
-            " WHERE r.work_item_id = %s.id AND r.status = 'reserved'), '[]'::jsonb)"
-            " AS migrations" % target)
+            " WHERE r.work_item_id = work_items.id AND r.status = 'reserved'), '[]'::jsonb)"
+            " AS migrations")
     else:
         migrations = "'[]'::jsonb AS migrations"
     return (_COLUMNS_TEMPLATE
@@ -1744,8 +1748,14 @@ class WorkItems(interface.WorkItems):
                         "       updated_at = now()"
                         " WHERE work_item_id = %s AND slot = %s"
                         "   AND status = 'reserved'", (int(item_id), row["slot"]))
-        WorkItems(tx)._event(int(item_id), state,
-                             note % {"number": target or 0}, actor)
+        if target is not None:
+            note = note % {"number": target}
+        elif "%(number)" in note:
+            # #2481 N2 : une libération totale n'a pas UN numéro ; le
+            # gabarit nomme l'ensemble au lieu du sentinelle 0.
+            note = note.replace("%(number)04d", "%s").replace("%(number)s", "%s")
+            note = note % ", ".join(str(value) for value in numbers)
+        WorkItems(tx)._event(int(item_id), state, note, actor)
         return self._migration_row(tx, item_id)
 
     def reserve_migration(self, item_id, repo, number, floor, *, note, actor,

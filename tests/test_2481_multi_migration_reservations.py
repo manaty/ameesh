@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest import mock
 
 from ameesh import migration_reservations as reservations, radar, work
+from ameesh.storage.postgres import work as pg_work
 
 from .support import PgTestCase
 from .test_l122_numeros_de_migration import NEXLINK, _depot
@@ -63,6 +65,33 @@ class MultiReservationTest(PgTestCase):
         with self.assertRaises(work.WorkError) as ctx:
             work.reserve_migration(self.db, other["id"], 529, repo=self.repo)
         self.assertIn("lot #%d" % self.lot["id"], str(ctx.exception))
+
+    def test_ref_columns_do_not_probe_the_slots_table(self):
+        """#2481 B1 : le chemin `ref` (work list, progress) ne paie pas la
+        sonde de table ; il rend la liste vide et se replie sur le scalaire."""
+        with mock.patch.object(pg_work, "has_migration_slots",
+                               side_effect=AssertionError("sonde sur le chemin ref")):
+            columns = pg_work.item_columns(self.db, "work_items")
+        self.assertIn("'[]'::jsonb AS migrations", columns)
+        # la ligne complète garde la liste réelle : work show affiche les deux
+        self.reserve(528)
+        self.reserve(529)
+        item = work.get(self.db, self.lot["id"])
+        self.assertEqual([row["number"] for row in item["migrations"]], [528, 529])
+
+    def test_total_release_note_names_every_number(self):
+        """#2481 N2 : une libération totale ne rend pas le sentinelle 0."""
+        self.reserve(528)
+        self.reserve(529)
+        item = work.get(self.db, self.lot["id"])
+        work.storage.of(self.db).work.reserve_migration(
+            self.lot["id"], "manaty/nexlink", None, 0, actor="test",
+            issue_ref=item.get("issue_ref"), release=True,
+            note="migrations %(number)s released")
+        note = self.db.query(
+            "SELECT note FROM work_item_events WHERE work_item_id = %s"
+            " ORDER BY id DESC LIMIT 1", (self.lot["id"],))[0]["note"]
+        self.assertEqual(note, "migrations 528, 529 released")
 
     def test_release_one_number_then_all(self):
         self.reserve(528)
