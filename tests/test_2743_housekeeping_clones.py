@@ -74,6 +74,7 @@ class CloneReapTest(PgTestCase):
         _sans_processus(self)
         lot = self.ended_lot()
         source = self.clone("a-%s-source" % lot)
+        self.clone("z-dependent-direct", source=source, shared=True)
         nested = os.path.join(self.root, "container", "nested")
         os.makedirs(nested)
         subprocess.run(["git", "clone", "-q", "--shared", source,
@@ -85,7 +86,7 @@ class CloneReapTest(PgTestCase):
             self.assertTrue(complete, why)
             dependents, doubt = clones._dependents(copies, [source])
         self.assertEqual(doubt, "")
-        self.assertTrue(dependents[source])
+        self.assertGreaterEqual(len(dependents[source]), 2)
 
     def test_a_dependent_clone_nested_under_a_container_is_seen(self):
         _sans_processus(self)
