@@ -221,6 +221,29 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertEqual([m["recipient"] for m in self.mailbox()], ["r1", "r2"])
         self.assertEqual(len(self.marks()), 1)
 
+    def test_a_light_freeze_uses_the_declared_floor(self):
+        # #2642 : un diff léger non vide demande le plancher du canon
+        # (`reviews.light_reviews: 1`), pas zéro ; la désignation le lit par
+        # `mechanics.reviews_for` et le passe à la sélection sans le réinventer.
+        self.repo.write("docs/guide.md", "base\n")
+        self.base = self.repo.commit("docs base")
+        self.repo.write("docs/guide.md", "lot\n")
+        self.frozen = self.repo.commit("docs lot")
+        self.db.execute("UPDATE work_items SET branch_target = %s WHERE id = %s",
+                        (self.base, self.lot))
+        self.receipts()
+        text = MECHANICS.replace("  distinct_families: true",
+                                 "  distinct_families: true\n  light_reviews: 1")
+        self.canon = _Canon(os.path.join(self.tmp, "canon-light"), mechanics=text)
+        self.cfg = dataclasses.replace(self.cfg, canon=self.canon.root, canon_ref="HEAD")
+        _, out = self.freeze()
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        self.assertEqual(out["required"], 1)
+        self.assertEqual(len(out["reviewers"]), 1)
+        self.assertNotEqual(out["reviewers"][0]["family"], "deepseek")
+        self.assertEqual([m["recipient"] for m in self.mailbox()],
+                         [out["reviewers"][0]["name"]])
+
     def test_the_freeze_designates_two_real_families_without_an_agent(self):
         _, out = self.freeze()
         self.assertEqual(out["state"], rd.DESIGNATED, out)

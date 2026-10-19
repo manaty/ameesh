@@ -1095,7 +1095,6 @@ class ReveilTest(_Base):
         self.assertIn("Scheduled wake", spec["prompt"])
         self.assertIsNotNone(work.get(self.db, lot)["wake_ts"],
                              "la délivrance médiée ne consomme pas l'échéance")
-
     def test_reveil_programme_perdu_au_drainage_est_redelivre(self):
         """#2466 B1 (cx2) : si le drainage refuse le tour entre le choix et le
         lancement, le claim expire et le réveil est délivré de nouveau."""

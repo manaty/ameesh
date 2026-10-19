@@ -482,6 +482,15 @@ Aux coupures de 11:00 et 23:00, la release prend la tête de la cible (ou le
 dernier commit vert), taguée et déployée en staging : elle ne compose plus de
 paquet.
 
+Un créneau manqué ne reste pas muet (#2601) : sur l'hôte opérateur, chaque
+`ameesh release tick` (minuteur de 5 min) relit la cadence compilée
+(`packets.cutoffs`) ; passé la grâce (15 min par défaut), si aucun porteur
+`integration/paquet*` n'est ouvert ni tout juste fusionné pour le projet et que
+la liste calculée rend au moins un lot prêt, une alerte urgente part, une fois
+par créneau, aux destinataires de `packet_watch.projects.<projet>.notify` (le
+composeur et le pilote). `ameesh release packet-watch --dry-run` montre ce qui
+partirait.
+
 La composition **part d'une liste calculée**, jamais des seuls courriers
 (#2404) : `scripts/paquet-candidats.py` lit tous les lots `qa` du projet (sans
 filtre d'assigné), leur gel effectif confronté à la tête **publiée**, les

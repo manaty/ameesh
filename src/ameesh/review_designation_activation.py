@@ -23,9 +23,12 @@ Inputs, all from machine sources (never a note, an assignment or a name):
   agent's session directory, another repository. The exact SHA and the issue's
   repository origin decide;
 - **authors**: the lot's assignee at freeze (`review_lot._author_at_freeze`,
-  the historical turn trace) and every commit of the frozen range through its
-  exact provenance receipt (#1465). A commit without a receipt makes the
-  designation wait: an unknown family cannot prove independence;
+  the historical turn trace, the same reference family as the merge gate) and
+  every commit of the frozen range through its exact provenance receipt
+  (#1465), except a designated reviewer's first-round correction under the §2
+  threshold (#2638: ≤ ~50 changed lines, no design). A commit without a
+  receipt makes the designation wait: an unknown family cannot prove
+  independence;
 - **candidates**: the registry rows of the lot's project, real session family
   only (`registry.live_harness`), availability and open-lot load;
 - **pilot**: the project's `orchestrateur` in the canon, when registered; an
@@ -82,6 +85,12 @@ LIGHT_WHY = ("light lot: no pre-merge reviewer is due (the other-family review"
 NO_PATH_WHY = "no changed path: no review due"
 #: a frozen range longer than this is not read in one selection (bounded work)
 MAX_COMMITS = 500
+#: canon §2: a reviewer's first-round correction is a small fix up to ~50
+#: changed lines; beyond that (or for a design change) its author becomes an
+#: author of the head (#2638)
+REVIEWER_FIX_LINES = 50
+#: canon §2 "ou de conception": a design document is never a small fix
+DESIGN_PREFIXES = ("docs/design/",)
 
 #: a run of `retry_pending` reads at most this many unavailable notes
 RETRY_SCAN = 200
@@ -568,9 +577,75 @@ def _family(harness) -> str:
     return review_lot.family_of(str(harness or ""))
 
 
+def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
+                          author: str) -> set[str]:
+    """The names designated as reviewers of the lot, automatic or manual.
+
+    The current column holds the previous freeze's automatic names and the
+    manual exception; the journal marks keep the names a later freeze retired.
+    A reviewer who pushed a first-round correction must stay recognizable after
+    the freeze that retired them (#2638). The lot author is never a reviewer.
+    """
+    names: list[str] = []
+    lot = int((item or {}).get("id") or 0)
+    freeze_id = int((milestone or {}).get("id") or 0)
+    try:
+        names.extend(_previous_reviewers(db, lot, freeze_id))
+    except Exception:  # noqa: BLE001 - unreadable journal: no automatic name
+        pass
+    try:
+        from .work_reviewers import designated
+
+        names.extend(designated(dict(item or {})))
+    except Exception:  # noqa: BLE001 - unreadable column: no manual name
+        pass
+    return {str(value).strip() for value in names
+            if str(value).strip() and str(value).strip() != author}
+
+
+def _change(repo: str, sha: str) -> Optional[tuple[int, bool]]:
+    """`(changed lines, touches a design path)` of one commit, or None.
+
+    `None` means the diff is unreadable: the caller must not guess a small fix.
+    A binary change is never a small fix, and neither is a design document
+    (canon §2: a correction "> ~50 lignes ou de conception" goes back to the
+    author, #2638)."""
+    if not repo:
+        return None
+    text = plan_git._out(repo, "show", "--numstat", "-z", "--format=", "--no-renames", sha)
+    if text is None:
+        return None
+    lines, design = 0, False
+    for row in str(text).split("\0"):
+        if not row:
+            continue
+        fields = row.split("\t", 2)
+        if len(fields) < 3:
+            return None
+        added, removed, path = fields
+        if added == "-" or removed == "-":
+            return REVIEWER_FIX_LINES + 1, design
+        try:
+            lines += int(added) + int(removed)
+        except ValueError:
+            return None
+        if path.startswith(DESIGN_PREFIXES):
+            design = True
+    return lines, design
+
+
 def _authors(db, item: Mapping, milestone: Optional[Mapping],
-             commits: Sequence[str]) -> tuple[list, list]:
-    """`(authors, unknown authors)` drawn from the freeze and exact receipts."""
+             commits: Sequence[str], repo: str = "") -> tuple[list, list]:
+    """`(authors, unknown authors)` drawn from the freeze and exact receipts.
+
+    The reference author is the lot's author at freeze (the assignee, exactly
+    as `merge_queue.review_gate` reads it). Every other commit counts as an
+    author, with one exception: a **designated reviewer's** first-round
+    correction under the §2 threshold (`REVIEWER_FIX_LINES`, no design change)
+    does not make its author an author of the head — their family stays
+    eligible, and the same reviewer may be designated again on the new head.
+    A larger or design change makes them an author like any other (#2638).
+    """
     lot = int((item or {}).get("id") or 0)
     assignee = str((item or {}).get("assignee") or "").strip()
     author = {}
@@ -598,10 +673,12 @@ def _authors(db, item: Mapping, milestone: Optional[Mapping],
                 family = _family(row.get("session_harness"))
         except Exception:  # noqa: BLE001 - no session: the family stays unknown
             family = ""
+    reviewers = _designated_reviewers(db, item, milestone, name)
     by_name: dict[str, set] = {}
     if name:
         by_name.setdefault(name, set()).add(family)
     unknown = []
+    review_commits: dict[str, list[tuple[str, str]]] = {}
     for sha in commits or ():
         try:
             receipt = review_provenance.receipt_for_commit(db, sha)
@@ -611,8 +688,26 @@ def _authors(db, item: Mapping, milestone: Optional[Mapping],
             unknown.append(str(sha)[:12])
             continue
         actor = str(receipt.get("actor") or "").strip()
-        if actor:
-            by_name.setdefault(actor, set()).add(_family(receipt.get("harness")))
+        if not actor:
+            continue
+        proven = _family(receipt.get("harness"))
+        if actor != name and actor in reviewers:
+            # held until the §2 threshold is known for their whole correction
+            review_commits.setdefault(actor, []).append((str(sha), proven))
+            continue
+        by_name.setdefault(actor, set()).add(proven)
+    for actor, entries in sorted(review_commits.items()):
+        total, design = 0, False
+        for sha, _proven in entries:
+            change = _change(repo, sha)
+            if change is None or change[1]:
+                design = True
+                break
+            total += change[0]
+        if design or total > REVIEWER_FIX_LINES:
+            # beyond the small first-round fix: they authored the head
+            by_name.setdefault(actor, set()).update(
+                proven for _sha, proven in entries if proven)
     authors = []
     for actor in sorted(by_name):
         families = {f for f in by_name[actor] if f}
@@ -813,7 +908,7 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         # project's agents, so the two roles never collapse into one mail
         candidates = [candidate for candidate in candidates
                       if candidate.name != notify]
-    authors, unknown = _authors(db, item, freeze, commits)
+    authors, unknown = _authors(db, item, freeze, commits, repo)
     return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=paths,
                   commits=commits, policy=policy, authors=authors,
                   unknown_authors=unknown, candidates=candidates, notify=notify,
