@@ -58,7 +58,8 @@ SCHEMA = "ameesh-train-host/1"
 MODES = ("shadow", "active")
 #: named providers. A name is an explicit selection, not a hint: an unknown
 #: name refuses and no adapter is inferred from the project or the registry.
-CONTRACTS = {"ameesh": train_contracts.ameesh}
+CONTRACTS = {"ameesh": train_contracts.ameesh,
+             "nexlink": train_contracts.nexlink}
 PROVENANCE = {"review_provenance": review_provenance}
 RESERVATIONS = {"packet_reservation": packet_reservation}
 #: compiled adapters named by the configuration for the candidate inventory

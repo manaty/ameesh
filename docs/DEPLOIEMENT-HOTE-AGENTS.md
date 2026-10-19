@@ -55,17 +55,40 @@ survit à sa sortie. La levée est **conditionnelle** : le motif exact de la
 pause posée (unique, avec son jeton) est son identité, et `ameesh resume
 --operator --expect-reason` ne lève que cette pause-là — la comparaison et la
 levée se font dans la même instruction SQL (migration 0458), donc une pause
-étrangère posée entre la lecture et la reprise n’est jamais levée. Si la
+étrangère posée entre la lecture et la reprise n’est jamais levée. La levée
+conditionnelle reste possible si l’agent est passé `externe` pendant le
+drain (migration 0459, #2184/N1) : un changement de mode ne rend pas la
+pause du drain orpheline ; la pose, elle, reste refusée sur un agent
+non-execute. Si la
 réponse de la pause se perd (SSH coupé, JSON illisible), le script réconcilie
 par l’état réel : motif identique, le drain continue ; sinon il ne redémarre
-ni ne lève rien et s’arrête en le disant, en nommant l’agent, le motif exact
-et la commande conditionnelle de levée manuelle. Pose et levée sont des gestes
-d’opérateur : le CLI local refuse une session liée à un agent (`bad_actor`),
-donc `vm.sh` doit être lancé hors session d’agent ; sinon la pause est refusée
-et le redémarrage de cet agent s’arrête sans interrompre aucun tour. Un CLI de
-cible antérieur à #2152 (sans `--expect-reason`) n’est jamais utilisé pour
+ni ne lève rien et le dit, en nommant l’agent, le motif exact et la commande
+conditionnelle de levée manuelle. Pose et levée sont des gestes d’opérateur :
+le CLI local refuse une session liée à un agent (`bad_actor`), donc `vm.sh`
+doit être lancé hors session d’agent ; l’acteur d’audit consigné est
+l’opérateur du poste (`--human`), jamais le compte `ameesh` de la VM
+(#2184/N6). Si la pose est refusée, cet agent est laissé en l’état sans
+redémarrage et les autres agents du balayage continuent ; un échec de levée
+est consigné, retenté à la sortie, et le code de retour le signale
+(#2184/N2) ; le verdict « NON levé » n’est écrit qu’après la dernière
+tentative (#2198/N3). Un CLI de
+cible antérieur à #2152 (sans `--expect-reason`) ou à #2184/R3 (sans
+`--not-after`) n’est jamais utilisé pour
 drainer : le script arrête l’agent sans drain plutôt que de laisser une pause
-orpheline. Il relit le placement avant chaque redémarrage :
+orpheline. La pose porte une échéance absolue (`--not-after`) comparée par
+la base sous le verrou de ligne : une commande distante retardée est refusée
+(`refusal=not_after`). Pour une pose incertaine, le script attend l’échéance,
+la borne d’instruction (`DRAIN_BORNE_INSTRUCTION`, 30 s) et la dérive
+d’horloge (`DRAIN_DERIVE`, 5 s) avant de relire l’état et de reprendre. Les
+appels de drain sont bornés (`DRAIN_APPEL_DELAI`, 60 s), transport SSH
+compris, et couverts par un keepalive (#2184/N3) ; leur borne locale vaut
+`DRAIN_APPEL_DELAI + DRAIN_MARGE_LOCALE` (20 s), pour que le `timeout`
+distant rende son code avant que le client ne tue le groupe (#2198/N2). Les
+lectures (`list`, `show`, `--help`) ont leur propre borne, plus courte
+(`DRAIN_LECTURE_DELAI`, 30 s — #2198/N4). Un signal reçu par le client
+(SIGINT/SIGTERM) est transmis au groupe de l’enfant, lancé dans sa propre
+session, qui n’est donc pas orphelin (#2198/N1). Il relit le placement et
+le mode avant chaque redémarrage, y compris en mode serveur (#2198/N5) :
 un agent déplacé ou passé en observation est ignoré ; un agent arrêté n’est
 pas réactivé (aucun bail, aucun tour — #1131), mais son unité encore active
 est rechargée sur le nouveau code (#1633), sans quoi elle servirait la

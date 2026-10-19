@@ -30,6 +30,10 @@ SELECT format('REVOKE ALL ON ALL TABLES IN SCHEMA %I FROM ameesh_it_proof, amees
 SELECT format('REVOKE ALL ON ALL SEQUENCES IN SCHEMA %I FROM ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
 SELECT format('GRANT SELECT ON %I.work_items, %I.project_modules, %I.work_module_milestones TO ameesh_it_proof, ameesh_it_qa',
               :'schema', :'schema', :'schema') \gexec
+-- #2481: a full work row projects its reserved migration slots
+-- (`work.get`); the isolated writers read the lot through that projection.
+SELECT format('GRANT SELECT ON %I.work_migration_reservations TO ameesh_it_proof, ameesh_it_qa', :'schema')
+ WHERE to_regclass(format('%I.work_migration_reservations', :'schema')) IS NOT NULL \gexec
 -- SELECT FOR NO KEY UPDATE needs UPDATE on at least one column.
 SELECT format('GRANT UPDATE (id) ON %I.work_items TO ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
 SELECT format('GRANT INSERT ON %I.work_module_milestones TO ameesh_it_proof, ameesh_it_qa', :'schema') \gexec

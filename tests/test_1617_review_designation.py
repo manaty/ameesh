@@ -87,6 +87,60 @@ class MovingPort(FakePort):
         return super().commit(lot, **kw)
 
 
+class CoveringRequestTest(unittest.TestCase):
+    """#2495 : un seul request par (lot, relecteur, tête)."""
+
+    SHA = "a" * 40
+
+    def row(self, *, sha="", delivered=False, lot="7", to="r1", kind="request", auto=False):
+        if auto:
+            payload = {"review_designation": {"lot": 7, "sha": sha}}
+        else:
+            payload = {"review_request": {"lot": 7, "reviewer": to, "manual": True}}
+            if sha:
+                payload["review_request"]["freeze"] = {"id": 3, "sha": sha}
+        return {"id": 1, "kind": kind, "work_item_id": lot, "recipient": to,
+                "payload": payload, "delivered_ts": 1.0 if delivered else None}
+
+    def covered(self, row, sha=""):
+        return rd.covering_request([row], lot=7, reviewer="r1", sha=sha) is not None
+
+    def test_same_head_is_covered_delivered_or_not(self):
+        for auto in (False, True):
+            for delivered in (False, True):
+                self.assertTrue(self.covered(self.row(sha=self.SHA, auto=auto,
+                                                      delivered=delivered), self.SHA))
+        # SHA abrégé du jalon : même gel
+        self.assertTrue(self.covered(self.row(sha=self.SHA[:9]), self.SHA))
+
+    def test_another_head_is_not_covered(self):
+        self.assertFalse(self.covered(self.row(sha="b" * 40, auto=True), self.SHA))
+
+    def test_a_manual_request_without_head_covers_the_freeze_while_unread(self):
+        self.assertTrue(self.covered(self.row(), self.SHA))
+        self.assertFalse(self.covered(self.row(delivered=True), self.SHA))
+        # re-désignation avant le gel : déjà prévenu, lu ou non
+        self.assertTrue(self.covered(self.row(delivered=True)))
+
+    def test_other_lot_reviewer_or_kind_does_not_count(self):
+        self.assertFalse(self.covered(self.row(sha=self.SHA, lot="8"), self.SHA))
+        self.assertFalse(self.covered(self.row(sha=self.SHA, to="r2"), self.SHA))
+        self.assertFalse(self.covered(self.row(sha=self.SHA, kind="notify"), self.SHA))
+
+    def test_manual_message_does_not_promise_a_new_freeze_cancels_it(self):
+        for freeze in (None, {"id": 3, "sha": self.SHA}):
+            body = rd.manual_reviewer_message({"id": 7, "title": "t"}, freeze=freeze)
+            self.assertNotIn("cancels this request", body)
+            self.assertIn("A new freeze does not cancel this request", body)
+
+    def test_an_ordinary_request_does_not_suppress_a_review_request(self):
+        for payload in ({}, {"question": "Please clarify this lot"},
+                        {"review_request": "invalid"}, "invalid json", []):
+            row = dict(self.row(), payload=payload)
+            self.assertFalse(self.covered(row, self.SHA))
+            self.assertFalse(self.covered(row))
+
+
 class PolicyTest(unittest.TestCase):
     """Le nombre requis : le maximum des règles par chemin, zéro pour un léger."""
 
@@ -99,6 +153,15 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual(rd.required_count(rules, ["src/ameesh/work.py", "a/b.sql"]), 2)
         self.assertEqual(rd.required_count(rules, ["src/ameesh/db.py",
                                                    "src/ameesh/work.py"]), 2)
+
+    def test_the_declared_light_floor_raises_the_count(self):
+        # #2642 : le plancher léger est lu par le lecteur de politique
+        # (mechanics.reviews_for), jamais deviné ici ; il ne rabaisse aucune règle.
+        rules = rd.rules_of(RULES)
+        self.assertEqual(rd.required_count(rules, ["docs/guide.md"], light=1), 1)
+        self.assertEqual(rd.required_count(rules, ["src/ameesh/work.py"], light=1), 1)
+        self.assertEqual(rd.required_count(rules, ["src/ameesh/db.py"], light=1), 2)
+        self.assertEqual(rd.required_count(rules, [], light=1), 1)
 
     def test_glob_semantics_do_not_leak_between_paths(self):
         rules = rd.rules_of({"rules": [{"paths": ["docs/**"], "reviews": 1}]})
@@ -221,6 +284,55 @@ class SelectionTest(unittest.TestCase):
         self.assertIn("claude", picked["why"])
         self.assertIn("deepseek", picked["why"])
 
+    def test_a_manual_reviewer_covers_only_its_own_seat(self):
+        # #2627 : un manuel claude couvre un des deux avis ; le manque est le
+        # codex, mail et selection inchanges.
+        picked = rd.select(
+            required=2,
+            authors=[{"name": "impl-02", "family": "deepseek"}],
+            candidates=candidates(row("claude-one", harness="claude", session="claude"),
+                                  row("codex-one", harness="codex", session="codex")),
+            already=[{"name": "manual-claude", "family": "claude"}])
+        self.assertEqual(picked["state"], rd.DESIGNATED)
+        self.assertEqual([r["name"] for r in picked["reviewers"]], ["codex-one"])
+        self.assertEqual(picked["manual"],
+                         [{"name": "manual-claude", "family": "claude"}])
+        self.assertEqual(picked["missing"], 0)
+
+    def test_a_manual_reviewer_of_the_author_family_covers_no_seat(self):
+        picked = rd.select(
+            required=1,
+            authors=[{"name": "impl-02", "family": "deepseek"}],
+            candidates=candidates(row("codex-one", harness="codex", session="codex")),
+            already=[{"name": "manual-deepseek", "family": "deepseek"}])
+        self.assertEqual(picked["state"], rd.DESIGNATED)
+        self.assertEqual([r["name"] for r in picked["reviewers"]], ["codex-one"])
+        self.assertEqual(picked["manual"], [])
+
+    def test_two_manual_reviewers_of_one_family_cover_one_seat(self):
+        picked = rd.select(
+            required=2,
+            authors=[{"name": "impl-02", "family": "deepseek"}],
+            candidates=candidates(row("claude-one", harness="claude", session="claude"),
+                                  row("codex-one", harness="codex", session="codex")),
+            already=[{"name": "manual-a", "family": "claude"},
+                     {"name": "manual-b", "family": "claude"}])
+        self.assertEqual(picked["state"], rd.DESIGNATED)
+        self.assertEqual([r["name"] for r in picked["reviewers"]], ["codex-one"])
+        self.assertEqual([r["name"] for r in picked["manual"]], ["manual-a"])
+
+    def test_manual_reviewers_covering_the_need_designate_nobody(self):
+        picked = rd.select(
+            required=2,
+            authors=[{"name": "impl-02", "family": "deepseek"}],
+            candidates=(),
+            already=[{"name": "manual-claude", "family": "claude"},
+                     {"name": "manual-codex", "family": "codex"}])
+        self.assertEqual(picked["state"], rd.DESIGNATED)
+        self.assertEqual(picked["reviewers"], [])
+        self.assertEqual(len(picked["manual"]), 2)
+        self.assertEqual(picked["missing"], 0)
+
     def test_required_must_be_zero_one_or_two(self):
         for value in (3, -1, True, "1"):
             with self.subTest(value=value), self.assertRaises(rd.DesignationError):
@@ -334,6 +446,32 @@ class ApplyTest(unittest.TestCase):
             self.assertIn(SHA_A, body)
         self.assertEqual(len(self.port.commits), 1)
 
+    def test_the_required_override_reads_the_critical_floor(self):
+        # #2627 : le canon ne déclare qu'un avis, la porte en exige deux. Le
+        # moteur reçoit le besoin compilé et désigne les deux familles.
+        one = {"rules": [{"paths": ["src/ameesh/**"], "reviews": 1}]}
+        out = self.apply(policy=one, required=2)
+        self.assertEqual(out["state"], rd.DESIGNATED)
+        self.assertEqual(out["required"], 2)
+        self.assertEqual(len(out["reviewers"]), 2)
+
+    def test_manual_reviewers_are_completed_by_only_the_missing_seat(self):
+        out = self.apply(already=[{"name": "manual-claude", "family": "claude"}])
+        self.assertEqual(out["state"], rd.DESIGNATED)
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["codex-one"])
+        self.assertEqual(len(out["messages"]), 1)
+        self.assertEqual(out["messages"][0]["to"], "codex-one")
+        self.assertIn("review 2/2", out["messages"][0]["body"])
+
+    def test_manual_reviewers_covering_the_need_write_nothing(self):
+        before = len(self.port.commits)
+        out = self.apply(already=[{"name": "manual-claude", "family": "claude"},
+                                  {"name": "manual-codex", "family": "codex"}])
+        self.assertEqual(out["state"], "manual")
+        self.assertEqual(out["reviewers"], [])
+        self.assertEqual(len(self.port.commits), before)
+        self.assertEqual(self.port.messages, [])
+
     def test_the_same_freeze_replayed_sends_no_second_mail(self):
         first = self.apply()
         again = self.apply()
@@ -432,6 +570,22 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(out["state"], rd.NONE)
         self.assertEqual(self.port.commits, [])
         self.assertEqual(self.port.messages, [])
+
+    def test_the_policy_reader_light_floor_designates_one_reviewer(self):
+        # #2642 : le plancher déclaré au canon (light_reviews: 1) vient du
+        # lecteur de politique, qui le passe à `apply` ; une règle absente ne
+        # doit plus rendre un lot léger sans avis.
+        out = self.apply(paths=["docs/guide.md"], risk="light", required=1)
+        self.assertEqual(out["state"], rd.DESIGNATED)
+        self.assertEqual(out["required"], 1)
+        self.assertEqual(len(out["messages"]), 1)
+        self.assertNotEqual(out["messages"][0]["family"], "deepseek")
+        self.assertEqual(len(self.port.commits), 1)
+
+    def test_an_empty_diff_never_asks_for_the_light_floor(self):
+        out = self.apply(paths=[], risk="light", required=1)
+        self.assertEqual(out["state"], rd.NONE)
+        self.assertEqual(out["required"], 0)
 
     def test_non_light_without_a_rule_is_refused(self):
         with self.assertRaises(rd.DesignationError):

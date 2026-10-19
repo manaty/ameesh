@@ -6,6 +6,7 @@ own human. Clearing this flag never changes status or adds a resume prompt.
 """
 from __future__ import annotations
 
+import math
 import re
 
 from . import storage
@@ -22,7 +23,8 @@ class PauseRefused(ValueError):
 
 
 def change(db, name: str, *, paused: bool, reason: str, actor: str,
-           principal: str | None = None, expect_reason: str | None = None) -> dict:
+           principal: str | None = None, expect_reason: str | None = None,
+           not_after: float | None = None) -> dict:
     """Change the hold and record by whom/for whom, once per transition.
 
     Native operator operation, absent from the mediated executor contract.
@@ -33,6 +35,11 @@ def change(db, name: str, *, paused: bool, reason: str, actor: str,
     raison est exactement celle-là (reprise conditionnelle, atomique côté
     base) : une pause étrangère qui aurait remplacé la nôtre n'est jamais
     levée. Refusé pour poser une pause.
+
+    `not_after` (#2184/R3) : avec paused=True, échéance absolue (epoch) que la
+    base compare à son horloge sous le verrou de ligne ; au-delà, la pose est
+    refusée (`changed=False`, `refusal='not_after'`) au lieu de committer en
+    retard. Refusé pour lever une pause.
     """
     principal = actor if principal is None else principal
     if (not isinstance(actor, str) or not HUMAN_RE.fullmatch(actor)
@@ -51,14 +58,25 @@ def change(db, name: str, *, paused: bool, reason: str, actor: str,
                 or len(expect_reason) > REASON_MAX):
             raise PauseRefused(
                 "bad_expect", "expect_reason: 1 to %d characters required" % REASON_MAX)
+    if not_after is not None:
+        if not paused:
+            raise PauseRefused("bad_not_after", "not_after only applies to a pause")
+        if (isinstance(not_after, bool) or not isinstance(not_after, (int, float))
+                or not math.isfinite(not_after) or not_after <= 0):
+            raise PauseRefused("bad_not_after", "not_after must be a positive epoch")
     if storage.is_remote(db):
         raise PauseRefused("native_only", "operator pause needs a native operator connection")
     result = storage.of(db).agents.operator_pause(
         name, paused=paused, reason=reason.strip(), actor=actor, principal=principal,
-        expect_reason=expect_reason.strip() if expect_reason is not None else None)
+        expect_reason=expect_reason.strip() if expect_reason is not None else None,
+        not_after=not_after)
     if result is None:
         raise PauseRefused("unknown_agent", "unknown agent: %s" % name)
-    if result.get("mode") != "execute":
+    # #2184/N1 : une levée conditionnelle doit encore aboutir si l'agent est
+    # devenu `externe` pendant l'attente du drain (0459). La pose, elle, reste
+    # interdite sur un agent non-execute.
+    levee_conditionnelle = not paused and expect_reason is not None
+    if result.get("mode") != "execute" and not levee_conditionnelle:
         raise PauseRefused("external_agent", "an external session cannot be paused by the runner")
     return result
 
@@ -78,14 +96,26 @@ def cmd_cli(cfg, args, *, paused: bool) -> int:
                 raise PauseRefused("bad_actor", "an agent session cannot act as the local human")
             human = serve.owner(cfg, args.human)
             expect = getattr(args, "expect_reason", None)
+            not_after = getattr(args, "not_after", None)
             out = change(db, args.agent, paused=paused, reason=args.reason,
-                         actor=human, principal=human, expect_reason=expect)
+                         actor=human, principal=human, expect_reason=expect,
+                         not_after=not_after)
         except (PauseRefused, ValueError) as exc:
             # Le même chemin sert « resume --operator » : nommer le geste
             # réellement demandé (N3 de la R2 sur #1462).
             print("ameesh operator %s: %s" % ("pause" if paused else "resume", exc),
                   file=sys.stderr)
             return 1
+        if out.get("refusal"):
+            # #2184/R3 : dire pourquoi la pose a été refusée ; le JSON la porte
+            # aussi (refusal=not_after), le drain la lit sans la confondre avec
+            # une pause étrangère. En texte, le refus remplace le compte rendu
+            # habituel (la pause n'est pas posée) et rend un code non nul
+            # (#2498) ; en JSON, le refus est une réponse lue (rc 0).
+            print("%s: operator pause refused (%s)" % (args.agent, out["refusal"]),
+                  file=sys.stderr)
+            if not args.json:
+                return 1
         if args.json:
             print(json.dumps(out, ensure_ascii=False))
         elif not paused and expect is not None:

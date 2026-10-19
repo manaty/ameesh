@@ -32,7 +32,8 @@ Un document, un bloc par règle, dans `manaty/home` :
   - `ci.packet` (`full` | `impacted` | `none`) et `ci.incident_label` :
     la suite par paquet, et l'étiquette qui autorise la CI d'un lot ;
   - `reviews.families`, `reviews.exclude_author_family`,
-    `reviews.distinct_families` : familles de modèle et indépendance ;
+    `reviews.distinct_families`, `reviews.light_reviews` : familles de modèle,
+    indépendance et plancher d'avis d'un lot léger (#2642) ;
   - `projects.<nom>` : surcharge d'un bloc pour un projet (le bloc présent
     remplace le bloc global ; aucune activation implicite).
 - `federation.yaml`, au **même commit** :
@@ -42,7 +43,10 @@ Un document, un bloc par règle, dans `manaty/home` :
 
 Les classes et les nombres d'avis ne sont pas répétés dans `mecanique.yaml` :
 le compilateur les lit à la source (home PR85), comme le fait déjà
-`train_policy.Versioned` de #1467.
+`train_policy.Versioned` de #1467. Seule exception depuis #2642 : le plancher
+d'un lot **léger**, `reviews.light_reviews` (0 le temps de la PR home, 1 au
+canon §2). C'est un paramètre de processus, pas un nombre d'avis par chemin :
+il ne reclasse aucun chemin et ne remplace jamais `train_reviews`.
 
 # Lecteur strict
 
@@ -73,12 +77,16 @@ raccordé qui refuse, jamais l'outil qui devine.
 |---|---|---|
 | Train #1467 | `cutoffs`, `timezone`, `ci.*`, `reviews.*`, `rules` | port à faire par cx3, contrat transmis ; **non activé** |
 | Désignation #1617 | `reviews.families`, `exclude_author_family`, `distinct_families`, `commit` | port à faire par impl-02 ; **non activé** |
-| Déclencheurs CI #1606(2) | `ci.packet`, `ci.incident_label` | raccord à ouvrir ; **non activé** |
+| Déclencheurs CI #1606(2) | `ci.packet`, `ci.incident_label` | `tests.yml` par étiquette de gel et paquet, `ui.yml` hors PR de lot (#2449) ; `ci.packet` lu par le train non activé |
 | Plafond 2 lots en build | `build.max_in_build` | consommateur à désigner ; **non activé** |
 | Staging #1606(5), comptes #1606(6) | blocs à déclarer plus tard | hors périmètre |
 
-Le refus par la CI d'un paramètre codé en dur qui ne vient pas du canon est un
-geste de CI distinct (#1606 point 2/7) : ce lot ne le pose pas.
+Le refus par la CI d'un paramètre codé en dur qui ne vient pas du canon
+(#1606 point 2/7) est posé par le lot #2449 : `scripts/garde-mecanique.py`
+analyse les sources suivies, refuse les motifs littéraux connus des clés du
+schéma et n'admet que des exemptions nommées et datées ;
+`tests/test_2449_garde_mecanique.py` le publie comme test de contrat
+(`tests/parts/toujours.txt`).
 
 # Preuve attendue
 

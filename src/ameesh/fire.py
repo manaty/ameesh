@@ -292,9 +292,28 @@ def _wake(db, to, lot: int, text: str, data: dict) -> int | None:
 # le dépôt, la cible, GitHub
 # --------------------------------------------------------------------------
 
+def _checkout(path: str | None) -> str | None:
+    """La racine du checkout git `path`, ou None si `path` n'en est pas un.
+
+    #2473 : un dossier peut exister sans être un dépôt. Le pilote Nexlink
+    enregistre comme `cwd` de son agent le **parent** de ses clones
+    (`/home/smichea/development/manaty`) : il n'a ni `origin` ni branches, et
+    le lire comme un dépôt faisait répondre « branch … is neither local nor
+    on origin » alors que la branche était poussée par le vrai clone. Le
+    dossier d'un worktree se résout par `rev-parse` ; le dépôt du lot se
+    choisit ensuite sur son `origin` (`_same_repository`)."""
+    if not path:
+        return None
+    path = os.path.expanduser(str(path))
+    if not path or not os.path.isdir(path):
+        return None
+    return plan_git._out(path, "rev-parse", "--show-toplevel") or None
+
+
 def _repo_of(db, row: dict) -> str | None:
     """Le dossier de travail de l'assigné (registre), comme le relevé des
-    branches ; None si l'assigné n'en a pas ou si le dossier a disparu."""
+    branches ; None si l'assigné n'en a pas, si le dossier a disparu ou s'il
+    n'est pas un checkout git (#2473)."""
     from . import registry
     assignee = str(row.get("assignee") or "").strip()
     if not assignee or ":" in assignee:
@@ -303,8 +322,22 @@ def _repo_of(db, row: dict) -> str | None:
         reg = registry.get(db, assignee)
     except Exception:  # noqa: BLE001 - registre illisible : pas de dépôt
         return None
-    path = os.path.expanduser(str((reg or {}).get("cwd") or ""))
-    return path if path and os.path.isdir(path) else None
+    return _checkout((reg or {}).get("cwd"))
+
+
+def _same_repository(checkout: str, slug: str) -> bool:
+    """Le checkout est-il celui du lot ? Un `origin` lisible qui nomme un
+    autre dépôt l'écarte ; un checkout sans `origin` reste accepté (copie
+    locale : `fetch_fresh` lit alors ses têtes locales)."""
+    from . import migrations
+    origin = migrations.origin_repo(checkout)
+    return not origin or migrations.repo_key(origin) == migrations.repo_key(slug)
+
+
+def _project_checkout(project) -> str | None:
+    """Le clone que l'hôte déclare pour ce projet
+    (`radar.projects.<p>.repo`), s'il est un checkout (#2473)."""
+    return _checkout(getattr(project, "repo", "") or "") if project is not None else None
 
 
 def _slug(cfg, item: dict, repo: str | None) -> str | None:
@@ -455,10 +488,10 @@ def _pr_status(slug: str, branch: str, *, gh) -> dict | None:
     row = (opened or merged or rows or [None])[0]
     if row is None:
         return None
-    rollup = row.get("statusCheckRollup") or []
+    from . import radar
+    rollup = radar.latest_rollup(row.get("statusCheckRollup"))
     pending = any((c.get("status") or "COMPLETED") != "COMPLETED"
                   or (c.get("state") or "") == "PENDING" for c in rollup)
-    from . import radar
     ci = "green" if radar.ci_green(rollup) else "pending" if pending or not rollup else "red"
     commit = row.get("mergeCommit") or {}
     return {
@@ -572,14 +605,62 @@ def _method(project, info: dict) -> str:
     return allowed[0] if allowed else "merge"
 
 
-def _merge_pr(slug: str, status: dict, sha: str, method: str, *, gh) -> tuple:
+def _stacked_base_guard(slug: str, status: dict, target: str, default: str, *,
+                        gh) -> str:
+    """#2603 : refuse une fusion sur une base de travail déjà fusionnée dans la
+    cible par défaut (home#112/#113 après canon/2452) : le contenu atterrirait
+    sur une branche morte. La comparaison GitHub `base...default` rend `ahead`
+    ou `identical` quand la base est un ancêtre de la cible par défaut. Une
+    lecture impossible refuse : le doute ne fusionne pas sur une base morte."""
+    base = merge_queue._remote_branch(status.get("base") or "")
+    target = merge_queue._remote_branch(target or "")
+    default = merge_queue._remote_branch(default or "")
+    if not base or not target or base != target:
+        return ""
+    if not default:
+        return ("PR #%s targets %s, and the repository's default target is unknown: "
+                "nothing merged — read the default branch by hand"
+                % (status.get("number"), base))
+    if base == default:
+        return ""
+    proc = gh(["api", "repos/%s/compare/%s...%s" % (
+        slug, quote(base, safe=""), quote(default, safe=""))])
+    if proc.returncode != 0:
+        return ("PR #%s targets %s, not the default target %s, and the comparison cannot be "
+                "read (%s): nothing merged on a possibly dead base — check the PR by hand"
+                % (status.get("number"), base, default,
+                   (proc.stderr or proc.stdout or "").strip()[:200]))
+    try:
+        compared = land._json(proc, "gh api compare %s...%s" % (base, default), dict)
+    except land.LandError as exc:
+        return ("PR #%s targets %s, not the default target %s, and the comparison is "
+                "unreadable (%s): nothing merged on a possibly dead base"
+                % (status.get("number"), base, default, exc))
+    comparison = str(compared.get("status") or "")
+    if comparison not in ("ahead", "identical", "behind", "diverged"):
+        return ("PR #%s: comparison of %s with %s unreadable: nothing merged"
+                % (status.get("number"), base, default))
+    if comparison in ("ahead", "identical"):
+        return ("PR #%s targets %s, already merged into %s: merging it there would land its "
+                "content on a dead branch — retarget it (`gh pr edit --base %s %s`), then "
+                "freeze and re-review" % (status.get("number"), base, default, default,
+                                          status.get("number")))
+    return ""
+
+
+def _merge_pr(slug: str, status: dict, sha: str, method: str, *, gh,
+              target: str = "", default: str = "") -> tuple:
     """Fusionne la PR **maintenant**, sur la tête exacte `sha` (#1374, P1-4).
 
     C'est ce geste, et lui seul, qui est lié au feu : `--match-head-commit`
     est vérifié par GitHub au moment de la fusion, pas à l'armement. Laisser
     une auto-fusion armée entre deux passages ferait fusionner une tête
     poussée après le feu (GitHub ne la désarme pas pour un push d'un compte
-    avec droit d'écriture). Rend `(ok, detail)`."""
+    avec droit d'écriture). Rend `(ok, detail)`. #2603 : une base de travail
+    déjà fusionnée dans la cible par défaut refuse avant l'appel."""
+    refusal = _stacked_base_guard(slug, status, target, default, gh=gh)
+    if refusal:
+        return False, refusal
     proc = gh(["pr", "merge", str(status["number"]), "--repo", slug, "--%s" % method,
                "--match-head-commit", sha], timeout=120.0)
     if proc.returncode == 0:
@@ -612,14 +693,23 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
     verdict reste exigé. Une cible `release/*` (classe release) n'est jamais
     une auto-fusion : c'est la procédure de release du pilote.
 
+    #2505 : la cible de la classe est celle que la file va fusionner, donc
+    `origin/<cible>` quand elle existe (#2207, `merge_queue._class_base`) ;
+    la cible **locale** du checkout ne sert qu'à défaut. Un `main` local en
+    retard y ajouterait des commits déjà fusionnés, dont des chemins
+    sensibles, et surclasserait le lot au-dessus de ses vrais avis.
+
     Cette porte s'évalue **avant** toute PR, toute entrée en file et toute CI :
     un feu peut être enregistré au gel, mais rien ne part avant les avis."""
     lot = int(row["id"])
     freeze = freeze_of(marks)
     frozen = _norm((freeze or {}).get("sha"))
     head = merge_queue.pinned(repo, frozen) if repo else None
+    base = target or None
+    if repo and target:
+        base = merge_queue._class_base(repo, target) or target
     klass = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=repo or None,
-                             base=target or None, head=head)
+                             base=base, head=head)
     if str(klass.get("class") or "") == lot_class.RELEASE:
         return False, ("class: release (%s) — the release procedure belongs to the pilot: "
                        "a fire never arms an automatic merge on a release"
@@ -693,8 +783,11 @@ def _required_gap(required, rollup, provenance=None) -> list:
     ce nom **et de cette application** est `SUCCESS` ; une entrée sans source
     (statut de commit) ou d'une autre application ne prouve rien. Sans
     application imposée (`app_id` à `None`), tout check ou statut du nom exigé
-    compte, et un même nom porté par plusieurs entrées n'est vert que si
-    toutes le sont : le doute ne verdit pas la porte."""
+    compte après sélection des derniers checks du rollup (#2524). Un même
+    nom encore porté par plusieurs workflows ou sources n'est vert que si
+    tous le sont : le doute ne verdit pas la porte."""
+    from . import radar
+    rollup = radar.latest_rollup(rollup)
     gaps = []
     for name, app_id in _required_pairs(required):
         if app_id is None:
@@ -1470,12 +1563,32 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
     if not branch:
         out.update(result="no-branch", detail="lot without branch: no PR to arm")
         return out
-    work_repo = repo or _repo_of(db, row)
+    work_repo = _repo_of(db, row) if repo is None else _checkout(repo)
+    # #2535 : un `--repo` explicite qui n'est pas un checkout est un refus,
+    # jamais un repli silencieux sur le clone que le projet déclare
+    # (`radar.projects.<p>.repo`). Le pilote qui se trompe de dépôt verrait
+    # sinon le feu lire une autre copie que celle demandée et rendre un
+    # verdict de préparation trompeur.
+    if repo is not None and work_repo is None:
+        out.update(result="no-repository", detail=(
+            "--repo %s is not a git checkout: pass a path inside the lot's repository "
+            "(#2535: refusing to read the project's declared clone instead)" % repo))
+        return out
     slug = _slug(cfg, row, work_repo)
     if not slug:
         out.update(result="no-repository", detail="no GitHub repository known for this lot")
         return out
+    # #2473 : le dossier de l'assigné n'est pas toujours un checkout du lot
+    # (le pilote Nexlink enregistre le parent de ses clones). Un `origin` qui
+    # nomme un autre dépôt l'écarte ; on retombe alors sur le clone que l'hôte
+    # déclare pour le projet (`radar.projects.<p>.repo`), jamais sur un
+    # dossier qui ne porte ni origin ni branches. Un `--repo` explicite est
+    # un geste du pilote : il est gardé tel quel s'il est un checkout.
+    if repo is None and work_repo is not None and not _same_repository(work_repo, slug):
+        work_repo = None
     project = _project(cfg, work_repo, slug)
+    if work_repo is None:
+        work_repo = _project_checkout(project)
     status = _pr_status(slug, branch, gh=gh)
     out.update(slug=slug, repo=work_repo,
                project=project.name if project is not None else "",
@@ -1705,7 +1818,9 @@ def _merge_direct(cfg, db, row: dict, marks: list, fire: dict, status: dict, *, 
     try:
         if not _renew(handle) or not _renew(cible, land.LOCK_TTL_S):
             return {"lot": lot, "result": "busy"}
-        ok, error = _merge_pr(slug, status, head, _method(project, info), gh=gh)
+        ok, error = _merge_pr(slug, status, head, _method(project, info), gh=gh,
+                              target=target,
+                              default=str(info.get("default_branch") or ""))
         if ok:
             out.update(result="merged", detail=error, sha=head)
             try:
@@ -1755,7 +1870,11 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
     `ci_required` (#2285 N3, hors périmètre de ce lot)."""
     lot = int(row["id"])
     if not repo:
-        out.update(result="no-repository", detail="no repository path known for this lot")
+        out.update(result="no-repository", detail=(
+            "no git checkout of %s known for lot #%d: the assignee's registered directory is "
+            "not a checkout and no radar.projects clone is declared for the project; pass "
+            "--repo <path> (a directory that is not a repository carries no branch, #2473)"
+            % (out.get("slug") or "the lot's repository", lot)))
         return out
     rows = {int(r["work_item_id"]): r for r in storage.of(db).work.queue()}
     entry = rows.get(lot)

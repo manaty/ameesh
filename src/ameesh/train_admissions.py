@@ -67,7 +67,7 @@ class Requirement:
         if not isinstance(self.policy_commit, str) or not SHA.fullmatch(self.policy_commit):
             raise TrainError("versioned review policy required")
         if type(self.reviews) is not int or self.risk not in _RISKS \
-                or self.reviews not in ({0} if self.risk == "light" else {1, 2}):
+                or self.reviews not in ({0, 1, 2} if self.risk == "light" else {1, 2}):
             raise TrainError("explicit known non-release review requirement expected")
         files = _classified(self.files)
         worst = max((entry["class"] for entry in files), key=review.RANK.__getitem__)

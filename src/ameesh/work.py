@@ -36,6 +36,7 @@ import os
 import re
 import time
 from typing import Sequence
+from urllib.parse import quote
 
 from . import storage
 from .db import Db, DbError, is_unique_violation
@@ -600,6 +601,8 @@ def detach_branch(db: Db, item_id: int, branch: str | None = None, *, reason: st
 
 #: le dépôt d'un lot, lu dans son issue : `owner/repo#N`
 _ISSUE_REPO_RE = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#[0-9]+$")
+#: #2603 : une PR fusionnée hors du dépôt du lot, `owner/repo#N`
+_PR_REF_RE = re.compile(r"^(?P<slug>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(?P<number>[0-9]+)$")
 
 
 def lot_repository(item: dict, cfg=None) -> str:
@@ -623,29 +626,87 @@ def lot_repository(item: dict, cfg=None) -> str:
                     "(`ameesh work link %s owner/repo#N`)" % (item["id"], item["id"]))
 
 
+def _migration_target(item: dict, checkout: str, cfg=None) -> str:
+    """La cible du lot pour l'invariant des numéros de migration (#2620) :
+    `branch_target`, sinon la cible de son projet, sinon celle du dépôt —
+    exactement celle que lisent la file de fusion et la classe de revue.
+    Chaîne vide quand aucune n'est connue."""
+    from . import lot_class
+
+    return str(lot_class.default_base(cfg, item, checkout) or "").strip()
+
+
+def _short_repo(repo) -> str:
+    """#2481 : le dépôt d'un créneau est stocké `github.com/owner/repo` ; la
+    vue et `work.migration_line` gardent la forme `owner/repo` du scalaire."""
+    text = str(repo or "")
+    prefix = "github.com/"
+    return text[len(prefix):] if text.startswith(prefix) else text
+
+
+def reserved_migrations(item: dict) -> list[dict]:
+    """#2481 : les réservations d'un lot, liste ordonnée `{number, repo, slot}`.
+
+    `migrations` vient de `item_columns` (table `work_migration_reservations`) ;
+    une base d'avant 0419 ou un client ancien n'a que le scalaire, qui est
+    alors repris. La réservation principale reste le scalaire ; ce helper ne
+    déduplique que les doublons exacts (même numéro, même dépôt)."""
+    rows, seen = [], set()
+    for raw in item.get("migrations") or ():
+        if not isinstance(raw, dict):
+            continue
+        try:
+            number = int(raw.get("number"))
+        except (TypeError, ValueError):
+            continue
+        repo = _short_repo(raw.get("repo") or item.get("migration_repo"))
+        key = (number, repo)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({"number": number, "repo": repo,
+                     "slot": str(raw.get("slot") or "default")})
+    if item.get("migration") is not None:
+        number = int(item["migration"])
+        repo = _short_repo(item.get("migration_repo"))
+        if (number, repo) not in seen:
+            rows.append({"number": number, "repo": repo, "slot": "default"})
+    rows.sort(key=lambda row: (row["number"], row["slot"]))
+    return rows
+
+
 def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
                       release: bool = False, repo: str | None = None,
                       actor: str = "", cfg=None,
                       skip_branches: tuple[str, ...] = (),
-                      skip_worktree: bool = False) -> dict:
-    """L122, #443 : réserve au lot le numéro de sa migration, avant d'écrire
-    le fichier, dans le dépôt du lot (`lot_repository`) : le dossier et la
-    numérotation sont les siens, jamais ceux d'ameesh pour un autre dépôt.
-    `repo` : un clone local de ce dépôt (défaut : celui que l'hôte déclare,
-    sinon le dépôt git courant) ; son `origin` doit être le dépôt du lot.
-    Sans `number` : le prochain libre, au-delà des numéros du dépôt (arbre,
-    toutes ses branches) et de ceux déjà réservés pour ce dépôt. `number` est
-    refusé s'il existe déjà dans le dépôt ou s'il est réservé par un autre lot
-    (index unique (dépôt, numéro) : la base tranche, même entre deux
-    réservations simultanées). Un lot qui a déjà sa réservation la garde
-    (idempotent). `release` la libère, y compris sur un lot déjà terminal
+                      skip_worktree: bool = False,
+                      target: str | None = None) -> dict:
+    """L122, #443, #2481, #2620 : réserve au lot le numéro de sa migration,
+    avant d'écrire le fichier, dans le dépôt du lot (`lot_repository`) : le
+    dossier et la numérotation sont les siens, jamais ceux d'ameesh pour un
+    autre dépôt. `repo` : un clone local de ce dépôt (défaut : celui que
+    l'hôte déclare, sinon le dépôt git courant) ; son `origin` doit être le
+    dépôt du lot. Sans `number` : le prochain libre, au-delà des numéros du
+    dépôt (arbre, toutes ses branches) et de ceux déjà réservés pour ce dépôt.
+    `number` est refusé s'il existe déjà **sur la branche cible du lot** —
+    `branch_target`, sinon la cible de son projet, sinon celle du dépôt,
+    `origin/` publiée d'abord (#2620 : l'arbre de travail, le paquet installé
+    et les autres branches ne comptent pas ; une branche non fusionnée sera
+    renumérotée à sa fusion, #2400) — ou s'il est réservé par un autre lot
+    (index uniques (dépôt, numéro) : la base tranche, même entre deux
+    réservations simultanées). Un lot qui a déjà une réservation garde les
+    précédentes : un second numéro s'ajoute (liste `migrations`), il ne
+    remplace plus la première (#2481). `release` libère toutes les
+    réservations, ou seulement `number`, y compris sur un lot déjà terminal
     (#956 : un lot fusionné gardait sa réservation et bloquait le numéro).
-    `skip_branches` (#1603) : branches supplémentaires ignorées par le scan,
-    en plus de celle du lot — la branche d'intégration d'un paquet en
-    composition, dont les fichiers renumérotés ne doivent pas compter contre
-    la réservation. `skip_worktree` (#2400) : ignorer l'arbre de travail du
-    clone de lecture — le train y compose justement la migration à réserver.
-    Rend le lot, avec `migration_file`. Une correction
+    `skip_branches` (#1603) : branches supplémentaires ignorées par le scan du
+    prochain libre, en plus de celle du lot — la branche d'intégration d'un
+    paquet en composition, dont les fichiers renumérotés ne doivent pas compter
+    contre la réservation. `skip_worktree` (#2400) : ignorer l'arbre de travail
+    du clone de lecture — le train y compose justement la migration à réserver.
+    `target` (#2620) : la cible à lire pour un numéro exact quand l'appelant la
+    connaît déjà (le train compose une cible explicite), sinon celle du lot.
+    Rend le lot, avec `migration_file` et la liste `migrations`. Une correction
     concurrente de `issue_ref` pendant le scan du dépôt est refusée (#1830 :
     `issue reference changed meanwhile, retry`), jamais écrite en silence."""
     from . import migrations
@@ -655,22 +716,45 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
         raise WorkError("lot %s not found" % item_id)
     if item["state"] in ("merged", "promoted", "closed") and not release:
         raise WorkError("lot %s already %s: no reservation" % (item_id, item["state"]))
+    reservations = reserved_migrations(item)
     current = item.get("migration")
     if release:
-        if current is None:
-            return item
-        layout = migration_layout(item, cfg)
+        if not reservations:
+            return _with_file(item, cfg)
+        numbers = {row["number"] for row in reservations}
+        target = None if number is None else int(number)
+        if target is not None and target not in numbers:
+            raise WorkError("lot %s holds no migration %s (%s): nothing released" % (
+                item_id,
+                migration_layout(item, cfg, repo=reservations[0]["repo"]).label(target),
+                ", ".join(migration_layout(item, cfg, repo=row["repo"]).label(row["number"])
+                          for row in reservations)))
+        reserved_repo = reservations[0]["repo"] or item.get("migration_repo")
+        layout = migration_layout(item, cfg, repo=reserved_repo)
+        if target is not None:
+            note = "migration %s released (%s)" % (layout.label(target), layout.repo)
+        elif len(reservations) == 1:
+            note = "migration %s released (%s)" % (
+                layout.label(reservations[0]["number"]), layout.repo)
+        else:
+            note = "migrations %s released (%s)" % (
+                ", ".join(layout.label(row["number"]) for row in reservations), layout.repo)
         row = storage.of(db).work.reserve_migration(
-            item_id, item.get("migration_repo"), None, 0, actor=actor, release=True,
-            issue_ref=item.get("issue_ref"),
-            note="migration %s released (%s)" % (layout.label(current), layout.repo))
+            item_id, reserved_repo, None, 0, actor=actor, release=True,
+            release_number=target, issue_ref=item.get("issue_ref"), note=note)
         if row is None:
-            raise WorkError("lot %s is no longer open: no reservation" % item_id)
-        return row
+            raise WorkError("lot %s: migration reservation changed meanwhile, retry" % item_id)
+        return _with_file(row, cfg)
     if number is not None and not 1 <= int(number) <= 9999:
         raise WorkError("migration number outside 0001-9999: %s" % number)
-    if current is not None and (number is None or current == int(number)):
-        return _with_file(item, cfg)
+    held = {row["number"] for row in reservations}
+    if number is None:
+        if reservations:
+            return _with_file(item, cfg)
+    else:
+        number = int(number)
+        if number in held:
+            return _with_file(item, cfg)
     slug = lot_repository(item, cfg)
     layout = migrations.layout_for(slug, cfg)
     if layout is None:
@@ -682,14 +766,28 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
     if trunks:
         # ignorer le tronc cacherait les migrations déjà fusionnées (#1603)
         raise WorkError("--skip-branch %s: a trunk branch is always scanned" % trunks[0])
-    present = migrations.repo_numbers(checkout, layout, skip_branch=item.get("branch"),
-                                      also_skip=tuple(skip_branches),
-                                      worktree=not skip_worktree)
     if number is None:
+        present = migrations.repo_numbers(checkout, layout, skip_branch=item.get("branch"),
+                                          also_skip=tuple(skip_branches),
+                                          worktree=not skip_worktree)
         floor = max(present or [0]) + 1
         note = "migration %%(number)0%dd reserved (%s)" % (layout.width, slug)
     else:
         number = int(number)
+        # #2620 : un numéro exact se lit sur la cible seule. Une branche non
+        # fusionnée qui porte le même numéro ne l'a pas fait atterrir : elle
+        # sera renumérotée à sa fusion (#2400), elle ne bloque pas ce lot.
+        target = (target or "").strip() or _migration_target(item, checkout, cfg)
+        present = migrations.target_numbers(checkout, layout, target)
+        if present is None:
+            raise WorkError(
+                "migration %s: %s of lot #%s is unknown in %s — an exact number is checked "
+                "against the target branch only (#2620); fetch it (`git fetch origin`) or "
+                "name the target (`ameesh work branch %s <branch> --target <target>`, or "
+                "`git config ameesh.target <target>`)"
+                % (layout.label(number),
+                   ("target branch %r" % target) if target else "no target branch",
+                   item_id, checkout, item_id))
         if number in present:
             raise WorkError("migration %s already in %s (%s): choose another number" % (
                 layout.label(number), slug, ", ".join(sorted(present[number])[:3])))
@@ -708,7 +806,9 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
     except DbError as exc:
         # une autre erreur qui nomme l'index (permission refusée) n'est pas
         # une réservation concurrente : elle remonte telle quelle (codex #478 r1)
-        if number is None or not is_unique_violation(exc, _pg.MIGRATION_INDEX):
+        indexes = (_pg.MIGRATION_INDEX, _pg.MIGRATION_SLOTS_INDEX)
+        if number is None or not any(is_unique_violation(exc, index)
+                                      for index in indexes):
             raise
         holder = storage.of(db).work.migration_holder(number, slug)
         raise WorkError("migration %s of %s already reserved by lot #%s (%s)" % (
@@ -737,11 +837,21 @@ def migration_layout(item: dict, cfg=None, repo: str | None = None):
 
 
 def _with_file(item: dict, cfg=None) -> dict:
+    """#2481 : ajoute les libellés et fichiers de toutes les réservations."""
+    reservations = reserved_migrations(item)
     if item.get("migration") is None:
-        return item
+        return dict(item, migrations=reservations)
     layout = migration_layout(item, cfg)
+    enriched = []
+    for row in reservations:
+        row_layout = migration_layout({}, cfg, repo=row["repo"])
+        enriched.append(dict(
+            row,
+            label=row_layout.label(row["number"]),
+            file=(row_layout.file(row["number"]) if row_layout.directory else None)))
     return dict(item, migration_label=layout.label(item["migration"]),
-                migration_file=layout.file(item["migration"]) if layout.directory else None)
+                migration_file=layout.file(item["migration"]) if layout.directory else None,
+                migrations=enriched)
 
 
 def _migration_file(number: int, repo: str, cfg=None) -> str:
@@ -753,26 +863,41 @@ def _migration_file(number: int, repo: str, cfg=None) -> str:
 
 
 def migration_line(item: dict, cfg=None) -> str | None:
-    """#1567 : la ligne `migration:` d'un lot. Le numéro **atterri** est nommé
-    quand il est enregistré (avec son fichier, et la réservation d'origine
-    quand elle en diffère) ; sinon la réservation seule, et pour un lot
-    terminal, « landed number not recorded » : la vue ne fait jamais passer la
+    """#1567, #2481 : la ligne `migration:` d'un lot. Le numéro **atterri** est
+    nommé quand il est enregistré (avec son fichier, et la ou les réservations
+    d'origine quand elles en diffèrent). Sinon la liste des réservations est
+    nommée (un lot peut en tenir plusieurs), et pour un lot terminal,
+    « landed number not recorded » : la vue ne fait jamais passer la
     réservation pour le fichier atterri."""
-    reserved, landed = item.get("migration"), item.get("migration_landed")
+    landed = item.get("migration_landed")
+    reservations = reserved_migrations(item)
     if landed is not None:
         repo = item.get("migration_landed_repo") or item.get("migration_repo")
         line = "%s landed in %s (L122) — file %s" % (
             migration_layout(item, cfg, repo=repo).label(landed), repo,
             _migration_file(landed, repo, cfg))
-        if reserved is not None and int(reserved) != int(landed):
-            line += " (reserved %s)" % migration_layout(item, cfg).label(reserved)
+        others = [row for row in reservations if row["number"] != int(landed)]
+        if others:
+            line += " (reserved %s)" % ", ".join(
+                migration_layout({}, cfg, repo=row["repo"]).label(row["number"])
+                for row in others)
         return line
-    if reserved is None:
+    if not reservations:
         return None
-    line = "%s reserved in %s (L122)" % (migration_layout(item, cfg).label(reserved),
-                                         item.get("migration_repo"))
+    if len(reservations) == 1:
+        row = reservations[0]
+        line = "%s reserved in %s (L122)" % (
+            migration_layout({}, cfg, repo=row["repo"]).label(row["number"]),
+            row["repo"] or item.get("migration_repo"))
+        if item.get("state") in MERGED_STATES:
+            line += " — landed number not recorded"
+        return line
+    labels = [migration_layout({}, cfg, repo=row["repo"]).label(row["number"])
+              for row in reservations]
+    repos = ", ".join(sorted({row["repo"] for row in reservations if row["repo"]}))
+    line = "migrations %s reserved in %s (L122)" % (", ".join(labels), repos)
     if item.get("state") in MERGED_STATES:
-        line += " — landed number not recorded"
+        line += " — landed numbers not recorded"
     return line
 
 
@@ -813,20 +938,27 @@ def set_issue_ref(db: Db, item_id: int, ref: str | None, *, actor: str = "", cfg
     current = (item.get("issue_ref") or "").strip() or None
     if current == clean:
         return item
-    if item.get("migration") is not None:
-        # la réservation reste dans le dépôt où elle a été prise : la garder
-        # sous une issue d'un autre dépôt la rendrait fausse en silence
-        # (`work migration` est idempotent sur une réservation existante)
+    reservations = reserved_migrations(item)
+    if reservations:
+        # les réservations restent dans le dépôt où elles ont été prises : les
+        # garder sous une issue d'un autre dépôt les rendrait fausses en
+        # silence (`work migration` est idempotent sur une réservation
+        # existante)
         try:
             target = lot_repository(dict(item, issue_ref=clean), cfg)
         except WorkError:
             target = None
-        if target != item.get("migration_repo"):
-            raise WorkError("lot %s holds migration %s in %s: release it first "
+        if any(row["repo"] != target for row in reservations):
+            labels = ", ".join(
+                migration_layout({}, cfg, repo=row["repo"]).label(row["number"])
+                for row in reservations)
+            repos = ", ".join(sorted({row["repo"] for row in reservations}))
+            what = "migration" if len(reservations) == 1 else "migrations"
+            pronoun = "it" if len(reservations) == 1 else "them"
+            raise WorkError("lot %s holds %s %s in %s: release %s first "
                             "(`ameesh work migration %s --release`), then correct the "
                             "issue reference and reserve again" % (
-                                item_id, migration_layout(item, cfg).label(item["migration"]),
-                                item.get("migration_repo"), item_id))
+                                item_id, what, labels, repos, pronoun, item_id))
     if not storage.of(db).work.set_issue_ref(item_id, clean, current=item.get("issue_ref"),
                                              migration_repo=item.get("migration_repo")):
         # #1654 : le CAS couvre aussi la réservation lue ; si l'issue n'a pas
@@ -1100,10 +1232,12 @@ def _reviewer_request(db: Db, item: dict, reviewer: str, who: str) -> dict:
     The designation is already written when this runs: a delivery failure is
     returned as a warning (same pattern as `delegate`), never raised, so the
     caller can surface it without losing the designation. A human reviewer has
-    no runner to wake and gets no mailbox request.
+    no runner to wake and gets no mailbox request. An earlier request that
+    already covers this reviewer and head is reused, not sent again (#2495).
     """
     from . import mail, plan_git
-    from .review_designation import REQUEST_KIND, manual_reviewer_message
+    from .review_designation import (REQUEST_KIND, covering_request,
+                                     manual_reviewer_message)
 
     name = (reviewer or "").strip()
     if not name or name.startswith(HUMAN_PREFIX) or name == REVIEWER_NONE:
@@ -1114,6 +1248,19 @@ def _reviewer_request(db: Db, item: dict, reviewer: str, who: str) -> dict:
         latest = None
     freeze = ({"id": int(latest["id"]), "sha": str(latest.get("sha") or "")}
               if latest is not None else None)
+    # #2495/#2504 : one request per (lot, reviewer, head). A re-designation, or
+    # a designation after the freeze already woke this reviewer, sends nothing.
+    # The requests are selected per lot in storage: an old one cannot fall out
+    # of a history window under a heavy mailbox.
+    try:
+        prior = covering_request(mail.review_requests(db, name, int(item["id"])),
+                                 lot=int(item["id"]), reviewer=name,
+                                 sha=freeze["sha"] if freeze else "")
+    except Exception:  # noqa: BLE001 - unreadable requests: send, as before #2495
+        prior = None
+    if prior is not None:
+        return {"reviewer_request_message_id": int(prior["id"]),
+                "reviewer_request_reused": True}
     payload = {"review_request": {"lot": int(item["id"]), "reviewer": name,
                                   "manual": True}}
     if freeze:
@@ -1399,6 +1546,15 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
         # dernière attribution, restent en place.
         row = set_branch(db, item_id, branch, branch_target, actor=actor)
         return {"item": row, "check": check, "previous": previous}
+    if not previous and takes_rule(check):
+        # #2584 (canon §2 l.129) : un élément du backlog sous le seuil de lot
+        # du canon ne se confie pas à un agent tant qu'un lot de roadmap de
+        # son projet est prenable — même règle que la prise au repos.
+        from . import backlog
+        refusal = backlog.assign_refusal(
+            db, item, cfg=cfg if cfg is not None else getattr(db, "cfg", None))
+        if refusal:
+            raise WorkError(refusal)
     note = "assigned to %s%s (before: %s)%s" % (
         check["assignee"],
         " — external session, owner %s" % check["responsible"] if check["externe"] else "",
@@ -2031,11 +2187,138 @@ def _declared_merge_commit(item: dict, sha: str, *, repo: str | None = None,
         raise WorkError("%s: merge declaration refused: %s" % (label, exc)) from exc
 
 
-def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
+def _merged_pr(item: dict, ref: str, *, sha: str = "", db=None, announce=None,
+               gh=None) -> tuple[str, str, int | None]:
+    """#2603 : preuve d'une PR fusionnée hors du dépôt du lot (canon, home).
+
+    `--pr owner/repo#N` : lit la PR par `gh`, exige l'état MERGED et rend
+    `(commit de fusion, référence de la PR, id du gel vérifié)`. La tête de
+    la PR doit être le gel du lot (ou, sans gel, sa branche) : une PR
+    quelconque ne ferme pas un lot. GitHub doit rendre le commit de fusion,
+    et ce commit doit être entré dans la branche par défaut du dépôt de la PR
+    (`compare` `behind`/`identical`) : une PR fusionnée sur une base morte
+    n'est pas livrée (home#112/#113). `--sha` n'est qu'un contrôle d'égalité.
+    Aucune écriture."""
+    from . import land, plan_git
+
+    match = _PR_REF_RE.match((ref or "").strip())
+    if not match:
+        raise WorkError("--pr: owner/repo#N (the merged PR of the lot), not %r" % (ref,))
+    slug = match.group("slug")
+    number = int(match.group("number"))
+    pr_ref = "%s#%d" % (slug, number)
+    reader = gh or land._gh
+    try:
+        proc = reader(["pr", "view", str(number), "--repo", slug, "--json",
+                       "number,state,title,mergeCommit,headRefOid,headRefName,"
+                       "baseRefName,url"])
+    except OSError as exc:
+        raise WorkError("--pr %s: `gh pr view` unavailable: %s" % (pr_ref, exc)) from exc
+    if proc.returncode != 0:
+        raise WorkError("--pr %s: `gh pr view` failed: %s"
+                        % (pr_ref, (proc.stderr or proc.stdout or "").strip()[:300]))
+    try:
+        data = land._json(proc, "gh pr view", dict)
+    except Exception as exc:  # noqa: BLE001 - a malformed view proves nothing
+        raise WorkError("--pr %s: unreadable PR view: %s" % (pr_ref, exc)) from exc
+    state = str(data.get("state") or "").upper()
+    if state != "MERGED":
+        raise WorkError("--pr %s is %s, not merged: nothing declared"
+                        % (pr_ref, state or "?"))
+    merge = str(((data.get("mergeCommit") or {}) or {}).get("oid") or "").strip().lower()
+    if not merge:
+        # #2603 (cx2) : GitHub rend `merge_commit_sha` même en squash/rebase ;
+        # un --sha déclaré ne prouve pas, à lui seul, l'entrée dans la cible.
+        # Sans commit de fusion, rien n'est déclaré.
+        raise WorkError("--pr %s: no merge commit reported by GitHub: nothing declared "
+                        "(--sha is only an equality check)" % pr_ref)
+    head = str(data.get("headRefOid") or "").strip().lower()
+    if not head:
+        raise WorkError("--pr %s: unreadable head" % pr_ref)
+    frozen = ""
+    freeze = None
+    if db is not None:
+        try:
+            freeze = plan_git.latest_freeze(milestones(db, int(item["id"])))
+        except Exception as exc:  # noqa: BLE001 - a doubt never closes a lot
+            raise WorkError("--pr %s: lot #%s milestones unreadable: %s"
+                            % (pr_ref, item["id"], type(exc).__name__)) from exc
+        if freeze is not None:
+            frozen = str(freeze.get("sha") or "").strip().lower()
+            if not frozen:
+                raise WorkError("--pr %s: the latest freeze of lot #%s has no commit: "
+                                "nothing declared" % (pr_ref, item["id"]))
+    if frozen:
+        if head != frozen:
+            raise WorkError("--pr %s head is %s, the lot is frozen on %s: nothing declared"
+                            % (pr_ref, head[:12], frozen[:12]))
+    elif item.get("branch"):
+        branch = str(data.get("headRefName") or "").strip()
+        if branch != item["branch"]:
+            raise WorkError("--pr %s head branch is %s, the lot is on %s: nothing declared"
+                            % (pr_ref, branch or "?", item["branch"]))
+    else:
+        raise WorkError("--pr %s: lot #%s has neither a freeze nor a branch to link the "
+                        "PR: nothing declared" % (pr_ref, item["id"]))
+    if sha and sha != merge:
+        raise WorkError("--sha %s differs from the PR merge commit %s: nothing declared"
+                        % (sha[:12], merge[:12]))
+    # #2603 (cx2 B) : la fusion constatée doit être une livraison réelle dans
+    # la cible du dépôt de la PR. Une base morte fusionnée plus tard dans le
+    # défaut reste livrée (le commit y est alors ancêtre) ; une base morte qui
+    # n'y est pas entrée ne ferme pas le lot (home#112/#113).
+    base = str(data.get("baseRefName") or "").strip()
+    try:
+        proc = reader(["repo", "view", slug, "--json", "defaultBranchRef"])
+    except OSError as exc:
+        raise WorkError("--pr %s: `gh repo view` unavailable: %s" % (pr_ref, exc)) from exc
+    if proc.returncode != 0:
+        raise WorkError("--pr %s: cannot read the default branch of %s: %s: nothing declared"
+                        % (pr_ref, slug, (proc.stderr or proc.stdout or "").strip()[:300]))
+    try:
+        repo_view = land._json(proc, "gh repo view", dict)
+    except Exception as exc:  # noqa: BLE001 - a malformed view proves nothing
+        raise WorkError("--pr %s: unreadable repository view: %s" % (pr_ref, exc)) from exc
+    default = str(((repo_view.get("defaultBranchRef") or {}) or {}).get("name")
+                  or "").strip()
+    if not default:
+        raise WorkError("--pr %s: %s reports no default branch: nothing declared"
+                        % (pr_ref, slug))
+    try:
+        proc = reader(["api", "repos/%s/compare/%s...%s"
+                       % (slug, quote(default, safe=""), quote(merge, safe=""))])
+    except OSError as exc:
+        raise WorkError("--pr %s: `gh api compare` unavailable: %s"
+                        % (pr_ref, exc)) from exc
+    if proc.returncode != 0:
+        raise WorkError("--pr %s: comparison of %s with %s unreadable: %s: nothing declared"
+                        % (pr_ref, merge[:12], default,
+                           (proc.stderr or proc.stdout or "").strip()[:300]))
+    try:
+        compared = land._json(proc, "gh api compare", dict)
+    except Exception as exc:  # noqa: BLE001 - a malformed comparison proves nothing
+        raise WorkError("--pr %s: comparison of %s with %s unreadable: %s: nothing declared"
+                        % (pr_ref, merge[:12], default, exc)) from exc
+    status = str(compared.get("status") or "").strip().lower()
+    if status not in ("behind", "identical"):
+        raise WorkError(
+            "--pr %s: merged into %s, commit %s is not in %s (%s): content not delivered "
+            "(home#112/#113); nothing declared"
+            % (pr_ref, base or "?", merge[:12], default, status or "unknown"))
+    if announce is not None:
+        announce({"id": int(item["id"]), "app": item.get("app") or "",
+                  "title": item.get("title") or "", "sha": merge,
+                  "subject": str(data.get("title") or ""),
+                  "how": "merged PR %s" % pr_ref})
+    return merge, pr_ref, int(freeze["id"]) if freeze is not None else None
+
+
+def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = "",
            repo: str | None = None, migration_landed: int | None = None, cfg=None,
-           announce=None) -> dict:
-    """`ameesh work merged <id> --sha S` : une fusion faite hors PR et sans gel
-    (fusion locale sur la branche cible) se déclare en une fois.
+           announce=None, pr: str | None = None) -> dict:
+    """`ameesh work merged <id> --sha S | --pr owner/repo#N` : une fusion faite
+    hors PR et sans gel (fusion locale sur la branche cible), ou une PR
+    fusionnée hors du dépôt du lot (#2603), se déclare en une fois.
 
     Le lot passe `merged` depuis tout état ouvert (intake, build, qa,
     blocked, waiting_human) ; son jalon `merged` reçoit le commit de fusion et
@@ -2044,6 +2327,14 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
     remplacé) n'est jamais rouvert : WorkError. Rend le constat de
     `close_merged`. Le commit doit être lisible dans le dépôt du lot, désigner
     ce lot et être entré dans sa cible ; aucune lecture réseau ni force.
+
+    `pr="owner/repo#N"` (#2603) : la preuve est la PR fusionnée d'un AUTRE
+    dépôt que celui du lot (une PR du canon pour un lot d'ameesh) ; sa tête
+    doit être le gel du lot, GitHub doit rendre son commit de fusion, et ce
+    commit doit être entré dans la branche par défaut du dépôt de la PR
+    (`compare` `behind`/`identical`, un doute refuse) ; `--sha` n'est qu'un
+    contrôle d'égalité avec ce commit. La lecture de la PR passe par `gh` ;
+    aucune écriture avant le constat.
 
     `announce` (facultatif, #1400) : le callback du constat, appelé avec
     `{id, app, title, sha, subject, how}` après la lecture de la preuve (une
@@ -2057,17 +2348,28 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
     lieu de 457). Il est écrit dans la transaction de la fusion ; sur un lot
     déjà fusionné ou promu, il enregistre (ou corrige) le fait après coup,
     journalisé."""
+    pr_text = (pr or "").strip()
     text = (sha or "").strip().lower()
-    if not _SHA_RE.match(text):
+    if not text and not pr_text:
+        raise WorkError("--sha: the merge commit (7 to 64 hex characters); for a PR of "
+                        "another repository, give --pr owner/repo#N")
+    if text and not _SHA_RE.match(text):
         raise WorkError("--sha: the merge commit (7 to 64 hex characters), not %r"
                         % (sha,))
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
+    pr_ref = None
+    proof_guard = {}
     # Preserve idempotency and the closed-lot diagnostic without requiring
     # that an old clone or object still be available.
     if item["state"] not in (*MERGED_STATES, "closed"):
-        text = _declared_merge_commit(item, text, repo=repo, cfg=cfg, announce=announce)
+        if pr_text:
+            text, pr_ref, frozen_id = _merged_pr(
+                item, pr_text, sha=text, db=db, announce=announce)
+            proof_guard = {"frozen_id": frozen_id, "unfrozen": frozen_id is None}
+        else:
+            text = _declared_merge_commit(item, text, repo=repo, cfg=cfg, announce=announce)
     landed = None
     if migration_landed is not None:
         number = _landed_number(migration_landed)
@@ -2087,7 +2389,7 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
     try:
         done = close_merged(db, item_id, sha=text, actor=actor,
                             source=actor or UNKNOWN_ACTOR, declared=True, extra=extra,
-                            landed=landed)
+                            landed=landed, pr_ref=pr_ref, **proof_guard)
     except DbError as exc:
         # #1567 : course perdue sur l'index unique (dépôt, numéro atterri) —
         # message lisible plutôt que la DbError brute ; la pré-vérification a
@@ -2100,6 +2402,8 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
         # un balayage a pu fusionner le lot après notre lecture : le numéro
         # déclaré est enregistré (ou corrige celui déjà tenu) après coup
         return _record_landed(db, done["item"], landed, actor=actor, cfg=cfg)
+    if done["result"] == "refrozen":
+        raise WorkError(done["detail"])
     if done["result"] == "refused":
         item = done["item"]
         if item["state"] != "closed":
@@ -2107,6 +2411,8 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
         raise WorkError("lot %s closed (%s): not reopened; see ameesh work show %s"
                         % (item_id, close_how(item.get("close_reason"),
                                               item.get("superseded_by")), item_id))
+    if text:
+        done["sha"] = text
     return done
 
 
@@ -2705,6 +3011,7 @@ def milestone(
     note: str = "",
     on_frozen=None,
     after_commit: list | None = None,
+    outcome: dict | None = None,
 ) -> dict:
     """Déclare un jalon que la machine à états ne peut pas déduire.
 
@@ -2731,6 +3038,13 @@ def milestone(
     hook et sa liste, comme le contrat #1617 l'exige. Un callback explicite
     l'emporte toujours (témoins, reprise hors hook).
 
+    `outcome` (facultatif) reçoit la forme de la désignation du gel par défaut,
+    pour le message de la CLI. Avant d'installer ce hook, un gel dont la tête
+    est couverte par un report de verdicts (#2442) est reconnu par
+    `verdict_carry.would_carry` : la désignation s'abstient alors et garde les
+    relecteurs reportés, sans courrier (#2487). Le plan est lu **avant** la
+    transaction du jalon : la transaction ne fait aucune lecture réseau.
+
     Le feu ne s'écrit pas ici sans contrôle : `ameesh.fire.give` vérifie qu'il
     porte sur le gel courant, et `ameesh.fire.withdraw` qu'un feu est actif.
     """
@@ -2755,7 +3069,11 @@ def milestone(
         from . import review_designation_activation as activation
         cfg = getattr(db, "cfg", None)
         if activation.enabled(cfg) and not _in_transaction(db):
-            on_frozen = activation.hook(cfg)
+            # #2487 : un gel réaligné dont les verdicts vont être reportés
+            # n'appelle pas de nouvelle désignation. Le plan est lu avant la
+            # transaction du jalon (lectures git/réseau hors verrou de ligne).
+            carried = activation.carried_plan(cfg, db, item_id, sha)
+            on_frozen = activation.hook(cfg, outcome, carried=carried)
             if after_commit is None:
                 after_commit = []
                 drain = after_commit

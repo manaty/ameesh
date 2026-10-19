@@ -18,7 +18,8 @@ elle, par `ameesh work move <id> qa --reviewer <agent>`.
 
 Chaque courrier dit l'action attendue, avec la commande exacte. Une alerte
 part une fois à sa levée, puis une seule relance si elle dure encore
-`REMIND_AFTER_S` (6 h) plus tard. Ce module rend les textes ; l'envoi et le
+`REMIND_AFTER_S` (6 h) plus tard ; les SLO ne repartent qu'au palier suivant
+ou après changement d'état (#2602). Ce module rend les textes ; l'envoi et le
 dédoublonnage sont dans `notify.Notifier`.
 """
 
@@ -260,7 +261,9 @@ def _idle_actionable_lot(alert: dict) -> str:
 def _slo_breach(alert: dict) -> str:
     """#789 tranche 2 (canon §9) : une étape interne du lot a dépassé son
     délai ; le texte dit l'étape, le retard, et le geste du niveau atteint
-    (1× l'assigné, 2× le pilote, 3× le bureau ou l'auditeur, owner pour un P1).
+    (1× l'assigné, 2× le pilote, 3× le bureau ou l'auditeur, bureau et
+    auditeur pour un P1). #2395 : aucun dépassement n'est notifié à l'owner
+    (décision owner 18/10 : « rien sur les SLO »).
 
     #2231 : quand l'attente est une fusion (`merge*`) ou un déblocage
     (`unblock`), le porteur n'est pas le blocage — le brief vise le pilote/le
@@ -349,8 +352,9 @@ def _slo_breach(alert: dict) -> str:
         move = ("assignee: act on it, or record why it cannot advance (ameesh work note "
                 "%d \"hold: <reason>\") — a silent lot is not a hold" % lot)
     if alert.get("critical"):
-        move += ("; the lot is P1: the owner is notified (ameesh notify), and nothing "
-                 "waits for a human that an agent can do")
+        move += ("; the lot is P1: the bureau handles it with the auditor (canon §9, "
+                 "niveau 4), and no SLO delay is notified to the owner — nothing waits "
+                 "for a human that an agent can do")
     return "%s Expected action: %s." % (head, move)
 
 
@@ -441,12 +445,19 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             teams = _projects(by_name, alert.get("agent"))
             for name in _of_teams(orchestras, by_name, teams):
                 out.setdefault(name, text)
-        if "bureau" in roles and "bureau" in by_name:
+        bureau = by_name.get("bureau") or {}
+        # #2602: the external desk cannot read automatic mail; home host
+        # operations are the exception, since they can require that desk.
+        # `registry.MODES`: a human-driven session is `externe` (0030).
+        if "bureau" in roles and bureau and (
+                bureau.get("mode") != "externe" or alert.get("project") == "home"):
             out.setdefault("bureau", text)
         if "auditeur" in roles:
             for name in auditor_names or ():
                 if name in by_name:
                     out.setdefault(name, text)
+        if bureau.get("mode") == "externe" and alert.get("project") != "home":
+            out.pop("bureau", None)  # also when listed as pilot or auditor
         return out
     else:
         extra: dict[str, str] = {}

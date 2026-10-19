@@ -56,6 +56,14 @@ from pathlib import Path
 TRAILER = "ameesh-work"
 TRAILER_RE = re.compile(r"(?im)^[ \t>*-]*ameesh-work[ \t]*:[ \t]*#?(\d+)[ \t]*$")
 
+#: #2546 : les instructions de saut reconnues par GitHub (mêmes formes que
+#: `ci.SKIP_CI_RE`). Un message de tête qui en porte une — même en citation —
+#: ne démarre aucun workflow `push` ou `pull_request`, l'événement `labeled`
+#: de la CI compris : le composeur ne doit jamais créer une telle tête.
+SKIP_CI_RE = re.compile(
+    r"\[[ \t]*(?:skip[ \t]+ci|ci[ \t]+skip|no[ \t]+ci|skip[ \t]+actions|"
+    r"actions[ \t]+skip)[ \t]*\]", re.IGNORECASE)
+
 
 class GitError(RuntimeError):
     """Une commande git a échoué, ou l'état du dépôt ne permet pas la fusion."""
@@ -120,6 +128,19 @@ def build_message(lots: list[int], short_source: str, cut: str | None,
     already = {int(match.group(1)) for match in TRAILER_RE.finditer(text)}
     lines = ["%s: %d" % (TRAILER, lot) for lot in lots if lot not in already]
     return text + "\n\n" + "\n".join(lines) + "\n" if lines else text + "\n"
+
+
+def reject_skip_marker(label: str, text: str | None) -> None:
+    """Refuse `text` s'il porte une instruction de saut GitHub (#2546)."""
+    match = SKIP_CI_RE.search(text or "")
+    if not match:
+        return
+    raise InputError(
+        "%s porte l'instruction de saut GitHub « %s » : la tête composée ne "
+        "démarrerait aucun workflow, pas même l'événement pull_request: labeled "
+        "de sa CI. Retirez ce marqueur du message et recomposez ; une tête qui "
+        "doit réellement sauter la CI ne passe pas par cet outil (les commits de "
+        "release [skip ci] restent hors de lui)." % (label, match.group(0)))
 
 
 def check_repo(repo: Path) -> Path:
@@ -207,6 +228,16 @@ def compose(args: argparse.Namespace) -> int:
     short_source = out(repo, "rev-parse", "--short=12", source)
     message = build_message(lots, short_source, args.cut, args.note,
                             args.subject, args.body)
+    # #2546 : refuser avant la fusion, sans toucher à l'arbre ni au message.
+    # Chaque champ est contrôlé pour lui-même (`--note` est ignoré quand
+    # `--subject` est donné), puis le message final, qui porte le sujet par
+    # défaut et le trailer.
+    reject_skip_marker("--subject", args.subject)
+    reject_skip_marker("--note", args.note)
+    reject_skip_marker("--cut", args.cut)
+    for body in args.body:
+        reject_skip_marker("--body", body)
+    reject_skip_marker("le message composé", message)
 
     proc = git(repo, "merge", "--no-ff", "--no-commit", "--no-edit", source,
                check=False)

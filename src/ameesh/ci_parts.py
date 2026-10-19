@@ -49,6 +49,13 @@ contrôle d'atterrissage, et une entrée relue est revalidée avant d'être
 servie. N4 de #1666 : le sélecteur tourne dans sa propre session et son
 groupe de processus entier est tué quand il dépasse `PARTS_TIMEOUT`.
 
+#2503 : `declarations_sha` sépare le code du sélecteur des déclarations qu'il
+lit. Le sélecteur reste celui du commit de base (audité) ; l'arbre extrait est
+celui des déclarations (la tête d'un paquet, qui peut ajouter ou élargir un
+workflow de suite). Le sélecteur de l'arbre de déclarations doit être le même
+blob que celui de la base, sinon la preuve est refusée : le code de la tête
+n'est jamais exécuté pour sélectionner ses propres parts.
+
 N3 de #1666 : le sélecteur est du code de la cible, relu mais jamais de
 confiance : il tourne dans un bac à sable `bwrap` (voie (a) du pilote,
 mesh-design, 16/10/2026) — espaces de noms séparés, **réseau coupé**,
@@ -74,7 +81,7 @@ import tempfile
 import time
 
 from . import plan_git
-from .canon import GIT_TIMEOUT, GitError, _git, _git_env
+from .canon import GIT_TIMEOUT, GitError, _git, _git_env, git_toplevel
 from .platform import PROC
 
 #: plafond d'exécution du sélecteur : un sélecteur bloqué ne retient pas la
@@ -140,6 +147,21 @@ def merge_base(repo: str, base: str, head: str) -> str:
     return proc.stdout.decode("ascii", "replace").strip()
 
 
+def _selector_blob(repo: str, commit: str, selector: str) -> str | None:
+    """Le blob de `selector` dans l'arbre de `commit`, ou None (#2503).
+
+    Sert à refuser d'exécuter le sélecteur d'un arbre de déclarations qui
+    n'est pas celui du commit audité : la sélection doit rester le code de la
+    base, même quand les déclarations sont celles de la tête."""
+    proc = _git(repo, "ls-tree", commit, "--", selector)
+    if proc.returncode != 0:
+        return None
+    meta = proc.stdout.decode("utf-8", "replace").split("\t", 1)[0].split()
+    if len(meta) != 3 or meta[0] not in ("100644", "100755") or meta[1] != "blob":
+        return None
+    return meta[2]
+
+
 def _member_path(dest: str, name: str) -> str:
     """Le chemin absolu d'une entrée d'archive sous `dest`, ou `PartsError` :
     aucun nom absolu, aucun `..`, rien hors de l'arbre extrait."""
@@ -157,7 +179,12 @@ def extract(repo: str, commit: str, dest: str) -> None:
     """L'arbre de `commit`, extrait dans `dest` depuis les objets Git
     (`git archive`), sans toucher au dépôt ni à un checkout. Seuls les
     fichiers, répertoires et liens symboliques internes entrent ; une entrée
-    d'un autre type, ou un lien qui sort de l'arbre, refuse."""
+    d'un autre type, ou un lien qui sort de l'arbre, refuse. Un sous-répertoire
+    est ramené à la racine de son arbre de travail : `git archive` est relatif
+    au cwd (#2567), un dépôt nu reste lu tel quel."""
+    top = git_toplevel(repo)
+    if top and os.path.realpath(repo) != top:
+        repo = top
     if not os.path.isdir(dest):
         os.makedirs(dest)
     argv = ["git", "--no-pager", "--no-replace-objects", "--literal-pathspecs",
@@ -383,22 +410,25 @@ def cache_dir(cfg) -> str | None:
     return os.path.join(state, "radar", "ci-parts") if state else None
 
 
-def _cache_key(plan, base: str, frozen: str) -> str:
-    """La clé d'une preuve : le couple (commit de base, tête gelée) et le
-    contrat qui la produit. Deux contrats différents ne partagent jamais une
-    entrée."""
-    payload = json.dumps({"version": PARTS_CACHE_VERSION, "base": base, "frozen": frozen,
-                          "selector": plan.selector, "argv": list(plan.argv),
-                          "schema": plan.schema, "due": plan.due},
-                         sort_keys=True, ensure_ascii=True)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+def _cache_key(plan, base: str, frozen: str, declarations: str | None = None) -> str:
+    """La clé d'une preuve : le couple (commit de base, tête gelée), l'arbre
+    de déclarations quand il diffère de la base (#2503) et le contrat qui la
+    produit. Deux contrats différents ne partagent jamais une entrée."""
+    payload = {"version": PARTS_CACHE_VERSION, "base": base, "frozen": frozen,
+               "selector": plan.selector, "argv": list(plan.argv),
+               "schema": plan.schema, "due": plan.due}
+    if declarations is not None and declarations != base:
+        payload["declarations"] = declarations
+    return hashlib.sha256(json.dumps(payload, sort_keys=True,
+                                     ensure_ascii=True).encode("utf-8")).hexdigest()
 
 
-def _cache_read(cache: str, key: str, plan, base: str, frozen: str) -> dict | None:
+def _cache_read(cache: str, key: str, plan, base: str, frozen: str,
+                declarations: str | None = None) -> dict | None:
     """La preuve mise en cache, relue et **revalidée** comme un plan frais ;
     toute entrée illisible, incomplète, d'un autre schéma, d'un autre format
-    ou d'un autre couple (base, tête gelée) est ignorée — la preuve est
-    recalculée, jamais servie."""
+    ou d'un autre couple (base, tête gelée, déclarations) est ignorée — la
+    preuve est recalculée, jamais servie."""
     try:
         with open(os.path.join(cache, key + ".json"), "r", encoding="utf-8") as handle:
             if time.time() - os.fstat(handle.fileno()).st_mtime > PARTS_CACHE_TTL:
@@ -422,11 +452,16 @@ def _cache_read(cache: str, key: str, plan, base: str, frozen: str) -> dict | No
         return None
     if data.get("base") != base or data.get("frozen") != frozen:
         return None
+    expected = declarations or base
+    stored = data.get("declarations", base)
+    if stored != expected:
+        return None
     if not isinstance(data.get("merge_base"), str) \
             or not _COMMIT_RE.fullmatch(data["merge_base"]):
         return None
     return {"schema": schema, "due": clean, "selector": plan.selector,
-            "base": base, "merge_base": data["merge_base"], "frozen": frozen}
+            "base": base, "merge_base": data["merge_base"], "frozen": frozen,
+            "declarations": stored}
 
 
 def _cache_write(cache: str, key: str, proof: dict) -> None:
@@ -438,7 +473,8 @@ def _cache_write(cache: str, key: str, proof: dict) -> None:
         os.makedirs(cache, exist_ok=True)
         data = {"version": PARTS_CACHE_VERSION, "schema": proof["schema"],
                 "due": list(proof["due"]), "base": proof["base"],
-                "merge_base": proof["merge_base"], "frozen": proof["frozen"]}
+                "merge_base": proof["merge_base"], "frozen": proof["frozen"],
+                "declarations": proof["declarations"]}
         with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(data, handle, sort_keys=True)
         os.chmod(tmp, 0o600)
@@ -482,18 +518,28 @@ def _kill_group(proc) -> None:
             pass
 
 
-def due(project, sha: str, base_sha: str, repo: str, *, cache: str | None = None) -> dict:
+def due(project, sha: str, base_sha: str, repo: str, *, cache: str | None = None,
+        declarations_sha: str | None = None) -> dict:
     """Les parts que le change set de la tête gelée `sha` rend dues, calculées
     par le sélecteur versionné de `project` (`ci_parts`), lu au commit
     `base_sha` de `repo` et alimenté du diff `merge-base(base_sha, sha)..sha`.
 
-    Rend `{schema, due, selector, base, merge_base, frozen}` ; lève
-    `PartsError` dès que la preuve manque (sélecteur absent de l'arbre
-    épinglé, change set inconnu, commande en échec, plan mal formé).
+    `declarations_sha` (#2503) sépare le **code** du sélecteur des
+    **déclarations** qu'il lit : le sélecteur est toujours celui, audité, de
+    `base_sha`, mais l'arbre extrait est celui de `declarations_sha` (la tête
+    gelée à défaut de base). Le sélecteur de l'arbre de déclarations doit être
+    le même blob que celui de `base_sha` : exécuter le sélecteur de la tête
+    serait une sélection non auditée. Un paquet dont la tête ajoute ou élargit
+    un workflow de suite est donc vu, sans exécuter le code de la tête.
+
+    Rend `{schema, due, selector, base, merge_base, frozen, declarations}` ;
+    lève `PartsError` dès que la preuve manque (sélecteur absent de l'arbre
+    épinglé ou différent de celui de la tête, change set inconnu, commande en
+    échec, plan mal formé).
 
     N2 de #1666 : `cache` (un répertoire, `cache_dir(cfg)`) garde la preuve
-    par couple (base, tête gelée) et par contrat. L'arbre entier de la cible
-    (~71 Mo pour Nexlink) n'est plus extrait aux trois contrôles
+    par couple (base, tête gelée, déclarations) et par contrat. L'arbre entier
+    de la cible (~71 Mo pour Nexlink) n'est plus extrait aux trois contrôles
     d'atterrissage : une preuve en cache est relue et revalidée, jamais
     recalculée pour un autre couple. Sans `cache`, le calcul reste intact.
 
@@ -514,6 +560,8 @@ def due(project, sha: str, base_sha: str, repo: str, *, cache: str | None = None
     try:
         frozen = plan_git._commit(repo, sha)
         base = plan_git._commit(repo, base_sha)
+        declarations = (plan_git._commit(repo, declarations_sha)
+                        if declarations_sha is not None else base)
     except GitError as exc:
         raise PartsError("cannot read %s in %s: %s" % ((sha or "?")[:12], repo, exc)) from exc
     if not frozen:
@@ -521,14 +569,31 @@ def due(project, sha: str, base_sha: str, repo: str, *, cache: str | None = None
     if not base:
         raise PartsError("the versioned selection source %r is not a commit of %s: the due "
                          "parts cannot be proven" % (base_sha, repo))
+    if not declarations:
+        raise PartsError("the declarations commit %s is not a commit of %s: the due parts "
+                         "cannot be proven" % ((declarations_sha or "?")[:12], repo))
+    #: #2503 : le sélecteur des déclarations est celui de la base, jamais celui
+    #: que la tête aurait changé. Le code audité sélectionne les déclarations
+    #: de la tête ; un sélecteur modifié exige un nouveau contrat audité.
+    try:
+        base_selector = _selector_blob(repo, base, plan.selector)
+        head_selector = (_selector_blob(repo, declarations, plan.selector)
+                         if declarations != base else base_selector)
+    except GitError as exc:
+        raise PartsError("cannot read the selection source %s in %s: %s"
+                         % (plan.selector, repo, exc)) from exc
+    if declarations != base and head_selector != base_selector:
+        raise PartsError("the selection source %s differs between the audited commit %s and "
+                         "the declarations commit %s: the due parts cannot be proven"
+                         % (plan.selector, base[:12], declarations[:12]))
     #: N2 de #1666 : la preuve est une fonction pure du couple (base, tête
     #: gelée) et du contrat ; l'extraction de l'arbre (~71 Mo pour Nexlink)
     #: n'est refaite que sur un défaut de cache, jamais aux contrôles
     #: répétés d'un même couple. Entrée revalidée : jamais servie telle quelle.
-    key = _cache_key(plan, base, frozen) if cache else None
+    key = _cache_key(plan, base, frozen, declarations) if cache else None
     if cache:
         _cache_prune(cache, time.time())
-        hit = _cache_read(cache, key, plan, base, frozen)
+        hit = _cache_read(cache, key, plan, base, frozen, declarations)
         if hit is not None:
             return hit
     #: N3 de #1666 : le sélecteur est du code de la cible ; il ne tourne que
@@ -553,11 +618,15 @@ def due(project, sha: str, base_sha: str, repo: str, *, cache: str | None = None
     tmp = tempfile.mkdtemp(prefix="ameesh-ci-parts-")
     try:
         root = os.path.join(tmp, "tree")
-        extract(repo, base, root)
+        #: #2503 : le sélecteur est celui de la base, les déclarations qu'il
+        #: lit sont celles de `declarations` (`base_sha` sans surcharge).
+        extract(repo, declarations, root)
         selector = os.path.join(root, *plan.selector.split("/"))
         if not os.path.isfile(selector):
             raise PartsError("the selection source %s is not in the tree of %s (%s): the due "
-                             "parts cannot be proven" % (plan.selector, base_sha[:12], base[:12]))
+                             "parts cannot be proven"
+                             % (plan.selector, (declarations_sha or base_sha)[:12],
+                                declarations[:12]))
         files = os.path.join(tmp, "changed.nul")
         with open(files, "wb") as out:
             out.write(changed)
@@ -606,7 +675,8 @@ def due(project, sha: str, base_sha: str, repo: str, *, cache: str | None = None
                              % (plan.selector, proc.returncode, tail))
         schema, names = _plan_file(result, plan)
         proof = {"schema": schema, "due": names, "selector": plan.selector,
-                 "base": base, "merge_base": parent, "frozen": frozen}
+                 "base": base, "merge_base": parent, "frozen": frozen,
+                 "declarations": declarations}
         if cache:
             _cache_write(cache, key, proof)
         return proof

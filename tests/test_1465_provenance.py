@@ -43,25 +43,26 @@ class ContractTest(unittest.TestCase):
 
     def test_capture_refuses_outside_a_managed_turn(self):
         env = {"AGENT_MAIL_NAME": "mty-amh-impl-07", "AMEESH_HARNESS": "deepseek"}
+        families = ("claude", "codex", "deepseek")
         with self.assertRaises(prov.ProvenanceError):
-            prov.capture(env)  # pas de tour
+            prov.capture(env, families=families)  # pas de tour
         env["AMEESH_TURN_ID"] = "t" * 32
-        self.assertEqual(prov.capture(env),
+        self.assertEqual(prov.capture(env, families=families),
                          {"actor": "mty-amh-impl-07", "turn": "t" * 32,
                           "harness": "deepseek"})
         # un tour ne signe pas la preuve d'un autre agent (relecture cx3)
         with self.assertRaises(prov.ProvenanceError):
-            prov.capture(env, actor="autre-agent")
+            prov.capture(env, actor="autre-agent", families=families)
         env["AMEESH_HARNESS"] = "autre"
         with self.assertRaises(prov.ProvenanceError):
-            prov.capture(env)  # famille inconnue
+            prov.capture(env, families=families)  # famille inconnue
         del env["AMEESH_HARNESS"]
         with self.assertRaises(prov.ProvenanceError):
-            prov.capture(env)  # pas de harnais
+            prov.capture(env, families=families)  # pas de harnais
         del env["AGENT_MAIL_NAME"]
         env["AMEESH_HARNESS"] = "claude"
         with self.assertRaises(prov.ProvenanceError):
-            prov.capture(env)  # pas d'acteur
+            prov.capture(env, families=families)  # pas d'acteur
 
 
     def test_resolve_commit_keeps_options_out_of_git(self):

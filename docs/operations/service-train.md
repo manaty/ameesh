@@ -101,12 +101,14 @@ paquet n'a pas encore atterri n'apparaît pas dans `comparisons`.
 
 Le passage réel du moteur #1467 : il compose la tête du paquet, publie la
 branche immuable `integration/train-*`, attend l'unique CI complète du paquet
-(le run `push` de `paquet.yml`, dont le job `suite` appelle `tests.yml` ; ses
-jobs appelés apparaissent dans le même run, préfixés par le job appelant) et
-fusionne au vert. Un push couvert par une PR ouverte laisse `suite` sauté : ce
-n'est pas une preuve de paquet, le train refuse. Le
-composeur humain devient le repli : en cas de rouge, le train s'arrête, alerte
-et n'enchaîne pas ; un humain reprend la main.
+et fusionne au vert. La forme de cette preuve est celle du contrat CI du
+projet (voir « Contrat CI ») : pour ameesh, le run `push` de `paquet.yml`, dont
+le job `suite` appelle `tests.yml` (jobs appelés dans le même run, préfixés
+par le job appelant) ; pour Nexlink, les runs `workflow_dispatch` des seules
+suites que le change set intégré rend dues. Un push ameesh couvert par une PR
+ouverte laisse `suite` sauté : ce n'est pas une preuve de paquet, le train
+refuse. Le composeur humain devient le repli : en cas de rouge, le train
+s'arrête, alerte et n'enchaîne pas ; un humain reprend la main.
 
 La bascule est un geste de pilote : changer `mode` en `active`, vérifier le
 commit canon audité et l'échéance, puis redémarrer l'exécuteur. Aucun code ne
@@ -139,6 +141,38 @@ la matrice complète 8 psycopg + 16 psql, le job `plateforme macOS` et l'agréga
 le train ne s'en sert jamais. Une modification d'un de ces fichiers exige un
 nouveau contrat audité : le témoin `tests/test_2446_train_contract.py` compare
 les blobs au commit.
+
+### Nexlink — les parts dues (#2503)
+
+Le paquet Nexlink n'est pas un run unique : chaque suite de lot est un
+`workflow_dispatch` qui publie `lot/<suite>`, et les parts dues sont calculées
+par `scripts/ci/lot-plan.mjs` sur le change set intégré. Le contrat ne fige
+donc **pas** les 23 suites : il épingle seulement le sélecteur
+(`scripts/ci/lot-plan.mjs`) et les workflows partagés de plan et de statut
+(`.github/workflows/lot-plan.yml`, `.github/workflows/lot-status.yml`), au
+commit `NEXLINK_AUDIT_COMMIT` (`9103c167`, develop du 18/10 19:09 Paris). Le
+sélecteur de la cible est vérifié au commit de base (une modification exige un
+nouveau contrat) ; `ci_parts.due` (bac à sable `bwrap`, aucun repli) rend les
+contextes `lot/<suite>` dus. Le même sélecteur audité tourne sur **deux
+arbres** : celui de la base (le plan déjà publié par la cible, qu'une tête ne
+peut pas réduire) et celui de la tête (les suites que le paquet ajoute ou
+élargit). Le sélecteur de l'arbre de la tête doit être le même blob que celui
+de la base : un sélecteur modifié est refusé, jamais exécuté. L'union des deux
+plans est exigée ; chaque fichier doit déclarer le même `context` à la tête
+dispatchée, puis il est dispatché avec `expected_sha`.
+À la lecture, la suite doit exister à la tête et **tous ses jobs exécutables**
+doivent être verts. Seuls des jobs de plomberie **nommés exactement**
+(`lot-plan`, `lot-plan-retry`, `lot-pending`, `lot-status` et leurs jobs
+appelés) et les exceptions **de la suite concernée** sont écartés :
+`changed-paths` dans backend-suite, `github-bridge` dans compute, la matrice
+`Desktop suite (...)` dans desktop-suite. Un job de test nommé `lot-*` ou
+`Desktop suite (...)` hors de sa suite reste donc requis, comme tout job
+nouveau — sans nouvelle relecture du contrat. Une liste due vide refuse : un
+paquet documentation seule n'est pas une preuve de train. Le contrat est livré
+pour le mode ombre seulement : aucune configuration d'hôte ni bascule n'est
+faite par ce lot. Prérequis d'hôte : `bwrap` (N3 de #1666) et `node` (le
+sélecteur) — sans eux, la preuve des parts est refusée, jamais remplacée par
+une exécution non isolée.
 
 ## Retour arrière
 

@@ -121,18 +121,23 @@ class FamilleDuPreneurTest(unittest.TestCase):
     def test_famille_de_la_session_vivante(self):
         from unittest import mock
 
-        with mock.patch.object(review_lot, "required_family", return_value="codex"):
+        with mock.patch.object(review_lot, "_required_family", return_value="codex"), \
+                mock.patch.object(review_lot, "compiled_families",
+                                  return_value=("claude", "codex", "deepseek")):
             # déclaré deepseek mais tourne sous codex : famille codex, accepté
             self.assertTrue(review_lot.may_take(
-                None, {}, {"name": "x", "harness": "deepseek",
-                           "session_harness": "codex"}))
+                None, {"issue_ref": "review-after-merge:#1"},
+                {"name": "x", "harness": "deepseek",
+                 "session_harness": "codex"}))
             # déclaré codex mais tourne sous deepseek : refusé
             self.assertFalse(review_lot.may_take(
-                None, {}, {"name": "x", "harness": "codex",
-                           "session_harness": "deepseek"}))
+                None, {"issue_ref": "review-after-merge:#1"},
+                {"name": "x", "harness": "codex",
+                 "session_harness": "deepseek"}))
             # un nom de harnais porte sa famille (`family_of`, #1374)
             self.assertTrue(review_lot.may_take(
-                None, {}, {"name": "x", "harness": "codex-mini"}))
+                None, {"issue_ref": "review-after-merge:#1"},
+                {"name": "x", "harness": "codex-mini"}))
 
 
 if __name__ == "__main__":

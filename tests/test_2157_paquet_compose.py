@@ -121,6 +121,54 @@ class PaquetComposeTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.message().count("ameesh-work: 11"), 1)
 
+    def test_un_marqueur_de_saut_dans_le_message_est_refuse(self) -> None:
+        # #2546 : une tête composée avec `[skip ci]` ne lancerait aucun
+        # workflow, même l'événement `pull_request: labeled` de sa CI. Le
+        # refus tombe avant la fusion : HEAD et MERGE_HEAD restent intacts.
+        source = self.lot_file(12, "douze.txt", "douze\n")
+        for marker in ("[skip ci]", "[CI SKIP]", "[no ci]", "[skip actions]",
+                       "[actions skip]"):
+            with self.subTest(marker=marker):
+                proc = self.compose("--lot", "12", "--source", source,
+                                    "--note", "composition %s" % marker)
+                self.assertEqual(proc.returncode, 2, proc.stdout)
+                self.assertIn(marker, proc.stderr)
+                self.assertIn("instruction de saut GitHub", proc.stderr)
+                self.assertEqual(self.rev("HEAD"), self.base)
+                self.assertFalse((self.repo / ".git" / "MERGE_HEAD").exists())
+
+    def test_le_marqueur_est_refuse_dans_chaque_champ(self) -> None:
+        source = self.lot_file(13, "treize.txt", "treize\n")
+        for field, value in (("--subject", "sujet [skip ci]"),
+                             ("--note", "note [ci skip]"),
+                             ("--body", "corps [no ci]"),
+                             ("--cut", "0400 [skip actions]")):
+            with self.subTest(field=field):
+                proc = self.compose("--lot", "13", "--source", source,
+                                    field, value)
+                self.assertEqual(proc.returncode, 2, proc.stdout)
+                self.assertIn(field, proc.stderr)
+                self.assertEqual(self.rev("HEAD"), self.base)
+                self.assertFalse((self.repo / ".git" / "MERGE_HEAD").exists())
+
+    def test_un_sujet_propre_reste_accepte(self) -> None:
+        source = self.lot_file(15, "quinze.txt", "quinze\n")
+        proc = self.compose("--lot", "15", "--source", source,
+                            "--subject", "composition propre")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.message().splitlines()[0], "composition propre")
+
+    def test_une_note_avec_marqueur_est_refusee_meme_avec_un_sujet_propre(self) -> None:
+        # #2546 : le champ est contrôlé pour lui-même, même si `--subject`
+        # rend `--note` inutilisé ; aucun marqueur ne doit entrer par un champ.
+        source = self.lot_file(16, "seize.txt", "seize\n")
+        proc = self.compose("--lot", "16", "--source", source,
+                            "--subject", "sujet propre", "--note", "note [skip ci]")
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn("--note", proc.stderr)
+        self.assertEqual(self.rev("HEAD"), self.base)
+        self.assertFalse((self.repo / ".git" / "MERGE_HEAD").exists())
+
     def test_source_deja_ancetre_refusee(self) -> None:
         self.write("apres.txt", "après\n")
         head = self.commit("commit suivant")

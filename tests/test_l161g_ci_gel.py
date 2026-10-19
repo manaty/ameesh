@@ -58,7 +58,7 @@ from urllib.parse import unquote
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from ameesh import ci, mesh_cli, plan_github, work  # noqa: E402
+from ameesh import ci, mesh_cli, plan_github, prevalidation, work  # noqa: E402
 
 DEPOT = "manaty/ameesh"
 GEL = "a" * 40
@@ -209,7 +209,8 @@ class Github:
 
     def __init__(self, *, head: str = GEL, base=BASE, runs=(), workflow: str | None = WORKFLOW,
                  pulls=None, checks=None, manifest: str | None = None,
-                 base_reviews=("integration-paquet-h-20261017-0500.md",)):
+                 base_reviews=("integration-paquet-h-20261017-0500.md",),
+                 message: str = "lot 1343: clean head"):
         self.head = head
         self.base = base
         self.runs = list(runs)
@@ -218,6 +219,7 @@ class Github:
         self.checks = {"check_runs": [check_run()]} if checks is None else checks
         self.manifest = manifest
         self.base_reviews = list(base_reviews)
+        self.message = message
         self.paths: list[str] = []
 
     def rows(self) -> list[dict]:
@@ -237,6 +239,11 @@ class Github:
             if unquote(path.split("/branches/", 1)[1]) == BRANCHE:
                 return {"commit": {"sha": self.head}}
             return {"commit": {"sha": self.base() if callable(self.base) else self.base}}
+        if re.fullmatch(r"repos/%s/commits/[0-9a-f]{40}" % re.escape(DEPOT), path):
+            # #2546 : le message de la tête, relu avant de poser une étiquette.
+            # Le motif exact laisse passer `…/commits/<sha>/check-runs`.
+            return {"sha": path.rsplit("/", 1)[-1],
+                    "commit": {"message": self.message}}
         if "/actions/workflows/tests.yml/runs?" in path:
             runs = self.rows()
             found = re.search(r"[?&]head_sha=([0-9a-f]{40})", path)
@@ -411,6 +418,47 @@ class GelPlanTest(GelTestCase):
             self.gel(api)
         self.assertIn("the ref moved", str(caught.exception))
         self.assertEqual(api.ecrit(), [], "aucun workflow lu")
+
+    def test_une_tete_avec_marqueur_de_saut_est_refusee_avant_toute_demande(self):
+        # #2546 : GitHub saute tous les workflows de cette tête, l'événement
+        # `pull_request: labeled` compris ; la demande doit refuser, jamais
+        # poser une étiquette qui ne lancerait rien.
+        self.gele()
+        for marker in ("[skip ci]", "[CI SKIP]", "[no ci]", "[skip actions]",
+                       "[actions skip]"):
+            with self.subTest(marker=marker):
+                api = Github(message="correctif — reprend %s du commit précédent"
+                                     % marker)
+                with self.assertRaises(ci.GelError) as caught:
+                    self.gel(api)
+                text = str(caught.exception)
+                self.assertIn("skip instruction", text)
+                self.assertIn(marker, text)
+                self.assertIn("rewrite the commit message", text)
+                self.assertIn("push a new head", text)
+                self.assertEqual(api.ecrit(), [], "aucun workflow lu")
+                self.assertIn("/commits/%s" % GEL, " ".join(api.paths))
+
+    def test_un_marqueur_cite_dans_le_corps_refuse_aussi(self):
+        # L'incident h-2000 : un marqueur cité du commit antérieur dans le
+        # corps de la tête suffisait à sauter la CI.
+        self.gele()
+        api = Github(message="h-2000 : correction\n\nreprend [skip ci] du commit "
+                             "e6c1118228, arbre inchangé")
+        with self.assertRaises(ci.GelError) as caught:
+            self.gel(api)
+        self.assertIn("[skip ci]", str(caught.exception))
+        self.assertEqual(api.ecrit(), [], "aucune demande sans tête propre")
+
+    def test_une_exception_ne_contourne_pas_le_marqueur_de_saut(self):
+        # #2546 : même `--exception incident` ne peut pas demander une CI que
+        # GitHub ne lancera pas ; la tête doit d'abord être réécrite.
+        self.gele()
+        api = Github(message="correctif d'incident [skip ci]")
+        with self.assertRaises(ci.GelError) as caught:
+            self.gel(api, exception="incident", reason="incident de banc")
+        self.assertIn("skip instruction", str(caught.exception))
+        self.assertEqual(api.ecrit(), [], "aucune demande sans tête propre")
 
     def test_une_demande_pose_l_etiquette_du_sha_gele_et_de_sa_base(self):
         self.gele()
@@ -994,7 +1042,8 @@ class RequestTest(GelTestCase):
         super().setUp()
         self.args = argparse.Namespace(id=1343, sha="", avis=1, exception="", reason="",
                                        full=False, force=False, repo=DEPOT, dry_run=False,
-                                       json=True)
+                                       json=True, prevalidation_repo="",
+                                       prevalidation_map="")
         self.notes: list[str] = []
         self.seq = itertools.count(1)
         self.on_note = None
@@ -1103,6 +1152,19 @@ class RequestTest(GelTestCase):
         code, notes = self.run_cmd(api, gh, args=argparse.Namespace(
             **{**vars(self.args), "dry_run": True}))
         self.assertEqual((code, gh.calls, notes), (0, [], []))
+
+    def test_une_tete_avec_marqueur_de_saut_ne_pose_rien_meme_en_dry_run(self):
+        # #2546 : le refus tombe au plan, avant toute écriture (annulation,
+        # acteur du jeton, étiquette) et le `--dry-run` le montre aussi.
+        self.gele()
+        for dry in (False, True):
+            with self.subTest(dry_run=dry):
+                api = Github(message="composition [skip ci]")
+                gh = Gh()
+                args = argparse.Namespace(**{**vars(self.args), "dry_run": dry})
+                code, notes = self.run_cmd(api, gh, args=args)
+                self.assertEqual(code, 1)
+                self.assertEqual((gh.calls, notes, gh.poses()), ([], [], []))
 
     def test_la_garde_du_paquet_refuse_une_ci_lot_sans_exception(self):
         """#2333 : aucune étiquette `ci-lot` entre deux paquets, même en dry-run."""
@@ -1621,6 +1683,87 @@ class RequestTest(GelTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(self.db.transactions, 0)
         self.assertEqual(gh.poses(), [LABEL])
+
+
+    # -- #2644 : la prévalidation passe avant l'étiquette d'un porteur --
+
+    def packet_args(self, **over):
+        values = dict(vars(self.args), avis=0, full=True,
+                      reason="porteur, unités relues au manifeste",
+                      prevalidation_repo="/arbre-paquet",
+                      prevalidation_map="/carte/carte.json.gz")
+        values.update(over)
+        return argparse.Namespace(**values)
+
+    def packet_api(self):
+        return Github(pulls=[pull(head_ref="integration/paquet-h-20261019-0600")],
+                      manifest="integration-paquet-h-20261019-0600.md")
+
+    def test_paquet_vert_pose_l_etiquette(self):
+        gh = Gh()
+        with mock.patch("ameesh.prevalidation_calls.gate_packet",
+                        return_value={"state": "green",
+                                      "report": {"schema": "ameesh-prevalidation/1",
+                                                 "ok": True, "sha": GEL,
+                                                 "modules": ["test_a"],
+                                                 "seconds": 12.0,
+                                                 "host": "vm1"}}) as gate:
+            code, notes = self.run_cmd(self.packet_api(), gh,
+                                       args=self.packet_args(), packet=False)
+        self.assertEqual(code, 0, notes)
+        self.assertIn(LABEL_FULL, gh.poses())
+        gate.assert_called_once()
+        kwargs = gate.call_args.kwargs
+        self.assertEqual(kwargs["repo"], "/arbre-paquet")
+        self.assertEqual(kwargs["map_path"], "/carte/carte.json.gz")
+
+    def test_paquet_rouge_ne_pose_aucune_etiquette(self):
+        gh = Gh()
+        with mock.patch("ameesh.prevalidation_calls.gate_packet",
+                        return_value={"state": "red",
+                                      "why": "run-red — tests en échec: tests.test_x"}):
+            code, notes = self.run_cmd(self.packet_api(), gh,
+                                       args=self.packet_args(), packet=False)
+        self.assertEqual(code, 1)
+        self.assertEqual(gh.poses(), [])
+        self.assertEqual(self.marques("reserve"), [])
+
+    def test_paquet_indisponible_continue_et_journalise(self):
+        # Décision pilote 19/10 : une prévalidation indisponible ne bloque
+        # jamais ; le motif est journalisé pour le manifeste du porteur.
+        gh = Gh()
+        with mock.patch("ameesh.prevalidation_calls.gate_packet",
+                        return_value={"state": "unavailable", "cause": "no-vm",
+                                      "why": "aucune VM de prévalidation"}):
+            code, notes = self.run_cmd(self.packet_api(), gh,
+                                       args=self.packet_args(), packet=False)
+        self.assertEqual(code, 0, notes)
+        self.assertIn(LABEL_FULL, gh.poses())
+        self.assertTrue(any(n.startswith("prevalidation-unavailable: no-vm")
+                            for n in notes), notes)
+
+    def test_exception_declaree_ne_bloque_pas_la_prevalidation(self):
+        self.events.append({"id": next(self.seq), "created_ts": time.time(),
+                            "note": "packet-exception incident sha=%s reason=incident"
+                                    % GEL})
+        gh = Gh()
+        with mock.patch("ameesh.prevalidation_calls.gate_packet") as gate:
+            code, notes = self.run_cmd(self.packet_api(), gh,
+                                       args=self.packet_args(), packet=False)
+        self.assertEqual(code, 0, notes)
+        self.assertIn(LABEL_FULL, gh.poses())
+        gate.assert_not_called()
+
+    def test_lot_hors_paquet_n_appelle_pas_la_prevalidation(self):
+        self.gele()
+        self.events.append({"id": next(self.seq), "created_ts": time.time(),
+                            "note": "packet-exception unblock sha=%s reason=test" % GEL})
+        gh = Gh()
+        with mock.patch("ameesh.prevalidation_calls.gate_packet") as gate:
+            code, notes = self.run_cmd(Github(), gh, packet=False)
+        self.assertEqual(code, 0, notes)
+        self.assertIn(LABEL, gh.poses())
+        gate.assert_not_called()
 
 
 class ParsingTest(unittest.TestCase):

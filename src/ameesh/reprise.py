@@ -1325,7 +1325,8 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
                              critical=_critical(cfg, row),
                              # #1580 (tranche 3) : le compte simulé pour cet
                              # agent tient compte de son modèle
-                             model=row.get("model") or book.model_of(row["name"]))
+                             model=row.get("model") or book.model_of(row["name"]),
+                             cfg=cfg)
     nxt = choice.profile or choice.active or items[0]
     if choice.profile is None:
         out["warnings"].append("all %s accounts are at their threshold (%s): the agent will "
@@ -1535,7 +1536,9 @@ def cmd_resume(cfg: Config, args) -> int:
                   file=sys.stderr)
             return 1
         return agent_pause.cmd_cli(cfg, args, paused=False)
-    if getattr(args, "expect_reason", None):
+    # #2184/N7 : un motif vide explicite n'est pas « absent » ; la présence
+    # du drapeau suffit à exiger --operator (même règle qu'agent_pause.py).
+    if getattr(args, "expect_reason", None) is not None:
         print("ameesh resume: --expect-reason requires --operator", file=sys.stderr)
         return 1
     try:
@@ -1573,6 +1576,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_pause.add_argument("agent")
     p_pause.add_argument("--reason", required=True)
     p_pause.add_argument("--human", default=None, help="local human (same as ameesh serve)")
+    p_pause.add_argument("--not-after", type=float, default=None, metavar="EPOCH",
+                         help="deadline (epoch) after which the database refuses "
+                              "the pause; set by the drain before a remote call")
     p_pause.add_argument("--json", action="store_true")
     from . import agent_pause
     p_pause.set_defaults(func=lambda cfg, args: agent_pause.cmd_cli(cfg, args, paused=True))

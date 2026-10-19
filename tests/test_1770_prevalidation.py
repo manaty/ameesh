@@ -228,6 +228,23 @@ class ProofTest(unittest.TestCase):
                 # la part fautive est nommée avec le statut observé
                 self.assertIn("psycopg:2", " ".join(rapport["detail"]))
 
+    def test_les_tests_en_echec_sont_nommes(self):
+        """#2644 : le refus nommé porte le test en échec, pas seulement la part."""
+        flow = "\n".join([
+            pv.PART_MARK + "psycopg:1",
+            json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "test",
+                        "part": "psycopg:1", "module": "test_a",
+                        "test": "tests.test_a.C.test_rouge", "statut": "echec"}),
+            json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "fin",
+                        "part": "psycopg:1", "statut": "echec", "duree_s": 1.0}),
+        ])
+        rapport = self.sel.proof(lot=7, host="vm", run={"outcome": "green", "exit": 0},
+                                 flow=pv.parse_flow(flow))
+        self.assertFalse(rapport["ok"])
+        self.assertIn("run-red", rapport["causes"])
+        self.assertEqual(rapport["failed"], ["tests.test_a.C.test_rouge"])
+        self.assertIn("tests.test_a.C.test_rouge", " ".join(rapport["detail"]))
+
     def test_run_rouge_de_loffload_refuse(self):
         rapport = self.sel.proof(lot=7, host="vm", run={"outcome": "run-red", "exit": 1},
                                  flow=self.flow)
@@ -499,6 +516,17 @@ class HostTest(unittest.TestCase):
     def test_vm_agents_acceptee(self):
         ok, cause = pv.host_allowed("vm-agents-1", local="pc-smichea")
         self.assertTrue(ok, cause)
+
+    def test_hote_local_declare_au_canon_est_une_vm(self):
+        # Décision pilote 19/10 06:03 (#2644) : l'hôte local déclaré au canon
+        # est une VM d'agents ; un poste local non déclaré reste refusé.
+        ok, cause = pv.host_allowed("ameesh-agents-1", local="ameesh-agents-1",
+                                    declared=("ameesh-agents-1",))
+        self.assertTrue(ok, cause)
+        ok, cause = pv.host_allowed("ameesh-agents-1", local="ameesh-agents-1",
+                                    declared=("ameesh-agents-2",))
+        self.assertFalse(ok)
+        self.assertEqual(cause, "no-vm")
 
 
 if __name__ == "__main__":

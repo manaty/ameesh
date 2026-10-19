@@ -13,7 +13,7 @@ import math
 import threading
 import time
 import uuid
-from dataclasses import asdict, replace
+from dataclasses import replace
 
 from . import (merge_queue, radar, resolutions, storage, train, train_admissions,
                train_candidates, train_ci, train_fire, train_git, train_history,
@@ -109,7 +109,7 @@ class Passage:
             raise train.TrainError("explicit qualified packet reservation required")
         return self.reservation.bind(db, self.project,
             merge_queue._remote_branch(self.project.target), self.owner,
-            train.digest([asdict(workflow) for workflow in self.workflows]))
+            train_ci.contract_digest(self.workflows))
 
     def maintain(self, db, now):
         self.maintenance_at = self.reservation_ledger(db).maintain(now)
@@ -169,10 +169,14 @@ class Passage:
             raise train.TrainError("explicit compiled packet merge policy required") from exc
         policy = replace(self.policy, schedule=rules)
         requirement = train_policy.Compiled(rules)
-        ci = train_ci.GitHub(radar.github_slug(self.project), self.workflows)
+        # #2503: a dynamic contract resolves the due parts in the private
+        # clone, against the plan's base and head; a static contract ignores
+        # the path and the proof cache.
+        directory = self.repository_path()
+        ci = train_ci.GitHub(radar.github_slug(self.project), self.workflows,
+                             repo=directory, cache=train_ci.parts_cache(self.cfg))
         # The radar, another target, and another runner may all replay merges
         # concurrently. They must never reset this passage's worktree.
-        directory = self.repository_path()
         clone = resolutions.Replayer(self.project.repo, directory, script=None)
         transports = (None if self.transports is None else
                       lambda **context: self.transports(db, **context))
@@ -193,10 +197,32 @@ class Passage:
             preparation = train_candidates.Preparation(db, self.project,
                 repository=repository, history=history, policy=requirement)
             enrollment = train_candidates.Enrollment(preparation, admissions, initial=self.initial)
+        def prevalidate(head, base):
+            """#2644 : la prévalidation de la composition, avant publication."""
+            from . import prevalidation, prevalidation_calls
+            try:
+                result = prevalidation_calls.gate_train(
+                    self.cfg, repo=clone.path, head=head, base=base,
+                    canon_repo=self.policy_path, canon_commit=self.policy_commit,
+                    project=self.project.name,
+                    repo_slug=radar.github_slug(self.project), say=self.notify)
+            except prevalidation.PrevalidationError as exc:
+                if exc.cause == "run-red":
+                    # Un rouge exécuté n'est pas une publication incertaine :
+                    # l'Engine l'arrête (paused, réservation rendue).
+                    raise train.PrevalidationRed(exc.why or "prevalidation red") from exc
+                raise train.TrainError(
+                    "prevalidation refused (%s): %s"
+                    % (exc.cause, exc.why or "")) from exc
+            if result.get("state") == "unavailable":
+                self.notify("prévalidation indisponible, publication maintenue: %s"
+                            % (result.get("why") or result.get("cause") or "?"), result)
+            return result
+
         return train_runtime.Runtime(ledger=ledger, repository=repository, ci=ci,
             fires=authority, admissions=admissions,
             target=target, policy=policy, notify=self.notify, inventory=inventory,
-            enrollment=enrollment, migrations=migrations)
+            enrollment=enrollment, migrations=migrations, prevalidation=prevalidate)
 
     def step(self, db, now):
         """One bounded event/pass; never wait for CI and never retain ``db``."""

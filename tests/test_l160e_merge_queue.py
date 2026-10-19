@@ -20,7 +20,7 @@ import unittest
 from unittest import mock
 
 from ameesh import (lot_class, mail, merge_queue, packet_guard, plan_git, plan_github, radar,
-                    resolutions, storage, work)
+                    registry, resolutions, review_lot, storage, work)
 
 from .support import PgTestCase
 from .test_l160b_radar import LOTS, MIG, _git, _write, git_env, make_repo
@@ -143,11 +143,14 @@ class _Base(unittest.TestCase):
         store = mock.Mock(work=self.fake)
         patches = [mock.patch.object(storage, "of", return_value=store),
                    mock.patch.object(work, "get",
-                                     side_effect=lambda db, n: self.fake.lots.get(n)),
+                                     side_effect=lambda db, n, **_: self.fake.lots.get(n)),
                    mock.patch.object(work, "milestones",
                                      side_effect=lambda db, n, *a: self.marks.get(n, [])),
+                   # #2664 : banc sans canon ; familles compilées épinglées.
+                   mock.patch.object(review_lot, "compiled_families",
+                                     return_value=("claude", "codex", "deepseek")),
                    mock.patch.object(merge_queue, "actor_family",
-                                     side_effect=lambda db, n: self.FAMILIES.get(
+                                     side_effect=lambda db, n, **_: self.FAMILIES.get(
                                          str(n or "").strip(), ""))]
         if getattr(self, "PACKET_GUARD", True):
             # #2333 : ces bancs sans base simulent la mécanique de file ; la
@@ -816,7 +819,7 @@ class ClassOfFreshTargetGitTest(unittest.TestCase):
         self.row, self.marks = {}, []
         for obj, name, kwargs in (
                 (work, "configured_canons", {"return_value": [self.canon()]}),
-                (work, "get", {"side_effect": lambda db, n: self.row}),
+                (work, "get", {"side_effect": lambda db, n, **_: self.row}),
                 (work, "milestones", {"side_effect": lambda db, n, *a: self.marks})):
             patcher = mock.patch.object(obj, name, **kwargs)
             patcher.start()
@@ -1454,7 +1457,7 @@ class QueueWithoutRadarTest(PgTestCase):
                 mock.patch.object(radar, "github_ci",
                                   return_value=lambda branch: dict(status)), \
                 mock.patch.object(merge_queue, "actor_family",
-                                  side_effect=lambda db, n: {
+                                  side_effect=lambda db, n, **_: {
                                       "a1": "deepseek", "rev1": "codex",
                                       "rev2": "claude"}.get(str(n or "").strip(), "")), \
                 mock.patch.object(merge_queue.tempfile, "mkdtemp", side_effect=record):
@@ -1480,6 +1483,22 @@ class QueueWithoutRadarTest(PgTestCase):
         self.addCleanup(shutil.rmtree, scratch, True)
         self.assertTrue(os.path.isdir(scratch))
         self.assertEqual(os.path.dirname(clone.path), scratch)
+
+
+class ActorFamilyReadTest(unittest.TestCase):
+    """#2521 : lecture du registre impossible ≠ famille inconnue."""
+
+    def test_an_unknown_agent_is_an_unknown_family(self):
+        with mock.patch.object(registry, "get", return_value=None):
+            self.assertEqual(merge_queue.actor_family(None, "ghost"), "")
+
+    def test_an_unreadable_registry_raises_a_read_error(self):
+        with mock.patch.object(
+                registry, "get",
+                side_effect=RuntimeError('column "aliases" does not exist')):
+            with self.assertRaises(merge_queue.RegistryReadError) as caught:
+                merge_queue.actor_family(None, "author")
+        self.assertIn("aliases", str(caught.exception))
 
 
 if __name__ == "__main__":

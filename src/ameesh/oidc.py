@@ -64,6 +64,10 @@ from dataclasses import dataclass, field
 ALLOWED_ALGS = ("RS256", "ES256")
 DEFAULT_LEEWAY_S = 60
 JWKS_TTL_S = 3600
+#: #1854 N2 : une clé inconnue déclenche une relecture du JWKS (rotation), mais
+#: au plus une fois par fenêtre et par émetteur — un flux de jetons à `kid`
+#: inconnu ne peut plus provoquer une requête réseau par jeton.
+JWKS_REFRESH_MIN_S = 30.0
 RSA_MIN_BITS = 2048
 
 
@@ -260,20 +264,41 @@ def _fetch_json(url: str, timeout: float = 10.0) -> dict:
         final = resp.geturl()
         if not _issuer_ok(final) or not _redirect_ok(url, final):
             raise OidcError("réponse obtenue hors du schéma autorisé : %s" % final)
-        return json.loads(resp.read(1_000_000))
+        raw = resp.read(1_000_000)
+    try:
+        return json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        # #1854 N3 : un JSON tronqué ou invalide est un refus nommé, jamais un
+        # JSONDecodeError qui s'échappe du contrat OidcError.
+        raise OidcError("réponse JSON invalide : %s" % exc) from None
 
 
 @dataclass
 class KeyCache:
     fetch: object = None                # url → dict (injectable pour les essais)
     ttl_s: float = JWKS_TTL_S
+    refresh_min_s: float = JWKS_REFRESH_MIN_S
     _keys: dict = field(default_factory=dict)    # issuer → (expire_at, {kid: jwk})
+    _refreshed_at: dict = field(default_factory=dict)  # issuer → dernier refresh forcé
 
     def keys(self, issuer: str, *, refresh: bool = False, now: float | None = None) -> dict:
         now = time.time() if now is None else now
         cached = self._keys.get(issuer)
-        if cached and cached[0] > now and not refresh:
+        if cached and not refresh and cached[0] > now:
             return cached[1]
+        if refresh and cached:
+            last = self._refreshed_at.get(issuer)
+            if last is not None and now - last < self.refresh_min_s:
+                # #1854 N2 : la relecture de rotation a déjà été tentée dans la
+                # fenêtre ; un `kid` inconnu ne relance pas le réseau à chaque jeton.
+                return cached[1]
+        if refresh:
+            # #1854 (relecture après fusion) : la TENTATIVE compte dans la
+            # fenêtre, même si la découverte ou le JWKS échoue ; sans cela, chaque
+            # jeton à `kid` inconnu relançait la paire de requêtes. Le premier
+            # échec reste rendu à l'appelant ; les suivants rendent le cache
+            # (fail closed, le `kid` demeure inconnu).
+            self._refreshed_at[issuer] = now
         fetch = self.fetch or _fetch_json
         discovery = fetch(issuer + "/.well-known/openid-configuration")
         if not isinstance(discovery, dict) or discovery.get("issuer") != issuer:
@@ -284,7 +309,17 @@ class KeyCache:
         jwks = fetch(jwks_uri)
         if not isinstance(jwks, dict) or not isinstance(jwks.get("keys"), list):
             raise OidcError("JWKS : `keys` doit être une liste")
-        found = {k.get("kid", ""): k for k in jwks["keys"] if isinstance(k, dict)}
+        found = {}
+        for cle in jwks["keys"]:
+            if not isinstance(cle, dict):
+                continue
+            kid = cle.get("kid", "")
+            if not isinstance(kid, str):
+                # #1854 N1 : un `kid` non chaîne (liste, objet) n'est pas
+                # sélectionnable par un jeton ; il est ignoré sans faire tomber
+                # la sélection des clés saines (fail closed pour cette clé).
+                continue
+            found[kid] = cle
         self._keys[issuer] = (now + self.ttl_s, found)
         return found
 
@@ -313,6 +348,10 @@ def verify(token: str, provider: Provider, *, cache: KeyCache | None = None,
     if header.get("alg") not in ALLOWED_ALGS:
         raise OidcError("algorithme refusé : %r (%s)" % (header.get("alg"), ", ".join(ALLOWED_ALGS)))
     kid = header.get("kid", "")
+    if not isinstance(kid, str):
+        # #1854 N1 : un `kid` de forme invalide est un refus nommé, pas un
+        # TypeError à la sélection (une liste ou un objet n'est pas hachable).
+        raise OidcError("identifiant de clé (kid) de forme invalide dans l'en-tête")
     keys = cache.keys(provider.issuer, now=now)
     if kid not in keys:                         # rotation des clés du fournisseur
         keys = cache.keys(provider.issuer, refresh=True, now=now)

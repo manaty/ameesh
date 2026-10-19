@@ -5,7 +5,10 @@ from __future__ import annotations
 import datetime
 import os
 import re
+import subprocess
+import tempfile
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -15,6 +18,109 @@ from ameesh import work_dependencies as D
 from ameesh.storage import interface as SI
 from ameesh.storage.postgres.progress import Progress
 from tests.support import PgTestCase
+
+
+class PacketTrailersTest(unittest.TestCase):
+    """#2599 : l'appartenance d'un porteur se lit aussi dans les trailers.
+
+    Le corps du porteur peut manquer la liste « #N <tête> » ; chaque commit
+    de composition porte `ameesh-work: <lot>`. On ne lit que les commits
+    au-dessus de la cible, jamais ceux hérités de `main`."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = self.tmp.name
+        self.git("init", "-q", "-b", "main")
+        self.write("README", "base\n")
+        self.git("add", "README")
+        self.git("commit", "-q", "-m", "base")
+
+    def git(self, *args):
+        return subprocess.run(
+            ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+             *args], cwd=self.repo, check=True, capture_output=True, text=True,
+            env=dict(os.environ, GIT_CONFIG_NOSYSTEM="1", HOME=self.repo)).stdout
+
+    def write(self, name, text):
+        with open(os.path.join(self.repo, name), "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def commit(self, message):
+        self.write("note", message + "\n")
+        self.git("add", "note")
+        self.git("commit", "-q", "-m", message)
+
+    def packet_branch(self):
+        """Une cible, un trailer hérité, puis une branche de porteur."""
+        self.commit("vehicule 2200 : #9999 abcdef0\n\nameesh-work: 9999")
+        self.git("checkout", "-q", "-b", "integration/paquet-test")
+        self.commit("vehicule 2300 : #1234 abcdef0\n\nameesh-work: 1234")
+        self.commit("vehicule 2300 : #5678 abcdef0\n\nameesh-work: 5678")
+        # un lot cité en prose, sans trailer, n'est pas une unité
+        self.commit("paquet ; #2203 exclu, #1976 admis mais exclu")
+        return self.git("rev-parse", "HEAD").strip()
+
+    def test_reads_the_trailers_above_the_target(self):
+        head = self.packet_branch()
+        carrier = {"branch": "integration/paquet-test", "branch_head": head}
+        self.assertEqual(W.packet_trailers(self.repo, carrier, "main"), {1234, 5678})
+        # la tête observée reste lisible quand la branche locale a disparu
+        self.git("checkout", "-q", "main")
+        self.git("branch", "-q", "-D", "integration/paquet-test")
+        self.assertEqual(W.packet_trailers(self.repo, carrier, "main"), {1234, 5678})
+
+    def test_an_unreadable_branch_is_not_a_membership(self):
+        self.assertIsNone(W.packet_trailers(
+            self.repo, {"branch": "integration/absente"}, "main"))
+
+    def test_published_target_excludes_history_when_local_main_is_stale(self):
+        head = self.packet_branch()
+        self.git("remote", "add", "origin", self.repo)
+        self.git("update-ref", "refs/remotes/origin/main", "main")
+        # Le clone partagé a fetché main sans déplacer sa branche locale.
+        self.git("branch", "-f", "main", "main~1")
+        carrier = {"branch": "integration/paquet-test", "branch_head": head}
+        self.assertEqual(W.packet_trailers(self.repo, carrier, "main"), {1234, 5678})
+
+    def test_published_carrier_excludes_units_dropped_since_local_branch(self):
+        head = self.packet_branch()
+        self.git("remote", "add", "origin", self.repo)
+        self.git("checkout", "-q", "-b", "recomposed", "main")
+        self.commit("vehicule : #5678 abcdef0\n\nameesh-work: 5678")
+        self.git("update-ref", "refs/remotes/origin/integration/paquet-test", "HEAD")
+        carrier = {"branch": "integration/paquet-test", "branch_head": head}
+        self.assertEqual(W.packet_trailers(self.repo, carrier, "main"), {5678})
+
+    def test_attachments_come_from_the_project_repo(self):
+        head = self.packet_branch()
+        cfg = types.SimpleNamespace(radar={"projects": {
+            "ameesh": {"repo": self.repo, "target": "main"}}})
+        carrier = {"id": 9001, "state": "qa", "app": "ameesh",
+                   "branch": "integration/paquet-test", "branch_head": head}
+        self.assertEqual(W.packet_attachments(cfg, [carrier]),
+                         {9001: {1234, 5678}})
+
+    def test_without_a_project_repo_nothing_is_attached(self):
+        carrier = {"id": 9001, "state": "qa", "app": "ameesh",
+                   "branch": "integration/paquet-test"}
+        self.assertEqual(W.packet_attachments(None, [carrier]), {})
+        self.assertEqual(W.packet_attachments(types.SimpleNamespace(radar={}), [carrier]), {})
+
+    def test_the_dry_pass_is_not_read(self):
+        # la passe à blanc de db.batched ne fait aucune I/O (même règle que
+        # la sonde pgbouncer, #2582)
+        from ameesh import db as db_mod
+
+        self.assertTrue(W._dry_pass(mock.Mock(spec=db_mod._Recorder)))
+        self.assertFalse(W._dry_pass(object()))
+
+    def test_prose_only_is_not_an_attached_unit(self):
+        rows = [{"id": 1234, "state": "qa"}, {"id": 2203, "state": "qa"}]
+        carrier = {"id": 9001, "state": "qa", "branch": "integration/paquet-test",
+                   "body": "paquet ; #2203 exclu (verdict manquant)"}
+        waits = W.packet_waits(rows, rows + [carrier], attachments={9001: {1234}})
+        self.assertEqual(list(waits), [1234])
 
 
 class UnitTest(unittest.TestCase):

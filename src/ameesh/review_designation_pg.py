@@ -5,8 +5,10 @@
 real `Port`: it reads the lot's milestones, re-reads the idempotent mark of the
 freeze and writes the designation in **one** transaction (lock of the lot row,
 mark in the journal, mails in the mailbox). A reviewer mail is a `request`
-linked to the lot (#2478): the reviewer's runner opens a turn on it; the
-capacity notification to the pilot stays a `notify`. The readable thread is
+linked to the lot (#2478): the reviewer's runner opens a turn on it, once
+per head (#2495: a reviewer already holding a request for this head, or an
+unread one naming none, gets no second mail); the capacity notification to the
+pilot stays a `notify`. The readable thread is
 written only after the commit (`mail.send(..., after_commit=…)`, pattern #315
 of `deep_analysis`): a cancelled send leaves no trace in the external thread.
 
@@ -21,11 +23,18 @@ Two uses, depending on who holds the transaction:
 
 The mark is a row of the lot journal, prefixed by the lot and the milestone:
 `review-designation:<lot>:<freeze>: {json}`. It carries the state, the required
-number, the reviewers, the exact SHA and the authors of the frozen content;
-`recorded` re-reads it as-is, so the same freeze replayed returns the recorded
+number, the reviewers, the exact SHA, the authors of the frozen content and the
+mails it deposited (`sent`); `recorded` re-reads it as-is, so the same freeze
+replayed returns the recorded
 designation without a second mail. A new freeze is another mark: the old one no
 longer counts, and the port refuses to write for a freeze that is no longer the
-latest (`StaleFreeze`) — no return to an old head.
+latest (`StaleFreeze`) — no return to an old head. A **forced** replay (#2487)
+writes a newer mark over a reported one, but still checks what already left for
+the same freeze: a review request or waiting notice already deposited is not
+sent again (#2541). That evidence is durable: the mark records the mails it
+deposited, the journal is not purged with the mailbox, and recipients are
+compared as primary names, so an alias matches the resolved name the mailbox
+holds (#2557).
 """
 from __future__ import annotations
 
@@ -33,7 +42,8 @@ import json
 from typing import Mapping, Optional, Sequence
 
 from . import mail, plan_git, registry, storage
-from .review_designation import DESIGNATED, WAITING, DesignationError, StaleFreeze
+from .review_designation import (DESIGNATED, REQUEST_KIND, WAITING,
+                                 DesignationError, StaleFreeze, covering_request)
 
 #: prefix of the journal marks: `<prefix><lot>:<milestone>: <json>`
 MARK_PREFIX = "review-designation:"
@@ -74,7 +84,8 @@ def designation_of(note: str) -> Optional[dict]:
 
 
 def _mark_note(lot: int, freeze_id: int, *, state: str, required: int, reviewers,
-               missing: int, why: str, authors, policy_ref: str, sha: str) -> str:
+               missing: int, why: str, authors, policy_ref: str, sha: str,
+               sent=()) -> str:
     payload = {
         "state": state,
         "required": int(required),
@@ -88,6 +99,13 @@ def _mark_note(lot: int, freeze_id: int, *, state: str, required: int, reviewers
                      "family": str((a or {}).get("family") or "")}
                     for a in authors or ()],
         "policy_ref": str(policy_ref or ""),
+        # #2557 : les courriels réellement déposés pour ce gel, en noms
+        # primaires. La marque est écrite dans la même transaction qu'eux et
+        # survit à une purge de la boîte ; c'est la preuve durable du rejeu.
+        "sent": [{"to": str((s or {}).get("to") or ""),
+                  "kind": str((s or {}).get("kind") or "notify"),
+                  "capacity": bool((s or {}).get("capacity"))}
+                 for s in sent or ()],
     }
     return "%s %s" % (mark_prefix(lot, freeze_id),
                       json.dumps(payload, ensure_ascii=False, sort_keys=True))
@@ -106,6 +124,135 @@ def _designation(lot: int, freeze_id: int, *, state: str, required: int, reviewe
         "authors": [dict(a) for a in authors or ()],
         "policy_ref": str(policy_ref or ""),
     }
+
+
+def _primary_name(db, name: str, cache: Optional[dict] = None) -> str:
+    """Le nom primaire d'un destinataire, alias résolu (#2557).
+
+    `mail.send` range déjà le nom primaire dans la boîte ; la lecture du rejeu
+    doit donc comparer des noms primaires, pas des orthographes. Un nom inconnu
+    reste inchangé, comme dans `agent_names.resolve`."""
+    text = str(name or "").strip()
+    if not text:
+        return ""
+    if cache is not None and text in cache:
+        return cache[text]
+    from .agent_names import resolve as resolve_agent_name
+    primary = str(resolve_agent_name(
+        text, db=db, operation="review_designation.mailbox") or text)
+    if cache is not None:
+        cache[text] = primary
+    return primary
+
+
+def _designation_payload(payload) -> dict:
+    """La charge `review_designation` d'un courrier (objet JSON ou texte)."""
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            return {}
+    found = (payload or {}).get("review_designation") if isinstance(payload, dict) else None
+    return found if isinstance(found, dict) else {}
+
+
+def _sent_review_mails(db, lot: int, freeze_id: int, *, since_ts: float,
+                       cache: Optional[dict] = None) -> tuple:
+    """Les courriels de désignation déjà partis pour CE gel (#2541, #2557).
+
+    Rend `(destinataires des demandes de relecture, destinataires de l'avis
+    d'attente)`, en noms **primaires**. Deux preuves sont lues :
+
+    - la **marque du gel** au journal (`review-designation:…`) : elle est écrite
+      dans la même transaction que les courriels et le journal n'est pas purgé
+      avec la boîte. Les marques récentes portent la liste `sent` des courriels
+      réellement déposés ; une marque `designated` plus ancienne prouve à elle
+      seule que les demandes de ses relecteurs sont parties (un destinataire
+      inconnu la transformerait en `waiting`, et un envoi en échec annule la
+      transaction avec elle) ;
+    - la **boîte** (`agent_mailbox`) pour les marques antérieures à #2557 et
+      pour l'avis d'attente d'une ancienne marque `waiting`, qui ne nomme pas
+      son destinataire.
+
+    Le rejeu forcé écrit une marque plus récente, mais un second réveil du même
+    relecteur ou une seconde alerte de capacité ne sont pas des faits nouveaux.
+    """
+    cache = {} if cache is None else cache
+    requests: set = set()
+    waiting: set = set()
+
+    def add(recipient, *, request: bool = False, capacity: bool = False) -> None:
+        primary = _primary_name(db, recipient, cache)
+        if not primary:
+            return
+        if request:
+            requests.add(primary)
+        elif capacity:
+            waiting.add(primary)
+
+    # 1. les marques du gel : preuve durable, indépendante de la boîte.
+    marks = storage.of(db).work.events_noted(
+        mark_prefix(lot, freeze_id), float(since_ts), ids=[int(lot)])
+    for row in marks or ():
+        noted = designation_of((row or {}).get("note"))
+        if noted is None:
+            continue
+        if int((noted.get("freeze") or {}).get("id") or 0) != int(freeze_id):
+            continue
+        for entry in noted.get("sent") or ():
+            if not isinstance(entry, Mapping):
+                continue
+            add(entry.get("to"),
+                request=str(entry.get("kind") or "") == "request",
+                capacity=bool(entry.get("capacity")))
+        if noted.get("state") == DESIGNATED:
+            # Une marque `designated` n'est écrite qu'une fois toutes les
+            # demandes déposées : elle prouve leurs destinataires même sans
+            # liste `sent` (marques d'avant #2557).
+            for reviewer in noted.get("reviewers") or ():
+                add((reviewer or {}).get("name"), request=True)
+
+    # 2. la boîte : preuve des marques antérieures à #2557, et de l'avis
+    # d'attente d'une marque `waiting` qui ne nomme pas son destinataire.
+    rows = db.query(
+        "SELECT recipient, kind, payload FROM agent_mailbox"
+        " WHERE work_item_id = %s"
+        "   AND payload->'review_designation'->>'freeze' = %s"
+        " ORDER BY id",
+        (str(int(lot)), str(int(freeze_id))))
+    for row in rows or ():
+        designation = _designation_payload((row or {}).get("payload"))
+        if str(designation.get("freeze")) != str(int(freeze_id)):
+            continue
+        if str((row or {}).get("kind") or "") == "request":
+            add((row or {}).get("recipient"), request=True)
+        elif str(designation.get("state") or "") == WAITING:
+            add((row or {}).get("recipient"), capacity=True)
+    return requests, waiting
+
+
+def _canonical_messages(db, messages, cache: Optional[dict] = None) -> list:
+    """Les courriels du port avec leur destinataire en nom primaire (#2557)."""
+    cache = {} if cache is None else cache
+    out = []
+    for message in messages or ():
+        row = dict(message or {})
+        row["to"] = _primary_name(db, row.get("to"), cache)
+        out.append(row)
+    return out
+
+
+def _already_sent(message: Mapping, sent: tuple) -> bool:
+    """Ce courrier du rejeu est-il déjà parti pour le même gel (#2541) ?
+
+    `message["to"]` est déjà un nom primaire (`_canonical_messages`)."""
+    recipient = str((message or {}).get("to") or "").strip()
+    if not recipient:
+        return False
+    requests, waiting = sent
+    if str((message or {}).get("kind") or "") == "request":
+        return recipient in requests
+    return bool((message or {}).get("capacity")) and recipient in waiting
 
 
 def _nested_transaction(db) -> bool:
@@ -204,7 +351,8 @@ class PgPort:
     def commit(self, lot: int, *, freeze: Mapping, required: int, state: str,
                reviewers: Sequence[Mapping], missing: int, why: str,
                authors: Sequence[Mapping] = (), policy_ref: str = "",
-               notify: str = "", messages: Sequence[Mapping] = ()) -> dict:
+               notify: str = "", messages: Sequence[Mapping] = (),
+               force: bool = False) -> dict:
         """Writes the freeze's designation in one transaction and returns its shape.
 
         Under the lock of the lot row: rechecks that `freeze` is still the
@@ -213,14 +361,20 @@ class PgPort:
         designation, without a second mail), deposits the mails then the mark —
         all in the same transaction. A designation is final for its freeze; a
         waiting state is retryable and its notification leaves only once per
-        freeze."""
+        freeze. `force` (#2487) writes a new mark even when the freeze already
+        has one (a forced selection after a refused carry must supersede the
+        reported mark); the caller uses it only for an explicit replay. That
+        replay does not send a request or a waiting notice already deposited
+        for the same freeze (#2541): the port filters them on the freeze's
+        marks and the mailbox, with primary names, so a purge or an alias does
+        not make a mail leave twice (#2557)."""
         lot = int(lot)
         if self.after_commit is not None:
             return self._write(self.db, lot, freeze=freeze, required=required,
                                state=state, reviewers=reviewers, missing=missing,
                                why=why, authors=authors, policy_ref=policy_ref,
                                notify=notify, messages=messages,
-                               hook=self.at_freeze)
+                               hook=self.at_freeze, force=force)
         threads: list = []
         inner = PgPort(self.db, sender=self.sender, after_commit=threads)
         with self.db.transaction() as tx:
@@ -237,7 +391,7 @@ class PgPort:
             out = inner._write(tx, lot, freeze=freeze, required=required, state=state,
                                reviewers=reviewers, missing=missing, why=why,
                                authors=authors, policy_ref=policy_ref, notify=notify,
-                               messages=messages, hook=False)
+                               messages=messages, hook=False, force=force)
         # the external thread only after the commit: a cancelled send leaves nothing
         for record in threads:
             record(self.db.cfg, self.db)
@@ -245,7 +399,8 @@ class PgPort:
 
     def _write(self, db, lot: int, *, freeze: Mapping, required: int, state: str,
                reviewers: Sequence[Mapping], missing: int, why: str, authors,
-               policy_ref: str, notify: str, messages, hook: bool) -> dict:
+               policy_ref: str, notify: str, messages, hook: bool,
+               force: bool = False) -> dict:
         freeze = dict(freeze or {})
         sha = str(freeze.get("sha") or "").strip().lower()
         try:
@@ -271,7 +426,22 @@ class PgPort:
             raise DesignationError("a designated review names its reviewers")
         if state == WAITING and reviewers:
             raise DesignationError("a waiting designation designates no reviewer")
-        messages = [dict(message or {}) for message in messages or ()]
+        names: dict = {}
+        messages = _canonical_messages(
+            db, [dict(message or {}) for message in messages or ()], names)
+        if force:
+            # #2541/#2557 : le rejeu forcé écrit une marque plus récente, mais
+            # ne renvoie pas les demandes de relecture ni l'avis d'attente déjà
+            # partis pour ce gel. Le filtre lit la marque du gel (preuve
+            # durable, survit à une purge de la boîte) et la boîte, avec des
+            # noms primaires (un alias ne fait pas repartir un doublon). Il
+            # précède le contrôle des destinataires : un courrier déjà déposé
+            # n'a plus à être validé.
+            sent = _sent_review_mails(
+                db, lot, freeze_id, since_ts=float(last.get("at_ts") or 0.0),
+                cache=names)
+            messages = [message for message in messages
+                        if not _already_sent(message, sent)]
         undelivered = []
         for row in messages:
             recipient = str(row.get("to") or "").strip()
@@ -302,12 +472,13 @@ class PgPort:
             if state == DESIGNATED:
                 state, reviewers, missing = WAITING, [], int(required)
             messages = []
-        existing = self._recorded_in(db, lot, freeze_id,
-                                     since_ts=float(last.get("at_ts") or 0.0))
+        existing = None if force else self._recorded_in(
+            db, lot, freeze_id, since_ts=float(last.get("at_ts") or 0.0))
         # A designation is final; a waiting state is not rewritten (a single
         # notification per freeze) but **yields** to the designation when
         # capacity comes back: it is the same freeze, the following mark
-        # prevails.
+        # prevails. A forced replay writes a newer mark even over a final one:
+        # the caller is an explicit recovery after a refused carry (#2487).
         if existing is not None and (existing.get("state") == DESIGNATED
                                      or state == WAITING):
             return existing
@@ -317,8 +488,17 @@ class PgPort:
                      "aucun relecteur prévenu ; relancer la désignation hors hook avec un "
                      "destinataire du registre." % (freeze_id, what), self.sender)
         threads = self.after_commit if self.after_commit is not None else []
+        deposited = []
         for row in messages:
             recipient = str(row.get("to") or "").strip()
+            if (str(row.get("kind") or "") == REQUEST_KIND
+                    and covering_request(mail.review_requests(db, recipient, lot),
+                                         lot=lot, reviewer=recipient, sha=sha)):
+                # #2495/#2504 : this reviewer already holds a request for this
+                # head (or an unread one naming none): the designation is
+                # written, no second mail. The requests are selected per lot in
+                # storage, so an old one cannot fall out of a history window.
+                continue
             mail.send(db, self.sender, recipient, str(row.get("body") or ""),
                       kind=str(row.get("kind") or "notify"),
                       work_item_id=str(lot),
@@ -327,10 +507,16 @@ class PgPort:
                           "required": int(required), "state": state,
                           "reviewer": str(row.get("family") or "")}},
                       after_commit=threads)
+            # #2557 : la marque porte les courriels réellement déposés ; le
+            # rejeu forcé les relit même si la boîte a été purgée.
+            deposited.append({"to": recipient,
+                              "kind": str(row.get("kind") or "notify"),
+                              "capacity": bool(row.get("capacity"))})
         ops.note(lot, str(rows[0].get("state") or ""),
                  _mark_note(lot, freeze_id, state=state, required=required,
                             reviewers=reviewers, missing=missing, why=why,
-                            authors=authors, policy_ref=policy_ref, sha=sha),
+                            authors=authors, policy_ref=policy_ref, sha=sha,
+                            sent=deposited),
                  self.sender)
         return _designation(lot, freeze_id, state=state, required=required,
                             reviewers=reviewers, missing=missing, why=why,

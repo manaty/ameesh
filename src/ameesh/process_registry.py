@@ -546,6 +546,7 @@ def _lock_lot(tx: Any, work_item_id: int) -> Mapping[str, Any]:
     rows = tx.query(
         "SELECT w.id, w.state, w.assignee, w.type, w.app, w.workstream, w.loops,"
         "       w.title, w.closed_at, w.migration, w.migration_repo,"
+        "       to_regclass('work_migration_reservations') IS NOT NULL AS migration_slots,"
         "       coalesce(to_jsonb(w)->>'reviewer', '') AS reviewer,"
         "       w.workflow_ref, w.workflow_stage, w.workflow_version"
         "  FROM work_items w WHERE w.id = %s FOR UPDATE",
@@ -1036,17 +1037,33 @@ def _release_migration(tx: Any, command: Command, row: Mapping[str, Any],
     line, written before the receipt so that `Receipt.version` stays the last
     id of the lot journal.
     """
-    number = row.get("migration")
-    if number is None:
+    numbers = set()
+    if row.get("migration") is not None:
+        numbers.add(int(row["migration"]))
+    if row.get("migration_slots"):
+        numbers.update(int(slot["number"]) for slot in tx.query(
+            "SELECT number FROM work_migration_reservations"
+            " WHERE work_item_id = %s AND status = 'reserved' ORDER BY number",
+            (int(command.work_item_id),)))
+    if not numbers:
         return
+    if row.get("migration_slots"):
+        tx.execute(
+            "UPDATE work_migration_reservations SET status = 'released',"
+            "       updated_at = now()"
+            " WHERE work_item_id = %s AND status = 'reserved'",
+            (int(command.work_item_id),))
     tx.execute(
         "UPDATE work_items SET migration = NULL, migration_repo = NULL,"
         "       updated_at = now() WHERE id = %s", (int(command.work_item_id),))
+    ordered = sorted(numbers)
+    what = ("migration %s" % ordered[0] if len(ordered) == 1
+            else "migrations %s" % ", ".join(str(number) for number in ordered))
     tx.execute(
         "INSERT INTO work_item_events (work_item_id, state, note, actor)"
         " VALUES (%s, %s, %s, %s)",
         (int(command.work_item_id), state,
-         "migration %s released (state %s, #956)" % (number, state),
+         "%s released (state %s, #956)" % (what, state),
          command.authority.actor))
 
 
@@ -1390,8 +1407,14 @@ def read_sources(context: VerificationContext) -> dict[str, Any]:
          "sha": str(row["sha"] or ""), "verdict": row["verdict"],
          "note": str(row["note"] or ""), "actor": str(row["actor"] or "")}
         for row in db.query(
+            # #2317 (N5) : un jalon `merged` annulé par une correction
+            # `merged → build` n'est plus une révision livrée ; il ne doit ni
+            # servir de `merged_of` ni de `revision_of` (fonction 0463).
             "SELECT id, kind, sha, verdict, note, actor FROM work_item_milestones"
-            " WHERE work_item_id = %s ORDER BY id", (item_id,))]
+            " WHERE work_item_id = %s"
+            "   AND (kind <> 'merged'"
+            "        OR NOT agent_mesh_merged_annulled(work_item_id, at))"
+            " ORDER BY id", (item_id,))]
     receipts: list[dict[str, Any]] = []
     for row in db.query(
             "SELECT id, command_id::text AS command_id, workflow_stage,"

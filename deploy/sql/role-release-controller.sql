@@ -29,7 +29,15 @@ DECLARE
     item record;
     column_right record;
     p text;
+    -- MAINTAIN only exists from PostgreSQL 17: before it, asking
+    -- has_table_privilege() for that name raises and would fail the whole
+    -- enrollment audit, so the server version builds the list.
+    privileges text[] := ARRAY['INSERT','UPDATE','DELETE','TRUNCATE','TRIGGER','REFERENCES'];
+    version_num int := current_setting('server_version_num')::int;
 BEGIN
+    IF version_num >= 170000 THEN
+        privileges := array_append(privileges, 'MAINTAIN');
+    END IF;
     SELECT * INTO r FROM pg_roles WHERE rolname=current_setting('ameesh.release_role');
     IF r.rolcanlogin OR r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolbypassrls OR r.rolreplication THEN
         RAISE EXCEPTION 'release controller group must be nonadministrative NOLOGIN';
@@ -47,7 +55,7 @@ BEGIN
     END LOOP;
     FOR item IN SELECT c.oid,c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
                  WHERE n.nspname=current_schema() AND c.relkind IN ('r','p','v','m','f') LOOP
-        FOREACH p IN ARRAY ARRAY['INSERT','UPDATE','DELETE','TRUNCATE','TRIGGER','REFERENCES','MAINTAIN'] LOOP
+        FOREACH p IN ARRAY privileges LOOP
             IF item.relname='agent_registry' AND p='UPDATE' THEN
                 -- Table UPDATE would allow turn/lease and owner-key changes;
                 -- only the metadata timestamp is admitted for row-locking.

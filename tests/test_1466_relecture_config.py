@@ -5,8 +5,8 @@ Un exécuteur gardait la configuration de son démarrage : un compte retiré,
 un plafond relevé ou un profil corrigé restaient sans effet, et des agents
 restaient en pause sur un plafond périmé. `Runner.reload_config` relit le
 fichier (et sa base héritée) dès qu'une empreinte change, applique ce que la
-décision de pause lit (comptes, plafonds, rôles critiques) et réveille les
-agents ; un fichier cassé ne remplace rien.
+décision de pause lit (comptes, plafonds, rôles critiques), le partage des
+comptes (#2571) et réveille les agents ; un fichier cassé ne remplace rien.
 """
 from __future__ import annotations
 
@@ -21,9 +21,12 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
+from ameesh import account_claims, accounts
 from ameesh import config as config_mod
 from ameesh.config import Config
 from ameesh.runner import AgentWorker, Runner
+
+from .test_l30_accounts import _dossier
 
 
 class RelectureConfigTest(unittest.TestCase):
@@ -86,6 +89,48 @@ class RelectureConfigTest(unittest.TestCase):
                                           "AMEESH_CONFIG": self.profil}):
             self.assertTrue(runner.reload_config())
         self.assertEqual(list(runner.cfg.accounts), ["claude"])
+
+    def test_le_partage_des_comptes_suit_la_relecture(self):
+        """#2571 (N1 de #313) : la politique de partage et le registre sont
+        relus comme les comptes. Un passage `report` → `strict` avec un
+        registre déplacé prend effet au tour suivant, sans redémarrer : le
+        compte revendiqué par un autre mesh passe du signalement au refus."""
+        dossier = _dossier(os.path.join(self.tmp, "claude-partage"),
+                           creds=".credentials.json")
+        ancien = os.path.join(self.tmp, "registre-ancien")
+        voisin = os.path.join(self.tmp, "registre-voisin")
+        commun = {"budget_usd_per_hour": 100,
+                  "accounts": {"claude": [{"name": "secondaire",
+                                           "path": dossier}]},
+                  "account_registry": ancien}
+        self._write(self.host, commun)
+        runner = self._runner()
+        self.assertEqual(runner.cfg.account_sharing, "report")
+        self.assertEqual(runner.cfg.account_registry, ancien)
+        # un AUTRE mesh revendique le même dossier, dans le registre voisin
+        account_claims.refresh(replace(runner.cfg, account_registry=voisin),
+                               mesh="mesh-voisin", now=time.time())
+        account_claims.remember("mesh-de-ce-test")
+        self.addCleanup(account_claims.remember, None)
+        (profil,) = accounts.profiles(runner.cfg, "claude")
+        self.assertEqual(profil.refused, "")   # report : signalé, pas refusé
+        # l'hôte passe en strict ET déplace le registre ; relecture à chaud
+        self._write(self.host, dict(commun, account_sharing="strict",
+                                    account_registry=voisin))
+        with mock.patch.dict(os.environ, {"HOME": self.home,
+                                          "AMEESH_CONFIG": self.profil}):
+            self.assertTrue(runner.reload_config())
+        self.assertEqual(runner.cfg.account_sharing, "strict")
+        self.assertEqual(runner.cfg.account_registry, voisin)
+        (profil,) = accounts.profiles(runner.cfg, "claude")
+        self.assertIn("another mesh of this host", profil.refused)
+        # #2580 : la clé d'hôte équivalente suit la même relecture
+        self._write(self.host, dict(commun, accounts_shared="refuse",
+                                    account_registry=voisin))
+        with mock.patch.dict(os.environ, {"HOME": self.home,
+                                          "AMEESH_CONFIG": self.profil}):
+            self.assertTrue(runner.reload_config())
+        self.assertEqual(account_claims.policy(runner.cfg), "refuse")
 
     def test_les_champs_figes_ne_suivent_pas_la_relecture(self):
         """R1 cx2/dev2 : recharger toute la `Config` appliquait le schéma, la
@@ -197,6 +242,7 @@ class RelectureConfigTest(unittest.TestCase):
         worker = SimpleNamespace(cfg=ancien, _cfg_pending=None,
                                  _cfg_lock=threading.Lock(), stopping=threading.Event())
         worker.ensure_watchdog = lambda: None
+        worker.ensure_peek = lambda: None  # #1349
         # #1270 (main) : process_once attend d'abord l'échéance de reprise
         worker.retry_remaining = lambda: 0.0
         worker.apply_restart_if_requested = lambda: None
