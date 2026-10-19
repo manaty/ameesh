@@ -233,9 +233,8 @@ only machine sources:
 - the **frozen diff** `merge-base(target, frozen)..frozen` and the exact
   provenance receipt (#1465) of each of its commits; an unknown commit or an
   unknown author family waits instead of proving a false independence — a
-  commit without a receipt whose declared Git author is a registry agent is
-  admitted with a `git-author` trace (#2721, see
-  `1465-preuves-par-commit.md` §6);
+  commit without a receipt is read from its committer's turn journal, with a
+  `turn-journal` trace (#2721/#2681, see `1465-preuves-par-commit.md` §6);
 - the **candidates** of the lot's project: real session family
   (`registry.live_harness`), availability and open-lot load;
 - the project's `orchestrateur` in the canon as the **capacity-alert

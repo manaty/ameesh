@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#1465 — le fournisseur exact d'origine d'un commit et d'un jalon.
 
-Contrat importable pour le qualificateur du train (#1467,
-`train_review.qualify`). Pour chaque sujet, il rend un reçu aux champs de
+Contrat importable pour le lecteur du train (#1467/#2681,
+`review_authors` et `merge_queue.review_gate`). Pour chaque sujet, il rend un reçu aux champs de
 `train_review.Receipt` — `subject`, `commit`, `actor`, `session`, `turn`,
 `harness`, `record`, `milestone` — ou `None` quand la source manque.
 
@@ -35,10 +35,6 @@ exige les deux, liés par le même aléa, et les consomme. Un objet seulement
 restauré par `reset` ou `checkout`, même committé par le même agent, ne produit
 pas de fait de création : son origine reste inconnue (écarts cx3, 15/10 04:37,
 puis B1 cx2/Codex, 15/10 12:12).
-
-La lecture brute de l'auteur Git (`declared_author`) est hors du fournisseur :
-elle ne rend jamais de reçu et n'est admise qu'avec la trace du repli **nommé**
-de la désignation au gel (#2721).
 """
 from __future__ import annotations
 
@@ -258,43 +254,6 @@ def _git(cwd: str | None, *args: str) -> str | None:
     if run.returncode != 0:
         return None
     return (run.stdout or "").strip()
-
-
-def declared_author(sha, *, cwd: str | None = None) -> dict | None:
-    """L'auteur et le committer Git déclarés d'un commit, ou None.
-
-    Ce n'est **pas** un reçu d'origine et cela ne remplace jamais
-    `receipt_for_commit` : le nom d'auteur Git est falsifiable (`git commit
-    --author`) et ne dit ni le tour ni la session. C'est la matière brute du
-    repli **nommé** de la désignation au gel (#2721), pour un commit réécrit
-    par rebase/amend — le nouveau nœud n'a pas de reçu, l'ancien le garde — ou
-    antérieur aux hooks : l'appelant n'admet le repli que si l'agent est au
-    registre, et journalise la trace `git-author`.
-
-    Rend `{"agent", "name", "email", "committer_name", "committer_email"}`
-    quand l'adresse de l'auteur est `<agent>@ameesh.invalid` (le domaine que le
-    runner pose, `identity.GIT_EMAIL_DOMAIN`) ; sinon None (adresse d'un
-    humain, d'un exécuteur relayé, ou commit illisible)."""
-    text = str(sha or "").strip().lower()
-    if not FULL_SHA.fullmatch(text):
-        return None
-    out = _git(cwd, "log", "-1", "--format=%an%x00%ae%x00%cn%x00%ce", text)
-    if out is None:
-        return None
-    fields = out.split("\0")
-    if len(fields) != 4:
-        return None
-    name, email, committer_name, committer_email = (
-        field.strip() for field in fields)
-    local, at, domain = email.lower().partition("@")
-    from .config import NAME_RE
-    from .identity import GIT_EMAIL_DOMAIN
-    if not local or at != "@" or domain != GIT_EMAIL_DOMAIN \
-            or not NAME_RE.match(local):
-        return None
-    return {"agent": local, "name": name, "email": email.lower(),
-            "committer_name": committer_name,
-            "committer_email": committer_email.lower()}
 
 
 #: L'attestation de création du hook `pre-commit` vit dans le répertoire git DU

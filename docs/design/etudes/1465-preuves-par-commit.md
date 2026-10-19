@@ -138,7 +138,7 @@ gelée :
 La route du défaut non bloquant vers le backlog (N5) était déjà alignée par
 #1391 avant ce lot.
 
-## 6. Repli nommé de la désignation au gel (#2721, 19/10)
+## 6. Repli de la désignation au gel : le journal des tours (#2721, 19/10)
 
 Un rebase ou un amend crée un **nouvel objet** : le reçu de #1465 reste sur
 l'ancien, et le gel lit le nouveau. Un commit antérieur aux hooks n'en a jamais
@@ -146,20 +146,23 @@ eu. La désignation au gel restait donc en attente « author provenance unknown 
 alors que le commit avait bien été produit par un agent connu (#652, #640,
 #2691/#2693).
 
-La désignation admet désormais l'**auteur Git déclaré** du commit quand toutes
-ces conditions tiennent :
-
-- l'adresse de l'auteur est `<agent>@ameesh.invalid` (le domaine posé par le
-  runner) et le local est un nom d'agent du registre ;
-- l'adresse du committer est dans le même domaine (l'objet a été créé sous une
-  identité managée, pas par un humain ou un Git étranger) ;
-- la famille vient de l'auteur de référence au gel quand c'est le même agent,
-  sinon du harnais déclaré au registre (`session_harness` en dernier recours).
+#2681 a ramené la lecture des auteurs à une seule source partagée par le train,
+la porte et la désignation (`review_authors`). Pour un commit sans reçu, cette
+lecture prend le **committer** — l'agent qui a créé l'objet, rebase ou amend
+compris — et sa famille au journal des tours (`turn_costs`) **à l'instant du
+commit**, pas le harnais déclaré au registre : un harnais emprunté reste le
+harnais qui a réellement tourné. Un committer distinct de l'auteur de référence
+doit être un agent du registre ; un tiers sans reçu reste inconnu. Pour un
+relecteur désigné, le seuil du §2 s'applique : sous ~50 lignes et sans
+conception, c'est une correction de relecture, pas un nouvel auteur.
 
 Le repli est une **trace**, pas un reçu : la marque de désignation porte
-`proof: git-author` et `fallback_commits` (les SHA admis par ce chemin), et
-`receipt_for_commit` continue de rendre `None` — le train #1467 ne lit que les
-preuves exactes. Un commit dont l'auteur Git n'est pas au registre reste
-`unknown`, et le gel attend. Témoin : un vrai rebase d'un commit muni d'un reçu
-gèle le nouvel objet et désigne les deux familles indépendantes
-(`test_a_rebased_commit_uses_its_declared_git_author`).
+`proof: turn-journal` et `fallback_commits` (les SHA admis par ce chemin), et
+`receipt_for_commit` continue de rendre `None` — le train ne lit que les preuves
+exactes. Témoins : un vrai rebase d'un commit muni d'un reçu gèle le nouvel
+objet et désigne les deux familles indépendantes
+(`test_a_rebased_commit_is_read_from_the_turn_journal`), un amend substantiel
+par un relecteur le compte comme auteur
+(`test_an_inter_agent_amend_counts_the_committer_as_author`), et un harnais
+emprunté est lu au tour, pas au registre
+(`test_a_borrowed_harness_uses_the_commit_turn_family`).

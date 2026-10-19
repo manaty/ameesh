@@ -103,49 +103,6 @@ class ContractTest(unittest.TestCase):
         finally:
             shutil.rmtree(repo, ignore_errors=True)
 
-    def test_declared_author_reads_only_the_managed_git_identity(self):
-        """#2721 : le repli lit l'auteur/committer Git déclarés, jamais un humain.
-
-        L'adresse d'un agent (`<agent>@ameesh.invalid`, posée par le runner)
-        donne son nom ; une adresse hors domaine ne prouve rien et rend None.
-        Ce n'est pas un reçu : le fournisseur exact continue de rendre None
-        pour ce commit."""
-        repo = tempfile.mkdtemp(prefix="ameesh-2721-author-")
-        try:
-            subprocess.run(["git", "init", "-q", repo], check=True,
-                           capture_output=True)
-            human = dict(os.environ, GIT_AUTHOR_NAME="t",
-                         GIT_AUTHOR_EMAIL="t@example.invalid",
-                         GIT_COMMITTER_NAME="t",
-                         GIT_COMMITTER_EMAIL="t@example.invalid")
-            with open(os.path.join(repo, "f"), "w", encoding="utf-8") as fh:
-                fh.write("x\n")
-            subprocess.run(["git", "add", "f"], cwd=repo, check=True,
-                           capture_output=True)
-            subprocess.run(["git", "commit", "-qm", "humain"], cwd=repo, check=True,
-                           capture_output=True, env=human)
-            first = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo,
-                                            text=True).strip()
-            agent = dict(os.environ, GIT_AUTHOR_NAME="mty-amh-impl-07",
-                         GIT_AUTHOR_EMAIL="mty-amh-impl-07@ameesh.invalid",
-                         GIT_COMMITTER_NAME="mty-amh-impl-07",
-                         GIT_COMMITTER_EMAIL="mty-amh-impl-07@ameesh.invalid")
-            with open(os.path.join(repo, "f"), "w", encoding="utf-8") as fh:
-                fh.write("agent\n")
-            subprocess.run(["git", "commit", "-qam", "agent"], cwd=repo, check=True,
-                           capture_output=True, env=agent)
-            second = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo,
-                                             text=True).strip()
-            self.assertIsNone(prov.declared_author(first, cwd=repo))
-            self.assertIsNone(prov.declared_author("pas-un-sha", cwd=repo))
-            declared = prov.declared_author(second, cwd=repo)
-            self.assertEqual(declared["agent"], "mty-amh-impl-07")
-            self.assertEqual(declared["email"], "mty-amh-impl-07@ameesh.invalid")
-            self.assertEqual(declared["committer_email"],
-                             "mty-amh-impl-07@ameesh.invalid")
-        finally:
-            shutil.rmtree(repo, ignore_errors=True)
-
     def test_intent_outside_a_turn_writes_nothing(self):
         """Le hook `pre-commit` hors tour managé n'atteste rien (jamais bloquant)."""
         repo = tempfile.mkdtemp(prefix="ameesh-1465-intent-")

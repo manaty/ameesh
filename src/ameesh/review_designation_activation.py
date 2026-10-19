@@ -27,11 +27,12 @@ Inputs, all from machine sources (never a note, an assignment or a name):
   every commit of the frozen range through its exact provenance receipt
   (#1465), except a designated reviewer's first-round correction under the §2
   threshold (#2638: ≤ ~50 changed lines, no design). A commit without a
-  receipt makes the designation wait — an unknown family cannot prove
-  independence — unless it declares a managed Git author known to the registry
-  (#2721: a rebase/amend keeps the receipt on the old object, and a commit
-  older than the hooks has none). That fallback is named in the mark
-  (`proof: git-author`, `fallback_commits`), never written as a receipt;
+  receipt is attributed by its agent committer's session family in the turn
+  journal (`review_authors`, #2681): the reference author stays the author, a
+  designated reviewer's small fix stays a correction; any other commit makes
+  the designation wait, because an unknown family cannot prove independence.
+  #2721 names that fallback in the mark (`proof: turn-journal`,
+  `fallback_commits`), never as an exact receipt;
 - **candidates**: the registry rows of the lot's project, real session family
   only (`registry.live_harness`), availability and open-lot load;
 - **pilot**: the project's `orchestrateur` in the canon, when registered; an
@@ -72,7 +73,7 @@ from . import canon as canon_mod
 from . import lot_class, mechanics, plan_git, projects, registry, review
 from . import review_designation as rd
 from . import review_designation_pg as pg
-from . import review_lot, review_provenance, storage, work
+from . import review_authors, storage, work
 
 #: the sender of the journal notes and automatic mails
 SENDER = pg.SENDER
@@ -89,12 +90,10 @@ LIGHT_WHY = ("light lot: no pre-merge reviewer is due (the other-family review"
 NO_PATH_WHY = "no changed path: no review due"
 #: a frozen range longer than this is not read in one selection (bounded work)
 MAX_COMMITS = 500
-#: canon §2: a reviewer's first-round correction is a small fix up to ~50
-#: changed lines; beyond that (or for a design change) its author becomes an
-#: author of the head (#2638)
-REVIEWER_FIX_LINES = 50
-#: canon §2 "ou de conception": a design document is never a small fix
-DESIGN_PREFIXES = ("docs/design/",)
+#: #2681 : le seuil et la lecture des auteurs sont celles de la porte et du
+#: train (`review_authors`), pas une seconde règle locale.
+REVIEWER_FIX_LINES = review_authors.REVIEWER_FIX_LINES
+DESIGN_PREFIXES = review_authors.DESIGN_PREFIXES
 
 #: a run of `retry_pending` reads at most this many unavailable notes
 RETRY_SCAN = 200
@@ -564,12 +563,8 @@ def _range(repo: str, base: str, head: str) -> tuple[str, list, list]:
 
 
 # --------------------------------------------------------------------------
-# the authors: the assignee at freeze and each commit's exact receipt
+# the authors: one reading shared with the train and the merge gate (#2681)
 # --------------------------------------------------------------------------
-
-def _family(harness, families) -> str:
-    return review_lot.family_of(str(harness or ""), families)
-
 
 def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
                           author: str) -> set[str]:
@@ -595,192 +590,6 @@ def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
         pass
     return {str(value).strip() for value in names
             if str(value).strip() and str(value).strip() != author}
-
-
-def _change(repo: str, sha: str) -> Optional[tuple[int, bool]]:
-    """`(changed lines, touches a design path)` of one commit, or None.
-
-    `None` means the diff is unreadable: the caller must not guess a small fix.
-    A binary change is never a small fix, and neither is a design document
-    (canon §2: a correction "> ~50 lignes ou de conception" goes back to the
-    author, #2638)."""
-    if not repo:
-        return None
-    text = plan_git._out(repo, "show", "--numstat", "-z", "--format=", "--no-renames", sha)
-    if text is None:
-        return None
-    lines, design = 0, False
-    for row in str(text).split("\0"):
-        if not row:
-            continue
-        fields = row.split("\t", 2)
-        if len(fields) < 3:
-            return None
-        added, removed, path = fields
-        if added == "-" or removed == "-":
-            return REVIEWER_FIX_LINES + 1, design
-        try:
-            lines += int(added) + int(removed)
-        except ValueError:
-            return None
-        if path.startswith(DESIGN_PREFIXES):
-            design = True
-    return lines, design
-
-
-def _git_author_fallback(db, sha: str, repo: str, *, name: str, family: str,
-                         families) -> Optional[tuple[str, str]]:
-    """#2721 — the declared Git author of a commit without an exact receipt.
-
-    A rebase/amend creates a new object: the receipt stays on the old one, and
-    the frozen head carries none. A commit older than the hooks has none
-    either. The designation admits the commit's Git author **only** when both
-    its author and committer addresses are in the managed domain
-    (`<agent>@ameesh.invalid`) and the author is a registry agent; the family
-    is the reference author's when it is the same agent, otherwise the
-    registry's declared harness (`session_harness` as a last resort). The
-    caller journals the `git-author` proof; this is never a
-    `provenance_receipts` row and the train keeps refusing it.
-
-    Returns `(actor, family)` — family may be empty (known agent, unknown
-    family: the selection then waits on the family, not on the provenance) —
-    or None, which keeps the commit in the unknown list.
-    """
-    if not repo or not sha:
-        # without the repository under the hand, the Git author proves nothing
-        return None
-    declared = review_provenance.declared_author(sha, cwd=repo)
-    if declared is None:
-        return None
-    from .identity import GIT_EMAIL_DOMAIN
-    committer = str(declared.get("committer_email") or "").strip().lower()
-    if committer.rpartition("@")[2] != GIT_EMAIL_DOMAIN:
-        # the object was not created under the runner's managed identity
-        return None
-    actor = str(declared.get("agent") or "").strip()
-    row = registry.get(db, actor) if actor else None
-    if not row:
-        return None
-    # the Git address may name an alias: the primary name is what the
-    # selection's forbidden-names set and the reviewer column use
-    actor = str(row.get("name") or actor).strip()
-    if actor == name and family:
-        return actor, family
-    harness = str(row.get("harness") or "").strip() \
-        or str(row.get("session_harness") or "").strip()
-    return actor, _family(harness, families)
-
-
-def _authors(db, item: Mapping, milestone: Optional[Mapping],
-             commits: Sequence[str], repo: str = "", families=()) -> tuple[list, list]:
-    """`(authors, unknown authors)` drawn from the freeze and exact receipts.
-
-    The reference author is the lot's author at freeze (the assignee, exactly
-    as `merge_queue.review_gate` reads it). Every other commit counts as an
-    author, with one exception: a **designated reviewer's** first-round
-    correction under the §2 threshold (`REVIEWER_FIX_LINES`, no design change)
-    does not make its author an author of the head — their family stays
-    eligible, and the same reviewer may be designated again on the new head.
-    A larger or design change makes them an author like any other (#2638).
-
-    A commit without an exact receipt is not immediately unknown (#2721): a
-    rebase/amend leaves the receipt on the old object, and commits older than
-    the hooks have none. When the commit declares a managed Git author (and
-    committer) that the registry knows, that author is admitted as a named
-    fallback; the returned author row carries `proof: git-author` and the
-    fallback commit list. The exact receipt remains the only proof the train
-    reads, and a commit whose declared author is outside the registry stays
-    unknown.
-
-    `families` are the compiled canon's model families (#2664), read at the
-    same audited commit as the policy: no local list is assumed.
-    """
-    lot = int((item or {}).get("id") or 0)
-    assignee = str((item or {}).get("assignee") or "").strip()
-    author = {}
-    try:
-        author = review_lot._author_at_freeze(db, lot, dict(item or {})) or {}
-    except Exception:  # noqa: BLE001 - unreadable trace: unknown family
-        author = {}
-    name = str(author.get("name") or assignee).strip()
-    family = _family(author.get("harness"), families)
-    if not family and milestone is not None:
-        try:
-            proof = review_provenance.receipt_for_milestone(db, int(milestone["id"]))
-        except (review_provenance.ProvenanceError, KeyError, TypeError, ValueError):
-            proof = None
-        if proof and str(proof.get("actor") or "").strip() == name:
-            family = _family(proof.get("harness"), families)
-    if not family and name and (milestone is None
-                                or str(milestone.get("actor") or "").strip()
-                                in ("", name)):
-        try:
-            row = registry.get(db, name) or {}
-            # the declared harness is not a session: only an opened session
-            # proves the family that really ran (L242b, #1037)
-            if row.get("session_id") or row.get("session_harness"):
-                family = _family(row.get("session_harness"), families)
-        except Exception:  # noqa: BLE001 - no session: the family stays unknown
-            family = ""
-    reviewers = _designated_reviewers(db, item, milestone, name)
-    by_name: dict[str, set] = {}
-    if name:
-        by_name.setdefault(name, set()).add(family)
-    unknown = []
-    proofs: dict[str, set] = {}
-    review_commits: dict[str, list[tuple[str, str]]] = {}
-    for sha in commits or ():
-        try:
-            receipt = review_provenance.receipt_for_commit(db, sha)
-        except review_provenance.ProvenanceError:
-            # a corrupt proof is not an absent one: the Git fallback only
-            # replaces an absent receipt, never contradicts an exact row
-            unknown.append(str(sha)[:12])
-            continue
-        if receipt is None:
-            fallback = _git_author_fallback(db, str(sha), repo, name=name,
-                                            family=family, families=families)
-            if fallback is None:
-                unknown.append(str(sha)[:12])
-                continue
-            actor, proven = fallback
-            by_name.setdefault(actor, set())
-            if proven:
-                by_name[actor].add(proven)
-            proofs.setdefault(actor, set()).add(str(sha)[:12])
-            continue
-        actor = str(receipt.get("actor") or "").strip()
-        if not actor:
-            continue
-        proven = _family(receipt.get("harness"), families)
-        if actor != name and actor in reviewers:
-            # held until the §2 threshold is known for their whole correction
-            review_commits.setdefault(actor, []).append((str(sha), proven))
-            continue
-        by_name.setdefault(actor, set()).add(proven)
-    for actor, entries in sorted(review_commits.items()):
-        total, design = 0, False
-        for sha, _proven in entries:
-            change = _change(repo, sha)
-            if change is None or change[1]:
-                design = True
-                break
-            total += change[0]
-        if design or total > REVIEWER_FIX_LINES:
-            # beyond the small first-round fix: they authored the head
-            by_name.setdefault(actor, set()).update(
-                proven for _sha, proven in entries if proven)
-    authors = []
-    for actor in sorted(by_name):
-        families = {f for f in by_name[actor] if f}
-        # one actor with two proven families is an ambiguity: never guess
-        family = next(iter(families)) if len(families) == 1 else ""
-        row = {"name": actor, "family": family}
-        if proofs.get(actor):
-            row["proof"] = "git-author"
-            row["fallback_commits"] = sorted(proofs[actor])
-        authors.append(row)
-    return authors, unknown
 
 
 # --------------------------------------------------------------------------
@@ -996,8 +805,9 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         # project's agents, so the two roles never collapse into one mail
         candidates = [candidate for candidate in candidates
                       if candidate.name != notify]
-    authors, unknown = _authors(db, item, freeze, commits, repo,
-                                families=policy.families)
+    authors, unknown = review_authors.authors(db, item, freeze, commits, repo,
+                                              families=policy.families,
+                                              trace=True)
     return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=paths,
                   commits=commits, policy=policy, authors=authors,
                   unknown_authors=unknown, candidates=candidates, notify=notify,
@@ -1510,7 +1320,82 @@ def _manual_outcome(db, item: Mapping, freeze: Mapping, manual: Sequence[str], *
             "why": why}
 
 
-def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
+#: journal prefix of the "your earlier block is superseded" notification
+SUPERSEDED_PREFIX = "review-block-superseded:"
+
+
+def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mapping,
+                              threads: list) -> None:
+    """Notifie le relecteur dont le blocage portait sur une tête antérieure.
+
+    #2681 : la porte ne lit que les verdicts de la tête gelée ; un blocage
+    posé sur une tête antérieure ne bloque plus, et un `ok` indépendant sur la
+    nouvelle tête suffit. Le relecteur qui a bloqué doit le savoir : un
+    `notify` par (lot, gel, relecteur), jamais un doublon, et pas de courrier
+    quand sa désignation du gel le prévient déjà. Une lecture impossible ne
+    perd jamais un gel : la notification est au mieux."""
+    lot = int((item or {}).get("id") or 0)
+    freeze_id = int((freeze or {}).get("id") or 0)
+    sha = str((freeze or {}).get("sha") or "").strip().lower()
+    state = str((outcome or {}).get("state") or "")
+    if not lot or not freeze_id or not sha or state in ("unavailable", "stale"):
+        return
+    rows = storage.of(db).work.milestones(lot, None)
+    latest: dict = {}
+    for row in rows or ():
+        if row.get("kind") != "verdict":
+            continue
+        actor = str(row.get("actor") or "").strip()
+        if not actor:
+            continue
+        key = actor.lower()
+        order = (float(row.get("at_ts") or 0.0), int(row.get("id") or 0))
+        if key not in latest or order > latest[key][0]:
+            latest[key] = (order, row)
+    designated = {str(row.get("name") or "").strip().lower()
+                  for row in (outcome or {}).get("reviewers") or ()}
+    designated.update(str(name or "").strip().lower()
+                      for name in (outcome or {}).get("manual") or ())
+    author = str((item or {}).get("assignee") or "").strip().lower()
+    for key, (_order, row) in sorted(latest.items()):
+        if (row.get("verdict") or "") != "blocked" or key == author:
+            continue
+        mark_sha = str(row.get("sha") or "").strip().lower()
+        current = bool(mark_sha) and (mark_sha == sha
+                                      or (len(mark_sha) >= 7 and sha.startswith(mark_sha)))
+        if current or key in designated:
+            # un blocage sur la tête gelée reste en vigueur ; une désignation
+            # du gel envoie déjà son propre courrier au relecteur
+            continue
+        prefix = "%s%d:%d:%s:" % (SUPERSEDED_PREFIX, lot, freeze_id, key)
+        if storage.of(db).work.events_noted(prefix, 0.0, ids=[lot]):
+            continue
+        actor = str(row.get("actor") or "").strip()
+        body = "\n".join([
+            "Blocage levé par une tête plus récente (canon §2, #2681).",
+            "",
+            "Lot: #%s" % lot,
+            "- Votre dernier verdict sur une tête antérieure (%s) était BLOQUANT." % mark_sha[:12],
+            "- La tête gelée courante est %s : la porte ne lit que les verdicts de" % sha[:12],
+            "  cette tête. Un `ok` indépendant sur elle suffit ; votre blocage antérieur",
+            "  ne la refuse pas.",
+            "",
+            "Si vous voulez re-relire cette tête :",
+            "  ameesh work milestone %d verdict ok|blocked --sha %s --actor %s"
+            % (lot, sha, actor),
+        ])
+        storage.of(db).work.note(
+            lot, str((item or {}).get("state") or ""), prefix + sha,
+            SENDER)
+        from . import mail
+        mail.send(db, SENDER, actor, body, work_item_id=str(lot),
+                  payload={"review_block_superseded": {
+                      "lot": lot, "freeze": freeze_id, "sha": sha,
+                      "blocked_sha": mark_sha}},
+                  after_commit=threads)
+
+
+def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
                              threads: list, carried: Optional[Mapping] = None) -> dict:
     """The `on_frozen` body: all writes stay in the freeze's transaction.
 
@@ -1600,6 +1485,24 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
             raise exc
         del threads[checkpoint:]
         return _internal_failure(cfg, tx, item, freeze, threads, exc)
+
+
+def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
+                             threads: list, carried: Optional[Mapping] = None) -> dict:
+    """The `on_frozen` body, plus the superseded-block notification (#2681).
+
+    The notification is best-effort: it runs after the designation writes, and
+    an error there never loses the freeze or its designation. The gate rule
+    (only the frozen head's verdicts) is unchanged; this only tells a reviewer
+    whose earlier block no longer blocks the new head."""
+    result = _designate_in_transaction(cfg, tx, lot, milestone=milestone,
+                                       threads=threads, carried=carried)
+    try:
+        item = work.get(tx, int(lot)) or {"id": int(lot)}
+        _notify_superseded_blocks(tx, item, milestone or {}, result, threads)
+    except Exception:  # noqa: BLE001 - une notification ne perd pas un gel
+        pass
+    return result
 
 
 def hook(cfg, outcome: Optional[dict] = None, *, carried: Optional[Mapping] = None):
@@ -1730,6 +1633,10 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
             names = ([r.get("name") for r in out.get("reviewers") or ()]
                      if out.get("state") == rd.DESIGNATED else [])
             _sync_reviewers(tx, item, freeze, names)
+            try:
+                _notify_superseded_blocks(tx, item, freeze, out, threads)
+            except Exception:  # noqa: BLE001 - une notification ne perd rien
+                pass
         _drain(db, threads)
         return out
     except rd.StaleFreeze as exc:
