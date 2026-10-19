@@ -223,7 +223,9 @@ TYPE_LABELS = {
     "orphan_resource": "orphan resource",
     "tmpfs_full": "tmpfs almost full",
     "worktree_kept": "worktree kept at end of lot",
-    "tmp_orphan": "/tmp entry left by a turn",
+    # #2618 : le libellé dit l'apparition, pas l'imputation : le ménage ne
+    # supprime jamais une entrée qu'il n'a pas attribuée (#222, #234).
+    "tmp_orphan": "/tmp entry that appeared during a turn",
     "tmp_unowned": "temporary directory without owner file (kept)",
     "tmp_unremovable": "temporary directory over quota with files it cannot remove",
     "tmp_unscanned": "temporary directory too large to scan; nothing evicted",
