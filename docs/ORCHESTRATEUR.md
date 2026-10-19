@@ -530,7 +530,10 @@ prêt, `git commit --no-edit` après résolution) ; aucun paquet déjà validé 
 réécrit pour ce seul métadonné.
 Le corps du lot porteur nomme ses unités avec leur tête, `#<lot> <tête>`, la
 ligne qu'imprime `scripts/paquet-compose.py --units --base <cible>` (#2360) :
-un `#N` seul n'y déclare aucune unité (#2335).
+un `#N` seul n'y déclare aucune unité (#2335). Quand ce corps omet la liste,
+la lecture des attentes retrouve les unités par ces trailers `ameesh-work:`
+de la branche, au-dessus de la cible (#2599) ; un `#N` cité en prose ne
+supprime toujours pas son alerte.
 
 À la fusion du paquet, ses unités se ferment **sans geste manuel** : le relevé
 de l'exécuteur lit les manifestes `reviews/**paquet**.md` de la cible et, pour

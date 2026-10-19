@@ -158,14 +158,18 @@ or, for a lot carried by an open integration packet (#2335):
 A packet is a structured carrier, not prose: an open work item whose branch
 starts with `integration/`, whose body/manifest names each carried lot with
 its frozen head (`#<lot> @ <sha>` / `#<lot> <sha>`, at least 7 hex digits).
-A bare `#<lot>` in running text is **not** an inclusion — an excluded lot
-(« #2203 exclu », « garder #1024 ») must keep its `stale` and `slo_breach`
-alerts. The units declared with their head wait for the packet merge, not for
-a lot executor, so `stale` and `slo_breach` are silenced for them. The
-`verdict_merge` clock of a merge-ready lot starts at the first packet slot
-after its GO (`mechanics.next_packet` as soon as the canon declares a cadence,
-even between two packets; otherwise the observed hourly UTC cut-off): the
-time before that slot is not a delay under canon §11 bis.
+Since #2599 the carrier's body may omit that list: the `ameesh-work: <lot>`
+trailers of the composition commits on its branch, above the target, are also
+read (the repo comes from `radar.projects.<app>.repo`; an unreadable branch
+concludes nothing and the alert stays due). A bare `#<lot>` in running text
+is **not** an inclusion — an excluded lot (« #2203 exclu », « garder #1024 »)
+must keep its `stale` and `slo_breach` alerts. The units declared with their
+head wait for the packet merge, not for a lot executor, so `stale` and
+`slo_breach` are silenced for them. The `verdict_merge` clock of a merge-ready
+lot starts at the first packet slot after its GO (`mechanics.next_packet` as
+soon as the canon declares a cadence, even between two packets; otherwise the
+observed hourly UTC cut-off): the time before that slot is not a delay under
+canon §11 bis.
 
 `planned_wait` is null when no explicit wait applies. While it applies,
 `stale` is null and no `stale_lot` is raised, so the notifier also stops its

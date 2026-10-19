@@ -304,6 +304,38 @@ class PaquetTest(_Base):
         self.assertIn("packet merge", work_dependencies.wait_label(info["planned_wait"]))
         self.assertIsNone(info["stale"])
 
+    def test_porteur_sans_liste_lie_par_les_trailers(self):
+        # #2599 : le corps des porteurs h-2300/h-0100 n'a pas la liste
+        # « #N <tête> » ; les trailers des commits de composition lient
+        # l'unité au paquet, et le SLO est tu.
+        self.qa_at(self.GO)
+        carrier = self.packet(body="aucune liste d'unités dans ce corps")
+        with mock.patch.object(planned_waits, "packet_attachments",
+                               return_value={carrier["id"]: {self.lot["id"]}}):
+            self.now = self.GO + 75 * 60
+            self.assertEqual(self.slo(), [])
+            rows = storage.of(self.db).operations.open_lots_activity(None)
+            described = stagnation.describe(self.db, rows, now=self.now, open_items=rows)
+        info = described[self.lot["id"]]
+        self.assertEqual((info["planned_wait"] or {}).get("what"), "packet")
+        self.assertIn("packet merge", info["waiting"]["label"])
+        self.assertIsNone(info["stale"])
+
+    def test_lot_exclu_en_prose_reste_signale_meme_avec_trailers(self):
+        # #2599 : un lot cité en prose n'est pas attaché ; même quand la
+        # lecture des trailers rend d'autres unités, son alerte reste due.
+        self.qa_at(self.GO)
+        exclu = work.add(self.db, title="exclu du paquet", assignee="dev1")
+        self.qa_at(self.GO, lot=exclu)
+        carrier = self.packet(body="paquet ; #%d exclu (verdict manquant)"
+                              % exclu["id"])
+        with mock.patch.object(planned_waits, "packet_attachments",
+                               return_value={carrier["id"]: {self.lot["id"]}}):
+            self.now = self.GO + 125 * 60
+            alerts = self.slo()
+        self.assertEqual([a["lot"] for a in alerts], [exclu["id"]], alerts)
+        self.assertEqual(alerts[0]["step"], "verdict_merge")
+
     def test_lot_exclu_en_prose_reste_signale(self):
         # B1 (relecture dev7) : un lot seulement cité (« exclu », « garder »)
         # n'est pas transporté ; son alerte ne doit pas être tue par le
