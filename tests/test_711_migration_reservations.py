@@ -577,6 +577,32 @@ class ScopedReservationsTest(PgTestCase):
         self.assertEqual([(row['slot'], row['status']) for row in renewed],
                          [('legacy-401', 'reserved')])
 
+    def test_merged_to_closed_does_not_release_a_landed_slot(self):
+        """#879 N (#2658) : `merged -> closed` ne libère pas un numéro atterri.
+
+        Le trigger de projection rejoué avec `work_items.migration` encore
+        posé donnait `released` au créneau `default` (état `closed`) et
+        effaçait la trace d'atterrissage ; la garde de 0432 ne couvrait que
+        `reserved`. Le numéro consommé doit le rester, sans 23505 même quand
+        un autre lot a réservé ce numéro entre-temps (comme après un retour
+        `merged -> blocked`)."""
+        work.set_branch(self.db, self.a['id'], 'agent/a', target='develop', actor='dev')
+        work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo, actor='dev')
+        # Ligne atterrie avant #956, ou écrite par un client pré-0419 : l'état
+        # passe à `merged` sans libérer `work_items.migration`.
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s",
+                        (self.a['id'],))
+        self.assertEqual(reservations.listing(self.db, self.a['id'])[0]['status'], 'landed')
+        # 400 n'est pas encore dans l'arbre : un autre lot peut le réserver.
+        self.advance(*['%d_x.sql' % number for number in range(377, 400)])
+        taken = self.reserve(self.b)[0]
+        self.assertEqual(taken['number'], 400)
+        self.db.execute("UPDATE work_items SET state = 'closed', close_reason = 'delivered'"
+                        " WHERE id = %s", (self.a['id'],))
+        default = reservations.listing(self.db, self.a['id'])[0]
+        self.assertEqual((default['slot'], default['number'], default['status']),
+                         ('default', 400, 'landed'))
+
     def test_landing_projection_and_null_in_one_statement_lands(self):
         """#1022, copie #879 : la fusion qui remet la projection à NULL lande.
 
