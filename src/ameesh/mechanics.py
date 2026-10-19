@@ -17,6 +17,10 @@ mécanique, ce que l'outillage exécute sans agent :
   fautif ;
 - `reviews.families`, `exclude_author_family`, `distinct_families` : les
   familles de modèle et l'indépendance des avis ;
+- `reviews.light_reviews` : le nombre d'avis d'un lot **léger** (§2, #2642) ;
+  c'est le plancher lu par `reviews_for`, jamais une règle de chemin — une
+  règle positive reclasse le chemin en sensible et ne doit pas servir de
+  raccourci fourre-tout ;
 - `merge.named_fire`, `repeat_freeze`, `on_green_packet`, `post_merge_red` :
   la fusion du paquet dès la suite verte, sans feu nominatif ni gel répété ;
 - `backlog.lot_min_value` (#2584, bloc optionnel) : la valeur à partir de
@@ -37,6 +41,7 @@ immuable qui porte le commit audité.
 """
 from __future__ import annotations
 
+import functools
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -77,7 +82,8 @@ _PREVALIDATION_KEYS = ("classes", "contracts", "hosts", "parts_script",
                        "timeout_seconds")
 _BUILD_KEYS = ("max_in_build",)
 _CI_KEYS = ("packet", "incident_label", "environment_red", "faulty_lot")
-_REVIEWS_KEYS = ("families", "exclude_author_family", "distinct_families")
+_REVIEWS_KEYS = ("families", "exclude_author_family", "distinct_families",
+                 "light_reviews")
 _MERGE_KEYS = ("named_fire", "repeat_freeze", "on_green_packet", "post_merge_red")
 _BACKLOG_KEYS = ("lot_min_value",)
 #: bornes du score de valeur d'un élément de backlog (`backlog.add`)
@@ -152,6 +158,9 @@ class Document:
     families: tuple[str, ...]
     exclude_author_family: bool
     distinct_families: bool
+    #: nombre d'avis d'un lot léger (`reviews.light_reviews`, §2) ; 0 = aucune
+    #: valeur déclarée (transition bornée à la PR home qui le pose à 1, #2642)
+    light_reviews: int
     merge_named_fire: bool
     merge_repeat_freeze: bool
     merge_on_green_packet: bool
@@ -182,7 +191,8 @@ class Document:
                    "faulty_lot": self.ci_faulty_lot},
             "reviews": {"families": list(self.families),
                         "exclude_author_family": self.exclude_author_family,
-                        "distinct_families": self.distinct_families},
+                        "distinct_families": self.distinct_families,
+                        "light_reviews": self.light_reviews},
             "merge": {"named_fire": self.merge_named_fire,
                       "repeat_freeze": self.merge_repeat_freeze,
                       "on_green_packet": self.merge_on_green_packet,
@@ -232,6 +242,7 @@ class Mechanics:
     families: tuple[str, ...]
     exclude_author_family: bool
     distinct_families: bool
+    light_reviews: int
     merge_named_fire: bool
     merge_repeat_freeze: bool
     merge_on_green_packet: bool
@@ -335,6 +346,11 @@ class Mechanics:
     def reviews_for(self, paths) -> ReviewNeed:
         """Classe et nombre d'avis d'un changement décrit par ses chemins.
 
+        Le nombre d'avis d'un chemin léger part du plancher déclaré
+        (`reviews.light_reviews`, §2, #2642) : la classe reste `light`, le
+        plancher ne reclasse pas. Une règle de chemin reste prioritaire et
+        positive : elle reclasse le chemin en sensible, jamais en léger.
+
         Un chemin non léger sans nombre d'avis déclaré fait refuser : le
         lecteur ne suppose jamais un repli (`train_reviews`, PR85).
         """
@@ -349,7 +365,7 @@ class Mechanics:
         if not paths:
             # un changement sans fichier ne se classe pas : zéro avis serait un repli
             raise MechanicsError("no path to classify")
-        risk, reviews = "light", 0
+        risk, reviews = "light", self.light_reviews
         for path in paths:
             if not isinstance(path, str):
                 raise MechanicsError("path is not a repository path: %r" % path)
@@ -391,7 +407,8 @@ class Mechanics:
                    "faulty_lot": self.ci_faulty_lot},
             "reviews": {"families": list(self.families),
                         "exclude_author_family": self.exclude_author_family,
-                        "distinct_families": self.distinct_families},
+                        "distinct_families": self.distinct_families,
+                        "light_reviews": self.light_reviews},
             "merge": {"named_fire": self.merge_named_fire,
                       "repeat_freeze": self.merge_repeat_freeze,
                       "on_green_packet": self.merge_on_green_packet,
@@ -451,6 +468,18 @@ def _packets(value, where: str) -> tuple[str, ...]:
 def _positive_int(value, where: str) -> int:
     if type(value) is not int or value <= 0:
         raise MechanicsError("%s: a positive integer is required" % where)
+    return value
+
+
+def _review_floor(value, where: str) -> int:
+    """Le nombre d'avis d'un lot léger : 0 (aucune valeur déclarée) ou 1 (§2).
+
+    Le canon §2 demande un avis d'une autre famille pour un lot léger ; 0
+    n'est admis que le temps de la PR home qui pose `light_reviews: 1`
+    (#2642). Aucun autre nombre n'est une règle de revue.
+    """
+    if type(value) is not int or value not in (0, 1):
+        raise MechanicsError("%s: 0 or 1 expected" % where)
     return value
 
 
@@ -670,6 +699,10 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
                              % (source, SCHEMA_PREVALIDATION))
     build = _mapping(parsed.get("build"), source + ".build", _BUILD_KEYS)
     reviews = _mapping(parsed.get("reviews"), source + ".reviews", _REVIEWS_KEYS)
+    # `light_reviews` absent : 0, la transition explicitement bornée à la PR
+    # home qui le pose à 1 (#2642) ; un zéro déclaré se dit, jamais un implicite.
+    light_reviews = _review_floor(reviews.get("light_reviews", 0),
+                                  source + ".reviews.light_reviews")
     packet, label, environment, faulty = _ci(parsed.get("ci"), source + ".ci")
     named_fire, repeat_freeze, on_green, post_merge = _merge(parsed.get("merge"),
                                                              source + ".merge")
@@ -695,6 +728,7 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
                                        source + ".reviews.exclude_author_family"),
         distinct_families=_boolean(reviews.get("distinct_families"),
                                    source + ".reviews.distinct_families"),
+        light_reviews=light_reviews,
         merge_named_fire=named_fire,
         merge_repeat_freeze=repeat_freeze,
         merge_on_green_packet=on_green,
@@ -749,6 +783,19 @@ def load_global(repo: str, commit: str) -> Document:
     """Le document global (`processus/mecanique.yaml`) au commit exact."""
     commit = _exact_commit(repo, commit)
     return compile_document(_regular_blob(repo, commit, PATH), source=PATH)
+
+
+@functools.lru_cache(maxsize=256)
+def light_reviews_at(repo: str, commit: str) -> int:
+    """Le plancher d'avis d'un lot léger au commit exact (#2642).
+
+    Un seul lecteur pour les consommateurs qui n'ont pas déjà l'objet compilé
+    (le lecteur de classe, donc la porte de fusion et `paquet-candidats`) :
+    `compile_document`, strict, et le même commit que la classification.
+    `MechanicsAbsent` remonte tel quel : un canon sans document n'est pas un
+    zéro implicite, c'est au consommateur de dire ce qu'il en fait.
+    """
+    return load_global(repo, commit).light_reviews
 
 
 def _federation(repo: str, commit: str) -> dict:
@@ -865,6 +912,7 @@ def load(repo: str, commit: str, project: str) -> Mechanics:
         families=document.families,
         exclude_author_family=document.exclude_author_family,
         distinct_families=document.distinct_families,
+        light_reviews=document.light_reviews,
         merge_named_fire=document.merge_named_fire,
         merge_repeat_freeze=document.merge_repeat_freeze,
         merge_on_green_packet=document.merge_on_green_packet,

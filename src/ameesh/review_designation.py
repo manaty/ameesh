@@ -156,15 +156,21 @@ def rules_of(declaration) -> tuple[Rule, ...]:
     return tuple(out)
 
 
-def required_count(rules: Sequence[Rule], paths: Iterable[str]) -> int:
-    """The number of opinions required for these paths: the **maximum** of the rules.
+def required_count(rules: Sequence[Rule], paths: Iterable[str],
+                   light: int = 0) -> int:
+    """The number of opinions required for these paths: the **maximum** of the
+    rules and of the declared light floor.
 
-    A path that no rule covers counts as zero: that is the light rule ("zero for
-    light outside a rule", PR85). Coverage of non-light paths is checked by the
+    The light floor comes from the caller that read it (`mechanics.reviews_for`,
+    §2: one opinion, #2642); it is never guessed here. `light` defaults to 0 for
+    the pure rule reader, whose only inputs are the rules. A path that no rule
+    covers counts as the floor. Coverage of non-light paths is checked by the
     policy reader (#1467), not here.
     """
+    if type(light) is not int or light < 0:
+        raise DesignationError("light opinions: a non-negative integer is expected")
     rules = tuple(rules or ())
-    highest = 0
+    highest = light
     for path in paths or ():
         for rule in rules:
             if rule.matches(path):
@@ -658,6 +664,13 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     `Port`). Returns the designation: `{state, required, reviewers, missing,
     why, freeze}` with `replayed` when it already existed.
 
+    `required` is the count already read by the policy reader
+    (`mechanics.reviews_for`) and includes the light floor (#2642) and the
+    critical floor of the merge gate (#2627): it is authoritative and overrides
+    the count read from the rules. Without it, the count comes from the rules
+    alone (pure callers). It must be 0, 1 or 2; without a changed path nothing
+    is due, whatever the caller's floor.
+
     `unknown_authors` names the commits of the freeze whose exact provenance
     (#1465) is unknown: without it, a reviewer's independence cannot be
     established, so the designation waits instead of guessing — an explicit
@@ -666,9 +679,7 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     `already` carries the manual reviewers already designated (#2627): the ones
     that prove an independent family cover a seat, and only the missing seats
     are selected. None is ever removed, and two manual reviewers of the same
-    family count one seat. `required` overrides the count read from the rules
-    when the caller has a compiled need (the critical floor of the merge gate,
-    #2627); it must still be 0, 1 or 2.
+    family count one seat.
 
     The freeze is re-read **once**, and the provided inputs (paths, authors,
     class) are those of this freeze: if the `Port` refuses a freeze that has
@@ -710,7 +721,12 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
             "the inputs of lot #%d were collected for freeze %s, the last freeze is %s:"
             " nothing written; recollect the paths, authors and class of the new"
             " freeze, then retry" % (lot, expected[:12], sha[:12]))
-    required = required_count(rules, paths) if required is None else required
+    paths = tuple(paths or ())
+    # Sans chemin changé il n'y a rien à relire, quel que soit le plancher.
+    if not paths:
+        required = 0
+    elif required is None:
+        required = required_count(rules, paths)
     if type(required) is not int or required not in (0, 1, 2):
         raise DesignationError("required reviews must be 0, 1 or 2, not %r" % (required,))
     if risk != "light" and required == 0:
