@@ -108,6 +108,27 @@ class FreezeCandidateTest(unittest.TestCase):
         self.assertEqual(out["sha"], "")
         self.assertEqual(out["causes"], ["freeze-after-verdict"])
 
+    def test_dispense_du_pilote_couvre_le_gel_apres_avis(self):
+        # #2681 : le gel déclaré est le candidat même si le dernier avis porte
+        # sur une tête antérieure ; la dispense `-none` couvre cette tête.
+        out = plan_git.freeze_candidate([verdict(A, 10), frozen(B, 20)], waived=True)
+        self.assertEqual(out["sha"], B)
+        self.assertEqual(out["origin"], "frozen")
+        self.assertEqual(out["causes"], [])
+        self.assertIn("verdict-not-required", out["notes"])
+
+    def test_dispense_ne_leve_pas_un_blocage_sur_la_tete_gelee(self):
+        out = plan_git.freeze_candidate(
+            [frozen(A, 10), verdict(A, 11, kind="blocked")], waived=True)
+        self.assertEqual(out["sha"], "")
+        self.assertEqual(out["causes"], ["blocked-verdict"])
+
+    def test_dispense_ne_cree_pas_de_gel_ni_de_candidat(self):
+        out = plan_git.freeze_candidate(
+            [{"kind": "requested", "sha": "", "at_ts": 1, "id": 1}], waived=True)
+        self.assertEqual(out["sha"], "")
+        self.assertEqual(out["causes"], ["no-verdict"])
+
     def test_gel_sans_avis_reste_candidat(self):
         # classe légère : le gel déclaré suffit ; la note dit l'avis manquant
         out = plan_git.freeze_candidate([frozen(A, 10)])

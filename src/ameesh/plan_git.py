@@ -469,7 +469,7 @@ def _freeze_mark(row: dict | None) -> dict | None:
 
 
 def freeze_candidate(rows: list[dict], repo: str | None = None,
-                     target: str | None = None) -> dict:
+                     target: str | None = None, *, waived: bool = False) -> dict:
     """Le gel effectif d'un lot (#1756) : le commit sur lequel un avis
     favorable existe, même sans jalon `frozen`, ou malgré un gel périmé.
 
@@ -500,6 +500,11 @@ def freeze_candidate(rows: list[dict], repo: str | None = None,
     * aucun avis : le gel déclaré reste candidat (note `no-verdict` — la
       classe légère n'exige pas d'avis) ; sans gel non plus, refus
       `no-verdict` ;
+    * `waived` (#2681, dispense `-none` du pilote, #1979) : le gel déclaré
+      est le candidat même quand le dernier avis porte sur une tête
+      antérieure — la dispense couvre la tête gelée, pas une remise (#2496) ;
+      note `verdict-not-required`. Un `blocked` sur la tête gelée refuse
+      toujours ;
     * un `blocked` applicable n'est jamais masqué par le `ok` d'un autre
       relecteur : refus `blocked-verdict`.
 
@@ -542,42 +547,49 @@ def freeze_candidate(rows: list[dict], repo: str | None = None,
     v_sha = commit_id((last or {}).get("sha"))
     v_at = float((last or {}).get("at_ts") or 0)
 
-    if last is None:
-        if f_sha:
-            out.update(sha=f_sha, origin="frozen")
-            out["notes"].append("no-verdict")
-            return out
-        out["causes"].append("no-verdict")
-        return out
-    if (last.get("verdict") or "ok") != "ok":
-        out["causes"].append("blocked-verdict")
-        return out
     carried_from = None
-    if f_sha and v_sha:
-        if same_commit(f_sha, v_sha):
-            out.update(sha=max(f_sha, v_sha, key=len), origin="frozen")
-        elif f_at > v_at:
-            carried = (rebase_identity(repo, v_sha, f_sha, target or DEFAULT_TARGET)
-                       if repo else {"mechanical": False})
-            if not carried["mechanical"]:
-                out["causes"].append("freeze-after-verdict")
-                return out
-            out.update(sha=f_sha, origin="frozen")
-            out["notes"].append("mechanical-rebase: %s" % carried["detail"])
-            carried_from = v_sha
-        else:
-            out.update(sha=v_sha, origin="verdict")
-            out["notes"].append("declared-freeze-stale")
-    elif v_sha:
-        out.update(sha=v_sha, origin="verdict")
-        if freeze is not None:
-            out["notes"].append("declared-freeze-stale")
-    elif f_sha and v_at >= f_at:
+    if waived and f_sha:
+        # La dispense du pilote couvre la tête déclarée (#2681) : un avis
+        # antérieur ne la déclasse pas. La porte garde son blocage courant,
+        # vérifié ci-dessous sur cette même tête.
         out.update(sha=f_sha, origin="frozen")
-        out["notes"].append("verdict-names-no-commit")
+        out["notes"].append("verdict-not-required")
     else:
-        out["causes"].append("verdict-names-no-commit")
-        return out
+        if last is None:
+            if f_sha:
+                out.update(sha=f_sha, origin="frozen")
+                out["notes"].append("no-verdict")
+                return out
+            out["causes"].append("no-verdict")
+            return out
+        if (last.get("verdict") or "ok") != "ok":
+            out["causes"].append("blocked-verdict")
+            return out
+        if f_sha and v_sha:
+            if same_commit(f_sha, v_sha):
+                out.update(sha=max(f_sha, v_sha, key=len), origin="frozen")
+            elif f_at > v_at:
+                carried = (rebase_identity(repo, v_sha, f_sha, target or DEFAULT_TARGET)
+                           if repo else {"mechanical": False})
+                if not carried["mechanical"]:
+                    out["causes"].append("freeze-after-verdict")
+                    return out
+                out.update(sha=f_sha, origin="frozen")
+                out["notes"].append("mechanical-rebase: %s" % carried["detail"])
+                carried_from = v_sha
+            else:
+                out.update(sha=v_sha, origin="verdict")
+                out["notes"].append("declared-freeze-stale")
+        elif v_sha:
+            out.update(sha=v_sha, origin="verdict")
+            if freeze is not None:
+                out["notes"].append("declared-freeze-stale")
+        elif f_sha and v_at >= f_at:
+            out.update(sha=f_sha, origin="frozen")
+            out["notes"].append("verdict-names-no-commit")
+        else:
+            out["causes"].append("verdict-names-no-commit")
+            return out
 
     # Blocage applicable : le dernier avis de chaque relecteur sur le commit
     # candidat (mêmes règles que la porte des avis, #1374).
@@ -682,8 +694,10 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
             # effectif (`freeze.origin=verdict`, #1756) ; sans jalon `frozen`,
             # c'est le contenu relu qui entre dans la cible. Un avis sur une
             # autre tête ne prouve rien : la branche a avancé depuis.
-            candidate = freeze_candidate(marks, repo_dir,
-                                         target or row.get("branch_target") or default)
+            from . import merge_queue
+            candidate = freeze_candidate(
+                marks, repo_dir, target or row.get("branch_target") or default,
+                waived=merge_queue.is_waived(row))
             # #2444 : la tête confrontée est la tête publiée (origin d'abord) ;
             # une branche disparue ne vaut pas un contrôle de la tête.
             reviewed = commit_id(candidate.get("sha"))
