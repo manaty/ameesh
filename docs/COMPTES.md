@@ -930,6 +930,16 @@ is written rather than a claim under a different identity. Two databases or
 two schemas are two meshes. This is what #1883 could not see: its
 `account_identities` compare fingerprints inside ONE database.
 
+**Identity of the machine** (#2593, 2026-10-19, N3 of the review of #2580).
+A claim also carries a fingerprint of the machine (`/etc/machine-id`, else the
+system hostname; the identifier itself is never written). Claims are matched
+on it, never on the configuration's `host` (`AMEESH_HOST`): two meshes of one
+workstation that name the host differently still see each other. The registry
+is already local to the machine and the user; the fingerprint only guards a
+registry shared between machines (a common `$XDG_STATE_HOME` or
+`account_registry`), where one path names two different credentials. A claim
+written before #2593 has no machine fingerprint and is still matched on `host`.
+
 **Report or refuse.** A credential claimed, within the hour, by **another**
 mesh of the same host is shared. By default this mesh only reports it:
 

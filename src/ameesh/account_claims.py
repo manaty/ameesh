@@ -49,6 +49,17 @@ Un identifiant revendiqué, vivant, par un AUTRE mesh est partagé :
   lancé. La politique est celle de chaque mesh : celui qui garde le compte
   reste en `report`, celui qui doit le rendre passe en `strict`/`refuse`.
 
+**Machine** (#2593, N3 de la relecture de #2580) : une revendication porte
+l'empreinte de la machine (`machine_hash` : `/etc/machine-id`, sinon le nom
+d'hôte du système), jamais filtrée sur `host` de la configuration
+(`AMEESH_HOST`) : deux meshes d'un même poste peuvent nommer l'hôte
+différemment et se verraient sinon l'un l'autre ignorés. Le registre est déjà
+local à la machine et à l'utilisateur ; l'empreinte ne défend que contre un
+`XDG_STATE_HOME` (ou `account_registry`) partagé entre machines, où un même
+chemin désigne deux identifiants distincts. `host` reste dans la revendication
+pour l'affichage ; une revendication sans empreinte de machine (écrite avant
+#2593) est encore comparée sur `host`.
+
 Jamais de secret : le registre porte des empreintes, des noms de compte, le
 nom (sans dossier) du fichier de configuration, l'hôte et la politique ;
 jamais une clé, jamais un chemin, jamais le contenu d'un identifiant. Deux
@@ -62,6 +73,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import tempfile
 import time
 
@@ -91,6 +103,9 @@ _IDENTITY_ATTR = "_ameesh_account_claim_mesh"
 #: dernière identité retenue par ce processus (empreinte de mesh), pour les
 #: lecteurs qui n'ont pas de connexion sous la main (`accounts.profiles`)
 _LAST_MESH: str | None = None
+#: fichiers d'identité de la machine (systemd, puis dbus), lus dans l'ordre
+MACHINE_ID_FILES = ("/etc/machine-id", "/var/lib/dbus/machine-id")
+_MACHINE: str | None = None
 
 
 def default_registry(environ=None) -> str:
@@ -133,6 +148,28 @@ def policy_name(cfg) -> str:
 
 def _fingerprint(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def machine_hash() -> str:
+    """#2593 : l'empreinte stable de la machine, identique pour tous les
+    meshes du poste quel que soit leur `host` : `/etc/machine-id` (jamais
+    écrit en clair), sinon le nom d'hôte du système. Lue une fois par
+    processus."""
+    global _MACHINE
+    if _MACHINE is None:
+        ident = ""
+        for path in MACHINE_ID_FILES:
+            try:
+                with open(path, encoding="ascii") as fh:
+                    ident = fh.read().strip()
+            except (OSError, ValueError):
+                continue
+            if ident:
+                break
+        if not ident:
+            ident = "hostname:" + socket.gethostname()
+        _MACHINE = _fingerprint("ameesh-account-claim/machine:" + ident)[:16]
+    return _MACHINE
 
 
 def mesh_hash(identity: str) -> str:
@@ -316,6 +353,7 @@ def _claim_data(cfg, host: str, profile, now: float) -> dict:
     return {
         "schema": SCHEMA,
         "host": host,
+        "machine": machine_hash(),
         "harness": profile.harness,
         "account": profile.name,
         "config": os.path.basename(str(getattr(cfg, "config_path", "") or "")),
@@ -400,8 +438,9 @@ def refresh(cfg, *, db=None, store=None, mesh: str | None = None,
 
 
 def _claims(folder: str, host: str) -> list[dict]:
-    """Les revendications lisibles d'un identifiant ; une illisible n'est pas
-    une preuve de partage, elle est ignorée."""
+    """Les revendications lisibles d'un identifiant, écrites sur CETTE
+    machine ; une illisible n'est pas une preuve de partage, elle est ignorée.
+    `host` ne départage que les revendications d'avant #2593 (sans machine)."""
     try:
         names = os.listdir(folder)
     except OSError:
@@ -419,7 +458,11 @@ def _claims(folder: str, host: str) -> list[dict]:
             continue
         if not isinstance(data, dict) or data.get("schema") != SCHEMA:
             continue
-        if str(data.get("host") or "") != host:
+        machine = data.get("machine")
+        if machine:
+            if str(machine) != machine_hash():
+                continue
+        elif str(data.get("host") or "") != host:
             continue
         out.append({"mesh": match.group(1), "seen_at": seen_at,
                     "harness": str(data.get("harness") or ""),
