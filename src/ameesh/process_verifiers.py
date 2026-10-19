@@ -567,9 +567,15 @@ def reviewed_head_of(milestones) -> str:
 
 
 def merged_of(milestones) -> str:
-    """Le dernier commit fusionne reel (sha), ou vide."""
+    """Le dernier commit fusionne reel (sha), ou vide.
+
+    #2317 (N5) : un jalon `merged` annulé par une correction `merged → build`
+    (`annulled`, calculé par la source) ne compte pas — sa fusion n'est plus
+    la revision livrée."""
     merged = ""
     for row in milestones or ():
+        if row.get("annulled"):
+            continue
         if _text(row.get("kind")) == "merged" and _text(row.get("sha")):
             merged = _text(row.get("sha"))
     return merged

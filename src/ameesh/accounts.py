@@ -305,6 +305,10 @@ class Profile:
     #: celui de l'environnement de l'exécuteur (L1078). Faux pour un profil
     #: synthétique (« (default) » : hôte sans comptes, session d'avant L30).
     declared: bool = False
+    #: #313 : raison du refus du compte par CE mesh (`account_sharing:
+    #: strict`, identifiant déclaré aussi par un autre mesh de l'hôte, posée
+    #: par `account_claims.mark_refused`) ; vide = pas de refus
+    refused: str = ""
 
     @property
     def default(self) -> bool:
@@ -587,8 +591,13 @@ def _refuse_shared_homes(harness: str, profiles: list[Profile]) -> None:
 
 
 def profiles(cfg, harness: str) -> list[Profile]:
-    """Les comptes déclarés pour ce harnais (liste vide : aucun, comportement d'avant L30)."""
-    return parse(getattr(cfg, "accounts", None) or {}).get(harness, [])
+    """Les comptes déclarés pour ce harnais (liste vide : aucun, comportement d'avant L30).
+
+    #313 : avec `account_sharing: strict`, un compte dont l'identifiant est
+    déclaré aussi par un autre mesh de l'hôte porte son refus (`refused`)."""
+    from . import account_claims
+    return account_claims.mark_refused(
+        cfg, parse(getattr(cfg, "accounts", None) or {}).get(harness, []))
 
 
 def homes(cfg, harness: str) -> list[str]:
@@ -618,8 +627,14 @@ def check(profile: Profile, environ=None) -> list[str]:
     Un dossier déclaré : existe, appartient à l'utilisateur, privé (aucun droit
     pour le groupe ni les autres), identifiants présents. Un fichier de clé :
     fichier ordinaire, à l'utilisateur, 0600 au plus. Une variable de clé :
-    présente et non vide dans l'environnement de l'exécuteur.
+    présente et non vide dans l'environnement de l'exécuteur. #313 : un compte
+    refusé par ce mesh (`refused`) a ce problème en premier.
     """
+    refused = getattr(profile, "refused", "")
+    return ([refused] if refused else []) + _check(profile, environ)
+
+
+def _check(profile: Profile, environ=None) -> list[str]:
     environ = os.environ if environ is None else environ
     problems: list[str] = []
     uid = os.getuid() if hasattr(os, "getuid") else None
@@ -1212,6 +1227,9 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
     result.problems = check(profile, environ)
     if result.problems:
         result.reason = "unusable profile: %s" % "; ".join(result.problems)
+        # #313 : le refus d'un compte partagé avec un autre mesh est une règle
+        # absolue — la garde de budget désactivée ne le lève pas
+        result.hard = bool(getattr(profile, "refused", ""))
         return result
     result.gauges = gauges_of(book, profile, items, environ, model=model, now=now)
     if result.gauges and record:
@@ -2177,7 +2195,9 @@ def report(cfg, db, book, *, now: float | None = None,
     fin de fenêtre s'y lit, comme dans la raison du compte.
     """
     now = time.time() if now is None else now
-    declared = parse(getattr(cfg, "accounts", None) or {})
+    from . import account_claims
+    declared = {harness: account_claims.mark_refused(cfg, items, now=now)
+                for harness, items in parse(getattr(cfg, "accounts", None) or {}).items()}
     store = storage.of(db).accounts if db is not None else None
     rows: list[dict] = []
     for harness, items in declared.items():

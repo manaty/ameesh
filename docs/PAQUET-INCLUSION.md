@@ -32,6 +32,21 @@ La correction a deux jambes, toutes deux dans ce dépôt :
    cette tête, essai de fusion propre contre la cible). C'est la liste de
    départ de la composition ; un courrier peut ajouter une admission, jamais
    retirer un lot prêt du calcul.
+
+   #2496 : un lot dont le seul motif est `conflict` est prêt **comme unité**
+   quand une remise poussée sous `refs/ameesh/resolutions/<lot>/<cible>-…`
+   (ou `union-<cible>-…`) a pour parents le gel relu et un commit de la
+   cible, fusionne proprement dans la base, et qu'un verdict la couvre (sur
+   le SHA de la remise, avec la classe la plus stricte du gel et du contenu
+   composé — la remise contre la base —, au moins un avis indépendant même
+   pour un lot léger, et jamais la dispense `-none` du gel) ou que c'est une
+   union mécanique (ajouts purs des deux côtés, arbre égal à la fusion
+   `merge=union` ; §2, aucun avis). La remise est alors la **source** à
+   composer (`source`, et « remise … » dans le rapport). Un verdict sur la
+   remise ne périme pas le gel de la branche ; il n'est mis de côté que pour
+   une fusion à deux parents, jamais pour la tête publiée ni un SHA gelé : un
+   blocage du gel reste. Un blocage sur la remise la refuse toujours. Sinon le
+   motif `conflict` dit pourquoi chaque remise est refusée.
 2. `scripts/paquet-inclusion.py --ready-file` confronte cette liste au
    manifeste : tout lot prêt doit être **composé**, ou figurer dans la table
    « Écartés (ce véhicule) » avec un **motif**. Une ligne sans motif ne compte
@@ -61,8 +76,10 @@ scripts/paquet-inclusion.py --manifest reviews/integration-paquet-h-…md \
 
 Sans source `--ready`/`--ready-file`, le contrôle s'arrête en `2` ; une source
 fournie mais vide (« aucun lot prêt ») est un calcul valide, pas une absence.
-`--no-ready` est le seul moyen d'assumer un contrôle sans liste calculée (audit
-hors base, par exemple).
+`--no-ready` est **refusé** (#2464) : sur la recomposition de h-1300, il a
+laissé passer #2384, prêt depuis 14:29, absent du manifeste sans ligne
+« écarté ». Une recomposition recalcule la liste sur sa cible
+(`paquet-candidats.py --ready-out`) ; elle ne saute pas le contrôle.
 
 `paquet-candidats.py` ne compose rien et n'écrit dans aucun dépôt : il lit la
 base, les jalons et Git (clone privé du radar, ou clone jetable),
@@ -104,17 +121,18 @@ scripts/paquet-inclusion.py … --no-expected
   après `#` isolé sont ignorés). À défaut, une section du manifeste dont le
   titre contient « admissions » fournit la liste, en liste à puces **ou en
   tableau** : le manifeste devient auto-porteur, c'est la forme recommandée.
-  Sans aucune de ces sources, le contrôle s'arrête en `2` : une sortie `0`
-  laisserait croire que le contrôle « admissions × manifeste » a eu lieu.
+  Une liste prête ne dispense pas de celle-ci : sans admissions, le contrôle
+  s'arrête en `2`, sauf `--no-expected` explicite — une sortie `0` laisserait
+  croire que le contrôle « admissions × manifeste » a eu lieu.
 - `--ready` / `--ready-file` : la liste **calculée** des lots prêts (#2404),
   telle que la produit `scripts/paquet-candidats.py --ready-out` (un id par
   ligne). Tout lot prêt doit être composé ou écarté avec un motif ; c'est la
   liste de départ de la composition, pas une seconde liste d'admissions. Un
   fichier fourni mais vide est un calcul valide (« aucun lot prêt »).
-- `--no-ready` : assume explicitement un contrôle sans liste calculée des lots
-  prêts ; le rapport dit alors « prêts × manifeste NON effectué ». Sans cette
-  option, l'absence de source prête arrête le contrôle en `2` : la composition
-  part de la liste calculée (#2404), elle ne suppose pas qu'elle est vide.
+- `--no-ready` : **refusé** (#2464). Il servait à assumer un contrôle sans
+  liste calculée ; utilisé sur la recomposition de h-1300, il a laissé passer
+  #2384 sans ligne « écarté ». L'absence de source prête arrête désormais le
+  contrôle en `2` : sur une recomposition, recalculer la liste sur la cible.
 - `--no-expected` : assume explicitement un contrôle sans liste d'admissions ;
   le rapport dit alors « admissions × manifeste NON effectué ». Si une liste
   de lots prêts est fournie, le contrôle « prêts × manifeste » reste rendu.
@@ -214,8 +232,8 @@ Codes de retour : `0` aucun défaut ; `1` une inclusion manquante, un lot prêt
 ni composé ni écarté avec un motif, un contenu absent non expliqué ou un commit
 introuvable, ou bien, sous `--strict`, un contenu partiel ou vide non
 expliqué ; `2` entrée invalide (manifeste ou tête introuvable, fichier de lots
-absent ou illisible, aucune source de liste prête sans `--no-ready`, ou aucune
-source de liste attendue sans `--no-expected`).
+absent ou illisible, aucune source de liste prête, `--no-ready` refusé, ou
+aucune source de liste attendue sans `--no-expected`).
 
 ## Ce qu'il ne prouve pas
 

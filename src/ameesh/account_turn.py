@@ -307,8 +307,10 @@ def for_turn(worker):
         return INVALID
     if not items:
         return None
-    if worker._account is not None and accounts.by_name(items, worker._account.name):
-        return worker._account
+    if worker._account is not None:
+        fresh = accounts.by_name(items, worker._account.name)
+        if fresh is not None:
+            return fresh
     try:
         return accounts.current(worker.db, worker.cfg.host, harness, items)
     except db_mod.Unavailable:

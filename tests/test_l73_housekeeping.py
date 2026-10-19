@@ -15,8 +15,8 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import (canon, containers, exploitation, menage, platform, registry,
-                    resources, storage, work)
+from ameesh import (build_artifacts, canon, containers, exploitation, menage,
+                    platform, registry, resources, storage, work)
 
 from .support import PgTestCase
 from .test_l43_perimetre_hote import HOST, _Canons, codes, host
@@ -55,6 +55,14 @@ def _write(path: str, size: int, age_s: float = 0.0) -> None:
         os.utime(path, (moment, moment))
 
 
+def _age_tree(path: str, age_s: float) -> None:
+    at = time.time() - age_s
+    for root, dirs, files in os.walk(path, topdown=False):
+        for name in files + dirs:
+            os.utime(os.path.join(root, name), (at, at))
+    os.utime(path, (at, at))
+
+
 def _git(*args: str, cwd: str) -> str:
     out = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True,
                          check=True, env=dict(os.environ, GIT_AUTHOR_NAME="t",
@@ -73,6 +81,18 @@ def _repo(base: str) -> str:
     _git("commit", "-q", "--allow-empty", "-m", "racine", cwd=main)
     _git("push", "-q", "origin", "main", cwd=main)
     return main
+
+
+def _pose_system_tmp(test: unittest.TestCase, chemin: str) -> None:
+    """Pose `AMEESH_SYSTEM_TMP` pour un test et le rend tel qu'il l'a trouvé
+    au nettoyage : absent s'il l'était, au lieu de le laisser vide. Vide vaut
+    `/tmp` en produit (`resources.system_tmp`) mais une variable vide n'est
+    pas une variable absente et fausse l'isolation du run suivant (#2532)."""
+    old = os.environ.get("AMEESH_SYSTEM_TMP")
+    os.environ["AMEESH_SYSTEM_TMP"] = chemin
+    test.addCleanup(lambda: os.environ.pop("AMEESH_SYSTEM_TMP", None)
+                    if old is None
+                    else os.environ.__setitem__("AMEESH_SYSTEM_TMP", old))
 
 
 class _Tmp(unittest.TestCase):
@@ -606,6 +626,25 @@ class TmpfsTest(unittest.TestCase):
         self.assertIsNone(resources.fs_usage("/chemin/absent")["tmp_size_bytes"])
 
 
+class SystemTmpNettoyageTest(unittest.TestCase):
+    def test_une_variable_absente_redevient_absente_apres_nettoyage(self):
+        """#2532 : le nettoyage d'un test rend `AMEESH_SYSTEM_TMP` absente
+        quand elle l'était. Le `old or ""` d'avant la laissait vide — vide
+        vaut `/tmp` en produit, mais une variable vide n'est pas une variable
+        absente et fausse l'isolation du run suivant."""
+        original = os.environ.pop("AMEESH_SYSTEM_TMP", None)
+        self.addCleanup(lambda: os.environ.__setitem__("AMEESH_SYSTEM_TMP", original)
+                        if original is not None
+                        else os.environ.pop("AMEESH_SYSTEM_TMP", None))
+        # les nettoyages sont LIFO : la restauration part en dernier, la
+        # vérification juste après le nettoyage du helper
+        self.addCleanup(self.assertNotIn, "AMEESH_SYSTEM_TMP", os.environ)
+        self.assertNotIn("AMEESH_SYSTEM_TMP", os.environ)
+        _pose_system_tmp(self, "/tmp/autre")
+        self.assertEqual(os.environ["AMEESH_SYSTEM_TMP"], "/tmp/autre")
+        self.doCleanups()
+
+
 # ==========================================================================
 # avec la base : tour, passage, CLI, alertes
 # ==========================================================================
@@ -626,9 +665,7 @@ class MenageDbTest(PgTestCase):
         systeme = os.path.join(self.tmp, "tmp-systeme")
         os.makedirs(systeme)
         pol = menage.Policy(orphan_min_size=4000)
-        old = os.environ.get("AMEESH_SYSTEM_TMP")
-        os.environ["AMEESH_SYSTEM_TMP"] = systeme
-        self.addCleanup(lambda: os.environ.__setitem__("AMEESH_SYSTEM_TMP", old or ""))
+        _pose_system_tmp(self, systeme)
         mine = menage.turn_env(self.cfgl, pol, "a1", {})["TMPDIR"]
         _write(os.path.join(mine, "de-la-session-precedente"), 100)
         tour = menage.Turn.begin(self.cfgl, pol, "a1", main, new_session=True, base_env={})
@@ -672,8 +709,12 @@ class MenageDbTest(PgTestCase):
         _write(os.path.join(root, "notes.txt"), 10)
         loin = time.time() + 30 * 24 * 3600
         rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t", now=loin)
-        self.assertTrue(os.path.isdir(root), rapport["skipped"])
-        self.assertIn("tmp %s kept: not owned by this mesh" % root, rapport["skipped"])
+        self.assertTrue(os.path.isdir(root))
+        self.assertNotIn("tmp %s kept: not owned by this mesh" % root,
+                         rapport["skipped"])
+        self.assertIn(root, [row["path"] for row in rapport["unowned"]])
+        self.assertEqual(len([e for e in rapport["entries"]
+                              if e.get("path") == root and e.get("action") == "unowned"]), 1)
         self.assertNotIn(root, [p["path"] for p in rapport["plan"]
                                 if p.get("action") == "suppression"])
 
@@ -705,9 +746,426 @@ class MenageDbTest(PgTestCase):
         _write(os.path.join(root, ".git"), 10)
         loin = time.time() + 30 * 24 * 3600
         rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t", now=loin)
+        self.assertTrue(os.path.isdir(root))
+        kept = [note for note in rapport["skipped"]
+                if note.startswith("tmp %s kept: git work —" % root)]
+        self.assertEqual(len(kept), 1)
+        self.assertIn("git metadata unreadable", kept[0])
+
+    def test_worktree_propre_et_pousse_dans_un_orphelin_possede_est_recupere(self):
+        """#2493 N2 : une copie git propre et poussée dans un dossier tmp
+        possédé n'est plus gardée à jamais : elle est récupérée par
+        `git worktree remove` (sans --force), puis le dossier part ; la branche
+        reste."""
+        _sans_processus(self)
+        pol = menage.Policy()
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        main = _repo(self.tmp)
+        root = os.path.join(troot, "a1+abcd9999")
+        os.makedirs(root)
+        menage._write_owner(troot, "a1+abcd9999", menage.mesh_key(self.cfgl),
+                            menage.ORIGIN_CREATED)
+        wt = os.path.join(root, "wt")
+        _git("worktree", "add", "-q", wt, "-b", "wt-recup", cwd=main)
+        _git("push", "-q", "origin", "wt-recup", cwd=main)
+        _age_tree(root, 3 * 3600)
+        rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t",
+                                  now=time.time() + 3 * 3600)
+        self.assertFalse(os.path.isdir(root), rapport["skipped"])
+        deleted = [e for e in rapport["entries"]
+                   if e.get("path") == root and e.get("action") == "deleted"]
+        self.assertEqual(len(deleted), 1)
+        self.assertIn("git worktrees recovered", deleted[0]["detail"])
+        self.assertNotIn(wt, _git("worktree", "list", cwd=main))
+        self.assertIn("wt-recup", _git("branch", "--list", "wt-recup", cwd=main))
+
+    def test_worktree_sale_dans_un_orphelin_possede_est_garde(self):
+        """#2493 N2 : aucun travail non commité n'est détruit : un worktree
+        sale garde le dossier, avec la raison et la commande d'inspection."""
+        _sans_processus(self)
+        pol = menage.Policy()
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        main = _repo(self.tmp)
+        root = os.path.join(troot, "a1+abcd9998")
+        os.makedirs(root)
+        menage._write_owner(troot, "a1+abcd9998", menage.mesh_key(self.cfgl),
+                            menage.ORIGIN_CREATED)
+        wt = os.path.join(root, "wt")
+        _git("worktree", "add", "-q", wt, "-b", "wt-sale", cwd=main)
+        _write(os.path.join(wt, "brouillon.txt"), 10)
+        _age_tree(root, 3 * 3600)
+        rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t",
+                                  now=time.time() + 3 * 3600)
+        self.assertTrue(os.path.isdir(root))
+        kept = [note for note in rapport["skipped"]
+                if note.startswith("tmp %s kept: git work —" % root)]
+        self.assertEqual(len(kept), 1)
+        self.assertIn("git -C", kept[0])
+        self.assertNotIn(root, [p["path"] for p in rapport["plan"]
+                                if p.get("action") == "suppression"])
+
+    def test_clone_avec_branche_locale_non_poussee_est_garde(self):
+        """#2493 (relecture dev7, cx1) : un clone emporte ses branches
+        locales, son stash, ses fichiers ignorés et casse ses worktrees liés ;
+        HEAD propre et poussé ne suffit pas — chacun garde le dossier."""
+        _sans_processus(self)
+        pol = menage.Policy()
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        _repo(self.tmp)
+        for nom, preparer in (
+                ("a1+abcd9997", lambda c: (
+                    _git("checkout", "-q", "-b", "travail", cwd=c),
+                    _git("commit", "-q", "--allow-empty", "-m", "jamais pousse", cwd=c),
+                    _git("checkout", "-q", "main", cwd=c))),
+                ("a1+abcd9996", lambda c: (
+                    _write(os.path.join(c, "brouillon.txt"), 10),
+                    _git("stash", "push", "-q", "-u", cwd=c))),
+                # relecture cx1 : un fichier ignoré (.env) partirait avec le clone
+                ("a1+abcd9995", lambda c: (
+                    _write(os.path.join(c, ".git", "info", "exclude"), 0),
+                    open(os.path.join(c, ".git", "info", "exclude"), "w").write("*.env\n"),
+                    _write(os.path.join(c, "private.env"), 10))),
+                # un clone qui porte un autre worktree lié ailleurs
+                ("a1+abcd9994", lambda c: _git(
+                    "worktree", "add", "-q", c + "-lie", "-b", "lie", cwd=c))):
+            root = os.path.join(troot, nom)
+            os.makedirs(root)
+            menage._write_owner(troot, nom, menage.mesh_key(self.cfgl),
+                                menage.ORIGIN_CREATED)
+            clone = os.path.join(root, "clone")
+            subprocess.run(["git", "clone", "-q", os.path.join(self.tmp, "origin.git"),
+                            clone], check=True, capture_output=True)
+            preparer(clone)
+            _age_tree(root, 3 * 3600)
+            rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t",
+                                      now=time.time() + 3 * 3600)
+            self.assertTrue(os.path.isdir(clone), nom)
+            kept = [note for note in rapport["skipped"]
+                    if note.startswith("tmp %s kept: git work —" % root)]
+            self.assertEqual(len(kept), 1, rapport["skipped"])
+
+    def test_worktree_dont_le_depot_commun_est_dans_le_tmp_est_garde(self):
+        _sans_processus(self)
+        main = _repo(self.tmp)
+        root = os.path.join(self.tmp, "tmp-recovery")
+        os.makedirs(root)
+        bare = os.path.join(root, "bare.git")
+        subprocess.run(["git", "clone", "-q", "--bare", main, bare],
+                       check=True, capture_output=True)
+        _git("fetch", "-q", "origin", "main:refs/remotes/origin/main", cwd=bare)
+        # #2525 : le dépôt nu est désormais vu lui aussi, mais le worktree
+        # dont le dépôt commun vit dans l'entrée passe en premier (gardes
+        # plus précises) et donne la raison.
+        self.assertIn(bare, menage._git_copies(root))
+        wt = os.path.join(root, "wt")
+        _git("worktree", "add", "-q", wt, "main", cwd=bare)
+        self.assertIn("common repository lives inside", menage.tmp_git_work(root))
+
+    def test_clone_dont_le_remote_est_dans_le_dossier_tmp_est_garde(self):
+        """#2493 (relecture) : les refs de suivi ne prouvent rien si le remote
+        vit dans le dossier temporaire supprimé : le clone et son origin
+        partiraient ensemble. Le dossier reste, avec la raison."""
+        _sans_processus(self)
+        pol = menage.Policy()
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        root = os.path.join(troot, "a1+abcd9993")
+        os.makedirs(root)
+        menage._write_owner(troot, "a1+abcd9993", menage.mesh_key(self.cfgl),
+                            menage.ORIGIN_CREATED)
+        origin = os.path.join(root, "origin.git")
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", origin],
+                       check=True)
+        amont = os.path.join(self.tmp, "amont")
+        subprocess.run(["git", "clone", "-q", origin, amont], check=True,
+                       capture_output=True)
+        _git("commit", "-q", "--allow-empty", "-m", "racine", cwd=amont)
+        _git("push", "-q", "origin", "main", cwd=amont)
+        clone = os.path.join(root, "clone")
+        subprocess.run(["git", "clone", "-q", origin, clone], check=True,
+                       capture_output=True)
+        # All these usable local URLs point to the same sole backup.
+        os.mkdir(os.path.join(clone, "sub"))
+        for url in (origin, "file://localhost" + origin,
+                    "file://" + origin.replace("origin.git", "%6frigin.git"),
+                    "sub/../../origin.git"):
+            with self.subTest(url=url):
+                _git("remote", "set-url", "origin", url, cwd=clone)
+                self.assertTrue(_git("ls-remote", "origin", cwd=clone))
+                self.assertIn("inside the temporary directory", menage.tmp_git_work(root))
+        _git("config", "url.%s.insteadOf" % origin, "review-backup:", cwd=clone)
+        _git("remote", "set-url", "origin", "review-backup:", cwd=clone)
+        self.assertTrue(_git("ls-remote", "origin", cwd=clone))
+        _age_tree(root, 3 * 3600)
+        self.assertIn("inside the temporary directory", menage.tmp_git_work(root))
+        rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t",
+                                  now=time.time() + 3 * 3600)
+        self.assertTrue(os.path.isdir(clone))
+        self.assertTrue(os.path.isdir(origin))
+        kept = [note for note in rapport["skipped"]
+                if note.startswith("tmp %s kept: git work —" % root)]
+        self.assertEqual(len(kept), 1, rapport["skipped"])
+        self.assertIn("inside the temporary directory", kept[0])
+
+    def test_entree_tmp_attribuee_avec_copie_git_non_sauvee_est_gardee(self):
+        """#2512 : une entrée de /tmp attribuée d'avant #222 ne se supprime
+        qu'avec les mêmes preuves qu'un dossier d'agent. Un fichier ignoré
+        hors artefacts, puis une branche locale non poussée d'un clone, la
+        gardent au lieu de partir avec le travail qu'ils portent."""
+        _sans_processus(self)
+        registry.upsert(self.db, "a1", harness="claude", host="pc")
+        systeme = os.path.join(self.tmp, "tmp-systeme")
+        os.makedirs(systeme)
+        _pose_system_tmp(self, systeme)
+        _repo(self.tmp)
+
+        def ignorer(copie: str) -> None:
+            with open(os.path.join(copie, ".git", "info", "exclude"), "w") as fh:
+                fh.write("*.env\n")
+            _write(os.path.join(copie, "private.env"), 10)
+
+        def branche_locale(copie: str) -> None:
+            _git("checkout", "-q", "-b", "travail", cwd=copie)
+            _git("commit", "-q", "--allow-empty", "-m", "jamais pousse", cwd=copie)
+            _git("checkout", "-q", "main", cwd=copie)
+
+        for nom, preparer in (("ignore", ignorer), ("branche", branche_locale)):
+            root = os.path.join(systeme, nom)
+            os.makedirs(root)
+            clone = os.path.join(root, "clone")
+            subprocess.run(["git", "clone", "-q",
+                            os.path.join(self.tmp, "origin.git"), clone],
+                           check=True, capture_output=True)
+            preparer(clone)
+            _age_tree(root, 3 * 3600)
+            self.assertTrue(menage.unsaved_git_work(root), nom)
+            st = os.lstat(root)
+            storage.of(self.db).housekeeping.log("pc", [{
+                "kind": "orphan", "action": "signaled", "path": root,
+                "bytes": menage.size_of(root), "agent": "a1",
+                "detail": "signalement attribué (avant #222)",
+                "data": {"ino": st.st_ino, "dev": st.st_dev}}], actor="test")
+            rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(),
+                                      host="pc", actor="t",
+                                      now=time.time() + 3 * 3600)
+            self.assertTrue(os.path.isdir(clone), nom)
+            garde = [p for p in rapport["plan"]
+                     if p.get("path") == root and p.get("action") == "garde"]
+            self.assertEqual(len(garde), 1, (nom, rapport["plan"]))
+            self.assertIn("git work to keep", garde[0]["detail"], nom)
+
+    def test_entree_tmp_attribuee_avec_artefact_de_build_seul_est_supprimee(self):
+        """#2512 : les règles d'artefacts de l'hôte restent exemptées — un clone
+        propre et poussé qui ne porte qu'un `node_modules` ignoré part, sinon
+        le contrôle garderait toute copie git par prudence."""
+        _sans_processus(self)
+        registry.upsert(self.db, "a1", harness="claude", host="pc")
+        systeme = os.path.join(self.tmp, "tmp-systeme")
+        os.makedirs(systeme)
+        _pose_system_tmp(self, systeme)
+        _repo(self.tmp)
+        root = os.path.join(systeme, "artefact")
+        os.makedirs(root)
+        clone = os.path.join(root, "clone")
+        subprocess.run(["git", "clone", "-q", os.path.join(self.tmp, "origin.git"),
+                        clone], check=True, capture_output=True)
+        with open(os.path.join(clone, ".git", "info", "exclude"), "w") as fh:
+            fh.write("node_modules/\n")
+        _write(os.path.join(clone, "node_modules", "x", "f"), 10)
+        _age_tree(root, 3 * 3600)
+        # sans les règles de l'hôte, l'ignoré garderait ; avec elles, il part
+        self.assertTrue(menage.unsaved_git_work(root))
+        self.assertEqual(menage.unsaved_git_work(root, build_artifacts.rules_of(None)), "")
+        st = os.lstat(root)
+        storage.of(self.db).housekeeping.log("pc", [{
+            "kind": "orphan", "action": "signaled", "path": root,
+            "bytes": menage.size_of(root), "agent": "a1",
+            "detail": "signalement attribué (avant #222)",
+            "data": {"ino": st.st_ino, "dev": st.st_dev}}], actor="test")
+        rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(),
+                                  host="pc", actor="t", now=time.time() + 3 * 3600)
+        self.assertFalse(os.path.exists(root))
+        self.assertIn(("orphan", "deleted"),
+                      {(e.get("kind"), e.get("action")) for e in rapport["entries"]})
+
+    def test_depot_nu_dans_une_entree_tmp_attribuee_est_garde(self):
+        """#2525 : `_git_copies` ne reconnaissait une copie qu'à son `.git` ;
+        un dépôt nu à la racine de l'entrée (`origin.git` : HEAD, objects,
+        refs) était invisible, et la suppression emportait ses commits."""
+        _sans_processus(self)
+        registry.upsert(self.db, "a1", harness="claude", host="pc")
+        systeme = os.path.join(self.tmp, "tmp-systeme")
+        os.makedirs(systeme)
+        old = os.environ.get("AMEESH_SYSTEM_TMP")
+        os.environ["AMEESH_SYSTEM_TMP"] = systeme
+        self.addCleanup(lambda: os.environ.__setitem__("AMEESH_SYSTEM_TMP", old or ""))
+        main = _repo(self.tmp)
+        root = os.path.join(systeme, "nu")
+        os.makedirs(root)
+        bare = os.path.join(root, "origin.git")
+        subprocess.run(["git", "clone", "-q", "--bare", main, bare],
+                       check=True, capture_output=True)
+        _age_tree(root, 3 * 3600)
+        self.assertIn(bare, menage._git_copies(root))
+        self.assertIn("bare repository", menage.unsaved_git_work(root))
+        st = os.lstat(root)
+        storage.of(self.db).housekeeping.log("pc", [{
+            "kind": "orphan", "action": "signaled", "path": root,
+            "bytes": menage.size_of(root), "agent": "a1",
+            "detail": "signalement attribué (avant #222)",
+            "data": {"ino": st.st_ino, "dev": st.st_dev}}], actor="test")
+        rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(),
+                                  host="pc", actor="t", now=time.time() + 3 * 3600)
         self.assertTrue(os.path.isdir(root), rapport["skipped"])
-        self.assertIn("tmp %s kept: contains a Git worktree or clone" % root,
-                      rapport["skipped"])
+        garde = [p for p in rapport["plan"]
+                 if p.get("path") == root and p.get("action") == "garde"]
+        self.assertEqual(len(garde), 1, rapport["plan"])
+        self.assertIn("git work to keep", garde[0]["detail"])
+        self.assertIn("bare repository", garde[0]["detail"])
+
+    def test_depot_nu_dans_un_dossier_d_agent_est_garde(self):
+        """#2525 : même angle mort pour `tmp_git_work` — un dossier d'agent
+        qui ne porte qu'un dépôt nu avec un commit reste, au lieu de partir
+        avec ses commits."""
+        _sans_processus(self)
+        pol = menage.Policy()
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        main = _repo(self.tmp)
+        root = os.path.join(troot, "a1+abcd9992")
+        os.makedirs(root)
+        menage._write_owner(troot, "a1+abcd9992", menage.mesh_key(self.cfgl),
+                            menage.ORIGIN_CREATED)
+        bare = os.path.join(root, "origin.git")
+        subprocess.run(["git", "clone", "-q", "--bare", main, bare],
+                       check=True, capture_output=True)
+        _age_tree(root, 3 * 3600)
+        self.assertIn("bare repository", menage.tmp_git_work(root))
+        rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t",
+                                  now=time.time() + 3 * 3600)
+        self.assertTrue(os.path.isdir(root), rapport["skipped"])
+        kept = [note for note in rapport["skipped"]
+                if note.startswith("tmp %s kept: git work —" % root)]
+        self.assertEqual(len(kept), 1, rapport["skipped"])
+        self.assertIn("bare repository", kept[0])
+        self.assertNotIn(root, [p["path"] for p in rapport["plan"]
+                                if p.get("action") == "suppression"])
+
+    def test_copie_git_imbriquee_non_sauvee_est_gardee(self):
+        """#2525 : une copie à plus d'un niveau (`entry/x/y/clone`) n'était
+        pas vue ; son travail non commité partait avec l'entrée. Le parcours
+        borné la trouve, pour l'entrée attribuée comme pour l'agent."""
+        _sans_processus(self)
+        registry.upsert(self.db, "a1", harness="claude", host="pc")
+        systeme = os.path.join(self.tmp, "tmp-systeme")
+        os.makedirs(systeme)
+        old = os.environ.get("AMEESH_SYSTEM_TMP")
+        os.environ["AMEESH_SYSTEM_TMP"] = systeme
+        self.addCleanup(lambda: os.environ.__setitem__("AMEESH_SYSTEM_TMP", old or ""))
+        _repo(self.tmp)
+        root = os.path.join(systeme, "imbrique")
+        os.makedirs(root)
+        clone = os.path.join(root, "x", "y", "clone")
+        os.makedirs(os.path.dirname(clone))
+        subprocess.run(["git", "clone", "-q", os.path.join(self.tmp, "origin.git"),
+                        clone], check=True, capture_output=True)
+        _write(os.path.join(clone, "brouillon.txt"), 10)
+        _age_tree(root, 3 * 3600)
+        self.assertIn(clone, menage._git_copies(root))
+        self.assertIn("modified or untracked", menage.unsaved_git_work(root))
+        self.assertIn("modified or untracked", menage.tmp_git_work(root))
+        st = os.lstat(root)
+        storage.of(self.db).housekeeping.log("pc", [{
+            "kind": "orphan", "action": "signaled", "path": root,
+            "bytes": menage.size_of(root), "agent": "a1",
+            "detail": "signalement attribué (avant #222)",
+            "data": {"ino": st.st_ino, "dev": st.st_dev}}], actor="test")
+        rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(),
+                                  host="pc", actor="t", now=time.time() + 3 * 3600)
+        self.assertTrue(os.path.isdir(clone), rapport["skipped"])
+
+    def test_copie_git_imbriquee_propre_et_poussee_part_avec_l_entree(self):
+        """#2525 : le parcours ne garde pas par simple présence — une copie
+        imbriquée propre et poussée, sans remote dans l'entrée, part avec
+        elle, comme une copie de premier niveau."""
+        _sans_processus(self)
+        registry.upsert(self.db, "a1", harness="claude", host="pc")
+        systeme = os.path.join(self.tmp, "tmp-systeme")
+        os.makedirs(systeme)
+        old = os.environ.get("AMEESH_SYSTEM_TMP")
+        os.environ["AMEESH_SYSTEM_TMP"] = systeme
+        self.addCleanup(lambda: os.environ.__setitem__("AMEESH_SYSTEM_TMP", old or ""))
+        _repo(self.tmp)
+        root = os.path.join(systeme, "imbrique-propre")
+        os.makedirs(root)
+        clone = os.path.join(root, "x", "y", "clone")
+        os.makedirs(os.path.dirname(clone))
+        subprocess.run(["git", "clone", "-q", os.path.join(self.tmp, "origin.git"),
+                        clone], check=True, capture_output=True)
+        _age_tree(root, 3 * 3600)
+        self.assertIn(clone, menage._git_copies(root))
+        self.assertEqual(menage.unsaved_git_work(root), "")
+        st = os.lstat(root)
+        storage.of(self.db).housekeeping.log("pc", [{
+            "kind": "orphan", "action": "signaled", "path": root,
+            "bytes": menage.size_of(root), "agent": "a1",
+            "detail": "signalement attribué (avant #222)",
+            "data": {"ino": st.st_ino, "dev": st.st_dev}}], actor="test")
+        rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(),
+                                  host="pc", actor="t", now=time.time() + 3 * 3600)
+        self.assertFalse(os.path.exists(root), rapport["skipped"])
+        self.assertIn(("orphan", "deleted"),
+                      {(e.get("kind"), e.get("action")) for e in rapport["entries"]})
+
+    def test_worktree_imbrique_propre_est_retire_par_git_worktree_remove(self):
+        """#2525 : un worktree lié à plus d'un niveau est vu comme les autres ;
+        propre et poussé, il est retiré par `git worktree remove` (jamais
+        forcé) avant la suppression du dossier, et son dépôt est élagué — pas
+        de métadonnées périmées laissées derrière."""
+        _sans_processus(self)
+        pol = menage.Policy()
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        main = _repo(self.tmp)
+        root = os.path.join(troot, "a1+abcd9991")
+        os.makedirs(os.path.join(root, "x", "y"))
+        menage._write_owner(troot, "a1+abcd9991", menage.mesh_key(self.cfgl),
+                            menage.ORIGIN_CREATED)
+        wt = os.path.join(root, "x", "y", "wt")
+        _git("worktree", "add", "-q", wt, "-b", "wt-imbrique", cwd=main)
+        _git("push", "-q", "origin", "wt-imbrique", cwd=main)
+        _age_tree(root, 3 * 3600)
+        self.assertIn(wt, menage._git_copies(root))
+        self.assertEqual(menage.tmp_git_work(root), "")
+        rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t",
+                                  now=time.time() + 3 * 3600)
+        self.assertFalse(os.path.isdir(root), rapport["skipped"])
+        deleted = [e for e in rapport["entries"]
+                   if e.get("path") == root and e.get("action") == "deleted"]
+        self.assertEqual(len(deleted), 1, rapport["entries"])
+        self.assertIn("git worktrees recovered", deleted[0]["detail"])
+        self.assertNotIn(wt, _git("worktree", "list", cwd=main))
+        self.assertIn("wt-imbrique", _git("branch", "--list", "wt-imbrique", cwd=main))
+
+    def test_parcours_des_copies_borne_au_walk_limit_garde_l_entree(self):
+        """#2525 : parcours borné à `WALK_LIMIT` dossiers ouverts ; budget
+        épuisé = doute, l'entrée est gardée au lieu de conclure à tort qu'il
+        n'y a pas de copie."""
+        root = os.path.join(self.tmp, "borne")
+        clone = os.path.join(root, "a", "b", "c", "clone")
+        os.makedirs(os.path.dirname(clone))
+        _repo(self.tmp)
+        subprocess.run(["git", "clone", "-q", os.path.join(self.tmp, "origin.git"),
+                        clone], check=True, capture_output=True)
+        _write(os.path.join(clone, "brouillon.txt"), 10)
+        with mock.patch.object(menage, "WALK_LIMIT", 3):
+            raison = menage.unsaved_git_work(root)
+            self.assertIn("more than 3 directories", raison)
+            self.assertIn("copies not fully inspected", raison)
+        self.assertIn("modified or untracked", menage.unsaved_git_work(root))
 
     def _suivi(self, main: str, nom: str, lot: int | None) -> str:
         wt = os.path.join(self.tmp, nom)

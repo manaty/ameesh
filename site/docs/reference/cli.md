@@ -375,6 +375,9 @@ ameesh work delegate <id> <agent> --within 30m|2h|1d|SECONDS [--actor A]
 ameesh work expire-delegations [--dry-run] [--json]
 ameesh work note <id> <text> [--actor A]
 ameesh work milestone <id> <frozen|verdict> [ok|blocked] [--sha SHA] [--note N] [--actor A]
+                       [--repo R] [--no-static-checks REASON]
+        # frozen: the project's static checks (scripts/freeze-checks.py of SHA,
+        # run on SHA's tree) pass first; red refuses the freeze (#2542)
 ameesh work backlog add --title T --value "expected value" --score 1-100
                         [--priority 1|2|3] [--source S] [--team T] [--requires CAP …]
                         [--body B] [--package CARD] [--json]

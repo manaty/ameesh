@@ -1104,6 +1104,15 @@ class Mailbox(Domain):
         """Derniers messages du destinataire, du plus récent au plus ancien."""
 
     @abc.abstractmethod
+    def review_requests(self, recipient: str, lot: str) -> list[dict]:
+        """#2504 : les demandes de relecture (`kind = 'request'`) du
+        destinataire liées à ce lot, du plus récent au plus ancien.
+
+        Le filtre (destinataire, nature, lot) est fait DANS la requête : un
+        `history` borne avant de filtrer, donc une demande ancienne du même lot
+        sortait de la fenêtre et une re-désignation renvoyait un doublon."""
+
+    @abc.abstractmethod
     def delivered_for_lot(self, recipient: str, lot: str, limit: int) -> list[dict]:
         """Messages déjà remis d'un lot, du plus récent au plus ancien, bornés
         par `limit`. Filtre destinataire ET lot dans la requête, sans fenêtre
@@ -1964,9 +1973,22 @@ class WorkItems(Domain):
         dédupliquée exactement."""
 
     @abc.abstractmethod
+    def corrections(self, ids: Sequence[int] | None = None) -> dict[int, float]:
+        """#2317 (N2/N4) : instant de la dernière correction `merged → build`
+        par lot, `{}` sans correction.
+
+        Une correction se reconnaît à la **transition** du journal (un
+        événement `build` dont l'état précédent est `merged`), jamais au texte
+        de sa note — une note libre du même préfixe n'annule rien. `ids` borne
+        la lecture aux lots candidats au lieu de relire tout le journal à
+        chaque relevé."""
+
+    @abc.abstractmethod
     def milestones(self, item_id: int, limit: int | None) -> list[dict]:
         """Les jalons d'un lot (0013), du plus récent au plus ancien.
-        `None` lit tout l'historique, notamment les anciens blocages du train."""
+        `None` lit tout l'historique, notamment les anciens blocages du train.
+        Chaque ligne porte `annulled` : vrai pour un jalon `merged` qu'une
+        correction `merged → build` postérieure a annulé (#2317)."""
 
     @abc.abstractmethod
     def add_milestone(self, item_id: int, kind: str, *, sha: str, actor: str,

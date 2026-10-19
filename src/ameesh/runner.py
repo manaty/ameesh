@@ -5409,6 +5409,29 @@ class AgentWorker(threading.Thread):
         return texte
 
     def _run_turn(self, spec: dict) -> bool:
+        """Un tour, sous battement de bail **dès la préparation** (#2544).
+
+        Le battement ne démarrait qu'une fois le harnais publié : sous charge
+        CI, la préparation (dossier, harnais, canon, ménage, comptabilité)
+        pouvait dépasser un bail court, le veilleur tuait le worker avant le
+        `Popen` et le tour ne démarrait jamais (run 39158768160, psql 6/16 :
+        « stop requested (lease deadline reached): harness not yet published »
+        puis « lease lost … before the turn »). Le bail protège le tour entier
+        — la préparation en fait partie — donc le battement démarre ici, avant
+        elle, et la couvre jusqu'à la sortie du tour, y compris les retours
+        anticipés.
+        """
+        heartbeat_done = threading.Event()
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat, args=(heartbeat_done,),
+                                                 daemon=True)
+        self.heartbeat_thread.start()
+        try:
+            return self._run_turn_sous_battement(spec, heartbeat_done)
+        finally:
+            heartbeat_done.set()
+
+    def _run_turn_sous_battement(self, spec: dict,
+                                 heartbeat_done: threading.Event) -> bool:
         if spec.get("lot_switch_failed"):
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             return False
@@ -5741,10 +5764,6 @@ class AgentWorker(threading.Thread):
                 self.fail_turn(budget_mod.PAUSE_PREFIX + refus, refus)
                 return False
 
-        heartbeat_done = threading.Event()
-        self.heartbeat_thread = threading.Thread(target=self._heartbeat, args=(heartbeat_done,),
-                                                 daemon=True)
-        self.heartbeat_thread.start()
         preempt_done = threading.Event()
         # Un nouveau tour remet à zéro le latch de publication : il ne concerne
         # que la course du tour précédent, et les autres déclencheurs (bail,
@@ -8679,6 +8698,7 @@ class Runner:
                     continue
             log_async(line)
         self._carry_errors = errors
+
     def packet_sweep_once(self, db) -> None:
         """#2426 : ferme les lots unitaires des paquets fusionnés.
 
@@ -9407,6 +9427,51 @@ class Runner:
                 except Exception:
                     pass
 
+    def account_claims_once(self) -> None:
+        """#313 (décision 0033) : revendique, dans le registre de l'hôte, les
+        identifiants des comptes de cette configuration, puis journalise ceux
+        qu'un autre mesh de l'hôte déclare aussi — au premier passage, puis à
+        chaque changement. Ne lève jamais."""
+        from . import account_claims
+        try:
+            account_claims.refresh(self.cfg)
+            partages = account_claims.shared(self.cfg)
+        except (OSError, ValueError) as exc:
+            log_async("account registry of this host unusable (%s): a provider "
+                      "account declared by another mesh is not detected" % exc)
+            return
+        vus = frozenset((p["harness"], p["account"], account_claims.describe(p))
+                        for p in partages)
+        if vus == getattr(self, "_accounts_shared", None):
+            return
+        self._accounts_shared = vus
+        strict = account_claims.policy(self.cfg) == "strict"
+        for harness, account, others in sorted(vus):
+            log_async("%s account %s: credentials also declared by another mesh of "
+                      "this host: %s — decision 0033, one organisation per account; "
+                      "%s" % (harness, account, others,
+                              "refused here (account_sharing: strict)" if strict
+                              else "reported only (account_sharing: report)"))
+
+    def start_account_claims(self) -> threading.Thread | None:
+        """#313 : revendications au démarrage, puis toutes les
+        `account_claims.REFRESH_S` sur leur propre fil (une revendication vit
+        une heure) ; en `--once`, un seul passage."""
+        from . import account_claims
+        if self.once:
+            self.account_claims_once()
+            return None
+
+        def boucle() -> None:
+            while not self.stop.is_set():
+                self.account_claims_once()
+                if self.stop.wait(account_claims.REFRESH_S):
+                    return
+
+        thread = threading.Thread(target=boucle, daemon=True, name="comptes-hote")
+        thread.start()
+        return thread
+
     def log_harnesses(self) -> None:
         """Au démarrage (L106) : le binaire de chaque harnais servi, résolu et
         journalisé avec son chemin absolu — ou « hôte non prêt » tout de suite,
@@ -9773,6 +9838,7 @@ class Runner:
                                              self.cfg.schema, int(self.mail_batch),
                                              self.cfg.config_source))
         self.start_canon_sync()
+        self.start_account_claims()
         # L159f : suivi de la porte et acquittements — en `--once` aussi (r3) :
         # le tour de premier plan compte dans l'accusé partagé de l'hôte
         self._start_host_gate()

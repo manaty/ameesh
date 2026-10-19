@@ -1104,7 +1104,7 @@ def _reviewer_request(db: Db, item: dict, reviewer: str, who: str) -> dict:
     already covers this reviewer and head is reused, not sent again (#2495).
     """
     from . import mail, plan_git
-    from .review_designation import (REQUEST_HISTORY, REQUEST_KIND, covering_request,
+    from .review_designation import (REQUEST_KIND, covering_request,
                                      manual_reviewer_message)
 
     name = (reviewer or "").strip()
@@ -1116,13 +1116,15 @@ def _reviewer_request(db: Db, item: dict, reviewer: str, who: str) -> dict:
         latest = None
     freeze = ({"id": int(latest["id"]), "sha": str(latest.get("sha") or "")}
               if latest is not None else None)
-    # #2495 : one request per (lot, reviewer, head). A re-designation, or a
-    # designation after the freeze already woke this reviewer, sends nothing.
+    # #2495/#2504 : one request per (lot, reviewer, head). A re-designation, or
+    # a designation after the freeze already woke this reviewer, sends nothing.
+    # The requests are selected per lot in storage: an old one cannot fall out
+    # of a history window under a heavy mailbox.
     try:
-        prior = covering_request(mail.history(db, name, REQUEST_HISTORY),
+        prior = covering_request(mail.review_requests(db, name, int(item["id"])),
                                  lot=int(item["id"]), reviewer=name,
                                  sha=freeze["sha"] if freeze else "")
-    except Exception:  # noqa: BLE001 - unreadable history: send, as before #2495
+    except Exception:  # noqa: BLE001 - unreadable requests: send, as before #2495
         prior = None
     if prior is not None:
         return {"reviewer_request_message_id": int(prior["id"]),
@@ -2718,6 +2720,7 @@ def milestone(
     note: str = "",
     on_frozen=None,
     after_commit: list | None = None,
+    outcome: dict | None = None,
 ) -> dict:
     """Déclare un jalon que la machine à états ne peut pas déduire.
 
@@ -2744,6 +2747,13 @@ def milestone(
     hook et sa liste, comme le contrat #1617 l'exige. Un callback explicite
     l'emporte toujours (témoins, reprise hors hook).
 
+    `outcome` (facultatif) reçoit la forme de la désignation du gel par défaut,
+    pour le message de la CLI. Avant d'installer ce hook, un gel dont la tête
+    est couverte par un report de verdicts (#2442) est reconnu par
+    `verdict_carry.would_carry` : la désignation s'abstient alors et garde les
+    relecteurs reportés, sans courrier (#2487). Le plan est lu **avant** la
+    transaction du jalon : la transaction ne fait aucune lecture réseau.
+
     Le feu ne s'écrit pas ici sans contrôle : `ameesh.fire.give` vérifie qu'il
     porte sur le gel courant, et `ameesh.fire.withdraw` qu'un feu est actif.
     """
@@ -2768,7 +2778,11 @@ def milestone(
         from . import review_designation_activation as activation
         cfg = getattr(db, "cfg", None)
         if activation.enabled(cfg) and not _in_transaction(db):
-            on_frozen = activation.hook(cfg)
+            # #2487 : un gel réaligné dont les verdicts vont être reportés
+            # n'appelle pas de nouvelle désignation. Le plan est lu avant la
+            # transaction du jalon (lectures git/réseau hors verrou de ligne).
+            carried = activation.carried_plan(cfg, db, item_id, sha)
+            on_frozen = activation.hook(cfg, outcome, carried=carried)
             if after_commit is None:
                 after_commit = []
                 drain = after_commit

@@ -46,16 +46,18 @@ dans le motif reste une référence faible. Une ligne « écartée » sans motif
 lève pas l'omission (#2404).
 
 Sortie : un rapport lisible, ou `--json` (schéma `ameesh-paquet-inclusion/1`).
-La liste des lots prêts est demandée : sans source `--ready`/`--ready-file`, le
-contrôle s'arrête en 2, sauf `--no-ready` qui assume un contrôle partiel ; un
-fichier fourni mais vide (« aucun lot prêt ») est valide, un fichier absent ou
-illisible est une entrée invalide.
+La liste des lots prêts est **exigée** : sans source `--ready`/`--ready-file`,
+le contrôle s'arrête en 2 ; `--no-ready` est refusé (#2464 : une recomposition
+l'a utilisé et a laissé passer un lot prêt). Un fichier fourni mais vide
+(« aucun lot prêt ») est valide, un fichier absent ou illisible est une entrée
+invalide. Sur une recomposition, la liste est recalculée sur la cible de la
+recomposition (`scripts/paquet-candidats.py --ready-out`).
 Codes de retour : 0 si aucun défaut ; 1 si une inclusion manquante, un lot
 prêt ni composé ni écarté avec un motif, un contenu absent non expliqué ou un
 commit introuvable, ou bien, sous `--strict`, un contenu partiel ou vide non
 expliqué ; 2 si l'entrée est invalide (manifeste ou tête introuvable, fichier
-de lots absent ou illisible, aucune source de liste prête sans `--no-ready`, ou
-aucune source de liste attendue sans `--no-expected`).
+de lots absent ou illisible, aucune source de liste prête, ou aucune source de
+liste attendue sans `--no-expected`).
 Le script est en lecture seule : aucun réseau, aucune écriture dans le dépôt.
 """
 
@@ -654,30 +656,39 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
     if not expected and manifest.admissions:
         expected = list(manifest.admissions)
     ready = collect_ids(getattr(args, "ready", []), getattr(args, "ready_file", []))
-    no_ready = bool(getattr(args, "no_ready", False))
-    # Une source fournie mais vide est un calcul valide (« aucun lot prêt ») :
-    # seule l'absence de source exige --no-ready (#2404, relecture cx2 B2).
+    if getattr(args, "no_ready", False):
+        # #2464 : sur la recomposition de h-1300, le composeur a gardé le
+        # manifeste et sauté le contrôle « prêts × manifeste » avec --no-ready ;
+        # #2384, prêt depuis 14:29, a été omis sans ligne « écarté ». Une
+        # recomposition recalcule la liste sur sa cible, elle ne s'en dispense
+        # pas.
+        raise InputError(
+            "--no-ready est refusé (#2464) : une recomposition l'a utilisé et a "
+            "laissé passer un lot prêt (#2384). Recalculer la liste sur la cible "
+            "de la recomposition (scripts/paquet-candidats.py --ready-out …) et "
+            "la passer avec --ready ou --ready-file"
+        )
+    # Une source fournie mais vide est un calcul valide (« aucun lot prêt »).
     ready_source = bool(
         getattr(args, "ready", None) or getattr(args, "ready_file", None)
     )
     expected_source = bool(args.expected or args.expected_file or manifest.admissions)
-    if not ready_source and not no_ready:
+    if not ready_source:
         # La composition part de la liste calculée (#2404) : sans elle, le
-        # contrôle ne peut pas dire qu'un lot prêt a été oublié. L'assumer
-        # explicitly (--no-ready) est un contrôle partiel, jamais un défaut.
+        # contrôle ne peut pas dire qu'un lot prêt a été oublié.
         raise InputError(
             "aucune liste de lots prêts : fournir --ready ou --ready-file "
-            "(sortie de scripts/paquet-candidats.py --ready-out), ou assumer "
-            "le contrôle partiel avec --no-ready"
+            "(sortie de scripts/paquet-candidats.py --ready-out), recalculée "
+            "sur la cible de la composition ou de la recomposition"
         )
-    if not expected_source and not ready_source and not args.no_expected:
-        # Sans liste attendue ni liste calculée, le contrôle ne peut pas
-        # conclure : une sortie 0 laisserait croire qu'il a eu lieu
-        # (#1655 N1, #2404). --no-expected l'assume explicitement.
+    if not expected_source and not args.no_expected:
+        # Une liste prête contrôle les omissions de lots prêts, pas les
+        # admissions du pilote : sauter ce second contrôle reste explicite
+        # (#1655 N1), même quand la liste calculée est fournie.
         raise InputError(
-            "aucun lot attendu ni prêt : fournir --expected, --expected-file, "
-            "--ready, --ready-file ou une section « admissions » au manifeste, "
-            "ou assumer le contrôle partiel avec --no-expected"
+            "aucun lot attendu : fournir --expected, --expected-file ou une "
+            "section « admissions » au manifeste, ou assumer le contrôle "
+            "partiel avec --no-expected"
         )
     excused = {
         lot: "reporté (déclaré hors manifeste)"
@@ -833,7 +844,6 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
         "ready_source": (
             "options" if ready_source else None
         ),
-        "no_ready": no_ready,
         "ecartes": {str(lot): reason for lot, reason in sorted(manifest.ecartes.items())},
         "excused": sorted(excused),
         "composed": sorted(composed),
@@ -885,12 +895,6 @@ def render(payload: dict) -> str:
         out.append(
             f"Prêts : {len(payload['ready'])} lots (liste calculée, "
             f"{payload['ready_source']}) — {liste}"
-        )
-    elif payload.get("no_ready"):
-        out.append(
-            "Prêts : contrôle « prêts × manifeste » NON effectué (--no-ready ; "
-            "fournir --ready-file, sortie de scripts/paquet-candidats.py "
-            "--ready-out)"
         )
     out.append("")
 
@@ -1039,8 +1043,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="assumer un contrôle sans liste attendue (admissions "
                              "non vérifiées)")
     parser.add_argument("--no-ready", dest="no_ready", action="store_true",
-                        help="assumer un contrôle sans liste calculée des lots "
-                             "prêts (#2404)")
+                        help="refusé (#2464) : la liste calculée des lots prêts "
+                             "est exigée, y compris sur une recomposition")
     args = parser.parse_args(argv)
 
     for value in args.expected:
