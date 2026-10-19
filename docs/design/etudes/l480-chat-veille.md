@@ -29,8 +29,8 @@ lancé avec un goal ».
 | journal de conversation (L78) | fusionné | table + NOTIFY `ameesh_chat`, écrit par l'exécuteur d'un tour |
 | client terminal (L79, #287) | PR #672, GO, en file CI | `ameesh chat <agent>` : historique, LISTEN, entrée tapée → courrier, `!urgent` / `!stop` |
 | veille d'agent (L121) | fusionné | minuterie systemd → courrier `consignes/veille.md` ; **le courrier n'ouvre un tour que si un exécuteur réclame l'agent** |
-| `ResidentWorker` (L76, #285) | PR #417 armée | le processus de harnais reste ouvert sous bail entre les tours |
-| file d'entrée + autorité (L77) | **aucun lot** | messages humains en file, enveloppe, identité locale (`local_accounts`) |
+| `ResidentWorker` (L76, #285) | **fusionné** (paquet 11h du 13/10) | le processus de harnais reste ouvert sous bail entre les tours |
+| file d'entrée + autorité (L77) | **qa** (PR #1990, gel `ad04d9644`, avis cx3 OK) | messages humains en file, enveloppe, identité locale (`local_accounts`) |
 
 # Voie cible (L76 + L77)
 
@@ -39,8 +39,9 @@ entrées (message humain, courrier, événement) comme des tours, le journal
 (L78) et le client (L79) portent la conversation, et l'autorité d'un message
 humain passe par l'enveloppe d'identité locale (L77) au lieu de l'ascendance
 du processus. C'est la décision 0035 ; elle règle le cas général (plusieurs
-humains, page Nexlink, rotation). Elle n'est **pas disponible** : L76 (#285)
-n'est pas fusionnée et L77 (#286) est en intake, dépendante de #285.
+humains, page Nexlink, rotation). Elle n'est **pas encore disponible** : L76
+(#285) est fusionnée, L77 (#286) est en qa sur `ad04d9644` (admise au paquet
+h-1100, reportée au paquet suivant par le pilote).
 
 # Intérim écrit, gardé au frigo : la veille dans le lanceur
 
@@ -48,11 +49,12 @@ Arbitrage du pilote (mesh-design, 2026-10-13 13:40) : **option 1** — attendre
 L76 (#285) et L77 (#286) et brancher la veille du chat dessus ; pas d'intérim
 par courrier, un agent externe n'est pas réveillé. L'intérim décrit ci-dessous
 n'est **pas** par courrier (le harnais est réveillé dans sa session ouverte) ;
-il est écrit et testé sur la branche `lot/480-chat-veille`, et n'est proposé à
-la relecture que si le pilote le décide. Le lot #480 reste bloqué sur #285 et
-#286.
+il est écrit et testé sur la branche `lot/480-chat-veille`, rebasé en local sur
+le gel de L77 `ad04d9644` (79 tests ciblés verts, aucun run CI), et n'est
+proposé à la relecture que si le pilote le décide après la fusion de #286. Le
+lot #480 reste bloqué sur cette fusion.
 
-Tant que L76/L77 manquent, `ameesh chat` garde la session interactive — et
+Tant que L77 manque, `ameesh chat` garde la session interactive — et
 donc l'ancrage humain intact — mais **le lanceur prête le terminal** au
 harnais par un pty et sert lui-même les événements comme des tours :
 
