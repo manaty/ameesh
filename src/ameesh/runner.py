@@ -618,6 +618,11 @@ class AgentWorker(threading.Thread):
         #: (brief déterministe d'une bascule de compte, L39) ; voir
         #: `adapters.resume_prompt`
         self.resume_origin = "agent"
+        #: #2619 : le brief `ameesh` continue un travail en cours (session
+        #: inconnue du harnais après un résumé non produit), ce n'est pas une
+        #: vraie session neuve : son `$TMPDIR` est gardé comme celui d'une
+        #: suite de rotation (#2610).
+        self.resume_continuation = False
         self.session_turns = 0
         self.session_tokens = 0.0
         self.last_turn_seconds = 0.0
@@ -1685,16 +1690,22 @@ class AgentWorker(threading.Thread):
     #: neuve qu'il ouvre (#389 r1 : il survit à une panne de l'exécuteur)
     RESUME_PENDING = "resume-pending.json"
 
-    def _resume_keep(self, resume: str, origin: str) -> bool:
+    def _resume_keep(self, resume: str, origin: str, *,
+                     continuation: bool = False) -> bool:
         """Le résumé de reprise retenu pour la session neuve : en mémoire et
         dans l'état local, AVANT l'oubli de l'ancienne session — une panne
         entre l'oubli et le lancement ne le perd pas (#389 r1). Faux s'il
         n'a pas pu être écrit : l'appelant garde alors l'ancienne session
-        (#389 r2)."""
+        (#389 r2).
+
+        `continuation` (#2619) : le brief `ameesh` continue le travail de la
+        session perdue (elle est inconnue du harnais, après un résumé non
+        produit) ; il est gardé au `$TMPDIR` comme une suite de rotation."""
         path = self._path(self.RESUME_PENDING)
         try:
             with open(path + ".tmp", "w", encoding="utf-8") as fh:
-                json.dump({"ts": time.time(), "resume": resume, "origin": origin}, fh,
+                json.dump({"ts": time.time(), "resume": resume, "origin": origin,
+                           "continuation": bool(continuation)}, fh,
                           ensure_ascii=False)
                 fh.flush()
                 os.fsync(fh.fileno())
@@ -1707,12 +1718,14 @@ class AgentWorker(threading.Thread):
                 pass
             return False
         self.resume_summary, self.resume_origin = resume, origin
+        self.resume_continuation = bool(continuation)
         return True
 
     def _resume_drop(self) -> None:
         """Le résumé de reprise a ouvert la session neuve, ou n'a plus lieu
         d'être : oublié, en mémoire et sur disque."""
         self.resume_summary = ""
+        self.resume_continuation = False
         try:
             os.unlink(self._path(self.RESUME_PENDING))
         except OSError:
@@ -1732,6 +1745,7 @@ class AgentWorker(threading.Thread):
             return
         self.resume_summary = resume
         self.resume_origin = "ameesh" if pending.get("origin") == "ameesh" else "agent"
+        self.resume_continuation = bool(pending.get("continuation"))
         log_async("[%s] pending resume summary recovered (%d characters)"
                   % (self.name, len(resume)))
 
@@ -2319,6 +2333,7 @@ class AgentWorker(threading.Thread):
             else:
                 if not self._resume_keep(brief, "ameesh"):
                     self.resume_summary, self.resume_origin = brief, "ameesh"
+                    self.resume_continuation = False
         log_async("[%s] session %s closed: lot #%s is finished"
                   % (self.name, session or "?", lot))
         self._fil_note(
@@ -2380,6 +2395,7 @@ class AgentWorker(threading.Thread):
             else:
                 if not self._resume_keep(brief, "ameesh"):
                     self.resume_summary, self.resume_origin = brief, "ameesh"
+                    self.resume_continuation = False
         log_async("[%s] session %s of lot %s put aside: lot %s is finished, no "
                   "session is dedicated to it" % (self.name, session or "?", courant, fini))
         self._fil_note(
@@ -2472,8 +2488,10 @@ class AgentWorker(threading.Thread):
         if resume and not self._resume_keep(resume, origin):
             # disque indisponible : la mémoire au moins, le tour partira
             self.resume_summary, self.resume_origin = resume, origin
+            self.resume_continuation = False
         elif not resume:
             self.resume_summary, self.resume_origin = "", "ameesh"
+            self.resume_continuation = False
         self._reset_session_counts()
         log_async("[%s] new session for lot %s: minimal lot brief" % (self.name, lot))
 
@@ -2522,6 +2540,7 @@ class AgentWorker(threading.Thread):
         if repris:
             self.write_session_file(repris)
             self.resume_summary = None
+            self.resume_continuation = False
         else:
             try:
                 os.unlink(self._path("session"))  # sinon `current_session` le relirait
@@ -2532,6 +2551,7 @@ class AgentWorker(threading.Thread):
         if not repris:
             self.resume_summary = self._lot_brief(lot, courant, out)
             self.resume_origin = "ameesh"
+            self.resume_continuation = False
         # #2055 : une reprise sans bascule (aucune session active) n'a pas de
         # lot courant à nommer.
         de = courant or "aucun"
@@ -2886,10 +2906,11 @@ class AgentWorker(threading.Thread):
                     session=refusee, reason=motif,
                     consigne="This turn's instruction follows this brief: resume your "
                              "work from there.")
-                if not self._resume_keep(brief, "ameesh"):
+                if not self._resume_keep(brief, "ameesh", continuation=True):
                     # #389 r3 : la session refusée ne se garde pas — le brief,
                     # au moins en mémoire, ouvre le tour
                     self.resume_summary, self.resume_origin = brief, "ameesh"
+                    self.resume_continuation = True
             except Exception as exc:  # un brief manquant n'empêche pas l'oubli
                 log_async("[%s] deterministic resume brief unavailable (%s)"
                           % (self.name, exc))
@@ -5848,8 +5869,11 @@ class AgentWorker(threading.Thread):
                 # travail EN COURS ; le dossier temporaire de l'agent est gardé
                 # (le résumé peut désigner ses fichiers). Le vidage reste pour
                 # une vraie session neuve (démarrage, fin de lot, redémarrage).
+                # #2619 : un brief `ameesh` qui continue la session perdue
+                # (inconnue du harnais après un résumé non produit) est aussi
+                # une continuation, pas une vraie session neuve.
                 suite_de_rotation = bool(self.resume_summary) \
-                    and self.resume_origin == "agent"
+                    and (self.resume_origin == "agent" or self.resume_continuation)
                 menage_tour = menage_mod.Turn.begin(
                     self.cfg, self.runner.housekeeping_policy(), self.name, cwd,
                     new_session=not session and not suite_de_rotation
