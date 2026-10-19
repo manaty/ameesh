@@ -23,7 +23,8 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import fire, land, lot_class, merge_queue, packet_guard, review, storage, work
+from ameesh import (fire, land, lot_class, merge_queue, packet_guard, review, review_lot,
+                    storage, work)
 
 from .support import PgTestCase
 
@@ -516,10 +517,15 @@ class ReadyTest(unittest.TestCase):
 
     ROW = {"id": 42, "title": "t", "branch": "lot/42-x", "assignee": "author"}
 
-    def _verdicts(self, marks, klass, *, repo=None, project=None, target="main"):
+    def _verdicts(self, marks, klass, *, repo=None, project=None, target="main",
+                  authors=None):
+        # #1515 : les auteurs complets sont lus par la porte du feu ; ici on
+        # simule cette lecture, la provenance réelle est éprouvée à part.
         with mock.patch.object(fire.lot_class, "of_lot", return_value=klass), \
-                mock.patch.object(merge_queue, "actor_family", side_effect=_family):
-            return fire.ready_verdicts(None, None, self.ROW, marks, repo=repo,
+                mock.patch.object(merge_queue, "actor_family", side_effect=_family), \
+                mock.patch.object(merge_queue, "_complete_authors",
+                                  return_value=(list(authors or []), ())):
+            return fire.ready_verdicts(None, object(), self.ROW, marks, repo=repo,
                                        project=project, target=target)
 
     def test_light_passes_without_a_pr(self):
@@ -537,6 +543,28 @@ class ReadyTest(unittest.TestCase):
         good = _marks(_mark("frozen", A), _verdict("rev1"))
         ok, why, _ = self._verdicts(good, klass)
         self.assertTrue(ok, why)
+
+    def test_a_corrector_author_does_not_review_his_own_work(self):
+        # #1515 N1 : les auteurs du delta sont lus avant la porte ; le
+        # relecteur qui a corrigé ne relit pas sa propre correction.
+        klass = {"class": "sensitive", "doubt": False, "files": [
+            {"path": "docs/x.md", "class": "sensitive", "rule": ["docs/**"]}]}
+        authors = [{"name": "rev1", "family": "codex"}]
+        ok, why, _ = self._verdicts(
+            _marks(_mark("frozen", A), _verdict("rev1")), klass, authors=authors)
+        self.assertFalse(ok, "le correcteur relit sa propre correction")
+        self.assertIn("independent review", why)
+        ok, why, _ = self._verdicts(
+            _marks(_mark("frozen", A), _verdict("rev2")), klass, authors=authors)
+        self.assertTrue(ok, why)
+
+    def test_gate_participants_are_critical_scope(self):
+        # #1515 N2 : radar et work peuvent calculer la classe ou le correcteur
+        # de la porte ; un lot qui ne les touche que là demande deux avis.
+        for path in ("src/ameesh/radar.py", "src/ameesh/work.py"):
+            klass = {"class": "sensitive",
+                     "files": [{"path": path, "class": "sensitive"}]}
+            self.assertEqual(merge_queue.required_verdicts(klass), 2, path)
 
     def test_sql_needs_two_families_before_any_pr(self):
         klass = {"class": "sensitive", "files": [
@@ -1231,6 +1259,160 @@ class StackedBaseMergeTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("cannot be read", detail)
         self.assertEqual([c[0] for c in calls], ["api"])
+
+
+class DeltaBaseTest(unittest.TestCase):
+    """#1515 B2 : la base du delta se lit sur la cible effective — ref privée
+    de la file d'abord, puis ref distante pour une cible non qualifiée, la
+    branche locale seulement ensuite (réécriture de la préférence 04e1d85e)."""
+
+    @staticmethod
+    def _git(tmp):
+        def git(*args, name="author"):
+            env = {k: v for k, v in os.environ.items()
+                   if not k.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_"))}
+            env.update(GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=name + "@example.invalid",
+                       GIT_COMMITTER_NAME=name,
+                       GIT_COMMITTER_EMAIL=name + "@example.invalid")
+            proc = subprocess.run(["git", "-C", tmp, *args], check=True,
+                                  capture_output=True, text=True, env=env)
+            return proc.stdout.strip()
+        return git
+
+    @staticmethod
+    def _write(tmp, name, text):
+        with open(os.path.join(tmp, name), "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def _base(self, tmp, git):
+        git("init", "-q", "-b", "main")
+        self._write(tmp, "a", "a\n")
+        git("add", "a")
+        git("commit", "-qm", "a")
+
+    def test_the_remote_ref_wins_for_an_unqualified_target(self):
+        # Une branche locale en avance du gel non publié ne masque pas la
+        # cible distante : c'est elle que le feu a contrôlée.
+        with tempfile.TemporaryDirectory() as tmp:
+            git = self._git(tmp)
+            self._base(tmp, git)
+            base = git("rev-parse", "HEAD")
+            git("update-ref", "refs/remotes/origin/develop", base)
+            git("checkout", "-qb", "lot")
+            self._write(tmp, "a", "correction\n")
+            git("commit", "-qam", "correction", name="rev1")
+            frozen = git("rev-parse", "HEAD")
+            git("branch", "-f", "develop", frozen)
+            commit, ref, _place = merge_queue._delta_base(tmp, {}, "develop")
+            self.assertEqual(ref, "refs/remotes/origin/develop")
+            self.assertEqual(commit, base)
+
+    def test_an_explicit_local_ref_is_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            git = self._git(tmp)
+            self._base(tmp, git)
+            git("checkout", "-qb", "lot")
+            self._write(tmp, "a", "correction\n")
+            git("commit", "-qam", "correction", name="rev1")
+            frozen = git("rev-parse", "HEAD")
+            git("branch", "-f", "develop", frozen)
+            commit, ref, _place = merge_queue._delta_base(tmp, {}, "refs/heads/develop")
+            self.assertEqual(ref, "refs/heads/develop")
+            self.assertEqual(commit, frozen)
+
+    def test_the_private_queue_ref_is_honoured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            git = self._git(tmp)
+            self._base(tmp, git)
+            base = git("rev-parse", "HEAD")
+            git("checkout", "-qb", "lot")
+            self._write(tmp, "a", "correction\n")
+            git("commit", "-qam", "correction", name="rev1")
+            frozen = git("rev-parse", "HEAD")
+            git("branch", "-f", "develop", frozen)
+            git("update-ref", "refs/ameesh/queue/develop", base)
+            commit, ref, _place = merge_queue._delta_base(tmp, {}, "develop")
+            self.assertEqual(ref, "refs/ameesh/queue/develop")
+            self.assertEqual(commit, base)
+
+    def test_an_unreadable_target_raises(self):
+        # Une cible introuvable n'est pas « aucun auteur » (#1515 B1/B2).
+        with tempfile.TemporaryDirectory() as tmp:
+            git = self._git(tmp)
+            self._base(tmp, git)
+            with self.assertRaises(merge_queue._ProvenanceError):
+                merge_queue._delta_base(tmp, {}, "nope")
+
+
+class CompleteAuthorsTest(unittest.TestCase):
+    """#1515 N1/B1 : la porte lit les détenteurs du journal et les auteurs du
+    delta gelé ; un détenteur sans famille refuse, un outil hors registre est
+    omis sans bloquer."""
+
+    @staticmethod
+    def _git(tmp):
+        return DeltaBaseTest._git(tmp)
+
+    def _repo(self, tmp, git, *commits):
+        DeltaBaseTest._write(tmp, "a", "a\n")
+        git("init", "-q", "-b", "main")
+        git("add", "a")
+        git("commit", "-qm", "a", name="author")
+        base = git("rev-parse", "HEAD")
+        git("checkout", "-qb", "lot")
+        for index, name in enumerate(commits):
+            DeltaBaseTest._write(tmp, "a", "v%d\n" % index)
+            git("commit", "-qam", "v%d" % index, name=name)
+        return base, git("rev-parse", "HEAD")
+
+    def _authors(self, tmp, frozen, events, family=None):
+        item = {"id": 7, "assignee": "author", "branch_target": "main"}
+        with mock.patch.object(merge_queue.work, "events", return_value=list(events)), \
+                mock.patch.object(merge_queue, "actor_family",
+                                  side_effect=family or _family), \
+                mock.patch.object(review_lot, "compiled_families", return_value=()):
+            return merge_queue._complete_authors(object(), item, frozen, tmp, "main")
+
+    def test_holders_and_delta_authors_are_all_authors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            git = self._git(tmp)
+            _base, frozen = self._repo(tmp, git, "rev1")
+            authors, _families = self._authors(
+                tmp, frozen, [{"note": "assigned to author (before: rev2)"}])
+        got = {entry["name"]: entry["family"] for entry in authors}
+        self.assertEqual(got.get("author"), "deepseek")
+        self.assertEqual(got.get("rev2"), "claude")
+        self.assertEqual(got.get("rev1"), "codex")
+
+    def test_an_unknown_holder_refuses_the_authors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            git = self._git(tmp)
+            _base, frozen = self._repo(tmp, git, "rev1")
+
+            def family(_db, name, **_kw):
+                return {"author": "deepseek", "rev1": "codex"}.get(name, "")
+
+            with self.assertRaises(merge_queue._ProvenanceError):
+                self._authors(tmp, frozen,
+                              [{"note": "assigned to author (before: rev2)"}],
+                              family=family)
+
+    def test_an_out_of_registry_commit_author_is_omitted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            git = self._git(tmp)
+            _base, frozen = self._repo(tmp, git, "rev1", "tool")
+            authors, _families = self._authors(tmp, frozen, [])
+        self.assertEqual([entry["name"] for entry in authors], ["author", "rev1"])
+
+    def test_an_unreadable_journal_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            git = self._git(tmp)
+            _base, frozen = self._repo(tmp, git, "rev1")
+            with mock.patch.object(merge_queue.work, "events",
+                                   side_effect=RuntimeError("journal down")):
+                with self.assertRaises(merge_queue._ProvenanceError):
+                    merge_queue._complete_authors(
+                        object(), {"id": 7, "assignee": "author"}, frozen, tmp, "main")
 
 
 if __name__ == "__main__":
