@@ -102,3 +102,40 @@ test("without an agent, the screen asks for one and sends nothing", async () => 
   await el.send();
   assert.ok(!fetch.calls.some((c) => c.path === CHAT));
 });
+
+test("the server's recipient-free final answer appears and clears the waiting state", async () => {
+  const { client } = fixture({
+    "/api/v1/threads/ameesh/7": [200, { entries: [
+      { id: "q", author: "human:ada", recipient: "agent:ada", text: "Status?", ts: stamp },
+      // Shape produced by conversation.Log.drain_threads for turn_end.
+      { id: "a", author: "agent:ada", recipient: "", text: "Finished", ts: stamp + 1,
+        meta: { conversation: { agent: "ada", seq: 2, turn: "t1" } } },
+      { id: "b", author: "agent:bob", recipient: "", text: "Another conversation", ts: stamp + 2,
+        meta: { conversation: { agent: "bob", seq: 3, turn: "t2" } } },
+      { id: "c", author: "agent:ada", recipient: "", text: "Unrelated broadcast", ts: stamp + 3 },
+    ] }],
+  });
+  const el = await mount(client, { agent: "ada", lot: "7" });
+  assert.match(text(el), /Finished/);
+  assert.doesNotMatch(text(el), /Waiting for the next turn|Another conversation|Unrelated broadcast/);
+});
+
+test("after a failed send, changing its lot or agent takes a fresh idempotency key", async () => {
+  const { client } = fixture();
+  const keys = [];
+  const wrapped = { ...client, post: async (_path, options) => {
+    keys.push(options.headers["Idempotency-Key"]);
+    throw new ui.ApiError(503, "unavailable", "down");
+  } };
+  const el = await mount(wrapped, { agent: "ada", lot: "7" });
+  el.draft = "Status?";
+  await el.send();
+  await el.send();
+  assert.equal(keys[0], keys[1]);
+  el.lot = "8";
+  await el.send();
+  assert.notEqual(keys[1], keys[2]);
+  el.agent = "bob";
+  await el.send();
+  assert.notEqual(keys[2], keys[3]);
+});

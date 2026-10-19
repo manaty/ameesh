@@ -38,7 +38,7 @@ export class AmeeshChat extends ReadView {
   failed = "";
   //: one key per message: a retry after an uncertain failure replays it, never
   //: sends it twice; a new text, or a delivered one, takes a fresh key
-  #key: { text: string; key: string } | null = null;
+  #key: { text: string; agent: string; lot: number | null; client: Client; key: string } | null = null;
 
   protected async load(client: Client, signal: AbortSignal) {
     const [me, detail, overview] = await Promise.all([
@@ -73,7 +73,11 @@ export class AmeeshChat extends ReadView {
     const seen = new Set<string>();
     return rows(data.entries).filter((entry) => {
       const to = parties(entry.recipient);
-      const between = (entry.author === agent && to.some((party) => mine.has(party)))
+      // Log.drain_threads writes final answers without recipients; its
+      // conversation metadata identifies the agent on that shared thread.
+      const final = entry.recipient === ""
+        && object(object(entry.meta).conversation).agent === this.agent;
+      const between = (entry.author === agent && (final || to.some((party) => mine.has(party))))
         || (mine.has(label(entry.author)) && to.includes(agent));
       const id = label(entry.id) + "|" + label(entry.ts);
       if (!between || seen.has(id)) return false;
@@ -87,10 +91,13 @@ export class AmeeshChat extends ReadView {
     const client = this.api;
     const text = this.draft.trim();
     if (!client || !text || this.sending || !this.agent) return;
-    if (this.#key?.text !== text) this.#key = { text, key: idempotencyKey() };
+    const lot = /^[1-9][0-9]{0,8}$/.test(this.lot) ? Number(this.lot) : null;
+    if (this.#key?.text !== text || this.#key.agent !== this.agent
+      || this.#key.lot !== lot || this.#key.client !== client) {
+      this.#key = { text, agent: this.agent, lot, client, key: idempotencyKey() };
+    }
     this.sending = true; this.failed = "";
     try {
-      const lot = /^[1-9][0-9]{0,8}$/.test(this.lot) ? Number(this.lot) : null;
       await client.post("/api/v1/agents/{agent}/chat", {
         path: { agent: this.agent },
         body: lot === null ? { text } : { text, lot },
