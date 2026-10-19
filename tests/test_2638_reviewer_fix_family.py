@@ -43,7 +43,7 @@ class ReviewerFixFamilyTest(_ActivationFixture, PgTestCase):
     """The reference author is the assignee; a small reviewer fix keeps its family."""
 
     # -- helpers ----------------------------------------------------------
-    def commit(self, actor, harness, text, path="src/ameesh/db.py"):
+    def commit(self, actor, harness, text, path="src/ameesh/work.py"):
         """A new frozen head whose exact receipt names `actor` / `harness`."""
         self.repo.write(path, text)
         sha = self.repo.commit("%s: %s" % (actor, path))
