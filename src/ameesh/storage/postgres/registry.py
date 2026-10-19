@@ -373,6 +373,7 @@ class Agents(interface.Agents):
                    model, budget_usd, spent_usd, turns, pending_prompt, last_error,
                    lease_owner, lease_epoch, lease_expires_ts, last_seen_ts, last_turn_ts,
                    public_key_fingerprint, key_role, key_ready, has_owner_key, unread,
+                   passive_unread,
                    responsible, team, projects, provider, credential_mode, capabilities,
                    canon_ref,
                    ephemeral, created_by, ephemeral_expires_ts, responsible_ok, priority,

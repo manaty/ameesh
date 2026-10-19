@@ -770,11 +770,20 @@ def hold_tmp(cfg, policy: Policy, agent: str, *, new_session: bool) -> TmpHold:
     if read_owner(troot, name) is None:            # under the exclusive lock (above)
         _write_owner(troot, name, key, ORIGIN_CREATED if created else ORIGIN_ADOPTED)
     elif new_session and not created and exclusive and created_by(troot, name, key):
-        freed = _clear_dir(mine, troot)
-        if freed:
-            entries.append({"kind": "tmp", "action": "deleted", "path": mine,
-                            "bytes": freed, "agent": agent,
-                            "detail": "new session: temporary directory emptied"})
+        # #2704 : une application lancée depuis ce dossier (AppImage extraite)
+        # peut le tenir hors tour ; la vider la ferait crasher. On la garde et
+        # on le dit, plutôt que de supprimer sous un processus vivant.
+        held = tmp_user_holder(mine)
+        if held:
+            entries.append({"kind": "tmp", "action": "held", "path": mine,
+                            "agent": agent,
+                            "detail": "new session: %s (not emptied)" % held})
+        else:
+            freed = _clear_dir(mine, troot)
+            if freed:
+                entries.append({"kind": "tmp", "action": "deleted", "path": mine,
+                                "bytes": freed, "agent": agent,
+                                "detail": "new session: temporary directory emptied"})
     fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
     # a resumed session writes nothing at first: the pass must not see it idle
     try:
@@ -2076,6 +2085,30 @@ def tmp_holder(path: str, allow=()) -> str:
         why = "path on the command line"
     return "held by process %s (%s: %s)" % (first.get("pid"), why,
                                            (first.get("cmd") or "")[:80])
+
+
+def tmp_user_holder(path: str, procs=None) -> str:
+    """#2704 : le processus qui utilise `path`, d'après les chemins observés de
+    l'utilisateur (dossier courant, exécutable, fichiers ouverts et projetés en
+    mémoire — `/proc/<pid>/maps`), en clair ; vide si aucun.
+
+    `procs` : un relevé `platform.user_paths()` déjà lu (un seul par passage,
+    False quand la lecture a échoué), sinon il est lu ici. Contrairement à
+    `tmp_holder`, un processus illisible n'est pas un doute qui retient tout le
+    ménage : un démon non dumpable (`gpg-agent`) n'a rien à faire dans le
+    dossier temporaire d'un agent, et l'ignorer évite d'arrêter toute éviction
+    de l'hôte. Seuls les chemins observés retiennent l'entrée. Hors Linux
+    (`user_paths` indisponible), on ne peut rien observer : vide, comme avant
+    #2704 — le défaut est propre à `/proc`."""
+    if procs is None:
+        try:
+            procs = platform.user_paths()
+        except Exception:  # noqa: BLE001 - un passage de ménage ne lève jamais
+            return ""
+    if procs is False or not getattr(procs, "available", False):
+        return ""
+    found = procs.holders(_real(path))
+    return "held by process %s" % found[0] if found else ""
 
 
 def _tmp_entry_problem(path: str, base: str, ino=None, dev=None) -> str:
@@ -3708,6 +3741,19 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
         registered = None  # type: ignore[assignment]
     # 1. dossiers temporaires des agents
     key = mesh_key(cfg)
+    # #2704 : un seul relevé des processus de l'utilisateur par passage (il
+    # lit /proc/*/maps : ~200 ms) ; False quand la lecture est impossible.
+    procs: object = None
+
+    def held_by_user(path: str) -> str:
+        nonlocal procs
+        if procs is None:
+            try:
+                procs = platform.user_paths()
+            except Exception:  # noqa: BLE001 - un passage de ménage ne lève jamais
+                procs = False
+        return tmp_user_holder(path, procs)
+
     # #2493 : dernier signalement d'un dossier sans propriétaire, pour ne pas
     # le répéter dans `skipped` à chaque passe (un constat persistant suffit).
     last_unowned: dict[str, dict] = {}
@@ -3803,6 +3849,14 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                     skipped.append("tmp %s kept: changed during the pass" % full)
                     continue
                 if orphan:
+                    # #2704 : un dossier utilisé par un processus vivant
+                    # (AppImage extraite et lancée hors tour) n'est jamais
+                    # supprimé, même ancien et sans copie git : ses fichiers
+                    # projetés en mémoire (/proc/<pid>/maps) le trahissent.
+                    held = held_by_user(full)
+                    if held:
+                        skipped.append("tmp %s kept: %s" % (full, held))
+                        continue
                     size = size_of(full)          # avant tout retrait : total libéré
                     # #2493 (N2) : un dossier qui porte une copie git n'est
                     # supprimé qu'après la preuve qu'aucun travail n'y est à
@@ -3849,6 +3903,18 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                                         "detail": "agent not in the registry"
                                         + ("; git worktrees recovered"
                                            if git_repos else "")})
+                    continue
+                # #2704 : l'éviction ne touche pas un dossier qu'un processus
+                # vivant utilise (cwd, fichiers ouverts ou projetés en
+                # mémoire) : une AppImage extraite y tourne hors tour, et
+                # libérer son quota la fait crasher. Le quota reste dit par le
+                # relevé tmpfs ; on ne supprime pas sous le processus.
+                held = held_by_user(full)
+                if held:
+                    skipped.append("tmp %s kept: %s (no eviction)" % (full, held))
+                    entries.append({"kind": "tmp", "action": "held", "path": full,
+                                    "bytes": size_of(full), "agent": agent,
+                                    "detail": held})
                     continue
                 result = evict_lru([full], troot, policy.tmp_quota, now=now,
                                    dry_run=dry_run)
