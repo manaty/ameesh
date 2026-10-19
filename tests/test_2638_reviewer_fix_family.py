@@ -9,12 +9,15 @@ becomes an author of the head; a third party's commit always does.
 """
 from __future__ import annotations
 
+import dataclasses
+import os
+
 from ameesh import registry
 from ameesh import review_designation as rd
 from ameesh import review_designation_pg as pg
 
 from .support import PgTestCase
-from .test_2447_review_designation_activation import _ActivationFixture
+from .test_2447_review_designation_activation import FEDERATION, _ActivationFixture, _Canon
 
 
 class ReviewerFixFamilyTest(_ActivationFixture, PgTestCase):
@@ -41,7 +44,38 @@ class ReviewerFixFamilyTest(_ActivationFixture, PgTestCase):
         self.assertEqual([r["name"] for r in out["reviewers"]], ["r1", "r2"])
         return out
 
+    def one_review_canon(self):
+        """The #2602 policy: one independent review for `src/ameesh/**`."""
+        canon = _Canon(os.path.join(self.tmp, "canon-one"),
+                       federation=FEDERATION.replace("reviews: 2", "reviews: 1"))
+        self.cfg = dataclasses.replace(self.cfg, canon=canon.root, canon_ref="HEAD")
+        self.canon = canon
+
+    def status(self, name, status):
+        registry.upsert(self.db, name, harness="claude", host=self.cfg.host,
+                        cwd=self.repo.root, status=status)
+
     # -- witnesses --------------------------------------------------------
+    def test_2602_chain_keeps_a_reviewer_retired_by_a_later_freeze(self):
+        # The exact #2602 sequence with one review: dev1 (Claude) reviews,
+        # pushes its small fix, then a later freeze designates dev5 (DeepSeek)
+        # and retires dev1 from the column. Both corrections are in the range
+        # of the third freeze, where the old code forbade all three families.
+        self.one_review_canon()
+        _, first = self.freeze()
+        self.assertEqual([r["name"] for r in first["reviewers"]], ["r1"])
+        self.commit("r1", "claude", "lot\nr1 small fix\n")
+        self.status("r1", "stopped")           # the later freeze cannot mail r1
+        _, second = self.freeze()
+        self.assertEqual(second["state"], rd.DESIGNATED, second)
+        self.assertEqual([r["name"] for r in second["reviewers"]], ["r2"])
+        self.commit("r2", "codex", "lot\nr1 small fix\nr2 small fix\n")
+        self.status("r1", "idle")              # dev1 is back for the third freeze
+        _, third = self.freeze()
+        self.assertEqual(third["state"], rd.DESIGNATED, third)
+        self.assertEqual([r["name"] for r in third["reviewers"]], ["r1"])
+        self.assertEqual(self.authors(), {"author": "deepseek"})
+
     def test_2602_three_families_with_small_reviewer_fixes_still_designate(self):
         # #2602: cx2 (Codex) authors, dev1 (Claude) then dev5 (DeepSeek) push
         # their first-round correction; the next freeze must still designate.
