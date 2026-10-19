@@ -797,7 +797,7 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         return policy
     listing = registry.overview(db)
     notify = _notify(cfg, db, project, listing)
-    families = policy.families or rd.KNOWN_FAMILIES
+    families = policy.families
     candidates = rd.candidates_from_registry(
         listing, loads=_loads(db), project=project, families=families)
     if notify:
@@ -1195,7 +1195,7 @@ def _selection(inputs: Inputs, port, *, force: bool = False) -> dict:
         authors=inputs.authors, candidates=inputs.candidates,
         risk=inputs.policy.risk, base=inputs.base, policy_ref=inputs.policy.ref,
         notify=inputs.notify, unknown_authors=inputs.unknown_authors,
-        families=inputs.policy.families or rd.KNOWN_FAMILIES,
+        families=inputs.policy.families,
         already=inputs.manual_seats, required=inputs.policy.required,
         advances=inputs.advances)
 
