@@ -60,15 +60,18 @@ composition rencontré, aucune résolution ni adaptation.
 
 Le run complet `39193274744` sur `fcd424ae70` a enregistré trois rouges
 (psycopg 6/8 et 7/8) ; le courrier de suivi n'en citait que les deux premiers,
-le troisième a été relevé au verdict avant l'abandon du run. Aucun code
-produit n'est modifié, aucune migration.
+le troisième a été relevé au verdict avant l'abandon du run. Le run de
+remplacement `39194479969` sur `acf2149b04` a ensuite relevé le même défaut de
+droits sur le writer de **preuve** (`test_l56`). Aucun code produit n'est
+modifié, aucune migration.
 
 ### #2481 — droits de lecture des créneaux de migration
 
-Deux contrôles du rôle QA isolé (`tests.test_420_qa_role.QaEvidenceTest`) :
+Contrôles du rôle QA isolé (`tests.test_420_qa_role.QaEvidenceTest`) et du
+writer de preuve simulé (`tests.test_l56_role_executor`, `it.prove`) :
 `permission denied for table work_migration_reservations` à l'appel de
-`it.record_qa` → `work.get`. #2481 fait projeter à la ligne complète du lot ses
-créneaux de migration (`work_migration_reservations`), mais
+`it.record_qa`/`it.prove` → `work.get`. #2481 fait projeter à la ligne complète
+du lot ses créneaux de migration (`work_migration_reservations`), mais
 `deploy/sql/role-module-writers.sql` ne donnait pas SELECT sur cette table à
 `ameesh_it_proof`/`ameesh_it_qa` ; la sonde positive de `has_migration_slots`,
 mise en cache sur la connexion partagée du banc, faisait ensuite lire la table
@@ -79,10 +82,11 @@ Correctif en droits seuls :
 - `deploy/sql/role-module-writers.sql` : GRANT SELECT conditionnel sur
   `work_migration_reservations` aux deux rôles d'écriture isolés (table absente
   sur une base d'avant 0419 → aucun geste).
-- `tests/test_420_qa_role.py` : le rôle isolé du banc reçoit le même droit (il
-  miroite le script de déploiement).
+- `tests/test_420_qa_role.py` (writer QA) et `tests/test_l56_role_executor.py`
+  (writer de preuve) : les rôles isolés du banc reçoivent le même droit, ils
+  miroitent le script de déploiement.
 - `tests/test_l56_role_executor.py` : garde de contrat — le script appliqué
-  donne bien SELECT à `ameesh_it_qa` sur la table.
+  donne bien SELECT aux **deux** rôles sur la table.
 
 ### #2584 — `work.backlog_basket_add` classée refusée
 
@@ -95,11 +99,12 @@ Adaptation mécanique de composition, sans avis nouveau (§2/§11 bis).
 
 ### Vérifications
 
-`tests.test_420_qa_role.QaEvidenceTest` (les deux rouges) **2 OK** ;
-`test_module_writer_role_contract_and_executor_separation` **1 OK** (script
-appliqué deux fois, audit compris) ; `tests.test_l107_executor_contract`
-**22 OK**. Une suite complète unique est redemandée sur la tête de ces
-correctifs ; l'ancienne tête `fcd424ae70` et son run sont abandonnés.
+Modules entiers sur la tête de ce correctif : `tests.test_420_qa_role` +
+`tests.test_l56_role_executor` **65 OK** (dont les rouges QA et preuve et le
+contrat des rôles, script appliqué deux fois, audit compris) ;
+`tests.test_l107_executor_contract` **22 OK**. Une suite complète unique est
+redemandée sur la tête de ces correctifs ; les têtes `fcd424ae70`/`dc79c09b02`
+et leurs runs sont abandonnées.
 
 ## Contrôles
 
@@ -111,7 +116,7 @@ correctifs ; l'ancienne tête `fcd424ae70` et son run sont abandonnés.
   (hors #2466, écarté).
 - `paquet-inclusion` (tête de ce manifeste, `--ready-file` + admissions) :
   **rc 0** — 11 lots attendus, 11 compositions, 0 défaut.
-- `git diff --check` vert ; aucune migration SQL (48 fichiers, +4384/−539
+- `git diff --check` vert ; aucune migration SQL (48 fichiers, +4390/−540
   hors manifeste).
 - Suite complète unique demandée sur la tête finale de ce manifeste
   (`ci-full-<sha>`), avec la revue unitaire du paquet pour seul avis de la
