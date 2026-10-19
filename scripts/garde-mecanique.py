@@ -296,16 +296,6 @@ EXEMPTIONS = (
                "(retrait : #2451)",
     ),
     Exemption(
-        path="src/ameesh/train_policy.py",
-        parameter="schema",
-        literal="ameesh-mechanics/1",
-        name="lot #2449 (mty-amh-impl-08), inventaire du 18/10",
-        date="2026-10-18",
-        reason="l'adaptateur du train n'accepte que le schéma /1 ; le bloc /2 "
-               "(prévalidation) sera porté à l'activation du train (#2446) ; "
-               "retrait : #2451",
-    ),
-    Exemption(
         path="src/ameesh/train_review.py",
         parameter="reviews.families",
         literal="*",
