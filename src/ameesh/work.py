@@ -97,10 +97,6 @@ WAITING = {"blocked", "waiting_human"}
 CORRECTIONS = {("promoted", "merged"), ("merged", "build")}
 #: rôles d'une fiche Agent du canon admis à corriger un état (avec les humains)
 CORRECTOR_ROLES = ("orchestrateur", "orchestrator", "conception", "design")
-#: §4 canon (owner 14/10/2026) : au plus 2 lots en développement (`build`) par
-#: agent ; les lots en surplus retournent à la file d'équipe. Règle générique,
-#: pour tous les projets et tous les agents.
-BUILD_LIMIT = 2
 #: §4 : marqueur d'une exception pilote EXPLICITE à la limite d'en-cours,
 #: portée par la note de la dernière attribution du lot (jamais une exemption
 #: silencieuse de qui a assigné le lot).
@@ -1644,6 +1640,19 @@ def queue_warning(db: Db, item: dict, agent: str) -> str:
                 "it has no team: it waits for the orchestrator (%s)" % later))
 
 
+def build_limit(cfg) -> int:
+    """§4 canon : le plafond de lots en développement (`build`) par agent.
+
+    Lu au canon compilé (`build.max_in_build`, #2451), jamais une constante
+    locale ; les lots en surplus retournent à la file d'équipe. Règle
+    générique du document global, pour tous les projets et tous les agents.
+    Sans document lisible, `mechanics.MechanicsError` : l'appelant refuse
+    d'agir plutôt que de supposer un plafond.
+    """
+    from . import mechanics
+    return mechanics.configured(cfg).max_in_build
+
+
 def return_to_queue(db: Db, item_id: int, *, actor: str = "", cfg=None,
                     reason: str = "") -> dict:
     """§4 : rend un lot à la file d'équipe — l'assignation est retirée (CAS sur
@@ -1670,8 +1679,8 @@ def return_to_queue(db: Db, item_id: int, *, actor: str = "", cfg=None,
     if who != current and not who.startswith(HUMAN_PREFIX) and not is_pilot(cfg, db, who):
         raise WorkError("return refused: %s is neither the assignee (%s), a human, nor "
                         "an orchestrator/design agent" % (who or "nobody", current))
-    note = "%s by %s (§4: at most %d lots in build per agent)" % (
-        RETURN_NOTE, who or UNKNOWN_ACTOR, BUILD_LIMIT)
+    note = "%s by %s (§4: lots in build per agent, capped by the canon)" % (
+        RETURN_NOTE, who or UNKNOWN_ACTOR)
     if reason.strip():
         note += ": %s" % " ".join(str(reason).split())
     row = storage.of(db).work.unassign(item_id, current=current, note=note,
@@ -2010,13 +2019,14 @@ def _resume_review_after_merge(db, item_id, *, sha: str = "", pr_ref=None,
 def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source: str = "",
                  pr_ref: str | None = None, frozen_id: int | None = None,
                  declared: bool = False, extra: str = "", repo: str | None = None,
-                 landed: tuple[int, str] | None = None, unfrozen: bool = False) -> dict:
+                 landed: tuple[int, str] | None = None, unfrozen: bool = False,
+                 content_guard=None) -> dict:
     """Fusion constatée : le lot passe `merged` et son jalon `merged` est posé.
 
     Idempotent : un lot déjà fusionné reste tel quel (`already`). Jamais de
     réouverture silencieuse : un lot fermé (abandonné, remplacé) n'est pas
     touché, le constat est rendu (`refused`) pour être dit à l'appelant. Rend
-    `{id, result: merged|already|refused|refrozen, detail, item}`.
+    `{id, result: merged|already|refused|refrozen|withheld, detail, item}`.
 
     `frozen_id` (preuve par le contenu) : le jalon `frozen` examiné ; si ce
     n'est plus le dernier gel du lot au moment d'écrire, rien n'est fermé
@@ -2026,6 +2036,13 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
 
     `landed` (#1567) : `(numéro, dépôt)` du numéro réellement atterri, écrit
     dans la transaction de la fusion ; l'appelant l'a validé et réservé.
+
+    `content_guard` (#2744) : callable `(storage, row) -> retention | None`,
+    appelé **sous le verrou de ligne du lot**, juste avant la fermeture ; une
+    retenue rend `withheld` sans rien écrire. Le verrou est aussi pris par les
+    notes `hold:`/`unhold:` (`work.note` le prend avant `note`) et par les
+    transitions d'état : une retenue ne peut plus se glisser entre la lecture
+    du journal et la fermeture.
 
     La note du journal et du jalon dit comment la fusion est connue :
     « fusion constatée par <source> », ou « fusion déclarée par … »
@@ -2071,7 +2088,7 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             # fusionné avant l'activation n'est pas relu rétroactivement.
             review = _resume_review_after_merge(db, item_id, sha=sha, pr_ref=pr_ref, repo=repo)
             detail = "already %s" % state
-            if not review.get("id"):
+            if not review.get("id") and not review.get("already_reviewed"):
                 detail += " — relecture non ouverte : %s" % (review.get("why") or "?")
             return {"id": int(item_id), "result": "already", "item": item,
                     "detail": detail, "review_lot": review}
@@ -2088,6 +2105,19 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             from . import work_dependencies
             with db.transaction() as tx:
                 work_dependencies.lock(tx)
+                if content_guard is not None and not storage.is_remote(db):
+                    locked = storage.of(tx).work.lock(item_id)
+                    if locked is not None:
+                        retention = content_guard(storage.of(tx), locked)
+                        if retention is not None:
+                            if retention.get("what") == "unreadable":
+                                return {"id": int(item_id), "result": "error",
+                                        "item": locked, "retention": retention,
+                                        "detail": retention.get("motif")}
+                            return {"id": int(item_id), "result": "withheld",
+                                    "item": locked, "retention": retention,
+                                    "detail": "content merged, closure withheld: %s"
+                                              % retention.get("motif")}
                 row = storage.of(tx).work.close_merged(
                     item_id, current=state, sha=sha, actor=actor, note=note, pr_ref=pr_ref,
                     frozen_id=frozen_id, landed=landed, unfrozen=unfrozen)
@@ -2112,7 +2142,7 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             # dans le constat (`review_lot`), pour être repris (`review_lot.catch_up`).
             review = _review_after_merge(db, item_id, sha=sha, pr_ref=pr_ref, repo=repo)
             detail = "%s → merged" % state
-            if not review.get("id"):
+            if not review.get("id") and not review.get("already_reviewed"):
                 detail += " — relecture non ouverte : %s" % (review.get("why") or "?")
             return {"id": int(item_id), "result": "merged", "item": row,
                     "detail": detail, "review_lot": review}
@@ -2989,7 +3019,21 @@ def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False
                                            float(wake_ts))
     else:
         options = {"once": True} if once else {}
-        storage.of(db).work.note(item_id, item["state"], text, actor, **options)
+        from . import planned_waits
+        # #2744 : une retenue (hold/levée) prend le verrou de ligne avant son
+        # écriture, commun avec la fermeture par contenu (work.close_merged).
+        # Jamais sur une connexion médiée : `note` y est une opération du
+        # contrat, sans ce verrou (la fermeture par contenu est serveur).
+        if (planned_waits.is_hold_note(text) or planned_waits.is_lift_note(text)) \
+                and not storage.is_remote(db):
+            with db.transaction() as tx:
+                locked = storage.of(tx).work.lock(item_id)
+                if locked is None:
+                    raise WorkError("lot %s not found" % item_id)
+                storage.of(tx).work.note(item_id, locked["state"], text, actor,
+                                         **options)
+        else:
+            storage.of(db).work.note(item_id, item["state"], text, actor, **options)
     return True
 
 

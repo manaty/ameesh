@@ -215,12 +215,18 @@ du choix) :
 
 ```
 harnais   compte         actif   état     jauges
-claude    primaire       oui     ok       five_hour 37% (rythme 83%), seven_day 35% (rythme 55%)
+claude    primaire       oui     ok       five_hour 37% (rythme 73%), seven_day 35% (rythme 45%)
                                           ↳ perdu à la remise à zéro si rien ne change : five_hour 63 % dans 1 h 21, seven_day 65 % dans 3 j 20 h
 claude    secondaire             ok       —
-                                          ↳ prochain choix pour une nouvelle session : sans relevé : non vérifié, premier (L117) ; avant : tertiaire sans relevé : non vérifié, primaire seven_day 35 % utilisé (rythme 55 %)
+                                          ↳ prochain choix pour une nouvelle session : sans relevé : non vérifié, premier (L117) ; avant : tertiaire sans relevé : non vérifié, primaire seven_day 35 % utilisé (rythme 45 %)
 claude    tertiaire              ok       —
 ```
+
+Le rythme affiché — et celui de la raison du prochain choix — est celui de la
+pause d'un agent non critique : la réserve de 10 points gardée pour les agents
+critiques est déduite (#2648), comme dans `accounts.choose`. Un compte encore
+sous son plafond ordinaire mais dans cette bande est donc « limit » et n'est
+pas proposé comme prochain choix.
 
 La colonne « actif » est le **dernier compte choisi** pour une nouvelle
 session (ligne `account_active`) : des agents dont la session est ouverte sur
@@ -232,7 +238,7 @@ ou à `ameesh cost gauges`. Un relevé dont la fenêtre est échue (`resets_at`
 passé) compte pour **0 %** : un compte inutilisé dont le dernier relevé date
 d'une fenêtre close n'est plus jugé au seuil (il ne servait pas, donc son
 relevé n'était jamais rafraîchi). L'affichage garde le dernier relevé :
-« codex-300min 0% (rythme 90%, remise à zéro passée, dernier relevé 93%) ».
+« codex-300min 0% (rythme 80%, remise à zéro passée, dernier relevé 93%) ».
 Un relevé **partiel** (une fenêtre remise à zéro, une autre ouverte) est au
 contraire marqué `↳ reading not current: window reset since the reading
 (unverified)` : la valeur lue n'est qu'une borne, et les pertes annoncées
@@ -285,7 +291,7 @@ concerné.
 Chaque choix de compte est journalisé avec sa raison dans le journal de
 l'exécuteur (`[agent] compte claude : secondaire — sans relevé : non vérifié,
 premier (L117) ; avant : tertiaire sans relevé : non vérifié, primaire
-seven_day 35 % utilisé (rythme 55 %)`, ou `— continuité :
+seven_day 35 % utilisé (rythme 45 %)`, ou `— continuité :
 la session reste sur primaire, sous son seuil`), une fois par changement de choix et non à
 chaque sondage. Chaque changement du dernier choix est journalisé en base
 (`account_switches`, type `bascule`, avec la même raison) et dans le fil de

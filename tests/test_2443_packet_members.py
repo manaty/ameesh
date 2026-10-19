@@ -294,6 +294,30 @@ class PacketLinkTest(_TmpMixin, PgTestCase):
         self.assertEqual(row["result"], "open", row)
         self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
 
+    def test_sync_merges_withholds_a_blocked_composition_unit(self):
+        """#2744 s'applique aussi à la fermeture par composition."""
+        frozen = self.unit_branch("lot/bloque", "bloque.py", "bloque\n", "bloque")
+        item = self.lot("unité bloquée")
+        self.freeze(item, frozen)
+        head = self.compose("integration/paquet-1", [(item["id"], frozen)])
+        porteur = self.carrier()
+        packet_link.record(self.db, porteur["id"], repo=self.repo, base=self.base,
+                           head=head, actor="pilote", cfg=self.cfg)
+        git(self.repo, "checkout", "-q", "main")
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "fusion paquet",
+            "integration/paquet-1")
+        work.move(self.db, item["id"], "blocked", note="passe réelle due")
+        report = plan_git.sync_merges(self.db, self.repo, target="main")
+        row = next(r for r in report["results"] if r["work_item"] == item["id"])
+        self.assertEqual(row["result"], "withheld", row)
+        self.assertEqual(row["retention"]["what"], "blocked")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "blocked")
+        work.move(self.db, item["id"], "qa", note="retenue levée")
+        report = plan_git.sync_merges(self.db, self.repo, target="main")
+        row = next(r for r in report["results"] if r["work_item"] == item["id"])
+        self.assertEqual(row["result"], "merged", row)
+        self.assertEqual(row["how"], "composition", row)
+
     def test_sync_merges_refuses_a_stale_composition(self):
         """Un re-gel postérieur à la composition rend la preuve périmée."""
         composed_sha = self.unit_branch("lot/douze", "src/huit.py", "huit\n", "huit")
