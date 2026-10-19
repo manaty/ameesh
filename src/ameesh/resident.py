@@ -554,6 +554,61 @@ class ResidentDriver:
             return self.send(text, input_id)
         return self._steer(turn, text, input_id) or turn
 
+    def steer_running(self, text: str, input_id: str | None = None) -> Turn | None:
+        """Serve `text` in the running turn, never start a new one (L77/B8).
+
+        The runner preempts a resident turn: if the turn ends while the steer
+        request is in flight, the input must wait for the next runner turn, not
+        open a turn that nobody reads. Returns None when no turn is running (or
+        when a driver would have opened a new one)."""
+        input_id = input_id or new_id()
+        with self._lock:
+            self._usable()
+            turn = self._turn
+            if turn is None:
+                return None
+            turn.inputs.append(input_id)
+            if self._steer_locked:
+                # written before the turn can end: never into the next one
+                try:
+                    self._steer(turn, text, input_id)
+                except BaseException:
+                    turn.inputs.remove(input_id)
+                    raise
+                return turn
+            # served only once the harness accepts it (`_finish` leaves it out
+            # until then: retried rather than lost)
+            self._unconfirmed.add(input_id)
+        try:
+            result = self._steer(turn, text, input_id, allow_new_turn=False)
+        except BaseException:
+            with self._lock:
+                self._unconfirmed.discard(input_id)
+                if input_id in turn.inputs:
+                    turn.inputs.remove(input_id)
+            raise
+        if result is not None and result is not turn:
+            # A driver that returns another turn in this mode is refused: the
+            # runner never adopts a turn it has not launched.
+            with self._lock:
+                self._unconfirmed.discard(input_id)
+                if input_id in turn.inputs:
+                    turn.inputs.remove(input_id)
+            return None
+        with self._lock:
+            if turn.result is not None:
+                # Accepted just before the end: served only if the effective
+                # result carries the input.
+                accepted = input_id in (turn.result.inputs or ())
+            else:
+                accepted = input_id in turn.inputs and not turn.interrupted
+            if not accepted:
+                self._unconfirmed.discard(input_id)
+                if input_id in turn.inputs:
+                    turn.inputs.remove(input_id)
+                return None
+        return turn
+
     def interrupt(self) -> bool:
         """End the running turn without killing the harness (False: no turn)."""
         with self._lock:
@@ -1280,7 +1335,8 @@ class CodexAppServer(ResidentDriver):
             self._turn_id = None
         self._turn_start(text)
 
-    def _steer(self, turn: Turn, text: str, input_id: str) -> Turn | None:
+    def _steer(self, turn: Turn, text: str, input_id: str,
+               *, allow_new_turn: bool = True) -> Turn | None:
         assert self.peer is not None
         deadline = time.monotonic() + CONTROL_TIMEOUT
         while True:
@@ -1317,6 +1373,16 @@ class CodexAppServer(ResidentDriver):
                 self._followups.append((input_id, text))
                 return None
         # the turn ended without it (left out of its inputs): a new turn
+        if not allow_new_turn:
+            # L77/B8 : the runner never adopts a turn it did not launch — the
+            # input is left unconfirmed (not served) and waits for the next
+            # runner turn, which will reserve and show it again.
+            with self._lock:
+                self._unconfirmed.add(input_id)
+                if input_id in turn.inputs:
+                    turn.inputs.remove(input_id)
+            log("turn/steer late: input kept for the next turn")
+            return None
         return self.send(text, input_id)
 
     def _interrupt(self, turn: Turn, admit=None) -> bool:

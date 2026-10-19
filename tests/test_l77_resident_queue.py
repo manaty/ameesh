@@ -239,6 +239,17 @@ class MemberDeclarationTest(unittest.TestCase):
             self.assertTrue(ident.verified)
 
 
+class _FakeTurn:
+    """L77/B8 : le `Turn` effectif rendu par `steer_running`."""
+
+    def __init__(self):
+        self.result = None
+
+    def served(self, input_id, status="completed"):
+        from types import SimpleNamespace
+        self.result = SimpleNamespace(status=status, inputs=(input_id,))
+
+
 class _FakeDriver:
     def __init__(self, steer_error=None, interrupt_ok=True):
         self.busy = True
@@ -247,12 +258,26 @@ class _FakeDriver:
         self.interrupt_ok = interrupt_ok
         self.steered = []
         self.interrupted = 0
+        self.turn = _FakeTurn()
+        self.inputs = []
+        self.steer_gate = None
+        self.steer_entered = __import__("threading").Event()
 
     def steer(self, text, input_id=None):
         if self.steer_error is not None:
             raise self.steer_error
         self.steered.append(text)
         return object()
+
+    def steer_running(self, text, input_id=None):
+        self.inputs.append(input_id)
+        self.steer_entered.set()
+        if self.steer_gate is not None:
+            self.steer_gate.wait(10)
+        if self.steer_error is not None:
+            raise self.steer_error
+        self.steered.append(text)
+        return self.turn
 
     def interrupt(self):
         self.interrupted += 1
@@ -277,6 +302,9 @@ class PreemptResidentTest(unittest.TestCase):
         worker.preempting = threading.Event()
         worker._preempt_seq = 0
         worker._steer_pending = []
+        worker._steer_lock = threading.Lock()
+        worker._turn_generation = 1
+        worker._turn_live = True
         worker.wake = threading.Event()
         worker.cfg = SimpleNamespace(host="h")
         worker.db = object()
@@ -400,9 +428,10 @@ class PreemptResidentTest(unittest.TestCase):
         deliver.assert_not_called()          # soldé seulement à la fin du tour
         self.assertFalse(worker.preempting.is_set())
         self.assertEqual(len(worker._steer_pending), 1)
+        driver.turn.served(driver.inputs[-1])
         with mock.patch("ameesh.runner.mail.deliver",
                         return_value=[3]) as deliver:
-            worker._solde_steers(True)
+            worker._solde_steers(True, worker._turn_generation)
         deliver.assert_called_once()
         self.assertEqual(worker._steer_pending, [])
 
@@ -419,8 +448,69 @@ class PreemptResidentTest(unittest.TestCase):
                 mock.patch("ameesh.runner.mail.release"):
             self.assertEqual(worker._preempt_resident(), "steered")
         with mock.patch("ameesh.runner.mail.release") as release:
-            worker._solde_steers(False)
+            worker._solde_steers(False, worker._turn_generation)
         release.assert_called_once()
+
+    def test_a_turn_result_without_the_steered_input_releases(self):
+        """B8 : un ACK tardif n'est jamais soldé par le tour qui l'a précédé."""
+        from types import SimpleNamespace
+        from unittest import mock
+        driver = _FakeDriver()
+        worker = self._worker(driver)
+        self._preempting(worker)
+        worker._preempt_row = self._row()
+        with mock.patch("ameesh.runner.mail.reserve", return_value=[{"id": 3}]):
+            self.assertEqual(worker._preempt_resident(), "steered")
+        driver.turn.result = SimpleNamespace(status="completed", inputs=("other",))
+        with mock.patch("ameesh.runner.mail.release") as release, \
+                mock.patch("ameesh.runner.mail.deliver") as deliver:
+            worker._solde_steers(True, worker._turn_generation)
+        release.assert_called_once()
+        deliver.assert_not_called()
+
+    def test_a_steer_of_a_closed_generation_is_refused(self):
+        from unittest import mock
+        driver = _FakeDriver(interrupt_ok=False)
+        worker = self._worker(driver)
+        self._preempting(worker)
+        worker._preempt_row = self._row()
+        worker._turn_live = False
+        with mock.patch("ameesh.runner.mail.reserve") as reserve, \
+                mock.patch("ameesh.runner.mail.release"):
+            self.assertEqual(worker._preempt_resident(worker._turn_generation),
+                             "deferred")
+        reserve.assert_not_called()
+        self.assertEqual(driver.steered, [])
+
+    def test_the_end_of_turn_waits_for_the_steer_barrier(self):
+        """B8 : le solde attend la réservation et la requête de steer en vol."""
+        import threading
+        import time
+        from unittest import mock
+        driver = _FakeDriver()
+        driver.steer_gate = threading.Event()
+        worker = self._worker(driver)
+        generation = worker._turn_generation
+        outcome = []
+        with mock.patch("ameesh.runner.mail.reserve", return_value=[{"id": 3}]), \
+                mock.patch("ameesh.runner.mail.deliver", return_value=[3]) as deliver, \
+                mock.patch("ameesh.runner.mail.release"):
+            steer = threading.Thread(
+                target=lambda: outcome.append(
+                    worker._steer_human(self._row(), driver, generation)))
+            steer.start()
+            self.assertTrue(driver.steer_entered.wait(2))
+            driver.turn.served(driver.inputs[0])
+            solde = threading.Thread(
+                target=lambda: worker._solde_steers(True, generation))
+            solde.start()
+            time.sleep(0.1)
+            self.assertTrue(solde.is_alive())  # barrière : le steer est en vol
+            driver.steer_gate.set()
+            steer.join(5)
+            solde.join(5)
+        self.assertEqual(outcome, [True])
+        deliver.assert_called_once()
 
     def test_steer_settled_at_the_end_of_a_turn_without_mail(self):
         """B8 : un steer reçu pendant un tour de consigne (sans courrier) est
@@ -438,7 +528,12 @@ class PreemptResidentTest(unittest.TestCase):
             worker._held_by_pressure = lambda pression: ""
 
             def tour(spec, _r=result, _w=worker):
-                _w._steer_pending.append(("jeton", [3]))  # steer accepté en cours de tour
+                from types import SimpleNamespace
+                turn = _FakeTurn()
+                if _r:
+                    turn.result = SimpleNamespace(status="completed", inputs=("in",))
+                _w._steer_pending.append(
+                    ("jeton", [3], _w._turn_generation, turn, "in"))
                 return _r
             worker._run_turn = tour
             worker._run_guarded_turn = types.MethodType(AgentWorker._run_guarded_turn, worker)
@@ -459,7 +554,7 @@ class PreemptResidentTest(unittest.TestCase):
         self._preempting(worker)
         worker._preempt_row = self._row()
         second = dict(self._row(), id=4)
-        real_steer = driver.steer
+        real_steer = driver.steer_running
         calls = []
 
         def steer(text, input_id=None):
@@ -468,7 +563,7 @@ class PreemptResidentTest(unittest.TestCase):
                 worker.request_preempt(second)
             return real_steer(text, input_id)
 
-        driver.steer = steer
+        driver.steer_running = steer
         with mock.patch("ameesh.runner.mail.reserve",
                         return_value=[{"id": 3}]), \
                 mock.patch("ameesh.runner.mail.deliver"), \

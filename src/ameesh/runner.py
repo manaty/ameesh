@@ -191,6 +191,11 @@ RESIDENT_END_WAIT_S = 5.0
 #: steers en fin de tour. Un `driver.steer` accepté après le solde laisserait
 #: une réservation orpheline ; la jonction ferme ce cycle.
 PREEMPT_JOIN_S = 10.0
+#: L77/B8 : barrière de steer. Le pilote borne une requête `turn/steer` à
+#: `resident.CONTROL_TIMEOUT` (15 s), avec une attente préalable possible du
+#: `turn/start` : la fin de tour attend le steer en cours au-delà de la simple
+#: jonction du moniteur, puis vérifie le `TurnResult` effectif.
+PREEMPT_STEER_WAIT_S = 35.0
 #: #339: this host's rows whose group is gone are settled at start and then
 #: every LIVE_REVIEW_EVERY_S (L147's rule, with a liveness check in place of
 #: the boot time); a `running` row only once its turn (or grace period) is
@@ -544,8 +549,14 @@ class AgentWorker(threading.Thread):
         #: L77/B10 : génération des demandes de préemption, pour ne pas effacer
         #: un signal arrivé pendant le traitement du précédent.
         self._preempt_seq = 0
-        #: L77/B8 : remises steer réservées, soldées à la fin effective du tour.
-        self._steer_pending: list[tuple[str, list[int]]] = []
+        #: L77/B8 : remises steer réservées, rattachées à la génération et au
+        #: `Turn` effectif : (jeton, ids, génération, Turn, input_id).
+        self._steer_pending: list[tuple[str, list[int], int, object | None, str]] = []
+        #: L77/B8 : barrière du steer en cours. Le tour ne se solde pas tant
+        #: qu'une remise steer peut encore être acceptée par le pilote.
+        self._steer_lock = threading.Lock()
+        self._turn_generation = 0
+        self._turn_live = False
         self._refus_vus: set[int] = set()
         #: arrêt demandé avant la publication du Popen (point de passage unique)
         self.stop_requested = threading.Event()
@@ -1414,7 +1425,7 @@ class AgentWorker(threading.Thread):
             self.preempting.set()
         self.wake.set()
 
-    def _preempt_resident(self) -> str:
+    def _preempt_resident(self, generation: int | None = None) -> str:
         """L77 : préempte un tour résident sans tuer le process.
 
         Rang 1 humain : `steer` au point sûr, la remise restant réservée jusqu'à
@@ -1443,11 +1454,13 @@ class AgentWorker(threading.Thread):
                       "kept for the next turn" % self.name)
             return "deferred"
         with self.lock:
+            if generation is None:
+                generation = getattr(self, "_turn_generation", 0)
             row = self._preempt_row
             seq = self._preempt_seq
             self._preempt_row = None
         if row is not None and self._from_human(row):
-            if self._steer_human(row, driver):
+            if self._steer_human(row, driver, generation):
                 # B10 : ne retombe le latch que si aucune nouvelle demande n'est
                 # arrivée pendant le steer ; sinon le moniteur doit la servir.
                 with self.lock:
@@ -1468,59 +1481,114 @@ class AgentWorker(threading.Thread):
                   "turn" % self.name)
         return "deferred"
 
-    def _steer_human(self, row: dict, driver) -> bool:
+    def _steer_human(self, row: dict, driver, generation: int) -> bool:
         """L77/B8 : réserve un message humain et le remet au point sûr.
 
-        La réservation n'est **pas** soldée ici : le message est tenu jusqu'à
-        la fin effective du tour (`_solde_steers`), pour qu'une mort du harnais
-        ou une interruption le rende à la reprise au lieu de le perdre. La
-        réservation active le retire aussi du hook mid-tour (ACTIVE_SQL).
+        La réservation n'est **pas** soldée ici : elle est rattachée au `Turn`
+        effectif et à la génération du tour, puis soldée par `_solde_steers` si
+        ce `Turn` l'a réellement servi. Le steer ne démarre jamais un nouveau
+        tour (`steer_running`) : si le tour s'achève pendant la requête, le
+        message reste en file pour le tour suivant. La barrière `_steer_lock`
+        couvre la réservation et la requête : `_solde_steers` attend qu'elles
+        soient finies, ce qui ferme la course de l'ACK tardif.
         """
         try:
             ident = int(row.get("id"))
         except (KeyError, TypeError, ValueError):
             return False
-        jeton = mail.new_token()
-        try:
-            reserves = mail.reserve(
-                self.db, self.name, self.runner.runner_id, self.epoch, jeton,
-                ids=[ident], porteur="consigne",
-                ttl_seconds=mail.human_reservation_ttl(self.turn_max_seconds()))
-        except db_mod.DbError as exc:
-            log_async("[%s] steer reservation failed (%s)" % (self.name, exc))
+        from . import resident as resident_mod
+        with self._steer_lock:
+            with self.lock:
+                if not self._turn_live or self._turn_generation != generation:
+                    return False
+            jeton = mail.new_token()
+            try:
+                reserves = mail.reserve(
+                    self.db, self.name, self.runner.runner_id, self.epoch, jeton,
+                    ids=[ident], porteur="consigne",
+                    ttl_seconds=mail.human_reservation_ttl(self.turn_max_seconds()))
+            except db_mod.DbError as exc:
+                log_async("[%s] steer reservation failed (%s)" % (self.name, exc))
+                return False
+            if not reserves:
+                return False
+            with self.lock:
+                if not self._turn_live or self._turn_generation != generation:
+                    # Le tour s'est clos pendant la réservation : ne pas
+                    # steerer un tour qui n'existe plus.
+                    try:
+                        mail.release(self.db, self.name, jeton, [ident])
+                    except db_mod.DbError as exc:
+                        log_async("[%s] steer reservation not released (%s)"
+                                  % (self.name, exc))
+                    return False
+            try:
+                texte = self._urgent_steer_text(row)
+                input_id = resident_mod.new_id()
+                turn = (driver.steer_running(texte, input_id=input_id)
+                        if texte and hasattr(driver, "steer_running") else None)
+                if turn is not None:
+                    with self.lock:
+                        if self._turn_live and self._turn_generation == generation:
+                            self._steer_pending.append(
+                                (jeton, [ident], generation, turn, input_id))
+                            log_async("[%s] priority message steered into the "
+                                      "resident turn" % self.name)
+                            return True
+                    # L77/B8 : ACK accepté après la clôture de la génération :
+                    # jamais attribué au tour suivant, la remise est libérée.
+                    log_async("[%s] late steer acknowledged after the turn: "
+                              "released" % self.name)
+            except Exception as exc:  # InputRefused, ResidentBusy, protocole muet
+                log_async("[%s] resident steer refused (%s): interrupting"
+                          % (self.name, " ".join(str(exc).split())[:120]))
+            try:
+                mail.release(self.db, self.name, jeton, [ident])
+            except db_mod.DbError as exc:
+                log_async("[%s] steer reservation not released (%s)"
+                          % (self.name, exc))
             return False
-        if not reserves:
-            return False
-        try:
-            texte = self._urgent_steer_text(row)
-            if texte and driver.steer(texte) is not None:
-                with self.lock:
-                    self._steer_pending.append((jeton, [ident]))
-                log_async("[%s] priority message steered into the resident turn"
-                          % self.name)
-                return True
-        except Exception as exc:  # InputRefused, ResidentBusy, protocole muet
-            log_async("[%s] resident steer refused (%s): interrupting"
-                      % (self.name, " ".join(str(exc).split())[:120]))
-        try:
-            mail.release(self.db, self.name, jeton, [ident])
-        except db_mod.DbError as exc:
-            log_async("[%s] steer reservation not released (%s)"
-                      % (self.name, exc))
-        return False
 
-    def _solde_steers(self, result: bool) -> None:
+    def _begin_turn_generation(self) -> int:
+        """L77/B8 : ouvre la génération du tour qui va être servi."""
+        with self._steer_lock:
+            with self.lock:
+                self._turn_generation += 1
+                self._turn_live = True
+                return self._turn_generation
+
+    def _solde_steers(self, result: bool, generation: int | None = None) -> None:
         """L77/B8 : solde les remises steer sur la fin effective du tour.
 
-        Tour achevé (`result` vrai) : la remise est soldée et tracée. Mort ou
-        échec avant la fin : la réservation est libérée, le message sera
-        re-servi (au moins une fois). La liste est vidée dans tous les cas.
+        La barrière `_steer_lock` attend le steer en cours (réservation et
+        requête) ; la génération rattache chaque remise à son tour, pour qu'un
+        ACK tardif ne soit jamais soldé par le tour suivant. Une remise n'est
+        soldée que si le `TurnResult` effectif est achevé et contient son
+        `input_id` ; sinon elle est libérée (au moins une fois).
         """
         with self.lock:
-            pending = self._steer_pending
-            self._steer_pending = []
-        for jeton, ids in pending:
-            if result:
+            if generation is None:
+                generation = self._turn_generation
+        acquired = self._steer_lock.acquire(timeout=PREEMPT_STEER_WAIT_S)
+        try:
+            with self.lock:
+                pending = self._steer_pending
+                self._steer_pending = []
+                self._turn_live = False
+                self._turn_generation += 1
+        finally:
+            if acquired:
+                self._steer_lock.release()
+        if not acquired:
+            log_async("[%s] steer barrier not reached within %.0fs: a late "
+                      "steer will release itself" % (self.name, PREEMPT_STEER_WAIT_S))
+        from . import resident as resident_mod
+        for jeton, ids, gen, turn, input_id in pending:
+            fin = getattr(turn, "result", None) if turn is not None else None
+            served = (gen == generation and fin is not None
+                      and getattr(fin, "status", "") == resident_mod.COMPLETED
+                      and input_id in (getattr(fin, "inputs", ()) or ()))
+            if served:
                 try:
                     livres = mail.deliver(self.db, self.name, self.runner.runner_id,
                                           self.epoch, jeton, ids)
@@ -1530,6 +1598,9 @@ class AgentWorker(threading.Thread):
                               % (self.name, exc))
                 self._remise_incertaine(ids, livres)
             else:
+                if turn is not None and gen != generation:
+                    log_async("[%s] late steer from an earlier turn released"
+                              % self.name)
                 try:
                     mail.release(self.db, self.name, jeton, ids)
                 except db_mod.DbError as exc:
@@ -1555,9 +1626,11 @@ class AgentWorker(threading.Thread):
         rattrapée par `kill_if_stop_requested()`. L77 : un tour résident est
         interrompu à son point sûr, sans tuer le process.
         """
+        with self.lock:
+            generation = self._turn_generation
         while not done.wait(0.1):
             if self.preempting.is_set():
-                status = self._preempt_resident()
+                status = self._preempt_resident(generation)
                 if status == "steered":
                     # Un steer accepté n'arrête pas le tour : le moniteur
                     # continue de veiller sur les urgents suivants et `restart`.
@@ -5053,12 +5126,13 @@ class AgentWorker(threading.Thread):
             # L77/B8 : un steer humain reçu pendant un tour sans courrier
             # (consigne, suite, relance) est soldé à sa fin effective lui aussi.
             self._solde_steers(False)  # restes d'un tour précédent, jamais réservés
+            generation = self._begin_turn_generation()
             result = False
             try:
                 result = self._run_turn(spec)
                 return result
             finally:
-                self._solde_steers(result)
+                self._solde_steers(result, generation)
         kind = spec["kind"]
         budget = self._budget_courrier()
         envelopes = spec.get("envelopes")
@@ -5089,6 +5163,7 @@ class AgentWorker(threading.Thread):
         spec = dict(spec, prompt=prompt, rows=inclus, ids=ids, jeton=jeton)
         self._courrier_lance = False
         self._solde_steers(False)  # restes d'un tour précédent, jamais réservés
+        generation = self._begin_turn_generation()
         result = False
         try:
             result = self._run_turn(spec)
@@ -5109,7 +5184,7 @@ class AgentWorker(threading.Thread):
                     # re-livré, signalé (aucune perte).
                     log("[%s] could not cancel the reservation (%s)"
                         % (self.name, exc))
-            self._solde_steers(result)
+            self._solde_steers(result, generation)
 
     def _livre_courrier(self, spec: dict) -> None:
         """Le harnais est lancé avec la consigne : la réservation est soldée.
@@ -5634,6 +5709,21 @@ class AgentWorker(threading.Thread):
         rp.turns += 1
         rp.last_used = time.monotonic()
         rp.mark_alive()          # T3 : le tour qui vient de finir est une preuve de vie
+        # L77/B8 : un steer est peut-être encore en vol (barrière `_steer_lock`) ;
+        # attendre sa fin avant de juger le résident occupé, puis fermer la
+        # génération pour qu'un ACK tardif ne soit pas attribué au tour suivant.
+        lock = getattr(self, "_steer_lock", None)
+        if lock is not None:
+            acquired = lock.acquire(timeout=PREEMPT_STEER_WAIT_S)
+            try:
+                with self.lock:
+                    self._turn_live = False
+            finally:
+                if acquired:
+                    lock.release()
+            if not acquired:
+                log_async("[%s] steer barrier not reached at turn end within "
+                          "%.0fs" % (self.name, PREEMPT_STEER_WAIT_S))
         urgence = self._urgent_end() or (
             "the host is withdrawing" if self.host_yield is not None else
             "stopping" if self.stopping.is_set() else "")
