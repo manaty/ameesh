@@ -248,11 +248,11 @@ class DeuxMeshesTest(_Base):
         with mock.patch.dict(os.environ, {"XDG_STATE_HOME": self.tmp}):
             self.assertEqual(
                 account_claims.registry(config_mod.Config()),
-                os.path.join(self.tmp, "ameesh", "account-claims"))
+                os.path.join(self.tmp, "ameesh-host", "accounts"))
         with mock.patch.dict(os.environ, {"XDG_STATE_HOME": "relative"}):
             self.assertEqual(account_claims.registry(config_mod.Config()),
                              os.path.expanduser(
-                                 "~/.local/state/ameesh/account-claims"))
+                                 "~/.local/state/ameesh-host/accounts"))
 
 
 class PolitiqueTest(_Base):

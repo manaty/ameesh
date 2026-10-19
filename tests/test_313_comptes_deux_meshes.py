@@ -8,7 +8,7 @@ dossiers d'identifiants Claude et Codex — quota commun, sessions dans les mêm
 dossiers, contraire à 0033. Chaque mesh a sa base : seul l'hôte le voit.
 
 Depuis #2580, l'identité du mesh est lue en base (jamais le DSN) et le registre
-est `$XDG_STATE_HOME/ameesh/account-claims` ; ces témoins restent ceux de
+est `~/.local/state/ameesh-host/accounts` ; ces témoins restent ceux de
 #313 : détection, refus strict, refus relu au lancement, alerte, configuration.
 """
 from __future__ import annotations

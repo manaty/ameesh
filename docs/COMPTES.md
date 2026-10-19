@@ -896,8 +896,11 @@ mesh) can see it. The host can.
 (#1883, `_publish_identities`) also claims the credentials of the accounts it
 declares, in a registry shared by the meshes of the host and the user:
 `account_registry` in the host configuration, by default
-`$XDG_STATE_HOME/ameesh/account-claims`
-(`~/.local/state/ameesh/account-claims` under the XDG default). The runner
+`~/.local/state/ameesh-host/accounts` (under `$XDG_STATE_HOME` when it is
+set). One host registry: this path is the one #313 introduced, kept by
+mesh-design's decision of 2026-10-19 for #2580; the earlier
+`$XDG_STATE_HOME/ameesh/account-claims` path in the lot's brief is abandoned.
+The runner
 also claims at startup and then every 10 minutes. A credential is the resolved
 location (`realpath`, links included) of a `config_dir` account's folder (the
 harness default folder for an account without `path`), of a `key_file`, or the

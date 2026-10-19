@@ -10,8 +10,8 @@ sessions dans les mêmes dossiers. La base ne peut pas le voir — #1883 compare
 les configurations d'UN mesh, et chaque mesh a sa base —, l'hôte si.
 
 Registre local à l'hôte et à l'utilisateur (`account_registry`, par défaut
-`$XDG_STATE_HOME/ameesh/account-claims`, soit
-`~/.local/state/ameesh/account-claims`), partagé par tous les meshes du
+`~/.local/state/ameesh-host/accounts` — sous `$XDG_STATE_HOME` quand il est
+posé), partagé par tous les meshes du
 poste : un dossier par identifiant — l'empreinte de l'emplacement résolu
 (`realpath`) du dossier de configuration (`config_dir`), du fichier de clé
 (`key_file`) ou de la valeur de la clé (`key_env`) — et, dedans, une
@@ -61,10 +61,10 @@ import time
 #: version du format : la v2 porte l'hôte et l'identité de mesh lue en base ;
 #: les revendications v1 (clé L219 dérivée du DSN) sont ignorées.
 SCHEMA = "ameesh-account-claim/2"
-#: registre par défaut : sous le dossier d'état XDG de l'utilisateur, jamais
-#: sous le `state_dir` d'un mesh (deux meshes peuvent en avoir deux) ; voir
-#: `default_registry` (XDG_STATE_HOME est lu à l'exécution).
-DEFAULT_REGISTRY = "~/.local/state/ameesh/account-claims"
+#: registre par défaut : le registre d'hôte historique de #313, sous le
+#: dossier d'état XDG de l'utilisateur, jamais sous le `state_dir` d'un mesh
+#: (deux meshes peuvent en avoir deux) ; voir `default_registry`.
+DEFAULT_REGISTRY = "~/.local/state/ameesh-host/accounts"
 #: vivacité d'une revendication : au-delà, le mesh qui l'a écrite ne tourne
 #: plus avec cette configuration — elle n'est plus un partage
 CLAIM_WINDOW_S = 3600.0
@@ -87,7 +87,7 @@ def default_registry(environ=None) -> str:
     base = str(env.get("XDG_STATE_HOME") or "").strip()
     if not base or not os.path.isabs(os.path.expanduser(base)):
         base = "~/.local/state"
-    return os.path.join(os.path.expanduser(base), "ameesh", "account-claims")
+    return os.path.join(os.path.expanduser(base), "ameesh-host", "accounts")
 
 
 def registry(cfg) -> str:

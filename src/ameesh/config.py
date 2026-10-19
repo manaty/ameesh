@@ -426,8 +426,8 @@ class Config:
     #: (#65) : refuser aujourd'hui arrêterait les deux meshes du poste.
     accounts_shared: str = "report"
     #: #313/#2580 : le registre des revendications de comptes, partagé par les
-    #: meshes de l'hôte ; vide = `$XDG_STATE_HOME/ameesh/account-claims`
-    #: (`~/.local/state/ameesh/account-claims` par défaut XDG)
+    #: meshes de l'hôte ; vide = `~/.local/state/ameesh-host/accounts` (sous
+    #: `$XDG_STATE_HOME` quand il est posé)
     account_registry: str = ""
     #: alertes poussées (L38, décision 0030 point 4) : la clé `notify` du
     #: fichier de configuration de l'HÔTE, telle quelle (routes, canaux,
