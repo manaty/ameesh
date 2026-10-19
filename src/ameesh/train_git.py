@@ -134,7 +134,14 @@ class Repository:
         return list(receipts.values())
 
     def _merge_sync(self, base, sha):
-        """The clean tree of ``main`` merged into ``base``, or a named refusal."""
+        """The clean tree of ``main`` merged into ``base``, or a named refusal.
+
+        Generated files are never taken from the merge: a conflict on them is
+        not a refusal, they are regenerated on the merged tree like
+        :func:`land.merge` does. Any other conflict still refuses the packet.
+        """
+        generated = tuple(getattr(self.project, "generated", ()))
+        paths = {item.path for item in generated}
         resolutions._check(resolutions._run(
             self.clone.path, "checkout", "-q", "-f", "--detach", base),
             "checkout main sync base")
@@ -143,9 +150,18 @@ class Repository:
             "merge", "--no-ff", "--no-commit", "--quiet", sha)
         if proc.returncode:
             files = resolutions.unmerged(self.clone.path)
-            resolutions._run(self.clone.path, "merge", "--abort")
-            raise TrainError("main sync conflict main=%s base=%s files=%s" % (
-                sha, base, ", ".join(files) or "unknown"))
+            resolutions.exclude_generated(self.clone.path, files, paths)
+            others = [name for name in files if name not in paths]
+            if not files or others:
+                resolutions._run(self.clone.path, "merge", "--abort")
+                raise TrainError("main sync conflict main=%s base=%s files=%s" % (
+                    sha, base, ", ".join(others or files) or "unknown"))
+        if paths:
+            made = land._regenerate(self.clone.path, generated, paths)
+            if not made["ok"]:
+                resolutions._run(self.clone.path, "merge", "--abort")
+                raise TrainError("main sync generated file %s: %s" % (
+                    made["file"], made["output"]))
         tree = plan_git._out(self.clone.path, "write-tree")
         if not tree:
             raise TrainError("cannot write the main sync tree")

@@ -727,3 +727,28 @@ class MainSyncTest(unittest.TestCase):
         _git(self.repo, "push", "-q", "--force", "origin", "main")
         with self.assertRaisesRegex(train.TrainError, "no longer on main"):
             self.repository.validate_sync(dict(sync, base=base))
+
+    def test_main_sync_regenerates_a_generated_file_instead_of_refusing(self):
+        # dev1: a generated file (domains.json on Nexlink) conflicts on a main
+        # sync; land.merge regenerates it, the sync must not refuse the packet.
+        generated = (radar.Generated(
+            "generated.txt", "printf 'generated\\n' > generated.txt"),)
+        project = radar.Project(name="p", repo=self.repo, target="develop",
+                                github="o/r", generated=generated)
+        repository = train_git.Repository(project, self.clone)
+        _git(self.repo, "checkout", "-q", "develop")
+        _write(self.repo, "generated.txt", "develop\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "develop generated")
+        _git(self.repo, "push", "-q", "origin", "develop")
+        _git(self.repo, "checkout", "-q", "main")
+        _write(self.repo, "generated.txt", "main\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "main generated")
+        _git(self.repo, "push", "-q", "origin", "main")
+        base = repository.target("develop")
+        sync = repository.main_sync("develop", base)
+        self.assertIsNotNone(sync)
+        composed = repository.compose("develop", base, [self.member], sync=sync)
+        self.assertEqual(_git(self.clone.path, "show",
+                              composed["head"] + ":generated.txt"), "generated")

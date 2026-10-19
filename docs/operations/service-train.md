@@ -97,9 +97,12 @@ Une cible autre que `main` reçoit la **synchro mécanique de main** (#2727) :
 quand le paquet a des membres et que `main` porte des commits absents de la
 cible, le plan porte `sync: {ref: "main", sha: …}` et le paquet réel fusionne
 ce commit en tête, sans avis ni lot build. La comparaison expose le fait dans
-`sync` (`plan`, `manual`, `lots`) et retire des lots manquants celui dont la
-fusion manuelle a apporté le même commit `main` (trailer `ameesh-work`) : une
-synchro manuelle n'est pas un écart de composition.
+`sync` (`plan`, `manual`, `lots`) et retire des lots manquants celui d'une
+fusion manuelle **prouvée pure** : deux parents (côté paquet, `main`), un seul
+trailer `ameesh-work`, arbre identique à la fusion propre des parents. Une
+fusion qui ajoute autre chose, résout à la main ou porte plusieurs trailers
+laisse son lot manquant (`sync.refused`) : une synchro non prouvée n'est pas un
+écart de composition.
 
 Rien n'est réservé, poussé, dispatché ni fusionné : aucun `merge_locks` de
 cible, aucune branche `integration/**`, aucune CI. C'est le mode qui doit
@@ -133,8 +136,10 @@ Avant les membres, le train fusionne le commit `main` que la cible ne porte
 pas encore (membre mécanique #2727, sans avis) : la tête du paquet porte
 `ameesh-sync: main <sha>`, cite `main` parmi ses parents et reste reproductible
 depuis le plan. Un conflit refuse le paquet en nommant `main`, la base et les
-fichiers ; une réécriture de `main` qui retire le commit planifié refuse aussi
-la publication. Une cible `main` n'a évidemment pas cette synchro.
+fichiers ; un fichier **généré** du projet fait exception : il est régénéré sur
+l'arbre fusionné comme à l'atterrissage, et un échec de régénération refuse le
+paquet. Une réécriture de `main` qui retire le commit planifié refuse aussi la
+publication. Une cible `main` n'a évidemment pas cette synchro.
 
 La bascule est un geste de pilote : changer `mode` en `active`, vérifier le
 commit canon audité et l'échéance, puis redémarrer l'exécuteur. Aucun code ne

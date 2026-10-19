@@ -569,3 +569,37 @@ class ShadowMainSyncTest(PgTestCase):
         self.assertEqual(comparison["sync"]["manual"], self.main_tip)
         self.assertEqual(comparison["sync"]["lots"], [2695])
         self.assertIn("synchro main", comparison["explanations"]["2695"])
+
+    def manual_sync(self, message, *, extra=None):
+        self.project_repo.git("checkout", "-q", "develop")
+        self.project_repo.git("merge", "--no-ff", "--no-commit", "main")
+        if extra is not None:
+            self.project_repo.write(extra, "not in main\n")
+        self.project_repo.commit(message % self.main_tip)
+        self.project_repo.git("push", "-q", "origin", "develop")
+
+    def test_impure_manual_sync_keeps_its_lot_missing(self):
+        # cx2: merging main then adding an unreviewed file is not a sync. The
+        # exact main parent and the trailer prove nothing without the tree.
+        self.shadow.scheduled_step(self.db, self.now)
+        self.manual_sync("Merge main %s dans develop — synchro #9999\n\n"
+                         "ameesh-work: 9999", extra="unreviewed-feature")
+        self.manual_packet([9999, self.item["id"]])
+        self.shadow.scheduled_step(self.db, self.now + 3600)
+        comparison = self.shadow.store.load()["comparisons"][0]
+        self.assertIn(9999, comparison["missing"])
+        self.assertEqual(comparison["sync"]["lots"], [])
+        self.assertFalse(comparison["sync"]["refused"]["pure"])
+        self.assertIn("tree", comparison["sync"]["refused"]["reason"])
+
+    def test_pure_sync_with_several_trailers_exempts_nothing(self):
+        # dev1: a packet merge with a main parent must not exempt every trailer.
+        self.shadow.scheduled_step(self.db, self.now)
+        self.manual_sync("Merge main %s dans develop\n\n"
+                         "ameesh-work: 9999\nameesh-work: 9998")
+        self.manual_packet([9999, 9998, self.item["id"]])
+        self.shadow.scheduled_step(self.db, self.now + 3600)
+        comparison = self.shadow.store.load()["comparisons"][0]
+        self.assertEqual(comparison["missing"], [9998, 9999])
+        self.assertEqual(comparison["sync"]["lots"], [])
+        self.assertIn("trailer", comparison["sync"]["refused"]["reason"])
