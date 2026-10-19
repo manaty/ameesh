@@ -7,6 +7,8 @@ import contextlib
 import dataclasses
 import io
 import os
+import shutil
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -33,6 +35,7 @@ class MemoryPorts:
         self.effects, self.probes, self.notices = [], [], []
         self.ci_by_head = {}
         self.fired, self.admitted = True, True
+        self.synced = None
         self.edges = []
 
     def acquire(self, epoch):
@@ -73,10 +76,18 @@ class MemoryPorts:
             raise train.TrainError("unknown historical author or missing review")
         return dict(base=base, mode=mode, members=[train.identity(r) for r in rows])
 
-    def compose(self, base, rows, nonce):
+    def compose(self, base, rows, nonce, sync=None):
         self.probes.append([r["work_item_id"] for r in rows])
         token = train.digest([base, [train.identity(r) for r in rows], nonce])[:40]
-        return dict(head=token, tree=train.digest([token, "tree"])[:40])
+        merged = dict(head=token, tree=train.digest([token, "tree"])[:40])
+        if sync is not None:
+            side = train.digest([base, sync, "sync"])[:40]
+            merged["sync"] = dict(sync, base=base, head=side,
+                                  tree=train.digest([side, "sync-tree"])[:40])
+        return merged
+
+    def sync(self, base):
+        return copy.deepcopy(self.synced)
 
     def publish(self, plan, epoch):
         self.effects.append(("publish", plan["head"]))
@@ -153,6 +164,36 @@ class TrainTest(unittest.TestCase):
         self.assertEqual([e[0] for e in self.ports.effects], ["publish", "ci", "promote"])
         self.assertEqual(self.ports.base, first["plan"]["head"])
         self.assertFalse(self.ports.held)
+
+    def test_mechanical_main_sync_is_persisted_with_the_plan(self):
+        # #2727: a main commit unknown to the target is a mechanical member,
+        # not a reviewed lot; the plan keeps its exact sha and tree.
+        engine = self.make()
+        self.ports.synced = dict(ref="main", sha="b" * 40)
+        plan = engine.step(3600)["plan"]
+        self.assertEqual(plan["sync"]["ref"], "main")
+        self.assertEqual(plan["sync"]["sha"], "b" * 40)
+        self.assertEqual(plan["sync"]["base"], plan["base"])
+        self.assertNotIn("promote", [e[0] for e in self.ports.effects])
+        self.assertEqual(self.ports.document["plan"]["sync"], plan["sync"])
+        # A restart rebuilds the same intent, with the same sync.
+        self.ports.held = False  # the previous process died
+        resumed = train.Engine(self.ports, source=engine.source, target=engine.target,
+                               policy=train.Policy(enabled=True, build_beta=False))
+        self.assertEqual(resumed.step(3601)["result"], "ci")
+        self.assertEqual(self.ports.probes[-1], [1])
+
+    def test_composition_sync_receipt_must_match_the_sync_adapter(self):
+        engine = self.make()
+        self.ports.synced = dict(ref="main", sha="b" * 40)
+        compose = self.ports.compose
+        self.ports.compose = lambda base, rows, nonce, sync=None: {
+            key: value for key, value in compose(base, rows, nonce).items() if key != "sync"}
+        outcome = engine.step(3600)
+        self.assertEqual(outcome["result"], "refused", outcome)
+        self.assertIn("no exact main sync receipt", outcome["error"])
+        self.assertNotIn("publish", [e[0] for e in self.ports.effects])
+        self.ports.compose = compose
 
     def test_composition_migration_mapping_is_persisted_with_the_plan(self):
         # #2400: a reconstruction reads the numbers from the plan, so the
@@ -590,3 +631,99 @@ class MigrationCompositionTest(_Land):
         base = self.repository.target("main")
         with self.assertRaisesRegex(train.MemberDeferred, "historical migration"):
             self.repository.compose("main", base, [member])
+
+
+class MainSyncTest(unittest.TestCase):
+    """#2727 : main en avance est un membre mécanique, sans avis ni lot."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-2727-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.repo = os.path.join(self.tmp, "repo")
+        os.makedirs(self.repo)
+        _git(self.repo, "init", "-q", "-b", "main")
+        _write(self.repo, "base.txt", "base\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "base")
+        self.origin = os.path.join(self.tmp, "origin.git")
+        _git(self.tmp, "clone", "-q", "--bare", self.repo, self.origin)
+        _git(self.repo, "remote", "add", "origin", self.origin)
+        _git(self.repo, "push", "-q", "origin", "main")
+        _git(self.repo, "checkout", "-qb", "develop")
+        _git(self.repo, "push", "-q", "origin", "develop")
+        _git(self.repo, "checkout", "-q", "main")
+        _write(self.repo, "prod.txt", "prod\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "prod")
+        _git(self.repo, "push", "-q", "origin", "main")
+        self.main_tip = _git(self.repo, "rev-parse", "main")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "checkout", "-qb", "lot/1")
+        _write(self.repo, "lot.txt", "lot\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "lot 1")
+        _git(self.repo, "push", "-q", "origin", "lot/1")
+        self.clone = resolutions.Replayer(self.repo, os.path.join(self.tmp, "clone"))
+        self.project = radar.Project(name="p", repo=self.repo, target="develop",
+                                     github="o/r")
+        self.repository = train_git.Repository(self.project, self.clone)
+        self.member = dict(work_item_id=1, generation=1, frozen_id=1,
+                           frozen_sha=_git(self.repo, "rev-parse", "lot/1"),
+                           target="develop", source=merge_queue.source_of(self.repo),
+                           branch="lot/1", queued_ts=0)
+
+    def test_main_ahead_is_a_mechanical_member_before_the_lots(self):
+        base = self.repository.target("develop")
+        sync = self.repository.main_sync("develop", base)
+        self.assertEqual(sync, dict(ref="main", sha=self.main_tip))
+        composed = self.repository.compose("develop", base, [self.member], sync=sync)
+        self.assertEqual(composed["sync"]["sha"], self.main_tip)
+        self.assertEqual(composed["sync"]["base"], base)
+        self.assertEqual(_git(self.clone.path, "rev-parse", composed["head"] + "^2"),
+                         self.main_tip)
+        self.assertIn("ameesh-sync: main " + self.main_tip,
+                      _git(self.clone.path, "show", "-s", "--format=%B", composed["head"]))
+        self.assertEqual(_git(self.clone.path, "show", composed["head"] + ":prod.txt"), "prod")
+        self.assertEqual(_git(self.clone.path, "show", composed["head"] + ":lot.txt"), "lot")
+        # The exact persisted receipt rebuilds the same tree and head.
+        again = self.repository.compose("develop", base, [self.member],
+                                        sync=composed["sync"])
+        self.assertEqual((again["head"], again["tree"]),
+                         (composed["head"], composed["tree"]))
+
+    def test_main_already_merged_needs_no_sync(self):
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "merge", "--no-ff", "-m", "merge main", "main")
+        _git(self.repo, "push", "-q", "origin", "develop")
+        self.assertIsNone(self.repository.main_sync("develop",
+                                                    self.repository.target("develop")))
+
+    def test_main_target_has_no_mechanical_sync(self):
+        self.assertIsNone(self.repository.main_sync("main", self.repository.target("main")))
+
+    def test_main_sync_conflict_is_named_and_never_composed(self):
+        _git(self.repo, "checkout", "-q", "develop")
+        _write(self.repo, "base.txt", "develop\n")
+        _git(self.repo, "commit", "-qam", "develop edit")
+        _git(self.repo, "push", "-q", "origin", "develop")
+        _git(self.repo, "checkout", "-q", "main")
+        _write(self.repo, "base.txt", "main\n")
+        _git(self.repo, "commit", "-qam", "main edit")
+        _git(self.repo, "push", "-q", "origin", "main")
+        tip = _git(self.repo, "rev-parse", "main")
+        base = self.repository.target("develop")
+        sync = self.repository.main_sync("develop", base)
+        with self.assertRaisesRegex(train.TrainError,
+                                    "main sync conflict .*base.txt") as caught:
+            self.repository.compose("develop", base, [self.member], sync=sync)
+        self.assertIn(tip, str(caught.exception))
+
+    def test_persisted_sync_no_longer_on_main_is_refused(self):
+        base = self.repository.target("develop")
+        sync = self.repository.main_sync("develop", base)
+        _git(self.repo, "checkout", "-q", "main")
+        _git(self.repo, "reset", "-q", "--hard", "develop")
+        _git(self.repo, "commit", "--allow-empty", "-qm", "rewritten main")
+        _git(self.repo, "push", "-q", "--force", "origin", "main")
+        with self.assertRaisesRegex(train.TrainError, "no longer on main"):
+            self.repository.validate_sync(dict(sync, base=base))

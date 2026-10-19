@@ -37,6 +37,7 @@ MAX_PLANS = 24
 MAX_COMPARISONS = 48
 _PACKET = re.compile(r"integration/(paquet-h-[^\s,()]+)")
 _STAMP = re.compile(r"(\d{8}-\d{4})")
+_WORK = re.compile(r"^ameesh-work: (\d+)$", re.M)
 _LOT = re.compile(r"#(\d+)")
 #: an open packet branch whose last composition before the cutoff is older
 #: than this window was abandoned, not in flight. An unproven lot stays an
@@ -285,14 +286,20 @@ class Passage:
                             or seen.add(row["work_item_id"]))]
         deferred.sort(key=lambda row: (row["work_item_id"], row["origin"]))
         stamp = datetime.fromtimestamp(slot, rules.zone()).strftime("%Y%m%d-%H%M")
+        # #2727: main commits unknown to the target are a mechanical member of
+        # the next packet, without review or a build lot. It is recorded only
+        # when a packet has members: an empty cutoff composes nothing.
+        sync = repository.main_sync(self.project.target, base) if members else None
         plan = dict(schema=SCHEMA, project=self.project.name,
                     target=merge_queue._remote_branch(self.project.target),
                     cutoff=float(slot), local_stamp=stamp, base=base,
                     created_ts=float(now), members=members, deferred=deferred,
+                    sync=sync,
                     rules=dict(commit=rules.commit, ci_packet=rules.ci_packet,
                                merge_named_fire=rules.merge_named_fire))
-        self.notify("shadow plan %s: %d member(s), %d deferred"
-                    % (stamp, len(members), len(deferred)))
+        self.notify("shadow plan %s: %d member(s), %d deferred%s"
+                    % (stamp, len(members), len(deferred),
+                       ", sync main %s" % sync["sha"][:12] if sync else ""))
         return plan
 
     # -- comparison with the human composer ---------------------------------
@@ -339,12 +346,33 @@ class Passage:
                 repository.clone.path, plan, history, open_packets, packet)
             carried = {lot: in_flight[lot] for lot in extras if lot in in_flight}
             extra = [lot for lot in extras if lot not in carried]
+            # #2727: the manual composer may have synced main as a lot while
+            # the train does it mechanically. The exact main sha proves the
+            # equivalence; it is not an unexplained omission.
+            plan_sync = (plan.get("sync") or {}).get("sha") or ""
+            manual_sync = (_manual_sync(repository.clone.path, plan["base"],
+                                        packet["sha"], plan_sync)
+                           if plan_sync else None)
+            sync = dict(plan=plan_sync or None,
+                        manual=(manual_sync or {}).get("sha"),
+                        lots=sorted((manual_sync or {}).get("lots") or ()))
+            for lot in sync["lots"]:
+                if lot in missing:
+                    missing.remove(lot)
+            missing.sort()
             reasons = {str(row["work_item_id"]): row["reason"]
                        for row in plan.get("deferred", [])}
             explanations = {}
             for lot in missing:
                 explanations[str(lot)] = reasons.get(
                     str(lot), "not a candidate of the train at this cutoff")
+            for lot in sync["lots"]:
+                explanations[str(lot)] = (
+                    "synchro main %s mécanique (même apport que le train)"
+                    % plan_sync[:12])
+            if plan_sync and manual_sync is None:
+                sync["difference"] = ("le paquet manuel n'a pas apporté main "
+                                      "%s" % plan_sync[:12])
             for lot in extra:
                 explanations[str(lot)] = (
                     "porteur inconnu: paquet en vol non prouvé au créneau"
@@ -355,7 +383,7 @@ class Passage:
                 packet=packet, plan=dict(cutoff=plan["cutoff"],
                                          local_stamp=plan["local_stamp"],
                                          matched=plan.get("matched")),
-                missing=missing, extra=extra,
+                missing=missing, extra=extra, sync=sync,
                 carried={str(lot): carrier for lot, carrier in sorted(carried.items())},
                 explanations=explanations))
         return comparisons
@@ -527,6 +555,28 @@ def _manifest_lots(clone, sha, tail):
     if manifest.returncode:
         return None
     return parse_manifest(resolutions._text(manifest))
+
+
+def _manual_sync(clone, base, head, sha):
+    """The packet commit that merged ``sha`` (main), with its ``ameesh-work`` lots.
+
+    The composer's manual sync is a real merge of main into the target; its
+    lot trailer names the build lot it used. None means the packet did not
+    bring this exact main commit.
+    """
+    log = resolutions._run(clone, "rev-list", "--parents", "%s..%s" % (base, head))
+    if log.returncode:
+        raise train.TrainError("cannot read the packet ancestry for the main sync")
+    for line in resolutions._text(log).splitlines():
+        fields = line.split()
+        if len(fields) < 2 or sha not in fields[1:]:
+            continue
+        body = resolutions._run(clone, "show", "-s", "--format=%B", fields[0])
+        if body.returncode:
+            raise train.TrainError("cannot read the packet main sync commit")
+        lots = [int(match.group(1)) for match in _WORK.finditer(resolutions._text(body))]
+        return dict(commit=fields[0], sha=sha, lots=lots)
+    return None
 
 
 def _member(row, *, origin, proof):

@@ -93,6 +93,14 @@ actif (`Enrollment.decide` : préparation, avis, puis frontière initiale et
 reçus de retrait), sans écrire : un gel retiré, d'historique inconnu ou une ligne de file sans reçu d'allocation
 n'est jamais présenté comme un membre que le train inscrirait.
 
+Une cible autre que `main` reçoit la **synchro mécanique de main** (#2727) :
+quand le paquet a des membres et que `main` porte des commits absents de la
+cible, le plan porte `sync: {ref: "main", sha: …}` et le paquet réel fusionne
+ce commit en tête, sans avis ni lot build. La comparaison expose le fait dans
+`sync` (`plan`, `manual`, `lots`) et retire des lots manquants celui dont la
+fusion manuelle a apporté le même commit `main` (trailer `ameesh-work`) : une
+synchro manuelle n'est pas un écart de composition.
+
 Rien n'est réservé, poussé, dispatché ni fusionné : aucun `merge_locks` de
 cible, aucune branche `integration/**`, aucune CI. C'est le mode qui doit
 tourner sur au moins deux paquets horaires réels avant la bascule.
@@ -120,6 +128,13 @@ suites que le change set intégré rend dues. Un push ameesh couvert par une PR
 ouverte laisse `suite` sauté : ce n'est pas une preuve de paquet, le train
 refuse. Le composeur humain devient le repli : en cas de rouge, le train
 s'arrête, alerte et n'enchaîne pas ; un humain reprend la main.
+
+Avant les membres, le train fusionne le commit `main` que la cible ne porte
+pas encore (membre mécanique #2727, sans avis) : la tête du paquet porte
+`ameesh-sync: main <sha>`, cite `main` parmi ses parents et reste reproductible
+depuis le plan. Un conflit refuse le paquet en nommant `main`, la base et les
+fichiers ; une réécriture de `main` qui retire le commit planifié refuse aussi
+la publication. Une cible `main` n'a évidemment pas cette synchro.
 
 La bascule est un geste de pilote : changer `mode` en `active`, vérifier le
 commit canon audité et l'échéance, puis redémarrer l'exécuteur. Aucun code ne
