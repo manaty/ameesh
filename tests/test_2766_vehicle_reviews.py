@@ -116,6 +116,66 @@ class CompositionMembersTest(_Base):
                                          [self.m1, self.m2])
         self.assertEqual(own["paths"], ["README.md"])
 
+    def test_an_octopus_that_restores_the_base_is_refused(self):
+        m1 = self.member("m1", "src/app.py", "changed\n")
+        m2 = self.member("m2", "other.txt", "other\n")
+        m3 = self.member("m3", "third.txt", "third\n")
+        # Arbre de base sous trois parents : les apports ont disparu, mais
+        # chaque chemin ressemble encore à au moins un parent.
+        tree = _git(self.repo, "rev-parse", self.base + "^{tree}")
+        head = _git(self.repo, "commit-tree", tree, "-p", m1, "-p", m2,
+                    "-p", m3, "-m", "octopus restores base")
+        with self.assertRaisesRegex(packet_reviews.VehicleError, "octopus"):
+            packet_reviews.own_changes(self.repo, self.base, head, [m1, m2, m3])
+
+    def test_a_clean_merge_that_drops_the_incoming_file_is_a_delta(self):
+        self.compose()
+        _git(self.repo, "rm", "src/app.py")
+        _git(self.repo, "commit", "-q", "--amend", "--no-edit")
+        head = _git(self.repo, "rev-parse", "HEAD")
+        own = packet_reviews.own_changes(self.repo, self.base, head,
+                                         [self.m1, self.m2])
+        self.assertEqual(own["paths"], ["src/app.py"])
+        self.assertEqual(own["commits"], [head])
+
+
+class BaseRestoreTest(_Base):
+    """B de dev1 (#2766) : une composition qui ramène un chemin à la base.
+
+    La fusion est propre (la fusion automatique garde le correctif de `main`),
+    mais l'auteur du paquet recopie la version du membre : le véhicule annule
+    un contenu de la cible. La comparaison au seul second parent rendait le
+    delta vide, donc aucun avis exigé.
+    """
+
+    def compose_reverting_migration(self):
+        _write(self.repo, "supabase/migrations/001.sql", "base\n")
+        _commit_all(self.repo, "base: migration")
+        old_base = _git(self.repo, "rev-parse", "HEAD")
+        _write(self.repo, "supabase/migrations/001.sql", "secure\n")
+        main_tip = _commit_all(self.repo, "main: secure migration")
+        _git(self.repo, "checkout", "-q", "-b", "legacy", old_base)
+        _write(self.repo, "other.txt", "other\n")
+        member = _commit_all(self.repo, "member from the old base")
+        _git(self.repo, "checkout", "-q", "main")
+        clean = _merge(self.repo, "legacy", 103)
+        return main_tip, member, clean
+
+    def test_the_clean_composition_has_no_vehicle_delta(self):
+        main_tip, member, clean = self.compose_reverting_migration()
+        own = packet_reviews.own_changes(self.repo, main_tip, clean, [member])
+        self.assertEqual(own["paths"], [])
+
+    def test_a_composition_that_restores_the_base_is_the_delta(self):
+        main_tip, member, _clean = self.compose_reverting_migration()
+        _git(self.repo, "checkout", "legacy", "--",
+             "supabase/migrations/001.sql")
+        _git(self.repo, "commit", "-q", "--amend", "--no-edit")
+        head = _git(self.repo, "rev-parse", "HEAD")
+        own = packet_reviews.own_changes(self.repo, main_tip, head, [member])
+        self.assertEqual(own["paths"], ["supabase/migrations/001.sql"])
+        self.assertEqual(own["commits"], [head])
+
 
 class ResolutionDeltaTest(_Base):
     def setUp(self):
@@ -256,7 +316,7 @@ class NeedTest(_Base):
         def query(self, _sql, _args=()):
             return self.rows
 
-    def need(self, rows, marks, head, gate=None, klass=None):
+    def need(self, rows, marks, head, gate=None, klass=None, base=None):
         db = self._Landings(rows)
         with mock.patch.object(packet_reviews.work, "get",
                                side_effect=lambda _db, lot: {"id": lot, "app": "ameesh"}):
@@ -270,7 +330,7 @@ class NeedTest(_Base):
                         return packet_reviews.need(
                             db, 999, {"id": 999, "app": "ameesh",
                                       "branch": "integration/paquet"},
-                            marks[101], self.repo, self.base, head, cfg=None)
+                            marks[101], self.repo, base or self.base, head, cfg=None)
 
     def test_a_packet_of_reviewed_lots_has_no_vehicle_requirement(self):
         self.compose()
@@ -295,6 +355,32 @@ class NeedTest(_Base):
         self.assertEqual(out["ok"], None)
         self.assertEqual(out["required"], 1)
         self.assertEqual(out["own_paths"], ["README.md"])
+
+    def test_a_composition_that_restores_the_base_is_the_vehicle_delta(self):
+        # B de dev1 (#2766) : le paquet recopie la migration du membre,
+        # annulant le correctif de main ; la porte doit voir le chemin SQL.
+        _write(self.repo, "supabase/migrations/001.sql", "base\n")
+        _commit_all(self.repo, "base: migration")
+        old_base = _git(self.repo, "rev-parse", "HEAD")
+        _write(self.repo, "supabase/migrations/001.sql", "secure\n")
+        main_tip = _commit_all(self.repo, "main: secure migration")
+        _git(self.repo, "checkout", "-q", "-b", "legacy", old_base)
+        _write(self.repo, "other.txt", "other\n")
+        member = _commit_all(self.repo, "member from the old base")
+        _git(self.repo, "checkout", "-q", "main")
+        _merge(self.repo, "legacy", 103)
+        _git(self.repo, "checkout", "legacy", "--",
+             "supabase/migrations/001.sql")
+        _git(self.repo, "commit", "-q", "--amend", "--no-edit")
+        head = _git(self.repo, "rev-parse", "HEAD")
+        rows = [{"work_item_id": 103, "pinned_sha": member}]
+        marks = {101: [],
+                 103: [{"id": 4, "kind": "frozen", "sha": member, "at_ts": 4.0}]}
+        out = self.need(rows, marks, head, base=main_tip)
+        self.assertIsNotNone(out)
+        self.assertIsNone(out["ok"])
+        self.assertEqual(out["own_paths"], ["supabase/migrations/001.sql"])
+        self.assertGreaterEqual(out["required"], 1)
 
     def test_a_member_without_a_verdict_is_refused(self):
         self.compose()
