@@ -140,3 +140,43 @@ class EndOfTurnServiceTest(PgTestCase):
         spec = {"ids": [mid], "jeton": token, "rows": list(reserves)}
         worker._livre_courrier(spec)
         self.assertIsNotNone(self._delivered_at(mid))
+
+
+class HumanReservationTtlTest(PgTestCase):
+    """L77/B6 : la réservation humaine couvre tout le tour, pas 10 min."""
+
+    def test_the_human_reservation_outlives_the_turn(self):
+        from ameesh import mail
+        name = "worker-b6"
+        worker = _make_worker(self, name)
+        worker.agent = dict(worker.agent or {}, turn_max_seconds=1800)
+        self.assertEqual(worker._reservation_ttl({"human": True}),
+                         1800.0 + mail.RESERVATION_TTL)
+        self.assertEqual(worker._reservation_ttl({}), mail.RESERVATION_TTL)
+
+        mail.send(self.db, "human:alice", name, "a long turn",
+                  payload={"human": True})
+        mid = int(self.db.query(
+            "SELECT id FROM agent_mailbox WHERE recipient = %s ORDER BY id DESC LIMIT 1",
+            (name,))[0]["id"])
+        token = mail.new_token()
+        self.assertTrue(mail.reserve(
+            self.db, name, worker.runner.runner_id, worker.epoch, token,
+            ids=[mid], porteur="consigne",
+            ttl_seconds=worker._reservation_ttl({"human": True})))
+        row = self.db.query(
+            "SELECT (meta->'consigne'->>'expire')::float8"
+            "     - (meta->'consigne'->>'ts')::float8 AS ttl"
+            "  FROM agent_mailbox WHERE id = %s", (mid,))[0]
+        self.assertGreaterEqual(float(row["ttl"]),
+                                1800.0 + mail.RESERVATION_TTL - 1.0)
+        # Le hook (autre jeton, même bail) ne reprend pas un message actif :
+        # c'est l'expiration du TTL qui le lui permettait.
+        self.assertEqual(mail.reserve(
+            self.db, name, worker.runner.runner_id, worker.epoch,
+            mail.new_token(), ids=[mid], porteur="hook",
+            ttl_seconds=mail.HOOK_RESERVATION_TTL), [])
+
+        worker.agent = dict(worker.agent, turn_max_seconds=0)
+        self.assertEqual(worker._reservation_ttl({"human": True}),
+                         mail.HUMAN_RESERVATION_MAX)

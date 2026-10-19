@@ -1150,6 +1150,29 @@ class AgentWorker(threading.Thread):
                     or self.restarting.is_set())
         if not en_cause:
             return False
+        # L77/B5 : une préemption seule ne tue jamais un résident vivant. Elle
+        # a pu arriver entre la sélection du tour et la publication du
+        # `Popen` (ou après que le moniteur a rendu la main) : le message est
+        # remis au point sûr, sinon gardé pour le tour suivant. Les autres
+        # déclencheurs (bail, échéance, arrêt, redémarrage, retrait d'hôte)
+        # gardent leur arrêt dur, y compris pour un résident.
+        if self.stop_requested.is_set():
+            # Le latch vient d'un `stop_group_now` : sa raison nomme la cause.
+            # Une préemption qui se serait ajoutée ne doit pas masquer un arrêt
+            # d'une autre classe.
+            preemption = self._stop_reason == "preemption"
+        else:
+            preemption = self.preempting.is_set()
+        autre_cause = (self.lease_lost.is_set() or self.deadline_passed()
+                       or self.stopping.is_set() or self.watchdog_stop.is_set()
+                       or self.restarting.is_set()
+                       or getattr(self, "host_yield", None) is not None
+                       or (getattr(self, "runner", None) is not None
+                           and self.runner.stop.is_set())
+                       or bool(self._power_texte))
+        if preemption and not autre_cause and self._preempt_resident():
+            self.stop_requested.clear()
+            return False
         if (self.deadline_passed() or self.stopping.is_set()
                 or self.watchdog_stop.is_set()):
             # Arrêt de classe « bail » : le tour ne doit pas être clos ni compté.
@@ -1438,7 +1461,7 @@ class AgentWorker(threading.Thread):
         ident = resident_queue.identity_for(
             row.get("sender") or "", cfg=getattr(self, "cfg", None),
             canon_id=self._canon_id(),
-            proof=mail.human_account(row))
+            proof=mail.human_account(row), human=self._from_human(row))
         return "%s\n%s" % (resident_queue.envelope(ident, self._envelope_token()),
                            resident_queue.neutralise(row.get("body") or ""))
 
@@ -3390,16 +3413,23 @@ class AgentWorker(threading.Thread):
         sender = (row.get("sender") or row.get("from") or "").strip()
         if not sender:
             return False
-        from . import work
-        if sender.startswith(work.HUMAN_PREFIX):
+        from . import resident_queue, work
+        # L77/B1 : toute entrée humaine est vérifiée AVANT la liste des agents.
+        # Un nom nu déposé par un humain (forme d'`agent-mail send`) est une
+        # entrée humaine dès que le message porte le marqueur `payload.human`
+        # ou une preuve d'entrée ; `human:<id>` l'est toujours. Sans cette
+        # normalisation, un nom nu déclaré dans `AMEESH_INTERRUPT_SENDERS`
+        # préemptait sans preuve.
+        humaine = (sender.startswith(work.HUMAN_PREFIX) or mail.is_human(row)
+                   or bool(mail.human_account(row)))
+        if humaine:
             # L77/B1 : un humain ne préempte que si la preuve d'entrée portée
             # par le message correspond à un local_account déclaré de sa fiche.
             # Le compte du runner/hook ne prouve jamais l'émetteur.
-            from . import resident_queue
             ident = resident_queue.identity_for(
                 sender, cfg=getattr(self, "cfg", None),
                 canon_id=self._canon_id() if hasattr(self, "_canon_id") else None,
-                proof=mail.human_account(row))
+                proof=mail.human_account(row), human=True)
             if not ident.verified:
                 log("[%s] urgent from %s without a verified local account: no "
                     "interruption" % (self.name, sender))
@@ -4506,9 +4536,10 @@ class AgentWorker(threading.Thread):
         return float(getattr(self.runner, "mail_batch", self.cfg.mail_batch))
 
     def _from_human(self, row: dict) -> bool:
-        """L125 : message d'un humain — marqué à l'envoi, ou expéditeur déclaré
-        humain sur cet hôte (`AMEESH_HUMANS`)."""
-        return mail.is_human(row) or (row.get("sender") or "") in self.cfg.human_names
+        """L125 : message d'un humain — marqué à l'envoi, expéditeur qualifié
+        `human:<id>`, ou nom déclaré humain sur cet hôte (`AMEESH_HUMANS`)."""
+        return (mail.is_human(row)
+                or (row.get("sender") or "") in getattr(self.cfg, "human_names", ()))
 
     def _mail_due(self, rows: list[dict]) -> bool:
         """L125 : le courrier ordinaire en attente ouvre-t-il un tour ?
@@ -4673,7 +4704,8 @@ class AgentWorker(threading.Thread):
             ident = resident_queue.identity_for(row.get("sender") or "",
                                                 cfg=getattr(self, "cfg", None),
                                                 canon_id=canon_id,
-                                                proof=mail.human_account(row))
+                                                proof=mail.human_account(row),
+                                                human=True)
             envelopes[key] = resident_queue.envelope(ident, token)
         prompt, retenus, reste = mail.prompt_for(
             self.db, messages, kind=kind, budget=self._budget_courrier(),
@@ -4868,6 +4900,17 @@ class AgentWorker(threading.Thread):
         except Exception as exc:  # une mesure ratée ne défait pas le tour
             log_async("[%s] turn memory not released (%s)" % (self.name, exc))
 
+    def _reservation_ttl(self, spec: dict) -> float:
+        """L77/B6 : durée de la réservation qui porte la consigne du tour.
+
+        Un message humain n'est soldé qu'à la fin du tour : sa réservation
+        couvre tout le tour, plus la marge de livraison. Les autres messages
+        sont soldés au lancement et gardent le TTL ordinaire.
+        """
+        if not spec.get("human"):
+            return mail.RESERVATION_TTL
+        return mail.human_reservation_ttl(self.turn_max_seconds())
+
     def _run_guarded_turn(self, spec: dict) -> bool:
         """Un tour. Pour un tour de courrier, protocole de remise unique :
         réservation sous un jeton (registre verrouillé, bail contrôlé), consigne
@@ -4931,7 +4974,7 @@ class AgentWorker(threading.Thread):
             reserves = mail.reserve(
                 self.db, self.name, self.runner.runner_id, self.epoch, jeton,
                 ids=[int(m["id"]) for m in retenus], porteur="consigne",
-                ttl_seconds=mail.RESERVATION_TTL)
+                ttl_seconds=self._reservation_ttl(spec))
         except db_mod.DbError as exc:
             log("[%s] mail reservation failed (%s): turn postponed"
                 % (self.name, exc))

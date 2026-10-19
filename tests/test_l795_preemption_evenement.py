@@ -107,6 +107,21 @@ class AutorisationTest(_Base):
         self.assertFalse(self.allowed(row))
         self.assertTrue(self.allowed(row, senders=("dev-b",)))
 
+    def test_un_nom_nu_humain_dans_la_liste_est_verifie(self):
+        """B1 : `alice` dans interrupt_senders ne contourne pas la preuve."""
+        row = self.urgent("dev-a", "alice",
+                          {"human": True, "human_account": "alice@pc"})
+        with mock.patch("ameesh.resident_queue.member_declaration",
+                        return_value=(["alice@pc"], "")):
+            self.assertTrue(self.allowed(row, senders=("alice",)))
+
+    def test_un_nom_nu_humain_non_verifie_ne_preempte_pas(self):
+        row = self.urgent("dev-a", "alice",
+                          {"human": True, "human_account": "ameesh@vm"})
+        with mock.patch("ameesh.resident_queue.member_declaration",
+                        return_value=(["alice@pc"], "")):
+            self.assertFalse(self.allowed(row, senders=("alice",)))
+
     def test_un_expediteur_vide_n_interrompt_pas(self):
         self.assertFalse(self.allowed({"sender": "", "payload": {"urgent": True}}))
         self.assertFalse(self.allowed({"payload": {"urgent": True}}))

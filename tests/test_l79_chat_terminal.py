@@ -201,7 +201,7 @@ class ClientTest(unittest.TestCase):
         client = self.client()
         self.assertTrue(client.handle("bonjour"))
         mail.send.assert_called_once_with(
-            client.db, "tester", "dev1", "bonjour", host=self.cfg.host, kind="notify",
+            client.db, "human:tester", "dev1", "bonjour", host=self.cfg.host, kind="notify",
             payload={"human": True, "human_account": mock.ANY})
         self.assertIn("sent to dev1 (mail #7)", client.view.out.getvalue())
 
@@ -215,6 +215,17 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(payload, {"human": True})     # urgent non accordé
         self.assertEqual(kwargs["kind"], "notify")
         self.assertIn("delivered as a normal message", client.view.out.getvalue())
+
+    def test_a_bound_terminal_does_not_carry_a_human_proof(self):
+        """(a) : un terminal porté par une liaison d'agent ne prouve pas un humain."""
+        from ameesh import identity
+        client = self.client()
+        bound = identity.Binding(name="dev1", source="runner", ok=True)
+        with mock.patch("ameesh.identity.resolve_binding", return_value=bound):
+            self.assertTrue(client.handle("bonjour"))
+        payload = mail.send.call_args.kwargs["payload"]
+        self.assertNotIn("human_account", payload)
+        self.assertTrue(payload.get("human"))
 
     def test_urgent_and_stop_use_the_interrupt_path_when_authorised(self):
         cfg = dataclasses.replace(self.cfg, interrupt_senders=("tester",))
@@ -376,4 +387,4 @@ class ClientDbTest(PgTestCase):
         rows = mail.unread(self.db, "dev1")
         self.assertEqual(len(rows), 1)
         self.assertEqual((rows[0]["sender"], mail.message_payload(rows[0]).get("human")),
-                         ("tester", True))
+                         ("human:tester", True))

@@ -416,6 +416,132 @@ class HookEnvelopeTest(unittest.TestCase):
         self.assertIn("[ameesh tok — humain alice (non vérifié, sans autorité)]",
                       out[1])
 
+    def test_human_envelopes_normalise_a_bare_sender(self):
+        """B1 : le nom nu du courrier humain est vérifié comme `human:<id>`."""
+        from types import SimpleNamespace
+        from unittest import mock
+        from ameesh import cli
+        canon = SimpleNamespace(id="c1", members=[SimpleNamespace(
+            title="alice", local_accounts=["alice@h"], roles=[])])
+        msg = {"id": 4, "from": "alice", "ts": 0, "text": "hi",
+               "payload": {"human": True, "human_account": "alice@h"}}
+        with mock.patch("ameesh.canon.load_configured", return_value=[canon]):
+            out = cli.human_envelopes([msg], cfg=SimpleNamespace(host="h"), token="tok")
+        self.assertIn("humain alice (vérifié : alice@h)", out[4])
+
+
+class BareIdentityTest(unittest.TestCase):
+    """L77/B1 : un nom de boîte nu est normalisé avant la vérification."""
+
+    def _canon(self, accounts=("alice@pc",)):
+        from types import SimpleNamespace
+        return SimpleNamespace(id="c1", members=[SimpleNamespace(
+            title="alice", local_accounts=list(accounts), roles=[])])
+
+    def test_bare_human_is_verified_with_his_own_proof(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        with mock.patch("ameesh.canon.load_configured", return_value=[self._canon()]):
+            ident = rq.identity_for("alice", cfg=SimpleNamespace(host="vm"),
+                                    proof="alice@pc", human=True)
+        self.assertTrue(ident.verified)
+        self.assertEqual((ident.sender, ident.human), ("human:alice", "alice"))
+
+    def test_bare_name_without_human_context_stays_an_agent(self):
+        from types import SimpleNamespace
+        ident = rq.identity_for("alice", cfg=SimpleNamespace(host="vm"),
+                                proof="alice@pc")
+        self.assertFalse(ident.is_human)
+        self.assertFalse(ident.verified)
+        self.assertIn("not a human", ident.reason)
+
+    def test_another_prefix_is_never_converted(self):
+        self.assertEqual(rq.human_ref("agent:x"), "")
+        self.assertEqual(rq.human_ref("human:alice"), "human:alice")
+        self.assertEqual(rq.human_ref(" alice "), "human:alice")
+
+
+class HumanReservationTtlTest(unittest.TestCase):
+    """L77/B6 : la réservation humaine couvre tout le tour, pas 10 min."""
+
+    def test_ttl_covers_the_turn(self):
+        from ameesh import mail
+        self.assertEqual(mail.human_reservation_ttl(1800),
+                         1800.0 + mail.RESERVATION_TTL)
+        self.assertGreater(mail.human_reservation_ttl(1800), mail.RESERVATION_TTL)
+
+    def test_ttl_is_capped_when_the_turn_has_no_limit(self):
+        from ameesh import mail
+        self.assertEqual(mail.human_reservation_ttl(0), mail.HUMAN_RESERVATION_MAX)
+        self.assertGreater(mail.HUMAN_RESERVATION_MAX, mail.RESERVATION_TTL)
+
+
+class StopAtPublicationTest(unittest.TestCase):
+    """L77/B5 : une préemption à la publication ne tue pas un résident vivant."""
+
+    def _worker(self, *, resident=True):
+        import threading
+        from types import SimpleNamespace
+        from ameesh.runner import AgentWorker
+        worker = AgentWorker.__new__(AgentWorker)
+        threading.Thread.__init__(worker)  # machine à états du fil, jamais démarrée
+        worker.name = "worker"
+        worker.lock = threading.Lock()
+        worker.preempting = threading.Event()
+        worker.lease_lost = threading.Event()
+        worker.stopping = threading.Event()
+        worker.watchdog_stop = threading.Event()
+        worker.restarting = threading.Event()
+        worker.stop_requested = threading.Event()
+        worker._stop_reason = ""
+        worker.proc = SimpleNamespace(pid=123)
+        worker.pgid = 123
+        worker.resident = (SimpleNamespace(
+            alive=True, closing=False, driver=SimpleNamespace(busy=False))
+            if resident else None)
+        worker._preempt_row = None
+        worker.deadline_passed = lambda: False
+        worker.host_yield = None
+        worker._power_texte = ""
+        worker.runner = SimpleNamespace(stop=threading.Event())
+        return worker
+
+    def test_preemption_alone_keeps_the_resident(self):
+        from unittest import mock
+        worker = self._worker()
+        worker.preempting.set()
+        with mock.patch.object(worker, "stop_group_now") as stop:
+            self.assertFalse(worker.kill_if_stop_requested())
+        stop.assert_not_called()
+        self.assertFalse(worker.stop_requested.is_set())
+
+    def test_the_publication_latch_of_a_preemption_keeps_the_resident(self):
+        from unittest import mock
+        worker = self._worker()
+        worker.stop_requested.set()
+        worker._stop_reason = "preemption"
+        with mock.patch.object(worker, "stop_group_now") as stop:
+            self.assertFalse(worker.kill_if_stop_requested())
+        stop.assert_not_called()
+        self.assertFalse(worker.stop_requested.is_set())
+
+    def test_a_lost_lease_still_stops_the_resident(self):
+        from unittest import mock
+        worker = self._worker()
+        worker.preempting.set()
+        worker.lease_lost.set()
+        with mock.patch.object(worker, "stop_group_now") as stop:
+            self.assertTrue(worker.kill_if_stop_requested())
+        stop.assert_called_once()
+
+    def test_preemption_without_resident_stops_the_one_shot(self):
+        from unittest import mock
+        worker = self._worker(resident=False)
+        worker.preempting.set()
+        with mock.patch.object(worker, "stop_group_now") as stop:
+            self.assertTrue(worker.kill_if_stop_requested())
+        stop.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

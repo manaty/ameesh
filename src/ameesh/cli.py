@@ -144,7 +144,8 @@ def human_envelopes(msgs: list[dict], *, cfg, token: str = "") -> dict[int, str]
         if not (mail.is_human(msg) or sender.startswith("human:")):
             continue
         ident = resident_queue.identity_for(sender, cfg=cfg,
-                                             proof=mail.human_account(msg))
+                                             proof=mail.human_account(msg),
+                                             human=True)
         out[mid] = resident_queue.envelope(ident, token)
     return out
 
@@ -410,9 +411,12 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             return 2
         parent_lot = int(number)
     dest, text = args[0], " ".join(args[1:]).strip()
+    # L77 : la liaison est lue même avec --from — un processus lié à un agent
+    # ne produit JAMAIS de preuve humaine, quel que soit l'expéditeur nommé.
+    entry_binding = identity.resolve_binding(cfg, bk.db if bk.kind == "pg" else None)
     binding = None
     if not sender:
-        binding = identity.resolve_binding(cfg, bk.db if bk.kind == "pg" else None)
+        binding = entry_binding
         if not binding.ok:
             # la raison quand une identité est annoncée (ex. « agent arrêté »)
             print("unbound sender%s: set AGENT_MAIL_NAME (the runner does it) "
@@ -454,6 +458,19 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 print("copy refused: unknown agent: %s (nothing delivered)" % name,
                       file=sys.stderr)
                 return 2
+    # L77/B1 : l'identité humaine est normalisée à la frontière (`human:<id>`,
+    # la forme que les décisions écrivent déjà), avant la signature, le fil et
+    # le dépôt : `identity_for` ne reconnaît que cette forme.
+    human = _sender_is_human(bk, cfg, sender, explicit_sender)
+    human_proof = ""
+    if human:
+        from . import resident_queue
+        sender = resident_queue.human_ref(sender) or sender
+        if entry_binding.source == "none":
+            # Entrée humaine interactive, sans liaison d'agent : la preuve
+            # user@host de CE processus est transportée avec le message.
+            user, host = resident_queue.local_account(cfg)
+            human_proof = "%s@%s" % (user or "?", host or "?")
     # R12 : le fil est lu par des humains ; un corps illisible n'est pas déposé.
     if not allow_structured:
         reason = fil.unreadable_reason(text)
@@ -510,15 +527,9 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     # (jamais d'accusé reconnu pour lui) ; un accusé de réception — `--ack`, ou
     # un texte très court qui n'est QUE cela (`mail.looks_like_ack`) — attend
     # son prochain tour sans le réveiller.
-    human = _sender_is_human(bk, cfg, sender, explicit_sender)
     payload: dict = {"human": True} if human else {}
-    if human:
-        # L77 : la preuve d'identité est prise à l'ENTRÉE (compte Unix réel et
-        # hôte de ce processus), transportée avec le message ; le lecteur ne
-        # l'établit jamais avec son propre compte.
-        from . import resident_queue
-        user, host = resident_queue.local_account(cfg)
-        payload["human_account"] = "%s@%s" % (user or "?", host or "?")
+    if human_proof:
+        payload["human_account"] = human_proof
     payload.update((key, True) for key in marks)
     if ack or (not urgent and not sign and not human and not marks and dest != "all"
                and lot is None and new_lot is None and kind in ("notify", "reply")

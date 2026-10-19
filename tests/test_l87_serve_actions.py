@@ -217,8 +217,10 @@ class ActionsPgTest(PostMixin, PgTestCase):
         rows = self.mailbox()
         self.assertEqual(len(rows), 1)
         self.assertEqual((rows[0]["sender"], rows[0]["recipient"], rows[0]["work_item_id"]),
-                         ("owner", "a1", str(self.lot["id"])))
-        self.assertTrue(json.loads(rows[0]["payload"])["human"])
+                         ("human:owner", "a1", str(self.lot["id"])))
+        payload = json.loads(rows[0]["payload"])
+        self.assertTrue(payload["human"])
+        self.assertNotIn("human_account", payload)  # (b) : API serve sans preuve
         self.assertNotIn("Idempotent-Replayed", headers)
         # the same key and request: the first answer, nothing sent twice
         again, headers, out2 = self.post("/api/v1/agents/a1/messages", body)

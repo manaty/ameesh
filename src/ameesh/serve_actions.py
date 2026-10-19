@@ -80,9 +80,18 @@ def actor(ctx) -> str:
 
 
 def mail_name(ctx) -> str:
-    """The human as a mailbox sender: the bare id, as `agent-mail send`
-    writes it (the thread renders a declared human as `human:<id>`)."""
-    return ctx.human.split(":", 1)[1]
+    """The human as a mailbox sender, normalized to `human:<id>` (L77/B1).
+
+    That is the form `resident_queue.identity_for` verifies against the
+    member's declared `local_accounts`; the bare id is only the authorization
+    name of `AMEESH_INTERRUPT_SENDERS` (`bare_name`)."""
+    from . import resident_queue
+    return resident_queue.human_ref(ctx.human) or ctx.human
+
+
+def bare_name(ctx) -> str:
+    """The human's bare id (`alice`), as `AMEESH_INTERRUPT_SENDERS` names it."""
+    return ctx.human.split(":", 1)[1] if ":" in ctx.human else ctx.human
 
 
 # --------------------------------------------------------------------------
@@ -155,10 +164,7 @@ def _message(ctx, db, params, body) -> dict:
                                  explicit=True)
     except undeliverable.Refused as exc:
         raise ActionError(409, "refused", str(exc)) from exc
-    from . import resident_queue
-    user, host = resident_queue.local_account(ctx.cfg)
-    payload = {"human": True,
-               "human_account": "%s@%s" % (user or "?", host or "?")}
+    payload = {"human": True}
     if urgent:
         payload["urgent"] = True
     message_id = mail.send(db, sender, params["agent"], text, host=ctx.cfg.host,
@@ -218,7 +224,7 @@ def _interrupt(ctx, db, params, body) -> dict:
     text = _text(body, "text")
     try:
         message_id = exploitation.interrupt(ctx.cfg, db, params["agent"], text,
-                                            sender=mail_name(ctx))
+                                            sender=bare_name(ctx))
     except exploitation.InterruptRefused as exc:
         raise ActionError(403 if exc.code == "not_allowed" else 404,
                           "forbidden" if exc.code == "not_allowed" else "not_found",

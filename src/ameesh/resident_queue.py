@@ -105,6 +105,26 @@ class Identity:
         return bool(self.human)
 
 
+def human_ref(sender: str) -> str:
+    """L77/B1 : l'identité humaine normalisée (``human:<id>``) d'un expéditeur.
+
+    Le courrier humain circule sous le nom nu (`alice`, forme d'`agent-mail
+    send`) ou déjà qualifié (`human:alice`, forme des décisions). Toute entrée
+    **connue comme humaine** est ramenée à la forme qualifiée avant
+    vérification : sans cela une preuve valide restait non reconnue et
+    l'enveloppe devenait celle d'un agent. Un nom qui contient déjà un autre
+    qualificatif (`agent:x`) n'est jamais converti.
+    """
+    name = (sender or "").strip()
+    if not name:
+        return ""
+    if name.startswith("human:"):
+        return name if name[len("human:"):].strip() else ""
+    if ":" in name:
+        return ""
+    return "human:" + name
+
+
 def verify_human(sender: str, local_accounts: Sequence[str], *,
                  user: str, host: str) -> Identity:
     """Qualifie ``human:<id>`` par les ``local_accounts`` déclarés du membre.
@@ -192,14 +212,15 @@ def member_declaration(cfg: Any, sender: str, *,
                        canon_id: str | None = None) -> tuple[list[str], str]:
     """Les ``local_accounts`` et le premier rôle déclarés pour ``human:<id>``.
 
-    Fail closed : membre absent, dupliqué entre canons, ou identifiant qui
-    n'est pas un ``human:`` → aucune déclaration. Un canon sans identifiant
-    n'est jamais écarté par le filtre ``canon_id`` (le canon par défaut).
+    Un nom nu est normalisé (L77/B1) ; un qualificatif autre que ``human:``
+    n'est jamais converti. Fail closed : membre absent, dupliqué entre canons,
+    ou identifiant vide → aucune déclaration. Un canon sans identifiant n'est
+    jamais écarté par le filtre ``canon_id`` (le canon par défaut).
     """
     from . import canon
 
-    name = str(sender or "").strip()
-    if not name.startswith("human:"):
+    name = human_ref(sender)
+    if not name:
         return [], ""
     ident = name[len("human:"):].strip()
     try:
@@ -233,7 +254,7 @@ def split_account(account: str | None) -> tuple[str, str]:
 
 
 def identity_for(sender: str, *, cfg: Any, canon_id: str | None = None,
-                 proof: str | None = None) -> Identity:
+                 proof: str | None = None, human: bool = False) -> Identity:
     """L'identité ameesh d'un expéditeur, pour l'enveloppe d'un message humain.
 
     L'authentification porte sur la preuve **transportée depuis l'entrée**
@@ -241,19 +262,26 @@ def identity_for(sender: str, *, cfg: Any, canon_id: str | None = None,
     déposé le message), jamais sur le compte du lecteur : un runner qui tourne
     sous un compte local de X ne rend pas vérifié un message venu d'ailleurs.
     Sans preuve, le message reste non vérifié (fail closed).
+
+    ``human`` (L77/B1) : l'appelant sait que l'entrée est humaine (marqueur
+    ``payload.human``, nom déclaré, en-tête du hook). Un nom nu est alors
+    normalisé en ``human:<id>`` avant la vérification ; sans ce drapeau, seul
+    un expéditeur déjà qualifié est humain — un nom d'agent reste un agent.
     """
     name = (sender or "").strip()
+    if human and name:
+        name = human_ref(name)
     if not name.startswith("human:"):
         return Identity(sender=sender, reason="not a human sender")
-    accounts, role = member_declaration(cfg, sender, canon_id=canon_id)
+    accounts, role = member_declaration(cfg, name, canon_id=canon_id)
     account = (proof or "").strip()
     if not account:
-        ident = Identity(sender=sender, human=name[len("human:"):].strip(),
+        ident = Identity(sender=name, human=name[len("human:"):].strip(),
                          verified=False, account="",
                          reason="no local account proof at entry")
     else:
         user, host = split_account(account)
-        ident = verify_human(sender, accounts, user=user, host=host)
+        ident = verify_human(name, accounts, user=user, host=host)
     if role and ident.is_human:
         ident = Identity(sender=ident.sender, human=ident.human,
                          verified=ident.verified, account=ident.account,

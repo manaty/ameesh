@@ -181,6 +181,32 @@ def mark_delivered(db: Db, ids: Sequence[int]) -> int:
 RESERVATION_TTL = 600.0
 HOOK_RESERVATION_TTL = 60.0
 
+#: L77/B6 : plafond de la réservation d'un message humain quand le tour n'a
+#: pas de durée maximale (`turn_max_seconds` = 0). La réservation doit couvrir
+#: un tour réaliste sans être infinie ; au-delà, la reprise par le hook vaut
+#: mieux qu'une réservation qui ne s'éteint jamais.
+HUMAN_RESERVATION_MAX = 24 * 3600.0
+
+
+def human_reservation_ttl(turn_max_seconds: float | int | None) -> float:
+    """L77/B6 : durée de la réservation d'un message humain.
+
+    Un message humain n'est soldé qu'à la **fin** du tour (`_solde_humains`) :
+    une réservation au TTL ordinaire expirerait pendant un tour plus long que
+    10 min, et le hook pourrait reprendre le message (doublon, solde final
+    refusé, pas de trace L78). La réservation couvre donc tout le tour, plus
+    la marge de livraison ; sans durée maximale (0), un plafond fixe la borne.
+    Elle reste liée au bail (runner, epoch) : un bail perdu la rend
+    inutilisable même avant son échéance.
+    """
+    try:
+        seconds = float(turn_max_seconds or 0)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if seconds > 0:
+        return seconds + RESERVATION_TTL
+    return HUMAN_RESERVATION_MAX
+
 
 def new_token() -> str:
     """Jeton unique d'une réservation : seule la remise qui le porte la solde."""
@@ -500,8 +526,12 @@ def passive_reason(row: Any) -> str:
 
 
 def is_human(row: Any) -> bool:
-    """L125 : message d'un humain, marqué à l'envoi — il réveille tout de suite."""
-    return bool(_payload(row).get("human"))
+    """L125 : message d'un humain, marqué à l'envoi — il réveille tout de suite.
+
+    L77/B1 : un expéditeur déjà qualifié ``human:<id>`` est humain même si une
+    ancienne ligne n'a pas le marqueur (les décisions l'écrivent ainsi)."""
+    sender = str(row.get("sender") or row.get("from") or "")
+    return bool(_payload(row).get("human")) or sender.startswith("human:")
 
 
 def human_account(row: Any) -> str:
