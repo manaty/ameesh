@@ -90,7 +90,9 @@ def named_lots(name: str, agents=()) -> list[int]:
     number it may be a lot (`lot-1`), so it is kept.
     """
     rest = _strip_agents(name or "", agents)
-    groups = [part for part in re.split(r"[^0-9]+", rest) if part]
+    # A version (`0.2.10`) is not a lot: a group surrounded by dots is not a
+    # candidate. `-665-`, `_665`, a trailing `665` are.
+    groups = re.findall(r"(?<![0-9.])([0-9]+)(?![0-9.])", rest)
     if any(len(part) > 1 for part in groups):
         groups = [part for part in groups if len(part) > 1]
     return [int(part) for part in groups]
@@ -163,7 +165,7 @@ def _clones_under(roots) -> list[str]:
             continue
         try:
             with os.scandir(root) as children:
-                for child in children:
+                for child in sorted(children, key=lambda entry: entry.name):
                     if len(found) >= CLONE_LIMIT:
                         return found
                     try:
@@ -180,7 +182,7 @@ def _clones_under(roots) -> list[str]:
     return found
 
 
-def _repository_copies(state_dir: str, roots, agents) -> list[str]:
+def _repository_copies(state_dir: str, roots, agents, known_clones=None) -> list[str]:
     """Known clones on this host whose alternates can point at a candidate.
 
     The shallow work-root inventory, the private radar/train clones under
@@ -197,14 +199,14 @@ def _repository_copies(state_dir: str, roots, agents) -> list[str]:
             seen.add(real)
             found.append(real)
 
-    for path in _clones_under(roots):
+    for path in (known_clones if known_clones is not None else _clones_under(roots)):
         add(path)
     for base in (os.path.join(state_dir, "radar"),
                  os.path.join(state_dir, "trains"),
                  os.path.join(state_dir, "trains", "shadow")):
         try:
             with os.scandir(base) as children:
-                for child in children:
+                for child in sorted(children, key=lambda entry: entry.name):
                     try:
                         if child.is_dir(follow_symlinks=False):
                             add(child.path)
@@ -255,7 +257,8 @@ def _alternate_paths(info: str, objects: str) -> list[str] | None:
     return out
 
 
-def _dependent_objects(cfg, roots, agents, candidates) -> tuple[dict[str, set[str]], str]:
+def _dependent_objects(cfg, roots, agents, candidates, known_clones=None
+                       ) -> tuple[dict[str, set[str]], str]:
     """candidate object dir -> repositories whose alternates point inside it.
 
     A doubt (unreadable alternates file) is returned as the second value:
@@ -269,7 +272,8 @@ def _dependent_objects(cfg, roots, agents, candidates) -> tuple[dict[str, set[st
             objects[path] = obj
     by_objects = {obj: path for path, obj in objects.items()}
     out: dict[str, set[str]] = {path: set() for path in candidates}
-    for repo in _repository_copies(cfg.state_dir, roots, agents):
+    for repo in _repository_copies(cfg.state_dir, roots, agents,
+                                   known_clones=known_clones):
         obj = _objects_dir(repo)
         if not obj:
             continue
@@ -377,9 +381,14 @@ def reap(db, host: str, cfg, *, roots, agents: dict, protected, dry_run: bool,
     except Exception:
         skipped.append("clones: tracked worktrees unreadable, nothing removed")
         return [], [], skipped
+    inventory = _clones_under(roots)
+    if not inventory:
+        return [], [], []
+    dependents, alternates_doubt = _dependent_objects(
+        cfg, roots, agents, inventory, known_clones=inventory)
     deadline = time.monotonic() + CLONE_BUDGET_S
     inspected = 0
-    for path in _clones_under(roots):
+    for path in inventory:
         if inspected >= CLONE_LIMIT or time.monotonic() >= deadline:
             skipped.append("clones: inventory bounded (%d inspected), the rest waits"
                            % inspected)
@@ -487,9 +496,8 @@ def reap(db, host: str, cfg, *, roots, agents: dict, protected, dry_run: bool,
             if not dry_run:
                 entries.append(dict(base, action="signaled", detail="%s; kept" % saved))
             continue
-        dependents, doubt = _dependent_objects(cfg, roots, agents, [path])
-        if doubt:
-            detail = "%s; kept" % doubt
+        if alternates_doubt:
+            detail = "%s; kept" % alternates_doubt
             plan.append(dict(base, action="garde", detail=detail))
             if not dry_run:
                 entries.append(dict(base, action="signaled", detail=detail))

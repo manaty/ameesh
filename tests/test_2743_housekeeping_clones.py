@@ -231,6 +231,9 @@ class NamedLotsTest(unittest.TestCase):
         self.assertEqual(clones.named_lots("ds6-2181-2176", agents), [2181, 2176])
         self.assertEqual(clones.named_lots("nexlink-665-reseed", agents), [665])
         self.assertEqual(clones.named_lots("a1", agents), [])
+        # a version is not a lot
+        self.assertEqual(clones.named_lots("nexlink-0.2.10", agents), [])
+        self.assertEqual(clones.named_lots("foo-2026.10.19-665", agents), [665])
 
 
 if __name__ == "__main__":
