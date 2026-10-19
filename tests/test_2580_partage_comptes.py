@@ -12,7 +12,8 @@ configurations d'UNE base. Témoins :
   deux bases (ou deux schémas) sont deux meshes ;
 * deux meshes, même dossier ou même clé (fichier résolu, valeur de variable) :
   signalés ; deux configurations d'un même mesh, revendication périmée,
-  revendication d'un autre hôte : rien ;
+  revendication d'une autre machine : rien ; deux noms d'hôte
+  (`AMEESH_HOST`) sur une même machine : signalés (#2593) ;
 * le registre ne contient ni chemin ni secret (dossier 0700, fichier 0600) ;
 * `report` (défaut) signale sans refuser ; `accounts_shared: refuse` refuse
   le compte dans ce mesh, comme `account_sharing: strict` (#313) ;
@@ -204,10 +205,62 @@ class DeuxMeshesTest(_Base):
             account_claims.shared(self.cfg(self.secondaire()), mesh=MESH_B, now=plus_tard),
             [])
 
-    def test_revendication_d_un_autre_hote_ignoree(self):
+    def test_deux_noms_d_hote_meme_machine_signale(self):
+        """#2593 : AMEESH_HOST diffère entre les deux meshes du poste, la
+        machine est la même — le partage est vu dans les deux sens."""
+        manaty = self.cfg(self.secondaire())
+        autre = dataclasses.replace(
+            self.cfg(self.secondaire(), fichier="config-ancienne-base.json"),
+            host="pc-ailleurs")
+        self.refresh(manaty, mesh=MESH_A)
+        self.refresh(autre, mesh=MESH_B)
+        self.assertEqual([p["account"] for p in self.shared(autre, mesh=MESH_B)],
+                         ["secondaire"])
+        self.assertEqual([p["account"] for p in self.shared(manaty, mesh=MESH_A)],
+                         ["secondaire"])
+
+    def test_revendication_d_une_autre_machine_ignoree(self):
+        """Registre partagé entre machines (XDG_STATE_HOME commun) : un même
+        chemin y désigne deux identifiants distincts, rien n'est signalé."""
+        with mock.patch.object(account_claims, "machine_hash",
+                               return_value="0123456789abcdef"):
+            self.refresh(self.cfg(self.secondaire()), mesh=MESH_A)
+        self.assertEqual(self.shared(self.cfg(self.secondaire()), mesh=MESH_B), [])
+
+    def test_revendication_sans_machine_comparee_sur_l_hote(self):
+        """Une revendication d'avant #2593 n'a pas d'empreinte de machine :
+        elle reste départagée par `host`."""
         self.refresh(self.cfg(self.secondaire()), mesh=MESH_A)
-        autre = dataclasses.replace(self.cfg(self.secondaire()), host="pc-ailleurs")
-        self.assertEqual(self.shared(autre, mesh=MESH_B), [])
+        for chemin in self.claims_files():
+            with open(chemin, encoding="utf-8") as fh:
+                data = json.load(fh)
+            del data["machine"]
+            with open(chemin, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+        meme = self.cfg(self.secondaire())
+        self.assertTrue(self.shared(meme, mesh=MESH_B))
+        ailleurs = dataclasses.replace(meme, host="pc-ailleurs")
+        self.assertEqual(self.shared(ailleurs, mesh=MESH_B), [])
+
+    def test_empreinte_de_machine_stable_sans_identifiant_en_clair(self):
+        account_claims._MACHINE = None
+        self.addCleanup(setattr, account_claims, "_MACHINE", None)
+        fichier = os.path.join(self.tmp, "machine-id")
+        with open(fichier, "w", encoding="ascii") as fh:
+            fh.write("0f1e2d3c4b5a69788796a5b4c3d2e1f0\n")
+        with mock.patch.object(account_claims, "MACHINE_ID_FILES",
+                               (os.path.join(self.tmp, "absent"), fichier)):
+            empreinte = account_claims.machine_hash()
+        self.assertRegex(empreinte, r"^[0-9a-f]{16}$")
+        self.assertNotIn(empreinte, "0f1e2d3c4b5a69788796a5b4c3d2e1f0")
+        account_claims._MACHINE = None
+        with mock.patch.object(account_claims, "MACHINE_ID_FILES", (fichier,)):
+            self.assertEqual(account_claims.machine_hash(), empreinte)
+        account_claims._MACHINE = None
+        with mock.patch.object(account_claims, "MACHINE_ID_FILES", ()), \
+                mock.patch.object(account_claims.socket, "gethostname",
+                                  return_value="pc-test"):
+            self.assertNotEqual(account_claims.machine_hash(), empreinte)
 
     def test_compte_retire_retire_sa_revendication(self):
         manaty = self.cfg(self.secondaire())
