@@ -22,9 +22,9 @@ SHA = "a" * 40
 
 
 def row(name, *, team="ameesh", harness="deepseek", session="", status="idle",
-        mode="execute", text=""):
+        mode="execute", text="", model=""):
     return {"name": name, "team": team, "harness": harness, "session_harness": session,
-            "status": status, "mode": mode, "status_text": text}
+            "status": status, "mode": mode, "status_text": text, "model": model}
 
 
 def candidates(*rows, loads=None):
@@ -47,29 +47,58 @@ class FamilyAdvanceTest(unittest.TestCase):
             [gauge("codex", "secondaire", 0.35, 0.19),
              gauge("claude", "secondaire", 0.60, 0.60)],
             now=NOW)
-        self.assertAlmostEqual(advances["codex"], 0.16, places=6)
-        self.assertAlmostEqual(advances["claude"], 0.0, places=6)
+        self.assertAlmostEqual(advances["codex"][""], 0.16, places=6)
+        self.assertAlmostEqual(advances["claude"][""], 0.0, places=6)
 
-    def test_a_model_scoped_bucket_does_not_contaminate_the_family(self):
+    def test_a_model_scoped_bucket_does_not_contaminate_another_model(self):
         # cx3 B/P1: seven_day@fable at 95 % is a Fable-only bucket; it must
-        # not make Claude look ahead for a reviewer of another model.
+        # not make Claude look ahead for a reviewer of another model. The
+        # general reading stays 0, the Fable bucket is 35 points ahead.
         rows = [gauge("claude", "secondaire", 0.60, 0.60),
                 gauge("claude", "secondaire", 0.95, 0.60, key="seven_day@fable"),
                 gauge("codex", "secondaire", 0.35, 0.19)]
         advances = review_pace.family_advances(rows, now=NOW)
-        self.assertAlmostEqual(advances["claude"], 0.0, places=6)
-        self.assertAlmostEqual(advances["codex"], 0.16, places=6)
+        self.assertAlmostEqual(advances["claude"][""], 0.0, places=6)
+        self.assertAlmostEqual(advances["claude"]["fable"], 0.35, places=6)
+        self.assertAlmostEqual(advances["codex"][""], 0.16, places=6)
         picked = rd.select(
             required=1,
             authors=[{"name": "author", "family": "deepseek"}],
-            candidates=candidates(row("claude-one", harness="claude", session="claude"),
+            candidates=candidates(row("claude-opus", harness="claude", session="claude",
+                                      model="claude-opus-5-5"),
                                   row("codex-one", harness="codex", session="codex")),
             advances=advances)
-        self.assertEqual([r["name"] for r in picked["reviewers"]], ["claude-one"])
+        self.assertEqual([r["name"] for r in picked["reviewers"]], ["claude-opus"])
 
-    def test_a_scoped_only_family_is_neutral(self):
+    def test_a_model_scoped_bucket_counts_for_its_model(self):
+        rows = [gauge("claude", "secondaire", 0.60, 0.60),
+                gauge("claude", "secondaire", 0.95, 0.60, key="seven_day@fable"),
+                gauge("codex", "secondaire", 0.35, 0.19)]
+        advances = review_pace.family_advances(rows, now=NOW)
+        picked = rd.select(
+            required=1,
+            authors=[{"name": "author", "family": "deepseek"}],
+            candidates=candidates(row("claude-fable", harness="claude", session="claude",
+                                      model="fable"),
+                                  row("codex-one", harness="codex", session="codex")),
+            advances=advances)
+        # the Fable bucket binds Claude (35 points ahead): Codex is behind
+        self.assertEqual([r["name"] for r in picked["reviewers"]], ["codex-one"])
+
+    def test_a_scoped_only_family_is_neutral_for_another_model(self):
         scoped = gauge("claude", "secondaire", 0.95, 0.60, key="seven_day@fable")
-        self.assertEqual(review_pace.family_advances([scoped], now=NOW), {})
+        advances = review_pace.family_advances(
+            [scoped, gauge("codex", "secondaire", 0.35, 0.19)], now=NOW)
+        self.assertEqual(set(advances["claude"]), {"fable"})
+        picked = rd.select(
+            required=1,
+            authors=[{"name": "author", "family": "deepseek"}],
+            candidates=candidates(row("claude-opus", harness="claude", session="claude",
+                                      model="claude-opus-5-5"),
+                                  row("codex-one", harness="codex", session="codex")),
+            advances=advances)
+        # Claude has no general reading: neutral 0, ahead of Codex's +16
+        self.assertEqual([r["name"] for r in picked["reviewers"]], ["claude-opus"])
 
     def test_the_reserve_of_the_critical_agents_is_deducted(self):
         # #2648: a non-critical reviewer stops 10 points below the pace. At
@@ -77,7 +106,7 @@ class FamilyAdvanceTest(unittest.TestCase):
         # reserve 10), not 29 %: Codex is 16 points ahead, as the lot says.
         advances = review_pace.family_advances(
             [gauge("codex", "secondaire", 0.35, 0.19)], now=NOW)
-        self.assertAlmostEqual(advances["codex"], 0.16, places=6)
+        self.assertAlmostEqual(advances["codex"][""], 0.16, places=6)
 
     def test_a_stale_reading_is_neutral(self):
         stale_claude = [
@@ -100,13 +129,13 @@ class FamilyAdvanceTest(unittest.TestCase):
         advances = review_pace.family_advances(
             [gauge("codex", "primaire", 0.30, 0.60),
              gauge("codex", "secondaire", 0.35, 0.19)], now=NOW)
-        self.assertAlmostEqual(advances["codex"], 0.16, places=6)
+        self.assertAlmostEqual(advances["codex"][""], 0.16, places=6)
         stale = gauge("codex", "tertiaire", 0.05, 0.05)
         stale["observed_ts"] = NOW - 8 * 86400.0
         stale["produced_ts"] = NOW - 8 * 86400.0
         advances = review_pace.family_advances(
             [gauge("codex", "secondaire", 0.35, 0.19), stale], now=NOW)
-        self.assertAlmostEqual(advances["codex"], 0.16, places=6)
+        self.assertAlmostEqual(advances["codex"][""], 0.16, places=6)
 
     def test_anonymous_readings_are_dropped_when_named_accounts_exist(self):
         # the default account is already counted by its named row
@@ -115,7 +144,7 @@ class FamilyAdvanceTest(unittest.TestCase):
               "used": 0.0, "resets_at_ts": NOW - 60.0, "window_s": WEEK,
               "observed_ts": NOW, "produced_ts": NOW, "source": "test"},
              gauge("claude", "secondaire", 0.60, 0.60)], now=NOW)
-        self.assertAlmostEqual(advances["claude"], 0.0, places=6)
+        self.assertAlmostEqual(advances["claude"][""], 0.0, places=6)
 
 
 class SelectionPaceTest(unittest.TestCase):

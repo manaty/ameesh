@@ -192,9 +192,11 @@ class Candidate:
     """A possible reviewer, as the registry describes it.
 
     `family` is the **real** family of the session
-    (`registry.live_harness`); `available` and `load` come from the registry
-    and from the number of open lots. The module completes nothing: an empty
-    family or a harness outside the known families makes the candidate
+    (`registry.live_harness`); `available`, `load` and `model` come from the
+    registry and from the number of open lots. `model` is only used to choose
+    the model-scoped gauges that apply to this reviewer (#2668); it never
+    changes the family or the eligibility. The module completes nothing: an
+    empty family or a harness outside the known families makes the candidate
     ineligible.
     """
 
@@ -202,6 +204,7 @@ class Candidate:
     family: str
     available: bool = True
     load: int = 0
+    model: str = ""
 
     def eligible(self, *, forbidden_names, forbidden_families,
                  families=KNOWN_FAMILIES) -> bool:
@@ -268,8 +271,11 @@ def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping
             load = int(loads.get(name, 0))
         except (TypeError, ValueError):
             load = 0
+        row = dict(row or {})
+        model = str(row.get("model") or row.get("session_model") or "").strip()
         out.append(Candidate(name=name, family=live_family(row, families=families),
-                             available=is_available(row), load=max(load, 0)))
+                             available=is_available(row), load=max(load, 0),
+                             model=model))
     return out
 
 
@@ -339,6 +345,61 @@ def manual_seats(already: Iterable, *, authors: Iterable = (),
     return seats
 
 
+def _finite(value) -> Optional[float]:
+    """A finite float, or None; a malformed advance is ignored, never guessed."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _normalise_advances(advances) -> dict:
+    """`{family: advance}` or `{family: {scope: advance}}`, numbers only.
+
+    A flat value is the family's general advance; a nested mapping carries the
+    general `""` key and one key per model scope (`fable`), so a candidate's
+    model can pick the gauges that apply to it (#2668, cx3 B/P1).
+    """
+    out: dict = {}
+    for family, value in (advances or {}).items():
+        family = str(family or "").strip().lower()
+        if not family:
+            continue
+        if isinstance(value, Mapping):
+            nested = {}
+            for scope, number in value.items():
+                number = _finite(number)
+                if number is not None:
+                    nested[str(scope or "").strip().lower()] = number
+            if nested:
+                out[family] = nested
+        else:
+            number = _finite(value)
+            if number is not None:
+                out[family] = number
+    return out
+
+
+def _advance_of(candidate, pace: Mapping) -> float:
+    """The advance applicable to one candidate, model-scoped gauges included.
+
+    A scope counts when its name is part of the candidate's model, the rule of
+    `accounts.model_scoped`; an unknown model gets the general `""` reading
+    only. A family absent from `pace` is neutral (0, at its pace).
+    """
+    entry = pace.get((candidate.family or "").strip().lower())
+    if entry is None:
+        return 0.0
+    if not isinstance(entry, Mapping):
+        return entry
+    model = str(getattr(candidate, "model", "") or "").strip().lower()
+    values = [entry[""]] if "" in entry else []
+    values.extend(value for scope, value in entry.items()
+                  if scope and scope in model)
+    return max(values) if values else 0.0
+
+
 def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
            families=KNOWN_FAMILIES, already: Iterable = (),
            advances: Optional[Mapping] = None) -> dict:
@@ -354,11 +415,14 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
       designation **wait**: without it, a reviewer's independence is not proven
       (canon §2);
     - `advances` maps a family to its advance over the plan pace, in points
-      (`review_pace`; positive = ahead, negative = behind). When several
-      families are eligible, the family **furthest behind** comes first; an
-      absent reading is neutral (0, at its pace), so the other criteria decide
-      (#2668, #1561). Never a reason to discard an eligible family: two
-      opinions still take two distinct families;
+      (`review_pace`; positive = ahead, negative = behind). A family value may
+      be a `{scope: advance}` mapping: the general `""` plus the model-scoped
+      buckets, selected by the candidate's `model` (a `fable` bucket counts
+      only for a Fable reviewer, never for another model or an unknown one).
+      When several families are eligible, the family **furthest behind** comes
+      first; an absent reading is neutral (0, at its pace), so the other
+      criteria decide (#2668, #1561). Never a reason to discard an eligible
+      family: two opinions still take two distinct families;
     - the load of the agent only breaks a pace tie (least loaded first), then
       the name: the selection is deterministic;
     - `already` names the manual reviewers already designated (#2627). The ones
@@ -400,16 +464,9 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
                               families=families)]
     # #2668: a family's advance over its plan pace (points), lower is further
     # behind. An unreadable or stale reading (#1561) is neutral: 0, as if at
-    # pace, so the load and the name decide.
-    pace: dict[str, float] = {}
-    for family, value in (advances or {}).items():
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            continue
-        family = str(family or "").strip().lower()
-        if family and math.isfinite(value):
-            pace[family] = value
+    # pace, so the load and the name decide. A model-scoped value is selected
+    # by the candidate's own model.
+    pace = _normalise_advances(advances)
     # a single candidate per family: the least loaded, then the name
     best: dict[str, Candidate] = {}
     for candidate in eligible:
@@ -419,8 +476,7 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
             best[family] = candidate
     ordered = [best[family] for family in sorted(best)]
     # pace first, then load, then name; a family absent from `pace` is neutral
-    ordered.sort(key=lambda c: (pace.get(c.family.strip().lower(), 0.0),
-                                c.load, c.name))
+    ordered.sort(key=lambda c: (_advance_of(c, pace), c.load, c.name))
     chosen = ordered[:remaining]
     out["reviewers"] = [{"name": c.name, "family": c.family} for c in chosen]
     if len(chosen) < remaining:
@@ -439,8 +495,7 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
         return out
     why = "designated %d reviewer(s)" % len(chosen)
     if pace:
-        reading = ["%s %+.0f pt" % (c.family.strip().lower(),
-                                    pace[c.family.strip().lower()] * 100)
+        reading = ["%s %+.0f pt" % (c.family.strip().lower(), _advance_of(c, pace) * 100)
                    for c in chosen if c.family.strip().lower() in pace]
         if reading:
             why += " (plan pace: %s)" % ", ".join(reading)
@@ -716,10 +771,11 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     family count one seat.
 
     `advances` maps a family to its advance over the plan pace, in points
-    (`review_pace`, #2668): the selection prefers the family furthest behind,
-    the load only breaking a tie. A family without a current reading is
-    neutral, and the pace never makes an eligible family ineligible: two
-    required opinions still take two distinct families.
+    (`review_pace`, #2668), or to a `{scope: advance}` mapping whose scoped
+    buckets are selected by the candidate's model: the selection prefers the
+    family furthest behind, the load only breaking a tie. A family without a
+    current reading is neutral, and the pace never makes an eligible family
+    ineligible: two required opinions still take two distinct families.
 
     The freeze is re-read **once**, and the provided inputs (paths, authors,
     class) are those of this freeze: if the `Port` refuses a freeze that has

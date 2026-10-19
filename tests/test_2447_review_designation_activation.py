@@ -254,7 +254,9 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         # Codex's agent is less loaded. The declared ×10 (Claude) and ×3
         # (Codex) profiles are deliberately ignored: with them Claude would
         # look 20 points behind and Codex 21.8, designating Codex, the inverse
-        # of the witness (B of mesh-design on 4123b99). With no current
+        # of the witness (B of mesh-design on 4123b99). A Fable-only bucket
+        # at 95 % is ignored for this Claude agent (no model declared), so it
+        # cannot contaminate its general reading (cx3 B). With no current
         # reading, the load rule returns.
         self.repo.write("docs/guide.md", "base\n")
         self.base = self.repo.commit("docs base")
@@ -288,8 +290,11 @@ class ActivationTest(_ActivationFixture, PgTestCase):
             " VALUES ('codex', 'seven_day', 0.35, to_timestamp(%s), %s, 'secondaire',"
             "         to_timestamp(%s), 'test'),"
             "        ('claude', 'seven_day', 0.60, to_timestamp(%s), %s, 'secondaire',"
-            "         to_timestamp(%s), 'test')",
-            (now + 0.81 * week, week, now, now + 0.40 * week, week, now))
+            "         to_timestamp(%s), 'test'),"
+            "        ('claude', 'seven_day@fable', 0.95, to_timestamp(%s), %s,"
+            "         'secondaire', to_timestamp(%s), 'test')",
+            (now + 0.81 * week, week, now, now + 0.40 * week, week, now,
+             now + 0.40 * week, week, now))
         _, out = self.freeze()
         self.assertEqual(out["state"], rd.DESIGNATED, out)
         self.assertEqual(out["required"], 1)
