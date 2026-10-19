@@ -273,6 +273,19 @@ class RedemarrageServeurDrainTest(unittest.TestCase):
         self.assertGreaterEqual(len(reprises), 3)
         self.assertTrue((self.state / 'pause-dev9').exists())
 
+    def test_final_verdict_is_not_followed_by_another_cleanup(self):
+        """#2498 : les trois premières reprises échouent ; une quatrième
+        réussirait et rendrait le verdict final périmé."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        (self.state / 'reprises-en-echec').write_text('3')
+        p = self.run_vm()
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('drain(s) NON levé(s) : dev9', p.stdout + p.stderr)
+        reprises = [l for l in self.poste().splitlines()
+                    if l.startswith('resume dev9 --operator')]
+        self.assertEqual(len(reprises), 3)
+        self.assertTrue((self.state / 'pause-dev9').exists())
+
 
 if __name__ == '__main__':
     unittest.main()

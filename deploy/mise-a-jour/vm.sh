@@ -754,6 +754,9 @@ drains_non_leves_relus() {  # #2498 : passe du trap avant le verdict
   # encore suivis (notre pause toujours en place ou état illisible).
   [ "${#DRAINS_NON_LEVES[@]}" -gt 0 ] || return 0
   lever_drains || true
+  # Cette passe remplace le nettoyage de sortie : aucune nouvelle tentative
+  # ne doit lever un drain après le verdict « NON levé(s) ».
+  trap - EXIT
   local p e reste=()
   for p in "${DRAINS_NON_LEVES[@]}"; do
     for e in ${DRAINS[@]+"${DRAINS[@]}"}; do
