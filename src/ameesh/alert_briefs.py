@@ -446,17 +446,18 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             for name in _of_teams(orchestras, by_name, teams):
                 out.setdefault(name, text)
         bureau = by_name.get("bureau") or {}
-        # #2602: the external desk cannot read automatic mail; home host
-        # operations are the exception, since they can require that desk.
+        # #2602/#2640: the external desk cannot read automatic mail; its copy
+        # goes to the readable lot thread (`notify`). There is no `home`
+        # project — canon lots are `app=ameesh`, branch `canon/…` (#2511) — so
+        # the old exception could never fire.
         # `registry.MODES`: a human-driven session is `externe` (0030).
-        if "bureau" in roles and bureau and (
-                bureau.get("mode") != "externe" or alert.get("project") == "home"):
+        if "bureau" in roles and bureau and bureau.get("mode") != "externe":
             out.setdefault("bureau", text)
         if "auditeur" in roles:
             for name in auditor_names or ():
                 if name in by_name:
                     out.setdefault(name, text)
-        if bureau.get("mode") == "externe" and alert.get("project") != "home":
+        if bureau.get("mode") == "externe":
             out.pop("bureau", None)  # also when listed as pilot or auditor
         return out
     else:

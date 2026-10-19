@@ -2164,11 +2164,16 @@ def send_mail(cfg, db, project: Project, report: dict, *, ci="github") -> list[d
         done = dict(before.get(key) or {})
         fingerprint = conflict.get("fingerprint")
         dormant = done.pop("dormant", False)
-        if (dormant and done.get("fp") != fingerprint) or \
-                _lot_inputs(done.get("fp")) != _lot_inputs(fingerprint):
+        known = done.get("fp")
+        if (dormant and known != fingerprint) or (
+                known is not None
+                and _lot_inputs(known) != _lot_inputs(fingerprint)):
             # #2238: back on other inputs than the notice already sent.
             # #2602: changed lot heads are new inputs, even without an absent
             # pass; the target's head alone is not (it moves every packet).
+            # #2640: a state written before the JSON fingerprints of
+            # migration/unreserved conflicts has no `fp`; upgrading the code
+            # must not resend a notice already delivered.
             done = {}
         for lot in conflict["lots"]:
             one = branches.get(lot) or {}
