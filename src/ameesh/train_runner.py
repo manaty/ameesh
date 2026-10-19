@@ -207,6 +207,10 @@ class Passage:
                     project=self.project.name,
                     repo_slug=radar.github_slug(self.project), say=self.notify)
             except prevalidation.PrevalidationError as exc:
+                if exc.cause == "run-red":
+                    # Un rouge exécuté n'est pas une publication incertaine :
+                    # l'Engine l'arrête (paused, réservation rendue).
+                    raise train.PrevalidationRed(exc.why or "prevalidation red") from exc
                 raise train.TrainError(
                     "prevalidation refused (%s): %s"
                     % (exc.cause, exc.why or "")) from exc

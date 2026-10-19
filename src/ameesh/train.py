@@ -30,6 +30,16 @@ class TrainError(RuntimeError):
     """A missing proof or an uncertain effect: do not merge."""
 
 
+class PrevalidationRed(TrainError):
+    """La prévalidation de la composition a exécuté la sélection et un test a
+    échoué : un résultat, pas une réponse perdue.
+
+    L'Engine ne doit pas la confondre avec une publication incertaine (qui
+    garde `publishing`, la réservation et rejoue la même composition à chaque
+    événement) : le paquet est arrêté (`paused`, terminal) et la réservation
+    est rendue par le `finally` de `step`."""
+
+
 class MemberDeferred(TrainError):
     """A named composition exclusion, never an accusation or queue ejection."""
     def __init__(self, row, reason):
@@ -328,6 +338,11 @@ class Engine:
                 # Idempotent compare-and-swap publication of an immutable ref.
                 try:
                     self.ports.publish(state["plan"], self.epoch)
+                except PrevalidationRed as exc:
+                    # Un rouge de prévalidation est un résultat, pas une
+                    # réponse perdue : on arrête le paquet (terminal, donc
+                    # réservation rendue) au lieu de rejouer la composition.
+                    return self._prevalidation_red(state, exc)
                 except TrainError as exc:
                     # A push may have succeeded despite a lost response.
                     # Keep the immutable publication intent for reconciliation.
@@ -416,6 +431,23 @@ class Engine:
             if state is None or state.get("phase") in TERMINAL:
                 self.ports.release(epoch)
                 self.epoch = None
+
+    def _prevalidation_red(self, state, exc):
+        """Arrête un paquet dont la prévalidation a exécuté et échoué.
+
+        La composition est immuable : rester en `publishing` rejouerait le
+        même rouge à chaque événement et tiendrait la réservation. `paused`
+        est terminal — le `finally` rend l'époque — et le diagnostic porte les
+        tests en échec ; le prochain créneau repart d'un état neuf. Comme pour
+        un CI rouge en build/beta, aucun diagnostic automatique n'est lancé :
+        un échec multi-lots ne prouve pas un coupable.
+        """
+        state["failures"] += 1
+        state["diagnosis"] = {"stage": "prevalidation", "why": str(exc)}
+        state["phase"] = "paused"
+        state = self._save(state)
+        self.ports.notify("prevalidation red before publication: %s" % exc, state)
+        return {"result": "paused", "error": str(exc)}
 
     def _red(self, state, now):
         state["failures"] += 1

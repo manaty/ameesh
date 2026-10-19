@@ -43,7 +43,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from . import canon as canon_mod
 from . import lot_class, mechanics, plan_git, prevalidation, registry, work
@@ -61,6 +61,11 @@ JOURNAL_PREFIX = "prevalidation"
 #: artefact de la mesure carte (#161e) publié par `.github/workflows/carte.yml`
 CARTE_WORKFLOW = "carte.yml"
 CARTE_ARTIFACT = "carte"
+#: #2644/N dev1 : la prévalidation du train tourne avant `_held()`, mais le
+#: bail de la cible (land.LOCK_TTL_S, 1800 s par défaut) court déjà. Plan et
+#: run restent sous 1500 s (300 + 1200) pour ne pas le laisser expirer.
+TRAIN_PLAN_TIMEOUT = 300
+TRAIN_RUN_TIMEOUT = 1200
 
 
 @dataclass(frozen=True)
@@ -618,10 +623,16 @@ def gate_train(cfg, *, repo: str, head: str, base: str, canon_repo: str = "",
             return {"state": "unavailable", "cause": "no-vm",
                     "why": "aucun hôte de prévalidation autorisé (%s)"
                            % ", ".join(declared)}
+        governed = min(int(getattr(params.params, "timeout_seconds", 0) or 0),
+                       TRAIN_RUN_TIMEOUT)
+        params = Parameters(params=replace(params.params, timeout_seconds=governed),
+                            repo=params.repo, commit=params.commit,
+                            project=params.project)
         carte, cleanup = map_for(repo_slug, repo, explicit=map_path)
         prepared = None
         try:
-            prepared = prepare(repo, head, base, map_path=carte)
+            prepared = prepare(repo, head, base, map_path=carte,
+                               timeout=TRAIN_PLAN_TIMEOUT)
             report = _run_hosts(prepared, params, lot=0, head=head, base=base,
                                 branch="", profile="", say=say,
                                 executable="ameesh", validate=None)
@@ -634,6 +645,9 @@ def gate_train(cfg, *, repo: str, head: str, base: str, canon_repo: str = "",
         if exc.cause == "run-red":
             raise
         return {"state": "unavailable", "cause": exc.cause, "why": exc.why}
+    except Exception as exc:  # noqa: BLE001 - panne d'outillage : indisponible
+        return {"state": "unavailable", "cause": "internal",
+                "why": "%s: %s" % (type(exc).__name__, str(exc)[:300])}
     state = report_state(report)
     if state == "red":
         raise prevalidation.PrevalidationError("run-red", describe(report))

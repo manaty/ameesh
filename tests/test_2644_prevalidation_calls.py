@@ -15,9 +15,11 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
+from ameesh import mechanics
 from ameesh import prevalidation as pv
 from ameesh import prevalidation_calls as calls
 
@@ -43,8 +45,9 @@ def report(*, ok=True, causes=(), failed=(), missing=(), modules=("test_a",),
 
 
 def params(*, hosts=("vm1", "vm2")):
-    return SimpleNamespace(classes=("P0", "P1"), contracts=(), hosts=hosts,
-                           timeout_seconds=60, parts_script="scripts/test-parts.py")
+    return mechanics.Prevalidation(classes=("P0", "P1"), contracts=(), hosts=hosts,
+                                   timeout_seconds=60,
+                                   parts_script="scripts/test-parts.py")
 
 
 class Repo:
@@ -401,6 +404,39 @@ class GateTrainTest(unittest.TestCase):
             got = calls.gate_train(None, repo="/repo", head="a" * 40, base="b" * 40)
         self.assertEqual(got["state"], "unavailable")
         self.assertEqual(got["cause"], "no-vm")
+
+    def test_an_internal_error_is_unavailable_not_a_crash(self):
+        # B2 dev1 : OSError/TimeoutExpired/MechanicsError ne doivent pas
+        # sortir de gate_train vers l'Engine.
+        with mock.patch.object(calls, "parameters",
+                               side_effect=OSError("disque plein")):
+            got = calls.gate_train(None, repo="/repo", head="a" * 40, base="b" * 40)
+        self.assertEqual(got["state"], "unavailable")
+        self.assertEqual(got["cause"], "internal")
+        self.assertIn("OSError", got["why"])
+
+    def test_the_train_timeout_stays_below_the_lock_ttl(self):
+        # N dev1 : le run de prévalidation ne doit pas dépasser le bail de la
+        # cible (land.LOCK_TTL_S 1800 s) ; plan 300 + run 1200.
+        prepared = SimpleNamespace(close=lambda: None)
+        seen = {}
+        block = replace(params(), timeout_seconds=3600)
+
+        def run_hosts(prepared_, params_, **kw):
+            seen["timeout"] = params_.params.timeout_seconds
+            return report()
+
+        with mock.patch.object(calls, "parameters",
+                               return_value=calls.Parameters(
+                                   params=block, repo="/canon",
+                                   commit="c" * 40, project="ameesh")), \
+                mock.patch.object(calls, "map_for", return_value=("", "")), \
+                mock.patch.object(calls, "prepare", return_value=prepared), \
+                mock.patch.object(calls, "_run_hosts", side_effect=run_hosts):
+            got = calls.gate_train(None, repo="/repo", head="a" * 40, base="b" * 40)
+        self.assertEqual(got["state"], "green")
+        self.assertEqual(seen["timeout"], calls.TRAIN_RUN_TIMEOUT)
+        self.assertLess(calls.TRAIN_PLAN_TIMEOUT + seen["timeout"], 1800)
 
     def test_a_no_vm_report_does_not_block_publication(self):
         prepared = SimpleNamespace(close=lambda: None)

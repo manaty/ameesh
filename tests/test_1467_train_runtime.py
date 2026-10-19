@@ -131,16 +131,23 @@ class TrainRuntimeTest(PgTestCase):
         self.repository.publish.assert_called_once()
 
     def test_prevalidation_red_prevents_publication(self):
+        # B1 dev1 : un rouge exécuté est un résultat, pas une publication
+        # incertaine ; le paquet est arrêté (paused, terminal) et la
+        # réservation rendue, sans rejouer la composition.
         def port(head, base):
-            raise train.TrainError("prevalidation refused (run-red): tests.test_x")
+            raise train.PrevalidationRed("run-red: tests.test_x")
 
         self.runtime = self.runtime_for(prevalidation=port)
         self.engine = self.engine_for(self.runtime)
         outcome = self.engine.step(3600)
-        self.assertEqual(outcome["result"], "publication-uncertain", outcome)
-        self.assertIn("prevalidation refused", outcome.get("error") or "")
+        self.assertEqual(outcome["result"], "paused", outcome)
+        self.assertIn("tests.test_x", outcome.get("error") or "")
         self.repository.publish.assert_not_called()
         self.ci.start.assert_not_called()
+        state = self.ledger.load()
+        self.assertEqual(state["phase"], "paused")
+        self.assertEqual(state["diagnosis"],
+                         {"stage": "prevalidation", "why": "run-red: tests.test_x"})
 
     def test_migration_mapping_is_persisted_and_recorded_after_promotion(self):
         # #2400: composition reserves and the runtime records the landed
