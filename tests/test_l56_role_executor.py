@@ -261,6 +261,13 @@ class RoleExecutorTest(PgTestCase):
                     "SELECT has_table_privilege('ameesh_canon_sync', %s,"
                     " 'INSERT,UPDATE,DELETE') AS p",
                     ("%s.review_catch_up" % q(self.schema),))[0]["p"])
+                # #2481: a full work row projects its reserved migration slots;
+                # both isolated writers read the lot through that projection.
+                for writer_role in ("ameesh_it_proof", "ameesh_it_qa"):
+                    with self.subTest(writer_role=writer_role):
+                        self.assertTrue(self.db.query(
+                            "SELECT has_table_privilege(%s, %s, 'SELECT') AS p",
+                            (writer_role, "%s.work_migration_reservations" % q(self.schema),))[0]["p"])
                 # This class has a private database: never mutate shared bench ACLs.
                 for grantee in (*names, "PUBLIC"):
                     with self.subTest(temp_grantee=grantee):
@@ -360,7 +367,10 @@ class RoleExecutorTest(PgTestCase):
         self.db.execute("CREATE ROLE %s NOLOGIN" % q(writer))
         try:
             self.db.execute("GRANT USAGE ON SCHEMA %s TO %s" % (q(self.schema), q(writer)))
-            self.db.execute("GRANT SELECT ON work_items, project_modules, work_module_milestones TO %s" % q(writer))
+            # #2481: the full work row projects its reserved migration slots.
+            self.db.execute("GRANT SELECT ON work_items, project_modules, "
+                            "work_module_milestones, work_migration_reservations TO %s"
+                            % q(writer))
             self.db.execute("GRANT UPDATE(id) ON work_items TO %s" % q(writer))
             self.db.execute("GRANT INSERT ON work_module_milestones TO %s" % q(writer))
             self.db.execute("GRANT USAGE ON SEQUENCE work_module_milestones_id_seq TO %s" % q(writer))

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 
 from . import migrations, plan_git, resolutions
@@ -158,16 +159,19 @@ def _rename(row: dict, name: str, reason: str) -> MemberDeferred:
 
 
 def rewrite(path: str, base: str, head: str, target: Layout, row: dict, *,
-            expected: dict | None = None, allocator=None) -> dict | None:
+            expected: dict | list | None = None, allocator=None) -> dict | None:
     """Renumber the migrations one clean merge adds, and return the new tree.
 
     ``base`` is the composed prefix, ``head`` the merge commit of ``row``.
-    The member's frozen commit is untouched. ``expected`` (a persisted plan
-    entry) makes a reconstruction verify the same old and new numbers instead
-    of allocating again. Without it, ``allocator`` moves the L122 reservation
-    to each new number before the tree is written.
+    The member's frozen commit is untouched. ``expected`` (the persisted plan
+    entries of this lot) makes a reconstruction verify the same old and new
+    numbers instead of allocating again; one dict is accepted for a lot with a
+    single migration. Without it, ``allocator`` reserves each new number
+    before the tree is written. #2481 : a lot may add several migrations; they
+    take the next contiguous numbers in file order, and each keeps its own
+    ``reserved``/``landed`` mapping and companion files.
 
-    Returns ``{"tree", "migration"}`` when the merge adds a migration, else
+    Returns ``{"tree", "migrations"}`` when the merge adds a migration, else
     None.
     """
     changes = _diff(path, base, head)
@@ -193,61 +197,89 @@ def rewrite(path: str, base: str, head: str, target: Layout, row: dict, *,
             raise TrainError("persisted migration mapping names lot #%s but the merge "
                              "adds no migration" % row["work_item_id"])
         return None
-    if len(numbered) > 1:
-        raise _rename(row, ", ".join(name for _, name, _ in numbered),
-                      "one L122 reservation per lot: split the migrations into lots")
-    numbered.sort()
-    old, migration, old_prefix = numbered[0]
+    numbered.sort(key=lambda entry: (entry[0], entry[1]))
+    prefixes = {old: prefix for old, _, prefix in numbered}
     # The member's own additions are already in ``head``: the target's
     # numbering is the one of the composed prefix before this merge.
     first = maximum(path, base, target) + 1
-    if first > MAX_NUMBER:
-        raise _rename(row, migration, "no migration number left")
+    if first + len(numbered) - 1 > MAX_NUMBER:
+        raise _rename(row, numbered[-1][1], "no migration number left")
+    assigned = [(old, first + offset, name)
+                for offset, (old, name, _prefix) in enumerate(numbered)]
+    new_for_old = {old: new for old, new, _name in assigned}
+    expected_by_reserved = None
     if expected is not None:
-        if not isinstance(expected, dict) or expected.get("work_item_id") != row["work_item_id"] \
-                or expected.get("reserved") != old or expected.get("landed") != first:
+        entries = [expected] if isinstance(expected, dict) else list(expected)
+        if not entries or not all(isinstance(entry, dict) for entry in entries):
             raise TrainError("persisted migration mapping no longer belongs to lot #%s"
                              % row["work_item_id"])
-    new_prefix = str(first).zfill(len(old_prefix))
-    renames: dict[str, str] = {}
+        expected_by_reserved = {}
+        for entry in entries:
+            if (entry.get("work_item_id") != row["work_item_id"]
+                    or not isinstance(entry.get("reserved"), int)
+                    or not isinstance(entry.get("landed"), int)
+                    or entry["reserved"] in expected_by_reserved):
+                raise TrainError("persisted migration mapping no longer belongs to lot #%s"
+                                 % row["work_item_id"])
+            expected_by_reserved[entry["reserved"]] = entry
+        if set(expected_by_reserved) != set(new_for_old) or any(
+                expected_by_reserved[old]["landed"] != new
+                for old, new, _name in assigned):
+            raise TrainError("persisted migration mapping no longer belongs to lot #%s"
+                             % row["work_item_id"])
+    source_old = {}
     for status, name in added:
         base_name = os.path.basename(name)
         match = COMPANION.match(base_name)
-        if match is None or int(match.group(1)) != old:
+        if match is None or match.group(2) not in ("_", "-"):
             continue
-        if match.group(2) not in ("_", "-"):
+        old = int(match.group(1))
+        if old not in new_for_old or new_for_old[old] == old:
             continue
+        source_old[name] = old
+    renames: dict[str, str] = {}
+    for name, old in sorted(source_old.items()):
+        base_name = os.path.basename(name)
+        old_prefix = prefixes[old]
+        new = new_for_old[old]
+        new_prefix = str(new).zfill(len(old_prefix))
         destination = os.path.join(os.path.dirname(name),
                                    new_prefix + base_name[len(old_prefix):])
         if destination == name:
             continue
         if destination in renames.values():
             raise _rename(row, name, "two companions would share %s" % destination)
-        if _mode(path, head, destination):
-            raise _rename(row, name, "destination %s already exists" % destination)
         renames[name] = destination
-    if old == first:
-        # The member already continues the target: no byte changes, but the
-        # reservation is still moved before publication.
-        if expected is not None and expected.get("files"):
-            raise TrainError("persisted migration files changed for lot #%s"
-                             % row["work_item_id"])
-        if allocator is not None and expected is None:
-            allocator.reserve(row, path, old, first, target)
-        return dict(tree=_git_out(path, "rev-parse", head + "^{tree}"),
-                    migration=dict(work_item_id=row["work_item_id"], reserved=old,
-                                   landed=first, files=[]))
-    if migration not in renames:
-        raise _rename(row, migration, "the added migration itself is missing")
+    for name, destination in sorted(renames.items()):
+        if destination not in renames and _mode(path, head, destination):
+            raise _rename(row, name, "destination %s already exists" % destination)
+    files_by_old: dict[int, list[dict]] = {old: [] for old, new, _name in assigned
+                                           if new != old}
+    for old_name, new_name in sorted(renames.items()):
+        files_by_old[source_old[old_name]].append({"from": old_name, "to": new_name})
+    for old, new, name in assigned:
+        if new != old and name not in renames:
+            raise _rename(row, name, "the added migration itself is missing")
+    entries = [dict(work_item_id=row["work_item_id"], reserved=old, landed=new,
+                    files=files_by_old.get(old, []))
+               for old, new, _name in assigned]
+    if expected_by_reserved is not None:
+        for entry in entries:
+            if expected_by_reserved[entry["reserved"]].get("files") != entry["files"]:
+                raise TrainError("persisted migration files changed for lot #%s"
+                                 % row["work_item_id"])
     if allocator is not None and expected is None:
-        allocator.reserve(row, path, old, first, target)
-    if expected is not None and expected.get("files") != [
-            {"from": name, "to": destination}
-            for name, destination in sorted(renames.items())]:
-        raise TrainError("persisted migration files changed for lot #%s"
-                         % row["work_item_id"])
+        for old, new, _name in assigned:
+            allocator.reserve(row, path, old, new, target)
+    if not renames:
+        # The member already continues the target: no byte changes, but the
+        # reservations are still moved before publication.
+        return dict(tree=_git_out(path, "rev-parse", head + "^{tree}"),
+                    migrations=entries)
     names = {os.path.basename(old_name): os.path.basename(new_name)
              for old_name, new_name in renames.items()}
+    name_pattern = re.compile("|".join(re.escape(name) for name in
+                                     sorted(names, key=len, reverse=True)))
     rewritten: dict[str, bytes] = {}
     for status, name in changes:
         if status not in ("A", "M"):
@@ -259,31 +291,34 @@ def rewrite(path: str, base: str, head: str, target: Layout, row: dict, *,
             if name in renames:
                 raise _rename(row, name, "a renamed artifact must be UTF-8")
             continue
-        changed = text
-        for old_name, new_name in names.items():
-            changed = changed.replace(old_name, new_name)
+        changed = name_pattern.sub(lambda match: names[match.group()], text)
         if name in renames:
-            changed = _comment_numbers(changed, old, first)
+            changed = _comment_numbers(changed, source_old[name], new_for_old[source_old[name]])
         if changed != text:
             rewritten[name] = changed.encode("utf-8")
     resolutions._check(_run(path, "checkout", "-q", "-f", "--detach", head),
                        "checkout migration composition")
     for name, content in rewritten.items():
         _write(path, "HEAD", name, content)
-    for old_name, new_name in renames.items():
-        destination = os.path.join(path, new_name)
-        os.makedirs(os.path.dirname(destination), exist_ok=True)
-        os.replace(os.path.join(path, old_name), destination)
+    # Stage every source before writing destinations: one destination may
+    # still be another migration's source. Moving preserves executable modes.
+    with tempfile.TemporaryDirectory(prefix=".migration-renames-", dir=path) as tmp:
+        staged = []
+        for index, (old_name, new_name) in enumerate(renames.items()):
+            source = os.path.join(tmp, str(index))
+            os.replace(os.path.join(path, old_name), source)
+            staged.append((source, new_name))
+        for source, new_name in staged:
+            destination = os.path.join(path, new_name)
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            os.replace(source, destination)
     touched = sorted(set(rewritten) | set(renames) | set(renames.values()))
     proc = _run(path, "add", "-A", "--", *touched)
     if proc.returncode:
         raise TrainError("cannot stage migration renumbering: %s"
                          % resolutions._err(proc)[:300])
     tree = _git_out(path, "write-tree")
-    return dict(tree=tree, migration=dict(
-        work_item_id=row["work_item_id"], reserved=old, landed=first,
-        files=[dict(**{"from": old_name}, to=new_name)
-               for old_name, new_name in sorted(renames.items())]))
+    return dict(tree=tree, migrations=entries)
 
 
 def audit(path: str, base: str, head: str, target: Layout) -> None:
@@ -336,11 +371,21 @@ def guard_transport(path: str, base: str, head: str, target: Layout, row: dict) 
 
 
 class Allocator:
-    """L122 side of the composition: move a reservation, release it at landing.
+    """L122 side of the composition: add the new slots, release all at landing.
 
     The caller must hold the target reservation. ``reserve`` runs before the
     train branch is published; a refusal names the member and defers it rather
     than publishing a package whose number is not reserved.
+
+    #2481 : a lot may hold several reservations, so ``reserve`` ADDS the
+    composition number to the lot's slots instead of replacing its previous
+    one. The old number stays reserved until landing (a failed or superseded
+    package therefore leaves its slots on the lot, and a retry can add more);
+    ``landed`` releases every slot at once, and the plan carries the
+    authoritative old -> new mapping. Releasing the previous number earlier
+    would require a batch release after all the lot's new numbers are taken,
+    which the one-number contract of ``work.reserve_migration`` does not
+    express.
     """
 
     def __init__(self, db, cfg=None, *, actor: str = "ameesh train"):
@@ -348,6 +393,14 @@ class Allocator:
 
     def reserve(self, row: dict, path: str, old: int, number: int,
                 target: Layout) -> None:
+        """Reserve ``number`` for the member, keeping its previous slots.
+
+        The reservation is added before the rewritten tree is published; a
+        refusal is a member deferral, never a package with an unreserved
+        number. The previous number (``old``) is not released here: the plan's
+        mapping keeps it meaningful until the lot lands and ``landed`` frees
+        the whole set.
+        """
         from . import work
 
         try:
@@ -363,34 +416,45 @@ class Allocator:
                 target.label(old), target.label(number), row["work_item_id"], exc)) from exc
 
     def landed(self, plan: dict, *, path: str | None = None) -> list[str]:
-        """Record the landed number and free the reservation, after promotion.
+        """Record the landed number and free the reservations, after promotion.
 
         The target already carries the plan's head, so ``work.merged`` can
         verify the exact commit. A failure never revokes the landing; it is
         returned so the passage can notify the pilot and retry later.
+        #2481 : the plan carries one entry per migration; the lot is closed
+        once with all its mappings in the journal, then every reservation is
+        released.
         """
         from . import work
 
         self._align_target(plan, path)
         errors = []
+        by_lot: dict[int, list[dict]] = {}
         for entry in plan.get("migrations", ()):
-            lot, number = entry["work_item_id"], entry["landed"]
+            by_lot.setdefault(int(entry["work_item_id"]), []).append(entry)
+        for lot, entries in sorted(by_lot.items()):
+            entries.sort(key=lambda entry: (int(entry["landed"]),
+                                            int(entry["reserved"])))
+            numbers = [int(entry["landed"]) for entry in entries]
+            reserved = [int(entry["reserved"]) for entry in entries]
+            note = ""
+            if len(entries) > 1:
+                note = "migration mapping %s -> %s" % (
+                    ", ".join(str(number) for number in reserved),
+                    ", ".join(str(number) for number in numbers))
             try:
                 work.merged(self.db, lot, sha=plan["head"], actor=self.actor,
-                            repo=path, migration_landed=number, cfg=self.cfg)
+                            repo=path, migration_landed=numbers[0], note=note,
+                            cfg=self.cfg)
             except Exception as exc:
                 errors.append("lot #%s landed migration not recorded: %s" % (lot, exc))
-                continue
-            item = work.get(self.db, lot)
-            if item is None or item.get("migration") is None \
-                    or int(item["migration"]) != int(number):
                 continue
             try:
                 work.reserve_migration(self.db, lot, release=True,
                                        actor=self.actor, cfg=self.cfg)
             except Exception as exc:
-                errors.append("lot #%s reservation %s not released: %s" % (
-                    lot, number, exc))
+                errors.append("lot #%s reservations %s not released: %s" % (
+                    lot, ", ".join(str(number) for number in reserved), exc))
         return errors
 
     def _align_target(self, plan: dict, path: str | None) -> None:

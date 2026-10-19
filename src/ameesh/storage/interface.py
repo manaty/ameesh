@@ -68,8 +68,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    delays timeline link_package by_package close_merged close
                    refresh_package_parents delegate current_delegation
                    mark_delegate_turn due_delegations resolve_delegation
-                   overdue_delegations returned_delegations backlog_add backlog
-                   auto_takes_since unassigned_lots issue_feed set_issue_ref set_estimate
+                   overdue_delegations returned_delegations backlog_add
+                   backlog_basket_add backlog auto_takes_since unassigned_lots issue_feed set_issue_ref set_estimate
                    estimates mark_started estimate_history
    packages       all get upsert retire lock_sync
    actions         get recent attempts events log_event last_event_note
@@ -194,6 +194,9 @@ AUTO_TAKE_NOTE = "prise automatique"
 HANDOFF_NOTE = "pause budget (reprise) : lot repris"
 ASSIGN_NOTE_PREFIXES = ("assigned to ", "assigné à ", "created and assigned to ",
                         DELEGATED_NOTE, LOT_TAKE_NOTE, AUTO_TAKE_NOTE, HANDOFF_NOTE)
+#: #2584 : début de la note de journal d'une ligne de panier (`backlog_basket_add`)
+#: — le compte des lignes d'un panier se lit sur ce préfixe
+BASKET_LINE_NOTE = "basket line"
 
 
 class Domain(abc.ABC):
@@ -1495,18 +1498,27 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def reserve_migration(self, item_id: int, repo: str | None, number: int | None,
                           floor: int, *, note: str, actor: str, issue_ref: str | None,
-                          release: bool = False) -> dict | None:
-        """L122, #443 : réserve un numéro de migration du dépôt `repo` au lot
-        ouvert (journalisé) : `number` s'il est donné, sinon le prochain libre
-        de ce dépôt, au moins `floor`. L'unicité (dépôt, numéro) est celle de
-        l'index unique : deux réservations simultanées ne prennent jamais le
-        même numéro ; la perdante réessaie avec une attente aléatoire croissante,
-        dans un budget de temps (#478). `note` peut citer `%(number)04d`. None
-        si le lot n'est plus ouvert, ou si `issue_ref` — la référence lue par
-        l'appelant — a changé entre-temps (#1830 : NULL et chaîne vide
-        confondus) ; DbError si `number` est pris par un autre lot ;
-        `ReservationContention` si le budget du prochain libre est épuisé.
-        `release` libère la réservation, sans condition sur la référence."""
+                          release: bool = False,
+                          release_number: int | None = None) -> dict | None:
+        """L122, #443, #2481 : réserve un numéro de migration du dépôt `repo`
+        au lot ouvert (journalisé) : `number` s'il est donné, sinon le prochain
+        libre de ce dépôt, au moins `floor`. Un lot garde ses réservations
+        précédentes : `number` s'ajoute à la liste (`migrations`), il ne
+        remplace plus le numéro courant. L'unicité (dépôt, numéro) est celle
+        des index uniques : deux réservations simultanées ne prennent jamais
+        le même numéro ; la perdante réessaie avec une attente aléatoire
+        croissante, dans un budget de temps (#478). `note` peut citer
+        `%(number)04d` pour une réservation ou une libération d'UN numéro ; une
+        libération totale nomme elle-même l'ensemble des numéros (un gabarit
+        y rend la liste, jamais le sentinelle 0). None si le lot n'est plus
+        ouvert, ou si `issue_ref` —
+        la référence lue par l'appelant — a changé entre-temps (#1830 : NULL
+        et chaîne vide confondus) ; DbError si `number` est pris par un autre
+        lot ; `ReservationContention` si le budget du prochain libre est
+        épuisé. `release` libère toutes les réservations du lot, ou seulement
+        `release_number` s'il est donné, sans condition sur la référence.
+        Les colonnes scalaires (`migration`, `migration_repo`) restent la
+        réservation principale et `migrations` porte la liste complète."""
 
     @abc.abstractmethod
     def migration_holder(self, number: int, repo: str) -> dict | None:
@@ -2095,6 +2107,29 @@ class WorkItems(Domain):
         assigné, et sa première ligne de journal ; rend le lot.
 
         `app`: its project (L118c), empty when unknown."""
+
+    @abc.abstractmethod
+    def backlog_basket_add(self, *, key: str, title: str, expected_value: str, line: str,
+                           value_score: int, priority: int, team: str | None,
+                           required_capabilities: list | None, package_id: str | None,
+                           package_parent: str | None, note: str, actor: str,
+                           app: str = "") -> dict:
+        """#2584 (canon §2 l.129) : ajoute une ligne au panier ouvert `key`
+        d'un chantier, ou ouvre ce panier ; rend le panier.
+
+        Le panier est un lot `improvement` en `intake`, sans assigné, dont la
+        `source` vaut `key` : la clé seule le désigne, l'équipe d'une ligne
+        n'ouvre pas un second panier. La ligne s'ajoute au corps ; la valeur
+        du panier est la plus haute de ses lignes, sa priorité la plus haute
+        (le plus petit nombre), ses capacités exigées l'union des leurs, son
+        équipe la première donnée (`team` de la ligne qui l'ouvre, sinon
+        d'une suivante) ;
+        `note` (qui commence par `BASKET_LINE_NOTE`) va au journal. Un panier
+        déjà pris (assigné, ou sorti d'`intake`) est fermé aux lignes : la
+        suivante ouvre un nouveau panier. Deux ajouts simultanés sur la même
+        clé n'ouvrent jamais deux paniers (un écrivain par clé). Le lot rendu
+        porte `basket_lines` (lignes au journal du panier) et `basket_opened`
+        (vrai si cet ajout l'a ouvert)."""
 
     @abc.abstractmethod
     def backlog(self, *, open_only: bool, limit: int,

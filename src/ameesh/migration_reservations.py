@@ -123,8 +123,8 @@ def import_reservations(db, rows, mapping: dict, *, repo: str, apply=False,
     numbers = {r["number"] for r in rows}
     if len(mapped) != len(mapping) or len(numbers) != len(rows) or set(mapped) - numbers:
         raise work.WorkError("mapping contains inactive or unknown migration numbers, or duplicate rows")
-    if any(lot <= 0 for lot in mapped.values()) or len(set(mapped.values())) != len(mapped):
-        raise work.WorkError("each reservation needs a distinct positive lot id")
+    if any(lot <= 0 for lot in mapped.values()):
+        raise work.WorkError("each reservation needs a positive lot id")
 
     def preview(conn):
         registry, result = storage.of(conn).work, []
@@ -137,13 +137,13 @@ def import_reservations(db, rows, mapping: dict, *, repo: str, apply=False,
                     raise work.WorkError("lot #%s is missing or closed" % lot)
                 if work.lot_repository(item, cfg) != slug:
                     raise work.WorkError("lot #%s belongs to another repository" % lot)
-                current = item.get("migration")
-                if current is not None and (current != number or item.get("migration_repo") != slug):
-                    raise work.WorkError("lot #%s already has a different reservation" % lot)
+                # #2481 : un lot peut déjà tenir d'autres numéros ; le numéro
+                # mapping s'ajoute, un numéro déjà tenu n'est pas réécrit.
+                held = {held["number"] for held in work.reserved_migrations(item)}
                 holder = registry.migration_holder(number, slug)
                 if holder and int(holder["id"]) != lot:
                     raise work.WorkError("migration %s of %s already held by lot #%s" % (number, slug, holder["id"]))
-                state = "existing" if current is not None else "reserve"
+                state = "existing" if number in held else "reserve"
             result.append(dict(row, lot=lot, action=state,
                                issue_ref=item.get("issue_ref") if lot is not None else None))
         return result
