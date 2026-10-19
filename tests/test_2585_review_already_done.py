@@ -165,6 +165,17 @@ class RuleTest(unittest.TestCase):
         self.assertTrue(out["created"], out)
         self.assertFalse(out["already_reviewed"], out)
 
+    def test_un_jalon_merged_ancien_n_elargit_pas_la_tete_examinee(self):
+        """Le sha de fusion constaté fait foi : un jalon `merged` égal au gel
+        ne dispense pas une tête C différente passée par l'appelant."""
+        self.ops.milestones_rows[LOT].append(
+            {"id": 50, "kind": "merged", "sha": SHA, "actor": "a1",
+             "at_ts": 1_700_000_050.0})
+        self.verdict("r-claude", SHA)
+        out = self.open(merged_sha=MERGE_COMMIT)
+        self.assertTrue(out["created"], out)
+        self.assertFalse(out["already_reviewed"], out)
+
     def test_sans_sha_de_fusion_aucune_preuve_garde_la_relecture(self):
         self.verdict("r-claude", SHA)
         out = self.open(merged_sha="")
@@ -394,10 +405,10 @@ class GitProofDbTest(PgTestCase):
         work.milestone(self.db, self.lot, "verdict", sha=self.frozen,
                        actor="codex1", verdict="ok")
 
-    def open(self, merged_sha):
+    def open(self, merged_sha, target=""):
         return review_lot.open_after_merge(
             self.db, lot=self.lot, klass={"class": "light", "why": "policy"},
-            merged_sha=merged_sha, repo=self.repo)
+            merged_sha=merged_sha, repo=self.repo, target=target)
 
     def test_un_gel_A_ne_couvre_pas_une_tete_B_differente(self):
         self._git("checkout", "-q", "main")
@@ -414,6 +425,52 @@ class GitProofDbTest(PgTestCase):
         self.assertFalse(out["created"], out)
         self.assertTrue(out["already_reviewed"], out)
         self.assertEqual([entry["actor"] for entry in out["reviewed_by"]], ["codex1"])
+
+    def test_une_tete_X_avancee_apres_le_gel_ne_dispense_pas(self):
+        """B1 cx1 : le gel A relu, puis X ajouté sur la branche et fusionné.
+        A est un ancêtre du commit de fusion, jamais la tête mergée : la REVUE
+        reste due."""
+        self._git("checkout", "-q", "lot/2585-A")
+        self.commit("X")
+        self._git("checkout", "-q", "main")
+        self._git("merge", "-q", "--no-ff", "-m", "merge X", "lot/2585-A")
+        merged = self._git("rev-parse", "HEAD")
+        out = self.open(merged, target="main")
+        self.assertTrue(out["created"], out)
+        self.assertFalse(out["already_reviewed"], out)
+
+    def test_la_voie_pr_avec_une_tete_avancee_ne_dispense_pas(self):
+        """B1 dev1 : voie `pr`, `merged_sha` = tête du lot C (A+C), A ancêtre
+        de C. L'ancêtre ne prouve pas le delta : la REVUE reste due."""
+        self._git("checkout", "-q", "lot/2585-A")
+        head = self.commit("X")
+        out = self.open(head, target="main")
+        self.assertTrue(out["created"], out)
+        self.assertFalse(out["already_reviewed"], out)
+
+    def test_une_resolution_qui_ajoute_du_contenu_ne_dispense_pas(self):
+        """B1 cx1/dev1 : une fusion propre du gel A, puis une résolution qui
+        ajoute un fichier change le delta du commit de fusion — REVUE due."""
+        self._git("checkout", "-q", "main")
+        self._git("merge", "-q", "--no-ff", "--no-commit", "lot/2585-A")
+        self.write("resolution", "contenu ajouté par la résolution\n")
+        self._git("add", "resolution")
+        self._git("commit", "-q", "-m", "resolution")
+        merged = self._git("rev-parse", "HEAD")
+        out = self.open(merged, target="main")
+        self.assertTrue(out["created"], out)
+        self.assertFalse(out["already_reviewed"], out)
+
+    def test_un_cherry_pick_exact_du_gel_dispense(self):
+        """Équivalence validée : le gel A est rejoué tel quel sur une cible
+        avancée (même delta, autre commit) — la relecture le couvre."""
+        self._git("checkout", "-q", "main")
+        self.commit("B")
+        self._git("cherry-pick", self.frozen)
+        merged = self._git("rev-parse", "HEAD")
+        out = self.open(merged, target="main")
+        self.assertFalse(out["created"], out)
+        self.assertTrue(out["already_reviewed"], out)
 
     def test_open_for_merge_transmet_le_depot_a_la_preuve(self):
         """Le dépôt du relevé arrive jusqu'à la preuve Git, pas seulement à la

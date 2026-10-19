@@ -75,10 +75,11 @@ qui entre, rendu avant la fusion (gel relu, revue désignée). Ouvrir une second
 mission `REVUE #N` demanderait une relecture déjà faite. Quand assez d'avis
 `ok` d'une famille **tracée à l'instant du verdict** (`turn_costs`, jamais le
 registre courant) et autre que celle de l'auteur couvrent la tête fusionnée —
-le sha fusionné, ou le dernier gel **prouvé par Git** entré dans la fusion
-(`plan_git.probe`) — l'ouverture est close sans création. Un avis bloquant,
-une famille inconnue, un sha différent ou une preuve Git absente ne dispensent
-de rien : la relecture reste due, et le doute n'ouvre jamais une dispense (§8).
+le sha fusionné, ou le dernier gel dont Git prouve que le **delta net est
+identique** à celui du lot fusionné (`_entered`, patch-id) — l'ouverture est
+close sans création. Un avis bloquant, une famille inconnue, un sha différent,
+un delta différent ou une preuve Git absente ne dispensent de rien : la
+relecture reste due, et le doute n'ouvre jamais une dispense (§8).
 """
 from __future__ import annotations
 
@@ -597,18 +598,41 @@ def _review_recursion(item: dict) -> str:
 
 
 def _entered(repo: Optional[str], merged: str, frozen: str) -> bool:
-    """Le contenu du gel `frozen` est-il **prouvé** entré dans `merged` ?
+    """Le contenu du lot fusionné **égale-t-il** le gel relu ?
 
-    Preuve Git seule (`plan_git.probe` : ancêtre, patch-id ou diff écrasé,
-    revert écarté), jamais une supposition. Sans dépôt, sans commit lisible
-    ou sur un doute, rien n'est prouvé : la relecture reste due (B1/P1 de la
-    revue cx1 #2585)."""
+    Preuve par le delta net, jamais par l'ancêtre seul (B1/P1 des revues cx1
+    et dev1 #2585) : le diff du commit fusionné depuis son **premier parent**
+    doit avoir le même patch-id que le diff du gel depuis sa base commune avec
+    ce premier parent (`plan_git._diff_patch_id`). Le premier parent est la
+    cible au moment de la fusion pour un commit de fusion, la base du commit
+    pour un squash ou un cherry-pick.
+
+    Ainsi une tête C poussée après le gel A puis fusionnée (merge ou voie
+    `pr`, `merged_sha = C`) a un delta A+C, différent de A : la REVUE reste
+    due. Une résolution de fusion qui ajoute du contenu change aussi le delta
+    du commit de fusion : refusée. Un gel A simplement **ancêtre** du commit
+    fusionné ne suffit jamais. L'égalité exacte des commits est le seul
+    raccourci (même contenu par construction). Sans dépôt, commit illisible ou
+    patch-id indisponible : rien n'est prouvé."""
     if not repo or not merged or not frozen:
         return False
     try:
-        if plan_git.same_commit(merged, frozen):
+        head = plan_git._commit(str(repo), str(merged))
+        tip = plan_git._commit(str(repo), str(frozen))
+        if not head or not tip:
+            return False
+        if plan_git.same_commit(head, tip):
             return True
-        return bool(plan_git.probe(str(repo), str(frozen), str(merged)).get("merged"))
+        parents = plan_git._commit_parents(str(repo), head)
+        if not parents:
+            return False
+        base = parents[0]
+        reviewed_base = plan_git._out(str(repo), "merge-base", tip, base)
+        if not reviewed_base:
+            return False
+        delivered = plan_git._diff_patch_id(str(repo), base, head)
+        reviewed = plan_git._diff_patch_id(str(repo), reviewed_base, tip)
+        return bool(delivered and reviewed and delivered == reviewed)
     except Exception:  # noqa: BLE001 - preuve impossible : pas de dispense
         return False
 
@@ -619,9 +643,9 @@ def _heads_on_merge(db, lot: int, merged: str, repo: Optional[str] = None) -> li
     La file en mode `pr` nomme la tête du lot (`landing_sha`) ; une fusion
     locale ou un relevé de branches nomme le commit de fusion sur la cible.
     Dans ce second cas, l'avis est porté par le dernier gel : il n'est compté
-    que si Git prouve que ce gel est bien entré dans le commit fusionné
+    que si Git prouve que le **delta du lot fusionné** est celui du gel
     (`_entered`). Un gel A relu puis une tête B différente fusionnée ne
-    couvrent pas B : `_entered` est faux et la REVUE reste due (B1 cx1).
+    couvrent pas B : `_entered` est faux et la REVUE reste due (B1 cx1/dev1).
     Une lecture de jalon impossible ne rend que les têtes connues, jamais une
     tête inventée."""
     heads: list = []
@@ -633,15 +657,20 @@ def _heads_on_merge(db, lot: int, merged: str, repo: Optional[str] = None) -> li
             into.append(text)
 
     add(merged, merged_heads)
-    add(merged_sha(db, lot), merged_heads)
+    if not merged_heads:
+        # Le sha de la fusion constatée fait foi quand l'appelant le connaît :
+        # un jalon `merged` plus ancien ne doit pas élargir les têtes au-delà
+        # du fait examiné (sinon un gel égal au jalon dispenserait une tête C
+        # différente). Le jalon n'est qu'un repli quand le sha manque.
+        add(merged_sha(db, lot), merged_heads)
     for head in merged_heads:
         add(head, heads)
     freezes = _freezes(db, lot)
     if freezes:
         frozen = str(freezes[-1].get("sha") or "").strip()
-        # Le gel n'est une tête relue que si son contenu est prouvé entré dans
-        # un des commits fusionnés ; sans cette preuve, l'avis sur le gel ne
-        # couvre pas la fusion.
+        # Le gel n'est une tête relue que si Git prouve que le delta livré est
+        # le sien ; sans cette preuve, l'avis sur le gel ne couvre pas la
+        # fusion.
         if frozen and any(_entered(repo, head, frozen) for head in merged_heads):
             add(frozen, heads)
     return heads
@@ -809,8 +838,9 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
     # #2585 : la revue déjà rendue avant la fusion est la relecture due ; ne
     # pas en ouvrir une seconde. `merged_sha` peut être le commit de fusion
     # (voie locale) : `_heads_on_merge` ne compte le dernier gel que si Git
-    # prouve son entrée dans la fusion (`repo`) — un gel A relu ne couvre pas
-    # une tête B différente fusionnée.
+    # prouve que le delta livré est le sien (`repo`) — un gel A relu ne couvre
+    # pas une tête B différente fusionnée, ni une résolution qui ajoute du
+    # contenu.
     try:
         reviewed = _reviewed_on_head(
             db, item, heads=_heads_on_merge(db, lot, merged_sha, repo=repo),
