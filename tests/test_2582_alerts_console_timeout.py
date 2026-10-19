@@ -123,24 +123,30 @@ class SnapshotStaysReadable(PgTestCase):
         lot = self.stale_lot()
 
         def read(dsn):
-            self.release.wait(5)
+            # 30 s : plus long que la borne du relevé, pour que la console ne
+            # puisse pas se débloquer pendant le test même sur un hôte chargé.
+            self.release.wait(30)
             return {}
 
         started = time.monotonic()
         with mock.patch.object(pgbouncer_local, "admin_dsn", return_value="admin"), \
                 mock.patch.object(pgbouncer_local, "read", side_effect=read), \
                 mock.patch.object(pgbouncer_local, "PROBE_TIMEOUT_S", 0.05):
-            # La borne porte sur la sonde : le relevé complet dépend du pilote
-            # (psql : plusieurs secondes sur un hôte chargé) et n'est pas le
-            # sujet du témoin. La lecture de la console reste bloquée 5 s.
+            # La sonde est bornée à 0,05 s ; le relevé complet, lui, peut être
+            # lent (psql : 6-7 s sur un hôte chargé) mais ne doit jamais
+            # attendre la console. La lecture de la console reste bloquée 30 s.
             with self.assertRaises(db_mod.Unavailable):
                 pgbouncer_local.probe(self.cfg)
             probe_elapsed = time.monotonic() - started
+            alerts_started = time.monotonic()
             alerts = exploitation.alerts(self.cfg, self.db, local_pool=True,
                                          **self.seuils)
+            alerts_elapsed = time.monotonic() - alerts_started
         self.assertFalse(self.release.is_set(), "the snapshot waited for the console")
         self.assertLess(probe_elapsed, 1.0,
                         "the probe must not wait for the console")
+        self.assertLess(alerts_elapsed, 20.0,
+                        "the snapshot must not wait for the console")
         types = {a["type"]: a for a in alerts}
         self.assertIn("stale_lot", types, "the other families stay readable")
         self.assertEqual(types["stale_lot"]["lot"], lot["id"])
