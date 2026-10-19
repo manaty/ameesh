@@ -78,6 +78,10 @@ _PR_MERGE = re.compile(r"^Merge pull request #(\d+) from [^/\s]+/([^\s]+)\s*$")
 _LOT_BRANCH = re.compile(r"^lot/(\d+)(?:-|$)")
 _LOT_REF = re.compile(r"(?<![\w/])#(\d{1,7})(?![\w])")
 _TRAILER = re.compile(r"(?im)^[ \t>*-]*ameesh-work[ \t]*:[ \t]*#?(\d+)[ \t]*$")
+#: #2692: prefixes GitHub adds to a full-suite job on a packet head — the
+#: packet gate's caller job and the flow check runs of tests.yml. A required
+#: job is matched exactly or under one of these, never by a loose suffix.
+_JOB_PREFIXES = ("suite complète du paquet / ", "tests (flux) ")
 
 
 class ReleaseError(RuntimeError):
@@ -958,12 +962,13 @@ def packet_head(repo: str, sha: str) -> str | None:
 def _same_job(required: str, actual: str) -> bool:
     """A job the target ran, as the packet head names it.
 
-    GitHub surfaces a reusable workflow's jobs under the caller job, and the
-    flow check runs under `tests (flux) …`: the same job may be prefixed. The
-    required name stays exact otherwise (`tests` never catches a flow run).
+    GitHub surfaces a reusable workflow's jobs under the caller job
+    (`suite complète du paquet / …`) and the flow check runs under
+    `tests (flux) …`: only those two known prefixes are accepted, so a
+    similarly named unrelated job never stands in for a required one.
     """
-    return (actual == required or actual.endswith(" / " + required)
-            or actual.endswith(" " + required))
+    return actual == required or any(actual == prefix + required
+                                     for prefix in _JOB_PREFIXES)
 
 
 def _full_suite_run(suite: dict) -> dict | None:

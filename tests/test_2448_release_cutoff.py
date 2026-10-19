@@ -759,6 +759,24 @@ class PacketTreeGreenTest(ReleaseFixtureMixin, unittest.TestCase):
         self.assertIsNone(plan.tree_green)
         self.assertEqual(plan.base, base)
 
+    def test_a_similarly_named_job_never_stands_in_for_a_required_one(self):
+        """Only an exact job, a caller prefix or a flow run proves it."""
+        base, _second, head, merge = self.second_packet()
+
+        def suites(project, sha):
+            runs = self.packet_runs()
+            if sha == head:
+                runs[0]["jobs"] = [job for job in runs[0]["jobs"]
+                                   if job["name"] != "tests"]
+                runs[0]["jobs"].append(_job("sommaire des tests"))
+                return {"head": sha, "runs": runs}
+            return {"head": sha, "runs": [self.reference_run()]}
+
+        plan = self.plan(self.ci(green=(base, head), pending=(merge,)), suites)
+        self.assertFalse(plan.green)
+        self.assertIsNone(plan.tree_green)
+        self.assertEqual(plan.base, base)
+
     def test_execute_releases_the_packet_tree_and_cites_the_runs(self):
         """The release tags the packet merge's content, not the previous green."""
         base, _second, head, merge = self.second_packet()
