@@ -16,11 +16,12 @@ lecture propre au véhicule :
   véhicule (`work_landings`, #1945) et ceux que nomment les commits de
   composition (`ameesh-work: <lot>`, #2157) ; un lot sans avis sur sa tête
   gelée refuse le véhicule ;
-* le **delta propre** du véhicule est ce que ses commits ajoutent au-delà des
-  têtes gelées des membres : une résolution de conflit dont le contenu diffère
-  des deux parents, un manifeste, une adaptation. Un commit de composition qui
-  ne fait qu'apporter le contenu d'un membre n'y figure pas ; une adaptation de
-  test ou un manifeste n'exige aucun avis (§11 bis) ;
+* le **delta propre** du véhicule est l'écart de ses commits à la fusion
+  automatique de leurs parents : une résolution de conflit (même recopiant un
+  parent), un chemin ramené à sa version de base, un manifeste, une
+  adaptation. Un commit de composition qui ne fait qu'apporter le contenu d'un
+  membre n'y figure pas ; une adaptation de test ou un manifeste n'exige aucun
+  avis (§11 bis) ;
 * la classe de ce delta, et elle seule, fixe le nombre d'avis dus sur la tête
   du paquet. Sans delta propre, aucun avis de véhicule n'est dû.
 
@@ -157,12 +158,6 @@ def _changed(repo: str, base: str, tip: str) -> list[str]:
     return [path for path in (text or "").splitlines() if path]
 
 
-def _blob(repo: str, sha: str, path: str) -> str:
-    """Le blob de `path` dans `sha`, "" quand le chemin n'y existe pas."""
-    return plan_git._out(repo, "rev-parse", "--verify", "-q",
-                         "%s:%s" % (sha, path)) or ""
-
-
 def _is_review_free(path: str) -> bool:
     """Un chemin que la composition ne soumet à aucun avis (§11 bis).
 
@@ -176,12 +171,13 @@ def _merge_own_paths(repo: str, parents: list, sha: str) -> list[str]:
     """Le delta propre d'un commit de fusion, vide s'il est mécanique.
 
     Une fusion **propre** n'ajoute que ce que la fusion automatique ne donne
-    pas : les chemins du premier parent que le second n'explique pas. Une
+    pas : les chemins dont l'entrée diffère de son arbre attendu. Une
     fusion **en conflit** ajoute les chemins en conflit même quand la
     résolution recopie un parent à l'identique : choisir un camp est un
     jugement, la ligne choisie n'a pas été relue. Une union pure des deux camps
-    reste mécanique (#2496) et n'exige aucun avis ; au-delà de deux parents,
-    seule une ligne qui diffère de **tous** est retenue (lecture prudente).
+    reste mécanique (#2496) et n'exige aucun avis. Au-delà de deux parents,
+    faute d'arbre automatique attendu, le véhicule est refusé : un delta vide
+    ne doit jamais couvrir une fusion qu'on ne sait pas rejouer.
     """
     from . import packet_candidates
 
@@ -199,14 +195,18 @@ def _merge_own_paths(repo: str, parents: list, sha: str) -> list[str]:
                 mechanical = False
             if mechanical:
                 return []
-        # Un chemin en conflit est propre quel que soit le parent recopié ;
-        # les autres ne le sont que s'ils dépassent le second parent.
-        return sorted(conflicts | {
-            path for path in _changed(repo, parents[0], sha)
-            if _blob(repo, sha, path) != _blob(repo, parents[1], path)})
-    return sorted(path for path in _changed(repo, parents[0], sha)
-                  if all(_blob(repo, sha, path) != _blob(repo, parent, path)
-                         for parent in parents[1:]))
+        # L'arbre attendu détecte aussi le contenu entrant supprimé et les
+        # changements de mode ; comparer seulement aux parents les masque.
+        # Les chemins conflictuels restent propres quel que soit le choix.
+        expected = str(merged.get("tree") or "")
+        actual = plan_git._out(repo, "rev-parse", "--verify", "-q",
+                               sha + "^{tree}") or ""
+        if not expected or not actual or not plan_git._out(
+                repo, "rev-parse", "--verify", "-q", expected + "^{tree}"):
+            raise VehicleError("cannot read the merge trees of %s" % sha[:12])
+        return sorted(conflicts | set(_changed(repo, expected, actual)))
+    raise VehicleError("cannot verify octopus merge %s: compose with two-parent merges"
+                       % sha[:12])
 
 
 def own_changes(repo: str, base: str, head: str, sources) -> dict:
