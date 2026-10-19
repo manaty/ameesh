@@ -30,7 +30,9 @@ Inputs, all from machine sources (never a note, an assignment or a name):
   receipt is attributed by its agent committer's session family in the turn
   journal (`review_authors`, #2681): the reference author stays the author, a
   designated reviewer's small fix stays a correction; any other commit makes
-  the designation wait, because an unknown family cannot prove independence;
+  the designation wait, because an unknown family cannot prove independence.
+  #2721 names that fallback in the mark (`proof: turn-journal`,
+  `fallback_commits`), never as an exact receipt;
 - **candidates**: the registry rows of the lot's project, real session family
   only (`registry.live_harness`), availability and open-lot load;
 - **pilot**: the project's `orchestrateur` in the canon, when registered; an
@@ -804,7 +806,8 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         candidates = [candidate for candidate in candidates
                       if candidate.name != notify]
     authors, unknown = review_authors.authors(db, item, freeze, commits, repo,
-                                              families=policy.families)
+                                              families=policy.families,
+                                              trace=True)
     return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=paths,
                   commits=commits, policy=policy, authors=authors,
                   unknown_authors=unknown, candidates=candidates, notify=notify,
