@@ -108,6 +108,14 @@ export class AmeeshChat extends ReadView {
       await this.refresh();
     } catch (error) {
       this.failed = error instanceof ApiError ? error.code : "network";
+      // The API stores a refusal under its key and replays it: keeping that key
+      // would refuse the same message again after the cause is fixed. Keep it
+      // only while the outcome is unknown (network, 5xx, first request still
+      // running); a deterministic answer releases it.
+      if (error instanceof ApiError && error.status < 500
+          && error.code !== "idempotency_in_progress") {
+        this.#key = null;
+      }
     } finally {
       this.sending = false;
     }

@@ -82,6 +82,27 @@ test("a message is sent once to the shared conversation, then waits for the next
   }
 });
 
+test("a refused send takes a fresh key: the stored refusal does not block the retry", async () => {
+  const { client } = fixture();
+  const keys = [];
+  let refused = true;
+  const wrapped = { ...client, post: async (path, options) => {
+    keys.push(options.headers["Idempotency-Key"]);
+    if (refused) throw new ui.ApiError(409, "refused", "agent stopped");
+    return client.post(path, options);
+  } };
+  const el = await mount(wrapped, { agent: "ada", lot: "7" });
+  el.draft = "Hello"; await settle(el);
+  el.shadowRoot.querySelector("form button").click(); await settle(el);
+  assert.match(text(el), /not sent \(refused\)/);
+  assert.equal(el.draft, "Hello");
+  refused = false;
+  el.shadowRoot.querySelector("form button").click(); await settle(el);
+  assert.equal(keys.length, 2);
+  assert.notEqual(keys[0], keys[1]);   // the stored refusal must not be replayed
+  assert.equal(el.draft, "");
+});
+
 test("a paused agent: the message waits in its mailbox until resumed", async () => {
   const paused = structuredClone(routes["/api/v1/projects"]);
   paused[1].projects[0].agents[0].state = "paused";
