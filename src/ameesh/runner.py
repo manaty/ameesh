@@ -7786,12 +7786,15 @@ class Runner:
             pending = [heartbeat] if heartbeat is not None else []
             return any(t.is_alive() for t in pending + list(worker.renewals))
 
+        # #2634 : la borne est prise sur l'horloge du worker (#2600) : elle
+        # est relue sur la même, jamais sur `time.monotonic()` directement
+        clock = _clock_of(worker)
         log_async("[%s] lease not returned (base): counted as held until it is, "
                   "or until it expires (%ds)"
-                  % (worker.name, max(0, worker.lease_held_until - time.monotonic())))
-        while renewing() or time.monotonic() < worker.lease_held_until:
+                  % (worker.name, max(0, worker.lease_held_until - clock.monotonic())))
+        while renewing() or clock.monotonic() < worker.lease_held_until:
             gate.tick()
-            left = worker.lease_held_until - time.monotonic()
+            left = worker.lease_held_until - clock.monotonic()
             wait = self.RELEASE_RETRY_S if renewing() else min(self.RELEASE_RETRY_S,
                                                                  max(0.0, left))
             if self.stop.wait(wait):
