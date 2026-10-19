@@ -75,6 +75,33 @@ def _duree(secondes: float) -> str:
     return "%d h %02d min" % (secondes // 3600, secondes % 3600 // 60)
 
 
+class SystemClock:
+    """Horloge de bail de l'exécuteur (#2600).
+
+    `time` est l'heure murale qui date l'échéance en base, `monotonic` la borne
+    locale du bail. Les tests de course injectent une horloge simulée : le
+    temps n'y avance que lorsqu'ils le décident, au lieu de dépendre de
+    l'ordonnanceur d'une CI chargée. Les deux méthodes relisent le module
+    `time` à chaque appel, donc un test qui le patche garde la main.
+    """
+
+    def time(self) -> float:
+        return time.time()
+
+    def monotonic(self) -> float:
+        return time.monotonic()
+
+
+#: Horloge par défaut : celle du système. Un `Runner` peut la remplacer
+#: (`runner.clock = …`) avant de construire ses workers.
+SYSTEM_CLOCK = SystemClock()
+
+
+def _clock_of(worker) -> SystemClock:
+    """L'horloge d'un worker (ou l'horloge système d'un double partiel)."""
+    return getattr(worker, "clock", SYSTEM_CLOCK)
+
+
 #: Marge de dérive tolérée entre l'horloge de la base (`session_reset_at`,
 #: `clock_timestamp()`) et celle de l'hôte (mtime du fichier de session local).
 #: Dans la fenêtre, on tranche pour l'oubli : une session oubliée ne ressuscite
@@ -518,6 +545,10 @@ class AgentWorker(threading.Thread):
         self._lot_wake_checked = float("-inf")
         self.state_dir = self.cfg.agent_dir(self.name)
         self.renew_failures = 0
+        #: #2600 : horloge du bail, injectable par les tests de course. Elle
+        #: date l'échéance en base (`time`) et la borne locale (`monotonic`).
+        horloge = getattr(runner, "clock", None)
+        self.clock = horloge if horloge is not None else SYSTEM_CLOCK
         self.lease_deadline = float(lease.get("lease_expires_ts") or 0.0)
         #: L159f4 r1 : borne du bail sur l'horloge monotone de cet hôte, prise
         #: après la réponse de la base (prise ou renouvellement + ttl) : jamais
@@ -821,7 +852,8 @@ class AgentWorker(threading.Thread):
     # -- bail --------------------------------------------------------------
     def deadline_passed(self) -> bool:
         """L'échéance du bail est-elle déjà atteinte (ou inconnue) ?"""
-        return self.lease_deadline > 0 and time.time() >= self.lease_deadline
+        return (self.lease_deadline > 0
+                and _clock_of(self).time() >= self.lease_deadline)
 
     def call_budget(self) -> float:
         """Temps qu'on accepte d'attendre une réponse avant de conclure.
@@ -834,7 +866,7 @@ class AgentWorker(threading.Thread):
             return max(3.0, self.runner.lease_ttl / 3.0)
         # Temps restant exact, sans plancher : un appel entamé 20 ms avant
         # l'échéance ne doit pas survivre 50 ms de plus (verdict codex3 B5a).
-        return max(0.0, self.lease_deadline - time.time())
+        return max(0.0, self.lease_deadline - _clock_of(self).time())
 
     def _renew_call(self) -> tuple[bool, float | None, Exception | None]:
         """`registry.renew` avec une borne dure, même si l'appel se bloque."""
@@ -892,7 +924,7 @@ class AgentWorker(threading.Thread):
                 # tant que le bail court encore ; seule l'échéance (ici, et le
                 # veilleur qui n'attend personne) l'arrête. Le compte d'échecs
                 # n'a plus de sens : le battement réessaie vite (2 s, 4 s…).
-                reste = self.lease_deadline - time.time()
+                reste = self.lease_deadline - _clock_of(self).time()
                 echec = ("[%s] heartbeat: %s — failure %d, lease still valid for %ds: "
                          "the turn continues, retrying soon"
                          % (self.name, db_mod.explain(error), self.renew_failures,
@@ -903,7 +935,7 @@ class AgentWorker(threading.Thread):
                          % (self.name, error, self.renew_failures,
                             self.MAX_RENEW_FAILURES))
                 definitive = (self.renew_failures >= self.MAX_RENEW_FAILURES
-                              or time.time() >= self.lease_deadline)
+                              or _clock_of(self).time() >= self.lease_deadline)
             if not definitive:
                 # Diagnostic par la file non bloquante : le fil du battement
                 # doit continuer à surveiller l'échéance même si le puits est
@@ -931,7 +963,7 @@ class AgentWorker(threading.Thread):
         return True
 
     def _held_until(self) -> float:
-        return time.monotonic() + float(self.runner.lease_ttl)
+        return _clock_of(self).monotonic() + float(self.runner.lease_ttl)
 
     def release_lease(self) -> bool:
         """Rend le bail ; False quand la base ne l'a pas pris (DbError) : le
@@ -1205,7 +1237,7 @@ class AgentWorker(threading.Thread):
         immédiatement le harnais.
         """
         if self.lease_deadline > 0:
-            return max(0.0, min(cap, self.lease_deadline - time.time()))
+            return max(0.0, min(cap, self.lease_deadline - _clock_of(self).time()))
         return cap
 
     def renew_wait(self, cap: float) -> float:
@@ -1242,7 +1274,7 @@ class AgentWorker(threading.Thread):
             # attendre au-delà de l'échéance connue.
             delai = max(0.0, min(float(cap), pas, Reprise.MINIMUM))
             if self.lease_deadline > 0:
-                reste = max(0.0, self.lease_deadline - time.time())
+                reste = max(0.0, self.lease_deadline - _clock_of(self).time())
                 if 0.0 < reste < Reprise.MINIMUM:
                     # #2172 : viser la mi-marge restante, avec un plancher de
                     # 50 ms, pour que l'essai suivant ait un budget d'appel
@@ -1250,7 +1282,7 @@ class AgentWorker(threading.Thread):
                     delai = min(delai, max(0.05, reste / 2.0))
             return self.wait_timeout(delai)
         if self.lease_deadline > 0:
-            reste = self.lease_deadline - time.time() - pas
+            reste = self.lease_deadline - _clock_of(self).time() - pas
             pas = min(pas, max(0.0, reste))
         return max(0.0, min(float(cap), pas))
 
@@ -1272,8 +1304,9 @@ class AgentWorker(threading.Thread):
         Il ne dépend d'aucun autre fil : même si le battement est bloqué dans un
         journal, une requête ou une écriture de fichier, il arrête le harnais
         dès que l'échéance connue du bail est atteinte. Il ne lit que
-        `lease_deadline` et `time.time`, n'attend que sur un Event (borné par
-        `WATCHDOG_TICK`), puis pose `lease_lost` et envoie le SIGKILL.
+        `lease_deadline` et l'horloge du worker (`clock.time`, simulable en
+        test), n'attend que sur un Event (borné par `WATCHDOG_TICK`), puis
+        pose `lease_lost` et envoie le SIGKILL.
 
         Il reste actif pendant un arrêt gracieux (`stopping`) : la grâce
         SIGTERM de 3 s ne doit pas laisser expirer le bail sans arrêt effectif
@@ -1285,7 +1318,7 @@ class AgentWorker(threading.Thread):
             if deadline <= 0:
                 self.watchdog_stop.wait(self.WATCHDOG_TICK)
                 continue
-            reste = deadline - time.time()
+            reste = deadline - _clock_of(self).time()
             if reste > 0:
                 # Réveil au plus tard à l'échéance ; relecture régulière pour
                 # voir une échéance repoussée (renouvellement) ou modifiée.
@@ -1293,7 +1326,7 @@ class AgentWorker(threading.Thread):
                 continue
             if self.watchdog_stop.is_set():
                 return
-            if self.lease_deadline > time.time():
+            if self.lease_deadline > _clock_of(self).time():
                 continue  # bail renouvelé entre-temps : rien à faire
             self.lease_lost.set()
             self.stop_group_now("lease deadline reached", grace=0, hard=True)
@@ -6926,6 +6959,8 @@ class Runner:
         self.train_service_lease = train_service_lease
         self.train_service = None
         self.lease_ttl = cfg.lease_ttl
+        #: #2600 : horloge des workers de cet exécuteur (simulée en test).
+        self.clock = SYSTEM_CLOCK
         self.idle_nudge = cfg.idle_nudge
         self.poll = max(1.0, cfg.poll)
         self._runner_seen_next = 0.0
