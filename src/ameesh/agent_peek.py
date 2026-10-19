@@ -30,6 +30,12 @@ TAIL_BYTES = 262144
 MAX_LINE = 65536
 INTERVAL = 15
 STALE_AFTER = 45
+#: Bound of the stored JSONB payload (`CHECK` of migration 0436).
+MAX_PAYLOAD_BYTES = 131072
+#: Bound of the HTTP answer: the payload plus the snapshot's bounded metadata
+#: and JSON envelope. Kept independent from the payload bound so a maximal
+#: legitimate snapshot is not refused by the reader (#1398/N5).
+MAX_RESPONSE_BYTES = MAX_PAYLOAD_BYTES + 16384
 _ASSIGNMENT = re.compile(r"\b[A-Za-z_][A-Za-z_0-9]*\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)")
 _URL_CREDENTIALS = re.compile(r"(\b[a-z][a-z0-9+.-]*://)[^\s/@]+@", re.I)
 _JWT = re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b")
@@ -195,6 +201,10 @@ class Publisher:
 def snapshot(db, agent, *, human, limit=10, now=None):
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_ITEMS:
         raise ValueError("limit must be between 1 and 50")
+    # An empty reader must never match an empty `responsible` in the store
+    # (N4, #1398): refuse it here and select nothing.
+    if not isinstance(human, str) or not human.strip():
+        raise PermissionError("unknown agent or reader is not its responsible human")
     # The store checks responsibility before selecting private snapshot data.
     row = storage.of(db).operations.read_peek(agent, human)
     if row is None:
@@ -250,8 +260,8 @@ def read_api(url, token_file, agent, limit):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
     try:
         with opener.open(request, timeout=10) as response:
-            raw = response.read(131073)
-        if len(raw) > 131072:
+            raw = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(raw) > MAX_RESPONSE_BYTES:
             raise ValueError("snapshot response too large")
         data = json.loads(raw)
         if not isinstance(data, dict) or data.get("schema") != SCHEMA:
@@ -285,7 +295,13 @@ def main(argv):
         else:
             cfg = load()
             db = db_mod.connect(cfg)
-            human = decisions.human_session(cfg, db)
+            # Reuse decisions' identity check, but not its decision-specific
+            # refusal: a peek reader gets a message about peek (N3, #1398).
+            try:
+                human = decisions.human_session(cfg, db)
+            except decisions.DecisionError as exc:
+                raise PermissionError(
+                    "peek is for a human reader outside an agent session") from exc
             data = snapshot(db, args.agent, human=human, limit=args.limit)
     except (decisions.DecisionError, PermissionError, ValueError) as exc:
         print("ameesh agent peek: %s" % exc, file=sys.stderr)

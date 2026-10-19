@@ -209,7 +209,8 @@ class Github:
 
     def __init__(self, *, head: str = GEL, base=BASE, runs=(), workflow: str | None = WORKFLOW,
                  pulls=None, checks=None, manifest: str | None = None,
-                 base_reviews=("integration-paquet-h-20261017-0500.md",)):
+                 base_reviews=("integration-paquet-h-20261017-0500.md",),
+                 message: str = "lot 1343: clean head"):
         self.head = head
         self.base = base
         self.runs = list(runs)
@@ -218,6 +219,7 @@ class Github:
         self.checks = {"check_runs": [check_run()]} if checks is None else checks
         self.manifest = manifest
         self.base_reviews = list(base_reviews)
+        self.message = message
         self.paths: list[str] = []
 
     def rows(self) -> list[dict]:
@@ -237,6 +239,11 @@ class Github:
             if unquote(path.split("/branches/", 1)[1]) == BRANCHE:
                 return {"commit": {"sha": self.head}}
             return {"commit": {"sha": self.base() if callable(self.base) else self.base}}
+        if re.fullmatch(r"repos/%s/commits/[0-9a-f]{40}" % re.escape(DEPOT), path):
+            # #2546 : le message de la tête, relu avant de poser une étiquette.
+            # Le motif exact laisse passer `…/commits/<sha>/check-runs`.
+            return {"sha": path.rsplit("/", 1)[-1],
+                    "commit": {"message": self.message}}
         if "/actions/workflows/tests.yml/runs?" in path:
             runs = self.rows()
             found = re.search(r"[?&]head_sha=([0-9a-f]{40})", path)
@@ -411,6 +418,47 @@ class GelPlanTest(GelTestCase):
             self.gel(api)
         self.assertIn("the ref moved", str(caught.exception))
         self.assertEqual(api.ecrit(), [], "aucun workflow lu")
+
+    def test_une_tete_avec_marqueur_de_saut_est_refusee_avant_toute_demande(self):
+        # #2546 : GitHub saute tous les workflows de cette tête, l'événement
+        # `pull_request: labeled` compris ; la demande doit refuser, jamais
+        # poser une étiquette qui ne lancerait rien.
+        self.gele()
+        for marker in ("[skip ci]", "[CI SKIP]", "[no ci]", "[skip actions]",
+                       "[actions skip]"):
+            with self.subTest(marker=marker):
+                api = Github(message="correctif — reprend %s du commit précédent"
+                                     % marker)
+                with self.assertRaises(ci.GelError) as caught:
+                    self.gel(api)
+                text = str(caught.exception)
+                self.assertIn("skip instruction", text)
+                self.assertIn(marker, text)
+                self.assertIn("rewrite the commit message", text)
+                self.assertIn("push a new head", text)
+                self.assertEqual(api.ecrit(), [], "aucun workflow lu")
+                self.assertIn("/commits/%s" % GEL, " ".join(api.paths))
+
+    def test_un_marqueur_cite_dans_le_corps_refuse_aussi(self):
+        # L'incident h-2000 : un marqueur cité du commit antérieur dans le
+        # corps de la tête suffisait à sauter la CI.
+        self.gele()
+        api = Github(message="h-2000 : correction\n\nreprend [skip ci] du commit "
+                             "e6c1118228, arbre inchangé")
+        with self.assertRaises(ci.GelError) as caught:
+            self.gel(api)
+        self.assertIn("[skip ci]", str(caught.exception))
+        self.assertEqual(api.ecrit(), [], "aucune demande sans tête propre")
+
+    def test_une_exception_ne_contourne_pas_le_marqueur_de_saut(self):
+        # #2546 : même `--exception incident` ne peut pas demander une CI que
+        # GitHub ne lancera pas ; la tête doit d'abord être réécrite.
+        self.gele()
+        api = Github(message="correctif d'incident [skip ci]")
+        with self.assertRaises(ci.GelError) as caught:
+            self.gel(api, exception="incident", reason="incident de banc")
+        self.assertIn("skip instruction", str(caught.exception))
+        self.assertEqual(api.ecrit(), [], "aucune demande sans tête propre")
 
     def test_une_demande_pose_l_etiquette_du_sha_gele_et_de_sa_base(self):
         self.gele()
@@ -1103,6 +1151,19 @@ class RequestTest(GelTestCase):
         code, notes = self.run_cmd(api, gh, args=argparse.Namespace(
             **{**vars(self.args), "dry_run": True}))
         self.assertEqual((code, gh.calls, notes), (0, [], []))
+
+    def test_une_tete_avec_marqueur_de_saut_ne_pose_rien_meme_en_dry_run(self):
+        # #2546 : le refus tombe au plan, avant toute écriture (annulation,
+        # acteur du jeton, étiquette) et le `--dry-run` le montre aussi.
+        self.gele()
+        for dry in (False, True):
+            with self.subTest(dry_run=dry):
+                api = Github(message="composition [skip ci]")
+                gh = Gh()
+                args = argparse.Namespace(**{**vars(self.args), "dry_run": dry})
+                code, notes = self.run_cmd(api, gh, args=args)
+                self.assertEqual(code, 1)
+                self.assertEqual((gh.calls, notes, gh.poses()), ([], [], []))
 
     def test_la_garde_du_paquet_refuse_une_ci_lot_sans_exception(self):
         """#2333 : aucune étiquette `ci-lot` entre deux paquets, même en dry-run."""

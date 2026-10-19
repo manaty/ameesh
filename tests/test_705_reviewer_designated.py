@@ -476,6 +476,29 @@ class ReviewerDesignationTest(PgTestCase):
         redesignate()
         self.assertEqual(len(requests()), 2)
 
+    def test_redesignation_retrouve_le_request_hors_fenetre(self):
+        """#2504 : une re-désignation retrouve le request du lot même derrière
+        plus de 200 courriers plus récents ; le filtre est fait en base par lot
+        et nature, pas dans une fenêtre d'historique."""
+        self.register("relecteur", "codex", cwd=self.tmp)
+        lot = self._lot(app="ameesh")
+        self.assertEqual(self._qa(lot, "--reviewer", "relecteur").returncode, 0)
+        first = self.db.query(
+            "SELECT id FROM agent_mailbox WHERE recipient = %s"
+            " AND payload ? 'review_request' ORDER BY id", ("relecteur",))
+        self.assertEqual(len(first), 1)
+        self.db.execute(
+            "INSERT INTO agent_mailbox (sender, recipient, body, kind, work_item_id)"
+            " SELECT 'chef', 'relecteur', 'other lot mail', 'notify', '9999'"
+            " FROM generate_series(1, 250)")
+        proc = self.mesh("work", "reviewer", str(lot["id"]), "relecteur",
+                         "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = self.db.query(
+            "SELECT id FROM agent_mailbox WHERE recipient = %s"
+            " AND payload ? 'review_request' ORDER BY id", ("relecteur",))
+        self.assertEqual([r["id"] for r in rows], [r["id"] for r in first])
+
     def test_le_runner_du_relecteur_prend_un_tour(self):
         """#2478 témoin : la désignation dépose un courrier actif ; le runner du
         relecteur le choisit comme prochain tour, sur le lot du message."""

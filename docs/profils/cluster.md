@@ -149,7 +149,9 @@ itself: two distinct roles, both `NOLOGIN`, read-only.
   (status, lease, unread, budget, placement), mailbox metadata (sender,
   recipient, type, status, dates), lots (title, state, assignee), thread
   index (without excerpt), actions and attempts (class, state, target,
-  without arguments or notes), costs, canon state, migrations.
+  without arguments or notes), costs, the agent snapshot's state columns
+  (`agent_peek.agent`, `host`, `lease_epoch`, `captured_at`, never
+  `payload`), canon state, migrations.
 * [`deploy/sql/role-superviseur-contenus.sql`](../../deploy/sql/role-superviseur-contenus.sql)
   — role `ameesh_superviseur_contenus`, **explicitly granted in addition** to
   a supervisor authorised to read the work: message bodies, payloads and
@@ -158,8 +160,9 @@ itself: two distinct roles, both `NOLOGIN`, read-only.
   (`restart_brief`, L26), thread excerpts
   (`thread_index.last_excerpt`), action arguments and notes (`actions.args`,
   `last_note`, `action_events.note`), lot descriptions and notes
-  (`work_items.body`, `work_item_events.note`, `work_item_milestones.note`), approval metadata
-  (`mesh_approvals.meta`). On its own, it only gives these columns.
+  (`work_items.body`, `work_item_events.note`, `work_item_milestones.note`),
+  approval metadata (`mesh_approvals.meta`), and the bounded activity
+  snapshot (`agent_peek.payload`). On its own, it only gives these columns.
 
 Neither has any write right, sequence right, nor access to the signature,
 receipt, nonce or challenge columns, to the public keys or to the
@@ -169,6 +172,17 @@ as state: lot titles, action targets and short diagnostics
 (`status_text`, `last_error`, `placement_diagnostic`…), which may quote an
 excerpt of a harness error — remove them from the script if that is not
 acceptable.
+
+The base role therefore sees whether an agent snapshot exists and from which
+host and lease, but never its content; the contents role is the only
+supervisor role that reads `agent_peek.payload`. That payload is the bounded
+JSON object published every 15 seconds by the agent's live runner (128 KiB at
+most, sanitised: no thoughts, prompts, arguments or tool output). The human
+API `GET /api/v1/agents/{agent}/peek` adds a separate guard: only the agent's
+declared `responsible` human reads it; any other reader — including an empty
+reader, or an agent whose `responsible` is empty — gets the same generic 403
+and the store selects no snapshot row. An absent or stale snapshot is
+reported as such, never reconstructed from another host.
 
 ```bash
 export PGOPTIONS='-c search_path=public'

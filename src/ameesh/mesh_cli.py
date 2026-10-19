@@ -20,7 +20,7 @@
   agent-mesh work list [--state S] | work show <id> | work move <id> <state> | work note <id> "…"
   agent-mesh work assign <id> <agent> [--externe] [--actor A]   reassign (guarded assignment)
   agent-mesh work merged <id> --sha S [--note …]   merge done outside a PR: any open state → merged
-  agent-mesh work migration <id> [--number N | --release] [--skip-branch B]   reserve the work item's migration number (L122)
+  agent-mesh work migration <id> [--number N] [--release [--number N]] [--skip-branch B]   reserve one of the work item's migration numbers (L122, #2481)
   agent-mesh work issue-ref <id> owner/repo#N | --none   correct the issue reference, journaled (#1603)
   agent-mesh work resolve <id> --with <other> [--done | --abort]   prepared conflict resolution (L160d)
   agent-mesh work queue add|remove <id> | show [--target T]   merge queue per target (L160e)
@@ -1914,13 +1914,22 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                                           skip_branches=tuple(args.skip_branch or ()))
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
-            elif item.get("migration") is None:
+            elif not item.get("migration"):
                 print("lot #%d: no migration reserved" % item["id"])
-            else:
+            elif len(item.get("migrations") or ()) <= 1:
                 print("lot #%d: migration %s reserved in %s — file %s" % (
                     item["id"], item["migration_label"], item["migration_repo"],
                     item.get("migration_file") or "<migrations>/%s_<name>.sql"
                     % item["migration_label"]))
+            else:
+                rows = item["migrations"]
+                print("lot #%d: migrations %s reserved in %s" % (
+                    item["id"], ", ".join(row["label"] for row in rows),
+                    ", ".join(sorted({row["repo"] for row in rows}))))
+                for row in rows:
+                    print("  %s — file %s" % (
+                        row["label"], row.get("file")
+                        or "<migrations>/%s_<name>.sql" % row["label"]))
             return 0
         if args.work_command == "move":
             item = work.move(db, args.id, args.state, note=args.note or "", actor=args.actor,
@@ -2063,6 +2072,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                         print("designation: %s" % names)
                         if designation.get("policy_ref"):
                             print("policy     : %s" % designation["policy_ref"])
+                    elif designation.get("state") == "carried":
+                        print("designation: kept from carried verdicts (%s)"
+                              % ", ".join(str(r.get("name"))
+                                          for r in designation.get("reviewers") or ()))
                     else:
                         print("designation: %s — %s" % (
                             designation.get("state"), designation.get("why") or ""))
@@ -2081,6 +2094,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     print("waiting    : %s" % (applied.get("why") or ""))
                 elif state == "manual":
                     print("manual     : %s" % (applied.get("why") or ""))
+                elif state == "carried":
+                    print("kept       : %s" % ", ".join(
+                        str(r.get("name")) for r in applied.get("reviewers") or ()))
                 elif state in ("unavailable", "none", "unfrozen"):
                     print("%-11s: %s" % (state, applied.get("why") or ""))
                 else:
@@ -2088,32 +2104,22 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             return 0
         if args.work_command == "milestone":
             from . import review_designation_activation as activation
-            threads: list = []
             outcome: dict = {}
-            on_frozen = None
-            if args.kind == "frozen" and activation.enabled(cfg):
-                on_frozen = activation.hook(cfg, outcome)
+            note = args.note or ""
+            if args.kind == "frozen":
+                # #2542 : un contrôle statique rouge refuse le gel, avant le paquet
+                from . import freeze_checks
+                note = freeze_checks.before_freeze(
+                    cfg, db, args.id, args.sha or "", repo=args.repo,
+                    skip=args.no_static_checks, note=note)
+            elif args.repo is not None or args.no_static_checks is not None:
+                raise work.WorkError("--repo and --no-static-checks only apply to a freeze")
             row = work.milestone(
                 db, args.id, args.kind, sha=args.sha or "", actor=args.actor or "",
-                verdict=args.verdict, note=args.note or "",
-                on_frozen=on_frozen, after_commit=threads if on_frozen else None)
-            for record in threads:
-                record(db.cfg, db)
+                verdict=args.verdict, note=note, outcome=outcome)
             print("milestone %s added to lot #%d%s" % (
                 row["kind"], args.id,
                 " (%s)" % row["verdict"] if row.get("verdict") else ""))
-            state = str(outcome.get("state") or "")
-            if state == "designated":
-                print("reviewers: %s" % ", ".join(
-                    "%s (%s)" % (r.get("name"), r.get("family"))
-                    for r in outcome.get("reviewers") or ()))
-            elif state == "waiting":
-                print("review pending: %s" % (outcome.get("why") or ""))
-            elif state == "manual":
-                print("reviewers: manual designation kept (%s)"
-                      % ", ".join(r.get("name") for r in outcome.get("reviewers") or ()))
-            elif state == "unavailable":
-                print("review designation unavailable: %s" % (outcome.get("why") or ""))
             if args.kind == "frozen":
                 # #2442 : un réalignement mécanique sur la cible garde les
                 # verdicts de la tête relue ; sinon l'exécuteur retente.
@@ -2121,6 +2127,36 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 carried = verdict_carry.carry(cfg, db, args.id)
                 if carried["result"] != "idle":
                     print(verdict_carry.describe(carried))
+                # #2487 : la désignation s'est abstenue sur le plan du report.
+                # Si le report refuse finalement, les sièges manquants sont
+                # désignés maintenant, hors du gel, sans attendre un passage.
+                # `busy`/`moved` ne sont pas des refus : un autre hôte porte le
+                # report ou le gel a bougé, la désignation attend.
+                if outcome.get("state") == "carried" \
+                        and carried.get("result") in ("not-carried", "no-repository",
+                                                      "error", "idle"):
+                    outcome = activation.designate(cfg, db, args.id, force=True)
+                    print("review designation after the carry refused: %s"
+                          % (outcome.get("state") or "?"))
+            state = str(outcome.get("state") or "")
+            if state == "designated":
+                print("reviewers: %s" % ", ".join(
+                    "%s (%s)" % (r.get("name"), r.get("family"))
+                    for r in outcome.get("reviewers") or ()))
+            elif state == "carried":
+                print("reviewers: kept from carried verdicts (%s)" % ", ".join(
+                    str(r.get("name")) for r in outcome.get("reviewers") or ()))
+            elif state == "waiting":
+                print("review pending: %s" % (outcome.get("why") or ""))
+            elif state == "manual":
+                print("reviewers: manual designation kept (%s)"
+                      % ", ".join(r.get("name") for r in outcome.get("reviewers") or ()))
+            elif state == "unavailable":
+                print("review designation unavailable: %s" % (outcome.get("why") or ""))
+            elif state == "none":
+                # #2561: a light lot has no pre-merge reviewer; say why instead
+                # of printing nothing and letting "no reviewer" look like a failure
+                print("review: none — %s" % (outcome.get("why") or ""))
             return 0
         print(USAGE_HINT % "unknown work subcommand", file=sys.stderr)
         return 2
@@ -2992,9 +3028,11 @@ def build_parser() -> argparse.ArgumentParser:
     pw_mig.add_argument("id", type=int)
     pw_mig.add_argument("--number", type=int, default=None,
                         help="reserve this exact number (refused if it already exists in the "
-                             "lot's repository or is reserved by another work item)")
+                             "lot's repository or is reserved by another work item); added to "
+                             "the lot's other reservations (#2481)")
     pw_mig.add_argument("--release", action="store_true",
-                        help="release the reservation (the work item no longer adds a migration)")
+                        help="release all the lot's reservations, or only --number when given "
+                             "(the work item no longer adds those migrations)")
     pw_mig.add_argument("--repo", default=None,
                         help="local clone of the lot's repository (that of its issue), whose "
                              "worktree and branches count (default: the clone declared in "
@@ -3176,6 +3214,14 @@ def build_parser() -> argparse.ArgumentParser:
                        help="for the verdict milestone: ok or blocked")
     pw_ms.add_argument("--note", default="")
     pw_ms.add_argument("--actor", default="")
+    # #2542 : les contrôles statiques du projet passent avant le gel
+    pw_ms.add_argument("--repo", default=None,
+                       help="frozen: the repository holding --sha (default: the current "
+                            "directory, then the lot's project repository)")
+    pw_ms.add_argument("--no-static-checks", dest="no_static_checks", default=None,
+                       metavar="REASON",
+                       help="frozen: freeze without the project's static checks "
+                            "(scripts/freeze-checks.py); the reason goes in the note")
     pw_ms.set_defaults(func=cmd_work)
     from . import plan_cli
     plan_cli.add_parsers(work_sub, cmd_work)  # plan de travail (L29)

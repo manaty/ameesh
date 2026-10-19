@@ -75,6 +75,33 @@ def _duree(secondes: float) -> str:
     return "%d h %02d min" % (secondes // 3600, secondes % 3600 // 60)
 
 
+class SystemClock:
+    """Horloge de bail de l'exécuteur (#2600).
+
+    `time` est l'heure murale qui date l'échéance en base, `monotonic` la borne
+    locale du bail. Les tests de course injectent une horloge simulée : le
+    temps n'y avance que lorsqu'ils le décident, au lieu de dépendre de
+    l'ordonnanceur d'une CI chargée. Les deux méthodes relisent le module
+    `time` à chaque appel, donc un test qui le patche garde la main.
+    """
+
+    def time(self) -> float:
+        return time.time()
+
+    def monotonic(self) -> float:
+        return time.monotonic()
+
+
+#: Horloge par défaut : celle du système. Un `Runner` peut la remplacer
+#: (`runner.clock = …`) avant de construire ses workers.
+SYSTEM_CLOCK = SystemClock()
+
+
+def _clock_of(worker) -> SystemClock:
+    """L'horloge d'un worker (ou l'horloge système d'un double partiel)."""
+    return getattr(worker, "clock", SYSTEM_CLOCK)
+
+
 #: Marge de dérive tolérée entre l'horloge de la base (`session_reset_at`,
 #: `clock_timestamp()`) et celle de l'hôte (mtime du fichier de session local).
 #: Dans la fenêtre, on tranche pour l'oubli : une session oubliée ne ressuscite
@@ -518,6 +545,10 @@ class AgentWorker(threading.Thread):
         self._lot_wake_checked = float("-inf")
         self.state_dir = self.cfg.agent_dir(self.name)
         self.renew_failures = 0
+        #: #2600 : horloge du bail, injectable par les tests de course. Elle
+        #: date l'échéance en base (`time`) et la borne locale (`monotonic`).
+        horloge = getattr(runner, "clock", None)
+        self.clock = horloge if horloge is not None else SYSTEM_CLOCK
         self.lease_deadline = float(lease.get("lease_expires_ts") or 0.0)
         #: L159f4 r1 : borne du bail sur l'horloge monotone de cet hôte, prise
         #: après la réponse de la base (prise ou renouvellement + ttl) : jamais
@@ -821,7 +852,8 @@ class AgentWorker(threading.Thread):
     # -- bail --------------------------------------------------------------
     def deadline_passed(self) -> bool:
         """L'échéance du bail est-elle déjà atteinte (ou inconnue) ?"""
-        return self.lease_deadline > 0 and time.time() >= self.lease_deadline
+        return (self.lease_deadline > 0
+                and _clock_of(self).time() >= self.lease_deadline)
 
     def call_budget(self) -> float:
         """Temps qu'on accepte d'attendre une réponse avant de conclure.
@@ -834,7 +866,7 @@ class AgentWorker(threading.Thread):
             return max(3.0, self.runner.lease_ttl / 3.0)
         # Temps restant exact, sans plancher : un appel entamé 20 ms avant
         # l'échéance ne doit pas survivre 50 ms de plus (verdict codex3 B5a).
-        return max(0.0, self.lease_deadline - time.time())
+        return max(0.0, self.lease_deadline - _clock_of(self).time())
 
     def _renew_call(self) -> tuple[bool, float | None, Exception | None]:
         """`registry.renew` avec une borne dure, même si l'appel se bloque."""
@@ -892,7 +924,7 @@ class AgentWorker(threading.Thread):
                 # tant que le bail court encore ; seule l'échéance (ici, et le
                 # veilleur qui n'attend personne) l'arrête. Le compte d'échecs
                 # n'a plus de sens : le battement réessaie vite (2 s, 4 s…).
-                reste = self.lease_deadline - time.time()
+                reste = self.lease_deadline - _clock_of(self).time()
                 echec = ("[%s] heartbeat: %s — failure %d, lease still valid for %ds: "
                          "the turn continues, retrying soon"
                          % (self.name, db_mod.explain(error), self.renew_failures,
@@ -903,7 +935,7 @@ class AgentWorker(threading.Thread):
                          % (self.name, error, self.renew_failures,
                             self.MAX_RENEW_FAILURES))
                 definitive = (self.renew_failures >= self.MAX_RENEW_FAILURES
-                              or time.time() >= self.lease_deadline)
+                              or _clock_of(self).time() >= self.lease_deadline)
             if not definitive:
                 # Diagnostic par la file non bloquante : le fil du battement
                 # doit continuer à surveiller l'échéance même si le puits est
@@ -931,7 +963,7 @@ class AgentWorker(threading.Thread):
         return True
 
     def _held_until(self) -> float:
-        return time.monotonic() + float(self.runner.lease_ttl)
+        return _clock_of(self).monotonic() + float(self.runner.lease_ttl)
 
     def release_lease(self) -> bool:
         """Rend le bail ; False quand la base ne l'a pas pris (DbError) : le
@@ -1205,7 +1237,7 @@ class AgentWorker(threading.Thread):
         immédiatement le harnais.
         """
         if self.lease_deadline > 0:
-            return max(0.0, min(cap, self.lease_deadline - time.time()))
+            return max(0.0, min(cap, self.lease_deadline - _clock_of(self).time()))
         return cap
 
     def renew_wait(self, cap: float) -> float:
@@ -1242,7 +1274,7 @@ class AgentWorker(threading.Thread):
             # attendre au-delà de l'échéance connue.
             delai = max(0.0, min(float(cap), pas, Reprise.MINIMUM))
             if self.lease_deadline > 0:
-                reste = max(0.0, self.lease_deadline - time.time())
+                reste = max(0.0, self.lease_deadline - _clock_of(self).time())
                 if 0.0 < reste < Reprise.MINIMUM:
                     # #2172 : viser la mi-marge restante, avec un plancher de
                     # 50 ms, pour que l'essai suivant ait un budget d'appel
@@ -1250,7 +1282,7 @@ class AgentWorker(threading.Thread):
                     delai = min(delai, max(0.05, reste / 2.0))
             return self.wait_timeout(delai)
         if self.lease_deadline > 0:
-            reste = self.lease_deadline - time.time() - pas
+            reste = self.lease_deadline - _clock_of(self).time() - pas
             pas = min(pas, max(0.0, reste))
         return max(0.0, min(float(cap), pas))
 
@@ -1272,8 +1304,9 @@ class AgentWorker(threading.Thread):
         Il ne dépend d'aucun autre fil : même si le battement est bloqué dans un
         journal, une requête ou une écriture de fichier, il arrête le harnais
         dès que l'échéance connue du bail est atteinte. Il ne lit que
-        `lease_deadline` et `time.time`, n'attend que sur un Event (borné par
-        `WATCHDOG_TICK`), puis pose `lease_lost` et envoie le SIGKILL.
+        `lease_deadline` et l'horloge du worker (`clock.time`, simulable en
+        test), n'attend que sur un Event (borné par `WATCHDOG_TICK`), puis
+        pose `lease_lost` et envoie le SIGKILL.
 
         Il reste actif pendant un arrêt gracieux (`stopping`) : la grâce
         SIGTERM de 3 s ne doit pas laisser expirer le bail sans arrêt effectif
@@ -1285,7 +1318,7 @@ class AgentWorker(threading.Thread):
             if deadline <= 0:
                 self.watchdog_stop.wait(self.WATCHDOG_TICK)
                 continue
-            reste = deadline - time.time()
+            reste = deadline - _clock_of(self).time()
             if reste > 0:
                 # Réveil au plus tard à l'échéance ; relecture régulière pour
                 # voir une échéance repoussée (renouvellement) ou modifiée.
@@ -1293,7 +1326,7 @@ class AgentWorker(threading.Thread):
                 continue
             if self.watchdog_stop.is_set():
                 return
-            if self.lease_deadline > time.time():
+            if self.lease_deadline > _clock_of(self).time():
                 continue  # bail renouvelé entre-temps : rien à faire
             self.lease_lost.set()
             self.stop_group_now("lease deadline reached", grace=0, hard=True)
@@ -2011,12 +2044,24 @@ class AgentWorker(threading.Thread):
            lui ; plusieurs lots distincts = ambigu, None.
         2. Sinon, l'unique lot ouvert assigné à l'agent ; plusieurs = None.
         Un tour dont le lot est inconnu ne déclenche jamais de rotation.
+
+        #2527 : un message seulement informatif (`_informative_message`) ne
+        porte pas le lot du tour : un avis sur le lot d'un autre n'ouvre ni
+        ne met de côté aucune session.
         """
         ops = storage.of(self.db).operations
         try:
             ids = [int(i) for i in spec.get("ids") or []]
-            if ids:
+            rows = spec.get("rows") or []
+            if rows:
+                utiles = [r for r in rows if not self._informative_message(r)]
+                if not utiles:
+                    return None   # que des avis : le tour reste où il est
+                lots = sorted({str(r.get("work_item_id") or "").strip()
+                               for r in utiles} - {""})
+            elif ids:
                 lots = ops.message_lots(ids)
+            if rows or ids:
                 if len(lots) == 1:
                     return lots[0]
                 if len(lots) > 1:
@@ -2033,6 +2078,19 @@ class AgentWorker(threading.Thread):
         if len(actifs) == 1:
             return str(actifs[0]["id"])
         return None
+
+    def _informative_message(self, row: dict) -> bool:
+        """#2527 : ce message n'est qu'un avis, il ne choisit pas le lot du
+        tour — message passif (L125 : accusé, copie, diffusion, radar…) ou
+        avis d'une prise automatique (L165) d'un lot par un AUTRE agent. Les
+        vrais échanges sur un lot (consigne, feu, CI, verdict) gardent la
+        rotation."""
+        if mail.passive_reason(row):
+            return True
+        payload = mail.message_payload(row)
+        prise = payload.get("lot_take") if isinstance(payload, dict) else None
+        return (mail.is_event(row) and isinstance(prise, dict)
+                and str(prise.get("agent") or "") != self.name)
 
     def _note_delegate_turn(self, spec: dict) -> None:
         """L40 (0030) : le tour qui commence compte pour les lots délégués à
@@ -5338,6 +5396,13 @@ class AgentWorker(threading.Thread):
                             % (self.name, entry["path"], entry.get("bytes"),
                                entry.get("detail", "").rpartition(" : ")[2],
                                (entry.get("data") or {}).get("command")))
+                    elif (entry.get("kind") == "tmp"
+                          and entry.get("detail")
+                          == "new session: temporary directory emptied"):
+                        # #2610 : trace au journal du vidage, pour mesurer les
+                        # rotations qui l'auraient encore déclenché.
+                        log("[%s] new session: temporary directory emptied (%s, %s bytes)"
+                            % (self.name, entry.get("path"), entry.get("bytes")))
         except Exception as exc:
             log("[%s] cleanup after turn %s failed (%s)" % (self.name, turn_id[:8], exc))
 
@@ -5408,6 +5473,34 @@ class AgentWorker(threading.Thread):
         return texte
 
     def _run_turn(self, spec: dict) -> bool:
+        """Un tour, sous battement de bail **dès la préparation** (#2544).
+
+        Le battement ne démarrait qu'une fois le harnais publié : sous charge
+        CI, la préparation (dossier, harnais, canon, ménage, comptabilité)
+        pouvait dépasser un bail court, le veilleur tuait le worker avant le
+        `Popen` et le tour ne démarrait jamais (run 39158768160, psql 6/16 :
+        « stop requested (lease deadline reached): harness not yet published »
+        puis « lease lost … before the turn »). Le bail protège le tour entier
+        — la préparation en fait partie — donc le battement démarre ici, avant
+        elle, et la couvre jusqu'à la sortie du tour, y compris les retours
+        anticipés.
+
+        #2597 : il couvre aussi l'après-harnais (nettoyage, compta, fin de tour).
+        Il s'arrêtait dès la sortie du harnais alors que le veilleur jugeait
+        encore l'échéance : une compta lente sous charge laissait expirer le bail
+        (run 39181194843, psql 6/16 : « harness not yet published » après
+        « end of turn »). Seule cette sortie l'arrête.
+        """
+        heartbeat_done = threading.Event()
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat, args=(heartbeat_done,),
+                                                 daemon=True)
+        self.heartbeat_thread.start()
+        try:
+            return self._run_turn_sous_battement(spec)
+        finally:
+            heartbeat_done.set()
+
+    def _run_turn_sous_battement(self, spec: dict) -> bool:
         if spec.get("lot_switch_failed"):
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             return False
@@ -5644,9 +5737,16 @@ class AgentWorker(threading.Thread):
                 # session neuve : dossier temporaire vidé — jamais sous le travail
                 # de fond d'un tour précédent encore en délai de grâce
                 fond = getattr(self.runner, "background", None)
+                # #2610 : une rotation ouvre la session neuve sur le résumé d'un
+                # travail EN COURS ; le dossier temporaire de l'agent est gardé
+                # (le résumé peut désigner ses fichiers). Le vidage reste pour
+                # une vraie session neuve (démarrage, fin de lot, redémarrage).
+                suite_de_rotation = bool(self.resume_summary) \
+                    and self.resume_origin == "agent"
                 menage_tour = menage_mod.Turn.begin(
                     self.cfg, self.runner.housekeeping_policy(), self.name, cwd,
-                    new_session=not session and not (fond and fond.has_jobs(self.name))
+                    new_session=not session and not suite_de_rotation
+                    and not (fond and fond.has_jobs(self.name))
                     and self.resident is None,
                     base_env=env)
                 env.update(menage_tour.env)
@@ -5740,10 +5840,6 @@ class AgentWorker(threading.Thread):
                 self.fail_turn(budget_mod.PAUSE_PREFIX + refus, refus)
                 return False
 
-        heartbeat_done = threading.Event()
-        self.heartbeat_thread = threading.Thread(target=self._heartbeat, args=(heartbeat_done,),
-                                                 daemon=True)
-        self.heartbeat_thread.start()
         preempt_done = threading.Event()
         # Un nouveau tour remet à zéro le latch de publication : il ne concerne
         # que la course du tour précédent, et les autres déclencheurs (bail,
@@ -6057,7 +6153,6 @@ class AgentWorker(threading.Thread):
             echec_lancement = str(exc)
             result_code = 127
         finally:
-            heartbeat_done.set()
             preempt_done.set()
             pgid = self.pgid
             if rp is not None:
@@ -6878,6 +6973,8 @@ class Runner:
         self.train_service_lease = train_service_lease
         self.train_service = None
         self.lease_ttl = cfg.lease_ttl
+        #: #2600 : horloge des workers de cet exécuteur (simulée en test).
+        self.clock = SYSTEM_CLOCK
         self.idle_nudge = cfg.idle_nudge
         self.poll = max(1.0, cfg.poll)
         self._runner_seen_next = 0.0
@@ -8067,6 +8164,7 @@ class Runner:
         """
         if getattr(self, "mediated", False):
             return True  # L109 : le canon est synchronisé par le serveur
+        self._designation_retry_ready = False
         entries = canon_mod.configured(self.cfg)
         # L159f : aucun canon, aucune fiche Host prêteuse : la porte est fixée
         self._canon_complete = not entries
@@ -8178,6 +8276,9 @@ class Runner:
             # L159f : la porte d'hôte n'est fixée que sur TOUS les canons
             # configurés (un hôte prêteur l'est par sa fiche Host, `policy.lend`)
             self._canon_complete = bool(entries) and len(synced) == len(entries)
+            # #2561: only a pass that actually synced a canon may replay the
+            # pending designations (a mocked/test `canon_sync_once` must not).
+            self._designation_retry_ready = bool(synced)
             refresh = getattr(self, "refresh_host_limits", None)
             if refresh is not None and synced:
                 refresh(*synced, complete=self._canon_complete)
@@ -8209,9 +8310,41 @@ class Runner:
                       % GATE_SETTLE_RETRY_S)
         return False
 
+    def retry_review_designations(self) -> None:
+        """#2561: retry the freezes whose automatic designation was journaled
+        unavailable. A canon publication/sync (or a worktree that became
+        readable) can lift the cause after the freeze; the freeze is kept, so
+        the same head is replayed, never a newer one. Bounded and never fatal:
+        the canon sync must not fail because a designation retry did."""
+        if getattr(self, "mediated", False):
+            return
+        if not getattr(self, "_designation_retry_ready", False):
+            return  # only after a pass that really synced a canon
+        try:
+            from . import review_designation_activation as activation
+            if not activation.enabled(self.cfg):
+                return
+            from .scoped_db import ScopedDb
+            db = ScopedDb(self.cfg)
+            try:
+                report = activation.retry_pending(self.cfg, db)
+            finally:
+                db.close()
+            if report.get("attempted") or report.get("errors"):
+                detail = "" if not report.get("errors") else (
+                    " (%d error(s): %s)" % (len(report["errors"]), report["errors"][0]))
+                log_async("review designation retry: %s%s"
+                          % (report.get("summary") or "", detail))
+        except Exception as exc:  # noqa: BLE001 - never fatal for the canon sync
+            log_async("review designation retry failed: %s"
+                      % " ".join(str(exc).split())[:200])
+
     def _canon_sync_loop(self) -> None:
         while not self.stop.is_set():
-            self.canon_sync_once()
+            if self.canon_sync_once():
+                # #2561: a designation that waited on the canon policy or on a
+                # worktree now readable is retried on the same freeze.
+                self.retry_review_designations()
             settled = self._settle_gate_after_sync()
             # avant la première porte fixée, on réessaie vite
             wait = (self.canon_sync_interval if settled or self.canon_sync_interval <= 0
@@ -8239,12 +8372,14 @@ class Runner:
             self._gate_settled.set()
             return
         if self.once:
-            self.canon_sync_once()
+            if self.canon_sync_once():
+                self.retry_review_designations()
             return
         if self.canon_thread is not None:
             return
         if self.canon_sync_interval <= 0:
-            self.canon_sync_once()  # seulement au démarrage…
+            if self.canon_sync_once():  # seulement au démarrage…
+                self.retry_review_designations()
             if self._settle_gate_after_sync():
                 return
             # … ou jusqu'à la première porte d'hôte fixée (fil ci-dessous)
@@ -8678,6 +8813,7 @@ class Runner:
                     continue
             log_async(line)
         self._carry_errors = errors
+
     def packet_sweep_once(self, db) -> None:
         """#2426 : ferme les lots unitaires des paquets fusionnés.
 
@@ -9406,6 +9542,56 @@ class Runner:
                 except Exception:
                     pass
 
+    def account_claims_once(self) -> None:
+        """#313/#2580 (décision 0033) : revendique, dans le registre de
+        l'hôte, les identifiants des comptes de cette configuration, puis
+        journalise ceux qu'un autre mesh de l'hôte déclare aussi — au premier
+        passage, puis à chaque changement. Ne lève jamais."""
+        from . import account_claims
+        try:
+            if not account_claims.refresh(self.cfg, db=self.db):
+                log_async("mesh identity unreadable from the database: provider "
+                          "accounts of this configuration are not claimed on the "
+                          "host, a shared account would not be detected")
+                return
+            partages = account_claims.shared(self.cfg, db=self.db)
+        except (OSError, ValueError) as exc:
+            log_async("account registry of this host unusable (%s): a provider "
+                      "account declared by another mesh is not detected" % exc)
+            return
+        vus = frozenset((p["harness"], p["account"], account_claims.describe(p))
+                        for p in partages)
+        if vus == getattr(self, "_accounts_shared", None):
+            return
+        self._accounts_shared = vus
+        strict = account_claims.refuses(self.cfg)
+        for harness, account, others in sorted(vus):
+            log_async("%s account %s: credentials also declared by another mesh of "
+                      "this host: %s — decision 0033, one organisation per account; "
+                      "%s" % (harness, account, others,
+                              "refused here (%s)" % account_claims.policy_name(self.cfg)
+                              if strict else
+                              "reported only (accounts_shared: report)"))
+
+    def start_account_claims(self) -> threading.Thread | None:
+        """#313 : revendications au démarrage, puis toutes les
+        `account_claims.REFRESH_S` sur leur propre fil (une revendication vit
+        une heure) ; en `--once`, un seul passage."""
+        from . import account_claims
+        if self.once:
+            self.account_claims_once()
+            return None
+
+        def boucle() -> None:
+            while not self.stop.is_set():
+                self.account_claims_once()
+                if self.stop.wait(account_claims.REFRESH_S):
+                    return
+
+        thread = threading.Thread(target=boucle, daemon=True, name="comptes-hote")
+        thread.start()
+        return thread
+
     def log_harnesses(self) -> None:
         """Au démarrage (L106) : le binaire de chaque harnais servi, résolu et
         journalisé avec son chemin absolu — ou « hôte non prêt » tout de suite,
@@ -9772,6 +9958,7 @@ class Runner:
                                              self.cfg.schema, int(self.mail_batch),
                                              self.cfg.config_source))
         self.start_canon_sync()
+        self.start_account_claims()
         # L159f : suivi de la porte et acquittements — en `--once` aussi (r3) :
         # le tour de premier plan compte dans l'accusé partagé de l'hôte
         self._start_host_gate()

@@ -260,7 +260,9 @@ def _idle_actionable_lot(alert: dict) -> str:
 def _slo_breach(alert: dict) -> str:
     """#789 tranche 2 (canon §9) : une étape interne du lot a dépassé son
     délai ; le texte dit l'étape, le retard, et le geste du niveau atteint
-    (1× l'assigné, 2× le pilote, 3× le bureau ou l'auditeur, owner pour un P1).
+    (1× l'assigné, 2× le pilote, 3× le bureau ou l'auditeur, bureau et
+    auditeur pour un P1). #2395 : aucun dépassement n'est notifié à l'owner
+    (décision owner 18/10 : « rien sur les SLO »).
 
     #2231 : quand l'attente est une fusion (`merge*`) ou un déblocage
     (`unblock`), le porteur n'est pas le blocage — le brief vise le pilote/le
@@ -349,8 +351,9 @@ def _slo_breach(alert: dict) -> str:
         move = ("assignee: act on it, or record why it cannot advance (ameesh work note "
                 "%d \"hold: <reason>\") — a silent lot is not a hold" % lot)
     if alert.get("critical"):
-        move += ("; the lot is P1: the owner is notified (ameesh notify), and nothing "
-                 "waits for a human that an agent can do")
+        move += ("; the lot is P1: the bureau handles it with the auditor (canon §9, "
+                 "niveau 4), and no SLO delay is notified to the owner — nothing waits "
+                 "for a human that an agent can do")
     return "%s Expected action: %s." % (head, move)
 
 

@@ -278,6 +278,55 @@ class SelectionTest(unittest.TestCase):
         self.assertIn("claude", picked["why"])
         self.assertIn("deepseek", picked["why"])
 
+    def test_a_manual_reviewer_covers_only_its_own_seat(self):
+        # #2627 : un manuel claude couvre un des deux avis ; le manque est le
+        # codex, mail et selection inchanges.
+        picked = rd.select(families=FAMILIES,
+            required=2,
+            authors=[{"name": "impl-02", "family": "deepseek"}],
+            candidates=candidates(row("claude-one", harness="claude", session="claude"),
+                                  row("codex-one", harness="codex", session="codex")),
+            already=[{"name": "manual-claude", "family": "claude"}])
+        self.assertEqual(picked["state"], rd.DESIGNATED)
+        self.assertEqual([r["name"] for r in picked["reviewers"]], ["codex-one"])
+        self.assertEqual(picked["manual"],
+                         [{"name": "manual-claude", "family": "claude"}])
+        self.assertEqual(picked["missing"], 0)
+
+    def test_a_manual_reviewer_of_the_author_family_covers_no_seat(self):
+        picked = rd.select(families=FAMILIES,
+            required=1,
+            authors=[{"name": "impl-02", "family": "deepseek"}],
+            candidates=candidates(row("codex-one", harness="codex", session="codex")),
+            already=[{"name": "manual-deepseek", "family": "deepseek"}])
+        self.assertEqual(picked["state"], rd.DESIGNATED)
+        self.assertEqual([r["name"] for r in picked["reviewers"]], ["codex-one"])
+        self.assertEqual(picked["manual"], [])
+
+    def test_two_manual_reviewers_of_one_family_cover_one_seat(self):
+        picked = rd.select(families=FAMILIES,
+            required=2,
+            authors=[{"name": "impl-02", "family": "deepseek"}],
+            candidates=candidates(row("claude-one", harness="claude", session="claude"),
+                                  row("codex-one", harness="codex", session="codex")),
+            already=[{"name": "manual-a", "family": "claude"},
+                     {"name": "manual-b", "family": "claude"}])
+        self.assertEqual(picked["state"], rd.DESIGNATED)
+        self.assertEqual([r["name"] for r in picked["reviewers"]], ["codex-one"])
+        self.assertEqual([r["name"] for r in picked["manual"]], ["manual-a"])
+
+    def test_manual_reviewers_covering_the_need_designate_nobody(self):
+        picked = rd.select(families=FAMILIES,
+            required=2,
+            authors=[{"name": "impl-02", "family": "deepseek"}],
+            candidates=(),
+            already=[{"name": "manual-claude", "family": "claude"},
+                     {"name": "manual-codex", "family": "codex"}])
+        self.assertEqual(picked["state"], rd.DESIGNATED)
+        self.assertEqual(picked["reviewers"], [])
+        self.assertEqual(len(picked["manual"]), 2)
+        self.assertEqual(picked["missing"], 0)
+
     def test_required_must_be_zero_one_or_two(self):
         for value in (3, -1, True, "1"):
             with self.subTest(value=value), self.assertRaises(rd.DesignationError):
@@ -390,6 +439,32 @@ class ApplyTest(unittest.TestCase):
         for _to, body in self.port.messages:
             self.assertIn(SHA_A, body)
         self.assertEqual(len(self.port.commits), 1)
+
+    def test_the_required_override_reads_the_critical_floor(self):
+        # #2627 : le canon ne déclare qu'un avis, la porte en exige deux. Le
+        # moteur reçoit le besoin compilé et désigne les deux familles.
+        one = {"rules": [{"paths": ["src/ameesh/**"], "reviews": 1}]}
+        out = self.apply(policy=one, required=2)
+        self.assertEqual(out["state"], rd.DESIGNATED)
+        self.assertEqual(out["required"], 2)
+        self.assertEqual(len(out["reviewers"]), 2)
+
+    def test_manual_reviewers_are_completed_by_only_the_missing_seat(self):
+        out = self.apply(already=[{"name": "manual-claude", "family": "claude"}])
+        self.assertEqual(out["state"], rd.DESIGNATED)
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["codex-one"])
+        self.assertEqual(len(out["messages"]), 1)
+        self.assertEqual(out["messages"][0]["to"], "codex-one")
+        self.assertIn("review 2/2", out["messages"][0]["body"])
+
+    def test_manual_reviewers_covering_the_need_write_nothing(self):
+        before = len(self.port.commits)
+        out = self.apply(already=[{"name": "manual-claude", "family": "claude"},
+                                  {"name": "manual-codex", "family": "codex"}])
+        self.assertEqual(out["state"], "manual")
+        self.assertEqual(out["reviewers"], [])
+        self.assertEqual(len(self.port.commits), before)
+        self.assertEqual(self.port.messages, [])
 
     def test_the_same_freeze_replayed_sends_no_second_mail(self):
         first = self.apply()
