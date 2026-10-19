@@ -158,7 +158,8 @@ class Passage:
 
     def plan(self, db, rules, slot, now):
         repository = train_git.Repository(
-            self.project, resolutions.Replayer(self.repository_source, self.clone_path))
+            self.project, resolutions.Replayer(self.repository_source, self.clone_path,
+                                               target=self.project.target))
         base = repository.target(self.project.target)
         history = train_history.Recorded(db, repository.clone.path,
                                          provider=self.provider, review_rules=rules)
@@ -252,7 +253,8 @@ class Passage:
         known = {row.get("packet", {}).get("sha")
                  for row in state.get("comparisons", [])}
         repository = train_git.Repository(
-            self.project, resolutions.Replayer(self.repository_source, self.clone_path))
+            self.project, resolutions.Replayer(self.repository_source, self.clone_path,
+                                               target=self.project.target))
         base = repository.target(self.project.target)
         comparisons = []
         # Packets merged before the first shadow plan, or named for an hour

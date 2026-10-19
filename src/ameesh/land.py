@@ -747,7 +747,8 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
         return {"lot": lot, "result": "busy"}
     locks[key] = epoch
     if replayer is None:
-        replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name))
+        replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name),
+                                        target=project.target)
     landing = _Landing(db, project, row, key, owner, epoch, locks, projects,
                        cfg=cfg, clone=getattr(replayer, "path", None), replayer=replayer,
                        parts=parts)

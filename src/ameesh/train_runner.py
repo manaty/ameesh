@@ -177,7 +177,8 @@ class Passage:
                              repo=directory, cache=train_ci.parts_cache(self.cfg))
         # The radar, another target, and another runner may all replay merges
         # concurrently. They must never reset this passage's worktree.
-        clone = resolutions.Replayer(self.project.repo, directory, script=None)
+        clone = resolutions.Replayer(self.project.repo, directory, script=None,
+                                     target=self.project.target)
         transports = (None if self.transports is None else
                       lambda **context: self.transports(db, **context))
         # #2400: composition moves the L122 reservation before publication and
