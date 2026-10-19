@@ -802,6 +802,60 @@ def veille_line(pending: list[dict], seen_decisions: set, inbox: list[dict],
         VEILLE_PREFIX, " et ".join(bits), who)
 
 
+#: L480 : l'état du harnais, écrit par le hook `agent-mail` et relu par la
+#: veille juste avant d'écrire. `Stop` = le tour est fini, le prompt est rendu ;
+#: tout le reste = un tour est en cours (dialogue de permission compris).
+PHASE_STOP = "Stop"
+PHASE_BUSY = "busy"
+
+
+def phase_path(cfg: Config, name: str) -> str:
+    return os.path.join(cfg.state_dir, "hooks", name + ".phase")
+
+
+def hook_phase(event: str) -> str:
+    """L'état à retenir après cet événement de hook.
+
+    Seul `Stop` dit que le harnais a rendu son prompt ; `SessionStart`,
+    `UserPromptSubmit` et `PostToolUse` disent qu'un tour est en cours."""
+    return PHASE_STOP if event == "Stop" else PHASE_BUSY
+
+
+def read_phase(cfg: Config, name: str) -> str | None:
+    """Le marqueur d'état, ou None s'il manque ou est illisible : échec fermé,
+    la veille n'écrit que sur un `Stop` explicite."""
+    try:
+        with open(phase_path(cfg, name), encoding="utf-8") as fh:
+            text = fh.read(64).strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return text or None
+
+
+def write_phase(cfg: Config, name: str, phase: str) -> bool:
+    """Écrit le marqueur atomiquement (temporaire puis renommage) ; ne lève
+    jamais : un marqueur qu'on ne peut pas écrire laisse la veille fermée."""
+    path = phase_path(cfg, name)
+    tmp = None
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, phase.encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        return False
+
+
 class Veille:
     """L480 : la veille d'une session de chat.
 
@@ -815,17 +869,21 @@ class Veille:
     n'est nouveau, deux services espacés d'au moins `min_interval`, et pas
     d'écriture dans les `idle` secondes qui suivent une frappe — au-delà de
     `max_defer`, on sert quand même : une session occupée ne doit pas affamer
-    la veille.
+    la veille. Garde d'état enfin : on n'écrit que si le hook `agent-mail` a
+    laissé un marqueur `Stop` (prompt rendu) ; marqueur absent, illisible ou
+    autre (tour en cours, dialogue de permission) = on attend le tour suivant.
     """
 
     def __init__(self, cfg: Config, human: str, name: str, *, every: float = VEILLE_EVERY_S,
                  min_interval: float = VEILLE_MIN_INTERVAL_S, idle: float = VEILLE_IDLE_S,
                  max_defer: float = VEILLE_MAX_DEFER_S, now=time.monotonic,
-                 connect=None, log=None):
+                 connect=None, log=None, phase=None):
         self.cfg, self.human, self.name = cfg, human, name
         self.every, self.min_interval = float(every), float(min_interval)
         self.idle, self.max_defer = float(idle), float(max_defer)
         self.now, self.connect = now, connect
+        #: l'état du harnais (Stop = prompt rendu) ; absent/illisible = on n'écrit pas
+        self.phase = phase or (lambda: read_phase(cfg, name))
         self.log = log or (lambda text: print("ameesh chat: %s" % text, file=sys.stderr,
                                               flush=True))
         self._lock = threading.Lock()
@@ -864,9 +922,9 @@ class Veille:
 
     def due(self, now: float | None = None) -> str | None:
         """La ligne à servir maintenant, ou None (rien de nouveau, frappe
-        récente, ou deux services trop rapprochés). Passé `max_defer` depuis
-        l'arrivée de la nouvelle, on sert quand même : une session occupée ne
-        doit pas affamer la veille."""
+        récente, deux services trop rapprochés, ou harnais pas au prompt).
+        Passé `max_defer` depuis l'arrivée de la nouvelle, on sert quand même :
+        une session occupée ne doit pas affamer la veille."""
         now = self.now() if now is None else float(now)
         with self._lock:
             text = self._text
@@ -879,6 +937,11 @@ class Veille:
                 if self._last_served is not None \
                         and now - self._last_served < self.min_interval:
                     return None
+            # garde d'état, relue juste avant l'écriture : sans un `Stop`
+            # explicite on n'écrit pas (dialogue de permission, tour en cours,
+            # marqueur absent) ; la ligne reste en attente pour le tour suivant
+            if self.phase() != PHASE_STOP:
+                return None
             self._text, self._text_at = None, None
             self._last_served = now
             return text
@@ -1271,6 +1334,9 @@ def run(cfg: Config, args, *, chain=None, environ_of=None, popen=None) -> int:
             try:
                 master, slave = pty.openpty()
                 _copy_winsize(sys.stdin.fileno(), slave)
+                # un marqueur `Stop` d'une session précédente ne vaut pas pour
+                # celle-ci : on part fermé, le hook dira quand le prompt est rendu
+                write_phase(cfg, name, PHASE_BUSY)
                 veille = Veille(cfg, human, name, every=args.veille_every)
             except OSError as exc:
                 print("ameesh chat: veille off (%s)" % exc, file=sys.stderr)

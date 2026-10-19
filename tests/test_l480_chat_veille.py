@@ -10,17 +10,23 @@ testé.
 """
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import os
 import pty
 import select
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
-from ameesh import chat, decisions, mail, registry, work
+from ameesh import chat, cli, decisions, mail, registry, work
 
 from .support import PgTestCase
 
@@ -100,7 +106,8 @@ class VeilleSchedulingTest(unittest.TestCase):
     def setUp(self):
         self.clock = _Clock()
         self.veille = chat.Veille(object(), "human:h", "chat-h", now=self.clock,
-                                  log=lambda text: None)
+                                  log=lambda text: None,
+                                  phase=lambda: chat.PHASE_STOP)
 
     def observe(self, pending=(), inbox=()):
         return self.veille.observe(list(pending), list(inbox))
@@ -162,6 +169,137 @@ class VeilleSchedulingTest(unittest.TestCase):
         self.clock.t += 1.0
         self.assertIsNone(self.observe([_decision(1)]))
         self.assertIsNone(self.veille.due())
+
+
+class VeillePhaseGuardTest(unittest.TestCase):
+    """L480 : pas d'écriture sans un marqueur `Stop` explicite (échec fermé)."""
+
+    def setUp(self):
+        self.clock = _Clock()
+        self.phase = chat.PHASE_STOP
+        self.veille = chat.Veille(object(), "human:h", "chat-h", now=self.clock,
+                                  log=lambda text: None, phase=lambda: self.phase)
+        self.veille.observe([], [])
+        self.clock.t = 1000.0
+        self.veille.observe([_decision(1)], [])
+        self.clock.t += chat.VEILLE_IDLE_S + 0.1
+
+    def test_marqueur_stop_ecrit(self):
+        self.assertIn("1 nouvelle décision", self.veille.due())
+
+    def test_marqueur_absent_n_ecrit_rien_et_garde_la_ligne(self):
+        self.phase = None
+        self.assertIsNone(self.veille.due())
+        self.assertIsNotNone(self.veille.pending_text())
+        self.phase = chat.PHASE_STOP
+        self.assertIn("1 nouvelle décision", self.veille.due())
+
+    def test_marqueur_busy_ou_permission_n_ecrit_rien(self):
+        for phase in (chat.PHASE_BUSY, "permission", "stop", "Stop\n", ""):
+            with self.subTest(phase=phase):
+                self.phase = phase
+                self.assertIsNone(self.veille.due())
+                self.assertIsNotNone(self.veille.pending_text())
+        self.phase = chat.PHASE_STOP
+        self.assertIn("1 nouvelle décision", self.veille.due())
+
+    def test_le_marqueur_est_relu_juste_avant_l_ecriture(self):
+        calls = []
+
+        def phase():
+            calls.append(1)
+            return chat.PHASE_BUSY if len(calls) < 3 else chat.PHASE_STOP
+        self.veille.phase = phase
+        self.assertIsNone(self.veille.due())
+        self.assertIsNone(self.veille.due())
+        self.assertIn("1 nouvelle décision", self.veille.due())
+        self.assertEqual(len(calls), 3)
+
+
+class PhaseFileTest(unittest.TestCase):
+    """Le marqueur d'état : écrit et relu, absent ou illisible = fermé."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="l480-phase-")
+        self.cfg = types.SimpleNamespace(state_dir=self.tmp)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_ecrit_et_relit(self):
+        self.assertTrue(chat.write_phase(self.cfg, "chat-a", chat.PHASE_STOP))
+        self.assertEqual(chat.read_phase(self.cfg, "chat-a"), chat.PHASE_STOP)
+        self.assertTrue(chat.write_phase(self.cfg, "chat-a", chat.PHASE_BUSY))
+        self.assertEqual(chat.read_phase(self.cfg, "chat-a"), chat.PHASE_BUSY)
+
+    def test_absent_ou_vide_est_none(self):
+        self.assertIsNone(chat.read_phase(self.cfg, "chat-b"))
+        self.assertTrue(chat.write_phase(self.cfg, "chat-b", ""))
+        self.assertIsNone(chat.read_phase(self.cfg, "chat-b"))
+
+    def test_illisible_est_none(self):
+        path = chat.phase_path(self.cfg, "chat-d")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(b"\xff\xfe")
+        self.assertIsNone(chat.read_phase(self.cfg, "chat-d"))
+
+    def test_marqueur_prive(self):
+        self.assertTrue(chat.write_phase(self.cfg, "chat-c", chat.PHASE_STOP))
+        mode = os.stat(chat.phase_path(self.cfg, "chat-c")).st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+    def test_hook_phase(self):
+        self.assertEqual(chat.hook_phase("Stop"), chat.PHASE_STOP)
+        for event in ("SessionStart", "UserPromptSubmit", "PostToolUse", "Inconnu"):
+            self.assertEqual(chat.hook_phase(event), chat.PHASE_BUSY)
+
+
+class ChatPhaseHookTest(PgTestCase):
+    """Le hook `agent-mail` tient le marqueur d'état que la veille relit."""
+
+    NAME = "chat-phase"
+
+    def setUp(self):
+        super().setUp()
+        registry.upsert(self.db, "orch", harness="claude", host=self.cfg.host)
+        try:
+            os.unlink(chat.phase_path(self.cfg, self.NAME))
+        except OSError:
+            pass
+
+    def _hook(self, event):
+        payload = json.dumps({"hook_event_name": event, "cwd": self.tmp})
+        out = io.StringIO()
+        env = dict(os.environ)
+        for key in decisions.RUNNER_ENV + decisions.LEASE_ENV:
+            env.pop(key, None)
+        env["AGENT_MAIL_NAME"] = self.NAME
+        with mock.patch.object(sys, "stdin", io.StringIO(payload)), \
+                mock.patch.dict(os.environ, env, clear=True), \
+                contextlib.redirect_stdout(out):
+            code = cli.cmd_hook(self.cfg, "claude")
+        return code, out.getvalue()
+
+    def test_stop_ecrit_stop(self):
+        code, _ = self._hook("Stop")
+        self.assertEqual(code, 0)
+        self.assertEqual(chat.read_phase(self.cfg, self.NAME), chat.PHASE_STOP)
+
+    def test_les_autres_evenements_ecrivent_busy(self):
+        for event in ("SessionStart", "UserPromptSubmit", "PostToolUse"):
+            with self.subTest(event=event):
+                self._hook("Stop")
+                self.assertEqual(chat.read_phase(self.cfg, self.NAME), chat.PHASE_STOP)
+                self._hook(event)
+                self.assertEqual(chat.read_phase(self.cfg, self.NAME), chat.PHASE_BUSY)
+
+    def test_un_stop_qui_bloque_ecrit_busy(self):
+        mail.send(self.db, "orch", self.NAME, "un message pour le chat")
+        code, out = self._hook("Stop")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["decision"], "block")
+        self.assertEqual(chat.read_phase(self.cfg, self.NAME), chat.PHASE_BUSY)
 
 
 class VeilleArmingTest(unittest.TestCase):
@@ -321,7 +459,8 @@ class VeilleDbTest(PgTestCase):
         self.lot = lot
 
     def _veille(self):
-        return chat.Veille(self.cfg, HUMAN, "chat-alice", log=lambda text: None)
+        return chat.Veille(self.cfg, HUMAN, "chat-alice", log=lambda text: None,
+                           phase=lambda: chat.PHASE_STOP)
 
     def test_une_decision_reelle_devient_une_ligne(self):
         decisions.ask(self.cfg, self.db, requester="orch", question="On fusionne ?",

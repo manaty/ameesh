@@ -75,6 +75,13 @@ $human ──frappes──► lanceur ──pty maître──► harnais interac
   d'écriture pendant les 3 s qui suivent une frappe de `$human` (une session
   active est déjà servie par la consigne) ; au-delà de 15 min d'attente, la
   ligne est servie quand même.
+* **Garde d'état** : le hook `agent-mail` du chat écrit un marqueur — `Stop`
+  quand le tour est fini (prompt rendu), `busy` sur `SessionStart`,
+  `UserPromptSubmit`, `PostToolUse`, et quand un `Stop` bloque pour un
+  message. La veille le relit juste avant chaque écriture et n'écrit que sur
+  `Stop` : marqueur absent, illisible ou différent, rien n'est écrit et la
+  ligne reste en attente pour le tour suivant (échec fermé). Le lanceur
+  invalide au démarrage le marqueur d'une session précédente.
 * **Recul** : la veille ne s'arme que si l'entrée et la sortie sont un
   terminal, et seulement dans le lanceur (jamais dans le client L79). Sans
   terminal, ou avec `--no-veille`, le lancement est exactement celui
@@ -90,12 +97,11 @@ $human ──frappes──► lanceur ──pty maître──► harnais interac
   injectée n'a pas d'autorité : elle demande de **présenter**, jamais de
   répondre ;
 * perte du TUI si le harnais n'accepte pas l'écriture dans son entrée ;
-* **dialogue de permission** : si la ligne est servie pendant que le harnais
-  attend une permission, le `\r` qui la soumet peut confirmer l'option par
-  défaut du dialogue. Garde proposée : n'écrire que si le dernier événement du
-  harnais est un `Stop` (marqueur d'état écrit par le hook `agent-mail`), sinon
-  attendre ; sans garde, le risque est propre au TUI interactif et disparaît
-  avec L77 (agent exécuté, permissions refusées). À trancher avant relecture ;
+* **fenêtre résiduelle de la garde** : entre la relecture du marqueur et
+  l'écriture (un seul `write`), un tour peut démarrer — un `UserPromptSubmit`
+  concurrent. La ligne part alors au tout début du tour, sans autorité ; c'est
+  le seul écart que la garde ne ferme pas. Le risque de dialogue de permission,
+  lui, est fermé : un dialogue n'existe qu'au milieu d'un tour, marqué `busy` ;
 * pas de service quand la session est fermée (le propriétaire reste seul juge
   de ce qu'il garde ouvert) ;
 * le lanceur porte du code de terminal (pty, redimensionnement, nettoyage) :
