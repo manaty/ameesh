@@ -4,17 +4,23 @@
 Un lot léger peut porter avant sa fusion l'avis d'une autre famille sur la
 tête qui entre (gel relu, revue désignée). Ouvrir en plus la mission de
 relecture après fusion demanderait une relecture déjà rendue. La décision est
-lue sur les jalons du lot source, au sha fusionné (ou au dernier gel que la
-fusion porte) : un avis `ok`, d'une famille connue et autre que celle de
-l'auteur, ferme l'ouverture. Un avis bloquant, une famille inconnue ou un sha
-différent ne dispensent de rien.
+lue sur les jalons du lot source : un avis `ok` ferme l'ouverture s'il porte
+sur le sha fusionné, ou sur le dernier gel **prouvé entré** par Git dans la
+fusion (`plan_git.probe`), d'une famille **tracée à l'instant du verdict**
+(`turn_costs`, jamais le registre courant), connue et autre que celle de
+l'auteur. Un avis bloquant, une famille inconnue, un sha différent ou une
+preuve Git absente ne dispensent de rien.
 
 Deux niveaux : la règle seule (magasin simulé), puis les jalons réels sur
-Postgres — ouverture par `open_after_merge` / `open_for_merge`, et rattrapage
-borné (`catch_up`) qui marque le candidat terminal au lieu de le retenter.
+Postgres — ouverture par `open_after_merge` / `open_for_merge`, preuve Git sur
+un dépôt réel (gel A relu, tête B fusionnée, puis A réellement fusionné), et
+rattrapage borné (`catch_up`) qui marque le candidat terminal au lieu de le
+retenter.
 """
 from __future__ import annotations
 
+import os
+import subprocess
 import unittest
 from unittest import mock
 
@@ -77,20 +83,28 @@ class RuleTest(unittest.TestCase):
         self.ops.milestones_rows[LOT] = [
             {"id": 1, "kind": "frozen", "sha": SHA, "actor": "a1",
              "at_ts": 1_700_000_000.0}]
-        self.agents = {
-            "a1": {"harness": "codex"},
-            "r-claude": {"harness": "claude"},
-            "r-claude2": {"harness": "claude"},
-            "r-deepseek": {"harness": "deepseek"},
-            "r-codex": {"harness": "codex"},
+        # #2585/B1 : la famille du relecteur est celle du tour au verdict,
+        # jamais le registre courant (qui peut avoir tourné depuis).
+        self.harness = {
+            "a1": "codex",
+            "r-claude": "claude",
+            "r-claude2": "claude",
+            "r-deepseek": "deepseek",
+            "r-codex": "codex",
         }
+        # le registre courant, distinct de la trace des tours : une rotation
+        # peut l'avoir fait changer depuis le verdict.
+        self.agents = {name: {"harness": value}
+                       for name, value in self.harness.items()}
         store = mock.Mock(work=self.ops)
         for patch in (
             mock.patch.object(storage, "of", return_value=store),
             mock.patch.object(work, "get",
                               side_effect=lambda db, n: self.ops.items.get(int(n))),
             mock.patch.object(work, "add", side_effect=lambda db, **kw: self.ops.add(**kw)),
-            mock.patch.object(review_lot, "_turns_harness", return_value="codex"),
+            mock.patch.object(review_lot, "_turns_harness",
+                              side_effect=lambda db, agent, at_ts, **kw:
+                              self.harness.get(agent, "")),
             mock.patch.object(registry, "get",
                               side_effect=lambda db, name: self.agents.get(name)),
         ):
@@ -142,17 +156,35 @@ class RuleTest(unittest.TestCase):
         out = self.open(merged_sha=SHA)
         self.assertTrue(out["created"], out)
 
-    def test_un_avis_sur_le_gel_couvre_un_commit_de_fusion(self):
-        """La fusion locale nomme le commit de fusion ; l'avis porte sur le
-        gel, son second parent — le contenu relu est bien celui qui entre."""
+    def test_sans_preuve_git_un_avis_sur_le_gel_ne_couvre_pas_la_fusion(self):
+        """B1 cx1 : le gel A relu et une tête B différente fusionnée. Sans
+        preuve Git de l'entrée de A dans B, l'avis sur A ne dispense pas de la
+        REVUE sur B (le test avec dépôt réel est plus bas)."""
         self.verdict("r-claude", SHA)
         out = self.open(merged_sha=MERGE_COMMIT)
-        self.assertFalse(out["created"], out)
-        self.assertTrue(out["already_reviewed"], out)
+        self.assertTrue(out["created"], out)
+        self.assertFalse(out["already_reviewed"], out)
 
-    def test_sans_sha_de_fusion_le_dernier_gel_suffit(self):
+    def test_sans_sha_de_fusion_aucune_preuve_garde_la_relecture(self):
         self.verdict("r-claude", SHA)
         out = self.open(merged_sha="")
+        self.assertTrue(out["created"], out)
+        self.assertFalse(out["already_reviewed"], out)
+
+    def test_famille_du_relecteur_lue_au_verdict_pas_au_registre(self):
+        """B1/P2 cx1 : le registre dit claude, mais l'avis a été rendu sous
+        codex — la famille de l'auteur (codex) ne compte donc pas."""
+        self.verdict("r-claude", SHA)
+        self.harness["r-claude"] = "codex"
+        out = self.open(merged_sha=SHA)
+        self.assertTrue(out["created"], out)
+
+    def test_avis_rendu_sous_une_autre_famille_compte_apres_rotation(self):
+        """Inverse : le registre courant dit codex (la famille de l'auteur),
+        mais l'avis a été rendu sous claude — il reste indépendant."""
+        self.verdict("r-claude", SHA)
+        self.agents["r-claude"] = {"harness": "codex"}
+        out = self.open(merged_sha=SHA)
         self.assertFalse(out["created"], out)
         self.assertTrue(out["already_reviewed"], out)
 
@@ -215,7 +247,13 @@ class ReviewAlreadyDoneDbTest(PgTestCase):
                         ("a1", "deepseek"))
         work.milestone(self.db, self.lot, "frozen", sha=SHA, actor="a1")
 
-    def verdict(self, actor, sha=SHA, kind="ok"):
+    def verdict(self, actor, sha=SHA, kind="ok", harness="codex"):
+        # #2585/B1 : la famille du relecteur est lue sur ses tours autour du
+        # verdict, jamais sur le registre courant.
+        if harness:
+            self.db.execute("INSERT INTO turn_costs (agent, harness, recorded_at)"
+                            " VALUES (%s, %s, now() - interval '1 second')",
+                            (actor, harness))
         work.milestone(self.db, self.lot, "verdict", sha=sha, actor=actor, verdict=kind)
 
     def reviews(self):
@@ -233,9 +271,12 @@ class ReviewAlreadyDoneDbTest(PgTestCase):
         self.assertTrue(out["already_reviewed"], out)
         self.assertEqual([entry["actor"] for entry in out["reviewed_by"]], ["codex1"])
         self.assertEqual(self.reviews(), [])
+        events = storage.of(self.db).work.events(self.lot, 50)
+        self.assertTrue(any(str(e.get("note") or "").startswith(
+            review_lot.TERMINAL_PREFIX + str(self.lot)) for e in events), events)
 
     def test_un_avis_de_la_famille_de_l_auteur_ouvre_la_relecture(self):
-        self.verdict("deepseek2")
+        self.verdict("deepseek2", harness="deepseek")
         out = self.open()
         self.assertTrue(out["created"], out)
         self.assertEqual(len(self.reviews()), 1)
@@ -245,12 +286,35 @@ class ReviewAlreadyDoneDbTest(PgTestCase):
         out = self.open()
         self.assertTrue(out["created"], out)
 
-    def test_un_avis_sur_le_gel_couvre_une_fusion_en_commit(self):
-        self.verdict("codex1", sha=SHA)
-        out = self.open(merged_sha=MERGE_COMMIT)
+    def test_famille_du_relecteur_lue_au_verdict_pas_au_registre(self):
+        """B1/P2 cx1 : le registre dit claude, mais l'avis a été rendu sous
+        codex, la famille de l'auteur — il ne compte pas."""
+        registry.upsert(self.db, "codex1", harness="claude", host=self.cfg.host)
+        self.verdict("codex1", harness="codex")
+        with mock.patch.object(review_lot, "_author_at_freeze",
+                               return_value={"name": "a1", "harness": "codex"}):
+            out = self.open()
+        self.assertTrue(out["created"], out)
+
+    def test_avis_rendu_sous_une_autre_famille_compte_apres_rotation(self):
+        """Inverse : le registre courant dit codex (la famille de l'auteur),
+        mais l'avis a été rendu sous claude — il reste indépendant."""
+        registry.upsert(self.db, "codex1", harness="codex", host=self.cfg.host)
+        self.verdict("codex1", harness="claude")
+        with mock.patch.object(review_lot, "_author_at_freeze",
+                               return_value={"name": "a1", "harness": "codex"}):
+            out = self.open()
         self.assertFalse(out["created"], out)
         self.assertTrue(out["already_reviewed"], out)
-        self.assertEqual(self.reviews(), [])
+
+    def test_sans_preuve_git_un_avis_sur_le_gel_ne_couvre_pas_un_commit(self):
+        """B1 cx1, témoin négatif sur les jalons réels : sans dépôt où prouver
+        l'entrée du gel A dans le commit B, la REVUE reste due."""
+        self.verdict("codex1", sha=SHA)
+        out = self.open(merged_sha=MERGE_COMMIT)
+        self.assertTrue(out["created"], out)
+        self.assertFalse(out["already_reviewed"], out)
+        self.assertEqual(len(self.reviews()), 1)
 
     def test_open_for_merge_propage_l_avis_deja_rendu(self):
         self.verdict("codex1")
@@ -279,6 +343,93 @@ class ReviewAlreadyDoneDbTest(PgTestCase):
         self.assertEqual(self.reviews(), [])
 
 
+class GitProofDbTest(PgTestCase):
+    """B1 cx1 : le gel A relu ne couvre la fusion que si Git prouve son entrée.
+
+    Un dépôt réel : gel A sur une branche, tête B différente sur la cible
+    (témoin négatif), puis A réellement fusionnée (témoin positif)."""
+
+    def _git(self, *args):
+        env = dict(os.environ, GIT_AUTHOR_NAME="t",
+                   GIT_AUTHOR_EMAIL="t@example.invalid",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+        proc = subprocess.run(["git", "-C", self.repo, *args],
+                              capture_output=True, text=True, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.strip()
+
+    def write(self, name, text):
+        path = os.path.join(self.repo, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(text)
+
+    def commit(self, name):
+        self.write(name, name + "\n")
+        self._git("add", name)
+        self._git("commit", "-q", "-m", "ajoute " + name)
+        return self._git("rev-parse", "HEAD")
+
+    def setUp(self):
+        super().setUp()
+        self.repo = os.path.join(self.tmp, "depot")
+        os.makedirs(self.repo)
+        self._git("init", "-q", "-b", "main")
+        self._git("config", "user.name", "t")
+        self._git("config", "user.email", "t@example.invalid")
+        self.commit("socle")
+        registry.upsert(self.db, "a1", harness="deepseek", host=self.cfg.host)
+        registry.upsert(self.db, "codex1", harness="codex", host=self.cfg.host)
+        self.lot = work.add(self.db, title="un chemin léger déjà relu",
+                            app="ameesh", assignee="a1")["id"]
+        self.db.execute("INSERT INTO turn_costs (agent, harness, recorded_at)"
+                        " VALUES (%s, %s, now() - interval '1 minute')",
+                        ("a1", "deepseek"))
+        self._git("checkout", "-q", "-b", "lot/2585-A")
+        self.frozen = self.commit("A")
+        work.milestone(self.db, self.lot, "frozen", sha=self.frozen, actor="a1")
+        self.db.execute("INSERT INTO turn_costs (agent, harness, recorded_at)"
+                        " VALUES (%s, %s, now() - interval '1 second')",
+                        ("codex1", "codex"))
+        work.milestone(self.db, self.lot, "verdict", sha=self.frozen,
+                       actor="codex1", verdict="ok")
+
+    def open(self, merged_sha):
+        return review_lot.open_after_merge(
+            self.db, lot=self.lot, klass={"class": "light", "why": "policy"},
+            merged_sha=merged_sha, repo=self.repo)
+
+    def test_un_gel_A_ne_couvre_pas_une_tete_B_differente(self):
+        self._git("checkout", "-q", "main")
+        merged = self.commit("B")
+        out = self.open(merged)
+        self.assertTrue(out["created"], out)
+        self.assertFalse(out["already_reviewed"], out)
+
+    def test_un_gel_A_prouve_entre_dans_la_fusion_ne_cree_rien(self):
+        self._git("checkout", "-q", "main")
+        self._git("merge", "-q", "--no-ff", "-m", "merge A", "lot/2585-A")
+        merged = self._git("rev-parse", "HEAD")
+        out = self.open(merged)
+        self.assertFalse(out["created"], out)
+        self.assertTrue(out["already_reviewed"], out)
+        self.assertEqual([entry["actor"] for entry in out["reviewed_by"]], ["codex1"])
+
+    def test_open_for_merge_transmet_le_depot_a_la_preuve(self):
+        """Le dépôt du relevé arrive jusqu'à la preuve Git, pas seulement à la
+        classe : sans transmission, un gel A entré dans un commit de fusion
+        serait rouvert par le rattrapage."""
+        self._git("checkout", "-q", "main")
+        self._git("merge", "-q", "--no-ff", "-m", "merge A", "lot/2585-A")
+        merged = self._git("rev-parse", "HEAD")
+        with mock.patch.object(review_lot, "class_at_merge",
+                               return_value={"class": "light", "why": "policy"}):
+            out = review_lot.open_for_merge(self.db, self.lot,
+                                            merged_sha=merged, repo=self.repo)
+        self.assertFalse(out["created"], out)
+        self.assertTrue(out["already_reviewed"], out)
+
+
 class CatchUpAlreadyDoneDbTest(PgTestCase):
     """#2585 au rattrapage : un candidat déjà relu est terminal, pas retenté."""
 
@@ -292,6 +443,9 @@ class CatchUpAlreadyDoneDbTest(PgTestCase):
                         " VALUES (%s, %s, now() - interval '1 minute')",
                         ("a1", "deepseek"))
         work.milestone(self.db, self.lot, "frozen", sha=SHA, actor="a1")
+        self.db.execute("INSERT INTO turn_costs (agent, harness, recorded_at)"
+                        " VALUES (%s, %s, now() - interval '1 second')",
+                        ("codex1", "codex"))
         work.milestone(self.db, self.lot, "verdict", sha=SHA, actor="codex1",
                        verdict="ok")
         # la voie déclarée est neutralisée : seule la fusion et le rattrapage

@@ -73,11 +73,12 @@ pas rendus sur le sha fusionné. Le nombre d'avis n'est donc plus seulement
 #2585 : un lot léger peut déjà porter l'avis d'une autre famille sur la tête
 qui entre, rendu avant la fusion (gel relu, revue désignée). Ouvrir une seconde
 mission `REVUE #N` demanderait une relecture déjà faite. Quand assez d'avis
-`ok` d'une famille **connue et autre que celle de l'auteur** couvrent la tête
-fusionnée (le sha fusionné, ou le dernier gel que la fusion a fait entrer),
-l'ouverture est close sans création. Un avis bloquant, une famille inconnue,
-un sha différent ou une famille non prouvée ne dispensent de rien : la
-relecture reste due, et le doute n'ouvre jamais une dispense (§8).
+`ok` d'une famille **tracée à l'instant du verdict** (`turn_costs`, jamais le
+registre courant) et autre que celle de l'auteur couvrent la tête fusionnée —
+le sha fusionné, ou le dernier gel **prouvé par Git** entré dans la fusion
+(`plan_git.probe`) — l'ouverture est close sans création. Un avis bloquant,
+une famille inconnue, un sha différent ou une preuve Git absente ne dispensent
+de rien : la relecture reste due, et le doute n'ouvre jamais une dispense (§8).
 """
 from __future__ import annotations
 
@@ -595,28 +596,73 @@ def _review_recursion(item: dict) -> str:
     return ""
 
 
-def _heads_on_merge(db, lot: int, merged: str) -> list:
-    """Les têtes qu'une fusion a fait entrer : le sha fusionné, le gel relu.
+def _entered(repo: Optional[str], merged: str, frozen: str) -> bool:
+    """Le contenu du gel `frozen` est-il **prouvé** entré dans `merged` ?
+
+    Preuve Git seule (`plan_git.probe` : ancêtre, patch-id ou diff écrasé,
+    revert écarté), jamais une supposition. Sans dépôt, sans commit lisible
+    ou sur un doute, rien n'est prouvé : la relecture reste due (B1/P1 de la
+    revue cx1 #2585)."""
+    if not repo or not merged or not frozen:
+        return False
+    try:
+        if plan_git.same_commit(merged, frozen):
+            return True
+        return bool(plan_git.probe(str(repo), str(frozen), str(merged)).get("merged"))
+    except Exception:  # noqa: BLE001 - preuve impossible : pas de dispense
+        return False
+
+
+def _heads_on_merge(db, lot: int, merged: str, repo: Optional[str] = None) -> list:
+    """Les têtes qu'une fusion a fait entrer : le sha fusionné, le gel **prouvé**.
 
     La file en mode `pr` nomme la tête du lot (`landing_sha`) ; une fusion
     locale ou un relevé de branches nomme le commit de fusion sur la cible.
-    Dans ce second cas, l'avis est porté par le dernier gel, second parent du
-    commit de fusion : le lire est la preuve que le contenu relu est bien
-    celui qui est entré. Une lecture de jalon impossible ne rend que les têtes
-    connues, jamais une tête inventée."""
+    Dans ce second cas, l'avis est porté par le dernier gel : il n'est compté
+    que si Git prouve que ce gel est bien entré dans le commit fusionné
+    (`_entered`). Un gel A relu puis une tête B différente fusionnée ne
+    couvrent pas B : `_entered` est faux et la REVUE reste due (B1 cx1).
+    Une lecture de jalon impossible ne rend que les têtes connues, jamais une
+    tête inventée."""
     heads: list = []
+    merged_heads: list = []
 
-    def add(value) -> None:
+    def add(value, into: list) -> None:
         text = str(value or "").strip()
-        if text and not any(plan_git.same_commit(text, head) for head in heads):
-            heads.append(text)
+        if text and not any(plan_git.same_commit(text, head) for head in into):
+            into.append(text)
 
-    add(merged)
-    add(merged_sha(db, lot))
+    add(merged, merged_heads)
+    add(merged_sha(db, lot), merged_heads)
+    for head in merged_heads:
+        add(head, heads)
     freezes = _freezes(db, lot)
     if freezes:
-        add(freezes[-1].get("sha"))
+        frozen = str(freezes[-1].get("sha") or "").strip()
+        # Le gel n'est une tête relue que si son contenu est prouvé entré dans
+        # un des commits fusionnés ; sans cette preuve, l'avis sur le gel ne
+        # couvre pas la fusion.
+        if frozen and any(_entered(repo, head, frozen) for head in merged_heads):
+            add(frozen, heads)
     return heads
+
+
+def _family_at(db, actor: str, at_ts) -> str:
+    """La famille de modèle tracée de `actor` **à l'instant du verdict**.
+
+    Le registre courant ne prouve rien : une rotation de harnais (Codex vers
+    Claude) ferait compter un avis rendu sous Codex comme indépendant d'un
+    auteur Codex. La trace est celle des tours (`turn_costs`), relue autour de
+    l'instant du verdict par `_turns_harness` — la même preuve que la famille
+    de l'auteur au gel (#1053). Sans tour tracé, aucune famille n'est prouvée
+    et la relecture reste due (autre point de la revue cx1 #2585)."""
+    actor = str(actor or "").strip()
+    if not actor or actor.startswith(work.HUMAN_PREFIX) or ":" in actor:
+        return ""
+    try:
+        return family_of(_turns_harness(db, actor, float(at_ts or 0.0)))
+    except Exception:  # noqa: BLE001 - trace illisible : famille non prouvée
+        return ""
 
 
 def _reviewed_on_head(db, item: dict, *, heads: list, required: int,
@@ -625,9 +671,10 @@ def _reviewed_on_head(db, item: dict, *, heads: list, required: int,
 
     Rend `{done, accepted, blocked}`. `done` n'est vrai qu'avec assez d'avis
     indépendants : dernier verdict de chaque relecteur, `ok`, sur une des
-    têtes, d'un acteur distinct de l'auteur, de famille connue et différente
-    de celle de l'auteur (un auteur humain n'a pas de famille). Un `blocked`
-    courant interdit la dispense : la correction puis un `ok` restent dus.
+    têtes, d'un acteur distinct de l'auteur, de famille **tracée à l'instant
+    du verdict** (`_family_at`) et différente de celle de l'auteur (un auteur
+    humain n'a pas de famille). Un `blocked` courant interdit la dispense :
+    la correction puis un `ok` restent dus.
 
     L'indépendance ne se suppose jamais (#1374) : une famille illisible ou
     inconnue ne prouve pas « une autre famille », donc la relecture reste due.
@@ -642,7 +689,6 @@ def _reviewed_on_head(db, item: dict, *, heads: list, required: int,
     author_family = family_of(author.get("harness"))
     author_human = name.lower().startswith(work.HUMAN_PREFIX)
     try:
-        from . import merge_queue
         rows = work.milestones(db, int(item["id"]), limit=200) or []
     except Exception:  # noqa: BLE001 - lecture impossible : la relecture reste due
         return out
@@ -666,10 +712,7 @@ def _reviewed_on_head(db, item: dict, *, heads: list, required: int,
             continue
         if actor and actor.lower() == name.lower():
             continue                      # on ne relit pas son propre travail
-        try:
-            family = merge_queue.actor_family(db, actor)
-        except merge_queue.RegistryReadError:
-            family = ""                   # #2521 : lecture impossible, non prouvée
+        family = _family_at(db, actor, mark.get("at_ts"))
         if not family:
             continue                      # aucune preuve d'une autre famille
         if not author_human:
@@ -690,7 +733,8 @@ def _reviewed_on_head(db, item: dict, *, heads: list, required: int,
 
 def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
                      merged_sha: str = "", pr=None, target: str = "",
-                     actor: str = work.SYSTEM_SENDER) -> dict:
+                     actor: str = work.SYSTEM_SENDER,
+                     repo: Optional[str] = None) -> dict:
     """Ouvre le lot de relecture du lot léger `lot`, s'il n'existe pas déjà.
 
     Rend `{lot, id, created, class, merged_class, critical, reviews,
@@ -705,8 +749,10 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
 
     #2585 : si assez d'avis `ok` d'une autre famille couvrent déjà la tête
     fusionnée, rien n'est créé : `already_reviewed` est vrai et `reviewed_by`
-    nomme les avis retenus. Un avis bloquant, une famille inconnue ou un sha
-    différent laissent la relecture due.
+    nomme les avis retenus. Le gel relu n'est compté que si Git prouve son
+    entrée dans la fusion (`repo` : `_entered`). Un avis bloquant, une famille
+    inconnue, un sha différent ou une preuve Git absente laissent la relecture
+    due.
 
     La création et la marque au journal de `lot` sont **une seule écriture**
     (revue #544 r1) : un échec de la marque annule la création, donc un nouvel
@@ -762,22 +808,36 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
     author_family = family_of(author.get("harness"))
     # #2585 : la revue déjà rendue avant la fusion est la relecture due ; ne
     # pas en ouvrir une seconde. `merged_sha` peut être le commit de fusion
-    # (voie locale) : `_heads_on_merge` relit aussi le dernier gel qu'il porte.
+    # (voie locale) : `_heads_on_merge` ne compte le dernier gel que si Git
+    # prouve son entrée dans la fusion (`repo`) — un gel A relu ne couvre pas
+    # une tête B différente fusionnée.
     try:
         reviewed = _reviewed_on_head(
-            db, item, heads=_heads_on_merge(db, lot, merged_sha),
+            db, item, heads=_heads_on_merge(db, lot, merged_sha, repo=repo),
             required=reviews, author=author)
     except Exception:  # noqa: BLE001 - lecture impossible : la relecture reste due
         reviewed = {"done": False, "accepted": [], "blocked": []}
     if reviewed["done"]:
+        reviewed_by = ", ".join("%s (%s)" % (entry["actor"], entry["family"])
+                                for entry in reviewed["accepted"])
         out.update({
             "already_reviewed": True,
             "reviewed_by": reviewed["accepted"],
             "why": ("avis déjà rendu sur la tête fusionnée : %s — pas de lot de "
-                    "relecture ouvert" % ", ".join(
-                        "%s (%s)" % (entry["actor"], entry["family"])
-                        for entry in reviewed["accepted"])),
+                    "relecture ouvert" % reviewed_by),
         })
+        # La marque terminale est le fait durable : le rattrapage ne
+        # réexaminera pas un lot déjà relu (souvent sans dépôt pour prouver le
+        # gel) et le journal dit pourquoi aucune mission n'est ouverte. Best
+        # effort : si elle échoue, le rattrapage réévalue, jamais ne perd un
+        # avis dû.
+        try:
+            ops.log_review_attempt(
+                lot, str(item.get("state") or ""),
+                "%s%d avis déjà rendu sur la tête fusionnée : %s"
+                % (TERMINAL_PREFIX, lot, reviewed_by), actor)
+        except Exception:  # noqa: BLE001 - marque de confort, jamais bloquante
+            pass
         return out
     mark = requirement_mark(lot, required=reviews, merged_sha=merged_sha,
                             author=author.get("name") or "",
@@ -1104,8 +1164,9 @@ def open_for_merge(db, lot: int, *, merged_sha: str = "", pr=None,
     relire la classe. `merged_class` garde la classe du diff fusionné (pour le
     rattrapage), `class` celle du lot de relecture ouvert. #2585 : un avis
     d'une autre famille déjà rendu sur la tête fusionnée donne
-    `already_reviewed` sans création. Ne lève jamais — la fusion est un fait
-    déjà enregistré."""
+    `already_reviewed` sans création ; `repo` sert aussi de preuve que le gel
+    relu est entré dans le commit fusionné. Ne lève jamais — la fusion est un
+    fait déjà enregistré."""
     lot = int(lot)
     out = {"lot": lot, "id": None, "created": False, "class": "",
            "merged_class": "", "critical": False, "reviews": 0,
@@ -1133,7 +1194,7 @@ def open_for_merge(db, lot: int, *, merged_sha: str = "", pr=None,
         out["doubt"] = bool(klass.get("doubt"))
         opened = open_after_merge(
             db, lot=lot, klass=klass, item=item, merged_sha=merged_sha, pr=pr,
-            target=where_target, actor=actor)
+            target=where_target, actor=actor, repo=repo)
         out.update({"id": opened.get("id"), "created": bool(opened.get("created")),
                     "class": opened.get("class") or out["class"],
                     "merged_class": opened.get("merged_class") or out["merged_class"],
@@ -1276,8 +1337,12 @@ def catch_up(db, *, repo: str = "", target: str = "",
                 reviewed_by = ", ".join(
                     "%s (%s)" % (entry.get("actor"), entry.get("family"))
                     for entry in done.get("reviewed_by") or ()) or "?"
-                terminal(lot, state, "avis déjà rendu sur la tête fusionnée : %s"
-                         % reviewed_by)
+                # `open_after_merge` a déjà posé la marque terminale avec la
+                # même raison ; ne pas la doubler (elle est best effort, le
+                # repli la pose si elle a manqué).
+                if not _noted(ops, lot, TERMINAL_PREFIX):
+                    terminal(lot, state, "avis déjà rendu sur la tête fusionnée : %s"
+                             % reviewed_by)
                 continue
             if done.get("id") or "déjà" in str(done.get("why") or ""):
                 # un autre exécuteur a ouvert la relecture entre la sélection
