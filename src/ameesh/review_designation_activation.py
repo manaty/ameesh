@@ -27,8 +27,11 @@ Inputs, all from machine sources (never a note, an assignment or a name):
   every commit of the frozen range through its exact provenance receipt
   (#1465), except a designated reviewer's first-round correction under the §2
   threshold (#2638: ≤ ~50 changed lines, no design). A commit without a
-  receipt makes the designation wait: an unknown family cannot prove
-  independence;
+  receipt makes the designation wait — an unknown family cannot prove
+  independence — unless it declares a managed Git author known to the registry
+  (#2721: a rebase/amend keeps the receipt on the old object, and a commit
+  older than the hooks has none). That fallback is named in the mark
+  (`proof: git-author`, `fallback_commits`), never written as a receipt;
 - **candidates**: the registry rows of the lot's project, real session family
   only (`registry.live_harness`), availability and open-lot load;
 - **pilot**: the project's `orchestrateur` in the canon, when registered; an
@@ -625,6 +628,49 @@ def _change(repo: str, sha: str) -> Optional[tuple[int, bool]]:
     return lines, design
 
 
+def _git_author_fallback(db, sha: str, repo: str, *, name: str, family: str,
+                         families) -> Optional[tuple[str, str]]:
+    """#2721 — the declared Git author of a commit without an exact receipt.
+
+    A rebase/amend creates a new object: the receipt stays on the old one, and
+    the frozen head carries none. A commit older than the hooks has none
+    either. The designation admits the commit's Git author **only** when both
+    its author and committer addresses are in the managed domain
+    (`<agent>@ameesh.invalid`) and the author is a registry agent; the family
+    is the reference author's when it is the same agent, otherwise the
+    registry's declared harness (`session_harness` as a last resort). The
+    caller journals the `git-author` proof; this is never a
+    `provenance_receipts` row and the train keeps refusing it.
+
+    Returns `(actor, family)` — family may be empty (known agent, unknown
+    family: the selection then waits on the family, not on the provenance) —
+    or None, which keeps the commit in the unknown list.
+    """
+    if not repo or not sha:
+        # without the repository under the hand, the Git author proves nothing
+        return None
+    declared = review_provenance.declared_author(sha, cwd=repo)
+    if declared is None:
+        return None
+    from .identity import GIT_EMAIL_DOMAIN
+    committer = str(declared.get("committer_email") or "").strip().lower()
+    if committer.rpartition("@")[2] != GIT_EMAIL_DOMAIN:
+        # the object was not created under the runner's managed identity
+        return None
+    actor = str(declared.get("agent") or "").strip()
+    row = registry.get(db, actor) if actor else None
+    if not row:
+        return None
+    # the Git address may name an alias: the primary name is what the
+    # selection's forbidden-names set and the reviewer column use
+    actor = str(row.get("name") or actor).strip()
+    if actor == name and family:
+        return actor, family
+    harness = str(row.get("harness") or "").strip() \
+        or str(row.get("session_harness") or "").strip()
+    return actor, _family(harness, families)
+
+
 def _authors(db, item: Mapping, milestone: Optional[Mapping],
              commits: Sequence[str], repo: str = "", families=()) -> tuple[list, list]:
     """`(authors, unknown authors)` drawn from the freeze and exact receipts.
@@ -636,6 +682,15 @@ def _authors(db, item: Mapping, milestone: Optional[Mapping],
     does not make its author an author of the head — their family stays
     eligible, and the same reviewer may be designated again on the new head.
     A larger or design change makes them an author like any other (#2638).
+
+    A commit without an exact receipt is not immediately unknown (#2721): a
+    rebase/amend leaves the receipt on the old object, and commits older than
+    the hooks have none. When the commit declares a managed Git author (and
+    committer) that the registry knows, that author is admitted as a named
+    fallback; the returned author row carries `proof: git-author` and the
+    fallback commit list. The exact receipt remains the only proof the train
+    reads, and a commit whose declared author is outside the registry stays
+    unknown.
 
     `families` are the compiled canon's model families (#2664), read at the
     same audited commit as the policy: no local list is assumed.
@@ -672,14 +727,27 @@ def _authors(db, item: Mapping, milestone: Optional[Mapping],
     if name:
         by_name.setdefault(name, set()).add(family)
     unknown = []
+    proofs: dict[str, set] = {}
     review_commits: dict[str, list[tuple[str, str]]] = {}
     for sha in commits or ():
         try:
             receipt = review_provenance.receipt_for_commit(db, sha)
         except review_provenance.ProvenanceError:
-            receipt = None
-        if receipt is None:
+            # a corrupt proof is not an absent one: the Git fallback only
+            # replaces an absent receipt, never contradicts an exact row
             unknown.append(str(sha)[:12])
+            continue
+        if receipt is None:
+            fallback = _git_author_fallback(db, str(sha), repo, name=name,
+                                            family=family, families=families)
+            if fallback is None:
+                unknown.append(str(sha)[:12])
+                continue
+            actor, proven = fallback
+            by_name.setdefault(actor, set())
+            if proven:
+                by_name[actor].add(proven)
+            proofs.setdefault(actor, set()).add(str(sha)[:12])
             continue
         actor = str(receipt.get("actor") or "").strip()
         if not actor:
@@ -707,7 +775,11 @@ def _authors(db, item: Mapping, milestone: Optional[Mapping],
         families = {f for f in by_name[actor] if f}
         # one actor with two proven families is an ambiguity: never guess
         family = next(iter(families)) if len(families) == 1 else ""
-        authors.append({"name": actor, "family": family})
+        row = {"name": actor, "family": family}
+        if proofs.get(actor):
+            row["proof"] = "git-author"
+            row["fallback_commits"] = sorted(proofs[actor])
+        authors.append(row)
     return authors, unknown
 
 

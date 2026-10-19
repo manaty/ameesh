@@ -20,6 +20,7 @@ from unittest import mock
 from ameesh import mail, registry, review_designation as rd
 from ameesh import review_designation_activation as act
 from ameesh import review_designation_pg as pg
+from ameesh import review_provenance as prov
 from ameesh import storage, work
 from ameesh.work_reviewers import designated
 
@@ -98,9 +99,9 @@ class _Repo:
         self.git("config", "user.name", "t")
         self.git("config", "user.email", "t@example.invalid")
 
-    def git(self, *args: str) -> str:
+    def git(self, *args: str, env=None) -> str:
         proc = subprocess.run(["git", "-C", self.root, *args],
-                              capture_output=True, text=True, env=self.dry)
+                              capture_output=True, text=True, env=env or self.dry)
         if proc.returncode:
             raise AssertionError("git %s: %s" % (" ".join(args), proc.stderr))
         return proc.stdout.strip()
@@ -111,9 +112,14 @@ class _Repo:
         with open(full, "w", encoding="utf-8") as handle:
             handle.write(text)
 
-    def commit(self, message: str) -> str:
+    def commit(self, message: str, *, agent: str = "") -> str:
+        env = None
+        if agent:
+            address = "%s@ameesh.invalid" % agent
+            env = dict(self.dry, GIT_AUTHOR_NAME=agent, GIT_AUTHOR_EMAIL=address,
+                       GIT_COMMITTER_NAME=agent, GIT_COMMITTER_EMAIL=address)
         self.git("add", "-A")
-        self.git("commit", "-qm", message)
+        self.git("commit", "-qm", message, env=env)
         return self.git("rev-parse", "HEAD")
 
 
@@ -574,6 +580,96 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertEqual(out["state"], rd.WAITING, out)
         self.assertIn("provenance unknown", out["why"])
         self.assertEqual([m["recipient"] for m in self.mailbox()], ["pilot"])
+
+    def test_a_rebased_commit_uses_its_declared_git_author(self):
+        """#2721 — un rebase crée un nouvel objet sans reçu.
+
+        Le reçu reste sur l'ancien commit ; le nouveau n'en a pas. Son auteur
+        Git déclaré, connu du registre, est admis avec la trace au gel — sans
+        écrire de faux reçu, que le train continuerait de refuser."""
+        self.repo.git("checkout", "-q", "-B", "topic", self.base)
+        self.repo.write("src/ameesh/work.py", "lot rebased\n")
+        old = self.repo.commit("lot", agent="author")
+        self.receipts(commits=[old])
+        # une vraie base neuve, puis un vrai rebase : la tête change d'objet
+        self.repo.git("checkout", "-q", "-B", "main", self.base)
+        self.repo.write("src/ameesh/other.py", "base 2\n")
+        new_base = self.repo.commit("base 2")
+        self.repo.git("checkout", "-q", "topic")
+        address = "author@ameesh.invalid"
+        rebase_env = dict(self.repo.dry, GIT_COMMITTER_NAME="author",
+                          GIT_COMMITTER_EMAIL=address)
+        self.repo.git("rebase", new_base, env=rebase_env)
+        rebased = self.repo.git("rev-parse", "HEAD")
+        self.assertNotEqual(rebased, old)
+        self.assertEqual(self.repo.git("log", "-1", "--format=%ae", rebased),
+                         address)
+        self.db.execute("UPDATE work_items SET branch_target = %s WHERE id = %s",
+                        (new_base, self.lot))
+        self.frozen = rebased
+        _, out = self.freeze()
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1", "r2"])
+        self.assertNotIn("provenance unknown", out["why"])
+        # le repli est une trace, pas un reçu : l'ancien objet garde le sien
+        self.assertIsNone(prov.receipt_for_commit(self.db, rebased))
+        self.assertEqual(prov.receipt_for_commit(self.db, old)["actor"], "author")
+        mark = pg.designation_of(self.marks()[0])
+        author = [a for a in mark["authors"] if a["name"] == "author"][0]
+        self.assertEqual(author["family"], "deepseek")
+        self.assertEqual(author["proof"], "git-author")
+        self.assertEqual(author["fallback_commits"], [rebased[:12]])
+
+    def test_a_commit_older_than_the_hooks_uses_the_registry_author(self):
+        """#2721 — un commit antérieur aux hooks n'a aucun reçu.
+
+        Son auteur Git déclaré, connu du registre, est admis par le même repli
+        nommé, au lieu de bloquer la désignation au gel."""
+        self.repo.git("checkout", "-q", "-B", "prehooks", self.base)
+        self.repo.write("src/ameesh/work.py", "avant les hooks\n")
+        head = self.repo.commit("avant les hooks", agent="author")
+        self.db.execute("DELETE FROM provenance_receipts")
+        self.frozen = head
+        _, out = self.freeze()
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        self.assertNotIn("provenance unknown", out["why"])
+        mark = pg.designation_of(self.marks()[0])
+        author = [a for a in mark["authors"] if a["name"] == "author"][0]
+        self.assertEqual(author["proof"], "git-author")
+        self.assertEqual(author["fallback_commits"], [head[:12]])
+
+    def test_a_git_author_outside_the_registry_still_waits(self):
+        """#2721 — le repli n'invente pas : une adresse d'agent que seul Git
+        connaît, absente du registre, laisse le gel en attente."""
+        self.repo.git("checkout", "-q", "-B", "ghost", self.base)
+        self.repo.write("src/ameesh/work.py", "fantôme\n")
+        head = self.repo.commit("fantôme", agent="ghost")
+        self.db.execute("DELETE FROM provenance_receipts")
+        self.frozen = head
+        _, out = self.freeze()
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.assertIn("provenance unknown", out["why"])
+
+    def test_a_corrupt_receipt_is_not_replaced_by_the_git_author(self):
+        """#2721 — le repli ne couvre qu'une preuve ABSENTE.
+
+        Une ligne de preuve qui contredit son sujet est une erreur du
+        fournisseur (`ProvenanceError`), pas une origine inconnue : le repli
+        Git ne doit pas la remplacer, le gel attend."""
+        self.repo.git("checkout", "-q", "-B", "corrupt", self.base)
+        self.repo.write("src/ameesh/work.py", "preuve corrompue\n")
+        head = self.repo.commit("preuve corrompue", agent="author")
+        self.db.execute(
+            "INSERT INTO provenance_receipts"
+            " (subject, sha, actor, session, turn, harness, work_item_id)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            " ON CONFLICT (subject) DO UPDATE SET sha = EXCLUDED.sha",
+            ("commit:" + head, "f" * 40, "author", "s-deepseek", "t",
+             "deepseek", self.lot))
+        self.frozen = head
+        _, out = self.freeze()
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.assertIn("provenance unknown", out["why"])
 
     def test_an_unknown_author_family_waits(self):
         self.db.execute("DELETE FROM turn_costs")

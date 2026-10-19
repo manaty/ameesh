@@ -137,3 +137,29 @@ gelée :
 
 La route du défaut non bloquant vers le backlog (N5) était déjà alignée par
 #1391 avant ce lot.
+
+## 6. Repli nommé de la désignation au gel (#2721, 19/10)
+
+Un rebase ou un amend crée un **nouvel objet** : le reçu de #1465 reste sur
+l'ancien, et le gel lit le nouveau. Un commit antérieur aux hooks n'en a jamais
+eu. La désignation au gel restait donc en attente « author provenance unknown »
+alors que le commit avait bien été produit par un agent connu (#652, #640,
+#2691/#2693).
+
+La désignation admet désormais l'**auteur Git déclaré** du commit quand toutes
+ces conditions tiennent :
+
+- l'adresse de l'auteur est `<agent>@ameesh.invalid` (le domaine posé par le
+  runner) et le local est un nom d'agent du registre ;
+- l'adresse du committer est dans le même domaine (l'objet a été créé sous une
+  identité managée, pas par un humain ou un Git étranger) ;
+- la famille vient de l'auteur de référence au gel quand c'est le même agent,
+  sinon du harnais déclaré au registre (`session_harness` en dernier recours).
+
+Le repli est une **trace**, pas un reçu : la marque de désignation porte
+`proof: git-author` et `fallback_commits` (les SHA admis par ce chemin), et
+`receipt_for_commit` continue de rendre `None` — le train #1467 ne lit que les
+preuves exactes. Un commit dont l'auteur Git n'est pas au registre reste
+`unknown`, et le gel attend. Témoin : un vrai rebase d'un commit muni d'un reçu
+gèle le nouvel objet et désigne les deux familles indépendantes
+(`test_a_rebased_commit_uses_its_declared_git_author`).

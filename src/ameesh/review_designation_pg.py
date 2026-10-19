@@ -83,6 +83,24 @@ def designation_of(note: str) -> Optional[dict]:
     return found
 
 
+def _mark_author(author) -> dict:
+    """One author of the frozen content, with its proof trace when it has one.
+
+    `proof: git-author` and `fallback_commits` are written only for an author
+    admitted by the #2721 fallback (a rewritten or pre-hook commit): the mark
+    keeps which commits relied on the declared Git author, so the decision is
+    auditable without pretending they carry an exact receipt."""
+    row = {"name": str((author or {}).get("name") or ""),
+           "family": str((author or {}).get("family") or "")}
+    proof = str((author or {}).get("proof") or "").strip()
+    if proof:
+        row["proof"] = proof
+        commits = (author or {}).get("fallback_commits")
+        if isinstance(commits, (list, tuple)):
+            row["fallback_commits"] = [str(commit) for commit in commits]
+    return row
+
+
 def _mark_note(lot: int, freeze_id: int, *, state: str, required: int, reviewers,
                missing: int, why: str, authors, policy_ref: str, sha: str,
                sent=()) -> str:
@@ -95,9 +113,7 @@ def _mark_note(lot: int, freeze_id: int, *, state: str, required: int, reviewers
         "missing": int(missing),
         "why": str(why or ""),
         "freeze": {"id": int(freeze_id), "sha": sha},
-        "authors": [{"name": str((a or {}).get("name") or ""),
-                     "family": str((a or {}).get("family") or "")}
-                    for a in authors or ()],
+        "authors": [_mark_author(a) for a in authors or ()],
         "policy_ref": str(policy_ref or ""),
         # #2557 : les courriels réellement déposés pour ce gel, en noms
         # primaires. La marque est écrite dans la même transaction qu'eux et
