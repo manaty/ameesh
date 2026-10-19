@@ -4413,11 +4413,9 @@ class AgentWorker(threading.Thread):
         témoin. Le réglage `lot_wake=off` ne l'éteint pas : c'est un geste
         posé, pas une relance d'inactivité. Les gardes de `_pick` (arrêt,
         budget, porte et pression d'hôte, authentification) sont déjà passées ;
-        un lot sans dossier reste armé (#811)."""
-        if storage.is_remote(self.db):
-            # L109 : le contrat de l'exécuteur médié ne porte pas encore
-            # l'échéance de lot ; le réveil reste porté par un exécuteur local.
-            return None
+        un lot sans dossier reste armé (#811). Sur un exécuteur médié, les
+        trois opérations passent par le contrat
+        (`lot_sessions.due_wakes/claim_wake/consume_wake`, #2613)."""
         if time.monotonic() - getattr(self, "_scheduled_wake_checked",
                                       float("-inf")) < self.SCHEDULED_WAKE_CHECK_S:
             return None
