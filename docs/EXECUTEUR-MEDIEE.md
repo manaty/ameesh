@@ -372,18 +372,20 @@ le consomment passent désormais par le contrat, au lieu d'être refusées :
   que `claim_ttl_s` écarte le lot (livraison en cours).
 - **`lot_sessions.claim_wake`** (écriture, portée B, enveloppe de bail) :
   `name`, `lot`, `now`, `claim_ttl_s`. Pose le bail de livraison
-  (`wake_claim_at`) et écrit la ligne `wake: scheduled wake delivered` au
-  journal ; l'échéance reste armée. Rend `{id, state, title, wake_ts}` ou
-  `null` si le réveil n'est plus dû, déjà réclamé, réassigné ou fini.
+  (`wake_claim_at`), sans rien écrire au journal (#2614) ; l'échéance reste
+  armée. Le détenteur renouvelle son bail avec `claim_ttl_s=0` tant que le
+  lancement se prépare. Rend `{id, state, title, wake_ts}` ou `null` si le
+  réveil n'est plus dû, déjà réclamé, réassigné ou fini.
 - **`lot_sessions.consume_wake`** (écriture, portée B, enveloppe de bail) :
   `name`, `lot`, `wake_ts`. Efface l'échéance réclamée **seulement** si elle
   porte encore le même `wake_ts` ; une échéance reposée entre-temps est
-  conservée. Rend `true` si elle a été consommée.
+  conservée, et écrit dans la même transaction la ligne `wake: scheduled
+  wake delivered` au journal (#2614). Rend `true` si elle a été consommée.
 
 La délivrance est un bail, pas une consommation : un drainage, un arrêt ou
 une panne entre le choix du tour et le lancement du harnais laisse le claim
 expirer ; le réveil est alors délivré de nouveau, sans doublon de témoin
-(une ligne `wake:` par délivrance). Le runner local et le runner médié
+(une ligne `wake:` par réveil consommé, #2614). Le runner local et le runner médié
 suivent le même chemin ; seule la couche de stockage diffère. Les opérations
 de session mises de côté (`lot_sessions.actionable`, `listing`, `note_wake`,
 `purge`, `switch`) restent refusées : elles portent l'état de session du

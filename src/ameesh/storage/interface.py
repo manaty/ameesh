@@ -3872,19 +3872,22 @@ class LotSessions(Domain):
     def claim_wake(self, name: str, lot: int, now: float,
                    claim_ttl_s: float = 120.0) -> dict | None:
         """#2466 : réclame le réveil programmé échu du lot (bail de livraison),
-        dans une transaction : `wake_claim_at` est posé et le journal reçoit
-        une ligne `wake: … delivered …` (témoin de la délivrance). Rend
-        `{id, state, title, wake_ts}` ou None si le lot n'a plus de réveil
-        échu, est déjà réclamé, n'est plus assigné à `name` ou est fini.
-        L'échéance n'est pas effacée : `consume_wake` le fera au lancement du
-        tour, un claim non consommé expirant après `claim_ttl_s`."""
+        en une écriture atomique : `wake_claim_at` est posé, rien n'est écrit
+        au journal (#2614). Rend `{id, state, title, wake_ts}` ou None si le
+        lot n'a plus de réveil échu, est déjà réclamé depuis moins de
+        `claim_ttl_s`, n'est plus assigné à `name` ou est fini. L'échéance
+        n'est pas effacée : `consume_wake` le fera au lancement du tour, un
+        claim non consommé expirant après `claim_ttl_s`. Le détenteur renouvelle
+        son bail avec `claim_ttl_s=0` tant que le lancement se prépare (#2614)."""
 
     @abc.abstractmethod
     def consume_wake(self, name: str, lot: int, wake_ts: float) -> bool:
         """#2466 : consomme le réveil programmé délivré : efface `wake_at` et
         `wake_claim_at` (une seule fois), **seulement** si l'échéance est
         encore celle qui a été réclamée (`wake_ts`) et sous claim — une
-        nouvelle échéance posée entre-temps est conservée. Rend False sinon."""
+        nouvelle échéance posée entre-temps est conservée. Rend False sinon.
+        #2614 : la consommation écrit au journal, dans la même transaction, la
+        ligne `wake: … delivered …` — un témoin par réveil réellement délivré."""
 
     @abc.abstractmethod
     def purge(self, name: str | None = None) -> list[dict]:

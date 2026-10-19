@@ -564,6 +564,10 @@ class AgentWorker(threading.Thread):
         self._lot_wake_checked = float("-inf")
         #: #2466 : dernière lecture des réveils programmés échus
         self._scheduled_wake_checked = float("-inf")
+        #: #2614 : réveil programmé réclamé, pas encore consommé ({lot,
+        #: wake_ts}) — le battement du tour en renouvelle le bail
+        self._wake_claim: dict | None = None
+        self._wake_claim_renewed = float("-inf")
         self.state_dir = self.cfg.agent_dir(self.name)
         self.renew_failures = 0
         #: #2600 : horloge du bail, injectable par les tests de course. Elle
@@ -1375,6 +1379,7 @@ class AgentWorker(threading.Thread):
         while not stop_event.wait(self.wait_timeout(attente)):
             if not self.renew():
                 return
+            self._renew_wake_claim()
             if self.renew_failures:
                 attente = reprise.echec()
             else:
@@ -4417,8 +4422,41 @@ class AgentWorker(threading.Thread):
     #: #2466 : intervalle minimal entre deux lectures des réveils programmés
     SCHEDULED_WAKE_CHECK_S = 10.0
     #: #2466 : bail de livraison d'un réveil ; non consommé (drainage, arrêt,
-    #: panne avant lancement), il expire et le réveil est délivré de nouveau
+    #: panne avant lancement), il expire et le réveil est délivré de nouveau.
+    #: #2614 : renouvelé par le battement tant que le tour se prépare — un
+    #: lancement plus long que le bail ne le laisse plus expirer.
     WAKE_CLAIM_TTL = 120.0
+
+    def _renew_wake_claim(self) -> None:
+        """#2614 : renouvelle le bail du réveil réclamé, depuis le battement.
+
+        Le bail de 120 s couvrait le choix du tour mais pas sa préparation
+        (rotation, dossier, attente du READY, résident) : au-delà, le claim
+        expirait et le réveil pouvait être délivré une seconde fois avant la
+        consommation du premier. Le battement ne tourne que sous le bail de
+        l'agent, donc seul le détenteur renouvelle (`claim_wake` avec
+        `claim_ttl_s=0`). Le claim est oublié à la consommation et en fin du
+        tour qui le porte : un tour non lancé laisse le bail expirer et le
+        réveil est délivré de nouveau (#2466 B1). Une base en panne laisse le
+        claim tel quel ; le prochain battement réessaie."""
+        claim = getattr(self, "_wake_claim", None)
+        if claim is None or (time.monotonic() - getattr(
+                self, "_wake_claim_renewed", float("-inf")) < self.WAKE_CLAIM_TTL / 4.0):
+            return
+        try:
+            taken = storage.of(self.db).lot_sessions.claim_wake(
+                self.name, int(claim["lot"]), time.time(), 0.0)
+        except db_mod.DbError as exc:
+            log_async("[%s] scheduled wake claim for lot #%s not renewed (%s)"
+                      % (self.name, claim["lot"], exc))
+            return
+        if self._wake_claim is not claim:
+            return  # consommé ou oublié pendant l'appel
+        if not taken or abs(float(taken["wake_ts"]) - float(claim["wake_ts"])) >= 0.001:
+            # échéance consommée, annulée ou reposée : plus rien à tenir
+            self._wake_claim = None
+            return
+        self._wake_claim_renewed = time.monotonic()
 
     def _scheduled_wake_spec(self) -> dict | None:
         """#2466 : réveil programmé échu d'un lot de l'agent.
@@ -4452,6 +4490,9 @@ class AgentWorker(threading.Thread):
                                       self.WAKE_CLAIM_TTL)
                 if not taken:
                     continue
+                self._wake_claim = {"lot": int(taken["id"]),
+                                    "wake_ts": float(taken["wake_ts"])}
+                self._wake_claim_renewed = time.monotonic()
                 when = time.strftime("%Y-%m-%d %H:%M %Z",
                                      time.localtime(float(taken["wake_ts"])))
                 log_async("[%s] scheduled wake for lot #%s claimed (due %s)"
@@ -4477,6 +4518,7 @@ class AgentWorker(threading.Thread):
         reveil = spec.get("scheduled_wake")
         if not reveil or not getattr(self, "_turn_launched", False):
             return
+        self._wake_claim = None  # #2614 : plus de bail à renouveler
         lot = int(reveil["lot"])
         try:
             if storage.of(self.db).lot_sessions.consume_wake(
@@ -4833,6 +4875,18 @@ class AgentWorker(threading.Thread):
                       % (self.name, db_mod.explain(exc)))
 
     def run_turn(self, spec: dict) -> bool | None:
+        """Un tour (voir `_run_turn_or_defer`).
+
+        #2614 : le tour qui porte un réveil programmé oublie son claim en
+        sortant, lancé ou non : non consommé, le bail n'est plus renouvelé,
+        expire, et le réveil est délivré de nouveau."""
+        try:
+            return self._run_turn_or_defer(spec)
+        finally:
+            if spec.get("scheduled_wake"):
+                self._wake_claim = None
+
+    def _run_turn_or_defer(self, spec: dict) -> bool | None:
         """Exclude attach for the whole turn and life of its resident.
 
         Rend `True` (tour lancé), `False` (échec) ou `None` quand le tour est
