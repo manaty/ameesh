@@ -20,6 +20,7 @@ from unittest import mock
 
 from ameesh import merge_pr, merge_queue, radar, work
 
+from .support import patch_families
 from .test_l160b_radar import _git, git_env
 
 
@@ -74,6 +75,8 @@ class _Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="ameesh-1003-test-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        # #2664 : banc sans canon ; familles compilées épinglées.
+        patch_families(self)
         self.repo = os.path.join(self.tmp, "repo")
         os.makedirs(self.repo)
         _git(self.repo, "init", "-q")
@@ -123,7 +126,7 @@ class _Base(unittest.TestCase):
                 mock.patch.object(work, "note", side_effect=self._note),
                 mock.patch.object(work, "events", side_effect=self._events),
                 mock.patch.object(merge_queue, "actor_family",
-                                  side_effect=lambda db, n: self.FAMILIES.get(
+                                  side_effect=lambda db, n, **_: self.FAMILIES.get(
                                       str(n or "").strip(), ""))):
             patch.start()
             self.addCleanup(patch.stop)

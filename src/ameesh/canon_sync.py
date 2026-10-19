@@ -422,6 +422,32 @@ def state_key(db: Db, canon: Canon, host: str) -> str:
     return canon.id
 
 
+def audited_commit(db: Db, cfg, canon: Canon, source) -> str:
+    """Le commit exact à lire pour ce canon : le dernier audité de l'hôte.
+
+    `canon_state.last_good_commit` est le commit que l'hôte a audité ; la
+    référence configurée peut être en avance (un fetch sans synchro). Un état
+    enregistré fait foi même si le passage courant est invalide (B2 de la
+    relecture cx2 de #2447) : sans dernier commit valide il n'y a pas de
+    politique auditée, et l'on ne retombe jamais sur la référence. Sans état
+    du tout (banc, premier démarrage), le commit exact de la source est le
+    seul connu ; `mechanics.load` refuse encore une référence non commit.
+
+    Une **lecture impossible** de l'état n'est pas une absence d'état : elle
+    remonte à l'appelant, qui refuse la politique ou les familles sans jamais
+    lire la référence configurée, non auditée.
+    """
+    key = state_key(db, canon, getattr(cfg, "host", ""))
+    state = storage.of(db).canon.state(getattr(cfg, "host", ""), key)
+    if state is not None:
+        commit = str(state.get("last_good_commit") or "").strip().lower()
+        root = str(state.get("root") or "")
+        if commit and (not root or root == str(getattr(canon, "root", "") or "")):
+            return commit
+        return ""
+    return str(getattr(source, "commit", "") or "").strip().lower()
+
+
 def record_state(db: Db, host: str, status: str, diagnostic: str,
                  canon: Canon | None = None, *, key: str | None = None) -> None:
     """Écrit l'état du canon de `host` ; le dernier commit valide ne suit que `ok`.
