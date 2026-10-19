@@ -422,6 +422,35 @@ class PreemptResidentTest(unittest.TestCase):
             worker._solde_steers(False)
         release.assert_called_once()
 
+    def test_steer_settled_at_the_end_of_a_turn_without_mail(self):
+        """B8 : un steer reçu pendant un tour de consigne (sans courrier) est
+        soldé à sa fin effective, ou libéré si le tour échoue."""
+        import threading
+        import types
+        from types import SimpleNamespace
+        from unittest import mock
+        from ameesh.runner import AgentWorker
+        for result, attendu in ((True, "deliver"), (False, "release")):
+            worker = self._worker(_FakeDriver())
+            worker.runner = SimpleNamespace(
+                runner_id="r1", draining=threading.Event(), restart_for_stale=False,
+                gate_holds=lambda: False, host_pressure=lambda: {}, dry_run=False)
+            worker._held_by_pressure = lambda pression: ""
+
+            def tour(spec, _r=result, _w=worker):
+                _w._steer_pending.append(("jeton", [3]))  # steer accepté en cours de tour
+                return _r
+            worker._run_turn = tour
+            worker._run_guarded_turn = types.MethodType(AgentWorker._run_guarded_turn, worker)
+            with mock.patch("ameesh.runner.mail.deliver", return_value=[3]) as deliver, \
+                    mock.patch("ameesh.runner.mail.release") as release:
+                self.assertIs(worker._run_guarded_turn({"kind": "prompt"}), result)
+            appel = deliver if attendu == "deliver" else release
+            autre = release if attendu == "deliver" else deliver
+            appel.assert_called_once()
+            autre.assert_not_called()
+            self.assertEqual(worker._steer_pending, [])
+
     def test_second_request_during_steer_is_kept(self):
         """B10 : une demande arrivée pendant le steer n'est pas effacée."""
         from unittest import mock

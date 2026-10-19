@@ -5046,7 +5046,16 @@ class AgentWorker(threading.Thread):
         if pression.get("blocked"):
             self.runner.pressure_bypassed(self.name)  # orchestrateur ou auditeur
         if not candidats or self.runner.dry_run:
-            return self._run_turn(spec)
+            # L77/B8 : un steer humain reçu pendant un tour sans courrier
+            # (consigne, suite, relance) est soldé à sa fin effective lui aussi.
+            with self.lock:
+                self._steer_pending = []
+            result = False
+            try:
+                result = self._run_turn(spec)
+                return result
+            finally:
+                self._solde_steers(result)
         kind = spec["kind"]
         budget = self._budget_courrier()
         envelopes = spec.get("envelopes")
