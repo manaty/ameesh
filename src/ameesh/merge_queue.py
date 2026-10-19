@@ -61,6 +61,14 @@ class QueueError(RuntimeError):
     """A lot that cannot enter the queue: actionable message."""
 
 
+class RegistryReadError(QueueError):
+    """#2521 : le registre des agents n'a pas pu être lu.
+
+    Ce n'est pas une famille inconnue (agent absent, harnais non reconnu) :
+    conclure `verdicts-missing` sur une lecture impossible ferait écarter un
+    lot prêt du paquet. Le diagnostic doit nommer l'échec de lecture."""
+
+
 # --------------------------------------------------------------------------
 # entering and leaving
 # --------------------------------------------------------------------------
@@ -120,6 +128,11 @@ CRITICAL_SCOPE = (
                # la porte de fusion hors API, la classe du lot et son classement
                # (#2249 ; ligne perdue dans une composition, restaurée #2374)
                r"(^|/)(merge_pr|lot_class|review)\.py$|"
+               # ce qui entre dans un paquet : la liste calculée des lots
+               # prêts et ses remises (#2496)
+               r"^src/ameesh/packet_candidates\.py$|^scripts/paquet-candidats\.py$|"
+               # le report des verdicts acquis sur une tête réalignée (#2442)
+               r"^src/ameesh/verdict_carry\.py$|"
                # preuve de famille indépendante des avis (#2265)
                r"^src/ameesh/(review_lot|registry)\.py$"),
 )
@@ -162,8 +175,12 @@ def critical_scope(klass) -> bool:
 
 def required_verdicts(klass) -> int:
     """Le nombre d'avis indépendants : deux pour un chemin critique, même si
-    le canon l'a omis ou classé léger ; sinon 0 pour léger, 1 pour normal et
-    1 pour sensible hors SQL, sécurité et prod.
+    le canon l'a omis ou classé léger ; sinon le plancher déclaré pour un lot
+    léger (`light_reviews`, §2 : un avis, #2642), 1 pour normal et 1 pour
+    sensible hors SQL, sécurité et prod.
+    Un lot léger **sans chemin changé** n'a rien à relire : 0. Le plancher est
+    lu par le lecteur de classe (`lot_class`), donc le même que la désignation
+    au gel et `paquet-candidats` ; il ne reclasse jamais la classe.
     Un doute de classe (politique ou diff illisible, `files` vide) est
     sensible : un avis d'une autre famille (canon §2, owner 15/10 : deux
     familles seulement pour droits SQL, secrets, paiement, prod réelle ;
@@ -183,7 +200,9 @@ def required_verdicts(klass) -> int:
     if klass.get("files") and critical_scope(klass):
         return CRITICAL_REVIEWS
     if cls == lot_class.LIGHT:
-        return 0
+        if not klass.get("files"):
+            return 0
+        return int(klass.get("light_reviews") or 0)
     if cls in (lot_class.NORMAL, lot_class.RELEASE):
         return 1
     return SENSITIVE_REVIEWS
@@ -210,15 +229,20 @@ def _same_sha(a, b, repo: str | None = None) -> bool:
 def actor_family(db, name) -> str:
     """La famille de modèle d'un agent (`claude`, `codex`, `deepseek`), "" si
     elle n'est pas connue : un humain, un agent absent du registre, un harnais
-    non reconnu. L'indépendance d'un avis ne se suppose jamais (#1374)."""
+    non reconnu. L'indépendance d'un avis ne se suppose jamais (#1374).
+
+    Une lecture du registre impossible lève `RegistryReadError` (#2521) : la
+    famille n'est pas « inconnue », elle n'a pas pu être lue ; les appelants
+    qui ne peuvent rien en faire d'autre l'attrapent explicitement."""
     from . import registry, review_lot
     name = str(name or "").strip()
     if not name or name.startswith(work.HUMAN_PREFIX) or ":" in name:
         return ""
     try:
         row = registry.get(db, name) or {}
-    except Exception:  # noqa: BLE001 - registre illisible : famille inconnue
-        return ""
+    except Exception as exc:  # noqa: BLE001 - #2521 : lecture impossible, pas inconnue
+        raise RegistryReadError(
+            "cannot read the agent registry for %s: %s" % (name, exc)) from exc
     return review_lot.family_of(registry.live_harness(row))
 
 
@@ -300,14 +324,15 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     blocage, celui d'un autre relecteur ne le masque pas. Un blocage encore en
     vigueur refuse la porte, quelle que soit la classe.
 
-    Le nombre d'avis dépend de la classe (`required_verdicts`) : 1 pour un lot
-    normal et pour un lot sensible hors SQL/sécurité/prod — un doute de classe
-    reste sensible —, 2 pour un lot sensible qui touche ces domaines. Les avis
-    comptés sont **indépendants** : jamais le travail de l'auteur ; pour une
-    classe sensible, une famille de modèle connue et autre que celle de
-    l'auteur ; pour deux avis, deux familles distinctes. L'indépendance ne se
-    suppose jamais : une famille d'auteur inconnue refuse la porte (canon §2,
-    décision 18855a).
+    Le nombre d'avis dépend de la classe (`required_verdicts`) : le plancher
+    déclaré pour un lot léger (#2642), 1 pour un lot normal et pour un lot
+    sensible hors SQL/sécurité/prod — un doute de classe reste sensible —,
+    2 pour un lot sensible qui touche ces domaines. Les avis comptés sont
+    **indépendants** : jamais le travail de l'auteur ; pour un lot léger à
+    plancher déclaré et pour une classe sensible, une famille de modèle connue
+    et autre que celle de l'auteur ; pour deux avis, deux familles distinctes.
+    L'indépendance ne se suppose jamais : une famille d'auteur inconnue refuse
+    la porte (canon §2, décision 18855a).
 
     #1979 : le pilote peut marquer « verdict non requis » (`work.reviewer
     --no-verdict`, colonne `reviewer = -none`, geste d'autorité journalisé) ;
@@ -333,8 +358,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     # une copie antérieure au gel.
     waived, waived_by, row = _waiver(db, item)
     author = str(row.get("assignee") or "").strip()
-    out = {"ok": False, "why": "", "class": cls, "required": 0, "accepted": [],
-           "blocked": [], "waived": waived, "waived_by": waived_by,
+    out = {"ok": False, "why": "", "error": "", "class": cls, "required": 0,
+           "accepted": [], "blocked": [], "waived": waived, "waived_by": waived_by,
            "author": author, "author_family": "", "on_freeze": 0}
     if not frozen:
         out["why"] = "no freeze to review: the fire names the exact frozen head"
@@ -365,16 +390,29 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     if required == 0:
         out["ok"] = True
         return out
-    author_family = actor_family(db, author)
+    try:
+        author_family = actor_family(db, author)
+    except RegistryReadError as exc:
+        # #2521 : le registre est illisible, ce n'est pas « famille inconnue ».
+        # La porte refuse toujours (l'indépendance ne se suppose pas) mais le
+        # diagnostic doit dire la lecture impossible, pas un verdict manquant.
+        out["error"] = str(exc)
+        out["why"] = ("no review verdict ok on the freeze %s (class: %s): the agent "
+                      "registry cannot be read (%s), so no verdict can be proven "
+                      "independent (canon §2: independence is never assumed)"
+                      % (frozen[:12], cls, exc))
+        return out
     out["author_family"] = author_family
     # L'indépendance ne se suppose jamais (canon §2, décision 18855a) : une
     # classe sensible — y compris un doute de classe, qui peut cacher SQL, la
-    # sécurité ou la prod — n'accepte que des familles connues et autres que
-    # celle de l'auteur. Famille d'auteur inconnue (agent absent du registre,
-    # harnais non reconnu) : aucun avis ne peut être prouvé indépendant, la
-    # porte refuse et le dit. Un auteur humain n'a pas de famille de modèle :
-    # il n'y a rien à comparer, seules les familles des relecteurs comptent.
-    strict = required >= 2 or cls == lot_class.SENSITIVE
+    # sécurité ou la prod — et un lot léger à plancher déclaré (#2642 : le §2
+    # demande « un avis d'une autre famille ») n'acceptent que des familles
+    # connues et autres que celle de l'auteur. Famille d'auteur inconnue
+    # (agent absent du registre, harnais non reconnu) : aucun avis ne peut être
+    # prouvé indépendant, la porte refuse et le dit. Un auteur humain n'a pas
+    # de famille de modèle : il n'y a rien à comparer, seules les familles des
+    # relecteurs comptent.
+    strict = required >= 2 or cls in (lot_class.LIGHT, lot_class.SENSITIVE)
     author_human = bool(author) and author.lower().startswith(work.HUMAN_PREFIX)
     if strict and not author_family and not author_human:
         out["why"] = ("no review verdict ok on the freeze %s (class: %s): the author %s has "
@@ -388,7 +426,15 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         actor = str(mark.get("actor") or "").strip()
         if author and actor and actor.lower() == author.lower():
             continue                      # on ne relit pas son propre travail
-        family = actor_family(db, actor)
+        try:
+            family = actor_family(db, actor)
+        except RegistryReadError as exc:
+            out["error"] = str(exc)
+            out["why"] = ("no review verdict ok on the freeze %s (class: %s): the agent "
+                          "registry cannot be read (%s), so the reviewer %s cannot be "
+                          "proven independent (canon §2: independence is never assumed)"
+                          % (frozen[:12], cls, exc, actor or "(none)"))
+            return out
         if strict:
             if not family:
                 continue                  # famille du relecteur inconnue : non prouvée
@@ -420,6 +466,47 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                   "verdict(s) required, %s; got %s"
                   % (frozen[:12], cls, required, need, got))
     return out
+
+
+def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None) -> dict | None:
+    """La porte des avis du dernier gel d'un lot, lue comme la composition du
+    paquet (`packet_candidates`) : dépôt retrouvé par le commit gelé (#2559,
+    l'hôte qui lit le lot n'est pas toujours celui de son auteur), classe du
+    diff gelé, puis `review_gate`.
+
+    Rend None quand la lecture n'est pas concluante (pas de gel, dépôt
+    introuvable, classe en doute sans chemin lisible) : l'appelant ne doit
+    jamais lire None comme une porte ouverte. Lecture seule."""
+    from . import lot_class
+
+    freeze = plan_git.latest_freeze(marks or ())
+    frozen = str((freeze or {}).get("sha") or "").strip()
+    repo = lot_class.repo_for_freeze(db, cfg, item, frozen) if frozen else ""
+    try:
+        # Comme la file : origin/<cible> avant la branche locale, qui peut
+        # encore contenir dans le diff des changements déjà fusionnés (#2207).
+        target = lot_class.default_base(cfg, item, repo) if repo else None
+        base = _class_base(repo, target) if target else None
+        base_sha = plan_git._commit(repo, base) if base else None
+        klass = klass or lot_class.of_lot(
+            db, int((item or {}).get("id") or 0), cfg=cfg, item=item,
+            repo=repo or None, head=frozen or None, milestones=marks or None,
+            base=base, base_sha=base_sha)
+    except Exception:  # noqa: BLE001 - une lecture ratée ne conclut pas
+        return None
+    if not klass:
+        return None
+    if klass.get("doubt") and not klass.get("files"):
+        return None
+    frozen = str(klass.get("frozen_sha") or frozen or "").strip()
+    if not frozen:
+        return None
+    try:
+        return review_gate(db, marks or [], frozen,
+                           repo=klass.get("repo") or repo or None,
+                           klass=klass, item=item)
+    except Exception:  # noqa: BLE001 - une porte illisible ne conclut pas
+        return None
 
 
 def _remote_branch(name: str) -> str:
@@ -787,7 +874,10 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
 
     La classe se lit entre la cible **fraîche** et la tête gelée. Seul `base`
     est une cible fraîche : le commit que l'appelant vient de récupérer
-    (`readiness`), ou `target` quand il nomme déjà un commit. Sinon, la borne
+    (`readiness`), ou `target` quand il nomme déjà un commit. Ce commit est
+    aussi la révision exacte du diff (`base_sha`, #2318), jamais une ref que le
+    fetch concurrent du radar peut déplacer entre la lecture et la classe.
+    Sinon, la borne
     est la cible que le radar a laissée sous `QUEUE_REF` dans son clone, à défaut
     `origin/<cible>` du dépôt des agents, puis sa cible locale : c'est la
     cible du **dernier** fetch connu, que rien ne prouve fraîche — un fetch
@@ -830,7 +920,7 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
             # `readiness` n'écrit que dans le clone).
             if fresh and plan_git._commit(path, fresh) and plan_git._commit(path, tip):
                 paths.append((path, _class_ref(path, target, fresh,
-                                               queue=cloned and path == source)))
+                                               queue=cloned and path == source), fresh))
         if not paths:
             # aucune cible fraîche lisible : repli explicite sur les refs de
             # cible disponibles. Ce repli ne prouve pas la fraîcheur : un
@@ -839,15 +929,15 @@ def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str
             # et `of_lot` peut alors rendre une classe calculée, `light`
             # comprise, au lieu d'un doute. L'admission doit refuser une cible
             # absente (#2278) ; ce repli ne le garantit pas (#2284).
-            paths.append((source, _class_base(source, target, queue=cloned) or target))
+            paths.append((source, _class_base(source, target, queue=cloned) or target, None))
             if cloned:
-                paths.append((repo, _class_base(repo, target) or target))
+                paths.append((repo, _class_base(repo, target) or target, None))
     else:
-        paths.append((repo, target))
+        paths.append((repo, target, None))
     best = None
-    for path, base_ref in paths:
+    for path, base_ref, base_sha in paths:
         current = lot_class.of_lot(db, lot, cfg=cfg, item=item, repo=path, base=base_ref,
-                                   head=tip)
+                                   head=tip, base_sha=base_sha)
         if best is None or _class_worse(current, best):
             best = current
     if (target and base is None and best is not None

@@ -57,6 +57,11 @@ pouvait le prendre (#2340). `required_family` relit la même preuve au moment
 de la prise et `may_take` n'ouvre le lot qu'à la famille opposée ; l'auteur
 inconnu ne se devine pas, et le lot attend alors une attribution explicite.
 
+#2552 : la référence d'un lot de relecture se lit aussi sur sa `source`. Des
+lots historiques la portent là avec un `issue_ref` GitHub (ou aucun) et
+échappaient à la garde de famille de #2377 ; la prise les écarte désormais de
+la famille de l'auteur de #N comme les lots courants.
+
 #2374 : une fusion classée `light` dont le diff touche pourtant la porte de
 fusion (`merge_queue.CRITICAL_SCOPE`) ouvre une relecture **sensible** à deux
 avis de familles distinctes. L'ouverture écrit en outre, au journal du lot
@@ -128,9 +133,11 @@ FREEZE_TURN_WINDOW_S = 1800.0
 BLOCKING = ("un défaut **bloquant** (B, P1) trouvé après la fusion ouvre aussitôt un lot de "
             "correction, qui passe avant tout nouveau travail ; un défaut **non bloquant** "
             "(N, P2, P3) ne crée pas de lot : il va au backlog "
-            "(`ameesh work backlog add --title … --value … --score …`), regroupé avec les "
-            "autres défauts mineurs du même chantier (canon §2, owner du 15/10/2026 ; sur "
-            "ameesh, un P2 de la classe sensible bloque encore)")
+            "(`ameesh work backlog add --title … --value … --score … --review-of <lot>`), "
+            "regroupé avec les autres défauts mineurs du même chantier — sous le seuil de "
+            "lot du canon, une ligne du panier du chantier — et un défaut trouvé en "
+            "relisant une suite d'avis ne crée rien (canon §2, owner du 15/10/2026 puis du "
+            "19/10/2026 ; sur ameesh, un P2 de la classe sensible bloque encore)")
 
 
 def ref_of(lot: int) -> str:
@@ -399,22 +406,38 @@ def _author_at_freeze(db, lot: int, item: dict) -> dict:
     return out
 
 
+def review_ref(item: dict) -> str:
+    """La référence `review-after-merge:#<lot>` que porte le lot (#2552).
+
+    `issue_ref` d'abord — c'est la marque écrite par l'ouverture —, puis
+    `source` : des lots de relecture plus anciens portent la référence en
+    `source` seulement, avec un `issue_ref` GitHub ou vide (#1218, #1231,
+    #1269). Rend "" hors lot de relecture ; la chaîne brute (minuscule) sinon,
+    que `required_family` valide."""
+    item = item or {}
+    for field in ("issue_ref", "source"):
+        ref = str(item.get(field) or "").strip().lower()
+        if ref.startswith(PREFIX):
+            return ref
+    return ""
+
+
 def required_family(db, item: dict) -> Optional[str]:
     """La famille de harnais qu'exige la prise d'un lot de relecture (#2377).
 
-    `None` quand ce n'est pas un lot de relecture (`issue_ref` hors du préfixe
-    `review-after-merge:`) : aucune garde. Une chaîne vide quand la famille de
-    l'auteur au gel est inconnue, ou quand sa trace est illisible : le lot
-    n'est alors **pris par personne** au repos (doute -> non pris, canon §8) et
-    attend une attribution explicite. Sinon la famille opposée à celle de
-    l'auteur au gel (`reviewer_family`), celle que le canon §2 demande au
-    relecteur.
+    `None` quand ce n'est pas un lot de relecture (ni `issue_ref` ni `source`
+    sous le préfixe `review-after-merge:`, #2552) : aucune garde. Une chaîne
+    vide quand la famille de l'auteur au gel est inconnue, ou quand sa trace
+    est illisible : le lot n'est alors **pris par personne** au repos (doute ->
+    non pris, canon §8) et attend une attribution explicite. Sinon la famille
+    opposée à celle de l'auteur au gel (`reviewer_family`), celle que le canon
+    §2 demande au relecteur.
 
     La lecture réutilise `_author_at_freeze` : c'est la même preuve que celle
     qui a écrit le corps du lot (gel, acteur, tours tracés), jamais le registre
     courant — il ne dit rien du harnais qui a produit le travail (#1053)."""
-    ref = str((item or {}).get("issue_ref") or "").strip().lower()
-    if not ref.startswith(PREFIX):
+    ref = review_ref(item)
+    if not ref:
         return None
     try:
         lot = int(ref[len(PREFIX):].strip().lstrip("#"))
@@ -455,6 +478,10 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
     """Le corps du lot de relecture : quoi relire, par qui, avant quand."""
     author = author or {}
     who = author.get("name") or "inconnu"
+    # #2384 : la famille se lit sur le harnais du gel, jamais sur le texte
+    # affiché (le nom d'un tiers qui a reposé le gel peut contenir un mot de
+    # famille) ; le corps doit annoncer exactement ce que la garde relira.
+    author_family = family_of(author.get("harness"))
     harness = author.get("harness") or UNTRACED
     if author.get("refroze"):
         # #1859 : un tiers a reposé le gel ; il n'est pas l'auteur
@@ -462,7 +489,9 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
     where = "PR #%s" % pr if pr else (merged_sha[:12] if merged_sha else "?")
     why = " ".join(str((klass or {}).get("why") or "").split())
     critical = bool((klass or {}).get("critical"))
-    families = review_families(harness) if critical else ()
+    families = review_families(author.get("harness")) if critical else ()
+    author_human = who.lower().startswith(work.HUMAN_PREFIX)
+    untraced = critical and not author_family and not author_human
     lines = [
         ("Relecture après fusion (canon `processus/lots.md` §2, **porte de fusion** : "
          "deux avis indépendants)." if critical
@@ -476,6 +505,19 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
                                      target or item.get("branch_target") or "sa cible"),
         "- Auteur : %s (harnais %s)." % (who, harness),
     ]
+    if untraced:
+        # #2384 : sans famille d'auteur tracée, les deux avis ne peuvent pas
+        # prouver leur indépendance et la garde de livraison refuse `--done`.
+        # Le corps le dit avant les verdicts, avec la route de sortie.
+        lines.extend([
+            "- **Famille de l'auteur non tracée** : l'indépendance des deux avis "
+            "ne peut pas être prouvée ; `ameesh work close <id> --done` sera refusé "
+            "même après deux verdicts `ok` (garde de livraison, #2374).",
+            "- Route : livrer les verdicts sur le lot source, puis saisir le pilote ; "
+            "il tranche l'abandon de la mission (`ameesh work close <id> --abandoned`), "
+            "son remplacement (`--superseded-by <id>`) ou une dispense, consignée dans "
+            "la note de clôture. Ne pas clore `--done` : la garde le refuse.",
+        ])
     if critical:
         lines.extend([
             "- Relecteurs : **deux familles distinctes**, hors de celle de l'auteur — "
@@ -504,9 +546,11 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
             "- livrer le verdict (`ameesh work milestone %d verdict ok|blocked --sha %s`) ;"
             % (int(lot), merged_sha or "<sha>"))
     lines.extend([
-        "- **livré le verdict ? clore cette mission** : `ameesh work close <id> --done` — "
-        "elle n'a ni branche ni fusion, et le verdict du parent relu en est la preuve "
-        "(#1280) ;",
+        ("- **livrés les verdicts ? saisir le pilote** pour clore cette mission "
+         "selon la route ci-dessus ;" if untraced else
+         "- **livré le verdict ? clore cette mission** : `ameesh work close <id> --done` — "
+         "elle n'a ni branche ni fusion, et le verdict du parent relu en est la preuve "
+         "(#1280) ;"),
         "- si un défaut **non bloquant** se corrige en moins de 5 minutes, le corriger "
         "et pousser la correction sur la cible : le relecteur corrige lui-même dès le "
         "premier tour (canon §2, home#81) ; les autres défauts non bloquants vont au "
@@ -525,7 +569,9 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
         "",
         ("Ce lot n'est assigné à personne : le premier relecteur disponible de la bonne "
          "famille le prend ; une seconde famille doit rendre le second avis avant la "
-         "clôture." if critical else
+         "clôture." + (" La clôture `--done` reste soumise à la route ci-dessus tant "
+                       "que la famille de l'auteur n'est pas tracée." if untraced else "")
+         if critical else
          "Ce lot n'est assigné à personne : il est dans la file de l'équipe, le premier "
          "relecteur disponible de la bonne famille le prend."),
     ])
@@ -575,8 +621,12 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
                    + "porte de fusion : chemin critique, deux avis requis",
         })
     review_class = str(klass.get("class") or "")
+    # #2642 : le plancher léger vient du canon quand la classe le porte (le
+    # lecteur `lot_class` l'a lu pour ce même diff) ; le plancher historique
+    # d'un avis reste le repli d'une classe sans paramètre, jamais zéro.
     reviews = (CRITICAL_REVIEWS if critical
-               else LIGHT_REVIEWS if merged_class == lot_class.LIGHT else 0)
+               else int(klass.get("light_reviews") or LIGHT_REVIEWS)
+               if merged_class == lot_class.LIGHT else 0)
     out = {"lot": lot, "id": None, "created": False, "class": review_class,
            "merged_class": merged_class, "critical": critical,
            "reviews": reviews, "why": ""}
@@ -747,7 +797,9 @@ def guard_delivery(db, item: dict) -> dict:
     if required >= 2 and not author_family and not author_human:
         raise work.WorkError(
             "lot #%s: famille de l'auteur inconnue ; indépendance des deux "
-            "avis non prouvée, clôture refusée" % item["id"])
+            "avis non prouvée, clôture refusée — route : le pilote tranche "
+            "(abandon/remplacement de la mission, ou dispense consignée dans "
+            "la note de clôture)" % item["id"])
     created = float(item.get("created_ts") or 0.0)
     repo = (_repo_of_agent(db, str(source.get("assignee") or ""))
             or lot_class.repository(getattr(db, "cfg", None), source) or "")
@@ -782,7 +834,10 @@ def guard_delivery(db, item: dict) -> dict:
             continue
         if author and actor and actor.lower() == author.lower():
             continue                  # on ne relit pas son propre travail
-        family = merge_queue.actor_family(db, actor)
+        try:
+            family = merge_queue.actor_family(db, actor)
+        except merge_queue.RegistryReadError:
+            family = ""              # #2521 : lecture impossible, famille non prouvée
         if family and author_family and family == author_family:
             continue                  # la famille de l'auteur ne compte pas
         if required >= 2:
@@ -897,8 +952,16 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
                 "policy_ref": "", "repo": where or "", "target": target or "",
                 "frozen_sha": "", "doubt": True}
     try:
-        return lot_class.of_lot(db, int(lot), cfg=getattr(db, "cfg", None), item=item,
-                                repo=where or None, base=base or None, head=head or None)
+        # #2464 : la base est un commit, illisible pour l'axe release ; la
+        # cible déjà résolue (`target`) porte cet axe quand la ligne du lot ne
+        # le fait pas. Sans elle, `of_lot` relirait `origin/HEAD` — ou ne
+        # verrait plus une release.
+        class_item = item
+        if target and not item.get("branch_target"):
+            class_item = dict(item, branch_target=target)
+        return lot_class.of_lot(db, int(lot), cfg=getattr(db, "cfg", None),
+                                item=class_item, repo=where or None,
+                                base=base or None, head=head or None)
     except Exception as exc:  # noqa: BLE001 - un doute, jamais une exception
         return {"class": "", "why": "%s: %s" % (type(exc).__name__, str(exc)[:200]),
                 "doubt": True}
@@ -964,9 +1027,11 @@ CATCH_UP_LIMIT = 20
 
 
 def merged_sha(db, lot: int) -> str:
-    """Le commit du dernier jalon `merged` du lot, ou "" (best effort)."""
+    """Le commit du dernier jalon `merged` EFFECTIF du lot, ou "" (best effort).
+    Un jalon annulé par une correction `merged → build` est ignoré (#2317/N5)."""
     try:
-        rows = [m for m in work.milestones(db, int(lot)) if m.get("kind") == "merged"]
+        rows = [m for m in work.milestones(db, int(lot))
+                if m.get("kind") == "merged" and not m.get("annulled")]
     except Exception:  # noqa: BLE001 - pas de jalon lisible : pas de commit
         return ""
     if not rows:

@@ -58,6 +58,11 @@ l'orchestrateur de l'équipe en reçoit un courrier (`event`, lié au lot).
   aujourd'hui attend sa date (exemple : un bilan à deux semaines).
 * Réserver un lot à une attribution explicite : capacité exigée `decision` ou
   `production`. Exiger un harnais : capacité `harness:<nom>`.
+* Un lot de relecture après fusion (`review-after-merge:#<lot>`, sur son
+  `issue_ref` ou sa `source`, #2377/#2552) n'est pris que par un agent de la
+  **famille opposée** à celle de l'auteur au gel ; famille de l'auteur
+  inconnue ou non traçable : le lot n'est pas pris au repos et attend une
+  attribution explicite.
 * Projet du lot, clé de la prise : son application (`--app`), sinon son
   équipe. L'agent le prend s'il figure parmi les projets déclarés de sa fiche
   (`projects`, L243) ; hors du projet primaire, il faut en plus que son
@@ -434,7 +439,7 @@ Un lot prêt entre dans la file de sa cible, au lieu d'un « feu de fusion »
 donné à la main :
 
 ```
-ameesh work milestone <id> frozen --sha <commit>               le gel
+ameesh work milestone <id> frozen --sha <commit>               le gel (contrôles statiques d'abord, #2542)
 ameesh work milestone <id> verdict --verdict ok --sha <commit>  le GO de revue, sur ce commit
 ameesh work queue add <id>                                      dans la file
 ```
@@ -477,6 +482,15 @@ Aux coupures de 11:00 et 23:00, la release prend la tête de la cible (ou le
 dernier commit vert), taguée et déployée en staging : elle ne compose plus de
 paquet.
 
+Un créneau manqué ne reste pas muet (#2601) : sur l'hôte opérateur, chaque
+`ameesh release tick` (minuteur de 5 min) relit la cadence compilée
+(`packets.cutoffs`) ; passé la grâce (15 min par défaut), si aucun porteur
+`integration/paquet*` n'est ouvert ni tout juste fusionné pour le projet et que
+la liste calculée rend au moins un lot prêt, une alerte urgente part, une fois
+par créneau, aux destinataires de `packet_watch.projects.<projet>.notify` (le
+composeur et le pilote). `ameesh release packet-watch --dry-run` montre ce qui
+partirait.
+
 La composition **part d'une liste calculée**, jamais des seuls courriers
 (#2404) : `scripts/paquet-candidats.py` lit tous les lots `qa` du projet (sans
 filtre d'assigné), leur gel effectif confronté à la tête **publiée**, les
@@ -501,9 +515,10 @@ scripts/paquet-inclusion.py --manifest reviews/2026-10-15-paquet-23h.md \
 Il sort `1` si un lot attendu **ou prêt** manque au manifeste (ni composition
 ni « écarté » motivé), ou si le contenu d'un lot composé a disparu de la tête
 (revert non consigné) — l'ascendance d'une tête ne suffit pas après un revert
-(#1638). Sans source de liste attendue ni de liste prête, il sort `2`, sauf
-`--no-expected` qui assume le contrôle partiel ; un fichier de lots prêts
-fourni mais vide est valide. Un contenu *partiel* ou *vide* est listé « à
+(#1638). Sans liste prête, il sort `2` (`--no-ready` est refusé) ; sans liste
+attendue, il sort `2` sauf `--no-expected` explicite. Un fichier de lots prêts
+fourni mais vide est valide. Sur une recomposition, la liste est recalculée sur
+la cible de la recomposition. Un contenu *partiel* ou *vide* est listé « à
 lire » (union, adaptation, remise fraîche) ; `--strict` le rend bloquant.
 Détail, format de la liste attendue et validation sur le paquet 11h :
 `docs/PAQUET-INCLUSION.md`.
@@ -524,7 +539,20 @@ prêt, `git commit --no-edit` après résolution) ; aucun paquet déjà validé 
 réécrit pour ce seul métadonné.
 Le corps du lot porteur nomme ses unités avec leur tête, `#<lot> <tête>`, la
 ligne qu'imprime `scripts/paquet-compose.py --units --base <cible>` (#2360) :
-un `#N` seul n'y déclare aucune unité (#2335).
+un `#N` seul n'y déclare aucune unité (#2335). Quand ce corps omet la liste,
+la lecture des attentes retrouve les unités par ces trailers `ameesh-work:`
+de la branche, au-dessus de la cible (#2599) ; un `#N` cité en prose ne
+supprime toujours pas son alerte.
+
+À la fusion du paquet, ses unités se ferment **sans geste manuel** : le relevé
+de l'exécuteur lit les manifestes `reviews/**paquet**.md` de la cible et, pour
+chaque lot de leur table de composition encore ouvert, examine son dernier gel
+par le contenu — ancêtre, patch-id, squash, revert (#1825) — puis le passe
+`merged` (`packet_close`, #2426). Une ligne de retrait ne ferme rien ; un lot
+re-gelé après la composition reste ouvert. `ameesh work sync-packets --git-dir
+D --target T [--dry-run]` fait le même constat à la main, sur les seules
+unités des manifestes : c'est le balayage ciblé qui manquait à `sync-merges`
+(tous les lots ouverts, plus de 120 s sur ameesh).
 
 ## Le lot en cours
 

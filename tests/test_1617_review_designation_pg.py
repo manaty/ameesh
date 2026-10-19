@@ -74,7 +74,8 @@ class Test1617ReviewDesignationPg(PgTestCase):
 
     def mailbox(self, db=None):
         return (db or self.db).query(
-            "SELECT id, recipient, body, payload FROM agent_mailbox ORDER BY id")
+            "SELECT id, recipient, body, payload, kind, work_item_id"
+            " FROM agent_mailbox ORDER BY id")
 
     def marks(self):
         return [row["note"] for row in self.db.query(
@@ -98,6 +99,90 @@ class Test1617ReviewDesignationPg(PgTestCase):
         return [rd.Candidate("r1", "claude"), rd.Candidate("r2", "codex")]
 
     # -- tests ------------------------------------------------------------
+    def test_a_reviewer_holding_a_request_gets_no_second_mail(self):
+        """#2495 : r1 désigné à la main avant le gel (request non lu, sans
+        tête) ; l'auto au gel ne lui renvoie rien, r2 reçoit le sien. Une fois
+        ce request lu, un nouveau gel le réveille à nouveau."""
+        from ameesh import mail
+        manual = mail.send(self.db, "chef", "r1", "Review request: lot", kind="request",
+                           work_item_id=str(self.lot),
+                           payload={"review_request": {"lot": self.lot, "reviewer": "r1",
+                                                       "manual": True}})
+        self.freeze()
+        out = self.run_apply(pg.PgPort(self.db), candidates=self.two_families())
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1", "r2"])
+        self.assertEqual([(m["recipient"], m["id"] == manual) for m in self.mailbox()],
+                         [("r1", True), ("r2", False)])
+        mail.mark_delivered(self.db, [m["id"] for m in self.mailbox()])
+        self.freeze(SHA_B)
+        self.run_apply(pg.PgPort(self.db), candidates=self.two_families())
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["r1", "r2", "r1", "r2"])
+
+    def test_a_request_is_found_beyond_the_mail_history_window(self):
+        """#2504 : la demande est lue par (destinataire, nature, lot) en base.
+
+        Plus de 200 messages plus récents ne la cachent plus : l'ancien
+        `mail.history(..., 200)` bornait AVANT de filtrer et renvoyait un
+        second request au même relecteur."""
+        from ameesh import mail
+        manual = mail.send(self.db, "chef", "r1", "Review request: lot", kind="request",
+                           work_item_id=str(self.lot),
+                           payload={"review_request": {"lot": self.lot, "reviewer": "r1",
+                                                       "manual": True}})
+        self.db.execute(
+            "INSERT INTO agent_mailbox (sender, recipient, body, kind, work_item_id)"
+            " SELECT 'chef', 'r1', 'other lot mail', 'notify', '9999'"
+            " FROM generate_series(1, 250)")
+        # la demande du lot est retrouvée malgré le volume ; un autre lot ou
+        # une autre nature ne compte pas
+        self.assertEqual([r["id"] for r in
+                          mail.review_requests(self.db, "r1", self.lot)], [manual])
+        self.assertEqual(mail.review_requests(self.db, "r1", 9999), [])
+
+        self.freeze()
+        out = self.run_apply(pg.PgPort(self.db), candidates=self.two_families())
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1", "r2"])
+        requests = self.db.query(
+            "SELECT id, recipient FROM agent_mailbox"
+            " WHERE payload ? 'review_request' OR payload ? 'review_designation'"
+            " ORDER BY id")
+        self.assertEqual([(r["recipient"], r["id"] == manual) for r in requests],
+                         [("r1", True), ("r2", False)])
+
+    def test_a_review_request_is_read_on_the_indexed_column(self):
+        """#2563 : le lot est filtré sur `work_item_id`, sans fonction.
+
+        `btrim(coalesce(work_item_id, ''))` ne peut pas servir l'index partiel
+        0413 (une fonction sur la colonne) : la lecture parcourait tout le
+        courrier du relecteur. Tous les écrivains de `request` posent
+        `str(int(lot))` : l'égalité simple reste exacte."""
+        from ameesh import mail
+        manual = mail.send(self.db, "chef", "r1", "Review request: lot", kind="request",
+                           work_item_id=str(self.lot),
+                           payload={"review_request": {"lot": self.lot, "reviewer": "r1",
+                                                       "manual": True}})
+        seen = []
+
+        class Trace:
+            """La connexion réelle, avec le SQL de la lecture du lot noté."""
+            def __init__(self, db):
+                self.db = db
+
+            def query(self, sql, params=()):
+                seen.append(" ".join(sql.split()))
+                return self.db.query(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self.db, name)
+
+        found = mail.review_requests(Trace(self.db), "r1", self.lot)
+        self.assertEqual([r["id"] for r in found], [manual])
+        queries = [sql for sql in seen if "FROM agent_mailbox" in sql]
+        self.assertEqual(len(queries), 1)
+        predicate = queries[0].split("WHERE", 1)[1]
+        self.assertIn("work_item_id = %s", predicate)
+        self.assertNotIn("btrim", predicate)
+
     def test_designated_records_and_mails_once(self):
         freeze = self.freeze()
         out = self.run_apply(pg.PgPort(self.db), candidates=self.two_families())
@@ -110,6 +195,9 @@ class Test1617ReviewDesignationPg(PgTestCase):
         for row in sent:
             self.assertIn(SHA_A, row["body"])
             self.assertIn("frozen milestone #%d" % int(freeze["id"]), row["body"])
+            # #2478 : un `request` lié au lot, actif pour le runner du relecteur
+            self.assertEqual(row["kind"], "request")
+            self.assertEqual(row["work_item_id"], str(self.lot))
         marks = self.marks()
         self.assertEqual(len(marks), 1)
         self.assertEqual(pg.designation_of(marks[0])["freeze"],
@@ -226,6 +314,7 @@ class Test1617ReviewDesignationPg(PgTestCase):
         self.assertEqual(out["missing"], 2)
         sent = self.mailbox()
         self.assertEqual([m["recipient"] for m in sent], ["pilot"])
+        self.assertEqual(sent[0]["kind"], "notify")  # pas une demande de relecture
         self.assertIn("No implicit admission", sent[0]["body"])
         self.assertIn("frozen milestone #%d" % int(freeze["id"]), sent[0]["body"])
         # rejoué sans capacité nouvelle : une seule notification

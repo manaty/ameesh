@@ -55,17 +55,40 @@ survit à sa sortie. La levée est **conditionnelle** : le motif exact de la
 pause posée (unique, avec son jeton) est son identité, et `ameesh resume
 --operator --expect-reason` ne lève que cette pause-là — la comparaison et la
 levée se font dans la même instruction SQL (migration 0458), donc une pause
-étrangère posée entre la lecture et la reprise n’est jamais levée. Si la
+étrangère posée entre la lecture et la reprise n’est jamais levée. La levée
+conditionnelle reste possible si l’agent est passé `externe` pendant le
+drain (migration 0459, #2184/N1) : un changement de mode ne rend pas la
+pause du drain orpheline ; la pose, elle, reste refusée sur un agent
+non-execute. Si la
 réponse de la pause se perd (SSH coupé, JSON illisible), le script réconcilie
 par l’état réel : motif identique, le drain continue ; sinon il ne redémarre
-ni ne lève rien et s’arrête en le disant, en nommant l’agent, le motif exact
-et la commande conditionnelle de levée manuelle. Pose et levée sont des gestes
-d’opérateur : le CLI local refuse une session liée à un agent (`bad_actor`),
-donc `vm.sh` doit être lancé hors session d’agent ; sinon la pause est refusée
-et le redémarrage de cet agent s’arrête sans interrompre aucun tour. Un CLI de
-cible antérieur à #2152 (sans `--expect-reason`) n’est jamais utilisé pour
+ni ne lève rien et le dit, en nommant l’agent, le motif exact et la commande
+conditionnelle de levée manuelle. Pose et levée sont des gestes d’opérateur :
+le CLI local refuse une session liée à un agent (`bad_actor`), donc `vm.sh`
+doit être lancé hors session d’agent ; l’acteur d’audit consigné est
+l’opérateur du poste (`--human`), jamais le compte `ameesh` de la VM
+(#2184/N6). Si la pose est refusée, cet agent est laissé en l’état sans
+redémarrage et les autres agents du balayage continuent ; un échec de levée
+est consigné, retenté à la sortie, et le code de retour le signale
+(#2184/N2) ; le verdict « NON levé » n’est écrit qu’après la dernière
+tentative (#2198/N3). Un CLI de
+cible antérieur à #2152 (sans `--expect-reason`) ou à #2184/R3 (sans
+`--not-after`) n’est jamais utilisé pour
 drainer : le script arrête l’agent sans drain plutôt que de laisser une pause
-orpheline. Il relit le placement avant chaque redémarrage :
+orpheline. La pose porte une échéance absolue (`--not-after`) comparée par
+la base sous le verrou de ligne : une commande distante retardée est refusée
+(`refusal=not_after`). Pour une pose incertaine, le script attend l’échéance,
+la borne d’instruction (`DRAIN_BORNE_INSTRUCTION`, 30 s) et la dérive
+d’horloge (`DRAIN_DERIVE`, 5 s) avant de relire l’état et de reprendre. Les
+appels de drain sont bornés (`DRAIN_APPEL_DELAI`, 60 s), transport SSH
+compris, et couverts par un keepalive (#2184/N3) ; leur borne locale vaut
+`DRAIN_APPEL_DELAI + DRAIN_MARGE_LOCALE` (20 s), pour que le `timeout`
+distant rende son code avant que le client ne tue le groupe (#2198/N2). Les
+lectures (`list`, `show`, `--help`) ont leur propre borne, plus courte
+(`DRAIN_LECTURE_DELAI`, 30 s — #2198/N4). Un signal reçu par le client
+(SIGINT/SIGTERM) est transmis au groupe de l’enfant, lancé dans sa propre
+session, qui n’est donc pas orphelin (#2198/N1). Il relit le placement et
+le mode avant chaque redémarrage, y compris en mode serveur (#2198/N5) :
 un agent déplacé ou passé en observation est ignoré ; un agent arrêté n’est
 pas réactivé (aucun bail, aucun tour — #1131), mais son unité encore active
 est rechargée sur le nouveau code (#1633), sans quoi elle servirait la
@@ -255,3 +278,81 @@ du code, selon la procédure de [BASCULE.md](BASCULE.md). Les commandes de cette
 page sont à exécuter par le responsable du déploiement après revue et
 validation CI, une VM à la fois ; `controler` affiche le code installé, le
 clone et `previous-sha` avant les unités.
+
+## Release automatique aux coupures (#2448)
+
+À 11:00 et 23:00 (Europe/Paris), la tête de `main` est taguée et déployée en
+staging sans agent. Le calendrier n'est pas écrit dans une unité systemd : il
+vient du bloc mécanique du canon compilé (`processus/mecanique.yaml`,
+`mechanics.cutoffs`), lu au commit exact du canon appliqué. Sans ce document,
+la commande refuse — aucun repli sur une heure locale.
+
+**Configuration de l'hôte opérateur** (pc-smichea seulement) :
+
+```json
+"release": {
+  "host": "pc-smichea",
+  "projects": {
+    "ameesh": {
+      "repo": "/home/ameesh/work/ameesh",
+      "target": "main",
+      "github": "manaty/ameesh",
+      "report": "smichea",
+      "staging_timeout_s": 7200
+    }
+  }
+}
+```
+
+`repo` est un clone dédié du projet, propre et à jour (le service y crée un
+worktree de version, pousse la cible et lance `deploy/mise-a-jour/staging.sh`
+depuis un worktree du commit publié). `staging` est facultatif (défaut
+`deploy/mise-a-jour/staging.sh`, relatif à `repo`). `window_s` (défaut 1800)
+borne le retard toléré après une coupure ; `lock_wait_s` (défaut 3600) borne
+l'attente du verrou d'écriture de la cible. `version_bump` vaut `level` (le
+plancher de `scripts/version-level.py`, appliqué par le pilote pour #2448) ou
+`patch` (dérogation explicite) ; un niveau `major` n'est jamais publié sans
+go owner.
+
+**Activation** (une fois, par l'opérateur) :
+
+```sh
+install -m 0644 deploy/systemd/ameesh-release.service \
+                   deploy/systemd/ameesh-release.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now ameesh-release.timer
+ameesh release calendar                # prochaine coupure et canon lu
+ameesh release cutoff --dry-run        # plan, notes, aucun effet
+```
+
+**Ce que fait un tick** : il prend `B`, la tête de la cible si la CI du
+commit exact est verte, sinon le plus récent commit vert de la chaîne
+first-parent (un commit de release `[skip ci]` hérite de l'état de son premier
+parent). Il calcule le niveau de version (`level <dernier tag> B`), génère
+`docs/versions/<version>.md` depuis les manifestes des paquets fusionnés (lots
+inclus et écartés), puis crée `V` sur `B` : version + notes, `[skip ci]`, avec
+le trailer `ameesh-release:`. Si la cible vaut encore `B`, `V` part en
+fast-forward ; sinon un commit de fusion `M = merge(main, V)` porte la version
+et les notes sur la tête courante, sans réécrire `main`. `V` et l'étiquette
+`v<version>` partent dans **une seule poussée atomique**, sans force : un rejet
+donne un seul recalcul, puis un rapport. Le staging déploie **le tag** (le
+contenu vert `V`), jamais la tête de `main`, puis crée la release GitHub. Un
+retour automatique de l'hôte en échec est celui de `staging.sh`. Le rapport
+part à l'owner (`report`) avec la version, les lots, les écarts et la santé par
+hôte ; il est aussi écrit sous `~/.local/state/ameesh/release/reports/`.
+
+**Idempotence** : l'état local
+(`~/.local/state/ameesh/release/state.json`) évite de reprendre une coupure
+déjà faite ; les faits durables sont l'étiquette et l'attestation
+`actif-<sha>.json`. Une étiquette créée à la coupure ou après, une release
+GitHub manquante ou un staging interrompu sont **réconciliés** au tick suivant
+sans publier une seconde version. La release prend le **même** bail d'écriture
+que le train (#2446), `land.lock_key(project, 'main')`, avec un owner propre et
+sans partage d'epoch ; elle attend qu'il soit libre dans sa borne avant la
+poussée atomique, puis le rend. `staging.sh` refuse deux séquences simultanées
+(code 75, `staging.lock`).
+
+**Preuve** : le journal `~/.local/state/ameesh/mise-a-jour/staging-<date>.jsonl`,
+l'attestation `actif-<sha>.json` (quatre hôtes, sonde de courrier remise) et le
+rapport JSON du tick. Aucune prod : le staging n'est pas une release de prod
+(canon §14), un go owner reste requis pour la prod.

@@ -35,6 +35,7 @@ for a freeze that is no longer the latest: no return to an old head.
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping, Optional, Protocol, Sequence
@@ -45,6 +46,9 @@ from . import review
 DESIGNATED = "designated"
 WAITING = "waiting"
 NONE = "none"
+#: the kind of a designation mail: a request linked to the lot wakes the
+#: reviewer's runner (#2478). The capacity notification stays a `notify`.
+REQUEST_KIND = "request"
 #: a harness that is not a model family (registry without a session)
 PLACEHOLDER_FAMILIES = frozenset(("", "none", "other", "unknown", "inconnu"))
 #: fallback families as long as the compiled canon (#1616) does not declare
@@ -152,15 +156,21 @@ def rules_of(declaration) -> tuple[Rule, ...]:
     return tuple(out)
 
 
-def required_count(rules: Sequence[Rule], paths: Iterable[str]) -> int:
-    """The number of opinions required for these paths: the **maximum** of the rules.
+def required_count(rules: Sequence[Rule], paths: Iterable[str],
+                   light: int = 0) -> int:
+    """The number of opinions required for these paths: the **maximum** of the
+    rules and of the declared light floor.
 
-    A path that no rule covers counts as zero: that is the light rule ("zero for
-    light outside a rule", PR85). Coverage of non-light paths is checked by the
+    The light floor comes from the caller that read it (`mechanics.reviews_for`,
+    §2: one opinion, #2642); it is never guessed here. `light` defaults to 0 for
+    the pure rule reader, whose only inputs are the rules. A path that no rule
+    covers counts as the floor. Coverage of non-light paths is checked by the
     policy reader (#1467), not here.
     """
+    if type(light) is not int or light < 0:
+        raise DesignationError("light opinions: a non-negative integer is expected")
     rules = tuple(rules or ())
-    highest = 0
+    highest = light
     for path in paths or ():
         for rule in rules:
             if rule.matches(path):
@@ -292,8 +302,40 @@ def unknown_families(authors: Iterable) -> list[str]:
                    in PLACEHOLDER_FAMILIES})
 
 
+def manual_seats(already: Iterable, *, authors: Iterable = (),
+                 families=KNOWN_FAMILIES) -> list:
+    """The manual reviewers that can count toward the required opinions.
+
+    A manual reviewer is kept in the column whatever happens (`#2627`); this
+    helper only says which ones cover a seat: a known family from the policy,
+    distinct from every author's family, distinct from the other manual
+    reviewers, and not an author itself. An unknown family, or the author's
+    family, does not prove independence: the seat remains to designate.
+    """
+    names, forbidden = families_of(authors)
+    if unknown_families(authors):
+        # An author of unknown family makes every reviewer's independence
+        # unprovable: no manual reviewer can cover a seat either (#2627).
+        return []
+    covered = set(forbidden)
+    seats = []
+    seen_names = set()
+    for row in already or ():
+        row = dict(row or {})
+        name = str(row.get("name") or "").strip()
+        family = str(row.get("family") or "").strip().lower()
+        if (not name or name in seen_names or name in names
+                or not family or family in PLACEHOLDER_FAMILIES
+                or family not in families or family in covered):
+            continue
+        seen_names.add(name)
+        covered.add(family)
+        seats.append({"name": name, "family": family})
+    return seats
+
+
 def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
-           families=KNOWN_FAMILIES) -> dict:
+           families=KNOWN_FAMILIES, already: Iterable = ()) -> dict:
     """Chooses `required` (1 or 2) independent and least-loaded reviewers.
 
     - each reviewer's family differs from that of **every** author or fixer, and
@@ -305,28 +347,43 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     - an author whose real family is unknown (empty or a label) makes the
       designation **wait**: without it, a reviewer's independence is not proven
       (canon §2);
-    - at equal load, the order of names decides: the selection is deterministic.
+    - at equal load, the order of names decides: the selection is deterministic;
+    - `already` names the manual reviewers already designated (#2627). The ones
+      that prove an independent family cover a seat; only the **missing** seats
+      are designated, never a manual reviewer removed or overridden.
 
-    Returns `{state, required, reviewers, missing, why, forbidden}`: `waiting`
-    when independent families are missing or an author family is unknown, with
-    the missing count — never an implicit admission.
+    Returns `{state, required, reviewers, missing, manual, why, forbidden}`:
+    `waiting` when independent families are missing or an author family is
+    unknown, with the missing count — never an implicit admission. `reviewers`
+    names only the automatic reviewers of this call; `manual` the manual seats
+    that count.
     """
     if type(required) is not int or required not in (0, 1, 2):
         raise DesignationError("required reviews must be 0, 1 or 2, not %r" % (required,))
     names, forbidden = families_of(authors)
+    seats = manual_seats(already, authors=authors, families=families)
     out = {"state": NONE, "required": required, "reviewers": [], "missing": 0,
-           "why": "no review required", "forbidden": sorted(forbidden)}
+           "manual": seats, "why": "no review required",
+           "forbidden": sorted(forbidden)}
     if required == 0:
+        return out
+    remaining = max(required - len(seats), 0)
+    if remaining == 0:
+        out.update({"state": DESIGNATED, "missing": 0,
+                    "why": "manual reviewer(s) already cover the required reviews"})
         return out
     unknown = unknown_families(authors)
     if unknown:
         # An author with no known real family: independence is not proven,
         # so we wait instead of discarding the only name (canon §2).
-        out.update({"state": WAITING, "missing": required,
+        out.update({"state": WAITING, "missing": remaining,
                     "why": "author family unknown: %s" % ", ".join(unknown)})
         return out
+    seat_names = {row["name"] for row in seats}
+    seat_families = {row["family"] for row in seats}
     eligible = [c for c in candidates or ()
-                if c.eligible(forbidden_names=names, forbidden_families=forbidden,
+                if c.eligible(forbidden_names=names | seat_names,
+                              forbidden_families=forbidden | seat_families,
                               families=families)]
     # a single candidate per family: the least loaded, then the name
     best: dict[str, Candidate] = {}
@@ -337,19 +394,20 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
             best[family] = candidate
     ordered = [best[family] for family in sorted(best)]
     ordered.sort(key=lambda c: (c.load, c.name))
-    chosen = ordered[:required]
+    chosen = ordered[:remaining]
     out["reviewers"] = [{"name": c.name, "family": c.family} for c in chosen]
-    if len(chosen) < required:
+    if len(chosen) < remaining:
         out.update({
             "state": WAITING,
-            "missing": required - len(chosen),
+            "missing": remaining - len(chosen),
             "reviewers": [],
             "why": ("%d independent %s missing: %d eligible famil%s (%s), "
                     "forbidden %s" % (
-                        required - len(chosen), "review" if required == 1 else "reviews",
+                        remaining - len(chosen),
+                        "review" if remaining == 1 else "reviews",
                         len(ordered), "y" if len(ordered) == 1 else "ies",
                         ", ".join(sorted(best)) or "none",
-                        ", ".join(sorted(forbidden)) or "none")),
+                        ", ".join(sorted(forbidden | seat_families)) or "none")),
         })
         return out
     out.update({"state": DESIGNATED,
@@ -417,6 +475,121 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
     return "\n".join(lines)
 
 
+def manual_reviewer_message(lot: Mapping, *, freeze: Optional[Mapping] = None,
+                            actor: str = "") -> str:
+    """The request mail of a manual designation (#705, #2478).
+
+    Unlike the automatic mail, this designation can happen as soon as the lot
+    enters `qa`: the head may not be frozen yet. The mail names the latest
+    frozen head when one exists and says what to watch otherwise. It is sent as
+    a `request` linked to the lot, so the reviewer's runner opens a turn (#2478).
+    """
+    row = dict(lot or {})
+    freeze = dict(freeze or {})
+    sha = str(freeze.get("sha") or "")
+    fid = freeze.get("id")
+    lines = [
+        "Review request (#2076): you are the designated reviewer of lot #%s."
+        % row.get("id"),
+        "",
+        "Lot: #%s \"%s\"" % (row.get("id"), " ".join(str(row.get("title") or "").split())),
+    ]
+    if row.get("app"):
+        lines.append("- Project: %s." % row["app"])
+    if sha:
+        lines += [
+            "- Latest frozen head: %s (frozen milestone #%s)."
+            % (sha, fid if fid is not None else "?"),
+            "- Review exactly this head and render your verdict:",
+            "  ameesh work milestone %s verdict ok|blocked --sha %s" % (row.get("id"), sha),
+        ]
+    else:
+        lines += [
+            "- No frozen head is recorded yet: the author declares it with",
+            "  ameesh work milestone %s frozen --sha <commit>." % row.get("id"),
+            "- Review exactly the frozen head and render your verdict:",
+            "  ameesh work milestone %s verdict ok|blocked --sha <frozen sha>"
+            % row.get("id"),
+        ]
+    lines.append("- This request is linked to lot #%s: your runner opens a turn on it."
+                 % row.get("id"))
+    if actor:
+        lines.append("- Designated by: %s." % actor)
+    lines += [
+        "",
+        "To do:",
+        "- read the diff of the frozen head and check the edge cases;",
+        "- a blocking defect: fix it yourself and push to the lot branch "
+        "(canon §2); a fix longer than ~50 lines, or a design change, goes back "
+        "to the author;",
+        "- a non-blocking defect goes to the backlog, it does not block the merge;",
+        "- do not rerun the suites: targeted tests are the author's job, CI runs "
+        "on the frozen head once the required opinions are acquired.",
+    ]
+    # #2495 : nothing cancels a manual request; a new freeze does not hand a
+    # new head to this reviewer either. Say what to review if the branch moves.
+    lines += ["", "A new freeze does not cancel this request: if the branch moves, "
+              "review the latest frozen head (`ameesh work show %s`) and render your "
+              "verdict on it." % row.get("id")]
+    return "\n".join(lines)
+
+
+def _request_sha(row: Mapping) -> Optional[str]:
+    """Review request head, empty before freeze, None for another mail."""
+    payload = row.get("payload") or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            return None
+    if not isinstance(payload, Mapping):
+        return None
+    auto = payload.get("review_designation")
+    if isinstance(auto, Mapping):
+        return str(auto.get("sha") or "").strip().lower()
+    manual = payload.get("review_request")
+    if isinstance(manual, Mapping):
+        freeze = manual.get("freeze")
+        if isinstance(freeze, Mapping):
+            return str(freeze.get("sha") or "").strip().lower()
+        return ""
+    return None
+
+
+def covering_request(rows: Iterable[Mapping], *, lot, reviewer: str,
+                     sha: str = "") -> Optional[dict]:
+    """The earlier request that already covers (lot, reviewer, head), if any (#2495).
+
+    One request per reviewer and head: a re-designation, or a manual
+    designation followed by the automatic one at the freeze, sends no second
+    mail. `rows` are the requests already addressed to the reviewer for this
+    lot (`mail.review_requests`, #2504): the lot is filtered in storage, so no
+    `history` window can hide an old request. A request covers
+    the new one when it names the same frozen head, or when it names no head
+    (manual designation before the freeze) and is either still unread — the
+    reviewer will read it and review the frozen head — or the new one names no
+    head either. A delivered request without a head does not cover a freeze:
+    the reviewer already took that turn, the freeze must wake them again.
+    """
+    name = str(reviewer or "").strip()
+    target = str(sha or "").strip().lower()
+    for row in rows or ():
+        if str(row.get("kind") or "") != REQUEST_KIND:
+            continue
+        if str(row.get("work_item_id") or "").strip() != str(lot).strip():
+            continue
+        if str(row.get("recipient") or "").strip() != name:
+            continue
+        prior = _request_sha(row)
+        if prior is None:
+            continue
+        if prior and target and _same_freeze(prior, target):
+            return dict(row)
+        if not prior and (not target or not row.get("delivered_ts")):
+            return dict(row)
+    return None
+
+
 def capacity_message(lot: dict, *, freeze: Mapping, required: int, missing: int,
                      why: str, families: str = "") -> str:
     """The waiting notification: no independent reviewer can be designated.
@@ -480,7 +653,8 @@ class Port(Protocol):
 def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
           freeze_sha: str, authors: Iterable = (), candidates: Iterable = (), risk: str = "light",
           base: str = "", policy_ref: str = "", notify: str = "",
-          unknown_authors: Iterable = (), families=KNOWN_FAMILIES) -> dict:
+          unknown_authors: Iterable = (), families=KNOWN_FAMILIES,
+          already: Iterable = (), required: Optional[int] = None) -> dict:
     """Designates the reviewers of the lot's latest freeze, or says why it waits.
 
     `policy` carries the already parsed rules (`Rule` or `{rules: [...]}`
@@ -490,10 +664,22 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     `Port`). Returns the designation: `{state, required, reviewers, missing,
     why, freeze}` with `replayed` when it already existed.
 
+    `required` is the count already read by the policy reader
+    (`mechanics.reviews_for`) and includes the light floor (#2642) and the
+    critical floor of the merge gate (#2627): it is authoritative and overrides
+    the count read from the rules. Without it, the count comes from the rules
+    alone (pure callers). It must be 0, 1 or 2; without a changed path nothing
+    is due, whatever the caller's floor.
+
     `unknown_authors` names the commits of the freeze whose exact provenance
     (#1465) is unknown: without it, a reviewer's independence cannot be
     established, so the designation waits instead of guessing — an explicit
     state, never a fallback.
+
+    `already` carries the manual reviewers already designated (#2627): the ones
+    that prove an independent family cover a seat, and only the missing seats
+    are selected. None is ever removed, and two manual reviewers of the same
+    family count one seat.
 
     The freeze is re-read **once**, and the provided inputs (paths, authors,
     class) are those of this freeze: if the `Port` refuses a freeze that has
@@ -535,13 +721,21 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
             "the inputs of lot #%d were collected for freeze %s, the last freeze is %s:"
             " nothing written; recollect the paths, authors and class of the new"
             " freeze, then retry" % (lot, expected[:12], sha[:12]))
-    required = required_count(rules, paths)
+    paths = tuple(paths or ())
+    # Sans chemin changé il n'y a rien à relire, quel que soit le plancher.
+    if not paths:
+        required = 0
+    elif required is None:
+        required = required_count(rules, paths)
+    if type(required) is not int or required not in (0, 1, 2):
+        raise DesignationError("required reviews must be 0, 1 or 2, not %r" % (required,))
     if risk != "light" and required == 0:
         raise DesignationError(
             "review count unknown for a non-light lot (#%d, class %s)" % (lot, risk))
     if required == 0:
         return {"state": NONE, "required": 0, "reviewers": [], "missing": 0,
-                "why": "light lot: no review before merge", "freeze": freeze}
+                "why": ("light lot: no pre-merge reviewer is due (the other-family"
+                        " review happens after merge)"), "freeze": freeze}
     existing = port.recorded(lot, freeze["id"])
     if existing and existing.get("state") == DESIGNATED:
         out = dict(existing)
@@ -553,10 +747,10 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         why = ("author provenance unknown for %d commit(s) of the frozen range: %s"
                % (len(unknown), ", ".join(unknown[:5])))
         selection = {"state": WAITING, "required": required, "reviewers": [],
-                     "missing": required, "why": why}
+                     "missing": required, "manual": [], "why": why}
     else:
         selection = select(required=required, authors=authors, candidates=candidates,
-                           families=families)
+                           families=families, already=already)
     if selection["state"] == WAITING and existing:
         # The waiting state of this freeze is already recorded and notified: we
         # do not send a second one, but the selection was retried — if capacity
@@ -565,12 +759,20 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         out["replayed"] = True
         return out
     state = selection["state"]
+    if state == DESIGNATED and not selection["reviewers"]:
+        # The manual reviewers already cover every required seat (#2627): no
+        # automatic reviewer, no mail, no designation mark to write.
+        return {"state": "manual", "required": required, "reviewers": [],
+                "missing": 0, "manual": [dict(row) for row in selection["manual"]],
+                "why": selection["why"], "freeze": freeze}
     messages = []
     if state == DESIGNATED:
-        for rank, reviewer in enumerate(selection["reviewers"], start=1):
+        first_rank = len(selection.get("manual") or ()) + 1
+        for rank, reviewer in enumerate(selection["reviewers"], start=first_rank):
             messages.append({
                 "to": reviewer["name"],
                 "family": reviewer["family"],
+                "kind": REQUEST_KIND,
                 "body": reviewer_message(item, freeze=freeze, required=required,
                                          rank=rank, reviewer=reviewer, authors=authors,
                                          base=base, risk=risk, policy_ref=policy_ref),
@@ -579,6 +781,7 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         messages.append({
             "to": notify,
             "family": "",
+            "kind": "notify",
             "body": capacity_message(item, freeze=freeze, required=required,
                                      missing=selection["missing"], why=selection["why"]),
             "capacity": True,

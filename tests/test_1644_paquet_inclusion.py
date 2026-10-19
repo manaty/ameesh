@@ -92,6 +92,8 @@ class PaquetInclusionTest(unittest.TestCase):
 
         self.manifest = pathlib.Path(self.tmp.name) / "manifeste.md"
         self.write_manifest()
+        self.ready_empty = pathlib.Path(self.tmp.name) / "prets-vide.txt"
+        self.ready_empty.write_text("", encoding="utf-8")
 
     # -- helpers -----------------------------------------------------------
     def git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -145,8 +147,12 @@ class PaquetInclusionTest(unittest.TestCase):
         )
 
     def namespace(self, expected=(), expected_file=(), excused=(),
-                  ready=(), ready_file=(), strict=False, head=None,
-                  manifest=None, no_expected=False, no_ready=True):
+                  ready=(), ready_file=None, strict=False, head=None,
+                  manifest=None, no_expected=False, no_ready=False):
+        if ready_file is None:
+            # Depuis #2464, le contrôle exige toujours la liste calculée : le
+            # cas par défaut du banc est « aucun lot prêt » (fichier vide).
+            ready_file = [str(self.ready_empty)]
         return inclusion.argparse.Namespace(
             manifest=str(manifest or self.manifest),
             head=head or self.head,
@@ -168,7 +174,7 @@ class PaquetInclusionTest(unittest.TestCase):
             "--manifest", str(self.manifest),
             "--head", self.head,
             "--repo", str(self.repo),
-            "--no-ready",
+            "--ready-file", str(self.ready_empty),
             *extra,
         ]
         return inclusion.main(argv)
@@ -245,7 +251,8 @@ class PaquetInclusionTest(unittest.TestCase):
         proc = subprocess.run(
             [sys.executable, str(REPO / "scripts" / "paquet-inclusion.py"),
              "--manifest", str(self.manifest), "--head", self.head,
-             "--repo", str(self.repo), "--json", "--no-ready"],
+             "--repo", str(self.repo), "--json",
+             "--ready-file", str(self.ready_empty)],
             capture_output=True, text=True,
         )
         self.assertEqual(proc.returncode, 1)
@@ -274,17 +281,22 @@ class PaquetInclusionTest(unittest.TestCase):
                             for check in entry["paths"]))
 
     def test_sans_liste_attendue_le_controle_est_refuse(self) -> None:
+        # La liste prête contrôle les omissions de lots prêts, pas les
+        # admissions : sauter ce second contrôle reste explicite (#1655 N1),
+        # même quand la liste calculée est fournie.
         self.ecrire_manifeste_sans_admissions()
-        with self.assertRaises(inclusion.InputError):
+        with self.assertRaises(inclusion.InputError) as caught:
             inclusion.run(self.namespace())
+        self.assertIn("--no-expected", str(caught.exception))
         proc = subprocess.run(
             [sys.executable, str(REPO / "scripts" / "paquet-inclusion.py"),
              "--manifest", str(self.manifest), "--head", self.head,
-             "--repo", str(self.repo), "--no-ready"],
+             "--repo", str(self.repo),
+             "--ready-file", str(self.ready_empty)],
             capture_output=True, text=True,
         )
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("aucun lot attendu", proc.stderr)
+        self.assertIn("--no-expected", proc.stderr)
 
     def test_sans_liste_attendue_option_no_expected(self) -> None:
         self.ecrire_manifeste_sans_admissions()
@@ -380,7 +392,8 @@ class PaquetInclusionTest(unittest.TestCase):
         ready_file = pathlib.Path(self.tmp.name) / "prets.txt"
         ready_file.write_text("# commentaire\n#100  prêt\n500\n#501\n", encoding="utf-8")
         code, payload = inclusion.run(
-            self.namespace(ready_file=[str(ready_file)], manifest=manifest)
+            self.namespace(ready_file=[str(ready_file)], manifest=manifest,
+                           no_expected=True)
         )
         self.assertEqual(code, 1)
         self.assertEqual(payload["expected_source"], None)
@@ -390,18 +403,36 @@ class PaquetInclusionTest(unittest.TestCase):
         self.assertIn("#100", inclusion.render(payload))
         self.assertIn("lot prêt ni composé ni écarté", payload["ready_omissions"][0]["reason"])
 
-    def test_ready_list_is_required_unless_no_ready(self) -> None:
+    def test_ready_list_is_required(self) -> None:
         manifest = self.manifest_simple(100, self.src100, self.c100)
         with self.assertRaises(inclusion.InputError) as caught:
             inclusion.run(self.namespace(expected=[100], manifest=manifest,
-                                         no_ready=False))
+                                         ready_file=[]))
         self.assertIn("--ready", str(caught.exception))
-        code, payload = inclusion.run(
-            self.namespace(expected=[100], manifest=manifest, no_ready=True)
+
+    def test_no_ready_is_refused(self) -> None:
+        # #2464 : une recomposition a utilisé --no-ready et laissé passer
+        # #2384, prêt depuis 14:29, absent du manifeste sans ligne « écarté ».
+        manifest = self.manifest_simple(100, self.src100, self.c100)
+        with self.assertRaises(inclusion.InputError) as caught:
+            inclusion.run(self.namespace(expected=[100], manifest=manifest,
+                                         no_ready=True))
+        message = str(caught.exception)
+        self.assertIn("--no-ready est refusé", message)
+        self.assertIn("#2384", message)
+        self.assertIn("--ready-file", message)
+
+    def test_no_ready_is_refused_by_the_cli(self) -> None:
+        manifest = self.manifest_simple(100, self.src100, self.c100)
+        proc = subprocess.run(
+            [sys.executable, str(REPO / "scripts" / "paquet-inclusion.py"),
+             "--manifest", str(manifest), "--head", self.head,
+             "--repo", str(self.repo), "--expected", "100", "--no-ready"],
+            capture_output=True, text=True,
         )
-        self.assertEqual(code, 0)
-        self.assertTrue(payload["no_ready"])
-        self.assertIn("--no-ready", inclusion.render(payload))
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("--no-ready est refusé", proc.stderr)
+        self.assertIn("#2384", proc.stderr)
 
     def test_ready_list_required_by_the_cli(self) -> None:
         manifest = self.manifest_simple(100, self.src100, self.c100)

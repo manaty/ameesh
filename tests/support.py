@@ -136,6 +136,11 @@ EMPTY_CODEX_HOME = tempfile.mkdtemp(prefix="ameesh-test-codex-home-")
 # aussi pour les tests qui lisent les jauges dans le processus même
 os.environ["CODEX_HOME"] = EMPTY_CODEX_HOME
 
+#: #2580 : le registre des comptes partagés de l'hôte (XDG) ne doit jamais
+#: écrire dans le `~/.local/state` réel d'un exécuteur de test.
+EMPTY_XDG_STATE = tempfile.mkdtemp(prefix="ameesh-test-xdg-state-")
+os.environ["XDG_STATE_HOME"] = EMPTY_XDG_STATE
+
 #: dossier de descripteurs de harnais vide (L16) : les tests ne voient jamais
 #: ceux de l'hôte, et posent les leurs explicitement quand ils en ont besoin
 EMPTY_HARNESS_DIR = tempfile.mkdtemp(prefix="ameesh-test-harnesses-")
@@ -469,14 +474,18 @@ class PgTestCase(unittest.TestCase):
             os.unlink(self.turns_log)
 
     # -- attentes ----------------------------------------------------------
-    def wait_for(self, predicate, timeout: float = 10.0, interval: float = 0.1):
+    def wait_for(self, predicate, timeout: float = 10.0, interval: float = 0.1,
+                 msg=None):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             value = predicate()
             if value:
                 return value
             time.sleep(interval)
-        self.fail("condition non remplie après %ss" % timeout)
+        # #2497 : `msg` (appelable) joint l'état observé à l'échec, sans quoi
+        # un rouge de CI sous charge reste muet sur sa cause
+        self.fail("condition non remplie après %ss%s"
+                  % (timeout, "\n" + msg() if msg else ""))
 
     def make_test_key(self, name: str = "test-owner") -> tuple[str, str, str]:
         """Paire de clés de TEST dans le bac à sable — jamais une clé réelle."""

@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import contextlib
 import datetime as _dt
+import functools
 import json
 import random
 import time
 
-from ...db import DbError, is_unique_violation
+from ...db import DbError, in_transaction, is_unique_violation
 from .. import interface
 from . import catalog as _catalog
 from .work_dependencies import (_DONE as _DEPENDENCIES_DONE, _LOCK as _DEPENDENCIES_LOCK,
@@ -252,6 +253,14 @@ _WAITING_ON_OTHERS = "('qa', 'waiting_human', 'blocked')"
 _RESERVE_BUDGET_S = 30.0
 _RESERVE_WAIT_BASE_S = 0.005
 _RESERVE_WAIT_MAX_S = 0.5
+#: #879 : pendant la fenêtre de déploiement mixte, un client pré-0419 verrouille
+#: la ligne du lot puis le dépôt (trigger), l'ordre inverse du code courant :
+#: PostgreSQL tue l'une des deux transactions (40P01). La victime rejouée dans
+#: le bon ordre retrouve les verrous libérés par l'autre. Reprise bornée : au
+#: delà, l'erreur remonte telle quelle.
+_DEADLOCK_ATTEMPTS = 5
+_DEADLOCK_WAIT_BASE_S = 0.05
+_DEADLOCK_WAIT_MAX_S = 0.5
 #: l'index unique (dépôt, numéro) de L122 : lui seul fait une contention
 MIGRATION_INDEX = "work_items_migration_repo_idx"
 #: #711/#2481 : l'index partiel des créneaux réservés (dépôt, cible, numéro) ;
@@ -335,6 +344,17 @@ _DELEGATION_COLUMNS = """
 """
 
 
+#: #1693 (N4)/#2317 (N2) : un jalon `merged` n'est effectif que si aucune
+#: correction `merged → build` ne l'a annulé — une correction au moins aussi
+#: récente que le jalon. Les jalons annulés RESTENT dans la table (aucune
+#: reprise destructive) ; la lecture calcule le jalon effectif depuis le
+#: journal. La correction se reconnaît à la TRANSITION du journal (fonction
+#: 0463), jamais au texte libre de sa note.
+def _effective_merged(alias: str) -> str:
+    return ("NOT agent_mesh_merged_annulled(%s.work_item_id, %s.at)"
+            % (alias, alias))
+
+
 #: Les délais d'un lot, dérivés de ses jalons (L10, R19). Forme **stable** :
 #: L24 (`ameesh progress`) et Nexlink la consomment telle quelle ; une étape qui
 #: n'a pas eu lieu est NULL, jamais zéro. Le premier gel et le premier verdict
@@ -368,8 +388,9 @@ _DELAYS_SELECT = """
              WHERE m.work_item_id = w.id AND m.kind = 'verdict'
              ORDER BY m.at, m.id LIMIT 1) rev ON true
       LEFT JOIN LATERAL (
-            SELECT min(m.at) AS at FROM work_item_milestones m
-             WHERE m.work_item_id = w.id AND m.kind = 'merged') fus ON true
+            SELECT max(m.at) AS at FROM work_item_milestones m
+             WHERE m.work_item_id = w.id AND m.kind = 'merged'
+               AND __MERGED_EFFECTIVE__) fus ON true
       LEFT JOIN LATERAL (
             SELECT min(m.at) AS at FROM work_item_milestones m
              WHERE m.work_item_id = w.id AND m.kind = 'delivered') liv ON true
@@ -380,11 +401,44 @@ _DELAYS_SELECT = """
             SELECT count(*) AS n FROM work_item_milestones m
              WHERE m.work_item_id = w.id AND m.kind = 'verdict'
                AND m.verdict = 'blocked') blk ON true
-"""
+""".replace("__MERGED_EFFECTIVE__", _effective_merged("m"))
 
 
 class _Refrozen(Exception):
     """Annule la fermeture : un nouveau gel a été validé pendant l'attente."""
+
+
+def _deadlock_victim(exc) -> bool:
+    """40P01, reconnu par le seul code du serveur (jamais le texte)."""
+    return isinstance(exc, DbError) and exc.sqlstate == '40P01'
+
+
+def _retry_deadlock(writer):
+    """Rejoue `writer` quand sa transaction est victime d'un interblocage.
+
+    Chaque essai ouvre sa propre transaction : la reprise reprend les verrous
+    dans l'ordre du code courant (dépôt avant ligne de lot). Le nombre
+    d'essais est borné, et seule la victime 40P01 est rejouée.
+
+    Jamais en transaction appelante (#879 B2) : sous psql l'erreur a fermé la
+    session, et la reprise en rouvrirait une neuve, hors du bloc atomique de
+    l'appelant (`import_reservations`) ; sous psycopg la transaction est
+    avortée. C'est à l'appelant de décider de l'échec ou de la reprise."""
+
+    @functools.wraps(writer)
+    def wrapped(self, *args, **kwargs):
+        for attempt in range(_DEADLOCK_ATTEMPTS):
+            try:
+                return writer(self, *args, **kwargs)
+            except DbError as exc:
+                if (not _deadlock_victim(exc) or attempt == _DEADLOCK_ATTEMPTS - 1
+                        or in_transaction(self.db)):
+                    raise
+                time.sleep(random.uniform(
+                    0.0, min(_DEADLOCK_WAIT_MAX_S, _DEADLOCK_WAIT_BASE_S * 2 ** attempt)))
+        raise AssertionError('unreachable')
+
+    return wrapped
 
 
 def _lock_migration_writer(tx, item_id, proposed=None):
@@ -412,6 +466,7 @@ def _lock_migration_writer(tx, item_id, proposed=None):
 
 class WorkItems(interface.WorkItems):
 
+    @_retry_deadlock
     def set_app(self, item_id, app, *, actor, if_empty=False, assignee=None) -> dict | None:
         with self.db.transaction() as tx:
             if not _lock_migration_writer(tx, item_id):
@@ -655,7 +710,8 @@ class WorkItems(interface.WorkItems):
             sql += (
                 "   AND EXISTS (SELECT 1 FROM work_item_milestones m"
                 "                WHERE m.work_item_id = w.id AND m.kind = 'merged'"
-                "                  AND m.at >= %s)"
+                "                  AND m.at >= %s"
+                "                  AND " + _effective_merged("m") + ")"
             )
             params.append(since)
         if terminal_prefix:
@@ -714,6 +770,7 @@ class WorkItems(interface.WorkItems):
         value = rows[0]["bound_at"]
         return value.isoformat() if hasattr(value, "isoformat") else str(value)
 
+    @_retry_deadlock
     def move(self, item_id, state, *, current, loops, note, actor,
              held=False) -> dict | None:
         """Déplace le lot s'il est encore en `current` (sinon None, rien
@@ -721,6 +778,10 @@ class WorkItems(interface.WorkItems):
         demande de décision ouverte le tient — vérifiée dans la même
         instruction, la demande verrouillée (voir l'interface). Un passage
         vers un état terminal libère la réservation de migration (#956).
+        #1693 (N4) : une correction `merged → build` ne retire PAS le jalon
+        `merged` de la table — l'historique reste, et la lecture (progress,
+        délais, jalons effectifs) écarte le jalon qu'elle annule. La vraie
+        fusion en écrit un second, que le trigger de 0013 pose après elle.
         Un lot pinné sur une révision Process (`workflow_ref`) n'est jamais
         déplacé ici : la garde est aussi dans le SQL, pour la course entre la
         lecture de l'appelant et l'adoption concurrente (#1922/N8)."""
@@ -1532,11 +1593,46 @@ class WorkItems(interface.WorkItems):
             tuple(params),
         )
 
+    def corrections(self, ids=None) -> dict[int, float]:
+        """#2317 (N2/N4) : instant de la dernière correction `merged → build`
+        par lot, `{}` sans correction.
+
+        Une correction se reconnaît à la TRANSITION du journal — l'événement
+        `build` dont l'état précédent du lot est `merged` —, jamais au texte
+        de sa note (une note libre du même préfixe n'annule rien). `ids`
+        borne la lecture aux lots candidats (index `work_item_events_item_idx`)
+        au lieu de relire tout le journal à chaque relevé."""
+        params: list = []
+        borne = ""
+        if ids is not None:
+            ids = sorted({int(item_id) for item_id in ids})
+            if not ids:
+                return {}
+            borne = " AND c.work_item_id IN (%s)" % ", ".join(["%s"] * len(ids))
+            params.extend(ids)
+        rows = self.db.query(
+            """
+            SELECT c.work_item_id,
+                   max(extract(epoch from c.created_at))::float8 as created_ts
+              FROM work_item_events c
+              JOIN LATERAL (SELECT p.state FROM work_item_events p
+                             WHERE p.work_item_id = c.work_item_id AND p.id < c.id
+                             ORDER BY p.id DESC LIMIT 1) prev ON true
+             WHERE c.state = 'build' AND prev.state = 'merged'
+            """ + borne + """
+             GROUP BY c.work_item_id
+            """,
+            tuple(params),
+        )
+        return {int(row["work_item_id"]): float(row["created_ts"]) for row in rows}
+
     def milestones(self, item_id, limit) -> list[dict]:
         return self.db.query(
             """
             SELECT id, work_item_id, kind, sha, actor, verdict, note,
-                   extract(epoch from at)::float8 as at_ts, at
+                   extract(epoch from at)::float8 as at_ts, at,
+                   (kind = 'merged'
+                    AND agent_mesh_merged_annulled(work_item_id, at)) AS annulled
               FROM work_item_milestones
              WHERE work_item_id = %s
              ORDER BY at DESC, id DESC LIMIT %s
@@ -1660,6 +1756,7 @@ class WorkItems(interface.WorkItems):
             return rows[0]
 
     # -- branche d'un lot (L118) ---------------------------------------------
+    @_retry_deadlock
     def set_branch(self, item_id, branch, target, *, note, actor) -> dict | None:
         """Pose la branche (et la cible) d'un lot ouvert, avec une ligne de
         journal ; le dernier commit vu est oublié si la branche change. None
@@ -1836,6 +1933,7 @@ class WorkItems(interface.WorkItems):
         WorkItems(tx)._event(int(item_id), state, note, actor)
         return self._migration_row(tx, item_id)
 
+    @_retry_deadlock
     def reserve_migration(self, item_id, repo, number, floor, *, note, actor,
                           issue_ref, release=False, release_number=None) -> dict | None:
         """Réserve (ou libère, `release`) un numéro de migration d'un lot
@@ -1852,7 +1950,9 @@ class WorkItems(interface.WorkItems):
         condition du CAS, NULL et chaîne vide confondus — une correction
         concurrente de la référence pendant le scan du dépôt ne peut plus
         laisser `issue_ref` d'un dépôt avec `migration_repo` d'un autre ;
-        `release` l'ignore.
+        `release` l'ignore. En transaction appelante (`import_reservations`,
+        #879 B2), aucune reprise locale : la transaction y est perdue, la
+        DbError remonte et l'appelant décide.
 
         #2481 : quand le lot a déjà une réservation, `number` (ou le prochain
         libre) est AJOUTÉ comme créneau `legacy-<numéro>` de
@@ -2036,7 +2136,7 @@ class WorkItems(interface.WorkItems):
                         note % {"number": int(rows[0]["migration"] or 0)}, actor)
                     return rows[0]
             except DbError as exc:
-                if (number is not None or release
+                if (number is not None or release or in_transaction(self.db)
                         or not (is_unique_violation(exc, MIGRATION_INDEX)
                                 or is_unique_violation(
                                     exc, "work_migration_reservations_active_idx"))):
@@ -2589,8 +2689,9 @@ class WorkItems(interface.WorkItems):
             "SELECT %s FROM work_items WHERE package_id = %%s ORDER BY id" % item_columns(self.db),
             (package_id,))
 
+    @_retry_deadlock
     def close_merged(self, item_id, *, current, sha, actor, note, pr_ref,
-                     frozen_id=None, landed=None) -> dict | None:
+                     frozen_id=None, landed=None, unfrozen=False) -> dict | None:
         """`current` → `merged` si le lot y est encore (sinon None, rien d'écrit),
         en UNE transaction : transition, journal, puis le jalon `merged` (posé
         par le trigger de 0013) reçoit le commit et l'auteur de la fusion.
@@ -2602,11 +2703,19 @@ class WorkItems(interface.WorkItems):
         COMMITTED elle voit tout gel validé pendant l'attente (le sous-select
         d'une seule instruction verrait l'instantané d'avant l'attente). S'il
         a changé, rien n'est écrit (None). Un gel ne peut pas s'insérer
-        ensuite : `add_milestone` prend le même verrou de ligne.
+        ensuite : `add_milestone` prend le même verrou de ligne. `unfrozen`
+        (#2444, gel d'origine verdict) : aucun gel examiné ; tout gel relu
+        à cet instant refuse de même.
 
         `landed` (#1567) : `(numéro, dépôt)` du numéro réellement atterri,
         écrit dans la transaction de la fusion (`migration_landed`,
         `migration_landed_repo`).
+
+        #1693 (N1/N4) : le `pr_ref` d'une fusion réelle remplace celui de la
+        fusion annulée (une chaîne vide ne l'efface pas), et le jalon visé est
+        le plus récent encore sans commit — après une correction, le jalon de
+        la fusion annulée reste dans la table, le trigger de 0013 a posé celui
+        de la vraie fusion.
 
         Rien n'est écrit avant ce recontrôle : la fermeture est appelée dans
         la transaction qui porte aussi le réveil des dépendants (L385 suite),
@@ -2626,18 +2735,19 @@ class WorkItems(interface.WorkItems):
                     (int(item_id), current))
                 if not locked:
                     return None
-                if frozen_id is not None:
+                if frozen_id is not None or unfrozen:
                     latest = tx.query(
                         "SELECT id FROM work_item_milestones"
                         " WHERE work_item_id = %s AND kind = 'frozen'"
                         " ORDER BY at DESC, id DESC LIMIT 1", (int(item_id),))
-                    if not latest or int(latest[0]["id"]) != int(frozen_id):
+                    if (bool(latest) if frozen_id is None
+                            else not latest or int(latest[0]["id"]) != int(frozen_id)):
                         raise _Refrozen()
                 rows = tx.query(
                     """
                     UPDATE work_items
                        SET state = 'merged', updated_at = now(), closed_at = NULL,
-                           pr_ref = coalesce(%s, pr_ref),
+                           pr_ref = coalesce(nullif(%s, ''), pr_ref),
                            migration_landed = coalesce(%s, migration_landed),
                            migration_landed_repo = coalesce(%s, migration_landed_repo)
                      WHERE id = %s AND state = %s AND __UNPINNED__
@@ -2651,12 +2761,16 @@ class WorkItems(interface.WorkItems):
                 self._release_migration(tx, item_id, rows[0], why="fusion", actor=actor)
                 tx.query(
                     "UPDATE work_item_milestones SET sha = %s, actor = %s, note = %s"
-                    " WHERE work_item_id = %s AND kind = 'merged' AND sha = '' RETURNING id",
+                    " WHERE id = (SELECT id FROM work_item_milestones"
+                    "              WHERE work_item_id = %s AND kind = 'merged' AND sha = ''"
+                    "                AND " + _effective_merged("work_item_milestones") +
+                    "              ORDER BY at DESC, id DESC LIMIT 1) RETURNING id",
                     (sha or "", actor or "", note or "", int(item_id)))
                 return rows[0]
         except _Refrozen:
             return None
 
+    @_retry_deadlock
     def close(self, item_id, *, current, reason, superseded_by, sha="", actor, note) -> dict | None:
         """`current` → `closed` (abandon, remplacement, ou livraison hors cible)
         si le lot y est encore ; journal et jalon `closed` dans la même
@@ -2742,6 +2856,65 @@ class WorkItems(interface.WorkItems):
                  package_id, package_parent, app or ""))
             item = rows[0]
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
+            return item
+
+    def backlog_basket_add(self, *, key, title, expected_value, line, value_score, priority,
+                           team, required_capabilities, package_id, package_parent, note,
+                           actor, app="") -> dict:
+        caps = _catalog._text_array(required_capabilities) if required_capabilities else None
+        with self.db.transaction() as tx:
+            # #2584 : un seul écrivain par clé de panier — deux ajouts
+            # simultanés n'ouvrent jamais deux paniers du même chantier.
+            tx.query("SELECT pg_advisory_xact_lock(hashtextextended("
+                     "current_schema() || ':backlog-basket:' || %s, 0))", (key,))
+            # Une prise concurrente (`assign_capped`) attend le verrou de
+            # ligne ; gagnée avant nous, la ligne ne vérifie plus le filtre :
+            # le panier pris reste fermé aux lignes. La clé seule fait le
+            # panier : l'équipe d'une ligne n'en ouvre pas un second.
+            rows = tx.query(
+                "SELECT id FROM work_items"
+                " WHERE type = 'improvement' AND source = %s AND state = 'intake'"
+                "   AND assignee IS NULL"
+                " ORDER BY id LIMIT 1 FOR NO KEY UPDATE", (key,))
+            opened = not rows
+            if opened:
+                rows = tx.query(
+                    "INSERT INTO work_items"
+                    "    (type, source, title, body, state, expected_value, value_score,"
+                    "     priority, team, required_capabilities, package_id, package_parent,"
+                    "     app)"
+                    " VALUES ('improvement', %s, %s, %s, 'intake', %s, %s, %s, %s,"
+                    "         %s::text[], %s, %s, %s)"
+                    " RETURNING id",
+                    (key, title, line, expected_value, int(value_score), int(priority),
+                     team, caps, package_id, package_parent, app or ""))
+            else:
+                tx.query(
+                    "UPDATE work_items"
+                    "   SET body = CASE WHEN btrim(coalesce(body, '')) = '' THEN %s"
+                    "                   ELSE body || %s END,"
+                    "       value_score = greatest(coalesce(value_score, 0), %s),"
+                    "       priority = least(coalesce(priority, %s), %s),"
+                    "       required_capabilities = (SELECT array_agg(DISTINCT c ORDER BY c)"
+                    "            FROM unnest(coalesce(required_capabilities, '{}'::text[])"
+                    "                        || coalesce(%s::text[], '{}'::text[])) AS c),"
+                    "       team = coalesce(team, %s),"
+                    "       updated_at = now()"
+                    " WHERE id = %s RETURNING id",
+                    (line, "\n" + line, int(value_score), int(priority), int(priority),
+                     caps, team, int(rows[0]["id"])))
+            item_id = int(rows[0]["id"])
+            WorkItems(tx)._event(item_id, "intake", note, actor)
+            rows = tx.query(
+                "SELECT " + item_columns(self.db) + ","
+                "       (SELECT count(*) FROM work_item_events e"
+                "         WHERE e.work_item_id = work_items.id"
+                "           AND starts_with(e.note, %s))::bigint AS basket_lines"
+                "  FROM work_items WHERE id = %s",
+                (interface.BASKET_LINE_NOTE, item_id))
+            item = dict(rows[0])
+            item["basket_lines"] = int(item.get("basket_lines") or 0)
+            item["basket_opened"] = opened
             return item
 
     def backlog(self, *, open_only, limit, ready_only=False) -> list[dict]:
@@ -2962,8 +3135,9 @@ class WorkItems(interface.WorkItems):
             "SELECT w.*, k.team AS package_team, r.team AS assignee_team,"
             "       r.chantier AS assignee_chantier, r.host AS assignee_host,"
             # L157 : dates prévues et fusion, pour l'en-tête de l'issue
-            "       (SELECT extract(epoch from min(m.at))::float8 FROM work_item_milestones m"
-            "         WHERE m.work_item_id = w.id AND m.kind = 'merged') AS merged_ts"
+            "       (SELECT extract(epoch from max(m.at))::float8 FROM work_item_milestones m"
+            "         WHERE m.work_item_id = w.id AND m.kind = 'merged'"
+            "           AND " + _effective_merged("m") + ") AS merged_ts"
             "  FROM (SELECT %s,"
             "               coalesce(to_jsonb(work_items)->>'workflow_ref', '')"
             "                 AS workflow_ref,"
@@ -3075,9 +3249,16 @@ class WorkItems(interface.WorkItems):
             "                               OR w.estimate_minutes IS NOT NULL)) AS late,"
             "       coalesce(n.n, 0)::int AS revisions"
             "  FROM work_items w"
+            # #2317 (N6) : la fin reste la PREMIÈRE livraison — la fusion,
+            # sinon la livraison hors cible —, mais on ignore les jalons
+            # `merged` annulés par une correction. Le max de #1693 faisait
+            # glisser la fin d'un lot historique au jalon `delivered` le plus
+            # récent et faussait la table de référence.
             "  JOIN LATERAL (SELECT min(m.at) AS at FROM work_item_milestones m"
             "                 WHERE m.work_item_id = w.id"
-            "                   AND m.kind IN ('merged', 'delivered')) fus"
+            "                   AND m.kind IN ('merged', 'delivered')"
+            "                   AND (m.kind <> 'merged' OR "
+            + _effective_merged("m") + ")) fus"
             "    ON fus.at IS NOT NULL"
             "  LEFT JOIN LATERAL (SELECT e.minutes, e.estimated_by, e.source"
             "                       FROM work_item_estimates e"
@@ -3128,7 +3309,8 @@ class WorkItems(interface.WorkItems):
             "  FROM work_items w"
             "  JOIN LATERAL (SELECT x.at, x.sha FROM work_item_milestones x"
             "                 WHERE x.work_item_id = w.id AND x.kind = 'merged'"
-            "                 ORDER BY x.at, x.id LIMIT 1) fus ON true"
+            "                   AND " + _effective_merged("x") +
+            "                 ORDER BY x.at DESC, x.id DESC LIMIT 1) fus ON true"
             "  LEFT JOIN work_item_measures m ON m.work_item_id = w.id"
             " WHERE w.started_at IS NOT NULL AND w.state <> 'closed'")
         params: list = []

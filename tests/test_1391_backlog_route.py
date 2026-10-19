@@ -155,6 +155,16 @@ class FollowupHintTest(unittest.TestCase):
                                     source="suite de la relecture R2 (N1)")
         self.assertIn("backlog", out)
 
+    def test_the_review_ref_in_the_source_is_the_rule_too(self):
+        """#2560 : un lot de relecture qui ne porte sa référence que dans sa
+        source (issue_ref GitHub ou vide, formes #1218/#1231/#1269) ne reçoit
+        pas le renvoi backlog, comme avec `review_lot.review_ref`."""
+        for issue_ref in ("manaty/ameesh#1906", ""):
+            self.assertEqual(backlog.followup_hint(
+                title="N2 : corriger le libellé",
+                source=review_lot.ref_of(123), issue_ref=issue_ref), "",
+                issue_ref)
+
 
 class RouteFalsePositiveTest(unittest.TestCase):
     """#1622 — the false positives reported by the Claude review of #1391."""

@@ -414,12 +414,32 @@ class Config:
     #: (`{harnais: [profil, …]}`), validée par `ameesh.accounts`. Ce sont des
     #: secrets d'hôte : jamais dans le canon, jamais en base.
     accounts: dict = field(default_factory=dict)
+    #: #313 (L65b, décision 0033) : un compte dont l'identifiant (dossier de
+    #: configuration, fichier de clé, valeur de clé) est déclaré aussi par un
+    #: AUTRE mesh de l'hôte. `report` le signale (journal de l'exécuteur,
+    #: alerte `account_shared`, `ameesh doctor`, `ameesh accounts list`) ;
+    #: `strict` le refuse en plus dans CE mesh (`ameesh.account_claims`).
+    account_sharing: str = "report"
+    #: #2580 : la clé d'hôte qui refuse un compte partagé. `report` (défaut)
+    #: le signale seulement ; `refuse` le refuse dans CE mesh, comme
+    #: `account_sharing: strict`. À activer après la séparation des comptes
+    #: (#65) : refuser aujourd'hui arrêterait les deux meshes du poste.
+    accounts_shared: str = "report"
+    #: #313/#2580 : le registre des revendications de comptes, partagé par les
+    #: meshes de l'hôte ; vide = `~/.local/state/ameesh-host/accounts` (sous
+    #: `$XDG_STATE_HOME` quand il est posé)
+    account_registry: str = ""
     #: alertes poussées (L38, décision 0030 point 4) : la clé `notify` du
     #: fichier de configuration de l'HÔTE, telle quelle (routes, canaux,
     #: humain par défaut, types), validée par `ameesh.notify`. Jamais de
     #: secret ici : jetons et webhooks viennent de l'environnement ou d'un
     #: fichier 0600 nommés par cette clé.
     notify: dict = field(default_factory=dict)
+    #: identité des humains par OIDC (L86, 0033 §4) : la clé `identity` de
+    #: l'hôte (`binding` : `subject` par défaut ou `email` ; `providers` :
+    #: issuer, client_id, domains), lue par `ameesh.oidc`. Jamais de secret
+    #: ici : un client OIDC public suffit pour vérifier un jeton.
+    identity: dict = field(default_factory=dict)
     #: L109 : exécuteur médié (`backend: mediated`) — URL du serveur du mesh
     #: (`/api/exec/v1`) et fichier 0600 du jeton d'accès de l'exécuteur (la
     #: source réelle du jeton est l'identité de l'exécuteur, L110). Dans la
@@ -449,6 +469,20 @@ class Config:
     #: configuration de l'HÔTE désigné (`projects` : projet → dépôt et dossier
     #: des migrations), validée par `ameesh.radar`.
     radar: dict = field(default_factory=dict)
+    #: #2448 : release aux coupures du canon compilé (clé `release` du fichier
+    #: de l'hôte opérateur : `host` et `projects` — dépôt, cible, staging,
+    #: rapport). Validée par `ameesh.release_cutoff` ; absente = aucune.
+    release: dict = field(default_factory=dict)
+    #: #2601 : alerte « créneau manqué » des paquets horaires (clé
+    #: `packet_watch` du fichier de l'hôte opérateur : `host`, `projects` —
+    #: destinataires et grâce). Validée par `ameesh.packet_watch` ; absente =
+    #: aucune alerte.
+    packet_watch: dict = field(default_factory=dict)
+    #: #2446 : clé `train` du fichier de configuration de l'HÔTE désigné pour
+    #: le service de train (`host`, `mode`, `projects`). Lue telle quelle et
+    #: validée par `ameesh.train_assembly`, qui refuse nommément une pièce
+    #: manquante : aucun passage n'est assemblé sans elle.
+    train: dict = field(default_factory=dict)
     #: #2212 : fichier de configuration lu par `load` ("" sans fichier), pour
     #: relire `radar` à chaque passage du feu (`fresh_radar`) ; calculé, jamais
     #: lu tel quel
@@ -856,6 +890,18 @@ def load(env: dict | None = None) -> Config:
     if cfg.session_policy not in SESSION_POLICIES:
         raise SystemExit("invalid AMEESH_SESSION_POLICY: %r (%s)"
                          % (cfg.session_policy, " | ".join(SESSION_POLICIES)))
+    # #313/#2580 : une politique mal écrite ne retombe pas en silence sur `report`
+    sharing = str(cfg.account_sharing or "report").strip().lower()
+    if sharing not in ("report", "strict"):
+        raise SystemExit("invalid `account_sharing`: %r (report | strict)"
+                         % cfg.account_sharing)
+    shared = str(cfg.accounts_shared or "report").strip().lower()
+    if shared not in ("report", "refuse"):
+        raise SystemExit("invalid `accounts_shared`: %r (report | refuse)"
+                         % cfg.accounts_shared)
+    cfg = replace(cfg, account_sharing=sharing, accounts_shared=shared,
+                  account_registry=_expand(str(cfg.account_registry))
+                  if cfg.account_registry else "")
     if not isinstance(cfg.harness_bins, dict) or not all(
             isinstance(k, str) and isinstance(v, str) and v.strip()
             for k, v in cfg.harness_bins.items()):

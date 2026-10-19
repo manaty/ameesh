@@ -676,6 +676,7 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
         sha = ((freeze or {}).get("sha") or "").strip()
         frozen_id = int(freeze["id"]) if freeze else None
         freeze_origin = "frozen" if sha else None
+        unchecked = None
         if not sha:
             # #2399 (cas #2366) : un avis `ok` sur la tête publiée vaut gel
             # effectif (`freeze.origin=verdict`, #1756) ; sans jalon `frozen`,
@@ -683,16 +684,21 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
             # autre tête ne prouve rien : la branche a avancé depuis.
             candidate = freeze_candidate(marks, repo_dir,
                                          target or row.get("branch_target") or default)
+            # #2444 : la tête confrontée est la tête publiée (origin d'abord) ;
+            # une branche disparue ne vaut pas un contrôle de la tête.
             reviewed = commit_id(candidate.get("sha"))
             if candidate.get("origin") == "verdict" and reviewed:
-                head = _tip(repo_dir, row["branch"]) if row.get("branch") else None
-                if head is None or same_commit(reviewed, head):
+                head = _published_tip(repo_dir, row["branch"]) if row.get("branch") else None
+                if head is None:
+                    unchecked = "verdict freeze not checked: branch head not found"
+                elif same_commit(reviewed, head):
                     sha, freeze_origin = reviewed, "verdict"
         entry = {"work_item": lot, "package": row.get("package_id"),
                  "state": row["state"], "result": "no-commit", "how": None, "ref": None,
                  "target": None, "off_target": None, "freeze_origin": freeze_origin,
-                 "detail": ("last freeze has no commit (milestone frozen --sha)" if freeze
-                            else "no freeze declared (milestone frozen --sha)")}
+                 "detail": unchecked or (
+                     "last freeze has no commit (milestone frozen --sha)" if freeze
+                     else "no freeze declared (milestone frozen --sha)")}
         if not sha:
             results.append(entry)
             continue
@@ -762,6 +768,7 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
             done = work_mod.close_merged(
                 db, lot, sha=entry["ref"] or "", actor="git:%s" % found_target,
                 source="content (%s)" % entry["how"], frozen_id=frozen_id,
+                unfrozen=frozen_id is None,   # #2444 : un gel apparu entre-temps refuse
                 repo=repo_dir)          # L539 : dépôt du relevé, indice de classe
             entry["result"] = done["result"]
             detail = "%s — %s" % (entry["detail"], done["detail"])
@@ -1010,6 +1017,16 @@ def _tip(repo: str, branch: str) -> str | None:
     return None
 
 
+def _published_tip(repo: str, branch: str) -> str | None:
+    """#2444 : la tête publiée d'abord (`origin/<branche>`), la locale à
+    défaut — un avis se confronte à ce que la forge porte, pas à un clone."""
+    for ref in ("refs/remotes/origin/" + branch, "refs/heads/" + branch):
+        found = _commit(repo, ref)
+        if found:
+            return found
+    return None
+
+
 def _on_first_parent(repo: str, commit: str, head: str) -> bool:
     chain = _out(repo, "rev-list", "--first-parent", "--max-count=%d" % MAX_TARGET_COMMITS,
                  head)
@@ -1118,9 +1135,31 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
                                "reverts its content"
                                % (branch, tip[:12], target, stopped["ref"][:12]))
         if not _on_first_parent(repo, tip, head):
-            return dict(out, merged=True, how="ancestor", ref=tip,
-                        detail="%s (%s) entered %s through a merge commit"
-                               % (branch, tip[:12], target))
+            # #2543 : une pointe entrée par un commit de fusion n'est pas une
+            # preuve en soi — une branche créée sur un commit de paquet déjà
+            # fusionné a exactement cette forme, sans travail propre. La voie
+            # « ancestor » n'est retenue que si cette pointe a déjà été vue en
+            # avance pour le lot (`branch_head`), ou qu'une fusion de la cible
+            # cite la branche ; sinon le lot ne bouge pas.
+            if seen_head and _commit(repo, seen_head) == tip:
+                return dict(out, merged=True, how="ancestor", ref=tip,
+                            detail="%s (%s) entered %s through a merge commit; "
+                                   "its tip was seen ahead for this lot"
+                                   % (branch, tip[:12], target))
+            found = seen()
+            if found:
+                return found
+            cited = mention(
+                "%s has no work of its own: its tip %s is an ancestor of %s through "
+                "a merge commit, but it was never seen ahead for this lot"
+                % (branch, tip[:12], target))
+            if cited["merged"]:
+                # la fusion cite la branche : la pointe est bien entrée par
+                # elle, l'ancêtre est la preuve (comme avant #2543)
+                return dict(cited, how="ancestor", ref=tip,
+                            detail="%s (%s) entered %s through a merge commit "
+                                   "that cites it" % (branch, tip[:12], target))
+            return cited
         return seen() or mention("%s has no work of its own: its tip %s is on the "
                                  "line of %s" % (branch, tip[:12], target))
     out["ahead"] = True

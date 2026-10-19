@@ -68,8 +68,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    delays timeline link_package by_package close_merged close
                    refresh_package_parents delegate current_delegation
                    mark_delegate_turn due_delegations resolve_delegation
-                   overdue_delegations returned_delegations backlog_add backlog
-                   auto_takes_since unassigned_lots issue_feed set_issue_ref set_estimate
+                   overdue_delegations returned_delegations backlog_add
+                   backlog_basket_add backlog auto_takes_since unassigned_lots issue_feed set_issue_ref set_estimate
                    estimates mark_started estimate_history
    packages       all get upsert retire lock_sync
    actions         get recent attempts events log_event last_event_note
@@ -194,6 +194,9 @@ AUTO_TAKE_NOTE = "prise automatique"
 HANDOFF_NOTE = "pause budget (reprise) : lot repris"
 ASSIGN_NOTE_PREFIXES = ("assigned to ", "assigné à ", "created and assigned to ",
                         DELEGATED_NOTE, LOT_TAKE_NOTE, AUTO_TAKE_NOTE, HANDOFF_NOTE)
+#: #2584 : début de la note de journal d'une ligne de panier (`backlog_basket_add`)
+#: — le compte des lignes d'un panier se lit sur ce préfixe
+BASKET_LINE_NOTE = "basket line"
 
 
 class Domain(abc.ABC):
@@ -247,7 +250,8 @@ class Agents(Domain):
     @abc.abstractmethod
     def operator_pause(self, name: str, *, paused: bool, reason: str,
                        actor: str, principal: str,
-                       expect_reason: str | None = None) -> dict | None:
+                       expect_reason: str | None = None,
+                       not_after: float | None = None) -> dict | None:
         """Native human hold: row lock, state and audit in one atomic statement.
 
         No status/prompt/lease changes; repeated state has no new event.
@@ -258,6 +262,11 @@ class Agents(Domain):
         instruction, sous le verrou de ligne : une pause étrangère posée entre
         la lecture et la reprise n'est jamais levée. Refusé pour POSER une
         pause (`paused=True`).
+
+        `not_after` (#2184/R3) : échéance absolue (epoch) pour une POSE ; la
+        base la compare à son horloge sous le verrou de ligne et refuse la
+        pose au-delà (`changed=false`, `refusal='not_after'`). Une pose
+        distante retardée ne peut donc pas committer après le nettoyage.
         """
 
     @abc.abstractmethod
@@ -360,7 +369,8 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def state(self, name: str) -> dict | None:
-        """Détenteur, epoch, statut et vie du bail (`live`), ou None."""
+        """Nom primaire résolu, détenteur, epoch, statut et vie du bail
+        (`live`), ou None."""
 
     @abc.abstractmethod
     def renew(self, name: str, owner: str, epoch: int, ttl_seconds: float) -> float | None:
@@ -1095,6 +1105,15 @@ class Mailbox(Domain):
     @abc.abstractmethod
     def history(self, recipient: str, limit: int) -> list[dict]:
         """Derniers messages du destinataire, du plus récent au plus ancien."""
+
+    @abc.abstractmethod
+    def review_requests(self, recipient: str, lot: str) -> list[dict]:
+        """#2504 : les demandes de relecture (`kind = 'request'`) du
+        destinataire liées à ce lot, du plus récent au plus ancien.
+
+        Le filtre (destinataire, nature, lot) est fait DANS la requête : un
+        `history` borne avant de filtrer, donc une demande ancienne du même lot
+        sortait de la fenêtre et une re-désignation renvoyait un doublon."""
 
     @abc.abstractmethod
     def pending_recipients(self) -> list[str]:
@@ -1974,9 +1993,22 @@ class WorkItems(Domain):
         dédupliquée exactement."""
 
     @abc.abstractmethod
+    def corrections(self, ids: Sequence[int] | None = None) -> dict[int, float]:
+        """#2317 (N2/N4) : instant de la dernière correction `merged → build`
+        par lot, `{}` sans correction.
+
+        Une correction se reconnaît à la **transition** du journal (un
+        événement `build` dont l'état précédent est `merged`), jamais au texte
+        de sa note — une note libre du même préfixe n'annule rien. `ids` borne
+        la lecture aux lots candidats au lieu de relire tout le journal à
+        chaque relevé."""
+
+    @abc.abstractmethod
     def milestones(self, item_id: int, limit: int | None) -> list[dict]:
         """Les jalons d'un lot (0013), du plus récent au plus ancien.
-        `None` lit tout l'historique, notamment les anciens blocages du train."""
+        `None` lit tout l'historique, notamment les anciens blocages du train.
+        Chaque ligne porte `annulled` : vrai pour un jalon `merged` qu'une
+        correction `merged → build` postérieure a annulé (#2317)."""
 
     @abc.abstractmethod
     def add_milestone(self, item_id: int, kind: str, *, sha: str, actor: str,
@@ -2032,10 +2064,12 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def close_merged(self, item_id: int, *, current: str, sha: str, actor: str, note: str,
                      pr_ref: str | None, frozen_id: int | None = None,
-                     landed: tuple[int, str] | None = None) -> dict | None:
+                     landed: tuple[int, str] | None = None,
+                     unfrozen: bool = False) -> dict | None:
         """Fusion constatée (L29) : `current` → `merged` si le lot y est encore
         et, si `frozen_id` est donné, si ce jalon `frozen` est toujours le
-        dernier gel du lot (sinon None, rien d'écrit) ; journal et jalon
+        dernier gel du lot — `unfrozen` (#2444) : si le lot n'a toujours aucun
+        gel (sinon None, rien d'écrit) ; journal et jalon
         `merged` (commit, auteur de la fusion) dans la même transaction.
         `landed` (#1567) : `(numéro, dépôt)` du numéro réellement atterri,
         écrit dans la même transaction."""
@@ -2073,6 +2107,29 @@ class WorkItems(Domain):
         assigné, et sa première ligne de journal ; rend le lot.
 
         `app`: its project (L118c), empty when unknown."""
+
+    @abc.abstractmethod
+    def backlog_basket_add(self, *, key: str, title: str, expected_value: str, line: str,
+                           value_score: int, priority: int, team: str | None,
+                           required_capabilities: list | None, package_id: str | None,
+                           package_parent: str | None, note: str, actor: str,
+                           app: str = "") -> dict:
+        """#2584 (canon §2 l.129) : ajoute une ligne au panier ouvert `key`
+        d'un chantier, ou ouvre ce panier ; rend le panier.
+
+        Le panier est un lot `improvement` en `intake`, sans assigné, dont la
+        `source` vaut `key` : la clé seule le désigne, l'équipe d'une ligne
+        n'ouvre pas un second panier. La ligne s'ajoute au corps ; la valeur
+        du panier est la plus haute de ses lignes, sa priorité la plus haute
+        (le plus petit nombre), ses capacités exigées l'union des leurs, son
+        équipe la première donnée (`team` de la ligne qui l'ouvre, sinon
+        d'une suivante) ;
+        `note` (qui commence par `BASKET_LINE_NOTE`) va au journal. Un panier
+        déjà pris (assigné, ou sorti d'`intake`) est fermé aux lignes : la
+        suivante ouvre un nouveau panier. Deux ajouts simultanés sur la même
+        clé n'ouvrent jamais deux paniers (un écrivain par clé). Le lot rendu
+        porte `basket_lines` (lignes au journal du panier) et `basket_opened`
+        (vrai si cet ajout l'a ouvert)."""
 
     @abc.abstractmethod
     def backlog(self, *, open_only: bool, limit: int,
@@ -3121,6 +3178,14 @@ class Operations(Domain):
     #: réglages entiers (colonne `bigint`) : la valeur texte est convertie
     INTEGER_SETTINGS = ("context_max_tokens", "turn_max_seconds", "turn_mail_max",
                         "turn_grace_seconds")
+
+    @abc.abstractmethod
+    def publish_peek(self, name: str, owner: str, epoch: int, payload: dict) -> bool:
+        """Replace a sanitised observation under the live agent lease; false if fenced."""
+
+    @abc.abstractmethod
+    def read_peek(self, name: str, human: str) -> dict | None:
+        """Responsible human only; no snapshot data selected on a refused read."""
 
     @abc.abstractmethod
     def set_settings(self, name: str, values: dict) -> bool:

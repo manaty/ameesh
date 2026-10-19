@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#775 : le vérificateur de liens et d'ancres de `docs/` (scripts/doc-links.py).
+"""#775: the link and anchor checker of `docs/` (scripts/doc-links.py).
 
-Sans base : la règle de slug GitHub (accents, tirets, doublons), les cas cassés
-sur une arborescence temporaire, et la garde sur le `docs/` du dépôt. Ce module
-lit `docs/` : il est déclaré dans `tests/parts/lecteurs-doc.txt` (L161a).
+No database: GitHub's slug rule (accents, dashes, duplicates), the broken
+cases on a throwaway tree, and the guard on the repository's `docs/`. This
+module reads `docs/`: it is declared in `tests/parts/lecteurs-doc.txt` (L161a).
 """
 from __future__ import annotations
 
@@ -37,12 +37,19 @@ class SlugTest(unittest.TestCase):
             page.write_text("# Foo\n\n## Foo\n\n### Foo\n", encoding="utf-8")
             self.assertEqual(doc_links.headings(page), {"foo", "foo-1", "foo-2"})
 
+    def test_closing_hash_needs_a_space(self):
+        self.assertEqual(doc_links.HEADING.match("# C#").group(2), "C#")
+        self.assertEqual(doc_links.HEADING.match("# C# ###").group(2), "C#")
+        self.assertEqual(doc_links.HEADING.match("# Title ###").group(2), "Title")
+
 
 class BrokenLinksTest(unittest.TestCase):
     """One case per rule, on a throwaway tree."""
 
     def tree(self, text: str) -> tuple[pathlib.Path, pathlib.Path]:
-        tmp = pathlib.Path(tempfile.mkdtemp())
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        tmp = pathlib.Path(tmp_dir.name)
         (tmp / "docs").mkdir()
         (tmp / "docs" / "target.md").write_text("# Section\n\n## Sous-section\n",
                                                 encoding="utf-8")
@@ -59,8 +66,8 @@ class BrokenLinksTest(unittest.TestCase):
             "# Section\n"), [])
 
     def test_missing_file_and_anchor(self):
-        self.assertEqual(self.reasons("[absent](nowhere.md)\n"), ["fichier absent"])
-        self.assertEqual(self.reasons("[ancre](target.md#absente)\n"), ["ancre absente"])
+        self.assertEqual(self.reasons("[absent](nowhere.md)\n"), ["missing file"])
+        self.assertEqual(self.reasons("[ancre](target.md#absente)\n"), ["missing anchor"])
 
     def test_directory_link_is_valid(self):
         self.assertEqual(self.reasons("[dossier](.)\n"), [])
@@ -73,18 +80,55 @@ class BrokenLinksTest(unittest.TestCase):
         self.assertEqual(self.reasons(
             "```\n[absent](nowhere.md)\n```\n\nUn `[absent](nowhere.md)` inline.\n"), [])
 
+    def test_fence_marker_is_remembered(self):
+        self.assertEqual(self.reasons(
+            "```\n[absent](nowhere.md)\n~~~\n[absent](nowhere.md)\n```\n"), [])
+        self.assertEqual(self.reasons(
+            "~~~\n[absent](nowhere.md)\n```\n[absent](nowhere.md)\n~~~\n"), [])
+
+    def test_longer_fence_closes(self):
+        self.assertEqual(self.reasons(
+            "````\n[absent](nowhere.md)\n```\n[absent](nowhere.md)\n````\n"), [])
+
+    def test_link_after_a_closed_fence_is_read(self):
+        self.assertEqual(self.reasons("```\ncode\n```\n[absent](nowhere.md)\n"),
+                         ["missing file"])
+
+    def test_indented_code_is_not_read(self):
+        self.assertEqual(self.reasons("    [absent](nowhere.md)\n"), [])
+        self.assertEqual(self.reasons("[faux](#faux-titre)\n\n    # Faux titre\n"),
+                         ["missing anchor"])
+
+    def test_setext_headings(self):
+        self.assertEqual(self.reasons("[titre](#mon-titre)\n\nMon titre\n=========\n"), [])
+        self.assertEqual(self.reasons("[titre](#mon-titre)\n\nMon titre\n---------\n"), [])
+
+    def test_fence_breaks_setext_context(self):
+        self.assertEqual(self.reasons(
+            "[faux](#titre)\n\nTitre\n```\ncode\n```\n---\n"), ["missing anchor"])
+
+    def test_html_anchors(self):
+        self.assertEqual(self.reasons('<a id="custom"></a>\n\n[lien](#custom)\n'), [])
+        self.assertEqual(self.reasons('<a name="legacy"></a>\n\n[lien](#legacy)\n'), [])
+
+    def test_footnote_is_not_a_reference(self):
+        self.assertEqual(self.reasons("[^1]: Voir.\n"), [])
+        self.assertEqual(self.reasons("[^1]: Voir.\n\n[ok](target.md)\n"), [])
+        self.assertEqual(self.reasons("[^1]: Voir [absent](nowhere.md).\n"),
+                         ["missing file"])
+
     def test_reference_without_definition(self):
         self.assertEqual(self.reasons("Voir [la cible][ref].\n"),
-                         ["référence sans définition"])
+                         ["reference without definition"])
         self.assertEqual(self.reasons("Voir [la cible][ref].\n\n[ref]: target.md\n"), [])
 
     def test_absolute_link_from_the_repository_root(self):
         self.assertEqual(self.reasons("[absolu](/docs/target.md)\n"), [])
-        self.assertEqual(self.reasons("[absolu](/docs/nowhere.md)\n"), ["fichier absent"])
+        self.assertEqual(self.reasons("[absolu](/docs/nowhere.md)\n"), ["missing file"])
 
     def test_duplicate_heading_anchor(self):
         self.assertEqual(self.reasons("[deuxième](target.md#sous-section-1)\n"),
-                         ["ancre absente"])
+                         ["missing anchor"])
 
 
 class DocsTreeTest(unittest.TestCase):

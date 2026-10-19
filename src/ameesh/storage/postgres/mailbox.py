@@ -373,6 +373,30 @@ class Mailbox(interface.Mailbox):
             (recipient, int(limit)),
         )
 
+    def review_requests(self, recipient, lot) -> list[dict]:
+        """#2504 : les `request` du lot, filtrés avant toute borne.
+
+        `history` lit les N derniers messages PUIS l'appelant filtre : sous un
+        fort volume de courrier, une demande de relecture du même lot sortait de
+        la fenêtre et la désignation en renvoyait une seconde. Ici le
+        destinataire, la nature et le lot sont dans le WHERE ; le lot reste
+        petit, aucune borne n'est nécessaire (une borne rouvrirait le défaut).
+
+        #2563 : le lot est comparé à `work_item_id` sans fonction, pour rester
+        sur l'index partiel 0413. Tous les écrivains de `request` posent
+        `str(int(lot))` : l'égalité simple est exacte."""
+        return self.db.query(
+            """
+            SELECT %s
+            FROM agent_mailbox
+            WHERE recipient = %%s
+              AND kind = 'request'
+              AND work_item_id = %%s
+            ORDER BY id DESC
+            """ % MAIL_COLUMNS,
+            (recipient, str(lot)),
+        )
+
     def pending_recipients(self) -> list[str]:
         return [row["recipient"] for row in self.db.query(
             "SELECT DISTINCT recipient FROM agent_mailbox WHERE delivered_at IS NULL"

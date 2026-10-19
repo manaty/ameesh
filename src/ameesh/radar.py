@@ -791,7 +791,7 @@ class Cache:
 
 def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
          migrations: str = "", cache: Cache | None = None,
-         verify=None, reservations=None) -> dict:
+         verify=None, reservations=None, reservation_holder=None) -> dict:
     """Le radar sur un dépôt. `lots` : `{id, branch, branch_target?, title?,
     assignee?}`. Rend le rapport (sans horodatage ni durée).
 
@@ -808,7 +808,13 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
 
     `reservations` : `branches -> liste`, appelé sur les cibles certifiées
     quand les entrées portent encore `added` (les migrations ajoutées par un lot) ; seul son résultat
-    entre au rapport, `added` ne sort jamais dans le journal (#1335)."""
+    entre au rapport, `added` ne sort jamais dans le journal (#1335).
+
+    `reservation_holder` (facultatif) : `numéro -> id du lot détenteur | None`,
+    lu sur le registre des réservations. #2396 : quand plusieurs copies d'une
+    migration héritée divergent, le détenteur de la réservation est préféré
+    comme survivant, pour que la sonde des réservations ne signale pas la copie
+    d'un autre détenteur comme « unreserved ». Sans lui, le rang par date décide."""
     cache = cache if cache is not None else Cache()
     objects = plan_git._out(repo, "rev-parse", "--path-format=absolute",
                             "--git-path", "objects")
@@ -964,8 +970,9 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
         if not one.get("target_certified", True):
             uncertified.setdefault((one["target"], one["target_ref"]),
                                    one.get("target_reason") or "")
-    migration_branches = (_native_migration_additions(repo, branches, migrations)
-                          if migrations else branches)
+    migration_branches = (_native_migration_additions(
+        repo, branches, migrations, reservation_holder=reservation_holder)
+        if migrations else branches)
     report = {"repo": repo, "branches": [{k: v for k, v in b.items() if k != "added"}
                                          for b in branches],
               "skipped": skipped, "pairs_checked": checked, "pairs": pairs,
@@ -982,7 +989,8 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
     return report
 
 
-def _native_migration_additions(repo: str, branches: list[dict], directory: str) -> list[dict]:
+def _native_migration_additions(repo: str, branches: list[dict], directory: str,
+                                *, reservation_holder=None) -> list[dict]:
     """#2279/#2388: attribute unchanged inherited migrations to their base.
 
     Inheritance is proved by history, never by a branch name: either a strict
@@ -991,11 +999,14 @@ def _native_migration_additions(repo: str, branches: list[dict], directory: str)
     same path and blob (#2388: a lot stacked on a package whose tip has moved
     since the fork). One survivor is kept for the whole diverged group, not
     pair by pair: a pairwise choice can cycle between ancestry and date and
-    hide every copy. The survivor (the tip that advanced last) keeps the
-    attribution, so a third holder, the duplicate probe and the reservation
-    probe still see the number. Equal tips, independent additions, modified
-    SQL and unreadable evidence keep their warnings. Both probes use this
-    view; branch diffs in the report keep their full scope.
+    hide every copy. The survivor keeps the attribution, so a third holder,
+    the duplicate probe and the reservation probe still see the number. The
+    reservation holder is preferred when it is in the group (#2396): the
+    surviving copy is then the one the registry names, so the reservation
+    probe does not report another holder's copy as unreserved. Otherwise the
+    tip that advanced last wins, then the oldest lot. Equal tips, independent
+    additions, modified SQL and unreadable evidence keep their warnings. Both
+    probes use this view; branch diffs in the report keep their full scope.
     """
     groups: dict = {}
     for one in branches:
@@ -1069,13 +1080,15 @@ def _native_migration_additions(repo: str, branches: list[dict], directory: str)
                 tip_dates[tip] = 0
         return tip_dates[tip]
 
-    def rank(one: dict):
-        """Pick the survivor of a diverged group: the tip that advanced last,
-        then the oldest work item. Git cannot tell which of several diverged
-        branches was the base (they carry the same file at their merge-base);
-        the ranking only keeps one attribution, so a third holder and the
+    def rank(one: dict, holder=None):
+        """Pick the survivor of a diverged group: the reservation holder when
+        it is in the group (#2396), else the tip that advanced last, then the
+        oldest work item. Git cannot tell which of several diverged branches
+        was the base (they carry the same file at their merge-base); the
+        ranking only keeps one attribution, so a third holder and the
         reservation probe still see the number (#2388 review)."""
-        return (tip_date(one["tip"]), -int(one["work_item"]), one["branch"])
+        return (1 if holder is not None and int(one["work_item"]) == holder else 0,
+                tip_date(one["tip"]), -int(one["work_item"]), one["branch"])
 
     for (_, _, path), holders in groups.items():
         if len(holders) < 2:
@@ -1135,10 +1148,20 @@ def _native_migration_additions(repo: str, branches: list[dict], directory: str)
         groups_by_root: dict = {}
         for index in list(roots):
             groups_by_root.setdefault(find(index), []).append(index)
+        holder = None
+        if (reservation_holder is not None
+                and any(len(members) > 1 for members in groups_by_root.values())):
+            number = int(MIGRATION_RE.fullmatch(os.path.basename(path)).group(1))
+            try:
+                found = reservation_holder(number)
+            except Exception as exc:
+                raise GitError(
+                    "migration reservation registry unreadable: %s" % exc) from exc
+            holder = int(found) if found is not None else None
         for members in groups_by_root.values():
             if len(members) < 2:
                 continue
-            keep = max(members, key=lambda index: rank(holders[index]))
+            keep = max(members, key=lambda index: rank(holders[index], holder))
             inherited_indices.update(index for index in members if index != keep)
         for index in inherited_indices:
             inherited.setdefault(holders[index]["work_item"], set()).add(path)
@@ -1269,13 +1292,34 @@ def run_pass(cfg, db, *, cache: Cache | None = None, settings: Settings | None =
             started = now()
             try:
                 from .migration_reservations import probe
-                missing_repo = bool(project.migrations) and not github_slug(project)
+                from .migrations import repo_key
+                github = github_slug(project)
+                missing_repo = bool(project.migrations) and not github
+                slug = repo_key(github) if project.migrations and github else ""
+                holders: dict = {}
+
+                def reservation_holder(number):
+                    """#2396: prefer the registry's holder as the survivor of a
+                    diverged inherited group, so the reservation probe does not
+                    report another holder's copy as unreserved."""
+                    if not slug:
+                        return None
+                    if number not in holders:
+                        try:
+                            row = storage.of(db).work.migration_holder(number, slug)
+                        except Exception as exc:
+                            raise GitError(
+                                "migration reservation registry unreadable: %s" % exc) from exc
+                        holders[number] = int(row["id"]) if row else None
+                    return holders[number]
+
                 report = scan(
                     project.repo, lots, default_target=project.target or None,
                     migrations=project.migrations, cache=cache,
                     verify=published_tip if project.migrations else None,
                     reservations=None if missing_repo
-                    else (lambda raw: probe(db, project, raw)))
+                    else (lambda raw: probe(db, project, raw)),
+                    reservation_holder=reservation_holder if slug else None)
                 if missing_repo:
                     report["reservation_error"] = (
                         "migration reservations need a GitHub repository identity")
@@ -1391,12 +1435,49 @@ def _status_success(contexts, required) -> list:
     return [p for p in required if not any((c or "").startswith(p) for c in won)]
 
 
+def latest_rollup(rollup) -> list:
+    """#2524 : les derniers checks par (workflow, nom), statuts par contexte.
+
+    Seule une date strictement plus récente remplace une entrée. Dates
+    absentes, invalides ou ex aequo : garder les entrées ambiguës afin de ne
+    jamais masquer un échec ou un check en cours sur la foi de l'ordre reçu.
+    """
+    from datetime import datetime
+
+    groups = {}
+    for index, entry in enumerate(rollup or ()):
+        context = (entry.get("__typename") == "StatusContext"
+                   or "state" in entry and "conclusion" not in entry)
+        name = entry.get("context" if context else "name")
+        key = (("context", name) if context else
+               ("check", entry.get("workflowName"), name)) if name else ("unknown", index)
+        # `gh` exporte la date d'un StatusContext sous `startedAt` (son
+        # `createdAt` GraphQL) ; `createdAt` reste lu pour un rollup GraphQL brut.
+        raw = (entry.get("startedAt") or entry.get("createdAt")) if context else entry.get("startedAt")
+        try:
+            stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            stamp = stamp.timestamp() if stamp.tzinfo is not None else None
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            stamp = None
+        groups.setdefault(key, []).append((entry, stamp))
+    latest = []
+    for entries in groups.values():
+        if any(stamp is None for _, stamp in entries):
+            latest.extend(entry for entry, _ in entries)
+        else:
+            newest = max(stamp for _, stamp in entries)
+            latest.extend(entry for entry, stamp in entries if stamp == newest)
+    return latest
+
+
 def ci_green(rollup, required=()) -> bool:
     """`statusCheckRollup` d'une PR : vert si au moins un check, et tous
-    terminés sans échec. #1748 (a) : chaque préfixe de `required`
+    terminés sans échec, après sélection des derniers checks (#2524).
+    #1748 (a) : chaque préfixe de `required`
     (`required_statuses`) doit en outre être porté par un statut de commit
     (`StatusContext`, jamais un check run, dont le nom est libre) en
     `success` — des checks `skipped` ou `success` seuls ne suffisent plus."""
+    rollup = latest_rollup(rollup)
     if not rollup:
         return False
     statuses = [(c.get("context"), c.get("state")) for c in rollup
@@ -1903,6 +1984,11 @@ def conflicts_of(report: dict) -> dict:
             "kind": "unreserved", "lots": [one["work_item"]], "files": [one["path"]],
             "target": one["target"], "number": one["number"], "repo": one["repo"],
             "holder": one.get("holder")}
+    for conflict in out.values():
+        if "fingerprint" not in conflict:
+            conflict["fingerprint"] = json.dumps(
+                [[(lot, (heads.get(lot) or {}).get("tip")) for lot in conflict["lots"]],
+                 conflict["files"], conflict.get("holder")], sort_keys=True)
     return out
 
 
@@ -2046,6 +2132,14 @@ def _key_lots(key: str) -> list[int] | None:
     return None
 
 
+def _lot_inputs(fingerprint):
+    """A `conflicts_of` fingerprint without the target's head (`lot:tip@head`
+    becomes `lot:tip`); JSON fingerprints carry no target head (#2602)."""
+    if not fingerprint or fingerprint.startswith("["):
+        return fingerprint
+    return re.sub(r"@[^|]*", "", fingerprint)
+
+
 def send_mail(cfg, db, project: Project, report: dict, *, ci="github") -> list[dict]:
     """Le courrier d'un passage : un message par lot concerné et par conflit
     nouveau (passif), puis un réveil quand un conflit avec la cible bloque
@@ -2068,20 +2162,29 @@ def send_mail(cfg, db, project: Project, report: dict, *, ci="github") -> list[d
     for key, conflict in sorted(current.items()):
         done = dict(before.get(key) or {})
         fingerprint = conflict.get("fingerprint")
-        if done.pop("dormant", False) and done.get("fp") != fingerprint:
-            # #2238: back on other inputs than the notice already sent
+        dormant = done.pop("dormant", False)
+        if (dormant and done.get("fp") != fingerprint) or \
+                _lot_inputs(done.get("fp")) != _lot_inputs(fingerprint):
+            # #2238: back on other inputs than the notice already sent.
+            # #2602: changed lot heads are new inputs, even without an absent
+            # pass; the target's head alone is not (it moves every packet).
             done = {}
         for lot in conflict["lots"]:
             one = branches.get(lot) or {}
             to = one.get("assignee")
             if not to or to.startswith(work.HUMAN_PREFIX):
                 continue
+            recipient_key = "%s:%s" % (lot, to)
+            # Upgrade the old per-lot ledger without resending existing mail.
+            previous = done.get(recipient_key, done.get(str(lot)))
             level, status = "passive", None
-            if conflict["kind"] == "target" and done.get(str(lot)) != "blocking" and ci:
+            if conflict["kind"] == "target" and previous != "blocking" and ci:
                 status = ci(one["branch"])
                 if status and status.get("green"):
                     level = "blocking"
-            if done.get(str(lot)) in (level, "blocking"):
+            if previous in (level, "blocking"):
+                done[recipient_key] = previous
+                done.pop(str(lot), None)
                 continue
             if conflict["kind"] == "target" and "merged" not in done:
                 # les lots fusionnés d'où vient le conflit, notés à sa première
@@ -2101,19 +2204,21 @@ def send_mail(cfg, db, project: Project, report: dict, *, ci="github") -> list[d
                     payload={"radar_blocking" if level == "blocking" else "radar": data})
             except Exception:  # noqa: BLE001 - réessayé au passage suivant
                 continue
-            done[str(lot)] = level
+            done[recipient_key] = level
+            done.pop(str(lot), None)
             sent.append({"key": key, "lot": lot, "to": to, "level": level,
                          "message_id": message_id})
         if done:
             if fingerprint is not None:
                 done["fp"] = fingerprint
+            done["lots"] = conflict["lots"]
             keys[key] = done
     # #2238: a conflict absent from this pass whose lots all stay on the
     # radar keeps its notice, dormant, instead of being forgotten.
     for key, done in before.items():
         if key in current or "fp" not in done:
             continue
-        lots = _key_lots(key)
+        lots = done.get("lots") or _key_lots(key)
         if lots and all(n in branches for n in lots):
             keys[key] = dict(done, dormant=True)
     if keys != before:
