@@ -183,11 +183,33 @@ class DeclaredMergeProofTest(unittest.TestCase):
         self.assertEqual(args["sha"], "b" * 40)
         self.assertEqual(args["pr_ref"], "acme/home#112")
         self.assertTrue(args["declared"])
+        self.assertEqual(args["frozen_id"], 1)
+        self.assertFalse(args["unfrozen"])
 
     def test_without_a_freeze_the_recorded_branch_links_the_pr(self):
         result, args = self.declare_pr(freeze="")
         self.assertEqual(result["sha"], "b" * 40)
         self.assertEqual(args["pr_ref"], "acme/home#112")
+        self.assertIsNone(args["frozen_id"])
+        self.assertTrue(args["unfrozen"])
+
+    def test_a_freeze_during_pr_declaration_does_not_report_success(self):
+        for freeze in ("a" * 40, ""):
+            with self.subTest(initial_freeze=bool(freeze)):
+                item, patches = self._pr_mocks(freeze)
+
+                def concurrent_freeze(*args, **kwargs):
+                    # The transaction refuses only when given the evidence
+                    # snapshot: otherwise a newer freeze would be closed.
+                    if kwargs.get("frozen_id") == 1 or kwargs.get("unfrozen"):
+                        return {"result": "refrozen", "item": item,
+                                "detail": "new freeze declared in the meantime"}
+                    return {"result": "merged", "item": item}
+
+                with patches[0], patches[1], patches[2], \
+                        mock.patch.object(work, "close_merged", side_effect=concurrent_freeze):
+                    with self.assertRaisesRegex(work.WorkError, "new freeze"):
+                        work.merged(object(), 637, pr="acme/home#112")
 
     def test_an_unmerged_pr_is_refused(self):
         self.refused_pr("not merged", state="OPEN")

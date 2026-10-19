@@ -2156,12 +2156,12 @@ def _declared_merge_commit(item: dict, sha: str, *, repo: str | None = None,
 
 
 def _merged_pr(item: dict, ref: str, *, sha: str = "", db=None, announce=None,
-               gh=None) -> tuple[str, str]:
+               gh=None) -> tuple[str, str, int | None]:
     """#2603 : preuve d'une PR fusionnée hors du dépôt du lot (canon, home).
 
     `--pr owner/repo#N` : lit la PR par `gh`, exige l'état MERGED et rend
-    `(commit de fusion, référence de la PR)`. La tête de la PR doit être le
-    gel du lot (ou, sans gel, sa branche) : une PR quelconque ne ferme pas un
+    `(commit de fusion, référence de la PR, id du gel vérifié)`. La tête de
+    la PR doit être le gel du lot (ou, sans gel, sa branche) : une PR quelconque ne ferme pas un
     lot. Aucune écriture."""
     from . import land, plan_git
 
@@ -2201,6 +2201,7 @@ def _merged_pr(item: dict, ref: str, *, sha: str = "", db=None, announce=None,
     if not head:
         raise WorkError("--pr %s: unreadable head" % pr_ref)
     frozen = ""
+    freeze = None
     if db is not None:
         try:
             freeze = plan_git.latest_freeze(milestones(db, int(item["id"])))
@@ -2232,7 +2233,7 @@ def _merged_pr(item: dict, ref: str, *, sha: str = "", db=None, announce=None,
                   "title": item.get("title") or "", "sha": merge,
                   "subject": str(data.get("title") or ""),
                   "how": "merged PR %s" % pr_ref})
-    return merge, pr_ref
+    return merge, pr_ref, int(freeze["id"]) if freeze is not None else None
 
 
 def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = "",
@@ -2280,11 +2281,14 @@ def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = 
     if item is None:
         raise WorkError("lot %s not found" % item_id)
     pr_ref = None
+    proof_guard = {}
     # Preserve idempotency and the closed-lot diagnostic without requiring
     # that an old clone or object still be available.
     if item["state"] not in (*MERGED_STATES, "closed"):
         if pr_text:
-            text, pr_ref = _merged_pr(item, pr_text, sha=text, db=db, announce=announce)
+            text, pr_ref, frozen_id = _merged_pr(
+                item, pr_text, sha=text, db=db, announce=announce)
+            proof_guard = {"frozen_id": frozen_id, "unfrozen": frozen_id is None}
         else:
             text = _declared_merge_commit(item, text, repo=repo, cfg=cfg, announce=announce)
     landed = None
@@ -2306,7 +2310,7 @@ def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = 
     try:
         done = close_merged(db, item_id, sha=text, actor=actor,
                             source=actor or UNKNOWN_ACTOR, declared=True, extra=extra,
-                            landed=landed, pr_ref=pr_ref)
+                            landed=landed, pr_ref=pr_ref, **proof_guard)
     except DbError as exc:
         # #1567 : course perdue sur l'index unique (dépôt, numéro atterri) —
         # message lisible plutôt que la DbError brute ; la pré-vérification a
@@ -2319,6 +2323,8 @@ def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = 
         # un balayage a pu fusionner le lot après notre lecture : le numéro
         # déclaré est enregistré (ou corrige celui déjà tenu) après coup
         return _record_landed(db, done["item"], landed, actor=actor, cfg=cfg)
+    if done["result"] == "refrozen":
+        raise WorkError(done["detail"])
     if done["result"] == "refused":
         item = done["item"]
         if item["state"] != "closed":
