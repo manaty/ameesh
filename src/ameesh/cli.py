@@ -143,7 +143,8 @@ def human_envelopes(msgs: list[dict], *, cfg, token: str = "") -> dict[int, str]
         sender = str(msg.get("from") or "")
         if not (mail.is_human(msg) or sender.startswith("human:")):
             continue
-        ident = resident_queue.identity_for(sender, cfg=cfg)
+        ident = resident_queue.identity_for(sender, cfg=cfg,
+                                             proof=mail.human_account(msg))
         out[mid] = resident_queue.envelope(ident, token)
     return out
 
@@ -160,6 +161,8 @@ def render(msgs: list[dict], verdicts: dict | None = None,
     `envelopes` (L77) : l'enveloppe écrite par ameesh pour un message humain,
     placée sur sa propre ligne AVANT la ligne du message — jamais issue du corps.
     """
+    from . import resident_queue
+
     verdicts = verdicts or {}
     envelopes = envelopes or {}
     prouves = sum(1 for msg in msgs
@@ -215,7 +218,7 @@ def render(msgs: list[dict], verdicts: dict | None = None,
             lines.append(env)
         lines.append("— from %s at %s%s: %s%s" % (
             msg.get("from", "?"), moment, " (%s)" % passif if passif else "",
-            msg.get("text", ""), suffixe))
+            resident_queue.neutralise(msg.get("text", "")), suffixe))
     lines.append("(to reply: agent-mail send <name> \"…\")")
     return "\n".join(lines)
 
@@ -509,6 +512,13 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     # son prochain tour sans le réveiller.
     human = _sender_is_human(bk, cfg, sender, explicit_sender)
     payload: dict = {"human": True} if human else {}
+    if human:
+        # L77 : la preuve d'identité est prise à l'ENTRÉE (compte Unix réel et
+        # hôte de ce processus), transportée avec le message ; le lecteur ne
+        # l'établit jamais avec son propre compte.
+        from . import resident_queue
+        user, host = resident_queue.local_account(cfg)
+        payload["human_account"] = "%s@%s" % (user or "?", host or "?")
     payload.update((key, True) for key in marks)
     if ack or (not urgent and not sign and not human and not marks and dest != "all"
                and lot is None and new_lot is None and kind in ("notify", "reply")

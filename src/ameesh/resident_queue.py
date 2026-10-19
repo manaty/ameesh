@@ -223,14 +223,37 @@ def member_declaration(cfg: Any, sender: str, *,
     return declarations[0]
 
 
+def split_account(account: str | None) -> tuple[str, str]:
+    """Décompose une preuve ``user@host`` ; jamais devinée si incomplète."""
+    value = (account or "").strip()
+    if "@" not in value:
+        return "", ""
+    user, host = value.rsplit("@", 1)
+    return user, host
+
+
 def identity_for(sender: str, *, cfg: Any, canon_id: str | None = None,
-                 user: str | None = None, host: str | None = None) -> Identity:
-    """L'identité ameesh d'un expéditeur, pour l'enveloppe d'un message humain."""
-    real_user, real_host = local_account(cfg)
+                 proof: str | None = None) -> Identity:
+    """L'identité ameesh d'un expéditeur, pour l'enveloppe d'un message humain.
+
+    L'authentification porte sur la preuve **transportée depuis l'entrée**
+    (``payload.human_account``, le couple ``user@host`` du processus qui a
+    déposé le message), jamais sur le compte du lecteur : un runner qui tourne
+    sous un compte local de X ne rend pas vérifié un message venu d'ailleurs.
+    Sans preuve, le message reste non vérifié (fail closed).
+    """
+    name = (sender or "").strip()
+    if not name.startswith("human:"):
+        return Identity(sender=sender, reason="not a human sender")
     accounts, role = member_declaration(cfg, sender, canon_id=canon_id)
-    ident = verify_human(sender, accounts,
-                         user=real_user if user is None else user,
-                         host=real_host if host is None else host)
+    account = (proof or "").strip()
+    if not account:
+        ident = Identity(sender=sender, human=name[len("human:"):].strip(),
+                         verified=False, account="",
+                         reason="no local account proof at entry")
+    else:
+        user, host = split_account(account)
+        ident = verify_human(sender, accounts, user=user, host=host)
     if role and ident.is_human:
         ident = Identity(sender=ident.sender, human=ident.human,
                          verified=ident.verified, account=ident.account,

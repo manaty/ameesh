@@ -504,6 +504,15 @@ def is_human(row: Any) -> bool:
     return bool(_payload(row).get("human"))
 
 
+def human_account(row: Any) -> str:
+    """L77 : la preuve d'entrée d'un message humain (``user@host``), ou ''.
+
+    Écrite par le CLI au dépôt, à partir du compte Unix réel et de l'hôte du
+    processus : le lecteur ne la recalcule jamais avec son propre compte."""
+    value = _payload(row).get("human_account")
+    return value.strip() if isinstance(value, str) else ""
+
+
 #: L514: payload keys of a message the sender marked as a review verdict
 #: (`agent-mail send --verdict`) or an arbitration (`--arbitration`)
 MID_TURN_KEYS = ("verdict", "arbitration")

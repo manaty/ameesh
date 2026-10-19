@@ -155,7 +155,10 @@ def _message(ctx, db, params, body) -> dict:
                                  explicit=True)
     except undeliverable.Refused as exc:
         raise ActionError(409, "refused", str(exc)) from exc
-    payload = {"human": True}
+    from . import resident_queue
+    user, host = resident_queue.local_account(ctx.cfg)
+    payload = {"human": True,
+               "human_account": "%s@%s" % (user or "?", host or "?")}
     if urgent:
         payload["urgent"] = True
     message_id = mail.send(db, sender, params["agent"], text, host=ctx.cfg.host,

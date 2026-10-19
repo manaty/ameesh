@@ -921,7 +921,8 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
     lot = _release_lot(db, view, actor=human, note="decision #%d answered by %s (%s): %s" % (
         view["id"], human, CHANNEL_LABELS[channel], said))
     out = {"decision": view, "lot": lot, "message_id": None, "warning": None}
-    from . import mail
+    from . import mail, resident_queue
+    user, host = resident_queue.local_account(cfg)
     try:
         out["message_id"] = mail.send(
             db, human, view["requester"], answer_text(view), host=cfg.host, kind=REPLY_KIND,
@@ -931,6 +932,7 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
             # réponse de l'owner est prioritaire (0018 §2) — elle préempte le
             # tour du demandeur, qui repart avec elle en tête.
             payload={"human": True, "urgent": True,
+                     "human_account": "%s@%s" % (user or "?", host or "?"),
                      "decision_answer": {"decision": view["id"], "lot": view.get("lot"),
                                          "by": human, "channel": channel, "option": option,
                                          "text": text}},

@@ -1393,8 +1393,18 @@ class AgentWorker(threading.Thread):
                 or getattr(rp, "closing", False):
             return False
         driver = getattr(rp, "driver", None)
-        if driver is None or not getattr(driver, "busy", False):
-            return False
+        if driver is None:
+            # Un résident vivant sans pilote reste vivant : le message attend
+            # le tour suivant, jamais un `stop_group_now` de préemption (B5).
+            log_async("[%s] preemption: resident alive without driver; message "
+                      "kept for the next turn" % self.name)
+            return True
+        if not getattr(driver, "busy", False):
+            # Course avant `send`/après la fin du tour : le résident est vivant,
+            # le message reste en file ; on ne le tue pas pour préempter.
+            log_async("[%s] preemption: resident alive between turns; message "
+                      "kept for the next turn" % self.name)
+            return True
         row = getattr(self, "_preempt_row", None)
         self._preempt_row = None
         if row is not None:
@@ -1415,7 +1425,11 @@ class AgentWorker(threading.Thread):
         except Exception as exc:
             log_async("[%s] resident interrupt failed (%s)"
                       % (self.name, " ".join(str(exc).split())[:120]))
-        return False
+        # Aucune remise immédiate possible : le message reste en file, le
+        # résident vivant est conservé (le tuer pour préempter est exclu).
+        log_async("[%s] resident preemption deferred: message kept for the next "
+                  "turn" % self.name)
+        return True
 
     def _urgent_steer_text(self, row: dict) -> str:
         """Le texte remis au point sûr : l'enveloppe ameesh, puis le corps
@@ -1423,7 +1437,8 @@ class AgentWorker(threading.Thread):
         from . import resident_queue
         ident = resident_queue.identity_for(
             row.get("sender") or "", cfg=getattr(self, "cfg", None),
-            canon_id=self._canon_id())
+            canon_id=self._canon_id(),
+            proof=mail.human_account(row))
         return "%s\n%s" % (resident_queue.envelope(ident, self._envelope_token()),
                            resident_queue.neutralise(row.get("body") or ""))
 
@@ -3377,7 +3392,18 @@ class AgentWorker(threading.Thread):
             return False
         from . import work
         if sender.startswith(work.HUMAN_PREFIX):
-            return True
+            # L77/B1 : un humain ne préempte que si la preuve d'entrée portée
+            # par le message correspond à un local_account déclaré de sa fiche.
+            # Le compte du runner/hook ne prouve jamais l'émetteur.
+            from . import resident_queue
+            ident = resident_queue.identity_for(
+                sender, cfg=getattr(self, "cfg", None),
+                canon_id=self._canon_id() if hasattr(self, "_canon_id") else None,
+                proof=mail.human_account(row))
+            if not ident.verified:
+                log("[%s] urgent from %s without a verified local account: no "
+                    "interruption" % (self.name, sender))
+            return ident.verified
         if sender in self.cfg.interrupt_senders:
             return True
         return (self._system_event_interrupt(sender, row)
@@ -4265,14 +4291,38 @@ class AgentWorker(threading.Thread):
                 log("[%s] urgent from %s without interruption: sender not allowed "
                     "to interrupt" % (self.name, refuse.get("sender") or "?"))
         if autorises:
-            # Le prioritaire passe devant la consigne en attente : c'est lui qui
-            # ouvre le tour, la consigne interrompue suivra (0018).
+            # L77 rang 1 : un message humain vérifié et urgent ne se mélange
+            # jamais au courrier ; il passe avant tout le reste et porte
+            # l'enveloppe. Les humains non vérifiés restent au rang 2.
+            humans_urgent = [m for m in autorises if self._from_human(m)]
+            if humans_urgent:
+                self.nudged = False
+                return self._human_spec("urgent", humans_urgent)
+        # Rang 2 (#286/B4) : les messages d'humains ordinaires passent AVANT
+        # le courrier urgent (rang 3), la suite et la consigne en attente
+        # (rang 4). On lit tout le courrier ici pour les trouver, y compris
+        # derrière un préfixe retenu ; les rangs suivants réutilisent la lecture.
+        messages = lot_workdir.deliverable_unread(cfg, self.db, self.agent,
+                                                   besoin=mail.UNREAD_LIMIT,
+                                                   deferred=self._lot_deferred)
+        if len(messages) >= mail.UNREAD_LIMIT and all(mail.passive_reason(m) for m in messages):
+            # L125 : boîte pleine de courrier passif — les messages qui
+            # réveillent, plus récents, ne doivent pas y rester invisibles
+            reveil = lot_workdir.deliverable_unread(cfg, self.db, self.agent,
+                                                     besoin=mail.UNREAD_LIMIT,
+                                                     mode="active",
+                                                     deferred=self._lot_deferred)
+            messages = reveil + messages
+        humans = [m for m in messages
+                  if self._from_human(m) and not mail.passive_reason(m)]
+        if humans:
             self.nudged = False
-            # L77 rang 1 : un message humain ne se mélange jamais au courrier ;
-            # l'urgence humaine passe avant tout le reste et porte l'enveloppe.
-            humans = [m for m in autorises if self._from_human(m)]
-            if humans:
-                return self._human_spec("urgent", humans)
+            self._reprise_attach = False
+            return self._human_spec("mail", humans)
+        if autorises:
+            # Rang 3 : le courrier urgent d'un expéditeur habilité (agent,
+            # système vérifié) passe avant la suite et la consigne en attente.
+            self.nudged = False
             return self._courrier_spec("urgent", autorises)
         if self.suite:
             lot = self.turn_lot({"kind": "suite", "prompt": "", "ids": []})
@@ -4295,30 +4345,7 @@ class AgentWorker(threading.Thread):
                 self.nudged = False
                 self._reprise_attach = False
                 return {"kind": "prompt", "prompt": prompt, "ids": [], "lot": lot}
-        # #811 (B1/R3) : le courrier d'un lot retenu attend, les autres
-        # messages du tour passent — et la lecture franchit un préfixe retenu
-        # qui masquerait un message remisable plus récent.
-        messages = lot_workdir.deliverable_unread(cfg, self.db, self.agent,
-                                                   besoin=mail.UNREAD_LIMIT,
-                                                   deferred=self._lot_deferred)
-        if len(messages) >= mail.UNREAD_LIMIT and all(mail.passive_reason(m) for m in messages):
-            # L125 : boîte pleine de courrier passif — les messages qui
-            # réveillent, plus récents, ne doivent pas y rester invisibles
-            reveil = lot_workdir.deliverable_unread(cfg, self.db, self.agent,
-                                                     besoin=mail.UNREAD_LIMIT,
-                                                     mode="active",
-                                                     deferred=self._lot_deferred)
-            messages = reveil + messages
         if messages:
-            # L77 rang 2 : les messages d'humains arrivent groupés, dans une
-            # entrée à eux, avec l'enveloppe écrite par ameesh. Le courrier
-            # suit au tour d'après : jamais la même entrée (étude §2).
-            humans = [m for m in messages
-                      if self._from_human(m) and not mail.passive_reason(m)]
-            if humans:
-                self.nudged = False
-                self._reprise_attach = False
-                return self._human_spec("mail", humans)
             spec = self._mail_spec(messages)
             if spec is not None:
                 self.nudged = False
@@ -4645,7 +4672,8 @@ class AgentWorker(threading.Thread):
                 continue
             ident = resident_queue.identity_for(row.get("sender") or "",
                                                 cfg=getattr(self, "cfg", None),
-                                                canon_id=canon_id)
+                                                canon_id=canon_id,
+                                                proof=mail.human_account(row))
             envelopes[key] = resident_queue.envelope(ident, token)
         prompt, retenus, reste = mail.prompt_for(
             self.db, messages, kind=kind, budget=self._budget_courrier(),
@@ -5465,6 +5493,19 @@ class AgentWorker(threading.Thread):
         urgence = self._urgent_end() or (
             "the host is withdrawing" if self.host_yield is not None else
             "stopping" if self.stopping.is_set() else "")
+        if urgence == "preemption" and rp.alive and not rp.driver.busy:
+            # L77/B5 : une préemption ne ferme pas un résident vivant. Les
+            # autres causes d'arrêt gardent la priorité.
+            if self.restarting.is_set():
+                urgence = "restart requested"
+            elif self.host_yield is not None and self.host_yield != self.HOST_SAFE_POINT:
+                urgence = "the host is withdrawing"
+            elif self.stopping.is_set():
+                urgence = "stopping"
+            elif self._power_texte:
+                urgence = "critical battery"
+            else:
+                urgence = ""
         raison = ("exited" if not rp.alive else
                   "its turn did not end" if rp.driver.busy else urgence)
         if raison and not urgence:
@@ -6123,9 +6164,10 @@ class AgentWorker(threading.Thread):
                                  or proc.stdout.readline().strip() != audit_guard.READY):
                 raise _LancementImpossible("auditor scope not validated: memory cap "
                                            "missing or scope creation refused")
-            # Lancé (et publié, pour que l'arrêt le trouve) : les messages de la
-            # consigne sont livrés, et seulement eux.
-            self._livre_courrier(spec)
+            # Lancé (et publié, pour que l'arrêt le trouve). La remise n'est
+            # constatée qu'APRÈS l'acceptation de la consigne par le harnais
+            # (L77/B2) : un `driver.send` en échec ne solde jamais un message
+            # jamais présenté ; il repart en réservation/livraison.
             if fond_dits:  # la note du travail de fond a été montrée
                 self.runner.background.mark_reported(fond_dits)
             # Course de publication : un déclencheur d'arrêt (bail perdu,
@@ -6139,12 +6181,14 @@ class AgentWorker(threading.Thread):
                 rp.drain()  # rien d'un tour précédent
                 try:
                     tour_resident = rp.driver.send(resume + spec["prompt"])
+                    self._livre_courrier(spec)  # consigne acceptée : remise
                     flux = (json.dumps(raw, ensure_ascii=False)
                             for raw, _parsed in rp.stream(tour_resident))
                 except resident_mod.ResidentError as exc:
                     error = "resident turn not started: %s" % exc
                     flux = ()
             else:
+                self._livre_courrier(spec)
                 log("[%s] %s turn: %s" % (self.name, shown, " ".join(argv[:6]) + " …"))
                 flux = proc.stdout or ()
             # L78: the writer owns its connection; harness output never waits

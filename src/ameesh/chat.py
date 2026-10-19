@@ -223,8 +223,12 @@ def post_human_message(cfg: Config, db, *, human: str, sender: str, agent: str,
         raise ValueError("invalid agent name: %r" % (agent,))
     row = registry.get(db, agent)
     work_item_id = None if lot is None else str(lot)
+    from . import resident_queue
+    user, host = resident_queue.local_account(cfg)
     message_id = mail.send(db, sender, agent, text, host=cfg.host, kind="notify",
-                           payload={"human": True}, work_item_id=work_item_id)
+                           payload={"human": True,
+                                    "human_account": "%s@%s" % (user or "?", host or "?")},
+                           work_item_id=work_item_id)
     log = conversation.Log(db, cfg, agent=agent,
                            project=fil.project_for(cfg, fil.lot_project(db, work_item_id),
                                                    fil.agent_project(row)),
@@ -541,6 +545,10 @@ class TerminalClient:
         if not text:
             return True
         payload: dict = {"human": True} if self.human else {}
+        if payload:
+            from . import resident_queue
+            user, host = resident_queue.local_account(self.cfg)
+            payload["human_account"] = "%s@%s" % (user or "?", host or "?")
         if urgent and self.sender in self.cfg.interrupt_senders:
             payload["urgent"] = True
         elif urgent:

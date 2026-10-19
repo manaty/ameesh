@@ -202,7 +202,7 @@ class ClientTest(unittest.TestCase):
         self.assertTrue(client.handle("bonjour"))
         mail.send.assert_called_once_with(
             client.db, "tester", "dev1", "bonjour", host=self.cfg.host, kind="notify",
-            payload={"human": True})
+            payload={"human": True, "human_account": mock.ANY})
         self.assertIn("sent to dev1 (mail #7)", client.view.out.getvalue())
 
     def test_urgent_without_authorisation_falls_back_to_a_normal_message(self):
@@ -210,7 +210,9 @@ class ClientTest(unittest.TestCase):
         client.handle("!urgent vite")
         kwargs = mail.send.call_args.kwargs
         self.assertEqual(mail.send.call_args.args[3], "vite")
-        self.assertEqual(kwargs["payload"], {"human": True})     # urgent non accordé
+        payload = dict(kwargs["payload"])
+        self.assertIn("@", payload.pop("human_account", ""))
+        self.assertEqual(payload, {"human": True})     # urgent non accordé
         self.assertEqual(kwargs["kind"], "notify")
         self.assertIn("delivered as a normal message", client.view.out.getvalue())
 
@@ -220,13 +222,16 @@ class ClientTest(unittest.TestCase):
         client.cfg = cfg
         client.handle("!urgent maintenant")
         kwargs = mail.send.call_args.kwargs
-        self.assertEqual(kwargs["payload"], {"human": True, "urgent": True})
+        payload = dict(kwargs["payload"])
+        self.assertIn("@", payload.pop("human_account", ""))
+        self.assertEqual(payload, {"human": True, "urgent": True})
         self.assertEqual(kwargs["kind"], "event")
         mail.send.reset_mock()
         client.handle("!stop")
         self.assertEqual(mail.send.call_args.args[3], chat.STOP_BODY)
-        self.assertEqual(mail.send.call_args.kwargs["payload"],
-                         {"human": True, "urgent": True})
+        payload = dict(mail.send.call_args.kwargs["payload"])
+        self.assertIn("@", payload.pop("human_account", ""))
+        self.assertEqual(payload, {"human": True, "urgent": True})
 
     def test_stop_without_authorisation_drops_nothing(self):
         client = self.client()

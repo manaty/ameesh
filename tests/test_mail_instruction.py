@@ -230,6 +230,47 @@ class CourrierDansLaConsigneTest(PgTestCase):
         self.assertIn("jamais vu", self._consigne())
         self.assertIsNotNone(self._ligne(mid)["delivered_ts"])
 
+    def test_humain_ordinaire_avant_courrier_urgent(self):
+        """B4 : le rang 2 humain passe avant le courrier urgent (rang 3)."""
+        _runner, worker = self._worker("ordre", senders=("dev-b",))
+        mid = mail.send(self.db, "human:alice", "ordre", "message humain",
+                        payload={"human": True, "human_account": "alice@pc"})
+        mail.send(self.db, "dev-b", "ordre", "urgent agent", kind="event",
+                  payload={"urgent": True})
+        spec = worker.pick()
+        self.assertEqual(spec["kind"], "mail")
+        self.assertEqual(spec["ids"], [mid])
+
+    def test_echec_du_send_resident_conserve_le_message_humain(self):
+        """B2 : un `driver.send` en échec ne solde pas un message jamais remis."""
+        from types import SimpleNamespace
+        from ameesh import resident as resident_mod
+        _runner, worker = self._worker("resident-echec")
+        mid = mail.send(self.db, "human:alice", "resident-echec", "à remettre",
+                        payload={"human": True, "human_account": "alice@pc"})
+        spec = worker.pick()
+        self.assertEqual(spec["kind"], "mail")
+
+        class _Driver:
+            busy = False
+
+            def send(self, text):
+                raise resident_mod.ResidentError("refus avant remise")
+
+        rp = SimpleNamespace(
+            driver=_Driver(), alive=True, closing=False, turns=0, last_used=0.0,
+            proc=None, pgid=None, resource_open=False, life_id="fake",
+            session=None, drain=lambda: None, mark_alive=lambda: None,
+            close=lambda *a, **k: None)
+
+        with self._env_harnais(), \
+                mock.patch.object(worker, "_resident_refusal", return_value=""), \
+                mock.patch.object(worker, "_resident_for_turn", return_value=rp):
+            self.assertFalse(worker.run_turn(spec))
+        ligne = self._ligne(mid)
+        self.assertIsNone(ligne["delivered_ts"])
+        self.assertIsNone(ligne["consigne_runner"])  # réservation libérée
+
     def test_echec_du_lancement_libere_la_reservation(self):
         _runner, worker = self._worker("oserror")
         mid = mail.send(self.db, "orch", "oserror", "lancement raté")
