@@ -95,6 +95,10 @@ exclus par la liste calculée ; aucun n'est admis sans porte verte.
   garde sa fermeture même sur citation explicite ou réassociation ; la preuve
   est consommée au relevé suivant après levée du blocage (2 témoins adaptés,
   module 13 OK, psql/psycopg).
+- Adaptation #2451 : `tests/test_l234a_auditor_canon_guard.py` — `CanonGuardTest`
+  patche `work.build_limit` avec la fixture §4 (`FIXTURE_BUILD_CAP`), comme
+  `AuditorTest` ; le module ne dépend plus du canon compilé pour un plafond
+  qu'il ne teste pas (6 OK).
 - Tests ciblés sur l'arbre composé : exécutés sur les modules des 10 unités
   (psql + psycopg), à consigner au fil du run.
 - Suite complète unique demandée sur la tête finale (`ci-full-<sha>`), avec la
