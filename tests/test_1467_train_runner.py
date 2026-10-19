@@ -18,6 +18,7 @@ from ameesh import (db as db_mod, prevalidation_calls, radar, storage, train, tr
                     train_transports, train_transport_journal, work)
 
 from .support import PgTestCase
+from .test_1467_train_cutoffs import paris_cutoff
 from .test_1467_train_review import author, verdict
 
 
@@ -36,7 +37,7 @@ class FixtureMechanics(train_policy.Versioned):
     # Independent packet calendar fixture; the release methods must never
     # schedule a train. #1757's real supplier is exercised by the port probe.
     packet_cutoffs = ("11:00", "23:00")
-    last_packet = staticmethod(train.cutoff)
+    last_packet = staticmethod(paris_cutoff)
 
     def next_packet(self, now):
         # Explicit fixture calendar; real provider/DST tested by the port probe.

@@ -14,6 +14,9 @@ from __future__ import annotations
 import unittest
 
 from ameesh import review_designation as rd
+
+#: #2451 : familles explicites ; l'activation passe celles du canon compilé
+FAMILIES = ("claude", "codex", "deepseek")
 from ameesh import review_pace
 
 NOW = 1_800_000_000.0
@@ -28,7 +31,8 @@ def row(name, *, team="ameesh", harness="deepseek", session="", status="idle",
 
 
 def candidates(*rows, loads=None):
-    return rd.candidates_from_registry(rows, project="ameesh", loads=loads)
+    return rd.candidates_from_registry(rows, project="ameesh", loads=loads,
+                                     families=FAMILIES)
 
 
 def gauge(harness, account, used, elapsed, *, key="seven_day", window=WEEK,
@@ -61,7 +65,7 @@ class FamilyAdvanceTest(unittest.TestCase):
         self.assertAlmostEqual(advances["claude"][""], 0.0, places=6)
         self.assertAlmostEqual(advances["claude"]["fable"], 0.35, places=6)
         self.assertAlmostEqual(advances["codex"][""], 0.16, places=6)
-        picked = rd.select(
+        picked = rd.select(families=FAMILIES,
             required=1,
             authors=[{"name": "author", "family": "deepseek"}],
             candidates=candidates(row("claude-opus", harness="claude", session="claude",
@@ -75,7 +79,7 @@ class FamilyAdvanceTest(unittest.TestCase):
                 gauge("claude", "secondaire", 0.95, 0.60, key="seven_day@fable"),
                 gauge("codex", "secondaire", 0.35, 0.19)]
         advances = review_pace.family_advances(rows, now=NOW)
-        picked = rd.select(
+        picked = rd.select(families=FAMILIES,
             required=1,
             authors=[{"name": "author", "family": "deepseek"}],
             candidates=candidates(row("claude-fable", harness="claude", session="claude",
@@ -90,7 +94,7 @@ class FamilyAdvanceTest(unittest.TestCase):
         advances = review_pace.family_advances(
             [scoped, gauge("codex", "secondaire", 0.35, 0.19)], now=NOW)
         self.assertEqual(set(advances["claude"]), {"fable"})
-        picked = rd.select(
+        picked = rd.select(families=FAMILIES,
             required=1,
             authors=[{"name": "author", "family": "deepseek"}],
             candidates=candidates(row("claude-opus", harness="claude", session="claude",
@@ -110,7 +114,7 @@ class FamilyAdvanceTest(unittest.TestCase):
         self.assertAlmostEqual(advances["claude"][""], -0.30, places=6)
         self.assertIsNone(advances["claude"]["fable"])
         self.assertAlmostEqual(advances["codex"][""], -0.10, places=6)
-        fable = rd.select(
+        fable = rd.select(families=FAMILIES,
             required=1,
             authors=[{"name": "author", "family": "deepseek"}],
             candidates=candidates(row("claude-fable", harness="claude", session="claude",
@@ -119,7 +123,7 @@ class FamilyAdvanceTest(unittest.TestCase):
             advances=advances)
         # the Fable candidate is neutral (0), Codex is behind (-10): Codex
         self.assertEqual([r["name"] for r in fable["reviewers"]], ["codex-one"])
-        opus = rd.select(
+        opus = rd.select(families=FAMILIES,
             required=1,
             authors=[{"name": "author", "family": "deepseek"}],
             candidates=candidates(row("claude-opus", harness="claude", session="claude",
@@ -184,7 +188,7 @@ class SelectionPaceTest(unittest.TestCase):
         self.advances = {"claude": 0.0, "codex": 0.16}
 
     def test_one_review_prefers_claude_even_when_codex_is_less_loaded(self):
-        picked = rd.select(
+        picked = rd.select(families=FAMILIES,
             required=1, authors=self.authors, advances=self.advances,
             candidates=candidates(row("claude-one", harness="claude", session="claude"),
                                   row("codex-one", harness="codex", session="codex"),
@@ -197,7 +201,7 @@ class SelectionPaceTest(unittest.TestCase):
         # cx3 B/P1: Opus (load 2, 0 pt) is the Claude representative, not the
         # less-loaded Fable agent (35 pt ahead); without the fix the Fable
         # agent wins the family then loses to Codex, designating Codex.
-        picked = rd.select(
+        picked = rd.select(families=FAMILIES,
             required=1, authors=self.authors,
             advances={"claude": {"": 0.0, "fable": 0.35},
                       "codex": {"": 0.16}},
@@ -212,7 +216,7 @@ class SelectionPaceTest(unittest.TestCase):
     def test_two_reviews_take_claude_and_codex_whatever_the_pace(self):
         # a sensitive lot (the merge gate, the review itself): two distinct
         # families, even when one is far behind and the other far ahead
-        picked = rd.select(
+        picked = rd.select(families=FAMILIES,
             required=2, authors=self.authors,
             advances={"claude": -0.50, "codex": 0.80},
             candidates=candidates(row("claude-one", harness="claude", session="claude"),
@@ -224,7 +228,7 @@ class SelectionPaceTest(unittest.TestCase):
         self.assertEqual(len({r["family"] for r in picked["reviewers"]}), 2)
 
     def test_unreadable_gauges_keep_the_load_rule(self):
-        picked = rd.select(
+        picked = rd.select(families=FAMILIES,
             required=1, authors=self.authors, advances={},
             candidates=candidates(row("claude-one", harness="claude", session="claude"),
                                   row("codex-one", harness="codex", session="codex"),
@@ -233,7 +237,7 @@ class SelectionPaceTest(unittest.TestCase):
         self.assertNotIn("plan pace", picked["why"])
 
     def test_a_stale_family_is_neutral_and_the_load_decides(self):
-        picked = rd.select(
+        picked = rd.select(families=FAMILIES,
             required=1, authors=self.authors, advances={"codex": 0.16},
             candidates=candidates(row("claude-one", harness="claude", session="claude"),
                                   row("codex-one", harness="codex", session="codex"),
@@ -241,7 +245,7 @@ class SelectionPaceTest(unittest.TestCase):
         self.assertEqual([r["name"] for r in picked["reviewers"]], ["claude-one"])
 
     def test_a_negative_advance_is_behind_and_comes_first(self):
-        picked = rd.select(
+        picked = rd.select(families=FAMILIES,
             required=1, authors=self.authors,
             advances={"claude": 0.10, "codex": -0.20},
             candidates=candidates(row("claude-one", harness="claude", session="claude"),
@@ -285,7 +289,8 @@ class ApplyPaceTest(unittest.TestCase):
                                   loads={"claude-one": 5, "codex-one": 0}),
             risk="sensitive")
         args.update(kw)
-        return rd.apply({"id": 2668, "title": "pace", "app": "ameesh"}, **args)
+        return rd.apply({"id": 2668, "title": "pace", "app": "ameesh"},
+                        **dict({"families": FAMILIES}, **args))
 
     def test_apply_uses_the_advances(self):
         out = self.apply(advances={"claude": 0.0, "codex": 0.16})

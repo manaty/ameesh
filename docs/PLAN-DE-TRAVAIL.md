@@ -394,8 +394,12 @@ is assumed (§7), every item stays a lot as before.
 ### WIP limit: at most 2 lots in `build` per agent (§4)
 
 Owner 14/10/2026, canon §4: an agent holds at most
-`ameesh.work.BUILD_LIMIT` (2) lots in `build`, **all projects
-confused** (the cap is global, not per team). Two guards:
+`build.max_in_build` lots in `build` (2 today), **all projects
+confused** (the cap is global, not per team). Since #2451 the value is
+read from the compiled canon (`ameesh.work.build_limit`, global
+document of `processus/mecanique.yaml`); without a readable canon the
+sweep and the automatic pick-up refuse rather than assume a cap. Two
+guards:
 
 * **the automatic pick-up refuses the third lot**: the count and the
   assignment are written in one transaction under the agent's advisory

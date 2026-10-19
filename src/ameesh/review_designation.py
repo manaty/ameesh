@@ -56,10 +56,6 @@ NONE = "none"
 REQUEST_KIND = "request"
 #: a harness that is not a model family (registry without a session)
 PLACEHOLDER_FAMILIES = frozenset(("", "none", "other", "unknown", "inconnu"))
-#: fallback families as long as the compiled canon (#1616) does not declare
-#: them: same values as `train_review.FAMILIES`, to be passed as a parameter as
-#: soon as the machine declaration "families and independence" is available
-KNOWN_FAMILIES = frozenset(("claude", "codex", "deepseek"))
 #: the registry states that forbid designation
 UNAVAILABLE_STATUS = frozenset(("stopped", "paused"))
 #: the `status_text` prefixes of an operations or budget pause
@@ -206,15 +202,14 @@ class Candidate:
     load: int = 0
     model: str = ""
 
-    def eligible(self, *, forbidden_names, forbidden_families,
-                 families=KNOWN_FAMILIES) -> bool:
+    def eligible(self, *, forbidden_names, forbidden_families, families) -> bool:
         name = (self.name or "").strip()
         family = (self.family or "").strip().lower()
         return bool(name) and self.available and family in families \
             and name not in forbidden_names and family not in forbidden_families
 
 
-def live_family(row: Mapping, *, families=KNOWN_FAMILIES) -> str:
+def live_family(row: Mapping, *, families) -> str:
     """The real family of a registry row, never the declared label.
 
     `registry.live_harness` (imported locally here so the module remains
@@ -249,7 +244,7 @@ def is_available(row: Mapping) -> bool:
 
 
 def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping] = None,
-                             project: str = "", families=KNOWN_FAMILIES) -> list[Candidate]:
+                             project: str = "", families) -> list[Candidate]:
     """The candidates of a project: real family, availability, load of open lots.
 
     `loads` maps a name to the number of open lots (`build`/`qa`); when absent,
@@ -314,7 +309,7 @@ def unknown_families(authors: Iterable) -> list[str]:
 
 
 def manual_seats(already: Iterable, *, authors: Iterable = (),
-                 families=KNOWN_FAMILIES) -> list:
+                 families) -> list:
     """The manual reviewers that can count toward the required opinions.
 
     A manual reviewer is kept in the column whatever happens (`#2627`); this
@@ -413,7 +408,7 @@ def _advance_of(candidate, pace: Mapping) -> float:
 
 
 def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
-           families=KNOWN_FAMILIES, already: Iterable = (),
+           families, already: Iterable = (),
            advances: Optional[Mapping] = None) -> dict:
     """Chooses `required` (1 or 2) independent reviewers, by plan pace then load.
 
@@ -760,7 +755,7 @@ class Port(Protocol):
 def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
           freeze_sha: str, authors: Iterable = (), candidates: Iterable = (), risk: str = "light",
           base: str = "", policy_ref: str = "", notify: str = "",
-          unknown_authors: Iterable = (), families=KNOWN_FAMILIES,
+          unknown_authors: Iterable = (), families,
           already: Iterable = (), required: Optional[int] = None,
           advances: Optional[Mapping] = None) -> dict:
     """Designates the reviewers of the lot's latest freeze, or says why it waits.

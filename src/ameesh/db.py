@@ -1709,6 +1709,15 @@ class _Replay:
         # sinon la connexion appartient à l'appelant de `batched`
 
 
+def is_dry_pass(db) -> bool:
+    """La connexion est-elle une passe à blanc de `batched` ?
+
+    Une passe à blanc n'envoie aucune requête : un appelant qui lit autre
+    chose que la base (une sonde réseau, #2582) doit attendre la vraie passe,
+    sinon la sonde est refaite à chaque niveau de préchargement."""
+    return isinstance(db, _Recorder)
+
+
 def batched(db, fn, *, levels: int = 4):
     """Exécute `fn(db)` en regroupant ses lectures (voir plus haut).
 

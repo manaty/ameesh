@@ -9,6 +9,11 @@ from ameesh.train import TrainError
 from ameesh.train_review import MARK_FIELDS, Receipt, qualify, qualify_recorded
 
 HEAD, FIRST = "a" * 40, "b" * 40
+#: #2451 : familles et indépendance explicites ; le passage raccordé les lit
+#: au canon compilé, la fonction pure n'a plus de défaut
+INDEPENDENCE = dict(families=("claude", "codex", "deepseek"),
+                    exclude_author_family=True, distinct_families=True)
+RULES = types.SimpleNamespace(**INDEPENDENCE)
 
 
 def author(commit=FIRST, actor="author", harness="codex"):
@@ -40,7 +45,8 @@ class HistoricalReviewsTest(unittest.TestCase):
         self.receipts[proof.subject] = proof
 
     def run_gate(self, *, required=2):
-        return qualify(HEAD, self.commits, self.marks, self.receipts, required=required)
+        return qualify(HEAD, self.commits, self.marks, self.receipts, required=required,
+                       **INDEPENDENCE)
 
     def test_every_commit_is_covered_by_two_historical_families(self):
         proof = self.run_gate()
@@ -150,12 +156,13 @@ class RecordedReviewsTest(HistoricalReviewsTest):
 
     def run_gate(self, *, required=2):
         return qualify_recorded(self.db, HEAD, self.commits, self.marks,
-                                required=required, provider=self.provider)
+                                required=required, provider=self.provider, **INDEPENDENCE)
 
     def test_compiled_family_declaration_and_independence_reach_recorded_validator(self):
         def check(**rules):
             return qualify_recorded(self.db, HEAD, self.commits, self.marks,
-                                    required=2, provider=self.provider, **rules)
+                                    required=2, provider=self.provider,
+                                    **dict(INDEPENDENCE, **rules))
         with self.assertRaisesRegex(TrainError, "missing independent"):
             check(families=("codex", "claude"))
         self.add(3, "reviewer-three", "claude")
@@ -208,4 +215,4 @@ class RecordedReviewsTest(HistoricalReviewsTest):
     def test_no_provider_cannot_fall_back_to_current_registry(self):
         with self.assertRaisesRegex(TrainError, "trusted exact provenance provider"):
             qualify_recorded(self.db, HEAD, self.commits, self.marks,
-                             required=0, provider=None)
+                             required=0, provider=None, **INDEPENDENCE)

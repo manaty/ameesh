@@ -12,9 +12,13 @@ from .train import TrainError, identity
 
 
 class Recorded:
-    def __init__(self, db, path, *, provider, review_rules=None):
+    def __init__(self, db, path, *, provider, review_rules):
         if provider is None:
             raise TrainError("trusted exact provenance provider required")
+        # #2451 : familles et indépendance viennent du canon compilé
+        # (`mechanics.load`), jamais d'un défaut de la fonction pure
+        if review_rules is None:
+            raise TrainError("compiled canon review rules required")
         self.db, self.path, self.provider = db, path, provider
         self.review_rules = review_rules
 
@@ -57,12 +61,11 @@ class Recorded:
         if freeze["id"] != row["frozen_id"] or len(raw) < 7 or not head.startswith(raw) \
                 or self._git("rev-parse", "--verify", raw + "^{commit}") != head:
             raise TrainError("admission no longer names the latest exact freeze")
-        independence = {} if self.review_rules is None else dict(
+        proof = train_review.qualify_recorded(self.db, head, commits, marks,
+            required=required, provider=self.provider,
             families=self.review_rules.families,
             exclude_author_family=self.review_rules.exclude_author_family,
             distinct_families=self.review_rules.distinct_families)
-        proof = train_review.qualify_recorded(self.db, head, commits, marks,
-            required=required, provider=self.provider, **independence)
         return dict(schema="ameesh-train-subject-history/1", base=base,
                     subject={key: row[key] for key in
                              ("work_item_id", "frozen_id", "frozen_sha")}, reviews=proof)

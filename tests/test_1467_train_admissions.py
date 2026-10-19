@@ -13,7 +13,7 @@ from ameesh import (resolutions, storage, train, train_admissions, train_candida
                     train_git, train_history, train_policy, work)
 from ameesh.db import DbError
 from .support import PgTestCase
-from .test_1467_train_review import author, verdict
+from .test_1467_train_review import RULES, author, verdict
 
 BASE, HEAD = "a" * 40, "b" * 40
 
@@ -149,7 +149,7 @@ class TrainAdmissionsTest(PgTestCase):
         provider = types.SimpleNamespace(ProvenanceError=RuntimeError,
             receipt_for_commit=lambda db, sha: receipts.get("commit:" + sha),
             receipt_for_milestone=lambda db, mid: receipts.get("milestone:%d" % mid))
-        self.admissions.history = train_history.Recorded(self.db, self.tmp, provider=provider)
+        self.admissions.history = train_history.Recorded(self.db, self.tmp, provider=provider, review_rules=RULES)
         return base, first, head, entry
 
     def test_real_git_history_and_sql_freezes_cover_correction_then_refuse_new_freeze(self):
@@ -174,7 +174,7 @@ class TrainAdmissionsTest(PgTestCase):
                            check=True, capture_output=True)
         clone = resolutions.Replayer(self.tmp, os.path.join(self.tmp, "private.clone"))
         repository = train_git.Repository(self.project, clone)
-        history = train_history.Recorded(self.db, clone.path, provider=self.admissions.history.provider)
+        history = train_history.Recorded(self.db, clone.path, provider=self.admissions.history.provider, review_rules=RULES)
         self.admissions.history = history
         preparation = train_candidates.Preparation(self.db, self.project,
             repository=repository, history=history, policy=self.admissions.policy)
@@ -281,7 +281,7 @@ class TrainAdmissionsTest(PgTestCase):
         other = self.connect()
         self.addCleanup(other.close)
         repository = train_git.Repository(self.project, resolutions.Replayer(self.tmp, clone_path))
-        history = train_history.Recorded(other, clone_path, provider=preparation.history.provider)
+        history = train_history.Recorded(other, clone_path, provider=preparation.history.provider, review_rules=RULES)
         admissions = train_admissions.Admissions(other, self.project, history,
             policy=self.admissions.policy,
             targeted_ci=mock.Mock(side_effect=AssertionError("unexpected individual CI")))

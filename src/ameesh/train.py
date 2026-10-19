@@ -16,9 +16,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from typing import Protocol
-from zoneinfo import ZoneInfo
 
 from . import merge_queue
 
@@ -51,7 +49,6 @@ class MemberDeferred(TrainError):
 class Policy:
     enabled: bool = False
     # Build/beta uses the installed passage's compiled packet calendar.
-    # The uninstalled engine retains its historical fixture calendars.
     build_beta: bool = True
     interval_s: int = 3600
     threshold: int = 5
@@ -59,7 +56,7 @@ class Policy:
     ci_mode: str = "packet"
     max_failures: int = 8
     # The installed passage supplies the compiled canon calendar (#1616).
-    # None retains the standalone, uninstalled engine's legacy calendar.
+    # None has no calendar: a cutoff is refused, never a local default (#2451).
     schedule: object | None = None
 
     def __post_init__(self):
@@ -71,7 +68,9 @@ class Policy:
             raise ValueError("positive train limits expected")
 
     def cutoff(self, now):
-        at = self.schedule.last_packet(now) if self.schedule is not None else cutoff(now)
+        if self.schedule is None:
+            raise TrainError("compiled canon calendar required for a packet cutoff")
+        at = self.schedule.last_packet(now)
         if isinstance(at, bool) or not isinstance(at, (int, float)) \
                 or not math.isfinite(at) or at > now:
             raise TrainError("compiled canon must provide a packet cutoff at or before now")
@@ -113,18 +112,6 @@ def ordered(rows: list[dict], dependencies: list[dict]) -> list[dict]:
         done.add(int(ready["work_item_id"]))
         remaining.remove(ready)
     return result
-
-
-def cutoff(now: float) -> float:
-    """Latest 11:00/23:00 Europe/Paris cutoff, including across DST."""
-    local = datetime.fromtimestamp(now, ZoneInfo("Europe/Paris"))
-    if local.hour >= 23:
-        slot = local.replace(hour=23, minute=0, second=0, microsecond=0)
-    elif local.hour >= 11:
-        slot = local.replace(hour=11, minute=0, second=0, microsecond=0)
-    else:
-        slot = (local - timedelta(days=1)).replace(hour=23, minute=0, second=0, microsecond=0)
-    return slot.timestamp()
 
 
 def due(rows: list[dict], now: float, policy: Policy, *, last_started: float = 0) -> bool:
