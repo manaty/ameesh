@@ -756,8 +756,10 @@ lever_drain() {  # $1 persona, $2 cause, $3 = 1 : dernière tentative (message d
     # était déjà levée. Dans les deux cas notre drain n'est plus en place, et
     # aucune pause étrangère n'a été touchée (R1 B1).
     if ! etat=$(pause_reelle "$1"); then
-      # #2184/N3 : garder l'intention pour une nouvelle tentative du trap ;
-      # rien n'a été levé, l'état ne prouve pas que la pause est partie.
+      # #2498 : l'intention est retirée. La reprise conditionnelle (motif
+      # identique, atomique) n'a rien levé : notre pause n'est plus en place,
+      # et l'échéance attendue plus haut exclut une pose tardive. Une nouvelle
+      # tentative du trap ne lèverait rien ; seul l'état reste à vérifier.
       echo "$1 : reprise conditionnelle sans effet et état illisible — vérifier « ameesh show $1 »" >&2
       drain_retire "$1"; return 1
     fi
@@ -812,23 +814,36 @@ lever_drain_sans_arreter() {  # $1 persona, $2 cause ; consigne l'échec, ne sto
   DRAINS_NON_LEVES+=("$1")
   return 1
 }
-lever_drains() {  # sortie du script : aucun drain ne survit à la commande
-  local e code tentative final
-  # #2184/N3 : une coupure SSH passagère ne doit pas laisser la pause au
-  # premier échec ; une seconde passe, bornée par les timeouts, la retire.
-  for tentative in 1 2; do
-    code=0
-    for e in ${DRAINS[@]+"${DRAINS[@]}"}; do
-      final=0
-      [ "$tentative" = 2 ] && final=1
-      lever_drain "${e%%$'\t'*}" "sortie du script" "$final" || code=1
-    done
-    [ "$code" = 0 ] && return 0
-    [ "$tentative" = 1 ] && sleep 2
+lever_drains_passe() {  # une passe de levée ; $1 = 1 : messages définitifs
+  local e code=0 final=${1:-0}
+  for e in ${DRAINS[@]+"${DRAINS[@]}"}; do
+    lever_drain "${e%%$'\t'*}" "sortie du script" "$final" || code=1
   done
   return "$code"
 }
-trap 'lever_drains || true' EXIT
+sortie_script() {  # EXIT : #2198/N3 + #2498, retenter avant le verdict
+  local code=$?
+  [ "${#DRAINS[@]}" -gt 0 ] || [ "${#DRAINS_NON_LEVES[@]}" -gt 0 ] || exit "$code"
+  if [ "${#DRAINS_NON_LEVES[@]}" -eq 0 ]; then
+    # Drain suivi par un autre échec (arrêt non prouvé, relecture perdue…) :
+    # le trap le lève comme avant et garde le code de la commande.
+    lever_drains_passe 1 || true
+    exit "$code"
+  fi
+  # #2184/N3 : une coupure SSH passagère ne doit pas laisser la pause au
+  # premier échec. #2498 : le verdict « NON levé(s) » ne se prononce qu'après
+  # cette dernière tentative, et ne nomme que les drains encore en place ; le
+  # trap sort ensuite, donc aucune quatrième reprise ne peut le périmer.
+  if lever_drains_passe 0; then
+    exit 0
+  fi
+  if lever_drains_passe 1; then
+    exit 1  # levée acquise à la seconde passe : la commande avait échoué
+  fi
+  echo "ERREUR: drain(s) NON levé(s) : ${DRAINS_NON_LEVES[*]} — lever à la main : ameesh resume <agent> --operator --reason …" >&2
+  exit 1
+}
+trap sortie_script EXIT
 
 redemarrer_agents() {
   local noms p st avant ligne heure attendu tenu restantes
