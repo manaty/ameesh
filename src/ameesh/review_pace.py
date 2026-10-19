@@ -62,7 +62,9 @@ def gauge_of(row: Mapping) -> Optional[cost.Gauge]:
     `resets_at_ts`, `window_s`, `observed_ts`, `produced_ts` and `source`.
     `read_at` is the instant the harness produced the reading; when the source
     does not date it (#1132, Codex), the insertion instant is the only age
-    known. A row without a positive window cannot be placed on the pace: it is
+    known. A model-scoped bucket (`seven_day@fable`) keeps its key and carries
+    its scope, like `sous_utilisation._gauge`: it is not a family-wide reading.
+    A row without a positive window cannot be placed on the pace: it is
     dropped, never defaulted to a guessed window.
     """
     row = dict(row or {})
@@ -70,6 +72,7 @@ def gauge_of(row: Mapping) -> Optional[cost.Gauge]:
     key = str(row.get("key") or row.get("gauge_key") or "").strip()
     if not harness or not key:
         return None
+    _, _, scope = key.partition("@")
     window = _number(row.get("window_s"))
     if window is None or window <= 0:
         return None
@@ -83,7 +86,8 @@ def gauge_of(row: Mapping) -> Optional[cost.Gauge]:
     return cost.Gauge(harness, key, max(0.0, used), resets, window,
                       read_at=produced if produced is not None else observed,
                       produced_at=produced,
-                      source=str(row.get("source") or ""))
+                      source=str(row.get("source") or ""),
+                      scope=scope.strip().lower())
 
 
 def account_advance(gauges: Sequence[cost.Gauge], *, now: float) -> Optional[float]:
@@ -111,6 +115,13 @@ def family_advances(rows, *, now: float) -> dict:
     already counted. A family's value is the **largest** current account
     advance (the most constrained one); an account with a stale reading is
     ignored, and a family with no current account is absent (neutral).
+
+    A **model-scoped** bucket (`seven_day@fable`) is not a family-wide
+    reading: the reviewer's model is not known at designation, so it can
+    neither raise nor lower the family's pace. It is dropped; a family with
+    only scoped readings is absent (neutral), never contaminated by a bucket
+    that applies to one model (`accounts.model_scoped` keeps the distinction
+    for a session, `sous_utilisation._gauge` for a display).
     """
     rows = list(rows or ())
     named = {str((row or {}).get("harness") or "").strip().lower()
@@ -123,7 +134,7 @@ def family_advances(rows, *, now: float) -> dict:
         if not harness or (not account and harness in named):
             continue
         gauge = gauge_of(row)
-        if gauge is None:
+        if gauge is None or gauge.scope:
             continue
         grouped.setdefault((harness, account), []).append(gauge)
     out: dict = {}

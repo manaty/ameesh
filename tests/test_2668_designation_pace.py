@@ -50,6 +50,27 @@ class FamilyAdvanceTest(unittest.TestCase):
         self.assertAlmostEqual(advances["codex"], 0.16, places=6)
         self.assertAlmostEqual(advances["claude"], 0.0, places=6)
 
+    def test_a_model_scoped_bucket_does_not_contaminate_the_family(self):
+        # cx3 B/P1: seven_day@fable at 95 % is a Fable-only bucket; it must
+        # not make Claude look ahead for a reviewer of another model.
+        rows = [gauge("claude", "secondaire", 0.60, 0.60),
+                gauge("claude", "secondaire", 0.95, 0.60, key="seven_day@fable"),
+                gauge("codex", "secondaire", 0.35, 0.19)]
+        advances = review_pace.family_advances(rows, now=NOW)
+        self.assertAlmostEqual(advances["claude"], 0.0, places=6)
+        self.assertAlmostEqual(advances["codex"], 0.16, places=6)
+        picked = rd.select(
+            required=1,
+            authors=[{"name": "author", "family": "deepseek"}],
+            candidates=candidates(row("claude-one", harness="claude", session="claude"),
+                                  row("codex-one", harness="codex", session="codex")),
+            advances=advances)
+        self.assertEqual([r["name"] for r in picked["reviewers"]], ["claude-one"])
+
+    def test_a_scoped_only_family_is_neutral(self):
+        scoped = gauge("claude", "secondaire", 0.95, 0.60, key="seven_day@fable")
+        self.assertEqual(review_pace.family_advances([scoped], now=NOW), {})
+
     def test_the_reserve_of_the_critical_agents_is_deducted(self):
         # #2648: a non-critical reviewer stops 10 points below the pace. At
         # 19 % elapsed the allowed pace is 19 % (the margin is 10, the

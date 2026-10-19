@@ -72,11 +72,16 @@ The same raw scale applies to every family (B of mesh-design on 4123b99,
 When several families are eligible for one opinion, the selection prefers the
 family furthest behind; the agent load only breaks a tie. A family's value is
 its most constrained current account (a fresh sibling does not hide a plan
-that is ahead). A stale reading (#1561: a dated window reset while another is
-open, or a reading older than its shortest window) is **neutral**, as is an
-absent reading: the family is absent from the mapping, and the load decides.
-The pace never makes a family ineligible: two required opinions still take two
-distinct families, whatever their pace.
+that is ahead). A **model-scoped** bucket (`seven_day@fable`) is not a
+family-wide reading: the reviewer's model is not known at designation, so it
+is dropped and a family with only scoped readings is neutral — a Fable-only
+bucket cannot make Claude look ahead for a reviewer of another model
+(`accounts.model_scoped` keeps the distinction for a session). A stale
+reading (#1561: a dated window reset while another is open, or a reading
+older than its shortest window) is **neutral**, as is an absent reading: the
+family is absent from the mapping, and the load decides. The pace never makes
+a family ineligible: two required opinions still take two distinct families,
+whatever their pace.
 
 Witnesses: a DeepSeek author, one opinion, Codex 16 points ahead and Claude at
 its pace designates Claude even when Codex's agent is less loaded — including
@@ -311,16 +316,18 @@ session directory, and a sibling of another project is refused; a policy that
 arrives later is retried on the same freeze (the runner call included); the CLI
 freeze (light explanation included) and the recovery command.
 
-`tests/test_2668_designation_pace.py` — 13 targeted tests, without a database:
+`tests/test_2668_designation_pace.py` — 15 targeted tests, without a database:
 the raw plan advance with the critical reserve (Codex 16 points ahead when
 19 % of the week is elapsed, multiplier 1 and default ceiling), a stale
 reading neutral (#1561), the family's most constrained account, the anonymous
-readings dropped when named accounts exist, one opinion preferring the family
-behind even when its agent is more loaded, two opinions keeping two distinct
-families, and the load rule when no reading is current. One integration test
-in the activation file adds a current Claude/Codex gauge pair and declared
-×10/×3 profiles, checks that the raw pace still designates Claude on a real
-freeze, then removes the readings and checks that the load rule returns.
+readings dropped when named accounts exist, a model-scoped `seven_day@fable`
+bucket ignored (a scoped-only family is neutral, cx3 B/P1), one opinion
+preferring the family behind even when its agent is more loaded, two opinions
+keeping two distinct families, and the load rule when no reading is current.
+One integration test in the activation file adds a current Claude/Codex gauge
+pair and declared ×10/×3 profiles, checks that the raw pace still designates
+Claude on a real freeze, then removes the readings and checks that the load
+rule returns.
 
 ## Verdict carry and the freeze designation (#2442 × #2487)
 
