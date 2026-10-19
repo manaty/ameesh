@@ -986,6 +986,35 @@ class BriefDeLotTest(_Base):
         self.assertIn("verdict utile", text)
         self.assertNotIn("bruit 200", text)
 
+    def test_courriers_livres_du_lot_lus_sur_la_colonne_indexee(self):
+        """#2752 : le lot est filtré sur `work_item_id`, sans fonction, pour
+        que l'index partiel 0413 serve (comme #2563 pour les requests)."""
+        self.bail("b7")
+        a = work.add(self.db, title="Le lot indexé", assignee="b7")["id"]
+        mid = mail.send(self.db, "orch", "b7", "livré", work_item_id=str(a))
+        self.assertEqual(mail.mark_delivered(self.db, [mid]), 1)
+        seen = []
+
+        class Trace:
+            """La connexion réelle, avec le SQL de la lecture du lot noté."""
+            def __init__(self, db):
+                self.db = db
+
+            def query(self, sql, params=()):
+                seen.append(" ".join(sql.split()))
+                return self.db.query(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self.db, name)
+
+        found = mail.delivered_for_lot(Trace(self.db), "b7", a, 10)
+        self.assertEqual([r["id"] for r in found], [mid])
+        queries = [sql for sql in seen if "FROM agent_mailbox" in sql]
+        self.assertEqual(len(queries), 1)
+        predicate = queries[0].split("WHERE", 1)[1]
+        self.assertIn("work_item_id = %s", predicate)
+        self.assertNotIn("btrim", predicate)
+
     def test_brief_borne_les_courriers_livres(self):
         """#2539 : la lecture par lot est bornée ; le brief annonce le reste."""
         from ameesh import reprise
