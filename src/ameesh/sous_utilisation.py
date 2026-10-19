@@ -13,9 +13,9 @@ Quatre types d'alerte, levés par `ameesh alerts` et poussés par
 `ameesh notify` (0030 §4), mêmes règles de dédoublonnage et de résolution :
 
 * `plan_underused` : un compte au forfait dont la capacité inutilisée sera
-  perdue à la prochaine remise à zéro — fin de fenêtre proche et peu
-  utilisée (`fin_de_fenetre`), ou consommation très en dessous du rythme
-  permis de 0019 (`sous_rythme`). Volume perdu estimé : `1 − utilisé` de la
+  perdue à la prochaine remise à zéro au rythme mesuré — fin de fenêtre
+  proche et peu utilisée (`fin_de_fenetre`), ou perte projetée dépassant
+  le seuil réglé (`sous_rythme`). Volume perdu estimé : `1 − utilisé` de la
   fenêtre si rien ne change (même définition que les « pertes à la remise à
   zéro » de L74, `Gauge.expiring`), et la projection au rythme actuel ;
 * `idle_capacity` : des agents réveillables (mode `execute`, exécuteur
@@ -66,11 +66,11 @@ BALANCE_MIN_SPAN_S = 1800.0
 
 #: seuils par défaut
 #: `plan_underused/fin_de_fenetre` : il reste moins de 24 h (au plus le quart
-#: de la fenêtre : 1 h 15 pour une fenêtre de 5 h) et moins de 50 % utilisés
+#: de la fenêtre : 1 h 15 pour une fenêtre de 5 h) et moins de 50 % projetés
 DEFAULT_PLAN_TAIL_S = 24 * 3600.0
 DEFAULT_PLAN_USED_PCT = 50.0
-#: `plan_underused/sous_rythme` : utilisation sous le rythme permis
-#: (`min(90 %, part écoulée + 10 points)`, 0019) de plus de 25 points
+#: `plan_underused/sous_rythme` : perte projetée à la remise à zéro
+#: supérieure à 25 points de capacité (option historique --plan-pace-gap)
 DEFAULT_PLAN_PACE_GAP_PCT = 25.0
 #: part maximale de la fenêtre prise par `fin_de_fenetre`
 PLAN_TAIL_MAX_FRACTION = 0.25
@@ -80,6 +80,9 @@ PLAN_PACE_MIN_WINDOW_S = 86400.0
 PLAN_PACE_MIN_ELAPSED = 0.25
 #: âge maximal des relevés de jauge lus (une fenêtre de 7 jours + marge)
 PLAN_GAUGES_SINCE_S = 8 * 86400.0
+#: rythme récent : six heures, avec au moins trente minutes entre relevés
+PLAN_RATE_WINDOW_S = 6 * 3600.0
+PLAN_RATE_MIN_SPAN_S = 1800.0
 #: `idle_capacity` : seuil (repli quand le relevé ne porte pas
 #: `actionable_lots` ; #1677)
 DEFAULT_IDLE_CAPACITY_S = 1800.0
@@ -246,6 +249,44 @@ def latest_account_gauges(db, now: float) -> dict:
     return out
 
 
+def _projected_plan_loss(gauge, account, now: float, history: list) -> tuple:
+    """(perte, source, durée) : débit des six dernières heures de production.
+
+    Même harnais, compte, jauge et échéance ; les échos d'un relevé ne
+    créent pas du temps mesuré. Sans deux relevés couvrant 30 min, ou si
+    l'usage recule, repli explicite sur la moyenne depuis le début de fenêtre.
+    Le rythme autorisé et son multiplicateur ne prédisent pas le débit réel.
+    """
+    points = {}
+    for row in history:
+        if (row["harness"], row.get("account") or None, row["key"]) != (
+                gauge.harness, account, gauge.key):
+            continue
+        stamp = row.get("produced_ts") or row.get("observed_ts")
+        reset = row.get("resets_at_ts")
+        if stamp is None or reset is None:
+            continue
+        stamp = float(stamp)
+        if not now - PLAN_RATE_WINDOW_S <= stamp <= now:
+            continue
+        if abs(float(reset) - float(gauge.resets_at)) > 1.0:
+            continue
+        points[stamp] = float(row.get("used") or 0.0)
+    samples = sorted(points.items())
+    if len(samples) >= 2:
+        start, initial = samples[0]
+        end, used = samples[-1]
+        span = end - start
+        if (span >= PLAN_RATE_MIN_SPAN_S and used == float(gauge.used)
+                and all(b[1] >= a[1] for a, b in zip(samples, samples[1:]))):
+            rate = (used - initial) / span
+            projected = used + rate * (float(gauge.resets_at) - end)
+            return max(0.0, 1.0 - projected), "recent", span
+    elapsed = gauge.elapsed(now)
+    projected = float(gauge.used) / elapsed if elapsed > 0 else float(gauge.used)
+    return max(0.0, 1.0 - projected), "window_average", elapsed * gauge.window_s
+
+
 def _declared_profiles(cfg) -> dict:
     """{harnais : [Profile]} de la configuration, sans lever (#1227 N3)."""
     if cfg is None:
@@ -275,9 +316,12 @@ def plan_underused(db, listing: list, now: float, *,
     le plafond du compte nommé par le relevé remplacent les 90 % et le ×1 en
     dur ; un compte absent, inconnu ou ambigu garde les défauts. #2233 : les
     plafonds fixes et courts de `accounts.limits` bloquent aussi une fausse
-    promesse de capacité sur une autre fenêtre du même compte. #2648 : ce
-    seuil et le `pace_cap` annoncé sont ceux de la pause d'un agent non
-    critique (réserve des critiques déduite), jamais le plafond ordinaire."""
+    promesse de capacité sur une autre fenêtre du même compte. #2648 :
+    la réserve des critiques est déduite du seuil de pause et du pace_cap
+    annoncé pour les non-critiques. #2757 :
+    le déclenchement dépend de la perte projetée au débit récent, avec repli
+    explicite sur la moyenne de fenêtre si les relevés sont insuffisants ;
+    le plafond autorisé reste une limite de capacité, pas une prévision."""
     used_max = max(0.0, float(used_pct)) / 100.0
     gap_min = max(0.0, float(pace_gap_pct)) / 100.0
     if (tail_s <= 0 or used_max <= 0) and gap_min <= 0:
@@ -287,6 +331,7 @@ def plan_underused(db, listing: list, now: float, *,
     spend_read = False
     book = None
     declared = _declared_profiles(cfg)
+    history = None
     for (harness, account), gauges in sorted(latest_account_gauges(db, now).items(),
                                               key=lambda kv: (kv[0][0], kv[0][1] or "")):
         items = declared.get(harness) or []
@@ -341,12 +386,23 @@ def plan_underused(db, listing: list, now: float, *,
             # non-critique (réserve déduite), pas le plafond ordinaire.
             cap = gauge.held_cap(now, accounts_mod.RESERVE, multiplier, ceiling)
             used = float(gauge.used or 0.0)
+            if history is None:
+                try:
+                    history = storage.of(db).operations.gauge_history(
+                        since_s=PLAN_RATE_WINDOW_S, harness=None)
+                except Exception:
+                    history = []  # historique indisponible : moyenne de fenêtre
+            lost_at_pace, rate_source, rate_span = _projected_plan_loss(
+                gauge, account, now, history)
+            if gap_min > 0 and lost_at_pace <= gap_min:
+                continue
             reason = None
             tail = min(float(tail_s), PLAN_TAIL_MAX_FRACTION * gauge.window_s)
-            if tail_s > 0 and used_max > 0 and remaining <= tail and used < used_max:
+            if tail_s > 0 and used_max > 0 and remaining <= tail \
+                    and lost_at_pace > max(0.0, 1.0 - used_max):
                 reason = "fin_de_fenetre"
             elif gap_min > 0 and gauge.window_s >= PLAN_PACE_MIN_WINDOW_S \
-                    and elapsed >= PLAN_PACE_MIN_ELAPSED and cap - used >= gap_min:
+                    and elapsed >= PLAN_PACE_MIN_ELAPSED and lost_at_pace > gap_min:
                 reason = "sous_rythme"
             if reason is None:
                 continue
@@ -356,21 +412,19 @@ def plan_underused(db, listing: list, now: float, *,
                       and (row.get("mode") or "execute") == "execute"]
             if held and agents and all(name in held for name in agents):
                 continue
-            # projection linéaire : au rythme actuel, l'utilisation à la remise à zéro
-            at_pace = min(1.0, used / elapsed) if elapsed > 0 else used
-            lost_at_pace = max(0.0, 1.0 - at_pace)
             who = "%s/%s" % (harness, account) if account else harness
             if reason == "fin_de_fenetre":
                 head = ("account %s, window %s: %.0f %% used, resets in %s"
                         % (who, gauge.key, used * 100, _duration(remaining)))
             else:
-                head = ("account %s, window %s: %.0f %% used against an allowed pace of "
-                        "%.0f %% (gap %.0f points), resets in %s"
-                        % (who, gauge.key, used * 100, cap * 100, (cap - used) * 100,
+                head = ("account %s, window %s: %.0f %% used, projected loss %.0f %% "
+                        "exceeds %.0f %%, resets in %s"
+                        % (who, gauge.key, used * 100, lost_at_pace * 100, gap_min * 100,
                            _duration(remaining)))
             detail = ("%s; estimated loss at reset: %.0f %% of the window if nothing "
                       "changes (%.0f %% at the current pace)"
                       % (head, unused * 100, lost_at_pace * 100))
+            detail += "; rate: %s over %s" % (rate_source, _duration(rate_span))
             idle = sorted(row["name"] for row in listing
                           if row.get("harness") == harness
                           and (row.get("mode") or "execute") == "execute"
@@ -399,6 +453,7 @@ def plan_underused(db, listing: list, now: float, *,
                 detail, harness=harness, account=account, gauge=gauge.key, reason=reason,
                 used=round(used, 4), pace_cap=round(cap, 4), resets_at=round(resets_at, 3),
                 lost=round(unused, 4), lost_at_pace=round(lost_at_pace, 4),
+                rate_source=rate_source, rate_span_s=round(rate_span, 3),
                 observed_ts=round(float(seen), 3) if seen is not None else None,
                 idle_agents=idle, responsible=responsible))
     return out
