@@ -5,10 +5,14 @@ Canon §2 requires, for a frozen sensitive lot, "a review by another model
 family (two for SQL, security or prod)". Until now an agent chose the reviewer
 by hand, and on 15/10 eighteen lots waited without a reviewer, for up to 42 h.
 This module does the **selection**: it takes the versioned policy
-(`review_policies.train_reviews`, read by #1616/#1467), the exact frozen head
-and the registry, and returns either designated reviewers with their mail, or
+(`review_policies.train_reviews`, read by #1616/#1467), the exact frozen head,
+the registry and, since #2668, the plan advance of each family
+(`review_pace`), and returns either designated reviewers with their mail, or
 an **explicit waiting state** with a capacity notification — never an implicit
-admission.
+admission. The family furthest behind its plan comes first, the load only
+breaking a tie; an unreadable plan reading is neutral (#1561), and the pace
+never makes an eligible family ineligible: two opinions still take two
+distinct families.
 
 What the module deliberately does not do:
 
@@ -36,6 +40,7 @@ for a freeze that is no longer the latest: no return to an old head.
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping, Optional, Protocol, Sequence
@@ -335,8 +340,9 @@ def manual_seats(already: Iterable, *, authors: Iterable = (),
 
 
 def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
-           families=KNOWN_FAMILIES, already: Iterable = ()) -> dict:
-    """Chooses `required` (1 or 2) independent and least-loaded reviewers.
+           families=KNOWN_FAMILIES, already: Iterable = (),
+           advances: Optional[Mapping] = None) -> dict:
+    """Chooses `required` (1 or 2) independent reviewers, by plan pace then load.
 
     - each reviewer's family differs from that of **every** author or fixer, and
       for two opinions the two families differ from each other (canon §2);
@@ -347,7 +353,14 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     - an author whose real family is unknown (empty or a label) makes the
       designation **wait**: without it, a reviewer's independence is not proven
       (canon §2);
-    - at equal load, the order of names decides: the selection is deterministic;
+    - `advances` maps a family to its advance over the plan pace, in points
+      (`review_pace`; positive = ahead, negative = behind). When several
+      families are eligible, the family **furthest behind** comes first; an
+      absent reading is neutral (0, at its pace), so the other criteria decide
+      (#2668, #1561). Never a reason to discard an eligible family: two
+      opinions still take two distinct families;
+    - the load of the agent only breaks a pace tie (least loaded first), then
+      the name: the selection is deterministic;
     - `already` names the manual reviewers already designated (#2627). The ones
       that prove an independent family cover a seat; only the **missing** seats
       are designated, never a manual reviewer removed or overridden.
@@ -385,6 +398,18 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
                 if c.eligible(forbidden_names=names | seat_names,
                               forbidden_families=forbidden | seat_families,
                               families=families)]
+    # #2668: a family's advance over its plan pace (points), lower is further
+    # behind. An unreadable or stale reading (#1561) is neutral: 0, as if at
+    # pace, so the load and the name decide.
+    pace: dict[str, float] = {}
+    for family, value in (advances or {}).items():
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        family = str(family or "").strip().lower()
+        if family and math.isfinite(value):
+            pace[family] = value
     # a single candidate per family: the least loaded, then the name
     best: dict[str, Candidate] = {}
     for candidate in eligible:
@@ -393,7 +418,9 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
         if current is None or (candidate.load, candidate.name) < (current.load, current.name):
             best[family] = candidate
     ordered = [best[family] for family in sorted(best)]
-    ordered.sort(key=lambda c: (c.load, c.name))
+    # pace first, then load, then name; a family absent from `pace` is neutral
+    ordered.sort(key=lambda c: (pace.get(c.family.strip().lower(), 0.0),
+                                c.load, c.name))
     chosen = ordered[:remaining]
     out["reviewers"] = [{"name": c.name, "family": c.family} for c in chosen]
     if len(chosen) < remaining:
@@ -410,8 +437,14 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
                         ", ".join(sorted(forbidden | seat_families)) or "none")),
         })
         return out
-    out.update({"state": DESIGNATED,
-                "why": "designated %d reviewer(s)" % len(chosen)})
+    why = "designated %d reviewer(s)" % len(chosen)
+    if pace:
+        reading = ["%s %+.0f pt" % (c.family.strip().lower(),
+                                    pace[c.family.strip().lower()] * 100)
+                   for c in chosen if c.family.strip().lower() in pace]
+        if reading:
+            why += " (plan pace: %s)" % ", ".join(reading)
+    out.update({"state": DESIGNATED, "why": why})
     return out
 
 
@@ -654,7 +687,8 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
           freeze_sha: str, authors: Iterable = (), candidates: Iterable = (), risk: str = "light",
           base: str = "", policy_ref: str = "", notify: str = "",
           unknown_authors: Iterable = (), families=KNOWN_FAMILIES,
-          already: Iterable = (), required: Optional[int] = None) -> dict:
+          already: Iterable = (), required: Optional[int] = None,
+          advances: Optional[Mapping] = None) -> dict:
     """Designates the reviewers of the lot's latest freeze, or says why it waits.
 
     `policy` carries the already parsed rules (`Rule` or `{rules: [...]}`
@@ -680,6 +714,12 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     that prove an independent family cover a seat, and only the missing seats
     are selected. None is ever removed, and two manual reviewers of the same
     family count one seat.
+
+    `advances` maps a family to its advance over the plan pace, in points
+    (`review_pace`, #2668): the selection prefers the family furthest behind,
+    the load only breaking a tie. A family without a current reading is
+    neutral, and the pace never makes an eligible family ineligible: two
+    required opinions still take two distinct families.
 
     The freeze is re-read **once**, and the provided inputs (paths, authors,
     class) are those of this freeze: if the `Port` refuses a freeze that has
@@ -750,7 +790,7 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
                      "missing": required, "manual": [], "why": why}
     else:
         selection = select(required=required, authors=authors, candidates=candidates,
-                           families=families, already=already)
+                           families=families, already=already, advances=advances)
     if selection["state"] == WAITING and existing:
         # The waiting state of this freeze is already recorded and notified: we
         # do not send a second one, but the selection was retried — if capacity
