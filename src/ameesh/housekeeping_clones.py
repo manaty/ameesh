@@ -268,7 +268,10 @@ def _linked_objects(path: str) -> tuple[str, str]:
                   encoding="utf-8", errors="surrogateescape") as stream:
             common = stream.read(4096).strip()
     except FileNotFoundError:
-        common = os.path.dirname(os.path.dirname(gitdir))
+        # A submodule or --separate-git-dir copy has no commondir:
+        # its gitdir itself owns the objects. Linked worktrees name their
+        # common directory explicitly in commondir.
+        common = gitdir
     except OSError as exc:
         return "", "commondir unreadable (%s)" % (exc.strerror or exc)
     if not os.path.isabs(common):

@@ -379,6 +379,34 @@ class CloneReapTest(PgTestCase):
                             and r["path"] == path for r in recent))
 
 
+class SeparateGitDirTest(unittest.TestCase):
+    def test_shared_copy_with_a_separate_gitdir_is_a_dependent(self):
+        import tempfile
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "work")
+            os.mkdir(root)
+            source = _repo(tmp)
+            other = os.path.join(root, "other")
+            metadata = os.path.join(tmp, "metadata")
+            subprocess.run(["git", "clone", "-q", "--shared",
+                            "--separate-git-dir=" + metadata, source, other],
+                           check=True, capture_output=True)
+            cfg = SimpleNamespace(state_dir=os.path.join(tmp, "state"))
+            copies, complete, why = clones._dependency_inventory(
+                cfg, (root,), {}, ())
+            self.assertTrue(complete, why)
+            self.assertIn((other, os.path.join(metadata, "objects")), copies)
+            dependents, doubt = clones._dependents(copies, [source])
+            self.assertEqual(doubt, "")
+            self.assertIn(other, dependents[source])
+            with mock.patch.object(hk, "worktree_in_use", return_value=""), \
+                    mock.patch.object(hk, "_git_copy_work", return_value=""):
+                self.assertIn("alternate dependent", clones._removal_check(
+                    source, cfg, (), (), (root,), {}))
+
+
 class NamedLotsTest(unittest.TestCase):
     def test_the_agent_number_is_not_a_lot_when_a_longer_number_is_named(self):
         agents = {"deepseek4", "mty-amh-impl-04", "a1"}
