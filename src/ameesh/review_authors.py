@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Une seule lecture des auteurs d'une tête gelée (#2681).
 
-La porte de fusion (`merge_queue.review_gate`) ne compare les avis qu'à la
-famille de l'**assigné** ; la désignation au gel (`review_designation_activation`)
-et le train (#1467) doivent lire les mêmes auteurs, avec les mêmes exceptions
-du canon §2 :
+La porte de fusion (`merge_queue.review_gate`) compare les avis à tous les
+auteurs que l'appelant lui donne (#2681) ; la désignation au gel
+(`review_designation_activation`) et le train (#1467) doivent lire les mêmes
+auteurs, avec les mêmes exceptions du canon §2 :
 
 * l'auteur de référence est l'assigné au gel (`review_lot._author_at_freeze`,
   la même trace historique que la porte) ;

@@ -42,6 +42,7 @@ import os
 import re
 import shutil
 import tempfile
+from collections.abc import Mapping
 from types import SimpleNamespace
 
 from . import packet_guard, plan_git, storage, work
@@ -345,7 +346,8 @@ def _waiver(db, item) -> tuple:
 
 
 def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
-                item=None, families=None, required=None, family_of=None) -> dict:
+                item=None, families=None, required=None, family_of=None,
+                authors=None) -> dict:
     """Les avis requis sur la tête gelée `frozen`, et eux seuls (#1374).
 
     Un verdict ne compte que s'il a été rendu **sur cette tête** (le `sha` du
@@ -362,11 +364,21 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     2 pour un lot sensible qui touche ces domaines. `required` (#2681) permet
     à un appelant qui lit une politique versionnée plus stricte (le train) de
     passer son compte : la porte garde le **maximum** et ne s'affaiblit jamais.
-    Les avis comptés sont **indépendants** : jamais le travail de l'auteur ;
+    Les avis comptés sont **indépendants** : jamais le travail d'un auteur ;
     pour un lot léger à plancher déclaré et pour une classe sensible, une
-    famille de modèle connue et autre que celle de l'auteur ; pour deux avis,
-    deux familles distinctes. L'indépendance ne se suppose jamais : une famille
-    d'auteur inconnue refuse la porte (canon §2, décision 18855a).
+    famille de modèle connue et autre que celle de tout auteur ; pour deux
+    avis, deux familles distinctes. L'indépendance ne se suppose jamais : une
+    famille d'auteur inconnue refuse la porte (canon §2, décision 18855a).
+
+    `authors` (#2681) est l'ensemble des auteurs **reconnus** de la tête, tel
+    que l'appelant l'a lu (`review_authors.authors`) : `{name, family}`. La
+    porte ne compare plus seulement à l'assigné : un coauteur — tiers avec
+    reçu exact, correcteur de relecteur au-delà du seuil du §2 — ne relit ni
+    lui-même ni sa famille. Un petit correctif de relecteur n'est pas un auteur
+    (#2638) et sa famille reste éligible. La famille de l'assigné historique
+    reste celle de la trace du gel (`family_of`) : le reçu d'un autre commit du
+    même nom ne la remplace pas. Sans `authors`, la porte garde son
+    comportement historique : seul l'assigné est connu.
 
     `family_of` (#2681) est la source historique de famille du train : le même
     code de porte, mais les familles des reçus/tours à la date des faits au
@@ -387,7 +399,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     n'est jamais levé par la dispense : la correction reste due.
 
     Rend `{ok, why, class, required, accepted, blocked, waived, author,
-    author_family, on_freeze}` ; ne lève jamais.
+    author_family, authors, on_freeze}` ; ne lève jamais.
     """
     from . import lot_class
     klass = klass or {}
@@ -404,7 +416,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     author = str(row.get("assignee") or "").strip()
     out = {"ok": False, "why": "", "error": "", "class": cls, "required": 0,
            "accepted": [], "blocked": [], "waived": waived, "waived_by": waived_by,
-           "author": author, "author_family": "", "on_freeze": 0}
+           "author": author, "author_family": "", "authors": [], "on_freeze": 0}
     if not frozen:
         out["why"] = "no freeze to review: the fire names the exact frozen head"
         return out
@@ -476,28 +488,69 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                       % (frozen[:12], cls, exc))
         return out
     out["author_family"] = author_family
+    # #2681 : les auteurs **reconnus** de la tête, quand l'appelant les a lus
+    # (`review_authors.authors`). L'assigné historique passé dans `item` en
+    # fait toujours partie ; un tiers avec reçu exact ou un correcteur au-delà
+    # du seuil du §2 s'y ajoute. Un petit correctif de relecteur n'y est pas
+    # (#2638) : sa famille reste éligible.
+    recognized: dict = {}
+    if author:
+        recognized[author.lower()] = {"name": author, "family": author_family}
+    for entry in authors or ():
+        if isinstance(entry, Mapping):
+            name = str(entry.get("name") or "").strip()
+            family = str(entry.get("family") or "").strip()
+        else:
+            name, family = str(entry or "").strip(), ""
+        if not name:
+            continue
+        key = name.lower()
+        if author and key == author.lower():
+            # La référence (l'assigné historique) est déjà reconnue, avec la
+            # famille de la trace du gel (`family_of`) : le reçu d'un autre
+            # commit du même nom ne prouve pas sa famille au gel.
+            continue
+        if not family:
+            try:
+                family = _family_of(name)
+            except RegistryReadError as exc:
+                out["error"] = str(exc)
+                out["why"] = ("no review verdict ok on the freeze %s (class: %s): the agent "
+                              "registry cannot be read (%s), so the author %s cannot be "
+                              "proven independent (canon §2: independence is never assumed)"
+                              % (frozen[:12], cls, exc, name))
+                return out
+        known = recognized.get(key)
+        if known is None:
+            recognized[key] = {"name": name, "family": family}
+        elif family and not known["family"]:
+            known["family"] = family
+    out["authors"] = sorted(recognized.values(), key=lambda entry: entry["name"].lower())
     # L'indépendance ne se suppose jamais (canon §2, décision 18855a) : une
     # classe sensible — y compris un doute de classe, qui peut cacher SQL, la
     # sécurité ou la prod — et un lot léger à plancher déclaré (#2642 : le §2
     # demande « un avis d'une autre famille ») n'acceptent que des familles
-    # connues et autres que celle de l'auteur. Famille d'auteur inconnue
-    # (agent absent du registre, harnais non reconnu) : aucun avis ne peut être
-    # prouvé indépendant, la porte refuse et le dit. Un auteur humain n'a pas
-    # de famille de modèle : il n'y a rien à comparer, seules les familles des
-    # relecteurs comptent.
+    # connues et autres que celles de **tous** les auteurs. Famille d'auteur
+    # inconnue (agent absent du registre, harnais non reconnu) : aucun avis ne
+    # peut être prouvé indépendant, la porte refuse et le dit. Un auteur humain
+    # n'a pas de famille de modèle : il n'y a rien à comparer, seules les
+    # familles des relecteurs comptent.
     strict = required >= 2 or cls in (lot_class.LIGHT, lot_class.SENSITIVE)
-    author_human = bool(author) and author.lower().startswith(work.HUMAN_PREFIX)
-    if strict and not author_family and not author_human:
-        out["why"] = ("no review verdict ok on the freeze %s (class: %s): the author %s has "
-                      "no known model family, so no verdict can be proven independent "
-                      "(canon §2: independence is never assumed)"
-                      % (frozen[:12], cls, author or "(none)"))
-        return out
+    if strict:
+        for entry in recognized.values():
+            if entry["family"] or entry["name"].lower().startswith(work.HUMAN_PREFIX):
+                continue
+            out["why"] = ("no review verdict ok on the freeze %s (class: %s): the author %s "
+                          "has no known model family, so no verdict can be proven "
+                          "independent (canon §2: independence is never assumed)"
+                          % (frozen[:12], cls, entry["name"]))
+            return out
+    author_families = {entry["family"] for entry in recognized.values() if entry["family"]}
     accepted = []
     for mark in sorted((m for m in latest.values() if (m.get("verdict") or "") == "ok"),
                        key=_mark_order):
         actor = str(mark.get("actor") or "").strip()
-        if author and actor and actor.lower() == author.lower():
+        if actor and actor.lower() in recognized:
             continue                      # on ne relit pas son propre travail
         try:
             family = _family_of(actor)
@@ -511,8 +564,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         if strict:
             if not family:
                 continue                  # famille du relecteur inconnue : non prouvée
-            if family == author_family:
-                continue                  # la famille de l'auteur ne compte pas
+            if family in author_families:
+                continue                  # la famille d'un auteur ne compte pas
         accepted.append({"actor": actor, "family": family, "id": mark.get("id"),
                          "at_ts": mark.get("at_ts")})
     if required >= 2:
@@ -531,7 +584,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         return out
     got = ", ".join("%s (%s)" % (e["actor"] or "?", e["family"] or "famille inconnue")
                     for e in accepted) or "aucun"
-    need = ("two independent verdicts from different model families, neither the author's"
+    need = ("two independent verdicts from different model families, neither from an author's"
             if required >= 2 else
             "one verdict from another family than the author's" if strict
             else "one verdict from another agent")

@@ -17,8 +17,8 @@ from .support import PgTestCase
 
 HEAD = "a" * 40
 OLD = "b" * 40
-FAMILIES = {"author": "deepseek", "r1": "claude", "r2": "codex",
-            "r3": "claude", "blocked": "claude"}
+FAMILIES = {"author": "deepseek", "coauthor": "claude", "r1": "claude",
+            "r2": "codex", "r3": "claude", "blocked": "claude"}
 
 
 def mark(number, actor, *, sha=HEAD, verdict="ok"):
@@ -77,6 +77,46 @@ class GateReadingTest(unittest.TestCase):
         out = self.gate([mark(1, "ghost")], required=1)
         self.assertFalse(out["ok"])
         self.assertEqual(out["accepted"], [])
+
+    def test_every_recognized_author_is_excluded_from_the_verdicts(self):
+        # #2681 : le train lit tous les auteurs de la tête (tiers avec reçu
+        # exact, correcteur au-delà du seuil) ; la porte les reçoit et n'exclut
+        # plus seulement l'assigné. Un coauteur ne relit ni lui-même ni sa
+        # famille.
+        authors = [{"name": "coauthor", "family": "claude"}]
+        own = self.gate([mark(1, "coauthor")], required=1, authors=authors)
+        self.assertFalse(own["ok"], own)
+        self.assertEqual(own["accepted"], [])
+        same = self.gate([mark(1, "r1")], required=1, authors=authors)
+        self.assertFalse(same["ok"], same)
+        self.assertEqual(same["accepted"], [])
+        # required=2 : un seul avis indépendant ne suffit pas quand l'autre
+        # vient d'un auteur ou de sa famille.
+        two = self.gate([mark(1, "coauthor"), mark(2, "r2")], required=2,
+                        authors=authors)
+        self.assertFalse(two["ok"], two)
+        self.assertEqual([entry["actor"] for entry in two["accepted"]], ["r2"])
+        same_two = self.gate([mark(1, "r1"), mark(2, "r2")], required=2,
+                             authors=authors)
+        self.assertFalse(same_two["ok"], same_two)
+        self.assertEqual([entry["actor"] for entry in same_two["accepted"]], ["r2"])
+
+    def test_a_small_reviewer_fix_keeps_its_family_eligible(self):
+        # #2638 : `review_authors.authors` n'inscrit pas un correctif de
+        # relecteur sous le seuil ; la porte ne voit que les auteurs reconnus
+        # et l'avis de ce relecteur reste recevable.
+        out = self.gate([mark(1, "r1")], required=1,
+                        authors=[{"name": "author", "family": "deepseek"}])
+        self.assertTrue(out["ok"], out["why"])
+        self.assertEqual([entry["actor"] for entry in out["accepted"]], ["r1"])
+
+    def test_an_unknown_coauthor_family_refuses_closed(self):
+        # L'indépendance ne se suppose jamais : une famille d'auteur inconnue
+        # (autres que `human:`) refuse la porte, même pour un coauteur.
+        out = self.gate([mark(1, "r2")], required=1,
+                        authors=[{"name": "ghost-author", "family": ""}])
+        self.assertFalse(out["ok"])
+        self.assertIn("no known model family", out["why"])
 
 
 class SupersededBlockNotificationTest(PgTestCase):

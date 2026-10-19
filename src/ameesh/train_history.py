@@ -7,7 +7,9 @@ reads the exact frozen range and the complete milestone history, then calls
 `paquet-candidats` use in their current-registry reading. The train supplies
 the **historical** family source through `family_of` (exact receipts, then the
 turn journal), so a verdict is counted with the family it had at its date, not
-the agent's family today.
+the agent's family today. It also passes the complete `authors` list, so the
+common gate refuses a co-author's own verdict and another agent of a
+co-author's family, not only the reference assignee (#2681 B, dev1/cx2).
 
 Authors are read once for the train and the designation (`review_authors`,
 #2681): exact commit receipts (#1465), the reference author at freeze, and a
@@ -120,7 +122,7 @@ class Recorded:
             str(reference.get("family") or "")
         gate = merge_queue.review_gate(
             self.db, marks, head, repo=self.path, klass=klass, item=historical,
-            required=required,
+            required=required, authors=authors,
             family_of=lambda name: family_of.get(str(name or "").strip().lower(), ""))
         if gate.get("error"):
             raise TrainError(gate["error"])

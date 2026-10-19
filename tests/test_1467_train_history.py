@@ -130,6 +130,13 @@ class HistoryFixture:
             entry or self.entry, self.base, required=required,
             klass=klass or self.klass)
 
+    def coauthored(self):
+        """A new head carrying a receipted third-party commit (an author)."""
+        head = self.commit("third party work", actor="third")
+        self.receipt_commit(head, "third", "claude")
+        frozen = self.freeze(head)
+        return dict(self.entry, frozen_id=frozen["id"], frozen_sha=head)
+
 
 class RecordedHistoryTest(HistoryFixture, PgTestCase):
     def test_every_commit_is_read_on_the_frozen_head_with_the_gate(self):
@@ -173,6 +180,40 @@ class RecordedHistoryTest(HistoryFixture, PgTestCase):
         self.assertEqual(unknown, [])
         self.assertEqual({row["name"] for row in authors}, {"author"})
         self.assertTrue(self.qualify()["reviews"]["gate"]["ok"])
+
+    def test_a_coauthor_cannot_admit_its_own_verdict_with_one_review(self):
+        # #2681 B (dev1/cx2) : un tiers avec reçu exact est un auteur de la
+        # tête ; son propre `ok` ne compte pas, même pour l'unique avis exigé.
+        entry = self.coauthored()
+        self.verdict(entry["frozen_sha"], "third", "claude")
+        with self.assertRaisesRegex(train.TrainError,
+                                    "one verdict from another family"):
+            self.qualify(entry=entry, required=1)
+
+    def test_another_agent_of_the_coauthor_family_cannot_admit_with_one_review(self):
+        # Même famille que le coauteur : l'avis d'un autre agent ne prouve pas
+        # l'indépendance.
+        entry = self.coauthored()
+        self.verdict(entry["frozen_sha"], "r1", "claude")
+        with self.assertRaisesRegex(train.TrainError,
+                                    "one verdict from another family"):
+            self.qualify(entry=entry, required=1)
+
+    def test_a_coauthor_verdict_does_not_count_towards_two_reviews(self):
+        entry = self.coauthored()
+        self.verdict(entry["frozen_sha"], "third", "claude")
+        self.verdict(entry["frozen_sha"], "r2", "codex")
+        with self.assertRaisesRegex(train.TrainError,
+                                    "two independent verdicts"):
+            self.qualify(entry=entry, required=2)
+
+    def test_another_agent_of_the_coauthor_family_does_not_count_towards_two(self):
+        entry = self.coauthored()
+        self.verdict(entry["frozen_sha"], "r1", "claude")
+        self.verdict(entry["frozen_sha"], "r2", "codex")
+        with self.assertRaisesRegex(train.TrainError,
+                                    "two independent verdicts"):
+            self.qualify(entry=entry, required=2)
 
     def test_pilot_waiver_covers_the_frozen_head_in_the_train_too(self):
         # #2681 cas (3) : la dispense `-none` est lue par la même porte que le
