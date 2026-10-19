@@ -1495,18 +1495,27 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def reserve_migration(self, item_id: int, repo: str | None, number: int | None,
                           floor: int, *, note: str, actor: str, issue_ref: str | None,
-                          release: bool = False) -> dict | None:
-        """L122, #443 : réserve un numéro de migration du dépôt `repo` au lot
-        ouvert (journalisé) : `number` s'il est donné, sinon le prochain libre
-        de ce dépôt, au moins `floor`. L'unicité (dépôt, numéro) est celle de
-        l'index unique : deux réservations simultanées ne prennent jamais le
-        même numéro ; la perdante réessaie avec une attente aléatoire croissante,
-        dans un budget de temps (#478). `note` peut citer `%(number)04d`. None
-        si le lot n'est plus ouvert, ou si `issue_ref` — la référence lue par
-        l'appelant — a changé entre-temps (#1830 : NULL et chaîne vide
-        confondus) ; DbError si `number` est pris par un autre lot ;
-        `ReservationContention` si le budget du prochain libre est épuisé.
-        `release` libère la réservation, sans condition sur la référence."""
+                          release: bool = False,
+                          release_number: int | None = None) -> dict | None:
+        """L122, #443, #2481 : réserve un numéro de migration du dépôt `repo`
+        au lot ouvert (journalisé) : `number` s'il est donné, sinon le prochain
+        libre de ce dépôt, au moins `floor`. Un lot garde ses réservations
+        précédentes : `number` s'ajoute à la liste (`migrations`), il ne
+        remplace plus le numéro courant. L'unicité (dépôt, numéro) est celle
+        des index uniques : deux réservations simultanées ne prennent jamais
+        le même numéro ; la perdante réessaie avec une attente aléatoire
+        croissante, dans un budget de temps (#478). `note` peut citer
+        `%(number)04d` pour une réservation ou une libération d'UN numéro ; une
+        libération totale nomme elle-même l'ensemble des numéros (un gabarit
+        y rend la liste, jamais le sentinelle 0). None si le lot n'est plus
+        ouvert, ou si `issue_ref` —
+        la référence lue par l'appelant — a changé entre-temps (#1830 : NULL
+        et chaîne vide confondus) ; DbError si `number` est pris par un autre
+        lot ; `ReservationContention` si le budget du prochain libre est
+        épuisé. `release` libère toutes les réservations du lot, ou seulement
+        `release_number` s'il est donné, sans condition sur la référence.
+        Les colonnes scalaires (`migration`, `migration_repo`) restent la
+        réservation principale et `migrations` porte la liste complète."""
 
     @abc.abstractmethod
     def migration_holder(self, number: int, repo: str) -> dict | None:

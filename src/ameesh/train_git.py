@@ -124,21 +124,23 @@ class Repository:
             # survive reconstruction after the first publication was lost.
             tree = plan_git._out(self.clone.path, "rev-parse", merged["sha"] + "^{tree}")
             if self.migrations is not None and migration_layout is not None:
-                expected = next((entry for entry in (pending_migrations or ())
-                                 if entry.get("work_item_id") == row["work_item_id"]), None)
+                # #2481 : un lot peut ajouter plusieurs migrations ; le plan
+                # persiste une entrée par numéro, toutes pour le même lot.
+                expected = [entry for entry in (pending_migrations or ())
+                            if entry.get("work_item_id") == row["work_item_id"]]
                 renumbered = train_migrations.rewrite(
                     self.clone.path, head, merged["sha"], migration_layout, row,
-                    expected=expected,
+                    expected=(expected or None),
                     allocator=(self.migrations if pending_migrations is None else None))
                 if renumbered is not None and pending_migrations is not None \
-                        and expected is None:
+                        and not expected:
                     raise TrainError("persisted migration mapping missing for lot #%s"
                                      % row["work_item_id"])
                 if renumbered is not None:
                     tree = renumbered["tree"]
-                    recorded_migrations.append(renumbered["migration"])
-                    if expected is not None:
-                        pending_migrations.remove(expected)
+                    recorded_migrations.extend(renumbered["migrations"])
+                    for entry in expected:
+                        pending_migrations.remove(entry)
             head = self._commit(tree, list(dict.fromkeys([head, row["frozen_sha"]])),
                 "Train intermediate\n\n" + json.dumps(dict(source=self.source,
                     target=branch, base=head, admission=identity(row)), sort_keys=True))

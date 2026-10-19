@@ -783,16 +783,20 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    l'hôte github.com exactement), et
    des numéros déjà réservés pour ce dépôt. Chaque dépôt a sa suite : la
    même valeur peut être réservée dans ameesh et dans nexlink. L'unicité
-   (dépôt, numéro) est un index unique en base : deux réservations
-   simultanées ne prennent jamais le même numéro ; la perdante réessaie après
-   une attente plein jitter (entre 0 et un plafond croissant), bornée au
-   budget restant, et si le budget s'épuise la commande rend
-   « reservation contention, retry » (jamais
-   l'erreur brute de l'index). Seule la violation d'unicité de cet index
+   (dépôt, numéro) est garantie en base (index scalaire et index partiel des
+   créneaux réservés) : deux réservations simultanées ne prennent jamais le
+   même numéro ; la perdante réessaie après une attente plein jitter (entre 0
+   et un plafond croissant), bornée au budget restant, et si le budget
+   s'épuise la commande rend « reservation contention, retry » (jamais
+   l'erreur brute de l'index). Seule la violation d'unicité de ces index
    déclenche un réessai ; une autre erreur qui le nomme remonte. La commande est
    idempotente ; `--number N` réserve un numéro précis (refusé s'il existe
-   déjà dans le dépôt, hors la branche du lot, ou s'il est réservé ailleurs),
-   `--release` libère. `--skip-branch BRANCHE` (répétable, #1603) ajoute une
+   déjà dans le dépôt, hors la branche du lot, ou s'il est réservé ailleurs).
+   Un lot qui ajoute plusieurs migrations en réserve plusieurs (#2481) :
+   chaque `--number` s'ajoute à sa liste `migrations`, le premier numéro
+   restant la réservation principale lue par les clients d'avant #2481 ;
+   `--release --number N` ne libère que ce numéro, `--release` les libère
+   tous. `--skip-branch BRANCHE` (répétable, #1603) ajoute une
    branche au scan ignoré, en plus de celle du lot : à la composition d'un
    paquet, la branche d'intégration porte déjà les fichiers renumérotés et
    ferait refuser le numéro ; l'option ne dispense pas de la réservation (un
@@ -804,26 +808,30 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    réservé aux correcteurs comme `work set-app` et journalisé ; refusé tant
    qu'une réservation est tenue dans l'ancien dépôt (`--release` d'abord). La réservation
    se lit dans `ameesh work show <lot>`
-   (ligne `migration`) et au journal du lot ; la description de la PR
-   l'annonce.
+   (ligne `migration`, plusieurs numéros sur la même ligne s'il y en a
+   plusieurs) et au journal du lot ; la description de la PR l'annonce.
    En confiant un lot qui touche au schéma, l'orchestrateur réserve le
    numéro ou demande à l'agent de le faire en premier. Deux fichiers de même numéro dans
    `src/ameesh/migrations` sont refusés par la suite unitaire
    (`tests/test_l122_numeros_de_migration.py`, sans base). À la composition
-   d'un paquet par le train (#2400), une migration ajoutée par un lot est
-   renumérotée au maximum de la cible + 1, jamais une migration historique :
-   le lot qui en modifie une est écarté avec un motif. Les fichiers compagnons
+   d'un paquet par le train (#2400), chaque migration ajoutée par un lot est
+   renumérotée au maximum de la cible + 1, puis + 2, … dans l'ordre des
+   fichiers ; un lot à plusieurs migrations les fait donc renuméroter toutes,
+   jamais une migration historique : le lot qui en modifie une est écarté avec
+   un motif. Les fichiers compagnons
    du même préfixe (rollback, test, banc) sont renommés avec elle, les
    références par nom de fichier et les numéros en commentaire suivent ; les
    littéraux de code ne changent pas. Un transport qualifié qui porterait une
    migration ajoutée ou modifiée est refusé et le lot écarté : sa qualification
    fige l'arbre et le delta, la renumérotation doit donc précéder la
-   qualification. La réservation L122 est déplacée avant
-   la publication (journal « before: … »), le plan porte la correspondance
-   (`reserved`/`landed`) et le commit final la ligne
-   `ameesh-migration: <lot> <ancien> <nouveau>`. Après promotion confirmée,
-   le numéro atterri est enregistré (`migration_landed`) et la réservation
-   libérée. Le train reste inactif : ce raccord ne l'active pas.
+   qualification. Les réservations L122 sont déplacées (ou ajoutées) avant
+   la publication (journal « before: … »), le plan porte une correspondance
+   (`reserved`/`landed`) par numéro et le commit final une ligne
+   `ameesh-migration: <lot> <ancien> <nouveau>` par numéro. Après promotion
+   confirmée, le premier numéro atterri est enregistré (`migration_landed`,
+   la correspondance complète reste dans le plan et le journal) et toutes les
+   réservations du lot sont libérées. Le train reste inactif : ce raccord ne
+   l'active pas.
 6. **Geler le périmètre d'une release à son ouverture** (L750/L756, #561/#566).
    Quand le lot de release est ouvert, son périmètre se fige à un commit
    **nommé** de sa cible : `ameesh release open <lot> --base <commit>`. Les
