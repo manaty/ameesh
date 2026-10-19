@@ -206,7 +206,14 @@ def _clones_under(roots) -> tuple[list[str], bool, str]:
     more = False
     for root in roots or ():
         root = hk._expand(root)
-        if not os.path.isdir(root):
+        try:
+            st = os.stat(root)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            return found, False, "unreadable root %s (%s)" % (
+                root, exc.strerror or exc)
+        if not stat.S_ISDIR(st.st_mode):
             continue
         try:
             with os.scandir(root) as children:
