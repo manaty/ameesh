@@ -2967,6 +2967,15 @@ MILESTONE_KINDS = ("requested", "frozen", "verdict", "fire", "unfire", "merged",
 MANUAL_KINDS = ("frozen", "verdict", "fire", "unfire")
 VERDICTS = ("ok", "blocked")
 
+#: #2674 : un verdict ne compte à la porte (`merge_queue.review_gate`) que
+#: s'il nomme la tête relue — un commit complet (40 ou 64 hexadécimaux), ou
+#: une abréviation d'au moins 12 caractères **résolue** dans un dépôt (ou,
+#: sans dépôt, dans la tête gelée courante). Un avis sans tête ne pouvait
+#: jamais compter et laissait le lot des heures en « verdicts-missing ».
+REVIEWED_HEAD_MIN = 12
+_FULL_HEAD = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+_REVIEWED_HEAD = re.compile(r"[0-9a-f]{%d,64}" % REVIEWED_HEAD_MIN)
+
 #: les jalons affichés, du plus récent au plus ancien : (nom, colonne d'instant,
 #: colonne de durée) — l'ordre est celui de la frise lue à l'envers. `delivered`
 #: (#988) est la fin d'un lot livré hors cible : il remplace la fusion.
@@ -3000,6 +3009,119 @@ def _in_transaction(db: Db) -> bool:
     return int(getattr(db, "_tx_depth", 0) or 0) > 0
 
 
+def _frozen_head(db: Db, item_id: int) -> str:
+    """Le SHA du dernier gel du lot, en minuscules ("" s'il n'est pas gelé)."""
+    from . import plan_git
+    freeze = plan_git.latest_freeze(milestones(db, item_id))
+    return str((freeze or {}).get("sha") or "").strip().lower()
+
+
+def _head_repos(db: Db, item: dict) -> list[str]:
+    """Les dépôts où résoudre l'abréviation d'un verdict, sans réseau.
+
+    Le répertoire courant est celui où `ameesh` est lancé (le plus souvent
+    l'arbre du relecteur) ; le dépôt du projet vient du radar ; le dossier de
+    travail de l'assigné, du registre. Aucun n'est autoritaire (seul `--repo`
+    l'est) : une abréviation résolue dans l'un suffit, et l'absence de dépôt
+    est dite par le refus."""
+    candidates: list = [os.getcwd()]
+    try:
+        from . import lot_class
+        candidates.append(lot_class.repository(getattr(db, "cfg", None), item))
+    except Exception:  # noqa: BLE001 - réglages illisibles : pas de dépôt
+        pass
+    try:
+        from . import fire
+        candidates.append(fire._repo_of(db, item))
+    except Exception:  # noqa: BLE001 - registre illisible : pas de dépôt
+        pass
+    seen: list[str] = []
+    for path in candidates:
+        path = str(path or "").strip()
+        if path and path not in seen and os.path.isdir(path):
+            seen.append(path)
+    return seen
+
+
+def _proposed_head(db: Db, item: dict, frozen: str, repo: str | None = None) -> str:
+    """La tête gelée proposée dans un refus, en abréviation valide (12+).
+
+    Un gel ancien peut porter moins de 12 caractères : on le complète dans un
+    dépôt quand l'un le connaît, sinon la proposition est vide (le refus dit
+    alors de geler de nouveau avec la tête complète)."""
+    head = frozen
+    if head and len(head) < REVIEWED_HEAD_MIN:
+        from . import freeze_checks
+        for where in ([repo] if repo else []) + _head_repos(db, item):
+            head = freeze_checks.commit_in(where, head) or head
+            if len(head) >= REVIEWED_HEAD_MIN:
+                break
+    return head[:12] if len(head) >= REVIEWED_HEAD_MIN else ""
+
+
+def _head_refusal(db: Db, item: dict, why: str, *, repo: str | None = None) -> WorkError:
+    """Le refus nommé d'un verdict sans tête, avec la tête gelée proposée."""
+    frozen = _frozen_head(db, item["id"])
+    proposed = _proposed_head(db, item, frozen, repo)
+    if proposed:
+        hint = ("the current frozen head is %s: pass it with `--sha %s`"
+                % (proposed, proposed))
+    elif frozen:
+        hint = ("the current frozen head %s is too short to name a commit: freeze "
+                "again with the full head" % frozen)
+    else:
+        hint = ("lot #%d has no frozen head yet: freeze it first "
+                "(`ameesh work milestone %d frozen --sha <commit>`)"
+                % (item["id"], item["id"]))
+    return WorkError("%s; %s" % (why, hint))
+
+
+def reviewed_head(db: Db, item: dict, sha: str, *, repo: str | None = None) -> str:
+    """Le `sha` d'un verdict, vérifié et normalisé (#2674).
+
+    Un avis ne compte à la porte (`merge_queue.review_gate`) que s'il nomme la
+    tête relue : un commit complet (40 ou 64 hexadécimaux), ou une abréviation
+    d'au moins [`REVIEWED_HEAD_MIN`] caractères **résolue** — dans `repo`
+    (nommé par `--repo`, alors autoritaire), sinon dans le répertoire courant,
+    le dépôt du projet ou celui de l'assigné, ou encore dans la tête gelée
+    courante. Un `sha` vide, trop court, non hexadécimal ou non résolu est
+    refusé avec la tête gelée proposée : le jalon n'est pas écrit, plutôt
+    qu'un avis qui ne pourrait jamais franchir la porte."""
+    text = str(sha or "").strip().lower()
+    if not text:
+        raise _head_refusal(
+            db, item,
+            "verdict refused (head-missing): a verdict must name the reviewed head — "
+            "the full commit id, or an abbreviation of at least %d hex characters "
+            "resolved in a repository (`--sha`)" % REVIEWED_HEAD_MIN)
+    if not _REVIEWED_HEAD.fullmatch(text):
+        raise _head_refusal(
+            db, item,
+            "verdict refused (head-missing): --sha %r is not a commit id: give the full "
+            "head, or an abbreviation of at least %d hex characters (`--sha`)"
+            % (sha, REVIEWED_HEAD_MIN), repo=repo)
+    if _FULL_HEAD.fullmatch(text):
+        return text
+    from . import freeze_checks
+    if repo:
+        if freeze_checks.commit_in(repo, text):
+            return text
+        raise _head_refusal(
+            db, item,
+            "verdict refused (head-unresolved): %s does not name a commit of %s"
+            % (text, repo), repo=repo)
+    for where in _head_repos(db, item):
+        if freeze_checks.commit_in(where, text):
+            return text
+    frozen = _frozen_head(db, item["id"])
+    if frozen and (frozen.startswith(text) or text.startswith(frozen)):
+        return text
+    raise _head_refusal(
+        db, item,
+        "verdict refused (head-unresolved): %s does not resolve to a commit here and "
+        "does not name the current frozen head" % text, repo=repo)
+
+
 def milestone(
     db: Db,
     item_id: int,
@@ -3012,6 +3134,7 @@ def milestone(
     on_frozen=None,
     after_commit: list | None = None,
     outcome: dict | None = None,
+    repo: str | None = None,
 ) -> dict:
     """Déclare un jalon que la machine à états ne peut pas déduire.
 
@@ -3021,6 +3144,13 @@ def milestone(
     et `delivered` sont écrits automatiquement (transitions, fermeture et
     livraison hors cible : 0013, 0026, #988), les déclarer à la main serait un
     mensonge sur la frise.
+
+    `verdict` (#2674) exige une tête relue : le `sha` est vérifié par
+    [`reviewed_head`] avant toute écriture — complet, ou abréviation de 12
+    caractères au moins résolue dans un dépôt. Sans elle, le jalon est refusé
+    avec la tête gelée courante proposée ; un avis qui ne peut pas compter à
+    la porte n'est plus accepté en silence. `repo` (facultatif) est le dépôt
+    nommé par `--repo`, où une abréviation doit alors se résoudre.
 
     `on_frozen` (facultatif, #1617) : le callback du gel, appelé dans la
     transaction du jalon `frozen` avec `(tx, milestone, after_commit)`. Il
@@ -3062,8 +3192,12 @@ def milestone(
         raise WorkError("a verdict only makes sense for the `verdict` milestone")
     if on_frozen is not None and kind != "frozen":
         raise WorkError("a freeze callback only makes sense for the `frozen` milestone")
-    if get(db, item_id) is None:
+    item = get(db, item_id)
+    if item is None:
         raise WorkError("lot %s not found" % item_id)
+    if kind == "verdict":
+        # #2674 : refuser à l'écriture un avis qui ne nomme pas la tête relue.
+        sha = reviewed_head(db, item, sha, repo=repo)
     drain: list | None = None
     if kind == "frozen" and on_frozen is None:
         from . import review_designation_activation as activation
