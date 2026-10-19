@@ -623,11 +623,22 @@ def lot_repository(item: dict, cfg=None) -> str:
                     "(`ameesh work link %s owner/repo#N`)" % (item["id"], item["id"]))
 
 
+def _migration_target(item: dict, checkout: str, cfg=None) -> str:
+    """La cible du lot pour l'invariant des numéros de migration (#2620) :
+    `branch_target`, sinon la cible de son projet, sinon celle du dépôt —
+    exactement celle que lisent la file de fusion et la classe de revue.
+    Chaîne vide quand aucune n'est connue."""
+    from . import lot_class
+
+    return str(lot_class.default_base(cfg, item, checkout) or "").strip()
+
+
 def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
                       release: bool = False, repo: str | None = None,
                       actor: str = "", cfg=None,
                       skip_branches: tuple[str, ...] = (),
-                      skip_worktree: bool = False) -> dict:
+                      skip_worktree: bool = False,
+                      target: str | None = None) -> dict:
     """L122, #443 : réserve au lot le numéro de sa migration, avant d'écrire
     le fichier, dans le dépôt du lot (`lot_repository`) : le dossier et la
     numérotation sont les siens, jamais ceux d'ameesh pour un autre dépôt.
@@ -635,16 +646,22 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
     sinon le dépôt git courant) ; son `origin` doit être le dépôt du lot.
     Sans `number` : le prochain libre, au-delà des numéros du dépôt (arbre,
     toutes ses branches) et de ceux déjà réservés pour ce dépôt. `number` est
-    refusé s'il existe déjà dans le dépôt ou s'il est réservé par un autre lot
-    (index unique (dépôt, numéro) : la base tranche, même entre deux
-    réservations simultanées). Un lot qui a déjà sa réservation la garde
-    (idempotent). `release` la libère, y compris sur un lot déjà terminal
-    (#956 : un lot fusionné gardait sa réservation et bloquait le numéro).
-    `skip_branches` (#1603) : branches supplémentaires ignorées par le scan,
-    en plus de celle du lot — la branche d'intégration d'un paquet en
+    refusé s'il existe déjà **sur la branche cible du lot** — `branch_target`,
+    sinon la cible de son projet, sinon celle du dépôt, `origin/` publiée
+    d'abord (#2620 : l'arbre de travail, le paquet installé et les autres
+    branches ne comptent pas ; une branche non fusionnée sera renumérotée à
+    sa fusion, #2400) — ou s'il est réservé par un autre lot (index unique
+    (dépôt, numéro) : la base tranche, même entre deux réservations
+    simultanées). Un lot qui a déjà sa réservation la garde (idempotent).
+    `release` la libère, y compris sur un lot déjà terminal (#956 : un lot
+    fusionné gardait sa réservation et bloquait le numéro). `skip_branches`
+    (#1603) : branches supplémentaires ignorées par le scan du prochain
+    libre, en plus de celle du lot — la branche d'intégration d'un paquet en
     composition, dont les fichiers renumérotés ne doivent pas compter contre
     la réservation. `skip_worktree` (#2400) : ignorer l'arbre de travail du
     clone de lecture — le train y compose justement la migration à réserver.
+    `target` (#2620) : la cible à lire pour un numéro exact quand l'appelant
+    la connaît déjà (le train compose une cible explicite), sinon celle du lot.
     Rend le lot, avec `migration_file`. Une correction
     concurrente de `issue_ref` pendant le scan du dépôt est refusée (#1830 :
     `issue reference changed meanwhile, retry`), jamais écrite en silence."""
@@ -682,14 +699,28 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
     if trunks:
         # ignorer le tronc cacherait les migrations déjà fusionnées (#1603)
         raise WorkError("--skip-branch %s: a trunk branch is always scanned" % trunks[0])
-    present = migrations.repo_numbers(checkout, layout, skip_branch=item.get("branch"),
-                                      also_skip=tuple(skip_branches),
-                                      worktree=not skip_worktree)
     if number is None:
+        present = migrations.repo_numbers(checkout, layout, skip_branch=item.get("branch"),
+                                          also_skip=tuple(skip_branches),
+                                          worktree=not skip_worktree)
         floor = max(present or [0]) + 1
         note = "migration %%(number)0%dd reserved (%s)" % (layout.width, slug)
     else:
         number = int(number)
+        # #2620 : un numéro exact se lit sur la cible seule. Une branche non
+        # fusionnée qui porte le même numéro ne l'a pas fait atterrir : elle
+        # sera renumérotée à sa fusion (#2400), elle ne bloque pas ce lot.
+        target = (target or "").strip() or _migration_target(item, checkout, cfg)
+        present = migrations.target_numbers(checkout, layout, target)
+        if present is None:
+            raise WorkError(
+                "migration %s: %s of lot #%s is unknown in %s — an exact number is checked "
+                "against the target branch only (#2620); fetch it (`git fetch origin`) or "
+                "name the target (`ameesh work branch %s <branch> --target <target>`, or "
+                "`git config ameesh.target <target>`)"
+                % (layout.label(number),
+                   ("target branch %r" % target) if target else "no target branch",
+                   item_id, checkout, item_id))
         if number in present:
             raise WorkError("migration %s already in %s (%s): choose another number" % (
                 layout.label(number), slug, ", ".join(sorted(present[number])[:3])))

@@ -354,7 +354,7 @@ class Allocator:
             work.reserve_migration(
                 self.db, row["work_item_id"], number, repo=path, cfg=self.cfg,
                 actor=self.actor, skip_branches=(row.get("branch") or "",),
-                skip_worktree=True)
+                skip_worktree=True, target=row.get("target"))
         except work.WorkError as exc:
             raise MemberDeferred(row, "migration %s -> %s: %s" % (
                 target.label(old), target.label(number), exc)) from exc

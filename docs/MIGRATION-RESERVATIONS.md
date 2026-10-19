@@ -8,6 +8,13 @@ git fetch origin
 ameesh work migration 711 --repo /path/to/clone
 ```
 
+The legacy next-free allocation keeps its repository-wide scan (worktree and
+all branches, #1603). An exact number (`--number N`) reads only the lot's
+target branch (#2620: `branch_target`, else the project target, else the
+repository default, published `origin/` first): a number carried by an
+unmerged branch no longer refuses it, since a package renumbers that branch's
+migration when it lands (#2400).
+
 Landing consumers can reserve several symbolic slots in one transaction. Fetch
 the target first, then pass its full commit SHA. Repeat `--slot` in the required
 migration order; numbers are contiguous and the entire batch either succeeds

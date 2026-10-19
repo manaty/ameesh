@@ -775,13 +775,19 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    dépôt, refus ; la clé est en minuscules, une seule suite par dépôt), avec
    son dossier et sa largeur (`src/ameesh/migrations` sur 4 chiffres pour
    ameesh, `supabase/migrations` sur 3 pour nexlink ; un autre dépôt se
-   déclare dans `radar.projects.<p>` avec `github` et `migrations`). Le
-   numéro passe au-delà de tout fichier numéroté (`N_…`) de l'arbre et de toutes les branches
-   d'un clone local du dépôt (locales et distantes, sans fetch : faire
-   `git fetch` avant ; `--repo <clone>`, défaut : le clone déclaré à l'hôte,
-   sinon le dépôt courant, dont l'`origin` doit être le dépôt du lot sur
-   l'hôte github.com exactement), et
-   des numéros déjà réservés pour ce dépôt. Chaque dépôt a sa suite : la
+   déclare dans `radar.projects.<p>` avec `github` et `migrations`). Sans
+   numéro, le prochain libre passe au-delà de tout fichier numéroté (`N_…`)
+   de l'arbre et de toutes les branches d'un clone local du dépôt (locales et
+   distantes, sans fetch : faire `git fetch` avant ; `--repo <clone>`, défaut :
+   le clone déclaré à l'hôte, sinon le dépôt courant, dont l'`origin` doit
+   être le dépôt du lot sur l'hôte github.com exactement), et
+   des numéros déjà réservés pour ce dépôt. `--number N` réserve un numéro
+   précis : il est refusé s'il existe déjà **sur la branche cible du lot**
+   (#2620 : sa `branch_target`, sinon la cible du projet, sinon celle du
+   dépôt, `origin/` publiée d'abord ; l'arbre de travail, le paquet installé
+   et les branches non fusionnées ne comptent pas — un paquet renumérote une
+   migration à sa fusion, #2400) ou s'il est réservé par un autre lot. Chaque
+   dépôt a sa suite : la
    même valeur peut être réservée dans ameesh et dans nexlink. L'unicité
    (dépôt, numéro) est un index unique en base : deux réservations
    simultanées ne prennent jamais le même numéro ; la perdante réessaie après
@@ -790,15 +796,15 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    « reservation contention, retry » (jamais
    l'erreur brute de l'index). Seule la violation d'unicité de cet index
    déclenche un réessai ; une autre erreur qui le nomme remonte. La commande est
-   idempotente ; `--number N` réserve un numéro précis (refusé s'il existe
-   déjà dans le dépôt, hors la branche du lot, ou s'il est réservé ailleurs),
-   `--release` libère. `--skip-branch BRANCHE` (répétable, #1603) ajoute une
-   branche au scan ignoré, en plus de celle du lot : à la composition d'un
-   paquet, la branche d'intégration porte déjà les fichiers renumérotés et
-   ferait refuser le numéro ; l'option ne dispense pas de la réservation (un
+   idempotente ; `--release` libère. `--skip-branch BRANCHE` (répétable,
+   #1603) ajoute une branche au scan ignoré de l'allocation du prochain
+   libre, en plus de celle du lot : à la composition d'un paquet, la branche
+   d'intégration porte déjà les fichiers renumérotés et ferait choisir un
+   numéro au-delà ; l'option ne dispense pas de la réservation (un
    numéro retenu par un autre lot reste refusé), et une branche de tronc
    (`main`, `master`, `develop`, la branche par défaut d'`origin`) ne s'ignore
-   jamais. Un lot dont l'`issue_ref`
+   jamais. Une réservation à numéro exact lit la cible seule : `--skip-branch`
+   n'y change rien. Un lot dont l'`issue_ref`
    désigne un autre dépôt se corrige avant de réserver :
    `ameesh work issue-ref <lot> owner/repo#N` (ou `--none` pour effacer),
    réservé aux correcteurs comme `work set-app` et journalisé ; refusé tant

@@ -1659,8 +1659,8 @@ class WorkItems(interface.WorkItems):
         (`merged`, `promoted`, `closed`), dans la transaction même de la
         transition : une réservation tenue par un lot fusionné bloquait le
         numéro pour toujours. Le numéro reste protégé tant qu'un fichier le
-        porte, puisque `repo_numbers` compte les fichiers de toutes les
-        branches du dépôt."""
+        porte sur la cible (réservation à numéro exact, `target_numbers`) ou
+        sur une branche (allocation du prochain libre, `repo_numbers`)."""
         if row.get("migration") is None:
             return
         number = row["migration"]
