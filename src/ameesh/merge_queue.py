@@ -536,6 +536,14 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     # n'a pas de famille de modèle : il n'y a rien à comparer, seules les
     # familles des relecteurs comptent.
     strict = required >= 2 or cls in (lot_class.LIGHT, lot_class.SENSITIVE)
+    if strict and not recognized:
+        # Aucun auteur connu (assigné absent, ni `authors`) : l'indépendance
+        # ne se suppose pas, comme avant #2681.
+        out["why"] = ("no review verdict ok on the freeze %s (class: %s): the author %s has "
+                      "no known model family, so no verdict can be proven independent "
+                      "(canon §2: independence is never assumed)"
+                      % (frozen[:12], cls, author or "(none)"))
+        return out
     if strict:
         for entry in recognized.values():
             if entry["family"] or entry["name"].lower().startswith(work.HUMAN_PREFIX):

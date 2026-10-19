@@ -118,6 +118,15 @@ class GateReadingTest(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertIn("no known model family", out["why"])
 
+    def test_a_gate_without_any_known_author_still_refuses_strict(self):
+        # Pas d'assigné ni d'auteurs : l'ancienne porte refusait déjà une
+        # classe stricte ; `authors` ne doit pas ouvrir ce cas.
+        out = merge_queue.review_gate(
+            None, [mark(1, "r1")], HEAD, klass=klass(), required=1, item={},
+            family_of=lambda name: FAMILIES.get(str(name or "").strip().lower(), ""))
+        self.assertFalse(out["ok"])
+        self.assertIn("no known model family", out["why"])
+
 
 class SupersededBlockNotificationTest(PgTestCase):
     def setUp(self):
