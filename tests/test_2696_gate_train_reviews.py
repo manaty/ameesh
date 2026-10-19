@@ -9,6 +9,10 @@ Le témoin porte sur les chemins réels du canon (`src/ameesh/train*.py`,
 qui n'est dans aucune liste de secours, pour prouver que la source est bien le
 canon. Un seul avis ne doit ni ouvrir la porte ni rendre le lot prêt.
 
+Témoin identité (auditeur, 19/10) : `src/ameesh/{oidc,login,login_cli}.py` sont
+déclarés à deux avis par la règle d'identité (`#2629`, `#2631`) et aucun n'est
+dans `CRITICAL_SCOPE` ; la porte ne peut donc les compter que par le canon.
+
 Second cas (mesh-design, 19/10) : le repli ne doit pas surclasser le canon d'un
 autre projet. Le crate Nexlink `desktop/host/host-linux` est déclaré à un avis
 par `desktop/**` ; `host[-_]` ne doit pas en faire un chemin de prod. Les motifs
@@ -29,6 +33,11 @@ TRAIN_PATHS = (
     "src/ameesh/radar.py",
     "src/ameesh/plan_git.py",
     "src/ameesh/resolutions.py",
+)
+IDENTITY_PATHS = (
+    "src/ameesh/oidc.py",
+    "src/ameesh/login.py",
+    "src/ameesh/login_cli.py",
 )
 FAMILIES = {"author": "deepseek", "reviewer": "claude", "second": "codex"}
 
@@ -82,6 +91,20 @@ class TrainMachineryScaleTest(unittest.TestCase):
         self.assertFalse(klass["doubt"])
         self.assertFalse(merge_queue.critical_scope(klass))
         self.assertEqual(merge_queue.required_verdicts(klass), 2)
+
+    def test_identity_declared_by_the_canon_needs_two_reviews(self):
+        # Auditeur 19/10 : l'identité est déclarée dans la même politique ;
+        # `oidc.py` n'est dans aucune liste de secours, donc seul le canon
+        # peut exiger les deux avis.
+        source = canon(reviews=[{"paths": list(IDENTITY_PATHS), "reviews": 2}])
+        for path in IDENTITY_PATHS:
+            with self.subTest(path=path):
+                klass = lot_class.class_of_paths([source], "ameesh", [path])
+                self.assertFalse(klass["doubt"])
+                self.assertEqual(klass["class"], "sensitive")
+                self.assertEqual(klass["train_reviews"], 2)
+                self.assertFalse(merge_queue.critical_scope(klass), path)
+                self.assertEqual(merge_queue.required_verdicts(klass), 2, path)
 
     def test_an_unreadable_train_declaration_is_a_doubt(self):
         # Une règle illisible ne se lit pas comme un zéro rassurant.
@@ -160,6 +183,16 @@ class TrainMachineryGateTest(unittest.TestCase):
 
     def test_one_verdict_does_not_open_the_gate(self):
         gate = self.gate(self.klass(), "reviewer")
+        self.assertEqual(gate["required"], 2)
+        self.assertFalse(gate["ok"], gate["why"])
+        self.assertEqual(len(gate["accepted"]), 1)
+
+    def test_one_identity_verdict_does_not_open_the_gate(self):
+        # Le témoin identité va jusqu'à la porte : un avis ne rend pas prêt.
+        source = canon(reviews=[{"paths": list(IDENTITY_PATHS), "reviews": 2}])
+        klass = lot_class.class_of_paths([source], "ameesh",
+                                         ["src/ameesh/oidc.py"])
+        gate = self.gate(klass, "reviewer")
         self.assertEqual(gate["required"], 2)
         self.assertFalse(gate["ok"], gate["why"])
         self.assertEqual(len(gate["accepted"]), 1)
