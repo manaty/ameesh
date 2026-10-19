@@ -675,6 +675,17 @@ def _packet_delivery(repo: str, lot: int, members: list[dict], refs: list[tuple]
         if current:
             if not (same_commit(current, recorded) or same_commit(current, source)):
                 continue                 # un nouveau gel : la composition est périmée
+            # Le gel capturé par record peut avoir avancé APRÈS la composition.
+            # Son identité avec le gel courant ne prouve donc pas sa livraison :
+            # la source réellement composée doit aussi en porter le contenu.
+            if not same_commit(current, source):
+                if not source:
+                    continue
+                try:
+                    if not probe(repo, current, source, lot=lot)["merged"]:
+                        continue
+                except (MergeProbeError, GitError):
+                    continue
         elif recorded:
             continue                     # le gel enregistré a disparu : ne pas conclure
         elif undecided:

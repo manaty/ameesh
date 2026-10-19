@@ -257,6 +257,43 @@ class PacketLinkTest(_TmpMixin, PgTestCase):
             self.assertEqual(result["composition"]["package"], porteur["id"])
             self.assertEqual(work.get(self.db, item["id"])["state"], "merged")
 
+    def test_sync_merges_accepts_a_source_containing_the_freeze(self):
+        frozen = self.unit_branch("lot/frozen", "code.py", "code\n", "code")
+        git(self.repo, "checkout", "-q", "lot/frozen")
+        source = self.commit("adaptation.py", "adaptation\n", "adaptation")
+        item = self.lot("source contenant le gel")
+        self.freeze(item, frozen)
+        head = self.compose("integration/paquet-1", [(item["id"], source)])
+        porteur = self.carrier()
+        packet_link.record(self.db, porteur["id"], repo=self.repo, base=self.base,
+                           head=head, actor="pilote", cfg=self.cfg)
+        git(self.repo, "checkout", "-q", "main")
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "fusion paquet",
+            "integration/paquet-1")
+        report = plan_git.sync_merges(self.db, self.repo, target="main")
+        row = next(r for r in report["results"] if r["work_item"] == item["id"])
+        self.assertEqual(row["result"], "merged", row)
+        self.assertEqual(row["how"], "composition", row)
+
+    def test_sync_merges_refuses_a_freeze_not_in_the_composed_source(self):
+        """Un gel avancé avant record ne prouve pas que la source le contient."""
+        old = self.unit_branch("lot/old", "old.py", "old\n", "old")
+        new = self.unit_branch("lot/new", "new.py", "new\n", "new")
+        item = self.lot("gel plus récent que la composition")
+        self.freeze(item, new)
+        head = self.compose("integration/paquet-1", [(item["id"], old)])
+        porteur = self.carrier()
+        packet_link.record(self.db, porteur["id"], repo=self.repo, base=self.base,
+                           head=head, actor="pilote", cfg=self.cfg)
+        self.assertEqual(self.membership(item["id"])[0]["frozen_sha"], new)
+        git(self.repo, "checkout", "-q", "main")
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "fusion paquet",
+            "integration/paquet-1")
+        report = plan_git.sync_merges(self.db, self.repo, target="main")
+        row = next(r for r in report["results"] if r["work_item"] == item["id"])
+        self.assertEqual(row["result"], "open", row)
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+
     def test_sync_merges_refuses_a_stale_composition(self):
         """Un re-gel postérieur à la composition rend la preuve périmée."""
         composed_sha = self.unit_branch("lot/douze", "src/huit.py", "huit\n", "huit")
