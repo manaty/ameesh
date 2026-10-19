@@ -26,6 +26,8 @@ class Inventory:
         self.candidate, self.target = candidate, target
 
     def read(self):
+        # Le lecteur de gel reçoit la dispense `-none` du pilote (#2681), lue
+        # par la même fonction que la porte ; il ne recopie pas la règle.
         candidates = []
         # A UI page limit would silently omit ready lots at the cutoff.
         for item in self.ops.items(state="qa", assignee=None, limit=None):
@@ -33,7 +35,7 @@ class Inventory:
                 continue
             target = merge_queue._remote_branch(item.get("branch_target") or self.target)
             marks = self.ops.milestones(item["id"], None)
-            candidate = self.candidate(marks)
+            candidate = self.candidate(marks, waived=merge_queue.is_waived(item))
             if not isinstance(candidate, dict) or not isinstance(candidate.get("sha"), str) \
                     or not isinstance(candidate.get("causes"), list):
                 raise TrainError("candidate reader returned no diagnostic for lot #%s" % item["id"])
@@ -104,7 +106,8 @@ class Preparation:
         if not isinstance(requirement, Requirement):
             raise TrainError("trusted policy returned no structured review requirement")
         requirement.check(subject, base)
-        historical = self.history.qualify_subject(subject, base, required=requirement.reviews)
+        historical = self.history.qualify_subject(
+            subject, base, required=requirement.reviews, klass=requirement.klass())
         return dict(schema="ameesh-train-candidate-preparation/1", subject=subject,
                     item=dict({key: item.get(key) for key in ("app", "branch", "branch_target", "type")},
                               resolved_target=target),

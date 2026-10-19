@@ -104,6 +104,20 @@ DRAIN_ATTENTE=${DRAIN_ATTENTE:-0}
 DRAIN_APPEL_DELAI=${DRAIN_APPEL_DELAI:-60}
 [[ $DRAIN_APPEL_DELAI =~ ^[0-9]+$ ]] && [ "$DRAIN_APPEL_DELAI" -gt 0 ] \
   || { echo "DRAIN_APPEL_DELAI invalide : « $DRAIN_APPEL_DELAI » (secondes attendues)" >&2; exit 2; }
+# #2198/N2 : la borne locale dépasse la borne distante de cette marge, pour que
+# le `timeout` distant rende son code (124, refus) avant que le client ne tue
+# le groupe ; à bornes égales, la réponse distante était perdue.
+DRAIN_MARGE_LOCALE=${DRAIN_MARGE_LOCALE:-20}
+[[ $DRAIN_MARGE_LOCALE =~ ^[0-9]+$ ]] && [ "$DRAIN_MARGE_LOCALE" -gt 0 ] \
+  || { echo "DRAIN_MARGE_LOCALE invalide : « $DRAIN_MARGE_LOCALE » (secondes attendues)" >&2; exit 2; }
+# #2198/N4 : les lectures (list, show, --help) n'ont pas le coût d'une pose ou
+# d'une levée ; une borne plus courte évite qu'un lien mort ne coûte
+# DRAIN_APPEL_DELAI par agent et par lecture. 30 s couvre largement les
+# mesures du poste (list ~3,5 s, show ~3,4 s en psql ; moins en psycopg) et
+# l'aller-retour systemd-run.
+DRAIN_LECTURE_DELAI=${DRAIN_LECTURE_DELAI:-30}
+[[ $DRAIN_LECTURE_DELAI =~ ^[0-9]+$ ]] && [ "$DRAIN_LECTURE_DELAI" -gt 0 ] \
+  || { echo "DRAIN_LECTURE_DELAI invalide : « $DRAIN_LECTURE_DELAI » (secondes attendues)" >&2; exit 2; }
 # #2184/R3 : une pose distante peut encore committer après la dernière lecture
 # du client (SSH coupé, timeout local) ; seule une échéance absolue, comparée
 # par la base sous le verrou de ligne, refuse une pose tardive. DRAIN_ECHEANCE
@@ -223,7 +237,10 @@ paquet_git() {
 # la liste des agents et n'en contrôle qu'un seul (#1455).
 ssh_agents() {
   if [ "${BORNE_APPEL_DRAIN:-}" = 1 ]; then
-    appel_drain ssh -n "${SSH_OPTS[@]}" "$AGENTS_SSH" "$@"
+    # #2198/N2 : la borne locale (BORNE_APPEL_LOCAL) dépasse toujours la borne
+    # distante, pour laisser le `timeout` distant rendre son code.
+    appel_drain "${BORNE_APPEL_LOCAL:-$DRAIN_APPEL_DELAI}" \
+      ssh -n "${SSH_OPTS[@]}" "$AGENTS_SSH" "$@"
   else ssh -n "${SSH_OPTS[@]}" "$AGENTS_SSH" "$@"; fi
 }
 utilisateur_agents() {
@@ -250,34 +267,81 @@ python_agents() { commande_agents /home/ameesh/.local/share/ameesh/venv/bin/pyth
 # Borne tout l'appel, transport SSH compris. Un keepalive ne limite pas une
 # commande sur un lien vivant. Python est déjà requis sur le poste ; le groupe
 # est tué avant de récolter le chef, descendants compris.
-appel_drain() {
-  python3 - "$DRAIN_APPEL_DELAI" "$@" <<'PY'
+# #2198/N1 : l'enfant est dans sa propre session (start_new_session), donc le
+# signal reçu par le client (SIGINT/SIGTERM) ne l'atteint pas tout seul : on le
+# transmet au groupe de l'enfant, puis on sort avec le code du signal.
+appel_drain() {  # $1 : délai local ; $2… : commande
+  python3 - "$@" <<'PY'
 import os, signal, subprocess, sys
+
+delai = int(sys.argv[1])
 p = subprocess.Popen(sys.argv[2:], start_new_session=True)
-try:
-    sys.exit(p.wait(timeout=int(sys.argv[1])))
-except subprocess.TimeoutExpired:
+
+
+class Interrompu(Exception):
+    def __init__(self, signum):
+        self.signum = signum
+
+
+def transmettre(signum, frame):
+    raise Interrompu(signum)
+
+
+for _sig in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(_sig, transmettre)
+
+
+def tuer_groupe(sig):
     try:
-        os.killpg(p.pid, signal.SIGKILL)
+        os.killpg(p.pid, sig)
     except ProcessLookupError:
         pass
+
+
+try:
+    code = p.wait(timeout=delai)
+except Interrompu as e:
+    # Ne pas laisser l'enfant orphelin : le signal est transmis, une courte
+    # grâce lui est laissée, puis le groupe est tué s'il résiste.
+    for _sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(_sig, signal.SIG_IGN)
+    tuer_groupe(e.signum)
+    try:
+        p.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        tuer_groupe(signal.SIGKILL)
+        p.wait()
+    print("appel de drain interrompu (signal %d transmis)" % e.signum,
+          file=sys.stderr)
+    sys.exit(128 + e.signum)
+except subprocess.TimeoutExpired:
+    tuer_groupe(signal.SIGKILL)
     p.wait()
     print("appel de drain expiré", file=sys.stderr)
     sys.exit(124)
+sys.exit(code)
 PY
 }
 # La VM est Linux : sa propre borne évite une commande distante orpheline
 # après perte du client. Elle ne dépend pas des outils installés sur le poste.
 ameesh_agents_drain() {
-  BORNE_APPEL_DRAIN=1 commande_agents timeout --kill-after=5 "$DRAIN_APPEL_DELAI" \
+  BORNE_APPEL_DRAIN=1 BORNE_APPEL_LOCAL=$((DRAIN_APPEL_DELAI + DRAIN_MARGE_LOCALE)) \
+    commande_agents timeout --kill-after=5 "$DRAIN_APPEL_DELAI" \
+    /home/ameesh/.local/share/ameesh/venv/bin/ameesh "$@"
+}
+# #2198/N4 : lectures (list, show, --help) bornées par leur propre délai, plus
+# court que celui d'une pose ou d'une levée.
+ameesh_agents_lecture() {
+  BORNE_APPEL_DRAIN=1 BORNE_APPEL_LOCAL=$((DRAIN_LECTURE_DELAI + DRAIN_MARGE_LOCALE)) \
+    commande_agents timeout --kill-after=5 "$DRAIN_LECTURE_DELAI" \
     /home/ameesh/.local/share/ameesh/venv/bin/ameesh "$@"
 }
 ameesh_local_drain() {
-  appel_drain "$AMEESH" "$@"
+  appel_drain "$DRAIN_APPEL_DELAI" "$AMEESH" "$@"
 }
 lire_bail() {
   if [ "$MODE" = agents ]; then
-    ameesh_agents_drain show "$1" --json | python3 -c 'import json,sys
+    ameesh_agents_lecture show "$1" --json | python3 -c 'import json,sys
 r=json.load(sys.stdin)
 if r.get("host") != sys.argv[1]: sys.exit("placement modifié")
 print(json.dumps(r))' "$HOTE_AGENTS"
@@ -354,7 +418,7 @@ redemarrer_hors_tour() {  # unité — 0 quand l'arrêt est prouvé puis l'unit�
 # contrôleur ne les attend pas (aucun bail d'une persona arrêtée).
 agents_du_registre() {
   local arretes=${1:-} noms
-  noms=$(ameesh_agents_drain list --json | python3 -c 'import json,re,sys
+  noms=$(ameesh_agents_lecture list --json | python3 -c 'import json,re,sys
 rows = json.load(sys.stdin)
 avec_arretes = sys.argv[2:] == ["avec-arretes"]
 # Même règle que ameesh.config.NAME_RE (config.py:48), utilisée par
@@ -454,12 +518,12 @@ print(serve.owner(config.load()))' 2>/dev/null) || h=
 }
 drain_supporte() {  # le CLI de la cible connaît la reprise conditionnelle ET l'échéance
   local aide
-  if [ "$MODE" = agents ]; then aide=$(ameesh_agents_drain resume --help 2>&1) || return 1
+  if [ "$MODE" = agents ]; then aide=$(ameesh_agents_lecture resume --help 2>&1) || return 1
   else aide=$(ameesh_local_drain resume --help 2>&1) || return 1; fi
   grep -q -- '--expect-reason' <<<"$aide" || return 1
   # #2184/R3 : sans --not-after côté cible, la pose n'a pas de barrière ; on
   # désactive le drain plutôt que de poser une pause sans échéance.
-  if [ "$MODE" = agents ]; then aide=$(ameesh_agents_drain pause --help 2>&1) || return 1
+  if [ "$MODE" = agents ]; then aide=$(ameesh_agents_lecture pause --help 2>&1) || return 1
   else aide=$(ameesh_local_drain pause --help 2>&1) || return 1; fi
   grep -q -- '--not-after' <<<"$aide"
 }
@@ -502,7 +566,7 @@ print("%d|%s" % (1 if r.get("operator_paused") else 0, r.get("operator_pause_rea
 }
 etat_agent() {  # $1 persona → « statut|pause|raison du skip » (une seule lecture)
   if [ "$MODE" = agents ]; then
-    ameesh_agents_drain show "$1" --json | python3 -c 'import json,sys
+    ameesh_agents_lecture show "$1" --json | python3 -c 'import json,sys
 r = json.load(sys.stdin)
 if r.get("host") != sys.argv[1]:
     print("skip|0|hôte=%s" % (r.get("host") or "absent"))
@@ -511,9 +575,14 @@ elif (r.get("mode") or "execute") != "execute":
 else:
     print("%s|%d|" % (r.get("status") or "", 1 if r.get("operator_paused") else 0))' "$HOTE_AGENTS"
   else
+    # #2198/N5 : le mode compte aussi en mode serveur ; sans cette garde,
+    # une persona passée `externe`/`observe` était redémarrée avec les autres.
     ameesh_local_drain show "$1" --json | python3 -c 'import json,sys
 r = json.load(sys.stdin)
-print("%s|%d|" % (r.get("status") or "", 1 if r.get("operator_paused") else 0))'
+if (r.get("mode") or "execute") != "execute":
+    print("skip|0|mode=%s" % (r.get("mode") or "execute"))
+else:
+    print("%s|%d|" % (r.get("status") or "", 1 if r.get("operator_paused") else 0))'
   fi
 }
 # Une entrée de DRAINS : persona<TAB>motif<TAB>échéance locale<TAB>incertain.
@@ -570,7 +639,7 @@ pause_reelle() {  # $1 persona → « <operator_paused>|<raison> » de l'état r
   # #2184/N1 : lecture par nom, sans la garde de placement de lire_bail : un
   # agent déplacé pendant le drain doit encore pouvoir être constaté levé.
   if [ "$MODE" = agents ]; then
-    ligne=$(ameesh_agents_drain show "$1" --json) || return 1
+    ligne=$(ameesh_agents_lecture show "$1" --json) || return 1
   else
     ligne=$(ameesh_local_drain show "$1" --json) || return 1
   fi
@@ -654,8 +723,8 @@ poser_drain() {  # $1 persona : pause immédiate d'un agent en tour
   fi
   return 1
 }
-lever_drain() {  # $1 persona, $2 : ce qui a mis fin à l'attente
-  local motif sortie change etat pose raison echeance
+lever_drain() {  # $1 persona, $2 cause, $3 = 1 : dernière tentative (message définitif)
+  local motif sortie change etat pose raison echeance final=${3:-1}
   motif=$(drain_motif_de "$1") || return 0
   # #2184/R3 : une pose incertaine peut encore être en cours d'exécution
   # (unité créée en retard). On attend l'échéance + la borne d'instruction +
@@ -687,8 +756,10 @@ lever_drain() {  # $1 persona, $2 : ce qui a mis fin à l'attente
     # était déjà levée. Dans les deux cas notre drain n'est plus en place, et
     # aucune pause étrangère n'a été touchée (R1 B1).
     if ! etat=$(pause_reelle "$1"); then
-      # #2184/N3 : garder l'intention pour une nouvelle tentative du trap ;
-      # rien n'a été levé, l'état ne prouve pas que la pause est partie.
+      # #2498 : l'intention est retirée. La reprise conditionnelle (motif
+      # identique, atomique) n'a rien levé : notre pause n'est plus en place,
+      # et l'échéance attendue plus haut exclut une pose tardive. Une nouvelle
+      # tentative du trap ne lèverait rien ; seul l'état reste à vérifier.
       echo "$1 : reprise conditionnelle sans effet et état illisible — vérifier « ameesh show $1 »" >&2
       drain_retire "$1"; return 1
     fi
@@ -704,14 +775,24 @@ lever_drain() {  # $1 persona, $2 : ce qui a mis fin à l'attente
   # Réponse illisible ou reprise refusée : réconcilier par l'état réel avant
   # de conclure — ne jamais lever une pause qui n'est pas la nôtre.
   if ! etat=$(pause_reelle "$1"); then
-    echo "$1 : drain NON levé (reprise sans réponse lisible, état illisible) — l'agent peut rester en pause opérateur" >&2
-    drain_secours "$1" "$motif"
+    if [ "$final" = 1 ]; then
+      echo "$1 : drain NON levé (reprise sans réponse lisible, état illisible) — l'agent peut rester en pause opérateur" >&2
+      drain_secours "$1" "$motif"
+    else
+      echo "$1 : levée non confirmée (reprise sans réponse lisible) — nouvelle tentative à la sortie du script" >&2
+    fi
     return 1
   fi
   IFS='|' read -r pose raison <<<"$etat"
   if [ "$pose" = 1 ] && [ "$raison" = "$motif" ]; then
-    echo "$1 : drain NON levé (reprise refusée ou sans réponse) — l'agent reste en pause opérateur" >&2
-    drain_secours "$1" "$motif"
+    # #2198/N3 : ne pas annoncer « NON levé » avant la dernière tentative du
+    # trap EXIT ; le message définitif n'apparaît qu'après la seconde passe.
+    if [ "$final" = 1 ]; then
+      echo "$1 : drain NON levé (reprise refusée ou sans réponse) — l'agent reste en pause opérateur" >&2
+      drain_secours "$1" "$motif"
+    else
+      echo "$1 : levée non confirmée (reprise refusée ou sans réponse) — nouvelle tentative à la sortie du script" >&2
+    fi
     return 1
   fi
   drain_retire "$1"
@@ -723,7 +804,9 @@ lever_drain() {  # $1 persona, $2 : ce qui a mis fin à l'attente
   return 0
 }
 lever_drain_sans_arreter() {  # $1 persona, $2 cause ; consigne l'échec, ne stoppe pas
-  lever_drain "$1" "$2" && return 0
+  # #2198/N3 : la sortie du script retente ; le message définitif est donc
+  # réservé au trap EXIT (final=1), pas à cette tentative intermédiaire.
+  lever_drain "$1" "$2" 0 && return 0
   local e
   for e in ${DRAINS_NON_LEVES[@]+"${DRAINS_NON_LEVES[@]}"}; do
     [ "$e" = "$1" ] && return 1
@@ -732,13 +815,15 @@ lever_drain_sans_arreter() {  # $1 persona, $2 cause ; consigne l'échec, ne sto
   return 1
 }
 lever_drains() {  # sortie du script : aucun drain ne survit à la commande
-  local e code tentative
+  local e code tentative final
   # #2184/N3 : une coupure SSH passagère ne doit pas laisser la pause au
   # premier échec ; une seconde passe, bornée par les timeouts, la retire.
   for tentative in 1 2; do
     code=0
     for e in ${DRAINS[@]+"${DRAINS[@]}"}; do
-      lever_drain "${e%%$'\t'*}" "sortie du script" || code=1
+      final=0
+      [ "$tentative" = 2 ] && final=1
+      lever_drain "${e%%$'\t'*}" "sortie du script" "$final" || code=1
     done
     [ "$code" = 0 ] && return 0
     [ "$tentative" = 1 ] && sleep 2
@@ -746,6 +831,23 @@ lever_drains() {  # sortie du script : aucun drain ne survit à la commande
   return "$code"
 }
 trap 'lever_drains || true' EXIT
+drains_non_leves_relus() {  # #2498 : passe du trap avant le verdict
+  # Le message « NON levé(s) » précédait la seconde passe du trap et pouvait
+  # être périmé. La passe est faite ici ; ne restent signalés que les drains
+  # encore suivis (notre pause toujours en place ou état illisible).
+  [ "${#DRAINS_NON_LEVES[@]}" -gt 0 ] || return 0
+  lever_drains || true
+  # Cette passe remplace le nettoyage de sortie : aucune nouvelle tentative
+  # ne doit lever un drain après le verdict « NON levé(s) ».
+  trap - EXIT
+  local p e reste=()
+  for p in "${DRAINS_NON_LEVES[@]}"; do
+    for e in ${DRAINS[@]+"${DRAINS[@]}"}; do
+      [ "${e%%$'\t'*}" = "$p" ] && { reste+=("$p"); break; }
+    done
+  done
+  DRAINS_NON_LEVES=(${reste[@]+"${reste[@]}"})
+}
 
 redemarrer_agents() {
   local noms p st avant ligne heure attendu tenu restantes
@@ -862,7 +964,10 @@ redemarrer_agents() {
     etape "ERREUR: drain(s) indisponible(s) : ${DRAINS_INDISPONIBLES[*]} — agents laissés en l'état, balayage poursuivi"
     return 1
   fi
+  drains_non_leves_relus
   if [ "${#DRAINS_NON_LEVES[@]}" -gt 0 ]; then
+    # #2198/N3, #2498 : drains_non_leves_relus a déjà fait les deux passes du
+    # trap (la dernière en final=1) et retiré le trap ; le verdict est définitif.
     etape "ERREUR: drain(s) NON levé(s) : ${DRAINS_NON_LEVES[*]} — lever à la main : ameesh resume <agent> --operator --reason …"
     return 1
   fi
@@ -1499,7 +1604,10 @@ redemarrer() {
     etape "ERREUR: drain(s) indisponible(s) : ${DRAINS_INDISPONIBLES[*]} — agents laissés en l'état, balayage poursuivi"
     exit 1
   fi
+  drains_non_leves_relus
   if [ ${#DRAINS_NON_LEVES[@]} -gt 0 ]; then
+    # #2198/N3, #2498 : drains_non_leves_relus a déjà fait les deux passes du
+    # trap (la dernière en final=1) et retiré le trap ; le verdict est définitif.
     etape "ERREUR: drain(s) NON levé(s) : ${DRAINS_NON_LEVES[*]} — lever à la main : ameesh resume <agent> --operator --reason …"
     exit 1
   fi

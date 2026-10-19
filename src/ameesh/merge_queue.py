@@ -42,6 +42,7 @@ import os
 import re
 import shutil
 import tempfile
+from collections.abc import Mapping
 from types import SimpleNamespace
 
 from . import packet_guard, plan_git, storage, work
@@ -175,8 +176,12 @@ def critical_scope(klass) -> bool:
 
 def required_verdicts(klass) -> int:
     """Le nombre d'avis indépendants : deux pour un chemin critique, même si
-    le canon l'a omis ou classé léger ; sinon 0 pour léger, 1 pour normal et
-    1 pour sensible hors SQL, sécurité et prod.
+    le canon l'a omis ou classé léger ; sinon le plancher déclaré pour un lot
+    léger (`light_reviews`, §2 : un avis, #2642), 1 pour normal et 1 pour
+    sensible hors SQL, sécurité et prod.
+    Un lot léger **sans chemin changé** n'a rien à relire : 0. Le plancher est
+    lu par le lecteur de classe (`lot_class`), donc le même que la désignation
+    au gel et `paquet-candidats` ; il ne reclasse jamais la classe.
     Un doute de classe (politique ou diff illisible, `files` vide) est
     sensible : un avis d'une autre famille (canon §2, owner 15/10 : deux
     familles seulement pour droits SQL, secrets, paiement, prod réelle ;
@@ -196,7 +201,9 @@ def required_verdicts(klass) -> int:
     if klass.get("files") and critical_scope(klass):
         return CRITICAL_REVIEWS
     if cls == lot_class.LIGHT:
-        return 0
+        if not klass.get("files"):
+            return 0
+        return int(klass.get("light_reviews") or 0)
     if cls in (lot_class.NORMAL, lot_class.RELEASE):
         return 1
     return SENSITIVE_REVIEWS
@@ -220,14 +227,22 @@ def _same_sha(a, b, repo: str | None = None) -> bool:
     return False
 
 
-def actor_family(db, name) -> str:
-    """La famille de modèle d'un agent (`claude`, `codex`, `deepseek`), "" si
-    elle n'est pas connue : un humain, un agent absent du registre, un harnais
-    non reconnu. L'indépendance d'un avis ne se suppose jamais (#1374).
+def actor_family(db, name, *, families=None) -> str:
+    """La famille de modèle d'un agent, "" si elle n'est pas connue.
+
+    `claude`, `codex`, `deepseek` sont les familles du canon compilé
+    (`review_lot.compiled_families`, #2664) ; un humain, un agent absent du
+    registre, un harnais non reconnu ou un canon illisible rendent "". Quand
+    l'appelant a déjà lu les familles (`families`), elles se réutilisent : la
+    porte les lit une fois pour tous les acteurs. L'indépendance d'un avis ne
+    se suppose jamais (#1374).
 
     Une lecture du registre impossible lève `RegistryReadError` (#2521) : la
     famille n'est pas « inconnue », elle n'a pas pu être lue ; les appelants
-    qui ne peuvent rien en faire d'autre l'attrapent explicitement."""
+    qui ne peuvent rien en faire d'autre l'attrapent explicitement. Un canon
+    illisible, lui, rend "" : les appelants qui doivent nommer le canon
+    (`review_gate`) le lisent avant et échouent fermé avec son diagnostic.
+    """
     from . import registry, review_lot
     name = str(name or "").strip()
     if not name or name.startswith(work.HUMAN_PREFIX) or ":" in name:
@@ -237,7 +252,20 @@ def actor_family(db, name) -> str:
     except Exception as exc:  # noqa: BLE001 - #2521 : lecture impossible, pas inconnue
         raise RegistryReadError(
             "cannot read the agent registry for %s: %s" % (name, exc)) from exc
-    return review_lot.family_of(registry.live_harness(row))
+    if families is None:
+        try:
+            families = review_lot.compiled_families(db)
+        except review_lot.FamiliesError:
+            return ""
+    return review_lot.family_of(registry.live_harness(row), families)
+
+
+
+def _actor_family(db, name, families) -> str:
+    """`actor_family` avec les familles déjà lues (ou None : il les lit)."""
+    if families is None:
+        return actor_family(db, name)
+    return actor_family(db, name, families=families)
 
 
 def blocked_verdicts(marks, frozen, *, repo: str | None = None) -> list[dict]:
@@ -253,6 +281,17 @@ def blocked_verdicts(marks, frozen, *, repo: str | None = None) -> list[dict]:
             latest[key] = mark
     return sorted((m for m in latest.values() if (m.get("verdict") or "") == "blocked"),
                   key=_mark_order)
+
+
+def is_waived(item) -> bool:
+    """La dispense de re-verdict du pilote (`-none`, #1979) sur cette ligne.
+
+    Une seule lecture de la dispense (#2681) : la porte, le gel effectif
+    (`plan_git.freeze_candidate`), `paquet-candidats` et le train lisent la
+    même marque. Elle couvre la tête gelée, jamais une remise (#2496)."""
+    row = item or {}
+    return (str(row.get("reviewer") or "").strip() == work.REVIEWER_NONE
+            or work.REVIEWER_NONE in tuple(row.get("reviewers") or ()))
 
 
 def _waiver(db, item) -> tuple:
@@ -273,8 +312,7 @@ def _waiver(db, item) -> tuple:
     """
     row = item or {}
     lot = row.get("id")
-    waived = (str(row.get("reviewer") or "").strip() == work.REVIEWER_NONE
-              or work.REVIEWER_NONE in tuple(row.get("reviewers") or ()))
+    waived = is_waived(row)
     if waived and lot is not None:
         # Seule une ligne qui *réclame* la dispense peut périmer dans le
         # mauvais sens : relire la base après les jalons ferme la course. Une
@@ -287,8 +325,7 @@ def _waiver(db, item) -> tuple:
             row = dict(row, reviewer="", reviewers=[])
         else:
             row = fresh
-        waived = (str(row.get("reviewer") or "").strip() == work.REVIEWER_NONE
-                  or work.REVIEWER_NONE in tuple(row.get("reviewers") or ()))
+        waived = is_waived(row)
     waived_by = ""
     if waived and lot is not None:
         try:
@@ -309,23 +346,49 @@ def _waiver(db, item) -> tuple:
 
 
 def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
-                item=None) -> dict:
+                item=None, families=None, required=None, family_of=None,
+                authors=None) -> dict:
     """Les avis requis sur la tête gelée `frozen`, et eux seuls (#1374).
 
     Un verdict ne compte que s'il a été rendu **sur cette tête** (le `sha` du
     jalon est résolu, jamais une ref). Parmi ces verdicts, seul le **dernier de
     chaque relecteur** compte : un `ok` plus récent du même relecteur lève son
     blocage, celui d'un autre relecteur ne le masque pas. Un blocage encore en
-    vigueur refuse la porte, quelle que soit la classe.
+    vigueur refuse la porte, quelle que soit la classe. Un blocage posé sur une
+    **tête antérieure** ne compte pas : la nouvelle tête a ses propres avis
+    (canon §2, #2681 ; la règle de levée est celle de la porte).
 
-    Le nombre d'avis dépend de la classe (`required_verdicts`) : 1 pour un lot
-    normal et pour un lot sensible hors SQL/sécurité/prod — un doute de classe
-    reste sensible —, 2 pour un lot sensible qui touche ces domaines. Les avis
-    comptés sont **indépendants** : jamais le travail de l'auteur ; pour une
-    classe sensible, une famille de modèle connue et autre que celle de
-    l'auteur ; pour deux avis, deux familles distinctes. L'indépendance ne se
-    suppose jamais : une famille d'auteur inconnue refuse la porte (canon §2,
-    décision 18855a).
+    Le nombre d'avis dépend de la classe (`required_verdicts`) : le plancher
+    déclaré pour un lot léger (#2642), 1 pour un lot normal et pour un lot
+    sensible hors SQL/sécurité/prod — un doute de classe reste sensible —,
+    2 pour un lot sensible qui touche ces domaines. `required` (#2681) permet
+    à un appelant qui lit une politique versionnée plus stricte (le train) de
+    passer son compte : la porte garde le **maximum** et ne s'affaiblit jamais.
+    Les avis comptés sont **indépendants** : jamais le travail d'un auteur ;
+    pour un lot léger à plancher déclaré et pour une classe sensible, une
+    famille de modèle connue et autre que celle de tout auteur ; pour deux
+    avis, deux familles distinctes. L'indépendance ne se suppose jamais : une
+    famille d'auteur inconnue refuse la porte (canon §2, décision 18855a).
+
+    `authors` (#2681) est l'ensemble des auteurs **reconnus** de la tête, tel
+    que l'appelant l'a lu (`review_authors.authors`) : `{name, family}`. La
+    porte ne compare plus seulement à l'assigné : un coauteur — tiers avec
+    reçu exact, correcteur de relecteur au-delà du seuil du §2 — ne relit ni
+    lui-même ni sa famille. Un petit correctif de relecteur n'est pas un auteur
+    (#2638) et sa famille reste éligible. La famille de l'assigné historique
+    reste celle de la trace du gel (`family_of`) : le reçu d'un autre commit du
+    même nom ne la remplace pas. Sans `authors`, la porte garde son
+    comportement historique : seul l'assigné est connu.
+
+    `family_of` (#2681) est la source historique de famille du train : le même
+    code de porte, mais les familles des reçus/tours à la date des faits au
+    lieu du registre courant. Un appelant qui le fournit ne lit ni le registre
+    ni le canon compilé.
+
+    #2664 : les familles viennent du canon compilé (`families`, sinon lues par
+    `review_lot.compiled_families` au dernier commit audité). Un canon
+    illisible refuse la porte **fermée** avec le canon nommé — une seule
+    synchro ratée ne bloque pas tant qu'un commit audité reste lisible.
 
     #1979 : le pilote peut marquer « verdict non requis » (`work.reviewer
     --no-verdict`, colonne `reviewer = -none`, geste d'autorité journalisé) ;
@@ -336,7 +399,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     n'est jamais levé par la dispense : la correction reste due.
 
     Rend `{ok, why, class, required, accepted, blocked, waived, author,
-    author_family, on_freeze}` ; ne lève jamais.
+    author_family, authors, on_freeze}` ; ne lève jamais.
     """
     from . import lot_class
     klass = klass or {}
@@ -353,11 +416,20 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     author = str(row.get("assignee") or "").strip()
     out = {"ok": False, "why": "", "error": "", "class": cls, "required": 0,
            "accepted": [], "blocked": [], "waived": waived, "waived_by": waived_by,
-           "author": author, "author_family": "", "on_freeze": 0}
+           "author": author, "author_family": "", "authors": [], "on_freeze": 0}
     if not frozen:
         out["why"] = "no freeze to review: the fire names the exact frozen head"
         return out
-    required = required_verdicts(klass)
+    floor = required_verdicts(klass)
+    if required is None:
+        required = floor
+    elif type(required) is not int or required not in (0, 1, 2):
+        out["error"] = "explicit review requirement expected"
+        out["why"] = ("no review verdict ok on the freeze %s (class: %s): an explicit"
+                      " review requirement of 0, 1 or 2 is required, not %r"
+                      % (frozen[:12], cls, required))
+        return out
+    required = max(required, floor)
     out["required"] = required
     on_freeze = [m for m in (marks or ()) if m.get("kind") == "verdict"
                  and _same_sha(m.get("sha"), frozen, repo)]
@@ -383,8 +455,28 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     if required == 0:
         out["ok"] = True
         return out
+    if family_of is None and families is None and db is not None:
+        from . import review_lot
+        try:
+            families = review_lot.compiled_families(db)
+        except review_lot.FamiliesError as exc:
+            # #2664 : canon illisible -> échec fermé, avec le canon nommé. Un
+            # commit audité restant lisible suffit ; seule son absence refuse.
+            out["error"] = str(exc)
+            out["why"] = ("no review verdict ok on the freeze %s (class: %s): the model "
+                          "families cannot be read (%s), so no verdict can be proven "
+                          "independent (canon §2: independence is never assumed)"
+                          % (frozen[:12], cls, exc))
+            return out
+
+    def _family_of(name):
+        if family_of is not None:
+            value = family_of(name)
+            return "" if value is None else str(value)
+        return _actor_family(db, name, families)
+
     try:
-        author_family = actor_family(db, author)
+        author_family = _family_of(author)
     except RegistryReadError as exc:
         # #2521 : le registre est illisible, ce n'est pas « famille inconnue ».
         # La porte refuse toujours (l'indépendance ne se suppose pas) mais le
@@ -396,29 +488,80 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                       % (frozen[:12], cls, exc))
         return out
     out["author_family"] = author_family
+    # #2681 : les auteurs **reconnus** de la tête, quand l'appelant les a lus
+    # (`review_authors.authors`). L'assigné historique passé dans `item` en
+    # fait toujours partie ; un tiers avec reçu exact ou un correcteur au-delà
+    # du seuil du §2 s'y ajoute. Un petit correctif de relecteur n'y est pas
+    # (#2638) : sa famille reste éligible.
+    recognized: dict = {}
+    if author:
+        recognized[author.lower()] = {"name": author, "family": author_family}
+    for entry in authors or ():
+        if isinstance(entry, Mapping):
+            name = str(entry.get("name") or "").strip()
+            family = str(entry.get("family") or "").strip()
+        else:
+            name, family = str(entry or "").strip(), ""
+        if not name:
+            continue
+        key = name.lower()
+        if author and key == author.lower():
+            # La référence (l'assigné historique) est déjà reconnue, avec la
+            # famille de la trace du gel (`family_of`) : le reçu d'un autre
+            # commit du même nom ne prouve pas sa famille au gel.
+            continue
+        if not family:
+            try:
+                family = _family_of(name)
+            except RegistryReadError as exc:
+                out["error"] = str(exc)
+                out["why"] = ("no review verdict ok on the freeze %s (class: %s): the agent "
+                              "registry cannot be read (%s), so the author %s cannot be "
+                              "proven independent (canon §2: independence is never assumed)"
+                              % (frozen[:12], cls, exc, name))
+                return out
+        known = recognized.get(key)
+        if known is None:
+            recognized[key] = {"name": name, "family": family}
+        elif family and not known["family"]:
+            known["family"] = family
+    out["authors"] = sorted(recognized.values(), key=lambda entry: entry["name"].lower())
     # L'indépendance ne se suppose jamais (canon §2, décision 18855a) : une
     # classe sensible — y compris un doute de classe, qui peut cacher SQL, la
-    # sécurité ou la prod — n'accepte que des familles connues et autres que
-    # celle de l'auteur. Famille d'auteur inconnue (agent absent du registre,
-    # harnais non reconnu) : aucun avis ne peut être prouvé indépendant, la
-    # porte refuse et le dit. Un auteur humain n'a pas de famille de modèle :
-    # il n'y a rien à comparer, seules les familles des relecteurs comptent.
-    strict = required >= 2 or cls == lot_class.SENSITIVE
-    author_human = bool(author) and author.lower().startswith(work.HUMAN_PREFIX)
-    if strict and not author_family and not author_human:
+    # sécurité ou la prod — et un lot léger à plancher déclaré (#2642 : le §2
+    # demande « un avis d'une autre famille ») n'acceptent que des familles
+    # connues et autres que celles de **tous** les auteurs. Famille d'auteur
+    # inconnue (agent absent du registre, harnais non reconnu) : aucun avis ne
+    # peut être prouvé indépendant, la porte refuse et le dit. Un auteur humain
+    # n'a pas de famille de modèle : il n'y a rien à comparer, seules les
+    # familles des relecteurs comptent.
+    strict = required >= 2 or cls in (lot_class.LIGHT, lot_class.SENSITIVE)
+    if strict and not recognized:
+        # Aucun auteur connu (assigné absent, ni `authors`) : l'indépendance
+        # ne se suppose pas, comme avant #2681.
         out["why"] = ("no review verdict ok on the freeze %s (class: %s): the author %s has "
                       "no known model family, so no verdict can be proven independent "
                       "(canon §2: independence is never assumed)"
                       % (frozen[:12], cls, author or "(none)"))
         return out
+    if strict:
+        for entry in recognized.values():
+            if entry["family"] or entry["name"].lower().startswith(work.HUMAN_PREFIX):
+                continue
+            out["why"] = ("no review verdict ok on the freeze %s (class: %s): the author %s "
+                          "has no known model family, so no verdict can be proven "
+                          "independent (canon §2: independence is never assumed)"
+                          % (frozen[:12], cls, entry["name"]))
+            return out
+    author_families = {entry["family"] for entry in recognized.values() if entry["family"]}
     accepted = []
     for mark in sorted((m for m in latest.values() if (m.get("verdict") or "") == "ok"),
                        key=_mark_order):
         actor = str(mark.get("actor") or "").strip()
-        if author and actor and actor.lower() == author.lower():
+        if actor and actor.lower() in recognized:
             continue                      # on ne relit pas son propre travail
         try:
-            family = actor_family(db, actor)
+            family = _family_of(actor)
         except RegistryReadError as exc:
             out["error"] = str(exc)
             out["why"] = ("no review verdict ok on the freeze %s (class: %s): the agent "
@@ -429,8 +572,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         if strict:
             if not family:
                 continue                  # famille du relecteur inconnue : non prouvée
-            if family == author_family:
-                continue                  # la famille de l'auteur ne compte pas
+            if family in author_families:
+                continue                  # la famille d'un auteur ne compte pas
         accepted.append({"actor": actor, "family": family, "id": mark.get("id"),
                          "at_ts": mark.get("at_ts")})
     if required >= 2:
@@ -449,7 +592,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         return out
     got = ", ".join("%s (%s)" % (e["actor"] or "?", e["family"] or "famille inconnue")
                     for e in accepted) or "aucun"
-    need = ("two independent verdicts from different model families, neither the author's"
+    need = ("two independent verdicts from different model families, neither from an author's"
             if required >= 2 else
             "one verdict from another family than the author's" if strict
             else "one verdict from another agent")
@@ -609,6 +752,10 @@ def fetch_fresh(repo: str, names, clone=None) -> tuple[dict, str]:
     try:
         if not os.path.isdir(os.path.join(clone.path, ".git")):
             clone.ensure()  # an existing clone is not reset: the radar may use it
+        else:
+            # #2673 : un clone déjà créé sans `ameesh.target` (origin/HEAD figé
+            # sur une release) reçoit sa cible ici, sans être réinitialisé.
+            clone.declare_target()
         wanted = sorted(set(remote.values()))
         listing = resolutions._run(clone.path, "ls-remote", url,
                                    *("refs/heads/" + b for b in wanted), timeout=FETCH_TIMEOUT)
@@ -1393,7 +1540,8 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
             live.append(row)
     if live and replayer is None:
         from . import radar
-        replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name))
+        replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name),
+                                        target=project.target)
     # the radar reads the agents' refs, which may be stale either way, or gone
     # (a checkout recreated): each pass fetches the branch of every queued
     # lot and its target, scanned or not, and those tips decide
@@ -1704,7 +1852,8 @@ def working_clone(cfg, repo: str, project) -> tuple:
     rien ne survit à la commande."""
     from . import radar, resolutions
     if project is not None:
-        return resolutions.Replayer(repo, radar.clone_dir(cfg, project.name)), None
+        return resolutions.Replayer(repo, radar.clone_dir(cfg, project.name),
+                                    target=project.target), None
     scratch = tempfile.mkdtemp(prefix="ameesh-queue-")
     return resolutions.Replayer(repo, os.path.join(scratch, "clone")), scratch
 

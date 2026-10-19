@@ -203,6 +203,23 @@ frontière d'écriture du fournisseur : celle-ci doit encore prouver que le
 commit a été créé dans le tour enregistré et que l'acteur du jalon est celui
 du tour. Aucun appel du runner n'est ajouté.
 
+**#2681 (19/10/2026) — une seule lecture.** `train_history` n'a plus de règle
+d'avis propre : il appelle `merge_queue.review_gate`, le même code que la
+file, le feu et `paquet-candidats`, avec les familles **historiques** lues par
+`review_authors` (reçus exacts, puis journal des tours). Seuls les verdicts de
+la tête gelée comptent : un blocage d'une tête antérieure ne refuse plus, et
+le relecteur qui avait bloqué est notifié au gel suivant. Les auteurs sont lus
+une fois pour le train et la désignation : un commit de relecteur désigné sous
+le seuil du §2 reste une correction ; sans reçu, le committer d'adresse
+d'agent donne la famille de session ; un tiers sans reçu reste inconnu et
+refuse. La porte reçoit cette liste complète d'auteurs : un coauteur (tiers
+avec reçu exact, correcteur au-delà du seuil) ne relit ni lui-même ni sa
+famille, et la famille de l'assigné historique reste celle de la trace du gel.
+Un petit correctif de relecteur n'est pas un auteur : sa famille reste
+éligible (#2638). La dispense `-none` du pilote est lue par
+`merge_queue.is_waived` et couvre le gel effectif
+(`plan_git.freeze_candidate`), jamais une remise.
+
 `train_history.Recorded` prépare la lecture réelle utilisée par les futures
 admissions : plage complète `base..gel` depuis les objets Git fetchés et tous
 les jalons du lot (`milestones(..., None)`, sans limite de page). La génération

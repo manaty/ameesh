@@ -305,9 +305,10 @@ class Profile:
     #: celui de l'environnement de l'exécuteur (L1078). Faux pour un profil
     #: synthétique (« (default) » : hôte sans comptes, session d'avant L30).
     declared: bool = False
-    #: #313 : raison du refus du compte par CE mesh (`account_sharing:
-    #: strict`, identifiant déclaré aussi par un autre mesh de l'hôte, posée
-    #: par `account_claims.mark_refused`) ; vide = pas de refus
+    #: #313/#2580 : raison du refus du compte par CE mesh (`accounts_shared:
+    #: refuse` ou `account_sharing: strict`, identifiant déclaré aussi par un
+    #: autre mesh de l'hôte, posée par `account_claims.mark_refused`) ; vide =
+    #: pas de refus
     refused: str = ""
 
     @property
@@ -593,8 +594,9 @@ def _refuse_shared_homes(harness: str, profiles: list[Profile]) -> None:
 def profiles(cfg, harness: str) -> list[Profile]:
     """Les comptes déclarés pour ce harnais (liste vide : aucun, comportement d'avant L30).
 
-    #313 : avec `account_sharing: strict`, un compte dont l'identifiant est
-    déclaré aussi par un autre mesh de l'hôte porte son refus (`refused`)."""
+    #313/#2580 : avec `accounts_shared: refuse` ou `account_sharing: strict`,
+    un compte dont l'identifiant est déclaré aussi par un autre mesh de
+    l'hôte porte son refus (`refused`)."""
     from . import account_claims
     return account_claims.mark_refused(
         cfg, parse(getattr(cfg, "accounts", None) or {}).get(harness, []))
@@ -1716,18 +1718,33 @@ def identity_of(profile: Profile) -> str | None:
     return hashlib.sha256(os.path.realpath(profile.home()).encode("utf-8")).hexdigest()
 
 
-def _publish_identities(store, host: str, harness: str, items: list[Profile]) -> None:
+def _publish_identities(store, host: str, harness: str, items: list[Profile],
+                        *, cfg=None, environ=None) -> None:
     """#1883 (R3 auditeur, B2) : publie l'empreinte du dossier résolu de chaque
     compte `config_dir` de ce processus.
 
     Écriture NARROW (`account_identities` seulement), faite par TOUT processus
     qui peut placer un tour, choix critique compris : sans elle, deux
     configurations exclusivement critiques ne se voient jamais et le conflit
-    d'identité n'existe pour personne. La simulation (L39) ne publie jamais."""
+    d'identité n'existe pour personne. La simulation (L39) ne publie jamais.
+
+    #2580 : le même point publie aussi la revendication locale de l'hôte
+    (`account_claims`) quand l'appelant fournit `cfg` — identité du mesh lue
+    en base, jamais le DSN ; le registre de l'hôte voit alors un compte
+    déclaré par deux meshes dont les bases sont distinctes. Un registre local
+    illisible ne défait pas la publication en base déjà faite : le placement
+    ne s'arrête pas pour lui."""
     for profile in items:
         empreinte = identity_of(profile)
         if empreinte is not None:
             store.publish_identity(host, harness, profile.name, empreinte)
+    if cfg is None:
+        return
+    from . import account_claims
+    try:
+        account_claims.claim(cfg, store, host, harness, items, environ=environ)
+    except (OSError, ValueError):
+        pass
 
 
 def _conflicts_of(vues: dict, items: list[Profile]) -> set[str]:
@@ -1769,7 +1786,8 @@ VALIDATION_ESSAIS = 3
 
 
 def identity_conflicts(store, host: str, harness: str, items: list[Profile],
-                       now: float, *, publish: bool = True) -> set[str]:
+                       now: float, *, publish: bool = True,
+                       cfg=None) -> set[str]:
     """#1883 (arbitrage pilote, option a) : les comptes dont l'identité est
     contredite par une autre configuration de l'hôte.
 
@@ -1781,9 +1799,10 @@ def identity_conflicts(store, host: str, harness: str, items: list[Profile],
     une preuve saine de l'autre est exactement l'incident de #1883 (le
     « secondaire » de deux profils de pc-smichea, l'un à 47 %, l'autre à
     34 %). `publish=False` (alertes, simulation : aucune écriture partagée) se
-    contente de relire."""
+    contente de relire. `cfg` (#2580) fait publier aussi la revendication
+    locale de l'hôte."""
     if publish:
-        _publish_identities(store, host, harness, items)
+        _publish_identities(store, host, harness, items, cfg=cfg)
     etat = store.placement_state(host, harness, now - IDENTITY_WINDOW_S)
     return _conflicts_of(etat["identities"], items)
 
@@ -1792,7 +1811,7 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
            now: float | None = None, agent: str | None = None, environ=None,
            simulate: bool = False, session_account: str | None = None,
            paced: bool = True, critical: bool = False, margin: bool = False,
-           model: str = "") -> Choice:
+           model: str = "", cfg=None) -> Choice:
     """Choisit le compte du prochain tour (voir l'en-tête du module).
 
     `session_account` : le compte sous lequel tourne la session en cours de
@@ -1808,8 +1827,8 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
 
     `simulate=True` (L39, `ameesh resume`) : le compte que choisirait le
     prochain tour, SANS AUCUNE écriture (ni bascule, ni historique des
-    jauges, ni empreinte d'identité) ; `switched` dit la bascule qui aurait
-    lieu.
+    jauges, ni empreinte d'identité, ni revendication locale #2580) ;
+    `switched` dit la bascule qui aurait lieu.
 
     `paced=False` (garde de budget désactivée, L30) : quand aucun compte
     n'est sous son seuil, le rythme est levé — mais jamais les règles
@@ -1838,6 +1857,13 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     hasard ; l'appelant qui connaît le modèle de l'agent le passe.
     """
     now = time.time() if now is None else now
+    # #2580 : le refus d'un compte partagé avec un autre mesh est appliqué à
+    # TOUT le choix (continuité et forçage compris), avant de lire le compte
+    # actif ; lecture seule. `_publish_identities` publiera ensuite les
+    # revendications de l'hôte, jamais en simulation.
+    if cfg is not None:
+        from . import account_claims
+        items = account_claims.mark_refused(cfg, items, db=db, now=now)
     store = storage.of(db).accounts
     # L242b : un choix critique n'écrit jamais l'état partagé (#324 r1)
     readonly = simulate or critical
@@ -1886,7 +1912,7 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     # le verrou de placement : aucune retenue publiée pendant la lecture des
     # identités n'est manquée. Le point de validation final relit ce même état.
     if not simulate:
-        _publish_identities(store, host, harness, items)
+        _publish_identities(store, host, harness, items, cfg=cfg, environ=environ)
     retenus, conflits = _etat_placement(store, host, harness, items, now)
 
     # #1883 (R2 auditeur, B1) : la décision est une fonction du jeu d'écartés
@@ -2196,7 +2222,12 @@ def report(cfg, db, book, *, now: float | None = None,
     """
     now = time.time() if now is None else now
     from . import account_claims
-    declared = {harness: account_claims.mark_refused(cfg, items, now=now)
+    # #2580 : un compte déclaré aussi par un autre mesh de l'hôte. Lecture
+    # unique, partagée par le refus des profils et la ligne d'affichage.
+    shares = account_claims.shared(cfg, db=db, now=now)
+    by_share = {(item["harness"], item["account"]): item for item in shares}
+    declared = {harness: account_claims.mark_refused(cfg, items, now=now,
+                                                     shares=shares)
                 for harness, items in parse(getattr(cfg, "accounts", None) or {}).items()}
     store = storage.of(db).accounts if db is not None else None
     rows: list[dict] = []
@@ -2230,6 +2261,9 @@ def report(cfg, db, book, *, now: float | None = None,
                 "reason": result.reason,
                 "problems": list(result.problems),
                 "hold_until": hold.get("until_ts"),
+                # #2580 : revendiqué vivant par un autre mesh de l'hôte
+                # ({harness, account, others}) ; None = pas de partage
+                "shared": by_share.get((harness, profile.name)),
                 "hourly_usd": profile.hourly_usd,
                 # #1075/#1028 : le rythme du compte, pour les affichages qui
                 # lisent ses jauges hors d'`evaluate` (cost.report, progress) ;
@@ -2391,4 +2425,11 @@ def format_rows(rows: list[dict]) -> str:
             lines.append("%-9s %-14s %-7s %-8s ↳ held until %s" % (
                 "", "", "", "", time.strftime("%Y-%m-%d %H:%M",
                                               time.localtime(float(row["hold_until"])))))
+        if row.get("shared"):
+            # #2580 : le compte n'est pas seulement à ce mesh ; le refus
+            # éventuel est déjà dans `reason` (profil refusé).
+            from . import account_claims
+            lines.append("%-9s %-14s %-7s %-8s ↳ shared with another mesh of the "
+                         "host: %s" % ("", "", "", "",
+                                      account_claims.describe(row["shared"])))
     return "\n".join(lines)

@@ -173,6 +173,43 @@ class AlerteTest(_Base):
         self.age(4 * HEURE)
         self.assertEqual(self.slo(), [])
 
+    def test_bloquant_fusionne_le_delai_part_de_la_levee(self):
+        # #2551 : #2198/#2498 — un lot assigné depuis 13 h mais retenu par
+        # #2184 ne doit pas escalader au niveau 3 à la seconde où le bloqueur
+        # fusionne : la mesure d'intake part de la fusion.
+        bloqueur = work.add(self.db, title="bloqueur", assignee="human:proprio")
+        work_dependencies.add(self.db, self.lot["id"], bloqueur["id"], actor="test")
+        self.age(13 * HEURE)
+        self.assertEqual(self.slo(), [])
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s",
+                        (bloqueur["id"],))
+        merged = time.time()
+        self.now = merged + 60
+        self.assertEqual(self.slo(), [])
+        self.now = merged + 1.5 * HEURE
+        alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"], a["targets"]) for a in alerts],
+                         [("intake_started", 1, ["assignee"])])
+        self.assertAlmostEqual(alerts[0]["since"], merged, delta=5)
+        self.assertAlmostEqual(alerts[0]["value"], 1800, delta=5)
+
+    def test_bloquant_clos_le_delai_part_de_la_cloture(self):
+        # #2551 : la fermeture d'un prérequis (abandon, remplacement) le rend
+        # non bloquant, comme la fusion : le délai part de sa clôture.
+        bloqueur = work.add(self.db, title="bloqueur", assignee="human:proprio")
+        work_dependencies.add(self.db, self.lot["id"], bloqueur["id"], actor="test")
+        self.age(13 * HEURE)
+        self.assertEqual(self.slo(), [])
+        work.close(self.db, bloqueur["id"], abandoned=True, actor="test")
+        closed = time.time()
+        self.now = closed + 60
+        self.assertEqual(self.slo(), [])
+        self.now = closed + 1.5 * HEURE
+        alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"]) for a in alerts],
+                         [("intake_started", 1)])
+        self.assertAlmostEqual(alerts[0]["since"], closed, delta=5)
+
     def test_etapes_tenues_puis_verdict_recent(self):
         # créé il y a 4 h, démarré 30 min plus tard, verdict ok il y a 5 min :
         # aucune étape en dépassement, seule la fusion reste à faire
@@ -304,6 +341,38 @@ class PaquetTest(_Base):
         self.assertIn("packet merge", work_dependencies.wait_label(info["planned_wait"]))
         self.assertIsNone(info["stale"])
 
+    def test_porteur_sans_liste_lie_par_les_trailers(self):
+        # #2599 : le corps des porteurs h-2300/h-0100 n'a pas la liste
+        # « #N <tête> » ; les trailers des commits de composition lient
+        # l'unité au paquet, et le SLO est tu.
+        self.qa_at(self.GO)
+        carrier = self.packet(body="aucune liste d'unités dans ce corps")
+        with mock.patch.object(planned_waits, "packet_attachments",
+                               return_value={carrier["id"]: {self.lot["id"]}}):
+            self.now = self.GO + 75 * 60
+            self.assertEqual(self.slo(), [])
+            rows = storage.of(self.db).operations.open_lots_activity(None)
+            described = stagnation.describe(self.db, rows, now=self.now, open_items=rows)
+        info = described[self.lot["id"]]
+        self.assertEqual((info["planned_wait"] or {}).get("what"), "packet")
+        self.assertIn("packet merge", info["waiting"]["label"])
+        self.assertIsNone(info["stale"])
+
+    def test_lot_exclu_en_prose_reste_signale_meme_avec_trailers(self):
+        # #2599 : un lot cité en prose n'est pas attaché ; même quand la
+        # lecture des trailers rend d'autres unités, son alerte reste due.
+        self.qa_at(self.GO)
+        exclu = work.add(self.db, title="exclu du paquet", assignee="dev1")
+        self.qa_at(self.GO, lot=exclu)
+        carrier = self.packet(body="paquet ; #%d exclu (verdict manquant)"
+                              % exclu["id"])
+        with mock.patch.object(planned_waits, "packet_attachments",
+                               return_value={carrier["id"]: {self.lot["id"]}}):
+            self.now = self.GO + 125 * 60
+            alerts = self.slo()
+        self.assertEqual([a["lot"] for a in alerts], [exclu["id"]], alerts)
+        self.assertEqual(alerts[0]["step"], "verdict_merge")
+
     def test_lot_exclu_en_prose_reste_signale(self):
         # B1 (relecture dev7) : un lot seulement cité (« exclu », « garder »)
         # n'est pas transporté ; son alerte ne doit pas être tue par le
@@ -427,6 +496,38 @@ class AttentePorteurTest(_Base):
             self.assertIn("merge vehicle/package", text)
             self.assertIn("push the pilot/composer", text)
             self.assertNotIn("reassign it now", text)
+
+    def test_fusion_canon_vise_le_bureau(self):
+        """#2511 : une branche `canon/…` cible manaty/home, qu'un paquet ameesh
+        ne porte pas ; l'alerte va au bureau qui fusionne, pas au pilote."""
+        self.qa(verdict_s=50 * 60)
+        work.set_branch(self.db, self.lot["id"], "canon/2511-test")
+        alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"], a["targets"]) for a in alerts],
+                         [("verdict_merge", 1, ["bureau"])])
+        alert = alerts[0]
+        self.assertEqual((alert["waiting"] or {}).get("what"), "merge")
+        self.assertTrue((alert["waiting"] or {}).get("canon"))
+        out = self.briefs(alert)
+        self.assertEqual(sorted(out), ["bureau"])
+        self.assertIn("merge it directly", out["bureau"])
+        self.assertIn("manaty/home", out["bureau"])
+        self.assertNotIn("push the pilot/composer", out["bureau"])
+        self.assertNotIn("include it in the next package", out["bureau"])
+
+    def test_fusion_canon_niveau_3_bureau_et_auditeur(self):
+        """#2511 : au triple, le bureau fusionne (l'auditeur veille) ; le
+        composeur de paquets ameesh n'est plus nommé."""
+        self.qa(verdict_s=100 * 60)
+        work.set_branch(self.db, self.lot["id"], "canon/2511-test")
+        alerts = self.slo()
+        self.assertEqual([(a["level"], a["targets"]) for a in alerts],
+                         [(3, ["bureau", "auditeur"])])
+        out = self.briefs(alerts[0])
+        self.assertEqual(sorted(out), ["auditeur", "bureau"])
+        for text in out.values():
+            self.assertIn("merge it directly", text)
+            self.assertNotIn("push the pilot/composer", text)
 
     def test_lot_bloque_vise_le_pilote(self):
         self.qa(verdict_s=50 * 60)

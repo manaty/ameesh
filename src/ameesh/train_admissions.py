@@ -61,13 +61,17 @@ class Requirement:
     #: paths need two distinct families) instead of trusting the count alone.
     files: tuple = ()
 
+    def klass(self) -> dict:
+        """La classe et les chemins classés, lus par la porte des avis (#2681)."""
+        return {"class": self.risk, "files": list(self.files)}
+
     def check(self, row, base):
         if (self.lot, self.base, self.head) != (row["work_item_id"], base, row["frozen_sha"]):
             raise TrainError("review policy covers another lot, base or frozen head")
         if not isinstance(self.policy_commit, str) or not SHA.fullmatch(self.policy_commit):
             raise TrainError("versioned review policy required")
         if type(self.reviews) is not int or self.risk not in _RISKS \
-                or self.reviews not in ({0} if self.risk == "light" else {1, 2}):
+                or self.reviews not in ({0, 1, 2} if self.risk == "light" else {1, 2}):
             raise TrainError("explicit known non-release review requirement expected")
         files = _classified(self.files)
         worst = max((entry["class"] for entry in files), key=review.RANK.__getitem__)
@@ -144,7 +148,8 @@ class Admissions:
         if not isinstance(requirement, Requirement):
             raise TrainError("trusted policy returned no structured review requirement")
         requirement.check(row, base)
-        historical = self.history.qualify(row, base, required=requirement.reviews)
+        historical = self.history.qualify(row, base, required=requirement.reviews,
+                                          klass=requirement.klass())
         proof = dict(admission=identity(row), policy=asdict(requirement), history=historical)
         if mode == "targeted":
             ci = self.targeted_ci(row) if self.targeted_ci is not None else None

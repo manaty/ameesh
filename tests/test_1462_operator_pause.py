@@ -402,11 +402,12 @@ class PauseTest(PgTestCase):
         self.assertIn("refused (not_after)", out.stderr)
         self.assertFalse(registry.get(self.db, "worker")["operator_paused"])
         self.assertEqual(self.events(), [])
-        # En texte, le refus remplace le compte rendu habituel.
+        # En texte, le refus remplace le compte rendu habituel et rend un
+        # code non nul (#2498).
         out = self.mesh("pause", "worker", "--human", "human:alice",
                         "--reason", "maintenance", "--not-after",
                         str(time.time() - 1))
-        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
         self.assertEqual(out.stdout.strip(), "")
         self.assertIn("refused (not_after)", out.stderr)
 

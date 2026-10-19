@@ -43,8 +43,9 @@ class TrainRuntimeTest(PgTestCase):
         self.fires = train_fire.Fires(None, self.ledger)
         self.repository = mock.Mock(project=self.project, source="github.com/o/r")
         self.repository.target.side_effect = lambda target: self.memory.target()
-        self.repository.compose.side_effect = lambda target, base, rows, nonce: self.memory.compose(
-            base, rows, nonce)
+        self.repository.main_sync.return_value = None
+        self.repository.compose.side_effect = lambda target, base, rows, nonce, sync=None: \
+            self.memory.compose(base, rows, nonce, sync=sync)
         self.repository.publish.side_effect = lambda plan, **kw: self.memory.effects.append(
             ("publish", plan["head"]))
         self.repository.promote.side_effect = lambda plan, **kw: self.memory.promote(plan, {}, kw["epoch"])
@@ -114,13 +115,48 @@ class TrainRuntimeTest(PgTestCase):
         self.assertEqual(self.repository.publish.call_args.kwargs["workflows"], self.ci.workflows)
         self.repository.promote.assert_called_once()
 
+    def test_prevalidation_runs_before_publication(self):
+        # #2644 : le port est appelé avant tout effet distant, donc avant le
+        # bail et la publication ; une indisponibilité est décidée par le port.
+        seen = []
+
+        def port(head, base):
+            seen.append((head, base, self.repository.publish.called))
+
+        self.runtime = self.runtime_for(prevalidation=port)
+        self.engine = self.engine_for(self.runtime)
+        plan, _fire = self.ready()
+        outcome = self.engine.step(3602)
+        self.assertEqual(outcome["result"], "landed", outcome)
+        self.assertEqual(seen, [(plan["head"], plan["base"], False)])
+        self.repository.publish.assert_called_once()
+
+    def test_prevalidation_red_prevents_publication(self):
+        # B1 dev1 : un rouge exécuté est un résultat, pas une publication
+        # incertaine ; le paquet est arrêté (paused, terminal) et la
+        # réservation rendue, sans rejouer la composition.
+        def port(head, base):
+            raise train.PrevalidationRed("run-red: tests.test_x")
+
+        self.runtime = self.runtime_for(prevalidation=port)
+        self.engine = self.engine_for(self.runtime)
+        outcome = self.engine.step(3600)
+        self.assertEqual(outcome["result"], "paused", outcome)
+        self.assertIn("tests.test_x", outcome.get("error") or "")
+        self.repository.publish.assert_not_called()
+        self.ci.start.assert_not_called()
+        state = self.ledger.load()
+        self.assertEqual(state["phase"], "paused")
+        self.assertEqual(state["diagnosis"],
+                         {"stage": "prevalidation", "why": "run-red: tests.test_x"})
+
     def test_migration_mapping_is_persisted_and_recorded_after_promotion(self):
         # #2400: composition reserves and the runtime records the landed
         # number only after a confirmed promotion, then frees it.
         compose = self.memory.compose
         mapping = [dict(work_item_id=1, reserved=525, landed=517, files=[])]
-        self.memory.compose = lambda base, rows, nonce: dict(
-            compose(base, rows, nonce), migrations=mapping)
+        self.memory.compose = lambda base, rows, nonce, sync=None: dict(
+            compose(base, rows, nonce, sync=sync), migrations=mapping)
         allocator = mock.Mock()
         allocator.landed.return_value = []
         self.engine = self.engine_for(self.runtime_for(migrations=allocator))
@@ -137,8 +173,8 @@ class TrainRuntimeTest(PgTestCase):
     def test_migration_landing_record_failure_never_revokes_the_merge(self):
         compose = self.memory.compose
         mapping = [dict(work_item_id=1, reserved=525, landed=517, files=[])]
-        self.memory.compose = lambda base, rows, nonce: dict(
-            compose(base, rows, nonce), migrations=mapping)
+        self.memory.compose = lambda base, rows, nonce, sync=None: dict(
+            compose(base, rows, nonce, sync=sync), migrations=mapping)
         allocator = mock.Mock()
         allocator.landed.return_value = ["record unavailable"]
         self.engine = self.engine_for(self.runtime_for(migrations=allocator))

@@ -1348,7 +1348,8 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
                              critical=_critical(cfg, row),
                              # #1580 (tranche 3) : le compte simulé pour cet
                              # agent tient compte de son modèle
-                             model=row.get("model") or book.model_of(row["name"]))
+                             model=row.get("model") or book.model_of(row["name"]),
+                             cfg=cfg)
     nxt = choice.profile or choice.active or items[0]
     if choice.profile is None:
         out["warnings"].append("all %s accounts are at their threshold (%s): the agent will "

@@ -269,6 +269,16 @@ LOT_WAKE_PROMPT = (
     "again; once it is ready for review, move it to qa."
 )
 
+#: #2466 : réveil programmé (séance owner, relecture planifiée, échéance de
+#: reprise d'un hold) — un rendez-vous explicite, même sur un lot tenu
+SCHEDULED_WAKE_PROMPT = (
+    "Scheduled wake for lot #%(id)d \"%(title)s\" (%(state)s): the deadline "
+    "recorded for %(when)s is due. This is an explicit appointment (an owner "
+    "session, a planned slot or the resume time of a hold): open it now. If it "
+    "cannot advance, record a new hold and its next deadline with: ameesh work "
+    "note %(id)d \"hold: <reason>\" --wake-at <ISO time with timezone>."
+)
+
 #: anciens dossiers de binaires acceptés en repli (renommage agent-mesh → ameesh)
 BIN_DIR_ENV = ("AMEESH_BIN_DIR", "AGENT_MESH_BIN_DIR")
 

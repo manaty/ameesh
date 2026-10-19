@@ -38,7 +38,12 @@ class Database:
         if 'clock_timestamp' in sql:
             return [{'now': self.now}]
         if 'agent_registry' in sql:
-            return [dict(self.registry)] if self.registry is not None else []
+            if self.registry is None:
+                return []
+            # Model the projection: a column the module forgets to SELECT is
+            # absent from the row, exactly like a real cursor description.
+            columns = sql.split('FROM', 1)[0].split('SELECT', 1)[1]
+            return [{name.strip(): self.registry.get(name.strip()) for name in columns.split(',')}]
         if 'count(*) AS running' in sql:
             return [{'running': self.running}]
         if 'turn_resources' in sql:
@@ -109,6 +114,16 @@ class HealthTurnTest(unittest.TestCase):
         # increments `turns` and closes its resource; the outcome is evidence.
         self.backend = Backend(self.db, outcome='blocked',
                                error='auth_failure: account not authenticated')
+        self.turn = pilot.HealthTurn(self.db, enrollment=self.enrollment, host='fixture-host',
+                                     system=self.backend)
+        self.assertFalse(self.call())
+        self.assertEqual(len(self.backend.calls), 1)
+
+    def test_a_recorded_turn_error_is_refused_even_when_the_status_is_idle(self):
+        # B3 : l'erreur enregistrée est lue dans le registre ; un tour clos
+        # `idle` mais marqué en erreur n'est pas une preuve de santé.
+        self.backend = Backend(self.db, outcome='idle',
+                               error='probe: authentication failed')
         self.turn = pilot.HealthTurn(self.db, enrollment=self.enrollment, host='fixture-host',
                                      system=self.backend)
         self.assertFalse(self.call())

@@ -1346,6 +1346,18 @@ def is_unavailable(exc: BaseException) -> bool:
     return isinstance(exc, Unavailable)
 
 
+def in_transaction(db) -> bool:
+    """`db` porte-t-il une transaction ouverte ?
+
+    Pilote psql : `db` EST la transaction (`_PsqlTransaction`) une fois entré
+    dans le bloc ; psycopg : le pilote lui-même porte sa profondeur
+    (`_tx_depth`). Sert aux écrivains qui ne doivent pas rejouer une erreur en
+    transaction appelante : sous psql l'erreur a fermé la session, et la
+    reprise rouvrirait une transaction neuve, hors du bloc atomique de
+    l'appelant (#879)."""
+    return isinstance(db, _PsqlTransaction) or getattr(db, "_tx_depth", 0) > 0
+
+
 def explain(exc: BaseException, limit: int = 160) -> str:
     """Cause lisible d'une erreur de base, sur une ligne, pour un statut ou un
     journal (L72). Un délai de connexion dépassé n'est pas un problème de
@@ -1695,6 +1707,15 @@ class _Replay:
         if self._owns:
             self._db.close()
         # sinon la connexion appartient à l'appelant de `batched`
+
+
+def is_dry_pass(db) -> bool:
+    """La connexion est-elle une passe à blanc de `batched` ?
+
+    Une passe à blanc n'envoie aucune requête : un appelant qui lit autre
+    chose que la base (une sonde réseau, #2582) doit attendre la vraie passe,
+    sinon la sonde est refaite à chaque niveau de préchargement."""
+    return isinstance(db, _Recorder)
 
 
 def batched(db, fn, *, levels: int = 4):

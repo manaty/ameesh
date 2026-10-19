@@ -446,7 +446,13 @@ def _decided(notes, reviewed: str, frozen: str) -> bool:
 def _clone(cfg, row: dict, repo: str):
     from . import radar, resolutions
     name = str(row.get("app") or "").strip() or os.path.basename(repo.rstrip("/"))
-    return resolutions.Replayer(repo, radar.clone_dir(cfg, name))
+    project = None
+    try:
+        project = radar.settings_of(cfg).projects.get(name)
+    except Exception:  # noqa: BLE001 - réglages radar illisibles : cible par défaut
+        project = None
+    return resolutions.Replayer(repo, radar.clone_dir(cfg, name),
+                                target=getattr(project, "target", "") or "")
 
 
 def _passive(db, to, lot: int, text: str, data: dict) -> None:

@@ -10,6 +10,7 @@ from unittest import mock
 
 from ameesh import migration_reservations as reservations, migrations, storage, work
 from ameesh.db import DbError
+from ameesh.storage.postgres import work as pg_work
 
 from .support import PgTestCase
 from .test_l122_numeros_de_migration import _commit, _depot, _git, NEXLINK
@@ -20,6 +21,10 @@ class ScopedReservationsTest(PgTestCase):
         super().setUp()
         self.repo = _depot(os.path.join(self.tmp, 'repo'), 'manaty/nexlink', NEXLINK.directory,
                            ['375_base.sql', '376_base.sql'], {'unrelated': ['9000_future.sql']})
+        # #2620 : le numéro exact lit la cible du lot ; ce dépôt n'a que
+        # `develop` (pas d'`origin/HEAD`), la cible est déclarée comme sur un
+        # clone réel de nexlink.
+        _git(self.repo, 'config', 'ameesh.target', 'develop')
         self.sha = reservations._git(self.repo, 'rev-parse', 'HEAD')
         self.a = self.lot('a')
         self.b = self.lot('b')
@@ -44,6 +49,11 @@ class ScopedReservationsTest(PgTestCase):
         self.sha = reservations._git(self.repo, 'rev-parse', 'HEAD')
         return self.sha
 
+    def move(self, item_id, state):
+        return storage.of(self.db).work.move(
+            item_id, state, current=work.get(self.db, item_id)['state'], loops=0,
+            note='move to %s' % state, actor='dev')
+
     def test_target_only_floor_multi_slot_json_and_idempotence(self):
         first = self.reserve(slots=('schema', 'backfill'))
         self.assertEqual([row['number'] for row in first], [377, 378])
@@ -62,10 +72,13 @@ class ScopedReservationsTest(PgTestCase):
         self.assertEqual(self.reserve(self.b, target_branch='refs/heads/develop')[0]['number'], 378)
         _git(self.repo, 'checkout', '-qb', 'release')
         self.assertEqual(self.reserve(self.b, slots=('release',), target_branch='release')[0]['number'], 377)
+        # #879 : un clone par un autre port du même dépôt reste le même espace
+        # d'allocation que la projection legacy (`github.com/<slug>`) : sans
+        # cela, le même numéro se réserve deux fois.
         _git(self.repo, 'remote', 'set-url', 'origin', 'ssh://git@github.com:2222/MANATY/NEXLINK.git')
         port = self.reserve(self.lot('port'))[0]
-        self.assertEqual(port['target']['repo'], 'github.com:2222/manaty/nexlink')
-        self.assertEqual(port['number'], 377)
+        self.assertEqual(port['target']['repo'], 'github.com/manaty/nexlink')
+        self.assertEqual(port['number'], 379)
 
     def test_legacy_reservations_and_new_slots_use_one_allocator(self):
         work.set_branch(self.db, self.b['id'], 'agent/b', target='origin/develop', actor='dev')
@@ -107,8 +120,10 @@ class ScopedReservationsTest(PgTestCase):
     def test_unique_index_blocks_legacy_explicit_collision(self):
         work.set_branch(self.db, self.b['id'], 'agent/b', target='develop', actor='dev')
         self.reserve()
-        with self.assertRaises(DbError):
+        # #2481 : la collision est rendue lisible, avec le lot tenant.
+        with self.assertRaises(work.WorkError) as refused:
             work.reserve_migration(self.db, self.b['id'], 377, repo=self.repo)
+        self.assertIn("lot #%d" % self.a['id'], str(refused.exception))
         self.assertIsNone(work.get(self.db, self.b['id'])['migration'])
 
     def test_target_advance_releases_other_lots_and_requalifies_slots(self):
@@ -228,8 +243,11 @@ class ScopedReservationsTest(PgTestCase):
     def test_unknown_legacy_target_cannot_take_named_number(self):
         self.reserve()
         legacy = self.lot('legacy without project', None)
-        with self.assertRaises(DbError):
+        # #2481 : la collision de créneau est maintenant rendue lisible par
+        # `work.reserve_migration` (lot tenant nommé), comme l'index scalaire.
+        with self.assertRaises(work.WorkError) as refused_by_name:
             work.reserve_migration(self.db, legacy['id'], 377, repo=self.repo)
+        self.assertIn("lot #%d" % self.a['id'], str(refused_by_name.exception))
         self.assertIsNone(work.get(self.db, legacy['id'])['migration'])
         # A pre-0419 client writes the old projection without a repo lock.
         # The compatibility guard still refuses the duplicate atomically.
@@ -446,6 +464,186 @@ class ScopedReservationsTest(PgTestCase):
         self.assertEqual(work.get(self.db, self.a['id'])['state'], self.a['state'])
         self.assertEqual(reservations.listing(self.db, self.a['id']), before)
         self.assertEqual(work.events(self.db, self.a['id']), events)
+
+    def test_writer_deadlock_victim_replays_in_repository_order(self):
+        """#879 : la victime 40P01 rejoue, dans l'ordre dépôt -> ligne du lot."""
+        real = pg_work._lock_migration_writer
+        attempts = []
+
+        def flaky(tx, item_id, proposed=None):
+            attempts.append(int(item_id))
+            if len(attempts) == 1:
+                raise DbError('deadlock detected', sqlstate='40P01')
+            return real(tx, item_id, proposed)
+
+        with mock.patch.object(pg_work, '_lock_migration_writer', side_effect=flaky):
+            moved = storage.of(self.db).work.move(
+                self.a['id'], 'build', current=self.a['state'], loops=0, note='move', actor='dev')
+        self.assertEqual(attempts, [self.a['id'], self.a['id']])
+        self.assertEqual(moved['state'], 'build')
+        self.assertEqual(work.get(self.db, self.a['id'])['state'], 'build')
+
+    def test_writer_deadlock_replays_are_bounded(self):
+        """#879 : au-delà des essais bornés, la DbError remonte telle quelle."""
+        attempts = []
+
+        def always(tx, item_id, proposed=None):
+            attempts.append(int(item_id))
+            raise DbError('deadlock detected', sqlstate='40P01')
+
+        with mock.patch.object(pg_work, '_lock_migration_writer', side_effect=always):
+            with self.assertRaises(DbError) as raised:
+                storage.of(self.db).work.close(
+                    self.a['id'], current=self.a['state'], reason='abandoned',
+                    superseded_by=None, note='close', actor='dev')
+        self.assertEqual(raised.exception.sqlstate, '40P01')
+        self.assertEqual(len(attempts), pg_work._DEADLOCK_ATTEMPTS)
+        self.assertEqual(work.get(self.db, self.a['id'])['state'], self.a['state'])
+
+    def test_writer_error_that_is_not_a_deadlock_is_not_replayed(self):
+        """#879 : seul 40P01 rejoue ; une autre DbError ne consomme aucun essai."""
+        attempts = []
+
+        def other(tx, item_id, proposed=None):
+            attempts.append(int(item_id))
+            raise DbError('lot migration repository changed; retry')
+
+        with mock.patch.object(pg_work, '_lock_migration_writer', side_effect=other):
+            with self.assertRaises(DbError):
+                storage.of(self.db).work.move(
+                    self.a['id'], 'build', current=self.a['state'], loops=0, note='move', actor='dev')
+        self.assertEqual(len(attempts), 1)
+
+    def test_import_does_not_replay_a_deadlock_in_the_caller_transaction(self):
+        """#879 B2 : une transaction appelante ne rejoue pas la victime 40P01.
+
+        `import_reservations` tient sa transaction sur plusieurs lignes ; sous
+        psql l'erreur a fermé la session et la reprise rouvrirait une
+        transaction neuve — l'import ne serait plus atomique (des numéros
+        réservés, d'autres non). Témoin multi-lignes, joué psql et psycopg.
+        """
+        rows = [{'number': number, 'label': 'legacy', 'who': 'dev', 'status': 'reserved'}
+                for number in (400, 401)]
+        mapping = {'400': self.a['id'], '401': self.b['id']}
+        real = pg_work._lock_migration_writer
+        attempts = []
+
+        def flaky(tx, item_id, proposed=None):
+            attempts.append(int(item_id))
+            if len(attempts) == 1:
+                raise DbError('deadlock detected', sqlstate='40P01')
+            return real(tx, item_id, proposed)
+
+        with mock.patch.object(pg_work, '_lock_migration_writer', side_effect=flaky):
+            with self.assertRaises(DbError) as raised:
+                reservations.import_reservations(
+                    self.db, rows, mapping, repo='manaty/nexlink', apply=True, actor='dev')
+        self.assertEqual(raised.exception.sqlstate, '40P01')
+        self.assertEqual(attempts, [self.a['id']])          # la victime ne rejoue pas
+        # rien n'est écrit : la transaction appelante est annulée en entier
+        self.assertEqual(reservations.listing(self.db, self.a['id']), [])
+        self.assertEqual(reservations.listing(self.db, self.b['id']), [])
+        self.assertEqual(work.get(self.db, self.a['id'])['migration'], None)
+        self.assertEqual(work.get(self.db, self.b['id'])['migration'], None)
+
+    def test_merged_to_blocked_does_not_resurrect_a_landed_slot(self):
+        """#879 : `merged -> blocked` ne rouvre pas un numéro déjà atterri.
+
+        Le trigger de projection repasserait le slot `default` de `landed` à
+        `reserved` ; quand un autre lot a réservé ce numéro entre-temps, la
+        transition échouait sur l'index partiel (ou la garde) avec un 23505
+        brut."""
+        work.set_branch(self.db, self.a['id'], 'agent/a', target='develop', actor='dev')
+        work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo, actor='dev')
+        # Ligne atterrie avant #956, ou écrite par un client pré-0419 : l'état
+        # passe à `merged` sans libérer `work_items.migration` dans la même
+        # écriture. C'est cette projection-là que `merged -> blocked` rejoue.
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s",
+                        (self.a['id'],))
+        self.assertEqual(work.get(self.db, self.a['id'])['migration'], 400)
+        self.assertEqual(reservations.listing(self.db, self.a['id'])[0]['status'], 'landed')
+        # 400 n'est pas encore dans l'arbre : un autre lot peut le réserver.
+        self.advance(*['%d_x.sql' % number for number in range(377, 400)])
+        taken = self.reserve(self.b)[0]
+        self.assertEqual(taken['number'], 400)
+        self.move(self.a['id'], 'blocked')
+        default = reservations.listing(self.db, self.a['id'])[0]
+        self.assertEqual(work.get(self.db, self.a['id'])['state'], 'blocked')
+        self.assertEqual((default['slot'], default['number'], default['status']),
+                         ('default', 400, 'landed'))
+        # Le numéro suivant reste projeté en `reserved` : la garde ne fige pas
+        # la projection, elle empêche seulement de rouvrir un numéro consommé.
+        # #2481 : le lot garde sa réservation principale `default` (400,
+        # landed) et le nouveau numéro est AJOUTÉ comme créneau `legacy-401`.
+        work.reserve_migration(self.db, self.a['id'], 401, repo=self.repo, actor='dev')
+        renewed = [row for row in reservations.listing(self.db, self.a['id'])
+                   if row['number'] == 401]
+        self.assertEqual([(row['slot'], row['status']) for row in renewed],
+                         [('legacy-401', 'reserved')])
+
+    def test_merged_to_closed_does_not_release_a_landed_slot(self):
+        """#879 N (#2658) : `merged -> closed` ne libère pas un numéro atterri.
+
+        Le trigger de projection rejoué avec `work_items.migration` encore
+        posé donnait `released` au créneau `default` (état `closed`) et
+        effaçait la trace d'atterrissage ; la garde de 0432 ne couvrait que
+        `reserved`. Le numéro consommé doit le rester, sans 23505 même quand
+        un autre lot a réservé ce numéro entre-temps (comme après un retour
+        `merged -> blocked`)."""
+        work.set_branch(self.db, self.a['id'], 'agent/a', target='develop', actor='dev')
+        work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo, actor='dev')
+        # Ligne atterrie avant #956, ou écrite par un client pré-0419 : l'état
+        # passe à `merged` sans libérer `work_items.migration`.
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s",
+                        (self.a['id'],))
+        self.assertEqual(reservations.listing(self.db, self.a['id'])[0]['status'], 'landed')
+        # 400 n'est pas encore dans l'arbre : un autre lot peut le réserver.
+        self.advance(*['%d_x.sql' % number for number in range(377, 400)])
+        taken = self.reserve(self.b)[0]
+        self.assertEqual(taken['number'], 400)
+        self.db.execute("UPDATE work_items SET state = 'closed', close_reason = 'delivered'"
+                        " WHERE id = %s", (self.a['id'],))
+        default = reservations.listing(self.db, self.a['id'])[0]
+        self.assertEqual((default['slot'], default['number'], default['status']),
+                         ('default', 400, 'landed'))
+
+    def test_landing_projection_and_null_in_one_statement_lands(self):
+        """#1022, copie #879 : la fusion qui remet la projection à NULL lande.
+
+        C'est la règle que 0420 et 0432 portent chacune en entier : un client
+        peut écrire l'état et la projection en une seule instruction."""
+        work.set_branch(self.db, self.a['id'], 'agent/a', target='develop', actor='dev')
+        work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo, actor='dev')
+        self.db.execute("UPDATE work_items SET state = 'merged', migration = NULL,"
+                        " migration_repo = NULL WHERE id = %s", (self.a['id'],))
+        self.assertEqual(reservations.listing(self.db, self.a['id'])[0]['status'], 'landed')
+
+    def test_landing_then_null_in_one_transaction_lands(self):
+        """#1022 : deux instructions dans une transaction — la dernière
+        écriture voit l'état `merged` et lande le créneau."""
+        work.set_branch(self.db, self.a['id'], 'agent/a', target='develop', actor='dev')
+        work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo, actor='dev')
+        with self.db.transaction() as tx:
+            tx.execute("UPDATE work_items SET state = 'merged' WHERE id = %s", (self.a['id'],))
+            tx.execute("UPDATE work_items SET migration = NULL, migration_repo = NULL"
+                       " WHERE id = %s", (self.a['id'],))
+        self.assertEqual(reservations.listing(self.db, self.a['id'])[0]['status'], 'landed')
+
+    def test_release_without_landing_stays_released(self):
+        """#1022 : une libération sans atterrissage reste `released`."""
+        work.set_branch(self.db, self.a['id'], 'agent/a', target='develop', actor='dev')
+        work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo, actor='dev')
+        self.db.execute("UPDATE work_items SET migration = NULL, migration_repo = NULL"
+                        " WHERE id = %s", (self.a['id'],))
+        self.assertEqual(reservations.listing(self.db, self.a['id'])[0]['status'], 'released')
+
+    def test_closed_without_landing_stays_released(self):
+        """#1022 : un lot clos sans atterrissage libère sans lander."""
+        work.set_branch(self.db, self.a['id'], 'agent/a', target='develop', actor='dev')
+        work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo, actor='dev')
+        self.db.execute("UPDATE work_items SET state = 'closed', close_reason = 'abandoned',"
+                        " migration = NULL, migration_repo = NULL WHERE id = %s", (self.a['id'],))
+        self.assertEqual(reservations.listing(self.db, self.a['id'])[0]['status'], 'released')
 
     def test_cli_json_list_and_legacy_output_compatible(self):
         args = ('work', 'migration', str(self.a['id']))

@@ -216,6 +216,115 @@ def packet_carriers(rows):
     return out
 
 
+#: #2599 : commits lus au plus sur la branche d'un porteur (borne de coût)
+MAX_PACKET_COMMITS = 500
+
+
+def _dry_pass(db) -> bool:
+    """La connexion est-elle une passe à blanc de `db.batched` ?
+
+    Une passe à blanc n'envoie aucune requête : la lecture des trailers
+    (git) attend la vraie passe, sinon elle est refaite à chaque niveau de
+    préchargement (#2599). La classe `_Recorder` de `db.batched` est la seule
+    marque d'une passe à blanc."""
+    from . import db as db_mod
+
+    return isinstance(db, db_mod._Recorder)
+
+
+def _carrier_ref(repo, carrier):
+    """La ref lisible de la branche du porteur, sans fetch.
+
+    La branche publiée d'abord, puis la branche locale, puis la tête observée
+    (`branch_head`) : un clone qui n'a pas la branche peut quand même avoir
+    le commit du dernier relevé. Aucune ref : None."""
+    from . import plan_git
+
+    branch = str(carrier.get("branch") or "").strip()
+    refs = []
+    if branch:
+        refs += [plan_git.published_target(repo, branch), branch,
+                 "refs/remotes/origin/" + branch, "refs/heads/" + branch]
+    head = str(carrier.get("branch_head") or "").strip()
+    if head:
+        refs.append(head)
+    for ref in refs:
+        if plan_git._commit(repo, ref):
+            return ref
+    return None
+
+
+def packet_trailers(repo, carrier, target=None):
+    """#2599 : les lots liés par les trailers `ameesh-work:` de la branche.
+
+    Le corps du lot porteur peut manquer la liste « #N <tête> » (paquets
+    h-2300 et h-0100) ; les commits de composition `vehicule …` portent, eux,
+    leur `ameesh-work: <lot>`. On ne lit que les commits **au-dessus de la
+    cible** (`<merge-base>..<branche>`) : les trailers hérités de `main` ne
+    désignent pas les unités de ce paquet. Rend un ensemble, ou None quand la
+    branche n'est pas lisible — un doute ne tait aucune alerte."""
+    from . import plan_git
+
+    ref = _carrier_ref(repo, carrier)
+    if ref is None:
+        return None
+    rev = ref
+    if target:
+        target = plan_git.published_target(repo, target)
+        base = plan_git._out(repo, "merge-base", ref, target)
+        if not base:
+            return None
+        rev = "%s..%s" % (base, ref)
+    text = plan_git._out(repo, "log", "--max-count=%d" % MAX_PACKET_COMMITS,
+                         "--format=%B%x00", rev)
+    if text is None:
+        return None
+    found: set[int] = set()
+    for message in text.split("\x00"):
+        found.update(plan_git.cited_lots(message))
+    return found
+
+
+def packet_attachments(cfg, open_items, rows=()):
+    """#2599 : `{porteur: lots}` lus dans les trailers de sa branche.
+
+    `cfg` est la configuration de l'hôte qui lit : le dépôt vient de
+    `radar.projects.<app>.repo` (`lot_class.repository`). Le census est
+    `open_items` plus `rows` (même univers que `packet_waits`). Sans dépôt,
+    sans cible ou sans branche lisible, le porteur n'a pas d'attachement — sa
+    liste de corps reste la seule preuve, et aucune alerte n'est tue par un
+    doute (le sens sûr)."""
+    from . import lot_class, plan_git
+
+    if cfg is None:
+        return {}
+    universe: dict[int, dict] = {}
+    for row in open_items or ():
+        universe[int(row["id"])] = row
+    for row in rows or ():
+        universe.setdefault(int(row["id"]), row)
+    carriers = packet_carriers(universe.values())
+    if not carriers:
+        return {}
+    out: dict[int, set[int]] = {}
+    for cid, carrier in carriers.items():
+        try:
+            repo = lot_class.repository(cfg, carrier)
+            if not repo:
+                continue
+            target = lot_class.default_base(cfg, carrier, repo)
+            if not target:
+                target = plan_git.default_target(repo)
+            if not target:
+                continue
+            members = packet_trailers(repo, carrier, target)
+        except Exception:  # noqa: BLE001 - dépôt illisible : aucune conclusion
+            continue
+        if members:
+            out[cid] = members
+    return out
+
+
 def _packet_wait(carrier):
     """L'attente d'un lot inclus dans un paquet ouvert (forme `planned_wait`)."""
     out = {"what": "packet", "vehicle": int(carrier["id"])}
@@ -228,14 +337,16 @@ def _packet_wait(carrier):
     return out
 
 
-def packet_waits(rows, open_items=None):
+def packet_waits(rows, open_items=None, attachments=None):
     """#2335 : `{lot: wait}` pour tout lot ouvert nommé par un paquet.
 
-    La seule preuve est le manifeste du porteur : une unité y est nommée avec
-    sa tête gelée (`#<lot> <hex>` / `#<lot> @ <hex>`), la forme des manifestes
-    réels. Un simple `#N` en prose est ignoré (B1 de la relecture dev7) : un
-    lot exclu du paquet doit continuer d'alerter, sinon son attente serait
-    tue par un porteur qui ne le transporte pas.
+    Deux preuves : le manifeste du porteur — une unité nommée avec sa tête
+    gelée (`#<lot> <hex>` / `#<lot> @ <hex>`) — et, depuis #2599, les
+    `attachments` lues dans les trailers `ameesh-work:` des commits de sa
+    branche (`packet_attachments`), qui complètent un corps sans liste. Un
+    simple `#N` en prose est ignoré (B1 de la relecture dev7) : un lot exclu
+    du paquet doit continuer d'alerter, sinon son attente serait tue par un
+    porteur qui ne le transporte pas.
 
     Un lot inclus attend la **fusion du paquet**, pas un exécuteur : cette
     attente est planifiée et tait la stagnation comme le SLO (#2335/A1).
@@ -255,6 +366,13 @@ def packet_waits(rows, open_items=None):
         text = "%s\n%s" % (carrier.get("title") or "", carrier.get("body") or "")
         for match in _UNIT.finditer(text):
             ident = int(match.group(1))
+            if ident in open_ids and ident != cid:
+                declared.setdefault(ident, carrier)
+        for ident in (attachments or {}).get(cid, ()):
+            try:
+                ident = int(ident)
+            except (TypeError, ValueError):
+                continue
             if ident in open_ids and ident != cid:
                 declared.setdefault(ident, carrier)
     out: dict[int, dict] = {}
@@ -520,7 +638,12 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
     ouvert comme attente de paquet. `None` (défaut) réutilise le census déjà
     fourni (`open_items`) ou déjà lu pour les engagements ; `True` le force ;
     `False` l'interdit. Un appelant qui n'a pas le census ne paie donc pas une
-    lecture `open_lots_activity(None)` en plus (N1 de la relecture dev7)."""
+    lecture `open_lots_activity(None)` en plus (N1 de la relecture dev7).
+
+    #2599 : quand un porteur est lu, les `ameesh-work:` de sa branche
+    (`packet_attachments`) complètent le corps, qui peut manquer la liste
+    « #N <tête> ». Dépôt ou branche illisibles : aucun attachement, l'alerte
+    reste due (le sens sûr)."""
     if not rows:
         return {}
     now = time.time() if now is None else float(now)
@@ -543,7 +666,9 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
     elif packets is True and not open_items:
         open_items = st.operations.open_lots_activity(None)
     want_packets = bool(packets) if packets is not None else (supplied or bool(open_items))
-    packet = packet_waits(rows, open_items) if want_packets else {}
+    attached = packet_attachments(getattr(db, "cfg", None), open_items, rows) \
+        if want_packets and not _dry_pass(db) else {}
+    packet = packet_waits(rows, open_items, attachments=attached) if want_packets else {}
     landings = _with_heads(st, _admitted(
         st, rows, st.work_dependencies.landings_for([int(r["id"]) for r in rows])))
     if decisions is None:

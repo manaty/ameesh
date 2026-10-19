@@ -469,7 +469,7 @@ def _freeze_mark(row: dict | None) -> dict | None:
 
 
 def freeze_candidate(rows: list[dict], repo: str | None = None,
-                     target: str | None = None) -> dict:
+                     target: str | None = None, *, waived: bool = False) -> dict:
     """Le gel effectif d'un lot (#1756) : le commit sur lequel un avis
     favorable existe, même sans jalon `frozen`, ou malgré un gel périmé.
 
@@ -500,6 +500,11 @@ def freeze_candidate(rows: list[dict], repo: str | None = None,
     * aucun avis : le gel déclaré reste candidat (note `no-verdict` — la
       classe légère n'exige pas d'avis) ; sans gel non plus, refus
       `no-verdict` ;
+    * `waived` (#2681, dispense `-none` du pilote, #1979) : le gel déclaré
+      est le candidat même quand le dernier avis porte sur une tête
+      antérieure — la dispense couvre la tête gelée, pas une remise (#2496) ;
+      note `verdict-not-required`. Un `blocked` sur la tête gelée refuse
+      toujours ;
     * un `blocked` applicable n'est jamais masqué par le `ok` d'un autre
       relecteur : refus `blocked-verdict`.
 
@@ -542,42 +547,49 @@ def freeze_candidate(rows: list[dict], repo: str | None = None,
     v_sha = commit_id((last or {}).get("sha"))
     v_at = float((last or {}).get("at_ts") or 0)
 
-    if last is None:
-        if f_sha:
-            out.update(sha=f_sha, origin="frozen")
-            out["notes"].append("no-verdict")
-            return out
-        out["causes"].append("no-verdict")
-        return out
-    if (last.get("verdict") or "ok") != "ok":
-        out["causes"].append("blocked-verdict")
-        return out
     carried_from = None
-    if f_sha and v_sha:
-        if same_commit(f_sha, v_sha):
-            out.update(sha=max(f_sha, v_sha, key=len), origin="frozen")
-        elif f_at > v_at:
-            carried = (rebase_identity(repo, v_sha, f_sha, target or DEFAULT_TARGET)
-                       if repo else {"mechanical": False})
-            if not carried["mechanical"]:
-                out["causes"].append("freeze-after-verdict")
-                return out
-            out.update(sha=f_sha, origin="frozen")
-            out["notes"].append("mechanical-rebase: %s" % carried["detail"])
-            carried_from = v_sha
-        else:
-            out.update(sha=v_sha, origin="verdict")
-            out["notes"].append("declared-freeze-stale")
-    elif v_sha:
-        out.update(sha=v_sha, origin="verdict")
-        if freeze is not None:
-            out["notes"].append("declared-freeze-stale")
-    elif f_sha and v_at >= f_at:
+    if waived and f_sha:
+        # La dispense du pilote couvre la tête déclarée (#2681) : un avis
+        # antérieur ne la déclasse pas. La porte garde son blocage courant,
+        # vérifié ci-dessous sur cette même tête.
         out.update(sha=f_sha, origin="frozen")
-        out["notes"].append("verdict-names-no-commit")
+        out["notes"].append("verdict-not-required")
     else:
-        out["causes"].append("verdict-names-no-commit")
-        return out
+        if last is None:
+            if f_sha:
+                out.update(sha=f_sha, origin="frozen")
+                out["notes"].append("no-verdict")
+                return out
+            out["causes"].append("no-verdict")
+            return out
+        if (last.get("verdict") or "ok") != "ok":
+            out["causes"].append("blocked-verdict")
+            return out
+        if f_sha and v_sha:
+            if same_commit(f_sha, v_sha):
+                out.update(sha=max(f_sha, v_sha, key=len), origin="frozen")
+            elif f_at > v_at:
+                carried = (rebase_identity(repo, v_sha, f_sha, target or DEFAULT_TARGET)
+                           if repo else {"mechanical": False})
+                if not carried["mechanical"]:
+                    out["causes"].append("freeze-after-verdict")
+                    return out
+                out.update(sha=f_sha, origin="frozen")
+                out["notes"].append("mechanical-rebase: %s" % carried["detail"])
+                carried_from = v_sha
+            else:
+                out.update(sha=v_sha, origin="verdict")
+                out["notes"].append("declared-freeze-stale")
+        elif v_sha:
+            out.update(sha=v_sha, origin="verdict")
+            if freeze is not None:
+                out["notes"].append("declared-freeze-stale")
+        elif f_sha and v_at >= f_at:
+            out.update(sha=f_sha, origin="frozen")
+            out["notes"].append("verdict-names-no-commit")
+        else:
+            out["causes"].append("verdict-names-no-commit")
+            return out
 
     # Blocage applicable : le dernier avis de chaque relecteur sur le commit
     # candidat (mêmes règles que la porte des avis, #1374).
@@ -682,8 +694,10 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
             # effectif (`freeze.origin=verdict`, #1756) ; sans jalon `frozen`,
             # c'est le contenu relu qui entre dans la cible. Un avis sur une
             # autre tête ne prouve rien : la branche a avancé depuis.
-            candidate = freeze_candidate(marks, repo_dir,
-                                         target or row.get("branch_target") or default)
+            from . import merge_queue
+            candidate = freeze_candidate(
+                marks, repo_dir, target or row.get("branch_target") or default,
+                waived=merge_queue.is_waived(row))
             # #2444 : la tête confrontée est la tête publiée (origin d'abord) ;
             # une branche disparue ne vaut pas un contrôle de la tête.
             reviewed = commit_id(candidate.get("sha"))
@@ -1027,6 +1041,64 @@ def _published_tip(repo: str, branch: str) -> str | None:
     return None
 
 
+#: #2654 : réponse de `git ls-remote --exit-code` quand la ref n'existe pas
+_LS_REMOTE_ABSENT = 2
+
+
+def _remote_head(repo: str, branch: str) -> tuple[str, str | None]:
+    """#2654 : la tête de `branch` sur la forge (`git ls-remote origin`), lue
+    au moment de conclure — un clone peut ignorer une branche recréée ou
+    poussée depuis son dernier fetch. Rend `("local", None)` sans remote
+    `origin` (rien à confronter), `("absent", None)` si la forge n'a pas la
+    branche, `("sha", <sha>)`, ou `("error", <raison>)`."""
+    if _out(repo, "remote", "get-url", "origin") is None:
+        return "local", None
+    try:
+        proc = _git(repo, "ls-remote", "--exit-code", "origin", "refs/heads/" + branch,
+                    timeout=FETCH_TIMEOUT)
+    except GitError as exc:
+        return "error", str(exc)
+    if proc.returncode == _LS_REMOTE_ABSENT:
+        return "absent", None
+    words = proc.stdout.decode("utf-8", "replace").split()
+    if proc.returncode != 0 or not words or not _SHA_RE.match(words[0]):
+        detail = proc.stderr.decode("utf-8", "replace").strip()
+        return "error", "git ls-remote origin: %s" % (detail[-200:] or "unreadable")
+    return "sha", words[0]
+
+
+def _remote_moved(repo: str, branch: str, target: str, out: dict,
+                  found: dict) -> dict:
+    """#2654 : `found` conclut à la livraison de `branch` sur une pointe du
+    clone ou une tête vue (`branch_head`) ; elle ne tient que si la tête
+    publiée de la branche est déjà dans la cible. Une forge illisible, ou une
+    branche poussée depuis (recréée sous le même nom, #2623) avec du travail
+    hors de la cible, laisse le lot ouvert ; la nouvelle pointe, présente au
+    clone, est rendue en avance (l'appelant la retient)."""
+    kind, value = _remote_head(repo, branch)
+    if kind in ("local", "absent"):
+        return found
+    if kind == "error":
+        return dict(out, tip=None, ahead=False,
+                    detail="%s; but the head of %s on origin is unreadable (%s): no "
+                           "conclusion" % (found.get("detail"), branch, value))
+    present = _commit(repo, value)
+    if present and (present == found.get("tip")
+            or probe(repo, present, target, lot=branch_lot(branch))["merged"]):
+        # la tête publiée est celle de la preuve, ou elle est entrée elle
+        # aussi (ancêtre, contenu identique : squash)
+        return found
+    if present:
+        return dict(out, tip=present, ahead=True,
+                    detail="%s ahead of %s (%s, origin): pushed since the evidence "
+                           "(%s), not concluded" % (branch, target, present[:12],
+                                                    found.get("detail")))
+    return dict(out, tip=None, ahead=False,
+                detail="%s is at %s on origin, absent from this clone (pushed since "
+                       "the last fetch): no conclusion on %s"
+                       % (branch, value[:12], found.get("detail")))
+
+
 def _on_first_parent(repo: str, commit: str, head: str) -> bool:
     chain = _out(repo, "rev-list", "--first-parent", "--max-count=%d" % MAX_TARGET_COMMITS,
                  head)
@@ -1093,12 +1165,25 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
                  since_ts: float | None = None) -> dict:
     """La branche est-elle entrée dans `target` ? Rend `{merged, how, ref, tip,
     ahead, detail}` ; `ahead` : la pointe a du travail absent de la cible
-    (l'appelant la retient comme `branch_head`)."""
+    (l'appelant la retient comme `branch_head`).
+
+    #2654 : une livraison prouvée par la branche (pointe du clone ou tête vue)
+    n'est rendue qu'après lecture de sa tête sur la forge (`_remote_moved`)."""
     head = _commit(repo, target)
     if head is None:
         raise MergeProbeError("target %r not found in %s" % (target, repo))
     tip = _tip(repo, branch)
     out = {"merged": False, "how": None, "ref": None, "tip": tip, "ahead": False}
+    found = _branch_probe(repo, branch, target, head, tip, out, seen_head=seen_head,
+                          since_ts=since_ts)
+    if found["merged"] and found["how"] != "message":
+        # la citation par une fusion de la cible ne dépend pas de la pointe
+        return _remote_moved(repo, branch, target, out, found)
+    return found
+
+
+def _branch_probe(repo: str, branch: str, target: str, head: str, tip: str | None,
+                  out: dict, *, seen_head: str | None, since_ts: float | None) -> dict:
 
     def seen() -> dict | None:
         if not seen_head:

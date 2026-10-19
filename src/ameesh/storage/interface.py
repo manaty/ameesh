@@ -68,8 +68,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    delays timeline link_package by_package close_merged close
                    refresh_package_parents delegate current_delegation
                    mark_delegate_turn due_delegations resolve_delegation
-                   overdue_delegations returned_delegations backlog_add backlog
-                   auto_takes_since unassigned_lots issue_feed set_issue_ref set_estimate
+                   overdue_delegations returned_delegations backlog_add
+                   backlog_basket_add backlog auto_takes_since unassigned_lots issue_feed set_issue_ref set_estimate
                    estimates mark_started estimate_history
    packages       all get upsert retire lock_sync
    actions         get recent attempts events log_event last_event_note
@@ -194,6 +194,9 @@ AUTO_TAKE_NOTE = "prise automatique"
 HANDOFF_NOTE = "pause budget (reprise) : lot repris"
 ASSIGN_NOTE_PREFIXES = ("assigned to ", "assigné à ", "created and assigned to ",
                         DELEGATED_NOTE, LOT_TAKE_NOTE, AUTO_TAKE_NOTE, HANDOFF_NOTE)
+#: #2584 : début de la note de journal d'une ligne de panier (`backlog_basket_add`)
+#: — le compte des lignes d'un panier se lit sur ce préfixe
+BASKET_LINE_NOTE = "basket line"
 
 
 class Domain(abc.ABC):
@@ -1502,18 +1505,27 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def reserve_migration(self, item_id: int, repo: str | None, number: int | None,
                           floor: int, *, note: str, actor: str, issue_ref: str | None,
-                          release: bool = False) -> dict | None:
-        """L122, #443 : réserve un numéro de migration du dépôt `repo` au lot
-        ouvert (journalisé) : `number` s'il est donné, sinon le prochain libre
-        de ce dépôt, au moins `floor`. L'unicité (dépôt, numéro) est celle de
-        l'index unique : deux réservations simultanées ne prennent jamais le
-        même numéro ; la perdante réessaie avec une attente aléatoire croissante,
-        dans un budget de temps (#478). `note` peut citer `%(number)04d`. None
-        si le lot n'est plus ouvert, ou si `issue_ref` — la référence lue par
-        l'appelant — a changé entre-temps (#1830 : NULL et chaîne vide
-        confondus) ; DbError si `number` est pris par un autre lot ;
-        `ReservationContention` si le budget du prochain libre est épuisé.
-        `release` libère la réservation, sans condition sur la référence."""
+                          release: bool = False,
+                          release_number: int | None = None) -> dict | None:
+        """L122, #443, #2481 : réserve un numéro de migration du dépôt `repo`
+        au lot ouvert (journalisé) : `number` s'il est donné, sinon le prochain
+        libre de ce dépôt, au moins `floor`. Un lot garde ses réservations
+        précédentes : `number` s'ajoute à la liste (`migrations`), il ne
+        remplace plus le numéro courant. L'unicité (dépôt, numéro) est celle
+        des index uniques : deux réservations simultanées ne prennent jamais
+        le même numéro ; la perdante réessaie avec une attente aléatoire
+        croissante, dans un budget de temps (#478). `note` peut citer
+        `%(number)04d` pour une réservation ou une libération d'UN numéro ; une
+        libération totale nomme elle-même l'ensemble des numéros (un gabarit
+        y rend la liste, jamais le sentinelle 0). None si le lot n'est plus
+        ouvert, ou si `issue_ref` —
+        la référence lue par l'appelant — a changé entre-temps (#1830 : NULL
+        et chaîne vide confondus) ; DbError si `number` est pris par un autre
+        lot ; `ReservationContention` si le budget du prochain libre est
+        épuisé. `release` libère toutes les réservations du lot, ou seulement
+        `release_number` s'il est donné, sans condition sur la référence.
+        Les colonnes scalaires (`migration`, `migration_repo`) restent la
+        réservation principale et `migrations` porte la liste complète."""
 
     @abc.abstractmethod
     def migration_holder(self, number: int, repo: str) -> dict | None:
@@ -1796,6 +1808,21 @@ class WorkItems(Domain):
 
         `once` sérialise sur le lot et n'insère pas un texte déjà présent.
         """
+
+    @abc.abstractmethod
+    def note_with_wake(self, item_id: int, state: str, text: str, actor: str,
+                       wake_ts: float, *, once: bool = False) -> None:
+        """#2466 : journalise une note et pose, dans la même transaction, le
+        réveil programmé du lot (epoch) : une note `hold: …` ne laisse jamais
+        la retenue sans son échéance si l'écriture s'interrompt."""
+
+    @abc.abstractmethod
+    def schedule_wake(self, item_id: int, wake_ts: float | None, *, text: str,
+                      actor: str) -> dict | None:
+        """#2466 : pose (ou efface avec `wake_ts=None`) le réveil programmé du
+        lot et journalise le geste, en une transaction ; rend le lot relu, ou
+        None s'il n'existe pas ou n'est plus ouvert. Un seul réveil par lot :
+        le dernier posé remplace le précédent."""
 
     @abc.abstractmethod
     def log_review_attempt(self, item_id: int, state: str, text: str, actor: str) -> None:
@@ -2087,6 +2114,29 @@ class WorkItems(Domain):
         assigné, et sa première ligne de journal ; rend le lot.
 
         `app`: its project (L118c), empty when unknown."""
+
+    @abc.abstractmethod
+    def backlog_basket_add(self, *, key: str, title: str, expected_value: str, line: str,
+                           value_score: int, priority: int, team: str | None,
+                           required_capabilities: list | None, package_id: str | None,
+                           package_parent: str | None, note: str, actor: str,
+                           app: str = "") -> dict:
+        """#2584 (canon §2 l.129) : ajoute une ligne au panier ouvert `key`
+        d'un chantier, ou ouvre ce panier ; rend le panier.
+
+        Le panier est un lot `improvement` en `intake`, sans assigné, dont la
+        `source` vaut `key` : la clé seule le désigne, l'équipe d'une ligne
+        n'ouvre pas un second panier. La ligne s'ajoute au corps ; la valeur
+        du panier est la plus haute de ses lignes, sa priorité la plus haute
+        (le plus petit nombre), ses capacités exigées l'union des leurs, son
+        équipe la première donnée (`team` de la ligne qui l'ouvre, sinon
+        d'une suivante) ;
+        `note` (qui commence par `BASKET_LINE_NOTE`) va au journal. Un panier
+        déjà pris (assigné, ou sorti d'`intake`) est fermé aux lignes : la
+        suivante ouvre un nouveau panier. Deux ajouts simultanés sur la même
+        clé n'ouvrent jamais deux paniers (un écrivain par clé). Le lot rendu
+        porte `basket_lines` (lignes au journal du panier) et `basket_opened`
+        (vrai si cet ajout l'a ouvert)."""
 
     @abc.abstractmethod
     def backlog(self, *, open_only: bool, limit: int,
@@ -3638,7 +3688,11 @@ class Housekeeping(Domain):
     @abc.abstractmethod
     def summary(self, host: str | None, since_s: float) -> list[dict]:
         """Par (hôte, kind, action) : nombre de lignes et octets, sur les
-        `since_s` dernières secondes (les bilans `mesure` exclus)."""
+        `since_s` dernières secondes (les bilans `mesure` exclus).
+
+        #2617 : un signalement `orphan` (ré-écrit toutes les 12 h pour une
+        entrée non attribuée) compte une fois par chemin, avec sa dernière
+        taille ; les autres actions comptent leurs lignes."""
 
     @abc.abstractmethod
     def last_measure(self, host: str | None) -> list[dict]:
@@ -3746,6 +3800,9 @@ class LotSessions(Domain):
     ACTIONABLE_STATES = ("intake", "build")
     #: note de lot qui retient le réveil (`ameesh work note N "hold: …"`)
     HOLD_PREFIX = "hold:"
+    #: notes du réveil programmé (#2466 : pose, annulation, déclenchement) :
+    #: elles ne changent pas la retenue d'un lot tenu par une note `hold:`
+    WAKE_PREFIX = "wake:"
 
     @abc.abstractmethod
     def switch(self, name: str, owner: str, epoch: int, *, to_lot: str | None,
@@ -3779,10 +3836,11 @@ class LotSessions(Domain):
         puis ancienneté : assignés à lui, en `intake`/`build`, ni prévus après
         `today`, ni en attente d'une décision (demande non lue, jalon de
         décision ouvert), d'un lot bloquant ouvert ou d'une note `hold:`
-        (la dernière note du lot). Chaque ligne : `id`, `title`, `state`,
-        `priority`, `activity_ts` (dernier signe de vie du lot : lot, journal,
-        pointe de branche, courrier sur le lot), `wakes`, `last_wake_ts`,
-        `wake_activity_ts`."""
+        (la dernière note du lot). Une note `wake:` (#2466 : pose ou
+        déclenchement d'un réveil programmé) ne lève pas la retenue. Chaque
+        ligne : `id`, `title`, `state`, `priority`, `activity_ts` (dernier
+        signe de vie du lot : lot, journal, pointe de branche, courrier sur
+        le lot), `wakes`, `last_wake_ts`, `wake_activity_ts`."""
 
     @abc.abstractmethod
     def note_wake(self, name: str, lot: int, activity_ts: float | None) -> dict:
@@ -3790,6 +3848,34 @@ class LotSessions(Domain):
         compte repart à 1 si le lot a vécu depuis le réveil précédent
         (`activity_ts` plus récent que `wake_activity_at`), sinon il croît.
         Rend la ligne."""
+
+    @abc.abstractmethod
+    def due_wakes(self, name: str, now: float, claim_ttl_s: float = 120.0) -> list[dict]:
+        """#2466 : les réveils programmés échus des lots encore ouverts de
+        `name`, par échéance puis priorité : `id`, `title`, `state`,
+        `priority`, `wake_ts`. Un réveil programmé est un rendez-vous
+        explicite : il ne dépend ni de l'état `intake`/`build`, ni d'une note
+        `hold:`, ni d'une décision ouverte — seulement de l'assignation et de
+        l'échéance. Un claim plus récent que `claim_ttl_s` écarte le lot : sa
+        livraison est en cours. Une base d'avant 0466 rend une liste vide."""
+
+    @abc.abstractmethod
+    def claim_wake(self, name: str, lot: int, now: float,
+                   claim_ttl_s: float = 120.0) -> dict | None:
+        """#2466 : réclame le réveil programmé échu du lot (bail de livraison),
+        dans une transaction : `wake_claim_at` est posé et le journal reçoit
+        une ligne `wake: … delivered …` (témoin de la délivrance). Rend
+        `{id, state, title, wake_ts}` ou None si le lot n'a plus de réveil
+        échu, est déjà réclamé, n'est plus assigné à `name` ou est fini.
+        L'échéance n'est pas effacée : `consume_wake` le fera au lancement du
+        tour, un claim non consommé expirant après `claim_ttl_s`."""
+
+    @abc.abstractmethod
+    def consume_wake(self, name: str, lot: int, wake_ts: float) -> bool:
+        """#2466 : consomme le réveil programmé délivré : efface `wake_at` et
+        `wake_claim_at` (une seule fois), **seulement** si l'échéance est
+        encore celle qui a été réclamée (`wake_ts`) et sous claim — une
+        nouvelle échéance posée entre-temps est conservée. Rend False sinon."""
 
     @abc.abstractmethod
     def purge(self, name: str | None = None) -> list[dict]:
