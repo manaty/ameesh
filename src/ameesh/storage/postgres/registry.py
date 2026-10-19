@@ -522,6 +522,20 @@ class Agents(interface.Agents):
             (status, status_text, error, stop_reason, name),
         )
 
+    def set_status_text(self, name, text) -> bool:
+        # #2789 : le statut reste celui de l'exécuteur ; le texte d'un agent
+        # retenu ou arrêté est un marqueur que sa levée relit à l'identique.
+        rows = self.db.query(
+            """
+            UPDATE agent_registry
+               SET status_text = %s, last_seen = now(), updated_at = now()
+             WHERE name = %s AND status IN ('idle', 'queued', 'running')
+            RETURNING name
+            """,
+            (text, name),
+        )
+        return bool(rows)
+
     def set_mode(self, name, mode) -> bool:
         rows = self.db.query(
             "UPDATE agent_registry SET mode = %s, updated_at = now() WHERE name = %s"

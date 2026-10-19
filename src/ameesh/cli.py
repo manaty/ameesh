@@ -52,7 +52,7 @@
   agent-mail unbind --session ID --harness H     revokes the binding of this session
   agent-mail bindings [--all] [--json]           active session bindings (--all: revoked ones too)
   agent-mail alias <NAME> <DIR> [WORKSPACE]      names the sessions whose directory starts with DIR
-  agent-mail status "<current work>"             agent status (registry + terminal title)
+  agent-mail status "<current work>"             status text (registry + terminal title); the status stays the runner's
   agent-mail hook <claude|codex|deepseek>        hook: reads the JSON on stdin, delivers the unread
   agent-mail statusline                          Claude Code status bar: [workspace/name] work · directory
   agent-mail migrate [--dry-run | --additive-only]  applies the versioned migrations

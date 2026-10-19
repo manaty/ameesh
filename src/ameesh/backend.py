@@ -397,8 +397,12 @@ class PgBackend:
         return (row or {}).get("status_text") or ""
 
     def set_status(self, name: str, text: str) -> None:
-        registry.upsert(self.db, name, host=self.cfg.host)
-        registry.set_status(self.db, name, "idle", status_text=text)
+        # #2789 : le texte seulement. Poser `idle` ici faisait passer un agent
+        # en plein tour pour un agent au repos (impl-01, 19/10 23:29 : tour de
+        # 30 min vu `idle`, relancé par l'auditeur). L46 : inscription sans
+        # bail — jamais l'hôte ni la session d'un agent `execute`.
+        registry.upsert_unleased(self.db, name, host=self.cfg.host)
+        registry.set_status_text(self.db, name, text)
 
     # -- état local --------------------------------------------------------
     def stop_counter(self, name: str, reset: bool = False, bump: bool = False) -> int:

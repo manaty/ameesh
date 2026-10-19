@@ -47,7 +47,7 @@ agent-mail bind --import FILE         # import bindings from a local bridge file
 agent-mail unbind --session ID --harness H
 agent-mail bindings [--all] [--json]  # active session bindings (--all: revoked ones too)
 agent-mail alias <NAME> <DIR> [PROJECT]
-agent-mail status "<current work>"    # agent status (registry + terminal title)
+agent-mail status "<current work>"    # status text (registry + terminal title); the status stays the runner's
 agent-mail hook <claude|codex|deepseek>   # hook: reads JSON on stdin, delivers unread mail
 agent-mail statusline                 # Claude Code status line
 agent-mail migrate                    # versioned migrations

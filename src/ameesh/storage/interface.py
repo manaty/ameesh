@@ -321,6 +321,18 @@ class Agents(Domain):
         """Pose le statut (et l'erreur) de l'agent ; `stop_reason` (L37) n'est
         gardé que pour `stopped` / `dead`."""
 
+    def set_status_text(self, name: str, text: str) -> bool:
+        """#2789 : le texte libre de `agent-mail status`, en une instruction,
+        SANS toucher au statut : `status`, `last_error` et `stop_reason`
+        restent ceux de l'exécuteur (un tour en cours reste `running`). Écrit
+        seulement sur un agent `idle`, `queued` ou `running` : le texte d'un
+        agent `blocked`, `stopped` ou `dead` est un marqueur (retenue, arrêt)
+        que sa levée relit à l'identique. Faux si rien n'est écrit.
+
+        Pas une opération du contrat médié : un statut libre n'est pas admis
+        depuis une session médiée (`MediatedBackend.set_status`)."""
+        raise NotImplementedError
+
     @abc.abstractmethod
     def set_mode(self, name: str, mode: str) -> bool:
         """Pose le mode (`execute` | `externe`, L37) ; faux si l'agent est inconnu."""
