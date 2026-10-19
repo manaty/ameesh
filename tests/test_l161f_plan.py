@@ -853,6 +853,7 @@ class MapTest(unittest.TestCase):
         always = plan.read_list(plan.ALWAYS_FILE, parts.modules())
         self.assertEqual(always, ["test_2340_auditeur_role",
                                   "test_2449_garde_mecanique",
+                                  "test_2457_garde_non_python",
                                   "test_339_orphan_settle",
                                   "test_cluster", "test_events_attach", "test_l31_orphans",
                                   "test_l50_group_orphan_work_items",

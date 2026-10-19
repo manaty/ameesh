@@ -19,6 +19,12 @@
 -- donnée n'est retirée. Les jalons déjà annulés restent dans la table ; la
 -- lecture les écarte.
 
+-- La correction doit partager la même horloge que le jalon : now() la
+-- daterait avant une fusion écrite dans sa transaction englobante, ou pendant
+-- son attente d'un verrou. Ne modifier que le jalon inverse alors leur ordre.
+-- Le défaut change pour les écritures futures ; aucun historique réécrit.
+alter table work_item_events alter column created_at set default clock_timestamp();
+
 create or replace function agent_mesh_merged_annulled(p_item_id bigint, p_at timestamptz)
 returns boolean
 language sql

@@ -292,9 +292,28 @@ def _wake(db, to, lot: int, text: str, data: dict) -> int | None:
 # le dépôt, la cible, GitHub
 # --------------------------------------------------------------------------
 
+def _checkout(path: str | None) -> str | None:
+    """La racine du checkout git `path`, ou None si `path` n'en est pas un.
+
+    #2473 : un dossier peut exister sans être un dépôt. Le pilote Nexlink
+    enregistre comme `cwd` de son agent le **parent** de ses clones
+    (`/home/smichea/development/manaty`) : il n'a ni `origin` ni branches, et
+    le lire comme un dépôt faisait répondre « branch … is neither local nor
+    on origin » alors que la branche était poussée par le vrai clone. Le
+    dossier d'un worktree se résout par `rev-parse` ; le dépôt du lot se
+    choisit ensuite sur son `origin` (`_same_repository`)."""
+    if not path:
+        return None
+    path = os.path.expanduser(str(path))
+    if not path or not os.path.isdir(path):
+        return None
+    return plan_git._out(path, "rev-parse", "--show-toplevel") or None
+
+
 def _repo_of(db, row: dict) -> str | None:
     """Le dossier de travail de l'assigné (registre), comme le relevé des
-    branches ; None si l'assigné n'en a pas ou si le dossier a disparu."""
+    branches ; None si l'assigné n'en a pas, si le dossier a disparu ou s'il
+    n'est pas un checkout git (#2473)."""
     from . import registry
     assignee = str(row.get("assignee") or "").strip()
     if not assignee or ":" in assignee:
@@ -303,8 +322,22 @@ def _repo_of(db, row: dict) -> str | None:
         reg = registry.get(db, assignee)
     except Exception:  # noqa: BLE001 - registre illisible : pas de dépôt
         return None
-    path = os.path.expanduser(str((reg or {}).get("cwd") or ""))
-    return path if path and os.path.isdir(path) else None
+    return _checkout((reg or {}).get("cwd"))
+
+
+def _same_repository(checkout: str, slug: str) -> bool:
+    """Le checkout est-il celui du lot ? Un `origin` lisible qui nomme un
+    autre dépôt l'écarte ; un checkout sans `origin` reste accepté (copie
+    locale : `fetch_fresh` lit alors ses têtes locales)."""
+    from . import migrations
+    origin = migrations.origin_repo(checkout)
+    return not origin or migrations.repo_key(origin) == migrations.repo_key(slug)
+
+
+def _project_checkout(project) -> str | None:
+    """Le clone que l'hôte déclare pour ce projet
+    (`radar.projects.<p>.repo`), s'il est un checkout (#2473)."""
+    return _checkout(getattr(project, "repo", "") or "") if project is not None else None
 
 
 def _slug(cfg, item: dict, repo: str | None) -> str | None:
@@ -612,14 +645,23 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
     verdict reste exigé. Une cible `release/*` (classe release) n'est jamais
     une auto-fusion : c'est la procédure de release du pilote.
 
+    #2505 : la cible de la classe est celle que la file va fusionner, donc
+    `origin/<cible>` quand elle existe (#2207, `merge_queue._class_base`) ;
+    la cible **locale** du checkout ne sert qu'à défaut. Un `main` local en
+    retard y ajouterait des commits déjà fusionnés, dont des chemins
+    sensibles, et surclasserait le lot au-dessus de ses vrais avis.
+
     Cette porte s'évalue **avant** toute PR, toute entrée en file et toute CI :
     un feu peut être enregistré au gel, mais rien ne part avant les avis."""
     lot = int(row["id"])
     freeze = freeze_of(marks)
     frozen = _norm((freeze or {}).get("sha"))
     head = merge_queue.pinned(repo, frozen) if repo else None
+    base = target or None
+    if repo and target:
+        base = merge_queue._class_base(repo, target) or target
     klass = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=repo or None,
-                             base=target or None, head=head)
+                             base=base, head=head)
     if str(klass.get("class") or "") == lot_class.RELEASE:
         return False, ("class: release (%s) — the release procedure belongs to the pilot: "
                        "a fire never arms an automatic merge on a release"
@@ -1473,12 +1515,22 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
     if not branch:
         out.update(result="no-branch", detail="lot without branch: no PR to arm")
         return out
-    work_repo = repo or _repo_of(db, row)
+    work_repo = _checkout(repo) if repo else _repo_of(db, row)
     slug = _slug(cfg, row, work_repo)
     if not slug:
         out.update(result="no-repository", detail="no GitHub repository known for this lot")
         return out
+    # #2473 : le dossier de l'assigné n'est pas toujours un checkout du lot
+    # (le pilote Nexlink enregistre le parent de ses clones). Un `origin` qui
+    # nomme un autre dépôt l'écarte ; on retombe alors sur le clone que l'hôte
+    # déclare pour le projet (`radar.projects.<p>.repo`), jamais sur un
+    # dossier qui ne porte ni origin ni branches. Un `--repo` explicite est
+    # un geste du pilote : il est gardé tel quel s'il est un checkout.
+    if repo is None and work_repo is not None and not _same_repository(work_repo, slug):
+        work_repo = None
     project = _project(cfg, work_repo, slug)
+    if work_repo is None:
+        work_repo = _project_checkout(project)
     status = _pr_status(slug, branch, gh=gh)
     out.update(slug=slug, repo=work_repo,
                project=project.name if project is not None else "",
@@ -1758,7 +1810,11 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
     `ci_required` (#2285 N3, hors périmètre de ce lot)."""
     lot = int(row["id"])
     if not repo:
-        out.update(result="no-repository", detail="no repository path known for this lot")
+        out.update(result="no-repository", detail=(
+            "no git checkout of %s known for lot #%d: the assignee's registered directory is "
+            "not a checkout and no radar.projects clone is declared for the project; pass "
+            "--repo <path> (a directory that is not a repository carries no branch, #2473)"
+            % (out.get("slug") or "the lot's repository", lot)))
         return out
     rows = {int(r["work_item_id"]): r for r in storage.of(db).work.queue()}
     entry = rows.get(lot)

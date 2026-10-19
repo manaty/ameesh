@@ -91,7 +91,9 @@ if action == 'show':
     # il finit son tour et devient idle. Après redémarrage, le bail est repris
     # (epoch 9, comme le veut bail.sh).
     etat = 'idle' if paused else 'running'
-    print(json.dumps({'name': name, 'host': 'mesh', 'status': etat,
+    # #2198/N5 : le mode de la persona, honoré aussi en mode serveur.
+    mode = 'externe' if (state / 'mode-externe').exists() else 'execute'
+    print(json.dumps({'name': name, 'host': 'mesh', 'mode': mode, 'status': etat,
                       'lease_owner': 'runner-dev9@mesh',
                       'lease_epoch': 9 if (state / 'restart-dev9').exists() else 7,
                       'lease_expires_ts': time.time() + 300,
@@ -235,6 +237,19 @@ class RedemarrageServeurDrainTest(unittest.TestCase):
                       (self.state / 'ssh.log').read_text())
         self.assertIn('systemctl start ameesh-runner@dev9',
                       (self.state / 'ssh.log').read_text())
+
+    def test_non_execute_agent_is_skipped_in_server_mode(self):
+        """#2198/N5 : etat_agent honore le mode aussi en mode serveur ; une
+        persona passée `externe` n'est ni arrêtée ni redémarrée."""
+        (self.state / 'mode-externe').touch()
+        p = self.run_vm()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('dev9 : déplacé ou mode non execute (mode=externe), ignoré',
+                      p.stdout)
+        journal_ssh = (self.state / 'ssh.log').read_text()
+        self.assertNotIn('systemctl stop ameesh-runner@dev9', journal_ssh)
+        self.assertNotIn('systemctl start ameesh-runner@dev9', journal_ssh)
+        self.assertNotIn('pause dev9', self.poste())
 
 
 if __name__ == '__main__':

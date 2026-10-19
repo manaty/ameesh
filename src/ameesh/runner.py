@@ -2011,12 +2011,24 @@ class AgentWorker(threading.Thread):
            lui ; plusieurs lots distincts = ambigu, None.
         2. Sinon, l'unique lot ouvert assigné à l'agent ; plusieurs = None.
         Un tour dont le lot est inconnu ne déclenche jamais de rotation.
+
+        #2527 : un message seulement informatif (`_informative_message`) ne
+        porte pas le lot du tour : un avis sur le lot d'un autre n'ouvre ni
+        ne met de côté aucune session.
         """
         ops = storage.of(self.db).operations
         try:
             ids = [int(i) for i in spec.get("ids") or []]
-            if ids:
+            rows = spec.get("rows") or []
+            if rows:
+                utiles = [r for r in rows if not self._informative_message(r)]
+                if not utiles:
+                    return None   # que des avis : le tour reste où il est
+                lots = sorted({str(r.get("work_item_id") or "").strip()
+                               for r in utiles} - {""})
+            elif ids:
                 lots = ops.message_lots(ids)
+            if rows or ids:
                 if len(lots) == 1:
                     return lots[0]
                 if len(lots) > 1:
@@ -2033,6 +2045,19 @@ class AgentWorker(threading.Thread):
         if len(actifs) == 1:
             return str(actifs[0]["id"])
         return None
+
+    def _informative_message(self, row: dict) -> bool:
+        """#2527 : ce message n'est qu'un avis, il ne choisit pas le lot du
+        tour — message passif (L125 : accusé, copie, diffusion, radar…) ou
+        avis d'une prise automatique (L165) d'un lot par un AUTRE agent. Les
+        vrais échanges sur un lot (consigne, feu, CI, verdict) gardent la
+        rotation."""
+        if mail.passive_reason(row):
+            return True
+        payload = mail.message_payload(row)
+        prise = payload.get("lot_take") if isinstance(payload, dict) else None
+        return (mail.is_event(row) and isinstance(prise, dict)
+                and str(prise.get("agent") or "") != self.name)
 
     def _note_delegate_turn(self, spec: dict) -> None:
         """L40 (0030) : le tour qui commence compte pour les lots délégués à
@@ -5408,6 +5433,34 @@ class AgentWorker(threading.Thread):
         return texte
 
     def _run_turn(self, spec: dict) -> bool:
+        """Un tour, sous battement de bail **dès la préparation** (#2544).
+
+        Le battement ne démarrait qu'une fois le harnais publié : sous charge
+        CI, la préparation (dossier, harnais, canon, ménage, comptabilité)
+        pouvait dépasser un bail court, le veilleur tuait le worker avant le
+        `Popen` et le tour ne démarrait jamais (run 39158768160, psql 6/16 :
+        « stop requested (lease deadline reached): harness not yet published »
+        puis « lease lost … before the turn »). Le bail protège le tour entier
+        — la préparation en fait partie — donc le battement démarre ici, avant
+        elle, et la couvre jusqu'à la sortie du tour, y compris les retours
+        anticipés.
+
+        #2597 : il couvre aussi l'après-harnais (nettoyage, compta, fin de tour).
+        Il s'arrêtait dès la sortie du harnais alors que le veilleur jugeait
+        encore l'échéance : une compta lente sous charge laissait expirer le bail
+        (run 39181194843, psql 6/16 : « harness not yet published » après
+        « end of turn »). Seule cette sortie l'arrête.
+        """
+        heartbeat_done = threading.Event()
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat, args=(heartbeat_done,),
+                                                 daemon=True)
+        self.heartbeat_thread.start()
+        try:
+            return self._run_turn_sous_battement(spec)
+        finally:
+            heartbeat_done.set()
+
+    def _run_turn_sous_battement(self, spec: dict) -> bool:
         if spec.get("lot_switch_failed"):
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             return False
@@ -5740,10 +5793,6 @@ class AgentWorker(threading.Thread):
                 self.fail_turn(budget_mod.PAUSE_PREFIX + refus, refus)
                 return False
 
-        heartbeat_done = threading.Event()
-        self.heartbeat_thread = threading.Thread(target=self._heartbeat, args=(heartbeat_done,),
-                                                 daemon=True)
-        self.heartbeat_thread.start()
         preempt_done = threading.Event()
         # Un nouveau tour remet à zéro le latch de publication : il ne concerne
         # que la course du tour précédent, et les autres déclencheurs (bail,
@@ -6057,7 +6106,6 @@ class AgentWorker(threading.Thread):
             echec_lancement = str(exc)
             result_code = 127
         finally:
-            heartbeat_done.set()
             preempt_done.set()
             pgid = self.pgid
             if rp is not None:
@@ -8678,6 +8726,7 @@ class Runner:
                     continue
             log_async(line)
         self._carry_errors = errors
+
     def packet_sweep_once(self, db) -> None:
         """#2426 : ferme les lots unitaires des paquets fusionnés.
 
@@ -9406,6 +9455,56 @@ class Runner:
                 except Exception:
                     pass
 
+    def account_claims_once(self) -> None:
+        """#313/#2580 (décision 0033) : revendique, dans le registre de
+        l'hôte, les identifiants des comptes de cette configuration, puis
+        journalise ceux qu'un autre mesh de l'hôte déclare aussi — au premier
+        passage, puis à chaque changement. Ne lève jamais."""
+        from . import account_claims
+        try:
+            if not account_claims.refresh(self.cfg, db=self.db):
+                log_async("mesh identity unreadable from the database: provider "
+                          "accounts of this configuration are not claimed on the "
+                          "host, a shared account would not be detected")
+                return
+            partages = account_claims.shared(self.cfg, db=self.db)
+        except (OSError, ValueError) as exc:
+            log_async("account registry of this host unusable (%s): a provider "
+                      "account declared by another mesh is not detected" % exc)
+            return
+        vus = frozenset((p["harness"], p["account"], account_claims.describe(p))
+                        for p in partages)
+        if vus == getattr(self, "_accounts_shared", None):
+            return
+        self._accounts_shared = vus
+        strict = account_claims.refuses(self.cfg)
+        for harness, account, others in sorted(vus):
+            log_async("%s account %s: credentials also declared by another mesh of "
+                      "this host: %s — decision 0033, one organisation per account; "
+                      "%s" % (harness, account, others,
+                              "refused here (%s)" % account_claims.policy_name(self.cfg)
+                              if strict else
+                              "reported only (accounts_shared: report)"))
+
+    def start_account_claims(self) -> threading.Thread | None:
+        """#313 : revendications au démarrage, puis toutes les
+        `account_claims.REFRESH_S` sur leur propre fil (une revendication vit
+        une heure) ; en `--once`, un seul passage."""
+        from . import account_claims
+        if self.once:
+            self.account_claims_once()
+            return None
+
+        def boucle() -> None:
+            while not self.stop.is_set():
+                self.account_claims_once()
+                if self.stop.wait(account_claims.REFRESH_S):
+                    return
+
+        thread = threading.Thread(target=boucle, daemon=True, name="comptes-hote")
+        thread.start()
+        return thread
+
     def log_harnesses(self) -> None:
         """Au démarrage (L106) : le binaire de chaque harnais servi, résolu et
         journalisé avec son chemin absolu — ou « hôte non prêt » tout de suite,
@@ -9772,6 +9871,7 @@ class Runner:
                                              self.cfg.schema, int(self.mail_batch),
                                              self.cfg.config_source))
         self.start_canon_sync()
+        self.start_account_claims()
         # L159f : suivi de la porte et acquittements — en `--once` aussi (r3) :
         # le tour de premier plan compte dans l'accusé partagé de l'hôte
         self._start_host_gate()
