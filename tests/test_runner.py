@@ -116,6 +116,32 @@ class EvenementSimule:
         return self._set
 
 
+class AttenteDuRetourDeBailTest(unittest.TestCase):
+    def test_l_echeance_est_relue_sur_l_horloge_du_worker(self):
+        """#2634 : `--once`, bail non rendu. `lease_held_until` est pris sur
+        l'horloge du worker (#2600) ; `_await_release` le relisait sur
+        `time.monotonic()`. Ici l'horloge simulée est loin de la monotone
+        réelle : l'attente doit finir à l'échéance simulée, après 30 s
+        simulées, et non tourner jusqu'au garde-fou."""
+        import types
+        horloge = HorlogeSimulee(maintenant=1e12)
+        worker = types.SimpleNamespace(
+            name="solo", clock=horloge, heartbeat_thread=None, renewals=[],
+            lease_held_until=horloge.monotonic() + 30.0)
+        essais = []
+        worker.release_lease = lambda: essais.append(horloge.monotonic()) and False
+        ticks = []
+        runner = types.SimpleNamespace(RELEASE_RETRY_S=Runner.RELEASE_RETRY_S,
+                                       stop=EvenementSimule(horloge))
+        with mock.patch("ameesh.runner.log_async"):
+            Runner._await_release(runner, worker,
+                                  types.SimpleNamespace(tick=lambda: ticks.append(1)))
+        self.assertEqual(horloge.monotonic(), worker.lease_held_until)
+        self.assertEqual(runner.stop.attentes, [Runner.RELEASE_RETRY_S] * 6)
+        self.assertEqual(len(essais), 6)
+        self.assertEqual(len(ticks), 6)
+
+
 class RaisonsDArretDeBailTest(unittest.TestCase):
     def test_chaque_arret_de_bail_est_attendu_par_le_temoin(self):
         """#2497 : `test_bail_perdu_interrompt_le_tour` attendait deux raisons

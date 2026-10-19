@@ -174,7 +174,8 @@ dans le canon :
 * La bascule demande `ameesh migrate` (migration 0028). La configuration de
   l'hôte est relue à chaud (#1466) : un compte ajouté, retiré ou corrigé dans
   `config.json` prend effet au tour suivant, sans redémarrage de l'exécuteur.
-  Seuls les comptes, les plafonds, les rôles critiques et les binaires de
+  Seuls les comptes, les plafonds, les rôles critiques, le partage des comptes
+  (`accounts_shared`, `account_sharing`, `account_registry`) et les binaires de
   harnais suivent la relecture : la base, le schéma, le dossier d'état et les
   cadences sont ceux du démarrage.
 * Deux meshes sur un même hôte (#313, #2580) : un dossier d'identifiants, un
@@ -963,7 +964,10 @@ guard on or off, a turn or `ameesh attach` on it is not started, and
 `ameesh accounts list` gives the reason. The policy belongs to each mesh: to
 keep a credential in mesh A and give it up in mesh B, set `refuse`/`strict` in
 B only. With it in both, neither uses the account until the configurations are
-separated. Any other value is refused when the configuration is read.
+separated. Any other value is refused when the configuration is read. The
+policy and the registry follow the hot reload (#1466, #2571): a switch from
+`report` to `refuse`/`strict`, or a moved `account_registry`, takes effect at
+the next turn and the next claim pass, without restarting the runner.
 
 ```json
 {"accounts_shared": "refuse"}

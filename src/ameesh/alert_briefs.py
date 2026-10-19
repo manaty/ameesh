@@ -18,7 +18,8 @@ elle, par `ameesh work move <id> qa --reviewer <agent>`.
 
 Chaque courrier dit l'action attendue, avec la commande exacte. Une alerte
 part une fois à sa levée, puis une seule relance si elle dure encore
-`REMIND_AFTER_S` (6 h) plus tard. Ce module rend les textes ; l'envoi et le
+`REMIND_AFTER_S` (6 h) plus tard ; les SLO ne repartent qu'au palier suivant
+ou après changement d'état (#2602). Ce module rend les textes ; l'envoi et le
 dédoublonnage sont dans `notify.Notifier`.
 """
 
@@ -444,12 +445,19 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             teams = _projects(by_name, alert.get("agent"))
             for name in _of_teams(orchestras, by_name, teams):
                 out.setdefault(name, text)
-        if "bureau" in roles and "bureau" in by_name:
+        bureau = by_name.get("bureau") or {}
+        # #2602: the external desk cannot read automatic mail; home host
+        # operations are the exception, since they can require that desk.
+        # `registry.MODES`: a human-driven session is `externe` (0030).
+        if "bureau" in roles and bureau and (
+                bureau.get("mode") != "externe" or alert.get("project") == "home"):
             out.setdefault("bureau", text)
         if "auditeur" in roles:
             for name in auditor_names or ():
                 if name in by_name:
                     out.setdefault(name, text)
+        if bureau.get("mode") == "externe" and alert.get("project") != "home":
+            out.pop("bureau", None)  # also when listed as pilot or auditor
         return out
     else:
         extra: dict[str, str] = {}
