@@ -220,14 +220,22 @@ def _same_sha(a, b, repo: str | None = None) -> bool:
     return False
 
 
-def actor_family(db, name) -> str:
-    """La famille de modèle d'un agent (`claude`, `codex`, `deepseek`), "" si
-    elle n'est pas connue : un humain, un agent absent du registre, un harnais
-    non reconnu. L'indépendance d'un avis ne se suppose jamais (#1374).
+def actor_family(db, name, *, families=None) -> str:
+    """La famille de modèle d'un agent, "" si elle n'est pas connue.
+
+    `claude`, `codex`, `deepseek` sont les familles du canon compilé
+    (`review_lot.compiled_families`, #2664) ; un humain, un agent absent du
+    registre, un harnais non reconnu ou un canon illisible rendent "". Quand
+    l'appelant a déjà lu les familles (`families`), elles se réutilisent : la
+    porte les lit une fois pour tous les acteurs. L'indépendance d'un avis ne
+    se suppose jamais (#1374).
 
     Une lecture du registre impossible lève `RegistryReadError` (#2521) : la
     famille n'est pas « inconnue », elle n'a pas pu être lue ; les appelants
-    qui ne peuvent rien en faire d'autre l'attrapent explicitement."""
+    qui ne peuvent rien en faire d'autre l'attrapent explicitement. Un canon
+    illisible, lui, rend "" : les appelants qui doivent nommer le canon
+    (`review_gate`) le lisent avant et échouent fermé avec son diagnostic.
+    """
     from . import registry, review_lot
     name = str(name or "").strip()
     if not name or name.startswith(work.HUMAN_PREFIX) or ":" in name:
@@ -237,7 +245,20 @@ def actor_family(db, name) -> str:
     except Exception as exc:  # noqa: BLE001 - #2521 : lecture impossible, pas inconnue
         raise RegistryReadError(
             "cannot read the agent registry for %s: %s" % (name, exc)) from exc
-    return review_lot.family_of(registry.live_harness(row))
+    if families is None:
+        try:
+            families = review_lot.compiled_families(db)
+        except review_lot.FamiliesError:
+            return ""
+    return review_lot.family_of(registry.live_harness(row), families)
+
+
+
+def _actor_family(db, name, families) -> str:
+    """`actor_family` avec les familles déjà lues (ou None : il les lit)."""
+    if families is None:
+        return actor_family(db, name)
+    return actor_family(db, name, families=families)
 
 
 def blocked_verdicts(marks, frozen, *, repo: str | None = None) -> list[dict]:
@@ -309,7 +330,7 @@ def _waiver(db, item) -> tuple:
 
 
 def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
-                item=None) -> dict:
+                item=None, families=None) -> dict:
     """Les avis requis sur la tête gelée `frozen`, et eux seuls (#1374).
 
     Un verdict ne compte que s'il a été rendu **sur cette tête** (le `sha` du
@@ -326,6 +347,11 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     l'auteur ; pour deux avis, deux familles distinctes. L'indépendance ne se
     suppose jamais : une famille d'auteur inconnue refuse la porte (canon §2,
     décision 18855a).
+
+    #2664 : les familles viennent du canon compilé (`families`, sinon lues par
+    `review_lot.compiled_families` au dernier commit audité). Un canon
+    illisible refuse la porte **fermée** avec le canon nommé — une seule
+    synchro ratée ne bloque pas tant qu'un commit audité reste lisible.
 
     #1979 : le pilote peut marquer « verdict non requis » (`work.reviewer
     --no-verdict`, colonne `reviewer = -none`, geste d'autorité journalisé) ;
@@ -383,8 +409,21 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     if required == 0:
         out["ok"] = True
         return out
+    if families is None and db is not None:
+        from . import review_lot
+        try:
+            families = review_lot.compiled_families(db)
+        except review_lot.FamiliesError as exc:
+            # #2664 : canon illisible -> échec fermé, avec le canon nommé. Un
+            # commit audité restant lisible suffit ; seule son absence refuse.
+            out["error"] = str(exc)
+            out["why"] = ("no review verdict ok on the freeze %s (class: %s): the model "
+                          "families cannot be read (%s), so no verdict can be proven "
+                          "independent (canon §2: independence is never assumed)"
+                          % (frozen[:12], cls, exc))
+            return out
     try:
-        author_family = actor_family(db, author)
+        author_family = _actor_family(db, author, families)
     except RegistryReadError as exc:
         # #2521 : le registre est illisible, ce n'est pas « famille inconnue ».
         # La porte refuse toujours (l'indépendance ne se suppose pas) mais le
@@ -418,7 +457,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         if author and actor and actor.lower() == author.lower():
             continue                      # on ne relit pas son propre travail
         try:
-            family = actor_family(db, actor)
+            family = _actor_family(db, actor, families)
         except RegistryReadError as exc:
             out["error"] = str(exc)
             out["why"] = ("no review verdict ok on the freeze %s (class: %s): the agent "

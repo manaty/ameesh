@@ -283,26 +283,6 @@ EXEMPTIONS = (
                "passage raccordé au canon (retrait : #2451)",
     ),
     Exemption(
-        path="src/ameesh/review_lot.py",
-        parameter="reviews.families",
-        literal="*",
-        name="lot #2449 (mty-amh-impl-08), inventaire du 18/10",
-        date="2026-10-18",
-        reason="relecture après fusion : familles connues et famille opposée "
-               "viennent de la règle du pilote (13/10), pas de "
-               "`processus/mecanique.yaml` (retrait : #2451)",
-    ),
-    Exemption(
-        path="src/ameesh/review_provenance.py",
-        parameter="reviews.families",
-        literal="*",
-        name="lot #2449 (mty-amh-impl-08), inventaire du 18/10",
-        date="2026-10-18",
-        reason="validation du harnais d'un reçu #1465 contre les familles "
-               "connues du mesh ; le fournisseur de provenance ne lit pas le "
-               "canon et refuse un harnais inconnu (retrait : #2451)",
-    ),
-    Exemption(
         path="src/ameesh/review_designation.py",
         parameter="reviews.families",
         literal="*",

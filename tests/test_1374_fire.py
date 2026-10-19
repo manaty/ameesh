@@ -76,7 +76,7 @@ def _info(**extra):
     return row
 
 
-def _family(db, name):
+def _family(db, name, **kw):
     return FAM.get(str(name or "").strip(), "")
 
 

@@ -170,32 +170,14 @@ class Inputs:
 def _audited_commit(db, cfg, canon, source) -> str:
     """The exact commit to read for this canon: the host's last good one.
 
-    `canon_state.last_good_commit` is the commit the host audited; the
-    configured ref can be ahead of it (a fetch without a sync). Without a
-    recorded state (bench, first start) the source commit is the only exact
-    commit known; `mechanics.load` still refuses a non-commit.
+    The single implementation lives in `canon_sync.audited_commit` (moved for
+    #2664, which reads the same commit for the model families): a recorded
+    state is authoritative even when the current pass is invalid, and with no
+    state at all the exact source commit is the only one known.
     """
     from . import canon_sync
 
-    try:
-        key = canon_sync.state_key(db, canon, getattr(cfg, "host", ""))
-        state = storage.of(db).canon.state(getattr(cfg, "host", ""), key)
-    except Exception:  # noqa: BLE001 - unreadable state: no audited commit known
-        state = None
-    if state is not None:
-        # A recorded state is authoritative even when the CURRENT pass is
-        # invalid: `last_good_commit` is the last audited commit, while the
-        # configured ref may already point at an un-audited head (B2 of the
-        # Codex review cx2). Without a last good commit there is no audited
-        # policy to read: never fall back to the ref on a known host.
-        commit = str(state.get("last_good_commit") or "").strip().lower()
-        root = str(state.get("root") or "")
-        if commit and (not root or root == str(getattr(canon, "root", "") or "")):
-            return commit
-        return ""
-    # No state at all (bench, first start): the exact configured ref is the
-    # only commit known, and `mechanics.load` still refuses a non-commit.
-    return str(source.commit or "").strip().lower()
+    return canon_sync.audited_commit(db, cfg, canon, source)
 
 
 def _policy(cfg, db, project: str, paths: Sequence[str]) -> Policy | Unavailable:
@@ -573,8 +555,8 @@ def _range(repo: str, base: str, head: str) -> tuple[str, list, list]:
 # the authors: the assignee at freeze and each commit's exact receipt
 # --------------------------------------------------------------------------
 
-def _family(harness) -> str:
-    return review_lot.family_of(str(harness or ""))
+def _family(harness, families) -> str:
+    return review_lot.family_of(str(harness or ""), families)
 
 
 def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
@@ -635,7 +617,7 @@ def _change(repo: str, sha: str) -> Optional[tuple[int, bool]]:
 
 
 def _authors(db, item: Mapping, milestone: Optional[Mapping],
-             commits: Sequence[str], repo: str = "") -> tuple[list, list]:
+             commits: Sequence[str], repo: str = "", families=()) -> tuple[list, list]:
     """`(authors, unknown authors)` drawn from the freeze and exact receipts.
 
     The reference author is the lot's author at freeze (the assignee, exactly
@@ -645,6 +627,9 @@ def _authors(db, item: Mapping, milestone: Optional[Mapping],
     does not make its author an author of the head — their family stays
     eligible, and the same reviewer may be designated again on the new head.
     A larger or design change makes them an author like any other (#2638).
+
+    `families` are the compiled canon's model families (#2664), read at the
+    same audited commit as the policy: no local list is assumed.
     """
     lot = int((item or {}).get("id") or 0)
     assignee = str((item or {}).get("assignee") or "").strip()
@@ -654,14 +639,14 @@ def _authors(db, item: Mapping, milestone: Optional[Mapping],
     except Exception:  # noqa: BLE001 - unreadable trace: unknown family
         author = {}
     name = str(author.get("name") or assignee).strip()
-    family = _family(author.get("harness"))
+    family = _family(author.get("harness"), families)
     if not family and milestone is not None:
         try:
             proof = review_provenance.receipt_for_milestone(db, int(milestone["id"]))
         except (review_provenance.ProvenanceError, KeyError, TypeError, ValueError):
             proof = None
         if proof and str(proof.get("actor") or "").strip() == name:
-            family = _family(proof.get("harness"))
+            family = _family(proof.get("harness"), families)
     if not family and name and (milestone is None
                                 or str(milestone.get("actor") or "").strip()
                                 in ("", name)):
@@ -670,7 +655,7 @@ def _authors(db, item: Mapping, milestone: Optional[Mapping],
             # the declared harness is not a session: only an opened session
             # proves the family that really ran (L242b, #1037)
             if row.get("session_id") or row.get("session_harness"):
-                family = _family(row.get("session_harness"))
+                family = _family(row.get("session_harness"), families)
         except Exception:  # noqa: BLE001 - no session: the family stays unknown
             family = ""
     reviewers = _designated_reviewers(db, item, milestone, name)
@@ -690,7 +675,7 @@ def _authors(db, item: Mapping, milestone: Optional[Mapping],
         actor = str(receipt.get("actor") or "").strip()
         if not actor:
             continue
-        proven = _family(receipt.get("harness"))
+        proven = _family(receipt.get("harness"), families)
         if actor != name and actor in reviewers:
             # held until the §2 threshold is known for their whole correction
             review_commits.setdefault(actor, []).append((str(sha), proven))
@@ -908,7 +893,8 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         # project's agents, so the two roles never collapse into one mail
         candidates = [candidate for candidate in candidates
                       if candidate.name != notify]
-    authors, unknown = _authors(db, item, freeze, commits, repo)
+    authors, unknown = _authors(db, item, freeze, commits, repo,
+                                families=policy.families)
     return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=paths,
                   commits=commits, policy=policy, authors=authors,
                   unknown_authors=unknown, candidates=candidates, notify=notify,
