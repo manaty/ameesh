@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#2696 — la porte exige deux avis pour la machinerie des paquets.
+"""#2696 — la porte lit le canon compilé, y compris pour la priorité.
 
 Le pilote a tranché la forme (b) : le classement lit `train_reviews` du canon
 (`federation.yaml`, `review_policies.train_reviews`) et la porte en dérive le
@@ -8,6 +8,12 @@ Le témoin porte sur les chemins réels du canon (`src/ameesh/train*.py`,
 `radar.py`, `plan_git.py`, `resolutions.py`) et sur un chemin déclaré au canon
 qui n'est dans aucune liste de secours, pour prouver que la source est bien le
 canon. Un seul avis ne doit ni ouvrir la porte ni rendre le lot prêt.
+
+Second cas (mesh-design, 19/10) : le repli ne doit pas surclasser le canon d'un
+autre projet. Le crate Nexlink `desktop/host/host-linux` est déclaré à un avis
+par `desktop/**` ; `host[-_]` ne doit pas en faire un chemin de prod. Les motifs
+ameesh sont ancrés sous `src/ameesh/` et le repli ne s'applique qu'à ameesh ;
+les témoins couvrent Nexlink=1, `resolutions.py`=2 et le repli ameesh conservé.
 """
 from __future__ import annotations
 
@@ -84,6 +90,57 @@ class TrainMachineryScaleTest(unittest.TestCase):
                                          ["src/ameesh/resolutions.py"])
         self.assertTrue(klass["doubt"])
         self.assertEqual(klass["class"], "sensitive")
+
+
+class CanonPriorityTest(unittest.TestCase):
+    """#2696, second cas : le repli ne surclasse pas le canon d'un autre projet
+    et reste borné aux chemins d'ameesh."""
+
+    NX_HOST = "desktop/host/crates/host-linux/src/lib.rs"
+    NX_DEPLOY = "deploy/foo.sh"
+
+    def nx_canon(self):
+        return canon(
+            rules=[{"paths": ["desktop/**", "deploy/**"], "class": "sensitive"}],
+            reviews=[{"paths": ["desktop/**", "deploy/**"], "reviews": 1}],
+            risk_project="nexlink", train_project="nexlink")
+
+    def test_the_nxlink_host_crate_keeps_the_canon_one(self):
+        klass = lot_class.class_of_paths([self.nx_canon()], "nexlink", [self.NX_HOST])
+        self.assertFalse(klass["doubt"])
+        self.assertEqual(klass["class"], "sensitive")
+        self.assertEqual(klass["project"], "nexlink")
+        self.assertEqual(klass["train_reviews"], 1)
+        self.assertFalse(merge_queue.critical_scope(klass))
+        self.assertEqual(merge_queue.required_verdicts(klass), 1)
+
+    def test_the_generic_fallback_is_skipped_for_another_project(self):
+        # Le motif `deploy` reste global, mais le repli ne s'applique qu'à
+        # ameesh : la politique Nexlink (un avis) fait foi.
+        klass = lot_class.class_of_paths([self.nx_canon()], "nexlink", [self.NX_DEPLOY])
+        self.assertEqual(klass["class"], "sensitive")
+        self.assertTrue(merge_queue.critical_scope(klass))
+        self.assertEqual(merge_queue.required_verdicts(klass), 1)
+
+    def test_the_ameesh_fallback_still_holds(self):
+        # Pour ameesh, un chemin critique que le canon ne déclare pas garde le
+        # minimum de deux avis.
+        path = "src/ameesh/merge_queue.py"
+        source = canon(rules=[{"paths": [path], "class": "sensitive"}])
+        klass = lot_class.class_of_paths([source], "ameesh", [path])
+        self.assertEqual(klass["train_reviews"], 0)
+        self.assertTrue(merge_queue.critical_scope(klass))
+        self.assertEqual(merge_queue.required_verdicts(klass), 2)
+
+    def test_an_ameesh_test_name_is_not_a_host_path(self):
+        # Le motif `host[-_]` est ancré sous src/ameesh/ : un fichier de test
+        # `test_host_gate.py` n'est pas un chemin de prod.
+        path = "tests/test_host_gate.py"
+        source = canon(rules=[{"paths": ["tests/**"], "class": "light"}])
+        klass = lot_class.class_of_paths([source], "ameesh", [path])
+        self.assertEqual(klass["class"], "light")
+        self.assertFalse(merge_queue.critical_scope(klass))
+        self.assertEqual(merge_queue.required_verdicts(klass), 0)
 
 
 class TrainMachineryGateTest(unittest.TestCase):

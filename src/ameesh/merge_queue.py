@@ -105,36 +105,45 @@ def latest_verdict(rows: list[dict]) -> dict | None:
 #: La règle explique leur classe mais peut citer d'autres fichiers inchangés.
 #: `critical: true` au canon fait foi ; ces motifs restent un minimum lorsque
 #: le canon ne connaît pas encore un chemin critique ou omet sa déclaration.
+#: Les motifs propres à ameesh sont ancrés sous `src/ameesh/` et le repli ne
+#: s'applique qu'au projet ameesh (#2696) : le crate Nexlink `host-linux`, sous
+#: `desktop/`, ne devient plus un chemin de prod par le motif `host[-_]`.
 #: Un doute de classe (politique ou diff illisible, `files` vide) n'ajoute
 #: aucun de ces domaines : il reste sensible, un avis (canon §2, owner 15/10 :
 #: deux familles seulement pour droits SQL, secrets, paiement, prod réelle ;
 #: #2394).
 CRITICAL_SCOPE = (
-    # SQL, migrations, stockage
-    re.compile(r"(^|/)(migrations?|supabase|storage)(/|$)|(^|/)migrations\.py$|"
-               r"(^|/)db\.py$|\.sql$"),
+    # SQL, migrations, stockage — les noms ameesh sont ancrés sous src/ameesh/ ;
+    # `supabase/`, `*.sql` et `deploy/sql/` restent globaux (SQL dans tout projet).
+    re.compile(r"^src/ameesh/(?:migrations?|storage)(?:/|$)|"
+               r"^src/ameesh/(?:migrations|db)\.py$|"
+               r"(?:^|/)supabase/|\.sql$|^deploy/sql/"),
     # sécurité : droits, identité, clés, secrets, décisions ; garde cgroup
-    # DeepSeek (#2282 : le préchargement Node et son module Python)
-    re.compile(r"(^|/)(approve|auth|authority|identity|signing|cose|p256|jcs|decisions|"
-               r"visibility|auth_failure|dsn|assignments)(/|\.py$|$)|"
-               r"(^|/)deepseek_cgroup\.(?:cjs|py)$|"
-               r"(^|/)(keys?|secrets?)(/|$)|"
-               r"^src/ameesh/(approve_check|approve_client|config)\.py$"),
-    # prod, infra, déploiement, hôtes et relais — dont la porte de fusion
-    re.compile(r"(^|/)(deploy|infra|lab|bin)(/|$)|(^|/)\.github/|"
-               r"(^|/)scripts/(ci|deploy|compute|test)|(^|/)(Dockerfile|pyproject\.toml)$|"
-               r"(^|/)host[-_]|(^|/)(hostcheck|exploitation|relay|serve|progress_serve|"
-               r"relocation|placement|merge_queue|land|fire)\.py$|"
+    # DeepSeek (#2282 : le préchargement Node et son module Python). Noms
+    # ameesh ancrés sous src/ameesh/ (#2696).
+    re.compile(r"^src/ameesh/(?:approve|auth|authority|identity|signing|cose|p256|jcs|"
+               r"decisions|visibility|auth_failure|dsn|assignments)(?:/|\.py$|$)|"
+               r"^src/ameesh/deepseek_cgroup\.(?:cjs|py)$|"
+               r"^src/ameesh/(?:keys?|secrets?)(?:/|$)|"
+               r"^src/ameesh/(?:approve_check|approve_client|config)\.py$"),
+    # prod, infra, déploiement, hôtes et relais — dont la porte de fusion.
+    # Les chemins ameesh sont ancrés sous src/ameesh/ ; les domaines génériques
+    # (deploy, infra, .github, scripts, Dockerfile, pyproject) restent globaux.
+    re.compile(r"(?:^|/)(?:deploy|infra|lab|bin)(?:/|$)|(?:^|/)\.github/|"
+               r"(?:^|/)scripts/(?:ci|deploy|compute|test)|"
+               r"(?:^|/)(?:Dockerfile|pyproject\.toml)$|"
+               r"^src/ameesh/host[-_]|^src/ameesh/(?:hostcheck|exploitation|relay|serve|"
+               r"progress_serve|relocation|placement|merge_queue|land|fire)\.py$|"
                # la porte de fusion hors API, la classe du lot et son classement
                # (#2249 ; ligne perdue dans une composition, restaurée #2374)
-               r"(^|/)(merge_pr|lot_class|review)\.py$|"
+               r"^src/ameesh/(?:merge_pr|lot_class|review)\.py$|"
                # ce qui entre dans un paquet : la liste calculée des lots
                # prêts et ses remises (#2496)
                r"^src/ameesh/packet_candidates\.py$|^scripts/paquet-candidats\.py$|"
                # le report des verdicts acquis sur une tête réalignée (#2442)
                r"^src/ameesh/verdict_carry\.py$|"
                # preuve de famille indépendante des avis (#2265)
-               r"^src/ameesh/(review_lot|registry)\.py$"),
+               r"^src/ameesh/(?:review_lot|registry)\.py$"),
 )
 #: la documentation Markdown que le canon classe léger ou normal : les motifs
 #: de secours, larges, y verraient un domaine (`docs/design/decisions/`). Seul
@@ -150,8 +159,10 @@ def critical_scope(klass) -> bool:
     """Le diff gelé touche-t-il SQL, la sécurité ou la prod (deux avis) ?
 
     Le canon peut le déclarer explicitement sur chaque chemin classé. Les
-    motifs de secours s'appliquent aussi aux chemins classés légers, sauf à la
-    documentation Markdown classée légère ou normale.
+    motifs de secours ameesh sont ancrés sous `src/ameesh/` ; `required_verdicts`
+    ne les applique qu'au projet ameesh, la politique compilée des autres
+    projets faisant foi (#2696). Ils s'appliquent aussi aux chemins classés
+    légers, sauf à la documentation Markdown classée légère ou normale.
     Seuls les **chemins changés** prouvent un domaine critique : une liste
     `files` vide, ou une entrée sans chemin, n'en désigne aucun. Le doute de
     classe n'est pas critique pour autant : `required_verdicts` le garde
@@ -182,6 +193,10 @@ def required_verdicts(klass) -> int:
     #2696) : le classement le lit et le porte (`train_reviews`), la porte
     l'applique comme la désignation au gel ; un chemin léger déclaré à deux
     avis les exige sans être reclassé, et le doute ne l'efface pas.
+    Les motifs de secours `CRITICAL_SCOPE` ne s'appliquent qu'au projet ameesh
+    (ou à un appel sans projet connu) : pour les autres projets, la politique
+    compilée fait foi (#2696, cas pilote Nexlink `desktop/host/**`) ; une
+    déclaration `critical: true` du canon garde deux avis pour tout projet.
     Un lot léger **sans chemin changé** n'a rien à relire : 0. Le plancher est
     lu par le lecteur de classe (`lot_class`), donc le même que la désignation
     au gel et `paquet-candidats` ; il ne reclasse jamais la classe.
@@ -198,11 +213,19 @@ def required_verdicts(klass) -> int:
     klass = klass or {}
     cls = str(klass.get("class") or lot_class.SENSITIVE)
     declared = int(klass.get("train_reviews") or 0)
+    project = str(klass.get("project") or "")
+    files = klass.get("files") or ()
     if klass.get("doubt"):
         # canon §8 : « en cas de doute, le lot est sensible » — jamais léger,
         # jamais critique par le seul doute (#2394).
         cls = lot_class.SENSITIVE
-    if klass.get("files") and critical_scope(klass):
+    # #2696 : le canon compilé fait foi hors ameesh. Les motifs de secours
+    # décrivent les chemins d'ameesh ; sur un lot Nexlink, `host-linux` (un
+    # crate sous `desktop/`) ne devient pas un chemin de prod par `host[-_]`.
+    # Une déclaration `critical: true` du canon reste lue pour tous les projets.
+    explicit_critical = any(entry.get("critical") is True for entry in files)
+    fallback = critical_scope(klass) if project in ("", "ameesh") else False
+    if files and (explicit_critical or fallback):
         return max(CRITICAL_REVIEWS, declared)
     if cls == lot_class.LIGHT:
         if not klass.get("files"):

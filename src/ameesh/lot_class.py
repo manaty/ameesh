@@ -265,22 +265,24 @@ def _train_reviews(federation, project: Optional[str], paths) -> tuple[int, str]
 def class_of_paths(canons, project: Optional[str], paths) -> dict:
     """La classe des `paths` pour `project`, lue dans tous les canons.
 
-    Rend `{class, why, files, policy_ref, doubt, light_reviews, train_reviews}` ;
-    une politique illisible, un projet que **aucun** canon ne déclare (sans
-    repli déclaré) ou des chemins inclassables rendent `sensitive` avec
-    `doubt` — jamais une classe rassurante par défaut. Un canon qui déclare
-    d'autres projets sans repli ne dit rien de celui-ci : il est ignoré, pas
-    compté comme un doute. `light_reviews` est le plancher d'avis de la classe
-    légère (#2642), lu au même commit ; la classe reste `light`, le plancher ne
-    reclasse pas. `train_reviews` est le plus grand nombre d'avis déclaré par
-    chemin (`train_reviews`, #2696) : la porte et `paquet-candidats` lisent le
-    même nombre que la désignation au gel.
+    Rend `{class, why, files, policy_ref, doubt, project, light_reviews,
+    train_reviews}` ; une politique illisible, un projet que **aucun** canon
+    ne déclare (sans repli déclaré) ou des chemins inclassables rendent
+    `sensitive` avec `doubt` — jamais une classe rassurante par défaut. Un
+    canon qui déclare d'autres projets sans repli ne dit rien de celui-ci : il
+    est ignoré, pas compté comme un doute. `light_reviews` est le plancher
+    d'avis de la classe légère (#2642), lu au même commit ; la classe reste
+    `light`, le plancher ne reclasse pas. `train_reviews` est le plus grand
+    nombre d'avis déclaré par chemin (`train_reviews`, #2696) : la porte et
+    `paquet-candidats` lisent le même nombre que la désignation au gel.
+    `project` permet à la porte de n'appliquer ses motifs de secours qu'au
+    projet ameesh, dont ils décrivent les chemins (#2696, cas pilote Nexlink).
     """
     canons = tuple(canons or ())
     light_reviews, light_problem = _light_reviews(canons)
     if light_problem:
         return {"class": SENSITIVE, "files": _doubtful_files(paths),
-                "policy_ref": "", "doubt": True,
+                "policy_ref": "", "doubt": True, "project": project or "",
                 "light_reviews": light_reviews, "train_reviews": 0,
                 "why": "review light floor unreadable: %s" % light_problem}
     worst, why, files, ref = LIGHT, "", [], ""
@@ -299,6 +301,7 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
         if errors:
             return {"class": SENSITIVE, "files": _doubtful_files(paths),
                     "policy_ref": _ref(canon), "doubt": True,
+                    "project": project or "",
                     "light_reviews": light_reviews,
                     "train_reviews": train_reviews,
                     "why": "review policy unreadable (%s): %s"
@@ -309,6 +312,7 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
         except review_mod.ReviewError as exc:
             return {"class": SENSITIVE, "files": _doubtful_files(paths),
                     "policy_ref": _ref(canon), "doubt": True,
+                    "project": project or "",
                     "light_reviews": light_reviews,
                     "train_reviews": train_reviews,
                     "why": "cannot classify the change: %s" % exc}
@@ -317,6 +321,7 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
         if declared_problem:
             return {"class": SENSITIVE, "files": _doubtful_files(paths),
                     "policy_ref": _ref(canon), "doubt": True,
+                    "project": project or "",
                     "light_reviews": light_reviews,
                     "train_reviews": train_reviews,
                     "why": "review train counts unreadable (%s): %s"
@@ -338,7 +343,7 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
             why = "policy of %s" % (root or "canon")
     if not covered:
         return {"class": SENSITIVE, "files": _doubtful_files(paths), "policy_ref": "",
-                "doubt": True, "light_reviews": light_reviews,
+                "doubt": True, "project": project or "", "light_reviews": light_reviews,
                 "train_reviews": 0,
                 "why": "project %r is not declared by any canon (no fallback policy)"
                        % (project,)}
@@ -349,7 +354,7 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
         if entry["path"] in critical_paths:
             entry["critical"] = True
     return {"class": worst, "why": why, "files": files, "policy_ref": ref,
-            "doubt": False, "light_reviews": light_reviews,
+            "doubt": False, "project": project or "", "light_reviews": light_reviews,
             "train_reviews": train_reviews}
 
 
@@ -368,16 +373,18 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     `canons` (liste ou lecteur différé) réutilisent les lectures groupées de
     l'appelant. Rend aussi `files`, `policy_ref`, `target`, `frozen_sha`,
     `why` et `doubt` (vrai quand la classe vient d'une lecture impossible, pas
-    d'une politique) et `light_reviews` (le plancher d'avis d'un lot léger,
-    #2642) pour la trace.
+    d'une politique), `light_reviews` (le plancher d'avis d'un lot léger,
+    #2642) et `train_reviews` avec `project` (le barème par chemin et le
+    projet qui décide du repli de la porte, #2696) pour la trace.
     """
     out: dict = {"lot": int(lot), "class": SENSITIVE, "why": "", "files": [],
                  "policy_ref": "", "repo": repo or "", "target": base or "",
-                 "frozen_sha": head or "", "doubt": True}
+                 "frozen_sha": head or "", "doubt": True, "project": ""}
     row = item if item is not None else work.get(db, lot)
     if row is None:
         out["why"] = "lot #%d not found" % lot
         return out
+    out["project"] = str(row.get("app") or "")
     reason = release_reason(row)
     if reason:
         out.update({"class": RELEASE, "why": reason, "doubt": False})
