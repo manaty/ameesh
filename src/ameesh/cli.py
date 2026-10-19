@@ -1887,6 +1887,14 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     print("agents     : %d" % agents)
     print("unread     : %d" % unread)
     print(host_measures_line(cfg))
+    # #2580 : un compte déclaré aussi par un autre mesh de l'hôte — signalé,
+    # sans changer le verdict par défaut (refuser arrêterait les deux meshes).
+    try:
+        from . import account_claims
+        for line in account_claims.doctor_lines(cfg, db=db):
+            print("accounts   : %s" % line)
+    except (OSError, ValueError) as exc:
+        print("accounts   : unreadable (%s)" % exc)
     # L106 : un agent mené sans unité d'exécuteur ne repart pas après une
     # coupure de l'hôte (signalé, sans changer le verdict)
     from . import hostcheck

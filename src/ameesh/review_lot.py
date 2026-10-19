@@ -133,9 +133,11 @@ FREEZE_TURN_WINDOW_S = 1800.0
 BLOCKING = ("un défaut **bloquant** (B, P1) trouvé après la fusion ouvre aussitôt un lot de "
             "correction, qui passe avant tout nouveau travail ; un défaut **non bloquant** "
             "(N, P2, P3) ne crée pas de lot : il va au backlog "
-            "(`ameesh work backlog add --title … --value … --score …`), regroupé avec les "
-            "autres défauts mineurs du même chantier (canon §2, owner du 15/10/2026 ; sur "
-            "ameesh, un P2 de la classe sensible bloque encore)")
+            "(`ameesh work backlog add --title … --value … --score … --review-of <lot>`), "
+            "regroupé avec les autres défauts mineurs du même chantier — sous le seuil de "
+            "lot du canon, une ligne du panier du chantier — et un défaut trouvé en "
+            "relisant une suite d'avis ne crée rien (canon §2, owner du 15/10/2026 puis du "
+            "19/10/2026 ; sur ameesh, un P2 de la classe sensible bloque encore)")
 
 
 def ref_of(lot: int) -> str:

@@ -16,7 +16,7 @@ script (il porte les motifs et les exemptions). Pour chaque clé du schéma
 `ameesh-mechanics` elle refuse les motifs littéraux connus — coupures et
 fuseau, cadence des paquets, plafond de lots en build, politique CI, familles
 et indépendance des avis, politique de fusion, seuils et plafonds de
-prévalidation — et exige une exemption nommée et datée pour un littéral
+prévalidation, seuil de lot du backlog (#2584) — et exige une exemption nommée et datée pour un littéral
 historique.
 
 Une exemption vit dans `EXEMPTIONS` ci-dessous : chemin, paramètre, littéral
@@ -89,6 +89,7 @@ SCHEMA_KEYS = (
     "prevalidation.hosts",
     "prevalidation.parts_script",
     "prevalidation.timeout_seconds",
+    "backlog.lot_min_value",
     "projects",
 )
 
@@ -130,6 +131,7 @@ BINDINGS = {
     "hosts": "prevalidation.hosts",
     "parts_script": "prevalidation.parts_script",
     "timeout_seconds": "prevalidation.timeout_seconds",
+    "lot_min_value": "backlog.lot_min_value",
 }
 
 #: constantes d'implémentation historiques dont le nom ne porte pas la clé
@@ -166,6 +168,7 @@ DICT_BINDINGS = {
     "cutoffs": "cutoffs",
     "timezone": "timezone",
     "schema": "schema",
+    "lot_min_value": "backlog.lot_min_value",
 }
 #: clés du bloc `prevalidation` dans un mapping, seulement dans un fichier
 #: qui parle de prévalidation
@@ -492,6 +495,9 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
                 and bool(value) and "/" in value)
     if key == "prevalidation.timeout_seconds":
         return prevalidation_context and type(value) is int and value > 0
+    if key == "backlog.lot_min_value":
+        # #2584 : un score de valeur (1 à 100), le seuil d'un lot du canon §2
+        return type(value) is int and 1 <= value <= 100
     return False
 
 
@@ -517,6 +523,8 @@ def _binding_key(name: str, value, train_context: bool,
         key = "packets.cutoffs" if "packet" in lower else "cutoffs"
     if key is None and lower.endswith("project_overrides"):
         key = "projects"
+    if key is None and lower.endswith("lot_min_value"):
+        key = "backlog.lot_min_value"
     if key is None:
         return None
     if key == "timezone" and not train_context:

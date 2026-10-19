@@ -230,6 +230,34 @@ class VerificationTest(unittest.TestCase):
         cache.keys(ISS, refresh=True, now=1062.0)              # fenêtre écoulée
         self.assertEqual(len(appels), 6)
 
+    def test_relecture_jwks_en_echec_bornee(self):
+        """#1854 : une tentative de rotation échouée compte dans la fenêtre."""
+        appels = []
+        panne = {"active": False}
+
+        def fetch(url):
+            appels.append(url)
+            if url.endswith("/.well-known/openid-configuration"):
+                return {"issuer": ISS, "jwks_uri": ISS + "/jwks"}
+            if panne["active"]:
+                raise oidc.OidcError("JWKS indisponible")
+            return {"keys": [self.ec.jwk()]}
+
+        cache = oidc.KeyCache(fetch=fetch, refresh_min_s=60.0)
+        cache.keys(ISS, now=1000.0)
+        self.assertEqual(len(appels), 2)
+        panne["active"] = True
+        with self.assertRaises(oidc.OidcError):
+            cache.keys(ISS, refresh=True, now=1001.0)      # premier échec rendu
+        self.assertEqual(len(appels), 4)                   # découverte + JWKS, une fois
+        for i in range(10):                                # dix jetons, même fenêtre
+            cles = cache.keys(ISS, refresh=True, now=1002.0 + i)
+            self.assertEqual(set(cles), {"ec1"})           # cache rendu, fail closed
+        self.assertEqual(len(appels), 4)
+        panne["active"] = False
+        cache.keys(ISS, refresh=True, now=1062.0)          # fenêtre écoulée : nouvel essai
+        self.assertEqual(len(appels), 6)
+
     def test_json_invalide_est_un_refus_nomme(self):
         """#1854 N3 : un JSON tronqué ou non UTF-8 est un OidcError."""
         class Reponse:
