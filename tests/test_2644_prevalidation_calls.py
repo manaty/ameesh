@@ -254,6 +254,14 @@ class RunTest(unittest.TestCase):
             got = self.call(lambda **kw: report(), database=fake_db)
         record.assert_called_once_with(fake_db, got)
 
+    def test_a_transport_report_is_not_persisted(self):
+        # Un no-vm n'est pas un run : la table des rapports ne le reçoit pas.
+        with mock.patch.object(pv, "record") as record:
+            got = self.call(lambda **kw: report(ok=False, causes=("no-vm",),
+                                                outcome="no-vm"))
+        self.assertEqual(got["outcome"], "no-vm")
+        record.assert_not_called()
+
     def test_persistence_failure_does_not_turn_a_green_run_into_a_refusal(self):
         fake_db = object()
         warnings = []
@@ -301,6 +309,14 @@ class FreezeTest(unittest.TestCase):
         outcome = self.freeze(raises=pv.PrevalidationError("no-vm", "vm absente"))
         self.assertEqual(outcome["state"], "unavailable")
         self.assertTrue(any("unavailable" in n and "no-vm" in n for n in self.notes))
+
+    def test_a_no_vm_report_is_unavailable_not_red(self):
+        # Le run d'offload peut rendre no-vm sans lever : ce n'est pas un rouge.
+        outcome = self.freeze(returns=report(ok=False, causes=("no-vm",),
+                                             outcome="no-vm"))
+        self.assertEqual(outcome["state"], "unavailable")
+        self.assertTrue(any("prevalidation unavailable" in n for n in self.notes))
+        self.assertFalse(any(n.startswith("prevalidation red") for n in self.notes))
 
     def test_a_freeze_without_sha_is_journaled(self):
         outcome = calls.after_freeze(None, object(), 2644, "")
@@ -382,6 +398,21 @@ class GateTrainTest(unittest.TestCase):
                 mock.patch.object(calls, "prepare", return_value=prepared), \
                 mock.patch.object(calls, "_run_hosts",
                                   side_effect=pv.PrevalidationError("no-vm", "absente")):
+            got = calls.gate_train(None, repo="/repo", head="a" * 40, base="b" * 40)
+        self.assertEqual(got["state"], "unavailable")
+        self.assertEqual(got["cause"], "no-vm")
+
+    def test_a_no_vm_report_does_not_block_publication(self):
+        prepared = SimpleNamespace(close=lambda: None)
+        with mock.patch.object(calls, "parameters",
+                               return_value=calls.Parameters(
+                                   params=params(), repo="/canon",
+                                   commit="c" * 40, project="ameesh")), \
+                mock.patch.object(calls, "map_for", return_value=("", "")), \
+                mock.patch.object(calls, "prepare", return_value=prepared), \
+                mock.patch.object(calls, "_run_hosts",
+                                  return_value=report(ok=False, causes=("no-vm",),
+                                                      outcome="no-vm")):
             got = calls.gate_train(None, repo="/repo", head="a" * 40, base="b" * 40)
         self.assertEqual(got["state"], "unavailable")
         self.assertEqual(got["cause"], "no-vm")

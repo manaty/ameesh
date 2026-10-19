@@ -54,6 +54,8 @@ PLAN_NAME = "ameesh-prevalidation-plan.json"
 PLAN_TIMEOUT = 900
 #: causes pour lesquelles un autre hôte déclaré au canon peut être essayé
 RETRYABLE = ("no-vm", "gate-preempted", "transport-lost")
+#: issues d'un run qui n'a pas exécuté la sélection : indisponible, pas rouge
+TRANSPORT_OUTCOMES = ("no-vm", "gate-preempted", "transport-lost")
 #: préfixe des notes du gel (lecture courte)
 JOURNAL_PREFIX = "prevalidation"
 #: artefact de la mesure carte (#161e) publié par `.github/workflows/carte.yml`
@@ -344,6 +346,21 @@ def prepare(repo: str, head: str, base: str, *, map_path: str = "",
 # le run et son rapport
 # --------------------------------------------------------------------------
 
+def report_state(report: dict) -> str:
+    """`green`, `red` ou `unavailable` : seul `run-red` est un rouge.
+
+    Un run incomplet (timeout, part sans fin, module muet), une préemption de
+    la porte ou un transport perdu ne disent pas qu'un test a échoué : selon
+    la décision pilote du 19/10, ils sont indisponibles et ne bloquent pas.
+    """
+    if report.get("ok"):
+        return "green"
+    causes = set(report.get("causes") or ())
+    if "run-red" in causes or report.get("outcome") == "run-red":
+        return "red"
+    return "unavailable"
+
+
 def describe(report: dict) -> str:
     """Le refus nommé d'un rapport : cause, tests en échec, modules muets."""
     bits: list[str] = []
@@ -403,7 +420,8 @@ def run(cfg, db, lot: int, *, repo: str, head: str, base: str, project: str,
             prepared.close()
         if cleanup:
             shutil.rmtree(cleanup, ignore_errors=True)
-    if record and db is not None:
+    if record and db is not None \
+            and str(report.get("outcome") or "") not in TRANSPORT_OUTCOMES:
         try:
             prevalidation.record(db, report)
         except Exception as exc:  # noqa: BLE001 - 0450 absente ou base en défaut
@@ -486,12 +504,13 @@ def gate_packet(cfg, db, item, decision: dict, *, repo: str = "",
     except Exception as exc:  # noqa: BLE001 - une indisponibilité, jamais un vert
         return {"state": "unavailable", "cause": "selection-unsafe",
                 "why": "%s: %s" % (type(exc).__name__, str(exc)[:300])}
-    causes = set(report.get("causes") or ())
-    if report.get("ok"):
+    state = report_state(report)
+    if state == "green":
         return {"state": "green", "report": report}
-    if "run-red" in causes or report.get("outcome") == "run-red":
+    if state == "red":
         return {"state": "red", "report": report, "why": describe(report)}
-    return {"state": "unavailable", "cause": (report.get("causes") or ("run-incomplete",))[0],
+    return {"state": "unavailable",
+            "cause": (report.get("causes") or ("run-incomplete",))[0],
             "why": describe(report), "report": report}
 
 
@@ -565,7 +584,7 @@ def _after_freeze(cfg, db, lot: int, sha: str, *, repo: str = "",
             JOURNAL_PREFIX, exc.cause, (" — " + exc.why) if exc.why else "")
         _journal(db, lot, text)
         return {"state": "unavailable", "cause": exc.cause, "why": exc.why}
-    state = "green" if report.get("ok") else "red"
+    state = report_state(report)
     text = "%s %s %s: %s" % (JOURNAL_PREFIX, state, head[:12], describe(report))
     _journal(db, lot, text)
     return {"state": state, "report": report}
@@ -612,10 +631,14 @@ def gate_train(cfg, *, repo: str, head: str, base: str, canon_repo: str = "",
             if cleanup:
                 shutil.rmtree(cleanup, ignore_errors=True)
     except prevalidation.PrevalidationError as exc:
-        if exc.cause in ("run-red", "run-incomplete"):
+        if exc.cause == "run-red":
             raise
         return {"state": "unavailable", "cause": exc.cause, "why": exc.why}
-    if not report.get("ok"):
-        raise prevalidation.PrevalidationError(
-            (report.get("causes") or ("run-red",))[0], describe(report))
+    state = report_state(report)
+    if state == "red":
+        raise prevalidation.PrevalidationError("run-red", describe(report))
+    if state == "unavailable":
+        return {"state": "unavailable",
+                "cause": (report.get("causes") or ("run-incomplete",))[0],
+                "why": describe(report), "report": report}
     return {"state": "green", "report": report}
