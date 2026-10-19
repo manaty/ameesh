@@ -79,7 +79,14 @@ service :
    `integration/**` encore en vol au créneau (paquet fusionné après la coupure,
    ou branche encore ouverte, lue en lecture seule) n'est pas un désaccord : il
    est exclu des « en trop » et nommé « porté par <paquet> en vol » dans
-   `carried` et `explanations`.
+   `carried` et `explanations`. La composition au créneau est **prouvée** au
+   dernier commit first-parent de la branche antérieur à la coupure, avec le
+   manifeste exact `reviews/integration-<paquet>.md` : le manifeste final d'une
+   branche enrichie après la coupure ne compte pas, et aucun manifeste d'un
+   autre paquet n'est repris (pas de repli). Sans preuve, le lot reste dans
+   `extra`, expliqué « porteur inconnu » ; une branche ouverte dont la dernière
+   composition avant la coupure dépasse six heures est tenue pour abandonnée,
+   jamais porteuse.
 
 L'inventaire de l'ombre applique la **même décision d'inscription** que le mode
 actif (`Enrollment.decide` : préparation, avis, puis frontière initiale et
