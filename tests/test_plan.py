@@ -1454,9 +1454,7 @@ class ContentMergeTest(_PlanDb):
                 tx.query("SELECT id FROM work_items WHERE id = %s FOR UPDATE",
                          (item["id"],))
                 thread.start()
-                # `pg_stat_activity.query` est tronqué à 1 Kio : le suffixe
-                # `FOR UPDATE` de la grande lecture tombe hors du texte lu.
-                self._wait_lock("work_migration_reservations")
+                self._wait_lock("SELECT migration_repo FROM work_items WHERE id =")
                 self.assertEqual(done, [])
             thread.join(10)
             self.assertFalse(thread.is_alive())
@@ -1468,6 +1466,43 @@ class ContentMergeTest(_PlanDb):
             thread.join(10)
             blocker.close()
             writer.close()
+
+    def test_2744_la_garde_prend_le_verrou_depot_avant_le_lot(self):
+        """Une transition qui tient le dépôt peut encore verrouiller le lot
+        pendant que la fermeture attend ce dépôt : aucun cycle de verrous."""
+        item = self._delivered("ordre-verrous")
+        self.db.execute("UPDATE work_items SET migration = 987, migration_repo = %s WHERE id = %s",
+                        ("acme/web", item["id"]))
+        blocker, closer = db_mod.connect(self.cfg), db_mod.connect(self.cfg)
+        results, errors = [], []
+
+        def close():
+            try:
+                results.append(work.close_merged(
+                    closer, item["id"], sha="a" * 40,
+                    content_guard=plan_git.content_retention))
+            except Exception as exc:
+                errors.append(repr(exc))
+
+        thread = threading.Thread(target=close)
+        try:
+            with blocker.transaction() as tx:
+                tx.execute("SELECT pg_advisory_xact_lock(hashtextextended("
+                           "current_schema() || ':migration-repo:' || %s, 0))",
+                           ("github.com/acme/web",))
+                thread.start()
+                self._wait_lock("pg_advisory_xact_lock(hashtextextended(")
+                tx.execute("SET LOCAL lock_timeout = '500ms'")
+                tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                         (item["id"],))
+            thread.join(10)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(results[0]["result"], "merged")
+        finally:
+            thread.join(10)
+            blocker.close()
+            closer.close()
 
     def test_2744_un_lot_qa_sans_hold_ferme_comme_avant(self):
         item = self._delivered("sans-hold")

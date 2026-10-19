@@ -615,6 +615,10 @@ class WorkItems(interface.WorkItems):
         courante (None s'il n'existe pas). Verrou commun avec les notes de
         retenue (`work.note` le prend avant `note`) : la lecture des hold et la
         fermeture par contenu ne peuvent plus s'entrelacer."""
+        # Même ordre que close_merged/move/réservation : dépôt avant lot.
+        # Prendre la ligne d'abord inverserait cet ordre lors de la fermeture.
+        if not _lock_migration_writer(self.db, item_id):
+            return None
         rows = self.db.query(
             "SELECT %s FROM work_items WHERE id = %%s FOR UPDATE" % item_columns(self.db),
             (int(item_id),))
