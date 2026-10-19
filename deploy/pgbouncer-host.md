@@ -168,6 +168,13 @@ every other alert from the database, still needs a working connection. A host
 without a local pool, or whose DSN does not use it yet, adds no probe; the
 warning is local to the host that runs the notifier.
 
+The console read is bounded (`PROBE_TIMEOUT_S`, 5 s): `connect_timeout` does
+not apply to a Unix-domain socket, and pgbouncer's `SHOW` commands have no
+statement timeout. A console that accepts the connection and stops answering
+therefore no longer hangs `ameesh alerts` (or ignores `SIGINT`): the probe
+gives up, the pass keeps every other alert family, and the console family is
+reported as `pgbouncer_console_unreadable` (#1179, #2582).
+
 Rollback, by bureau:
 
 ```sh

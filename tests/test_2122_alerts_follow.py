@@ -17,7 +17,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import alert_ack, canon, exploitation
+from ameesh import alert_ack, canon, exploitation, pgbouncer_local
 from ameesh.mediated_executor import availability
 
 
@@ -100,6 +100,27 @@ class FollowTest(unittest.TestCase):
         self.assertEqual([e["event"] for e in events], ["raised", "resolved"])
         self.assertEqual(events[1]["type"], "host_unavailable")
 
+    def test_une_console_muette_ne_resout_pas_la_file(self):
+        """#2582 : la console illisible ne dit rien de la file du pool."""
+        pool = {"type": "pgbouncer_pool_waiting", "agent": None, "host": "h1",
+                "since": None, "value": 3, "threshold": 1, "detail": "queue"}
+        console = {"type": "pgbouncer_console_unreadable", "agent": None,
+                   "host": "h1", "since": None,
+                   "detail": "local PgBouncer console unreadable: no answer"}
+        self.passes = [
+            ([pool], []),                                         # console lisible
+            ([console], [pgbouncer_local.FAMILY]),                # console muette
+            ([], []),                                             # lisible, file vide
+        ]
+        events = self.run_follow()
+        # la passe muette ne résout pas la file : elle n'est pas observée
+        self.assertEqual([(e["event"], e["type"]) for e in events][:2],
+                         [("raised", "pgbouncer_pool_waiting"),
+                          ("raised", "pgbouncer_console_unreadable")])
+        self.assertEqual([(e["event"], e["type"]) for e in events][2:],
+                         [("resolved", "pgbouncer_console_unreadable"),
+                          ("resolved", "pgbouncer_pool_waiting")])
+
 
 class ResolutionUnobservableTest(unittest.TestCase):
     """Le prédicat, isolé : hôte local, famille gate, champ d'observation."""
@@ -129,6 +150,14 @@ class ResolutionUnobservableTest(unittest.TestCase):
         self.assertFalse(exploitation._resolution_unobservable(
             {"type": "host_unavailable", "observation_host": None},
             [availability.GATE_FAMILY], SimpleNamespace(host=None)))
+
+    def test_console_muette_ne_resout_pas_la_file(self):
+        self.assertTrue(exploitation._resolution_unobservable(
+            {"type": "pgbouncer_pool_waiting"}, [pgbouncer_local.FAMILY], self.cfg))
+
+    def test_console_muette_ne_bloque_pas_les_autres_types(self):
+        self.assertFalse(exploitation._resolution_unobservable(
+            {"type": "long_turn"}, [pgbouncer_local.FAMILY], self.cfg))
 
 
 if __name__ == "__main__":
