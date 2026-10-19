@@ -65,6 +65,27 @@ class Banc(unittest.TestCase):
 
 
 class ScrubTest(Banc):
+    def test_concurrent_turns_keep_the_production_bin_hidden(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+
+        shims = str(self.base / "shims")
+        barrier = threading.Barrier(2)
+        replace = os.replace
+
+        def concurrent_replace(src, dst):
+            if Path(dst).name == "ameesh":
+                barrier.wait(timeout=5)
+            return replace(src, dst)
+
+        with self.en_venv(self.vivant), \
+             mock.patch.object(venv_guard.os, "replace", side_effect=concurrent_replace), \
+             ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: venv_guard.scrub(self.env(), shims), range(2)))
+        for env in results:
+            self.assertNotIn(str(self.vivant / "bin"), env["PATH"].split(os.pathsep))
+            self.assertEqual(shims, env["PATH"].split(os.pathsep)[0])
+
     def env(self):
         return {"VIRTUAL_ENV": str(self.vivant),
                 "PATH": os.pathsep.join([str(self.vivant / "bin"), str(self.autre),

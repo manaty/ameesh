@@ -30,6 +30,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 
 #: points d'entrée rendus au tour (les hooks des harnais appellent agent-mail)
 SHIMMED = ("ameesh", "agent-mail")
@@ -95,11 +96,19 @@ def install_shims(directory: str) -> str:
                     continue
         except OSError:
             pass
-        tmp = cible + ".tmp-%d" % os.getpid()
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(texte)
-        os.chmod(tmp, 0o755)
-        os.replace(tmp, cible)
+        # Les tours partagent le PID du runner : un fichier par écriture,
+        # pour qu'un thread ne renomme pas le temporaire d'un autre.
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                         dir=directory, delete=False) as fh:
+            tmp = fh.name
+            try:
+                fh.write(texte)
+                fh.flush()
+                os.chmod(tmp, 0o755)
+                os.replace(tmp, cible)
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
     return directory
 
 
