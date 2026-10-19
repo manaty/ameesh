@@ -69,10 +69,11 @@ l'attend, forfait d'abord, budget, hôte), et en plus :
   sans équipe connue n'est pas pris ;
 * l'agent sait le faire : les capacités exigées sont les siennes, et
   `harness:<nom>` désigne son harnais ;
-* un lot de relecture après fusion (`issue_ref` = `review-after-merge:#<lot>`,
-  #2377) n'est pris que par un agent de la famille opposée à celle de l'auteur
-  au gel (`review_lot.reviewer_family`) ; famille d'auteur inconnue : le lot
-  n'est pas pris au repos, il attend une attribution explicite ;
+* un lot de relecture après fusion (`issue_ref` ou `source` =
+  `review-after-merge:#<lot>`, #2377/#2552) n'est pris que par un agent de la
+  famille opposée à celle de l'auteur au gel (`review_lot.reviewer_family`) ;
+  famille d'auteur inconnue : le lot n'est pas pris au repos, il attend une
+  attribution explicite ;
 * un lot dont le début prévu (`planned_start`) est après aujourd'hui attend
   sa date ;
 * un lot avec une dépendance explicite encore ouverte attend son amont ;
@@ -211,7 +212,6 @@ BLOCKING_B = re.compile(r"(?:^|[\s\[(\"«])B[0-9]*\b")
 SENSITIVE_P2 = re.compile(r"p2[^.;\n]{0,30}sensible|sensible[^.;\n]{0,30}p2", re.I)
 #: a review-after-merge lot is the rule, not a review follow-up
 REVIEW_LOT_TITLE = re.compile(r"^\s*revue\s*#", re.I)
-REVIEW_REF = "review-after-merge:"
 
 
 def followup_hint(*, title: str, source: str = "", issue_ref: str = "",
@@ -245,7 +245,11 @@ def followup_hint(*, title: str, source: str = "", issue_ref: str = "",
     text = " ".join([str(title or ""), str(source or "")]).strip()
     if not text:
         return ""
-    if str(issue_ref or "").startswith(REVIEW_REF) \
+    # #2560 : la référence de relecture se lit comme partout ailleurs
+    # (`review_lot.review_ref`) : issue_ref d'abord, puis la source des lots
+    # historiques (#1218, #1231, #1269) qui ne l'ont que là.
+    from . import review_lot
+    if review_lot.review_ref({"issue_ref": issue_ref, "source": source}) \
             or REVIEW_LOT_TITLE.search(str(title or "")):
         return ""                       # the review-after-merge lot is the rule
     # A suite-of-**tests** phrase must not serve as a marker: it is neutralised,
@@ -581,9 +585,9 @@ def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
 
     `others` : les lignes du registre, pour la garde structurelle de classe
     (#803) — sans elles, un lot marqué n'est pas pris (doute -> sensible).
-    `db` : requis pour un lot de relecture après fusion (#2377) — sa famille
-    de preneur se relit sur le gel du lot d'origine ; sans base, un tel lot
-    n'est pas pris (doute -> refus).
+    `db` : requis pour un lot de relecture après fusion (#2377, #2552) — sa
+    famille de preneur se relit sur le gel du lot d'origine ; sans base, un tel
+    lot n'est pas pris (doute -> refus).
     """
     if auditor and not auditor_may_take(item, agent["name"], card):
         return False

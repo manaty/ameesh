@@ -214,7 +214,10 @@ local files). The lease is the only authorization to run.
   (`max(3, ttl/3)` second interval), and stops the process as soon as the
   database stays unreachable or the known lease deadline is reached. It
   **never sleeps past the deadline** (wake-up is bounded by
-  `lease_deadline`), even if the nominal interval is longer.
+  `lease_deadline`), even if the nominal interval is longer. It covers the
+  whole turn, from preparation (directory, harness, canon, accounting) to the
+  harness's exit, not only the published process: a short lease is renewed
+  during preparation instead of expiring before the `Popen` (#2544).
 * **Harness stop** — `terminate` signals the **process group** (the
   harness is launched in its own session, the pgid is recorded at launch):
   its descendants do not survive. SIGTERM, 3 seconds of grace for a clean

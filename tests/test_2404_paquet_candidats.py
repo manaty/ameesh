@@ -21,7 +21,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import lot_class, merge_queue, packet_candidates, resolutions, storage
+from ameesh import lot_class, merge_queue, packet_candidates, resolutions, storage, work
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -187,9 +187,17 @@ class InventoryTest(unittest.TestCase):
             3: [{"path": "migrations/0009_x.sql", "class": "sensitive", "rule": None}],
         }
         self.families = {"author": "deepseek", "reviewer": "claude"}
+        self.class_calls = []
+        self.head_classes: dict[str, tuple] = {}
 
-    def inventory(self, **kwargs):
+    def inventory(self, *, family=None, **kwargs):
         def fake_class(db, lot, **rest):
+            self.class_calls.append((lot, rest))
+            # #2496 : la classe du contenu composé d'une remise, par SHA
+            if rest.get("head") in self.head_classes:
+                cls, files = self.head_classes[rest["head"]]
+                return {"lot": lot, "class": cls, "doubt": False, "why": "test",
+                        "files": files}
             return {"lot": lot, "class": self.classes[lot], "doubt": False,
                     "why": "test", "files": self.files.get(
                         lot, [{"path": "src/ameesh/x.py", "class": "light", "rule": None}])}
@@ -199,7 +207,8 @@ class InventoryTest(unittest.TestCase):
 
         with mock.patch.object(storage, "of", return_value=self.store), \
                 mock.patch.object(lot_class, "of_lot", side_effect=fake_class), \
-                mock.patch.object(merge_queue, "actor_family", side_effect=fake_family):
+                mock.patch.object(merge_queue, "actor_family",
+                                  side_effect=family or fake_family):
             return packet_candidates.inventory(
                 object(), SimpleNamespace(name="ameesh", target="main"),
                 repo=self.repo, clone=self.clone, target="main", cfg=None, **kwargs)
@@ -236,6 +245,25 @@ class InventoryTest(unittest.TestCase):
         self.assertIn("verdicts-missing", [cause["code"] for cause in entry["causes"]])
         self.assertGreaterEqual(entry["gate"]["required"], 2)
 
+    def test_unreadable_registry_is_an_error_not_a_verdicts_missing_wait(self):
+        # #2521 : une lecture du registre impossible ne doit pas se lire
+        # « verdicts-missing » (le lot serait écarté du paquet comme sans avis).
+        def unreadable(db, name):
+            raise merge_queue.RegistryReadError(
+                'cannot read the agent registry for %s: column "aliases" does not exist'
+                % name)
+
+        payload = self.inventory(family=unreadable)
+        entry = self.by_id(payload)[1]
+        self.assertFalse(entry["ready"])
+        self.assertIn("aliases", entry["error"])
+        self.assertNotIn("verdicts-missing",
+                         [cause["code"] for cause in entry["causes"]])
+        self.assertIn(1, [e["work_item"] for e in payload["candidates"] if e["error"]])
+        self.assertTrue(any("aliases" in error for error in payload["errors"]))
+        self.assertNotIn(1, payload["waiting"])
+        self.assertNotIn(1, payload["ready"])
+
     def test_conflict_with_target_is_named(self):
         entry = self.by_id(self.inventory())[4]
         self.assertFalse(entry["ready"])
@@ -267,6 +295,28 @@ class InventoryTest(unittest.TestCase):
         payload = self.inventory()
         self.assertNotIn(10, [entry["work_item"] for entry in payload["candidates"]])
 
+    def test_class_reads_the_package_target_not_origin_head(self):
+        # #2464 : avec un origin/HEAD resté sur une release, la classe doit
+        # recevoir la cible du paquet (main), pas relire ce HEAD.
+        base = _git(self.repo, "rev-parse", self.tips[1] + "^")
+        _git(self.repo, "update-ref", "refs/remotes/origin/release/1.11.0", base)
+        _git(self.repo, "symbolic-ref", "refs/remotes/origin/HEAD",
+             "refs/remotes/origin/release/1.11.0")
+        payload = self.inventory()
+        call = next(rest for lot, rest in self.class_calls if lot == 1)
+        self.assertEqual(call["item"]["branch_target"], "main")
+        self.assertEqual(call["base"], payload["base"])
+
+    def test_origin_head_release_without_target_is_a_read_error(self):
+        base = _git(self.repo, "rev-parse", self.tips[1] + "^")
+        _git(self.repo, "update-ref", "refs/remotes/origin/release/1.11.0", base)
+        _git(self.repo, "symbolic-ref", "refs/remotes/origin/HEAD",
+             "refs/remotes/origin/release/1.11.0")
+        with self.assertRaises(packet_candidates.CandidateError):
+            packet_candidates.inventory(
+                object(), SimpleNamespace(name="ameesh", target=""),
+                repo=self.repo, clone=self.clone, target=None, cfg=None)
+
     def test_base_option_reproduces_a_manifest(self):
         base = _git(self.repo, "rev-parse", "main^")
         payload = self.inventory(base=base)
@@ -289,6 +339,186 @@ class InventoryTest(unittest.TestCase):
         self.assertIn("freeze-not-head", text)
         self.assertIn("ERREURS", text)
         self.assertIn("#99 : lecture impossible", text)
+
+
+class RemiseTest(InventoryTest):
+    """#2496 : une remise propre sur la cible rend un lot en conflit prêt
+    comme unité — parents (gel relu, commit de la cible), fusion propre avec
+    la base, et un verdict sur la remise ou une union mécanique."""
+
+    def _remise(self, lot: int, tail: str, content: dict, *, parent: str | None = None,
+                verdict: str | None = None) -> str:
+        """Fusionne main dans `parent` (le gel par défaut), résout avec
+        `content`, publie la ref de remise et, si demandé, un verdict dessus."""
+        _git(self.repo, "switch", "-q", "--detach", parent or self.tips[lot])
+        subprocess.run(["git", "-C", self.repo, "merge", "-q", "--no-ff", "-m", "remise",
+                        "main"], capture_output=True)
+        for path, text in content.items():
+            _write(self.repo, path, text)
+        _git(self.repo, "add", "-A")
+        if subprocess.run(["git", "-C", self.repo, "rev-parse", "-q", "--verify",
+                           "MERGE_HEAD"], capture_output=True).returncode == 0:
+            _git(self.repo, "commit", "-qm", "remise #%d sur main" % lot)
+        else:  # fusion déjà propre : la résolution s'y ajoute, mêmes parents
+            _git(self.repo, "commit", "-q", "--amend", "--no-edit", "--allow-empty")
+        sha = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "switch", "-q", "main")
+        ref = "refs/ameesh/resolutions/%d/%s" % (lot, tail)
+        _git(self.repo, "update-ref", ref, sha)
+        _git(self.repo, "push", "-q", "origin", "%s:%s" % (ref, ref))
+        if verdict:
+            self.marks[lot].append({"id": 9000 + len(self.marks[lot]), "work_item_id": lot,
+                                    "kind": "verdict", "sha": sha, "actor": "reviewer",
+                                    "verdict": verdict, "at_ts": 9000.0})
+        return sha
+
+    def _union_lot(self) -> None:
+        """Lot 11 : ajout pur en fin de liste ; main ajoute une autre ligne au
+        même endroit — un conflit que seule une union résout."""
+        _write(self.repo, "list.txt", "a\nb\n")
+        _commit(self.repo, "liste")
+        _git(self.repo, "switch", "-q", "-c", "lot/11-union")
+        _write(self.repo, "list.txt", "a\nb\nlot\n")
+        tip = _commit(self.repo, "#11")
+        _git(self.repo, "switch", "-q", "main")
+        _write(self.repo, "list.txt", "a\nb\nmain\n")
+        _commit(self.repo, "main ajoute")
+        self.tips[11] = tip
+        self.marks[11] = [{"id": 1100, "work_item_id": 11, "kind": "frozen", "sha": tip,
+                           "actor": "author", "verdict": None, "at_ts": 1100.0},
+                          {"id": 1101, "work_item_id": 11, "kind": "verdict", "sha": tip,
+                           "actor": "reviewer", "verdict": "ok", "at_ts": 1101.0}]
+        self.rows.append({"id": 11, "state": "qa", "app": "ameesh", "branch": "lot/11-union",
+                          "branch_target": None, "title": "lot 11", "assignee": "author",
+                          "priority": 2, "created_ts": 11.0})
+        self.classes[11] = "normal"
+        _git(self.repo, "push", "-q", "origin", "--all")
+
+    def test_remise_with_verdict_makes_the_lot_ready(self):
+        sha = self._remise(4, "main-abc", {"shared.py": "FOUR MAIN\ntwo\n"}, verdict="ok")
+        payload = self.inventory()
+        entry = self.by_id(payload)[4]
+        self.assertTrue(entry["ready"], entry["causes"])
+        self.assertEqual(entry["source"], sha)
+        self.assertEqual(entry["remise"]["cover"], "verdict")
+        self.assertIn(4, payload["ready"])
+        self.assertIn("remise refs/ameesh/resolutions/4/main-abc",
+                      candidates_script.render(payload))
+
+    def test_ready_lot_source_is_its_published_head(self):
+        entry = self.by_id(self.inventory())[1]
+        self.assertEqual(entry["source"], self.tips[1])
+        self.assertIsNone(entry["remise"])
+
+    def test_judged_remise_without_verdict_stays_conflict(self):
+        self._remise(4, "main-abc", {"shared.py": "FOUR MAIN\ntwo\n"})
+        entry = self.by_id(self.inventory())[4]
+        self.assertFalse(entry["ready"])
+        cause = next(c for c in entry["causes"] if c["code"] == "conflict")
+        self.assertIn("main-abc", cause["detail"])
+        self.assertIn("not a pure addition", cause["detail"])
+
+    def test_mechanical_union_needs_no_verdict(self):
+        self._union_lot()
+        sha = self._remise(11, "union-main-1", {"list.txt": "a\nb\nlot\nmain\n"})
+        entry = self.by_id(self.inventory())[11]
+        self.assertTrue(entry["ready"], entry["causes"])
+        self.assertEqual(entry["source"], sha)
+        self.assertEqual(entry["remise"]["cover"], "mechanical")
+
+    def test_union_with_extra_content_is_not_mechanical(self):
+        self._union_lot()
+        self._remise(11, "main-1", {"list.txt": "a\nb\nlot\nmain\n", "extra.py": "x\n"})
+        entry = self.by_id(self.inventory())[11]
+        self.assertFalse(entry["ready"])
+        self.assertIn("beyond the union", entry["remises"][0]["why"])
+
+    def test_blocked_verdict_on_a_union_refuses_it(self):
+        self._union_lot()
+        self._remise(11, "main-1", {"list.txt": "a\nb\nlot\nmain\n"}, verdict="blocked")
+        entry = self.by_id(self.inventory())[11]
+        self.assertFalse(entry["ready"])
+        self.assertIn("blocked", entry["remises"][0]["why"])
+
+    def test_remise_not_on_the_reviewed_freeze_is_refused(self):
+        parent = _git(self.repo, "rev-parse", self.tips[4] + "^")
+        self._remise(4, "main-old", {"shared.py": "MAIN\ntwo\n"}, parent=parent,
+                     verdict="ok")
+        entry = self.by_id(self.inventory())[4]
+        self.assertFalse(entry["ready"])
+        self.assertIn("reviewed freeze", entry["remises"][0]["why"])
+
+    def test_resolution_with_another_lot_is_not_a_remise(self):
+        self._remise(4, "12", {"shared.py": "FOUR MAIN\ntwo\n"}, verdict="ok")
+        entry = self.by_id(self.inventory())[4]
+        self.assertFalse(entry["ready"])
+        self.assertEqual(entry["remises"], [])
+
+    def test_remise_ref_on_the_freeze_never_hides_its_blocked_verdict(self):
+        """B1 (cx1) : une ref de remise qui pointe sur le gel lui-même (un
+        alias) ne fait pas disparaître le blocage rendu sur ce gel."""
+        self.marks[5].append({"id": 5000, "work_item_id": 5, "kind": "verdict",
+                              "sha": self.tips[5], "actor": "reviewer",
+                              "verdict": "blocked", "at_ts": 5000.0})
+        self.assertFalse(self.by_id(self.inventory())[5]["ready"])
+        ref = "refs/ameesh/resolutions/5/main-alias"
+        _git(self.repo, "update-ref", ref, self.tips[5])
+        _git(self.repo, "push", "-q", "origin", "%s:%s" % (ref, ref))
+        entry = self.by_id(self.inventory())[5]
+        self.assertFalse(entry["ready"])
+        self.assertIn("blocked-verdict", [c["code"] for c in entry["causes"]])
+
+    def test_remise_is_classed_on_its_composed_content(self):
+        """B2 (cx1, cx2) : une remise qui ajoute une migration passe la porte
+        de son contenu (deux avis), pas celle du gel normal (un avis)."""
+        sha = self._remise(4, "main-sql", {"shared.py": "FOUR MAIN\ntwo\n",
+                                           "migrations/9999_review.sql": "-- x\n"},
+                           verdict="ok")
+        self.head_classes[sha] = ("sensitive", [
+            {"path": "migrations/9999_review.sql", "class": "sensitive", "rule": None}])
+        entry = self.by_id(self.inventory())[4]
+        self.assertFalse(entry["ready"])
+        remise = entry["remises"][0]
+        self.assertFalse(remise["ok"])
+        self.assertEqual(remise["review_class"]["class"], "sensitive")
+
+    def test_remise_of_a_light_lot_needs_an_independent_verdict(self):
+        """B2 (cx1) : une porte légère à zéro avis ne prouve rien sur une
+        résolution jugée ; l'avis de l'auteur ne compte pas."""
+        self.classes[4] = "light"
+        sha = self._remise(4, "main-abc", {"shared.py": "FOUR MAIN\ntwo\n"})
+        self.marks[4].append({"id": 9500, "work_item_id": 4, "kind": "verdict", "sha": sha,
+                              "actor": "author", "verdict": "ok", "at_ts": 9500.0})
+        entry = self.by_id(self.inventory())[4]
+        self.assertFalse(entry["ready"])
+        self.marks[4].append({"id": 9501, "work_item_id": 4, "kind": "verdict", "sha": sha,
+                              "actor": "reviewer", "verdict": "ok", "at_ts": 9501.0})
+        entry = self.by_id(self.inventory())[4]
+        self.assertTrue(entry["ready"], entry["causes"])
+        self.assertEqual(entry["remise"]["cover"], "verdict")
+
+    def test_waiver_of_the_freeze_does_not_cover_a_remise(self):
+        """B2 (cx2) : la dispense `-none` du gel ne couvre pas la résolution
+        d'une remise jamais relue."""
+        for row in self.rows:
+            if row["id"] == 4:
+                row["reviewer"] = work.REVIEWER_NONE
+        self._remise(4, "main-abc", {"shared.py": "FOUR MAIN\ntwo\n", "extra.py": "x\n"})
+        entry = self.by_id(self.inventory())[4]
+        self.assertFalse(entry["ready"])
+        self.assertNotEqual(entry["remises"][0]["cover"], "waiver")
+
+    def test_is_remise_names(self):
+        self.assertTrue(packet_candidates.is_remise(
+            "refs/ameesh/resolutions/4/main-c85280ab", 4, "main"))
+        self.assertTrue(packet_candidates.is_remise(
+            "refs/ameesh/resolutions/4/union-main-1", 4, "main"))
+        self.assertFalse(packet_candidates.is_remise(
+            "refs/ameesh/resolutions/4/2479", 4, "main"))
+        self.assertFalse(packet_candidates.is_remise(
+            "refs/ameesh/resolutions/41/main-1", 4, "main"))
+        self.assertFalse(packet_candidates.is_remise(
+            "refs/ameesh/resolutions/4/develop-1", 4, "main"))
 
 
 class ReadyOutTest(unittest.TestCase):
@@ -325,6 +555,36 @@ class ReadyOutTest(unittest.TestCase):
             )
         self.assertEqual(code, 2)
         self.assertFalse(self.path.exists())
+
+    def test_script_exits_1_and_clears_ready_out_on_a_read_error(self):
+        # #2521 : une lecture du registre impossible rend la liste incomplète :
+        # code 1 et aucun export, comme une porte illisible.
+        self.path.write_text("#100\n", encoding="utf-8")
+        payload = {
+            "schema": "ameesh-packet-candidates/1", "project": "ameesh",
+            "repo": self.tmp, "clone": self.tmp, "target": "main",
+            "target_head": "a" * 40, "base": "a" * 40, "base_source": "target",
+            "candidates": [], "ready": [], "waiting": [],
+            "errors": ["#1 : cannot read the review gate: registry unreadable"],
+        }
+        project = SimpleNamespace(name="ameesh", target="main")
+        conn = mock.Mock()
+        with mock.patch.object(candidates_script.config, "load",
+                               return_value=object()), \
+                mock.patch.object(candidates_script, "resolve_project",
+                                  return_value=(project, True)), \
+                mock.patch.object(candidates_script.db, "connect", return_value=conn), \
+                mock.patch.object(candidates_script.merge_queue, "working_clone",
+                                  return_value=(self.tmp, None)), \
+                mock.patch.object(candidates_script.packet_candidates, "inventory",
+                                  return_value=payload):
+            code = candidates_script.main(
+                ["--repo", self.tmp, "--project", "ameesh", "--target", "main",
+                 "--ready-out", str(self.path)]
+            )
+        self.assertEqual(code, 1)
+        self.assertFalse(self.path.exists())
+        conn.close.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -57,6 +57,11 @@ pouvait le prendre (#2340). `required_family` relit la même preuve au moment
 de la prise et `may_take` n'ouvre le lot qu'à la famille opposée ; l'auteur
 inconnu ne se devine pas, et le lot attend alors une attribution explicite.
 
+#2552 : la référence d'un lot de relecture se lit aussi sur sa `source`. Des
+lots historiques la portent là avec un `issue_ref` GitHub (ou aucun) et
+échappaient à la garde de famille de #2377 ; la prise les écarte désormais de
+la famille de l'auteur de #N comme les lots courants.
+
 #2374 : une fusion classée `light` dont le diff touche pourtant la porte de
 fusion (`merge_queue.CRITICAL_SCOPE`) ouvre une relecture **sensible** à deux
 avis de familles distinctes. L'ouverture écrit en outre, au journal du lot
@@ -399,22 +404,38 @@ def _author_at_freeze(db, lot: int, item: dict) -> dict:
     return out
 
 
+def review_ref(item: dict) -> str:
+    """La référence `review-after-merge:#<lot>` que porte le lot (#2552).
+
+    `issue_ref` d'abord — c'est la marque écrite par l'ouverture —, puis
+    `source` : des lots de relecture plus anciens portent la référence en
+    `source` seulement, avec un `issue_ref` GitHub ou vide (#1218, #1231,
+    #1269). Rend "" hors lot de relecture ; la chaîne brute (minuscule) sinon,
+    que `required_family` valide."""
+    item = item or {}
+    for field in ("issue_ref", "source"):
+        ref = str(item.get(field) or "").strip().lower()
+        if ref.startswith(PREFIX):
+            return ref
+    return ""
+
+
 def required_family(db, item: dict) -> Optional[str]:
     """La famille de harnais qu'exige la prise d'un lot de relecture (#2377).
 
-    `None` quand ce n'est pas un lot de relecture (`issue_ref` hors du préfixe
-    `review-after-merge:`) : aucune garde. Une chaîne vide quand la famille de
-    l'auteur au gel est inconnue, ou quand sa trace est illisible : le lot
-    n'est alors **pris par personne** au repos (doute -> non pris, canon §8) et
-    attend une attribution explicite. Sinon la famille opposée à celle de
-    l'auteur au gel (`reviewer_family`), celle que le canon §2 demande au
-    relecteur.
+    `None` quand ce n'est pas un lot de relecture (ni `issue_ref` ni `source`
+    sous le préfixe `review-after-merge:`, #2552) : aucune garde. Une chaîne
+    vide quand la famille de l'auteur au gel est inconnue, ou quand sa trace
+    est illisible : le lot n'est alors **pris par personne** au repos (doute ->
+    non pris, canon §8) et attend une attribution explicite. Sinon la famille
+    opposée à celle de l'auteur au gel (`reviewer_family`), celle que le canon
+    §2 demande au relecteur.
 
     La lecture réutilise `_author_at_freeze` : c'est la même preuve que celle
     qui a écrit le corps du lot (gel, acteur, tours tracés), jamais le registre
     courant — il ne dit rien du harnais qui a produit le travail (#1053)."""
-    ref = str((item or {}).get("issue_ref") or "").strip().lower()
-    if not ref.startswith(PREFIX):
+    ref = review_ref(item)
+    if not ref:
         return None
     try:
         lot = int(ref[len(PREFIX):].strip().lstrip("#"))
@@ -807,7 +828,10 @@ def guard_delivery(db, item: dict) -> dict:
             continue
         if author and actor and actor.lower() == author.lower():
             continue                  # on ne relit pas son propre travail
-        family = merge_queue.actor_family(db, actor)
+        try:
+            family = merge_queue.actor_family(db, actor)
+        except merge_queue.RegistryReadError:
+            family = ""              # #2521 : lecture impossible, famille non prouvée
         if family and author_family and family == author_family:
             continue                  # la famille de l'auteur ne compte pas
         if required >= 2:
@@ -922,8 +946,16 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
                 "policy_ref": "", "repo": where or "", "target": target or "",
                 "frozen_sha": "", "doubt": True}
     try:
-        return lot_class.of_lot(db, int(lot), cfg=getattr(db, "cfg", None), item=item,
-                                repo=where or None, base=base or None, head=head or None)
+        # #2464 : la base est un commit, illisible pour l'axe release ; la
+        # cible déjà résolue (`target`) porte cet axe quand la ligne du lot ne
+        # le fait pas. Sans elle, `of_lot` relirait `origin/HEAD` — ou ne
+        # verrait plus une release.
+        class_item = item
+        if target and not item.get("branch_target"):
+            class_item = dict(item, branch_target=target)
+        return lot_class.of_lot(db, int(lot), cfg=getattr(db, "cfg", None),
+                                item=class_item, repo=where or None,
+                                base=base or None, head=head or None)
     except Exception as exc:  # noqa: BLE001 - un doute, jamais une exception
         return {"class": "", "why": "%s: %s" % (type(exc).__name__, str(exc)[:200]),
                 "doubt": True}
@@ -989,9 +1021,11 @@ CATCH_UP_LIMIT = 20
 
 
 def merged_sha(db, lot: int) -> str:
-    """Le commit du dernier jalon `merged` du lot, ou "" (best effort)."""
+    """Le commit du dernier jalon `merged` EFFECTIF du lot, ou "" (best effort).
+    Un jalon annulé par une correction `merged → build` est ignoré (#2317/N5)."""
     try:
-        rows = [m for m in work.milestones(db, int(lot)) if m.get("kind") == "merged"]
+        rows = [m for m in work.milestones(db, int(lot))
+                if m.get("kind") == "merged" and not m.get("annulled")]
     except Exception:  # noqa: BLE001 - pas de jalon lisible : pas de commit
         return ""
     if not rows:

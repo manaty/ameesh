@@ -20,7 +20,7 @@ import unittest
 from unittest import mock
 
 from ameesh import (lot_class, mail, merge_queue, packet_guard, plan_git, plan_github, radar,
-                    resolutions, storage, work)
+                    registry, resolutions, storage, work)
 
 from .support import PgTestCase
 from .test_l160b_radar import LOTS, MIG, _git, _write, git_env, make_repo
@@ -1480,6 +1480,22 @@ class QueueWithoutRadarTest(PgTestCase):
         self.addCleanup(shutil.rmtree, scratch, True)
         self.assertTrue(os.path.isdir(scratch))
         self.assertEqual(os.path.dirname(clone.path), scratch)
+
+
+class ActorFamilyReadTest(unittest.TestCase):
+    """#2521 : lecture du registre impossible ≠ famille inconnue."""
+
+    def test_an_unknown_agent_is_an_unknown_family(self):
+        with mock.patch.object(registry, "get", return_value=None):
+            self.assertEqual(merge_queue.actor_family(None, "ghost"), "")
+
+    def test_an_unreadable_registry_raises_a_read_error(self):
+        with mock.patch.object(
+                registry, "get",
+                side_effect=RuntimeError('column "aliases" does not exist')):
+            with self.assertRaises(merge_queue.RegistryReadError) as caught:
+                merge_queue.actor_family(None, "author")
+        self.assertIn("aliases", str(caught.exception))
 
 
 if __name__ == "__main__":

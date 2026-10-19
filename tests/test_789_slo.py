@@ -84,10 +84,12 @@ class NiveauxTest(unittest.TestCase):
         self.assertEqual(slo.targets(2), ("pilot",))
         self.assertEqual(slo.targets(3), ("bureau", "auditeur"))
 
-    def test_p1_ajoute_l_owner(self):
-        self.assertEqual(slo.targets(1, critical=True), ("assignee", "owner"))
-        self.assertEqual(slo.targets(3, critical=True),
-                         ("bureau", "auditeur", "owner"))
+    def test_p1_ajoute_bureau_et_auditeur(self):
+        # #2395 : le niveau 4 vise le bureau et l'auditeur, jamais l'owner
+        # (canon §9, décision owner 18/10).
+        self.assertEqual(slo.targets(1, critical=True),
+                         ("assignee", "bureau", "auditeur"))
+        self.assertEqual(slo.targets(3, critical=True), ("bureau", "auditeur"))
 
     def test_delai_p1(self):
         self.assertEqual(slo.target_s(slo.step_of("build_quiet")), 7200)
@@ -120,13 +122,13 @@ class MesureTest(unittest.TestCase):
         self.assertEqual(row["targets"], ("pilot",))
         self.assertEqual(row["overdue_s"], 7200 - 3600)
 
-    def test_p1_signal_assigne_notifie_l_owner(self):
+    def test_p1_signal_assigne_vise_bureau_et_auditeur(self):
         item = _item(priority=1)
         rows = slo.lot_steps(item, _jalons(item, []), [], now=T0 + 7200)
         row = self._row(rows, "signal_assigned")
         self.assertEqual(row["target_s"], 900)
         self.assertEqual(row["level"], 3)
-        self.assertEqual(row["targets"], ("bureau", "auditeur", "owner"))
+        self.assertEqual(row["targets"], ("bureau", "auditeur"))
 
     def test_intake_demarre(self):
         events = [_ev("intake", T0), _ev("build", T0 + 1800)]

@@ -175,6 +175,39 @@ class GateTest(unittest.TestCase):
         self.assertFalse(self.gate(klass, "codex")["ok"])
         self.assertTrue(self.gate(klass, "codex", "claude")["ok"])
 
+    def test_an_unreadable_registry_is_a_read_error_not_an_unknown_family(self):
+        # #2521 : la porte refuse toujours (l'indépendance ne se suppose pas),
+        # mais le diagnostic nomme la lecture impossible, pas un avis manquant.
+        klass = {"class": "normal", "doubt": False, "files": []}
+        marks = [{"kind": "verdict", "verdict": "ok", "sha": HEAD,
+                  "actor": "codex", "at_ts": 1, "id": 1}]
+        error = merge_queue.RegistryReadError(
+            'cannot read the agent registry for author: column "aliases" does not exist')
+        with mock.patch.object(merge_queue, "actor_family", side_effect=error):
+            gate = merge_queue.review_gate(None, marks, HEAD, klass=klass,
+                                           item={"assignee": "author"})
+        self.assertFalse(gate["ok"])
+        self.assertIn("aliases", gate["error"])
+        self.assertIn("registry cannot be read", gate["why"])
+
+    def test_an_unreadable_registry_for_a_reviewer_is_a_read_error(self):
+        klass = {"class": "normal", "doubt": False, "files": []}
+        marks = [{"kind": "verdict", "verdict": "ok", "sha": HEAD,
+                  "actor": "codex", "at_ts": 1, "id": 1}]
+
+        def family(_db, name):
+            if name == "author":
+                return "deepseek"
+            raise merge_queue.RegistryReadError(
+                "cannot read the agent registry for codex: connection lost")
+
+        with mock.patch.object(merge_queue, "actor_family", side_effect=family):
+            gate = merge_queue.review_gate(None, marks, HEAD, klass=klass,
+                                           item={"assignee": "author"})
+        self.assertFalse(gate["ok"])
+        self.assertIn("connection lost", gate["error"])
+        self.assertIn("reviewer codex", gate["why"])
+
 
 if __name__ == "__main__":
     unittest.main()

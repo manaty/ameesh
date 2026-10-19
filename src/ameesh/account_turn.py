@@ -97,7 +97,10 @@ def choose(worker, book=None, *, pause: bool = True, margin: bool | None = None)
                                  critical=is_critical(worker), margin=bool(margin),
                                  # #1580 (tranche 3) : les seaux propres au
                                  # modèle de l'agent comptent pour lui seul
-                                 model=session_model(worker, book))
+                                 model=session_model(worker, book),
+                                 # #2580 : politique et registre des comptes
+                                 # partagés de l'hôte
+                                 cfg=worker.cfg)
     except db_mod.Unavailable:
         # Base injoignable (L72) : ce n'est ni une pause budget ni un problème
         # de migration — l'exécuteur suspend les tours et réessaie, avec son
@@ -156,7 +159,7 @@ def fallback(worker, reason: str, limits=None) -> str:
                     # #1580 (tranche 3) : sous un harnais emprunté, le tour
                     # part sans modèle (runner) : modèle inconnu, les seaux
                     # de modèle sont écartés
-                    model="")
+                    model="", cfg=worker.cfg)
                 if choice.profile is None or choice.auth_blocked:
                     continue
                 profile = choice.profile
@@ -307,8 +310,10 @@ def for_turn(worker):
         return INVALID
     if not items:
         return None
-    if worker._account is not None and accounts.by_name(items, worker._account.name):
-        return worker._account
+    if worker._account is not None:
+        fresh = accounts.by_name(items, worker._account.name)
+        if fresh is not None:
+            return fresh
     try:
         return accounts.current(worker.db, worker.cfg.host, harness, items)
     except db_mod.Unavailable:
@@ -653,7 +658,7 @@ def _own_hold(cfg, db, name: str, harness: str, items: list, limites, *, now: fl
                              **limites.book_kwargs())
     choice = accounts.choose(db, cfg.host, harness, items, book, now=now, agent=name,
                              environ=environ, simulate=True, critical=critical,
-                             paced=paced, margin=margin)
+                             paced=paced, margin=margin, cfg=cfg)
     if choice.profile is None:
         return choice.reason, False
     if choice.auth_blocked:
@@ -691,7 +696,7 @@ def _fallback_available(cfg, db, name: str, own: str, limites, *, now: float,
             if items:
                 choice = accounts.choose(db, cfg.host, harness, items, book, now=now,
                                          agent=name, environ=environ, simulate=True,
-                                         critical=True)
+                                         critical=True, cfg=cfg)
                 if choice.profile is None or choice.auth_blocked:
                     continue
             elif book.pace_exceeded(harness):

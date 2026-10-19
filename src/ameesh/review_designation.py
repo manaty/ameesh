@@ -480,11 +480,6 @@ def manual_reviewer_message(lot: Mapping, *, freeze: Optional[Mapping] = None,
     return "\n".join(lines)
 
 
-#: how many recent mails of a reviewer are read to find an earlier request
-#: (#2495): a designation reads the reviewer's history, not the whole mailbox.
-REQUEST_HISTORY = 200
-
-
 def _request_sha(row: Mapping) -> Optional[str]:
     """Review request head, empty before freeze, None for another mail."""
     payload = row.get("payload") or {}
@@ -513,7 +508,9 @@ def covering_request(rows: Iterable[Mapping], *, lot, reviewer: str,
 
     One request per reviewer and head: a re-designation, or a manual
     designation followed by the automatic one at the freeze, sends no second
-    mail. `rows` are the reviewer's mails (`mail.history`). A request covers
+    mail. `rows` are the requests already addressed to the reviewer for this
+    lot (`mail.review_requests`, #2504): the lot is filtered in storage, so no
+    `history` window can hide an old request. A request covers
     the new one when it names the same frozen head, or when it names no head
     (manual designation before the freeze) and is either still unread — the
     reviewer will read it and review the frozen head — or the new one names no

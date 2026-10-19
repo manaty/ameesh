@@ -2,9 +2,11 @@
 
 Contrat figé par le lot L107 (version `1.0.0`, schéma
 `ameesh-exec-contract/1`), complété à l'assemblage de la voie B (version
-`1.1.0`, compatible : voir « Contrat 1.1 »), par l'expiration médiée des fils
-(version `1.2.0`, compatible : voir « Contrat 1.2 ») puis par la résolution
-d'alias des agents (#423, version `1.3.0`, compatible : voir « Contrat 1.3 »).
+`1.1.0`, compatible : voir « Contrat 1.1 »), par la version `1.2.0`, compatible,
+qui porte deux ajouts — l'expiration médiée des fils (#499, voir « Contrat 1.2 »)
+et l'aperçu d'activité (#1349, voir « Aperçu d'activité ») — puis par la
+résolution d'alias des agents (#423, version `1.3.0`, compatible : voir
+« Contrat 1.3 »).
 Étude et décision : `docs/design/etudes/executeur-mediee.md`,
 `docs/design/decisions/00xx-executeur-mediee.md`.
 
@@ -17,7 +19,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 67 opérations et la liste des 394 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 67 opérations et la liste des 396 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -65,7 +67,7 @@ Comptes : 67 opérations, dont 26 lectures et 41 écritures. 57 passent par
 lignes de `op` sont marquées `session: true` (contrats 1.1, 1.2 et 1.3) :
 elles sont servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (461
+signature et les mêmes types. Il vérifie aussi que l'interface entière (463
 opérations) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
@@ -151,6 +153,11 @@ Human key registration, owner registration auditing and owner confirmation
 are outside the mediated executor's scope, alongside key registration and
 revocation. The admitted operations and contract version remain unchanged.
 
+`mailbox.review_requests` (#2504 : les demandes de relecture d'un lot, lues
+par destinataire, nature et lot, sans la fenêtre de `mailbox.history`) est
+refusée de même : la déduplication d'une désignation de relecteur est tenue
+par le serveur du mesh, jamais par un appareil.
+
 ## Requête et réponse
 
 ```
@@ -219,22 +226,6 @@ fait la correspondance.
 
 Un réveil ne fait jamais foi : l'exécuteur relit toujours la base.
 
-## Contrat 1.2 : aperçu d’activité
-
-L'ajout compatible #1349 admet uniquement `operations.publish_peek(name,
-owner, epoch, payload)` depuis la route `op`, portée B, sous un bail vivant
-de l'agent admis. Le serveur force owner et epoch depuis l'enveloppe,
-masque et borne le contenu avant écriture. Une clé d'idempotence est requise.
-Les champs acceptés sont la branche et le diff stat suivis, des extraits
-publics et des noms/états d'outils ; pensées, arguments, sorties et champs
-inconnus sont exclus. Le jeu doré et son générateur couvrent cette opération.
-
-`operations.read_peek` reste refusée à tout exécuteur et toute session. La
-lecture passe par l'API humaine `/api/v1/agents/{agent}/peek`, avec contrôle du
-responsable déclaré. Déployer la migration additive 0436 et le serveur avant
-les nouveaux exécuteurs ; un ancien serveur refuse la nouvelle opération et
-l'aperçu est alors absent ou périmé, sans bloquer le harnais.
-
 ## Contrat 1.1
 
 L'assemblage de la voie B (L108 à L114) a relevé des écarts entre le
@@ -291,15 +282,16 @@ table : aucun écart n'est toléré d'un côté seulement.
   l'exécuteur ou que l'agent est hors de son invitation. Les commandes
   sont `ameesh host` (serveur) et `ameesh device` (appareil).
 
-## Contrat 1.2
+## Contrat 1.2 : expiration des fils (#499)
 
 L'expiration des fils d'un exécuteur médié (L361b, #499) ajoute une
 opération, `threads.recount` : le fil est un fichier sur l'appareil,
 l'index (`thread_index`) est sur le serveur. L'appareil réécrit son fichier
 sous son propre verrou, puis cette seule opération verrouille la ligne
 d'index, reprend le census du fichier et l'écrit dans la même transaction.
-L'ajout est compatible : la version passe à `1.2.0` et une sixième ligne de
-`op` est marquée `session: true`.
+L'ajout est compatible : la version `1.2.0` est introduite ici et une
+sixième ligne de `op` est marquée `session: true` ; l'aperçu d'activité
+(#1349), ci-dessous, ajoute une seconde opération à la même version.
 
 - **`threads.recount`** (écriture, portée H, sans enveloppe de bail) :
   `project`, `lot`, `transport`, `host` (forcé à celui de l'exécuteur),
@@ -326,6 +318,31 @@ L'ajout est compatible : la version passe à `1.2.0` et une sixième ligne de
   deux en 1.2.0) ; seule la répartition des écritures change.
 - **Sans connexion, rien n'expire** : `fil expire` refuse et ne touche à
   aucun fichier ; `--dry-run` liste ce qui expirerait.
+
+## Aperçu d’activité (ajout 1.2, #1349)
+
+L'ajout compatible #1349 admet uniquement `operations.publish_peek(name,
+owner, epoch, payload)` depuis la route `op`, portée B, sous un bail vivant
+de l'agent admis. `name` est le `param_agent` de l'opération : il doit être
+celui de l'agent de l'enveloppe (`fence.agent`), sinon `validate_request`
+refuse en `bad_args` avant toute écriture. `publish_peek` ne reçoit que
+owner et epoch forcés et recontrôle le bail en base ; l'égalité des noms
+n'est pas dupliquée. Le serveur force owner et epoch depuis l'enveloppe,
+masque et borne le contenu avant écriture. Une clé d'idempotence est requise.
+Les champs acceptés sont la branche et le diff stat suivis, des extraits
+publics et des noms/états d'outils ; pensées, arguments, sorties et champs
+inconnus sont exclus. Le contenu écrit reste borné à 128 Kio (CHECK de la
+migration 0436). Le jeu doré et son générateur couvrent cette opération.
+
+`operations.read_peek` reste refusée à tout exécuteur et toute session. La
+lecture passe par l'API humaine `/api/v1/agents/{agent}/peek`, avec contrôle du
+responsable déclaré. Le refus est générique et ne sélectionne aucune donnée :
+un lecteur inconnu ou vide, ou un agent dont le `responsible` est vide,
+reçoit le même `403`. La réponse du lecteur est bornée à 144 Kio (128 Kio de
+charge utile + 16 Kio de métadonnées), au-dessus de la borne d'écriture.
+Déployer la migration additive 0436 et le serveur avant
+les nouveaux exécuteurs ; un ancien serveur refuse la nouvelle opération et
+l'aperçu est alors absent ou périmé, sans bloquer le harnais.
 
 ## Contrat 1.3
 
@@ -529,7 +546,7 @@ Le client vit dans `src/ameesh/storage/remote/` :
 
 | Fichier | Rôle |
 |---|---|
-| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 66 opérations), `LeaseBook` (carnet des baux) |
+| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 67 opérations), `LeaseBook` (carnet des baux) |
 | `http.py` | `HttpTransport(ExecTransport)`, `StaticTokenSource`, `FileTokenSource` |
 | `events.py` | `RemoteSubscription` : SSE, repli en attente longue, curseur gardé |
 | `__init__.py` | `connect(cfg)`, `set_token_source_factory` (point d'attache de L110) |

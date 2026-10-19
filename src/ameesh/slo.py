@@ -20,10 +20,14 @@ Escalade (§9), à chaque dépassement :
    réassigne ;
 3. au triple — ou si le pilote est lui-même en retard — le bureau ou
    l'auditeur réassigne directement à un agent libre ;
-4. pour un P1, ou si rien n'est possible sans l'owner, notification à l'owner.
+4. pour un P1, le bureau traite, avec l'auditeur en copie. **Aucun
+   dépassement de délai n'est notifié à l'owner** (décision de l'owner du
+   18/10/2026 vers 08:00 : « rien sur les SLO ») : le niveau 4 vise le bureau
+   et l'auditeur, jamais l'owner.
 
 Un lot P1 (priorité 1, « high ») porte le délai court de la colonne
-« P1 / bloquant » et notifie l'owner dès le premier dépassement.
+« P1 / bloquant » et vise le bureau et l'auditeur dès le premier dépassement ;
+aucun dépassement n'est notifié à l'owner.
 """
 from __future__ import annotations
 
@@ -95,9 +99,9 @@ LEVEL_TARGETS = {
     2: ("pilot",),
     3: ("bureau", "auditeur"),
 }
-#: Le niveau 4 n'a pas de seuil propre : un P1 le déclenche, sinon « rien n'est
-#: possible sans l'owner » se constate au niveau 3.
-OWNER = "owner"
+#: #2395 : le niveau 4 n'a pas de seuil propre — un P1 le déclenche. Il vise le
+#: bureau et l'auditeur, jamais l'owner (canon §9, décision owner 18/10).
+CRITICAL_TARGETS = ("bureau", "auditeur")
 
 
 def step_of(key: str) -> Step:
@@ -126,10 +130,13 @@ def level(elapsed_s: float, target: float) -> int:
 
 
 def targets(level_: int, *, critical: bool = False) -> tuple:
-    """Les destinataires du niveau atteint ; un P1 y ajoute l'owner (§9.4)."""
+    """Les destinataires du niveau atteint ; un P1 y ajoute le bureau et
+    l'auditeur (niveau 4, canon §9) — jamais l'owner."""
     out = list(LEVEL_TARGETS.get(int(level_), ()))
-    if critical and OWNER not in out:
-        out.append(OWNER)
+    if critical:
+        for role in CRITICAL_TARGETS:
+            if role not in out:
+                out.append(role)
     return tuple(out)
 
 

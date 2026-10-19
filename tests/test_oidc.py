@@ -191,6 +191,76 @@ class VerificationTest(unittest.TestCase):
         with self.assertRaises(oidc.OidcError):
             self.verifier(jeton(_CleEC(kid="fantome"), "ES256"))
 
+    def test_kid_non_chaîne_du_jeton_refuse(self):
+        """#1854 N1 : un `kid` liste/objet est un OidcError, jamais un TypeError."""
+        for kid in (["rsa1"], {"k": "rsa1"}):
+            with self.assertRaises(oidc.OidcError, msg=repr(kid)):
+                self.verifier(jeton(self.rsa, "RS256", _header={"kid": kid}))
+
+    def test_cle_a_kid_non_hashable_ignoree(self):
+        """#1854 N1 : une clé au `kid` non chaîne ne fait pas tomber la sélection."""
+        def fetch(url):
+            if url.endswith("/.well-known/openid-configuration"):
+                return {"issuer": ISS, "jwks_uri": ISS + "/jwks"}
+            return {"keys": [{"kty": "RSA", "kid": ["fantome"]},
+                             {"kty": "RSA", "kid": {"x": 1}},
+                             self.ec.jwk()]}
+
+        cles = oidc.KeyCache(fetch=fetch).keys(ISS)
+        self.assertEqual(set(cles), {"ec1"})
+
+    def test_relecture_jwks_bornee(self):
+        """#1854 N2 : la relecture de rotation est au plus d'une par fenêtre."""
+        appels = []
+
+        def fetch(url):
+            appels.append(url)
+            if url.endswith("/.well-known/openid-configuration"):
+                return {"issuer": ISS, "jwks_uri": ISS + "/jwks"}
+            return {"keys": [self.ec.jwk()]}
+
+        cache = oidc.KeyCache(fetch=fetch, refresh_min_s=60.0)
+        cache.keys(ISS, now=1000.0)                            # découverte + JWKS
+        self.assertEqual(len(appels), 2)
+        cache.keys(ISS, refresh=True, now=1001.0)              # première rotation
+        self.assertEqual(len(appels), 4)
+        for i in range(10):                                    # dix `kid` inconnus
+            cache.keys(ISS, refresh=True, now=1002.0 + i)
+        self.assertEqual(len(appels), 4)                       # aucune requête de plus
+        cache.keys(ISS, refresh=True, now=1062.0)              # fenêtre écoulée
+        self.assertEqual(len(appels), 6)
+
+    def test_json_invalide_est_un_refus_nomme(self):
+        """#1854 N3 : un JSON tronqué ou non UTF-8 est un OidcError."""
+        class Reponse:
+            def __init__(self, corps):
+                self.corps = corps
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def geturl(self):
+                return ISS + "/jwks"
+
+            def read(self, n):
+                return self.corps
+
+        class Ouvreur:
+            def __init__(self, corps):
+                self.corps = corps
+
+            def open(self, req, timeout=None):
+                return Reponse(self.corps)
+
+        for corps in (b'{"keys": [', b"\xff\xfe{}"):
+            with mock.patch.object(oidc, "_OPENER", Ouvreur(corps)):
+                with self.assertRaises(oidc.OidcError) as ctx:
+                    oidc._fetch_json(ISS + "/jwks")
+            self.assertIn("JSON", str(ctx.exception))
+
     @_AVEC_CRYPTO
     def test_cle_rsa_trop_courte(self):
         self.assertFalse(oidc.rsa_verify(2 ** 1023 + 1, 65537, b"m", b"\x00" * 128))
