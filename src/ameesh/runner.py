@@ -4212,6 +4212,11 @@ class AgentWorker(threading.Thread):
             # Le prioritaire passe devant la consigne en attente : c'est lui qui
             # ouvre le tour, la consigne interrompue suivra (0018).
             self.nudged = False
+            # L77 rang 1 : un message humain ne se mélange jamais au courrier ;
+            # l'urgence humaine passe avant tout le reste et porte l'enveloppe.
+            humans = [m for m in autorises if self._from_human(m)]
+            if humans:
+                return self._human_spec("urgent", humans)
             return self._courrier_spec("urgent", autorises)
         if self.suite:
             lot = self.turn_lot({"kind": "suite", "prompt": "", "ids": []})
@@ -4249,6 +4254,15 @@ class AgentWorker(threading.Thread):
                                                      deferred=self._lot_deferred)
             messages = reveil + messages
         if messages:
+            # L77 rang 2 : les messages d'humains arrivent groupés, dans une
+            # entrée à eux, avec l'enveloppe écrite par ameesh. Le courrier
+            # suit au tour d'après : jamais la même entrée (étude §2).
+            humans = [m for m in messages
+                      if self._from_human(m) and not mail.passive_reason(m)]
+            if humans:
+                self.nudged = False
+                self._reprise_attach = False
+                return self._human_spec("mail", humans)
             spec = self._mail_spec(messages)
             if spec is not None:
                 self.nudged = False
@@ -4544,6 +4558,53 @@ class AgentWorker(threading.Thread):
             "remaining": reste,
         }
 
+    def _envelope_token(self) -> str:
+        """Le jeton de session écrit dans l'enveloppe L77 (jamais journalisé).
+
+        Il est lié au bail (agent, owner, epoch) et donc stable pendant la
+        session ; si le serveur le refuse, un jeton opaque par tour le remplace.
+        """
+        try:
+            return self.runner.session_token_for(self.name, self.runner.runner_id,
+                                                 self.epoch)
+        except Exception:
+            return mail.new_token()
+
+    def _human_spec(self, kind: str, messages: list[dict]) -> dict:
+        """L77 : un tour dédié aux messages d'humains, avec l'enveloppe ameesh.
+
+        Les humains ne se mélangent jamais au courrier dans la même entrée ;
+        `envelopes` est conservé dans le spec pour que `run_turn` rende la
+        consigne réservée avec la même enveloppe, dans le même budget.
+        """
+        from . import resident_queue
+
+        token = self._envelope_token()
+        canon_id = self._canon_id()
+        envelopes: dict[int, str] = {}
+        for row in messages:
+            try:
+                key = int(row["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            ident = resident_queue.identity_for(row.get("sender") or "",
+                                                cfg=getattr(self, "cfg", None),
+                                                canon_id=canon_id)
+            envelopes[key] = resident_queue.envelope(ident, token)
+        prompt, retenus, reste = mail.prompt_for(
+            self.db, messages, kind=kind, budget=self._budget_courrier(),
+            envelopes=envelopes)
+        return {
+            "kind": kind,
+            "prompt": prompt,
+            "ids": [int(m["id"]) for m in retenus if m.get("id") is not None],
+            "rows": retenus,
+            "candidats": list(messages),
+            "remaining": reste,
+            "envelopes": envelopes,
+            "human": True,
+        }
+
     def _release_session_lock(self) -> None:
         lock = getattr(self, "_session_lock", None)
         if lock is not None:
@@ -4778,8 +4839,9 @@ class AgentWorker(threading.Thread):
             return self._run_turn(spec)
         kind = spec["kind"]
         budget = self._budget_courrier()
+        envelopes = spec.get("envelopes")
         _texte, retenus, reste = mail.prompt_for(self.db, candidats, kind=kind,
-                                                 budget=budget)
+                                                 budget=budget, envelopes=envelopes)
         jeton = mail.new_token()
         try:
             reserves = mail.reserve(
@@ -4797,7 +4859,7 @@ class AgentWorker(threading.Thread):
         # La consigne est rendue sur les messages RÉSERVÉS (leur état exact :
         # « re-livré » compris), dans le même budget.
         prompt, inclus, _ = mail.prompt_for(self.db, reserves, kind=kind, budget=budget,
-                                            extra_remaining=reste)
+                                            extra_remaining=reste, envelopes=envelopes)
         ids = [int(m["id"]) for m in inclus]
         hors = [int(m["id"]) for m in reserves if int(m["id"]) not in ids]
         if hors:  # par construction vide ; jamais réservé sans être montré

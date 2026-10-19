@@ -186,3 +186,53 @@ def rank_for(*, human: bool, urgent: bool) -> int:
     if human:
         return RANK_HUMAN
     return RANK_MAIL
+
+
+def member_declaration(cfg: Any, sender: str, *,
+                       canon_id: str | None = None) -> tuple[list[str], str]:
+    """Les ``local_accounts`` et le premier rôle déclarés pour ``human:<id>``.
+
+    Fail closed : membre absent, dupliqué entre canons, ou identifiant qui
+    n'est pas un ``human:`` → aucune déclaration. Un canon sans identifiant
+    n'est jamais écarté par le filtre ``canon_id`` (le canon par défaut).
+    """
+    from . import canon
+
+    name = str(sender or "").strip()
+    if not name.startswith("human:"):
+        return [], ""
+    ident = name[len("human:"):].strip()
+    try:
+        canons = canon.load_configured(cfg)
+    except Exception:
+        return [], ""
+    declarations: list[tuple[list[str], str]] = []
+    for entry in canons:
+        cid = getattr(entry, "id", None) or ""
+        if canon_id and cid and cid != canon_id:
+            continue
+        matches = [m for m in entry.members if m.title == ident]
+        if len(matches) == 1:
+            member = matches[0]
+            accounts = [str(a).strip() for a in (member.local_accounts or ())
+                        if str(a).strip()]
+            role = (member.roles or [""])[0] if member.roles else ""
+            declarations.append((accounts, role))
+    if len(declarations) != 1:
+        return [], ""  # absent ou ambigu : aucune autorité
+    return declarations[0]
+
+
+def identity_for(sender: str, *, cfg: Any, canon_id: str | None = None,
+                 user: str | None = None, host: str | None = None) -> Identity:
+    """L'identité ameesh d'un expéditeur, pour l'enveloppe d'un message humain."""
+    real_user, real_host = local_account(cfg)
+    accounts, role = member_declaration(cfg, sender, canon_id=canon_id)
+    ident = verify_human(sender, accounts,
+                         user=real_user if user is None else user,
+                         host=real_host if host is None else host)
+    if role and ident.is_human:
+        ident = Identity(sender=ident.sender, human=ident.human,
+                         verified=ident.verified, account=ident.account,
+                         role=role, reason=ident.reason)
+    return ident

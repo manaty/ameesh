@@ -23,7 +23,7 @@ import unicodedata
 import uuid
 from typing import Any, Sequence
 
-from . import fastmail, fil, storage
+from . import fastmail, fil, resident_queue, storage
 from .config import NAME_RE
 from .db import Db
 from .storage.postgres import mailbox as _pg
@@ -259,7 +259,8 @@ def _readable_body(row: dict, limite: int | None = None) -> str:
     body = row.get("body") or ""
     if fil.unreadable_reason(body):
         return "[unreadable body, not reproduced: see the thread, message #%s]" % row.get("id")
-    text = fil.clean_text(body).strip("\n")
+    # L77 : un corps ne se fait jamais passer pour l'enveloppe écrite par ameesh.
+    text = resident_queue.neutralise(fil.clean_text(body).strip("\n"))
     if limite is not None:
         text, retire = _tronque(text, limite)
         if retire:
@@ -284,17 +285,22 @@ def _verdict_note(db: Db | None, row: dict) -> str:
     return "  [⚠ signature NOT valid: %s]" % verdict.reason
 
 
-def _block(db: Db | None, row: dict, limite: int | None = None, note: str | None = None
-           ) -> str:
+def _block(db: Db | None, row: dict, limite: int | None = None, note: str | None = None,
+           envelope: str | None = None) -> str:
     """Le rendu d'un message : en-tête (n°, expéditeur, heure, nature,
-    autorité, re-livré) puis corps lisible cité ligne à ligne."""
+    autorité, re-livré) puis corps lisible cité ligne à ligne.
+
+    `envelope` (L77) : la ligne d'enveloppe écrite par ameesh pour un message
+    humain, placée AVANT l'en-tête du message — elle ne vient jamais du corps.
+    """
     nature = _nature(row)
     relivre = ("  [re-delivered: already reserved for delivery before an outage, "
                "you may have handled it already]" if maybe_redelivered(row) else "")
     moment = fil.iso_local(row.get("created_ts") or 0.0)
     corps = _readable_body(row, limite)
-    return "— message #%s from %s, %s%s%s%s%s:\n%s" % (
-        row.get("id"), row.get("sender") or "?", moment, nature,
+    tete = (envelope + "\n") if envelope else ""
+    return "%s— message #%s from %s, %s%s%s%s%s:\n%s" % (
+        tete, row.get("id"), row.get("sender") or "?", moment, nature,
         _verdict_note(db, row) if note is None else note, relivre, forwarded_note(row),
         "\n".join("> " + line for line in corps.split("\n")))
 
@@ -325,8 +331,20 @@ def _assemble(kind: str, blocks: Sequence[str], remaining: int) -> str:
     return "\n\n".join(parts)
 
 
+def _envelope_for(envelopes: dict[int, str] | None, row: dict) -> str | None:
+    """L'enveloppe L77 d'un message, ou None (message ordinaire)."""
+    if not envelopes:
+        return None
+    try:
+        key = int(row.get("id"))
+    except (TypeError, ValueError):
+        return None
+    return envelopes.get(key)
+
+
 def prompt_for(db: Db | None, rows: Sequence[dict], *, kind: str,
-               budget: int = PROMPT_MAX_BYTES, extra_remaining: int = 0
+               budget: int = PROMPT_MAX_BYTES, extra_remaining: int = 0,
+               envelopes: dict[int, str] | None = None
                ) -> tuple[str, list[dict], int]:
     """La consigne d'un tour de courrier, bornée sur son rendu RÉEL complet.
 
@@ -342,7 +360,8 @@ def prompt_for(db: Db | None, rows: Sequence[dict], *, kind: str,
     blocks: list[str] = []
     for index, row in enumerate(rows):
         note = _verdict_note(db, row)  # une vérification par message, pas par essai
-        bloc = _block(db, row, note=note)
+        env = _envelope_for(envelopes, row)
+        bloc = _block(db, row, note=note, envelope=env)
         if octets(_assemble(kind, blocks + [bloc], total - index - 1)) <= budget:
             blocks.append(bloc)
             continue
@@ -351,7 +370,7 @@ def prompt_for(db: Db | None, rows: Sequence[dict], *, kind: str,
         # Premier message trop long à lui seul : corps tronqué jusqu'à tenir.
         limite = budget
         while True:
-            bloc = _block(db, row, limite, note=note)
+            bloc = _block(db, row, limite, note=note, envelope=env)
             exces = octets(_assemble(kind, [bloc], total - 1)) - budget
             if exces <= 0 or limite == 0:
                 break
