@@ -300,7 +300,11 @@ class PreemptResidentTest(unittest.TestCase):
         worker.agent = {}
         worker._preempt_row = None
         worker.preempting = threading.Event()
-        worker._preempt_seq = 0
+        # Résolution #286 × #2729 : le compteur de préemption est unifié
+        # (`preempt_gen`, sous `_preempt_lock`) ; la doublure le porte comme
+        # un vrai worker.
+        worker.preempt_gen = 0
+        worker._preempt_lock = threading.Lock()
         worker._steer_pending = []
         worker._steer_lock = threading.Lock()
         worker._turn_generation = 1
