@@ -9,13 +9,14 @@ est lu par `ameesh.mechanics` (`load`, `load_global`) ; aucun consommateur ne
 doit réappliquer une valeur de ce document.
 
 Cette garde est déterministe : elle analyse les sources suivies par Git (AST
-Python, aucun import du code scanné, aucun réseau, aucune horloge), hors
+Python et motifs shell/systemd/workflows, aucun import du code scanné,
+aucun réseau, aucune horloge), hors
 `tests/`, `reviews/`, `src/ameesh/mechanics.py` (le lecteur du canon) et ce
 script (il porte les motifs et les exemptions). Pour chaque clé du schéma
 `ameesh-mechanics` elle refuse les motifs littéraux connus — coupures et
 fuseau, cadence des paquets, plafond de lots en build, politique CI, familles
 et indépendance des avis, politique de fusion, seuils et plafonds de
-prévalidation — et exige une exemption nommée et datée pour un littéral
+prévalidation, seuil de lot du backlog (#2584) — et exige une exemption nommée et datée pour un littéral
 historique.
 
 Une exemption vit dans `EXEMPTIONS` ci-dessous : chemin, paramètre, littéral
@@ -29,6 +30,12 @@ capacité qui comparent une valeur déjà compilée (`rules.ci_packet != "full"`
 et les commentaires ou docstrings. La garde ne refuse que les littéraux qui
 *fournissent* un paramètre — affectation, défaut de fonction, argument nommé,
 mapping ou calendrier recopié.
+
+#2457 : shell (.sh/.bash ou shebang sans suffixe), timers .timer et workflows
+.github/workflows/*.{yml,yaml} : motifs 11:00/23:00, paire 11/23, cron à
+minute zéro et OnCalendar. Contexte actif ou chemin de runner release/paquet/
+train/coupure requis ; commentaires et liens symboliques exclus. Analyse
+lexicale : pas d’expansion shell, de calcul, d’include ou de décodage YAML.
 
 Usage :
   scripts/garde-mecanique.py [--root REPO] [--json]
@@ -73,6 +80,7 @@ SCHEMA_KEYS = (
     "reviews.families",
     "reviews.exclude_author_family",
     "reviews.distinct_families",
+    "reviews.light_reviews",
     "merge.named_fire",
     "merge.repeat_freeze",
     "merge.on_green_packet",
@@ -82,6 +90,7 @@ SCHEMA_KEYS = (
     "prevalidation.hosts",
     "prevalidation.parts_script",
     "prevalidation.timeout_seconds",
+    "backlog.lot_min_value",
     "projects",
 )
 
@@ -116,6 +125,7 @@ BINDINGS = {
     "exclude_author_family": "reviews.exclude_author_family",
     "distinct_families": "reviews.distinct_families",
     "families": "reviews.families",
+    "light_reviews": "reviews.light_reviews",
     "cutoffs": "cutoffs",
     "timezone": "timezone",
     "classes": "prevalidation.classes",
@@ -123,6 +133,7 @@ BINDINGS = {
     "hosts": "prevalidation.hosts",
     "parts_script": "prevalidation.parts_script",
     "timeout_seconds": "prevalidation.timeout_seconds",
+    "lot_min_value": "backlog.lot_min_value",
 }
 
 #: constantes d'implémentation historiques dont le nom ne porte pas la clé
@@ -156,9 +167,11 @@ DICT_BINDINGS = {
     "exclude_author_family": "reviews.exclude_author_family",
     "distinct_families": "reviews.distinct_families",
     "families": "reviews.families",
+    "light_reviews": "reviews.light_reviews",
     "cutoffs": "cutoffs",
     "timezone": "timezone",
     "schema": "schema",
+    "lot_min_value": "backlog.lot_min_value",
 }
 #: clés du bloc `prevalidation` dans un mapping, seulement dans un fichier
 #: qui parle de prévalidation
@@ -263,6 +276,17 @@ EXEMPTIONS = (
         reason="validation du harnais d'un reçu #1465 contre les familles "
                "connues du mesh ; le fournisseur de provenance ne lit pas le "
                "canon et refuse un harnais inconnu (retrait : #2451)",
+    ),
+    Exemption(
+        path="src/ameesh/review_lot.py",
+        parameter="reviews.light_reviews",
+        literal="1",
+        name="lot #2642 (mty-amh-impl-08), 19/10",
+        date="2026-10-19",
+        reason="relecture après fusion : plancher historique d'un avis pour un "
+               "lot léger, repli d'une classe qui ne porte pas encore le "
+               "paramètre ; la valeur du canon (`light_reviews`) fait foi dès "
+               "qu'elle est déclarée (retrait : PR home)",
     ),
 )
 
@@ -388,6 +412,9 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
     if key == "reviews.families":
         return (isinstance(value, tuple) and bool(value)
                 and bool(set(value) & FAMILY_NAMES))
+    if key == "reviews.light_reviews":
+        # §2 (#2642) : 0 n'est admis que le temps de la PR home, 1 au canon.
+        return type(value) is int and value in (0, 1)
     if key in ("cutoffs", "packets.cutoffs"):
         return _is_cutoff_literal(value)
     if key == "timezone":
@@ -407,6 +434,9 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
                 and bool(value) and "/" in value)
     if key == "prevalidation.timeout_seconds":
         return prevalidation_context and type(value) is int and value > 0
+    if key == "backlog.lot_min_value":
+        # #2584 : un score de valeur (1 à 100), le seuil d'un lot du canon §2
+        return type(value) is int and 1 <= value <= 100
     return False
 
 
@@ -432,6 +462,8 @@ def _binding_key(name: str, value, train_context: bool,
         key = "packets.cutoffs" if "packet" in lower else "cutoffs"
     if key is None and lower.endswith("project_overrides"):
         key = "projects"
+    if key is None and lower.endswith("lot_min_value"):
+        key = "backlog.lot_min_value"
     if key is None:
         return None
     if key == "timezone" and not train_context:
@@ -594,6 +626,119 @@ def inspect_source(path: str, text: str) -> list[Finding]:
                                     item.literal))
 
 
+# #2457 : formats non-Python. Analyse lexicale volontairement bornée : les
+# heures 11/23 ne sont une règle mécanique que dans un runner dont le chemin
+# ou le code actif parle de coupures, paquets, train ou release. Pas de shell
+# exécuté, pas de YAML chargé, pas d'expansion des variables ni des includes.
+_RUNNER_CONTEXT = re.compile(
+    r"(?<![a-z])(?:cutoffs?|coupures?|packets?|paquets?|train|releases?)(?![a-z])",
+    re.IGNORECASE)
+_CLOCK_CUTOFF = re.compile(r"(?<![\d:])(11|23):00(?::00)?(?![\d:])")
+_HOUR_PAIR = re.compile(r"(?<!\d)(?:11[\s,|]+23|23[\s,|]+11)(?![\d:])")
+_ANY_CRON = re.compile(r"(?<!\S)[\d*,/\-]+\s+[\d*,/\-]+\s+[\w*,/\-]+\s+[\w*,/\-]+\s+[\w*,/\-]+(?!\S)")
+_CRON = re.compile(
+    r"(?<!\S)0\s+(?:11|23|11,23|23,11)\s+[\w*,/\-]+\s+[\w*,/\-]+\s+[\w*,/\-]+(?!\S)")
+
+
+def _active_line(line: str) -> str:
+    """Retire les commentaires hors guillemets, conserve le texte et ses quotes.
+
+    Shell/YAML : # démarre un commentaire après un blanc ; dans une chaîne
+    ou un mot (URL, fragment, expansion shell), il reste une donnée.
+    """
+    quote = None
+    escaped = False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = None
+        elif char in ("'", '"'):
+            quote = char
+        elif char == "#" and (index == 0 or line[index - 1].isspace()):
+            return line[:index]
+    return line
+
+
+def inspect_runner(path: str, text: str) -> list[Finding]:
+    """Coupures littérales dans shell, OnCalendar et cron des workflows.
+
+    Les commentaires seuls ne donnent jamais le contexte. Pour systemd, les
+    commentaires ; sont également exclus ; seule la section [Timer] fournit
+    un calendrier. Dans un workflow, les clés cron et les blocs run sont lus
+    lexicalement ; les chaînes multilignes sont couvertes ligne par ligne.
+    Les horaires génériques (sauvegarde, budget…) et les heures différentes
+    (9/17), ainsi que les expressions calculées, restent hors de ces motifs.
+    """
+    timer = path.endswith(".timer")
+    lines = ["" if timer and line.lstrip().startswith(";")
+             else _active_line(line) for line in text.splitlines()]
+    if not _RUNNER_CONTEXT.search(path + "\n" + "\n".join(lines)):
+        return []
+    found = []
+    section = ""
+    for number, line in enumerate(lines, 1):
+        if timer:
+            if line.strip().startswith("["):
+                section = line.strip()
+            if section != "[Timer]":
+                continue
+            match = re.match(r"\s*OnCalendar\s*=\s*(.*)", line)
+            if not match:
+                continue
+            value = match[1]
+            # Formes systemd : 11:00, 23:00, 11,23:00, avec date et TZ
+            # éventuels. Une minute/seconde non nulle n'est pas une coupure.
+            if re.search(r"(?<![\d:,])(?:11,23|23,11):00(?::00)?(?![\d:])", value):
+                found.append(Finding(path, number, "cutoffs", "OnCalendar 11,23"))
+            else:
+                for match in _CLOCK_CUTOFF.finditer(value):
+                    found.append(Finding(path, number, "cutoffs", match[1] + ":00"))
+            continue
+        # Les expressions cron sont souvent entre guillemets (YAML/shell).
+        value = line.replace('"', " ").replace("'", " ")
+        if _CRON.search(value):
+            found.append(Finding(path, number, "cutoffs", "cron 11/23"))
+            continue
+        if _ANY_CRON.search(value):
+            continue  # autre minute/heure cron : ne pas relire sa paire d’heures
+        for match in _CLOCK_CUTOFF.finditer(line):
+            found.append(Finding(path, number, "cutoffs", match[1] + ":00"))
+        if _HOUR_PAIR.search(line):
+            found.append(Finding(path, number, "cutoffs", "hours 11/23"))
+        if re.search(r"(?i)\b[a-z_]*hour[a-z_]*[}\"' ]*"
+                     r"(?:-eq|==|=)\s*['\"]?(?:11|23)(?![\d:])", line):
+            found.append(Finding(path, number, "cutoffs", "hour comparison 11/23"))
+        # Constantes shell CUTOFF_HOUR=11 / RELEASE_HOUR=23 ; une simple
+        # comparaison de nombres sans contexte local n'est pas interprétée.
+        if re.search(r"(?i)(?:cutoff|coupure|release)[a-z_]*=\s*['\"]?(?:11|23)(?![\d:])", line):
+            found.append(Finding(path, number, "cutoffs", "hour 11/23"))
+    return found
+
+
+def _source_kind(path: str, source: pathlib.Path) -> str | None:
+    if path.endswith(".py"):
+        return "python"
+    if path.endswith((".sh", ".bash", ".timer")):
+        return "runner"
+    if path.startswith(".github/workflows/") and path.endswith((".yml", ".yaml")):
+        return "runner"
+    # Scripts shell suivis sans suffixe (bin/* notamment).
+    if not pathlib.PurePosixPath(path).suffix:
+        try:
+            with source.open("rb") as stream:
+                first = stream.readline(256).decode("ascii", "ignore").strip()
+            if re.fullmatch(r"#!\s*(?:/usr/bin/env\s+(?:-S\s+)?|/(?:usr/)?bin/)(?:ba|da|k|z)?sh(?:\s+.*)?", first):
+                return "runner"
+        except OSError:
+            pass
+    return None
+
+
 # --------------------------------------------------------------------------
 # fichiers, exemptions, sortie
 # --------------------------------------------------------------------------
@@ -603,8 +748,8 @@ def _excluded(path: str) -> bool:
             or any(path.startswith(prefix) for prefix in EXCLUDED_PREFIXES))
 
 
-def python_files(root: pathlib.Path) -> list[tuple[str, pathlib.Path]]:
-    """Les sources Python suivies par Git, triées, hors périmètres exclus.
+def source_files(root: pathlib.Path) -> list[tuple[str, pathlib.Path]]:
+    """Sources Python, shell, timers et workflows suivis par Git, triées.
 
     `git ls-files` écarte les worktrees et fichiers non suivis d'un clone
     partagé ; hors dépôt Git (témoin), on retombe sur une marche triée.
@@ -620,25 +765,31 @@ def python_files(root: pathlib.Path) -> list[tuple[str, pathlib.Path]]:
         if top.returncode == 0 and pathlib.Path(
                 top.stdout.decode("utf-8", "surrogateescape").strip()).resolve() \
                 == root.resolve():
-            git = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--", "*.py"],
+            git = subprocess.run(["git", "-C", str(root), "ls-files", "-z"],
                                  capture_output=True, check=False)
     except OSError:
         git = None
-    if git is not None and git.returncode == 0 and git.stdout:
+    if git is not None and git.returncode == 0:
         names = [name for name in git.stdout.decode("utf-8", "surrogateescape")
                  .split("\0") if name]
     else:
         names = [str(item.relative_to(root))
-                 for item in sorted(root.rglob("*.py"))]
+                 for item in sorted(root.rglob("*")) if item.is_file()
+                 and ".git" not in item.relative_to(root).parts]
     files = []
     for name in sorted(set(names)):
         rel = pathlib.PurePosixPath(name).as_posix()
         if _excluded(rel):
             continue
         path = root / rel
-        if path.is_file():
+        if not path.is_symlink() and path.is_file() and _source_kind(rel, path):
             files.append((rel, path))
     return files
+
+
+def python_files(root: pathlib.Path) -> list[tuple[str, pathlib.Path]]:
+    """Compatibilité des consommateurs de #2449 : seulement les .py."""
+    return [(rel, path) for rel, path in source_files(root) if rel.endswith(".py")]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -679,13 +830,14 @@ def apply_exemptions(findings: list[Finding], exemptions=EXEMPTIONS):
 
 def scan_repository(root: pathlib.Path = REPO, exemptions=EXEMPTIONS) -> Scan:
     findings: list[Finding] = []
-    for rel, path in python_files(root):
+    for rel, path in source_files(root):
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as exc:
             findings.append(Finding(rel, 0, "source", "unreadable: %s" % exc))
             continue
-        findings.extend(inspect_source(rel, text))
+        findings.extend(inspect_source(rel, text) if rel.endswith(".py")
+                        else inspect_runner(rel, text))
     findings.sort(key=lambda item: (item.path, item.line, item.parameter,
                                     item.literal))
     remaining, used, unused = apply_exemptions(findings, exemptions)

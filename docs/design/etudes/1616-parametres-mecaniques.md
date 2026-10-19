@@ -32,7 +32,8 @@ Un document, un bloc par règle, dans `manaty/home` :
   - `ci.packet` (`full` | `impacted` | `none`) et `ci.incident_label` :
     la suite par paquet, et l'étiquette qui autorise la CI d'un lot ;
   - `reviews.families`, `reviews.exclude_author_family`,
-    `reviews.distinct_families` : familles de modèle et indépendance ;
+    `reviews.distinct_families`, `reviews.light_reviews` : familles de modèle,
+    indépendance et plancher d'avis d'un lot léger (#2642) ;
   - `projects.<nom>` : surcharge d'un bloc pour un projet (le bloc présent
     remplace le bloc global ; aucune activation implicite).
 - `federation.yaml`, au **même commit** :
@@ -42,7 +43,10 @@ Un document, un bloc par règle, dans `manaty/home` :
 
 Les classes et les nombres d'avis ne sont pas répétés dans `mecanique.yaml` :
 le compilateur les lit à la source (home PR85), comme le fait déjà
-`train_policy.Versioned` de #1467.
+`train_policy.Versioned` de #1467. Seule exception depuis #2642 : le plancher
+d'un lot **léger**, `reviews.light_reviews` (0 le temps de la PR home, 1 au
+canon §2). C'est un paramètre de processus, pas un nombre d'avis par chemin :
+il ne reclasse aucun chemin et ne remplace jamais `train_reviews`.
 
 # Lecteur strict
 

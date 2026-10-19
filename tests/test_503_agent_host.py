@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 
 from tests import support  # isolate the workstation environment
@@ -17,10 +19,23 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'deploy/mise-a-jour/vm.sh'
 
 SSH = r'''#!/usr/bin/env python3
-import os, subprocess, sys
+import os, signal, subprocess, sys
 from pathlib import Path
-if os.environ.get('FAKE_STALL_SSH'):
-    __import__('signal').pause()  # live transport, remote command never finishes
+if os.environ.get('FAKE_STALL_SSH') \
+        and os.environ.get('FAKE_STALL_MATCH', '') in sys.argv[-1]:
+    # #2198/N1 : lien vivant et muet ; le signal reçu par le client doit être
+    # transmis à l'enfant (le vrai ssh). On le trace pour le banc.
+    def _recu(signum, frame):
+        if os.environ.get('FAKE_SIGNAL_FILE'):
+            Path(os.environ['FAKE_SIGNAL_FILE']).write_text(str(signum))
+        sys.exit(128 + signum)
+    signal.signal(signal.SIGINT, _recu)
+    signal.signal(signal.SIGTERM, _recu)
+    # Le témoin n'est posé qu'une fois les gestionnaires installés : le banc
+    # peut alors envoyer le signal sans course.
+    if os.environ.get('FAKE_STALL_STARTED'):
+        Path(os.environ['FAKE_STALL_STARTED']).write_text('1')
+    signal.pause()
 state = Path(os.environ['FAKE_STATE'])
 argv = sys.argv[1:]
 command = argv[-1]
@@ -78,6 +93,10 @@ if sys.argv[1:] == ['list', '--json']:
     print((state / 'agents.json').read_text())
 elif sys.argv[1] == 'show':
     name = sys.argv[2]
+    # #2198/N4 : lecture lente ; la borne de lecture doit la couper avant la
+    # borne (plus longue) des gestes de drain.
+    if scenario == 'show-lent':
+        time.sleep(5)
     row = next(a for a in json.loads((state / 'agents.json').read_text()) if a['name'] == name)
     row = dict(row, lease_owner='runner-' + name + '@host-agents', lease_epoch=7, lease_expires_ts=time.time()+300)
     pause = state / ('pause-' + name)
@@ -120,7 +139,7 @@ elif sys.argv[1] == 'show':
                                        'pause-coupee', 'pause-coupee-etat-perdu',
                                        'pause-perdue-sans-pose', 'drain-puis-stop-error',
                                        'drain-refuse-identite', 'pause-expiree-tardive',
-                                       'mode-change-apres-drain') \
+                                       'mode-change-apres-drain', 'resume-error-deux-fois') \
             and not pause.exists():
         row['status'] = 'running'
     if name == 'dev9' and scenario in ('chaines-toujours', 'chaines-relance'):
@@ -217,6 +236,14 @@ elif sys.argv[1] in ('pause', 'resume'):
         if (state / 'sans-expect-reason').exists() and '--expect-reason' in args:
             sys.exit(2)
         if scenario == 'chaines-resume-error': sys.exit(1)
+        if scenario == 'resume-error-deux-fois':
+            # #2198/N3 : les deux premières levées échouent (celle de la boucle
+            # puis la première passe du trap) ; la seconde passe réussit.
+            compteur = state / 'resume-compte'
+            compte = int(compteur.read_text()) if compteur.exists() else 0
+            compteur.write_text(str(compte + 1))
+            if compte < 2:
+                sys.exit(1)
         attendu = args[args.index('--expect-reason') + 1] if '--expect-reason' in args else None
         raison = motif.read_text() if motif.exists() else ''
         if pause.exists() and (attendu is None or raison == attendu):
@@ -539,10 +566,26 @@ class AgentHostTest(unittest.TestCase):
         self.assertIn('reprise prouvée (operator_paused=false)', p.stdout)
         self.assertFalse((self.state / 'pause-dev9').exists())
 
+    def _un_seul_agent_au_tour(self):
+        """Un banc direct (Popen) : un seul agent, vu en tour, pour que la
+        première lecture réussisse et que ce soit bien la pose qui bloque."""
+        (self.state / 'scenario').write_text('chaines')
+        (self.state / 'agents.json').write_text(
+            json.dumps([self.agents[0]]))
+        # Une pose incertaine fait attendre l'échéance au trap EXIT ; l'horloge
+        # injectée (le faux `sleep 15` avance le fichier) rend l'attente nulle.
+        (self.state / 'horloge').write_text('0')
+        self.env.update(DRAIN_ATTENTE='1', FAKE_STALL_SSH='1',
+                        FAKE_STALL_MATCH='ameesh pause dev9',
+                        DRAIN_ECHEANCE='1', DRAIN_BORNE_INSTRUCTION='1',
+                        DRAIN_DERIVE='1',
+                        HORLOGE_FICHIER=str(self.state / 'horloge'))
+
     def test_a_live_ssh_client_is_bounded_by_the_drain_deadline(self):
         """#2184/N3 : un client SSH vivant mais bloqué ne suspend pas le
         balayage au-delà de DRAIN_APPEL_DELAI (borne locale du groupe)."""
-        self.env.update(DRAIN_APPEL_DELAI='1', FAKE_STALL_SSH='1')
+        self._un_seul_agent_au_tour()
+        self.env.update(DRAIN_APPEL_DELAI='1', DRAIN_MARGE_LOCALE='1')
         proc = subprocess.Popen(['bash', str(SCRIPT), 'agents', 'redemarrer'],
                                 env=self.env, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True,
@@ -556,6 +599,87 @@ class AgentHostTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn('appel de drain expiré', stderr)
         self.assertEqual(self.units(), '')
+
+    def test_the_local_deadline_leaves_a_margin_to_the_remote_one(self):
+        """#2198/N2 : la borne locale vaut DRAIN_APPEL_DELAI plus une marge,
+        pour que le timeout distant rende son code avant que le client ne tue
+        le groupe. Sans marge, les deux expiraient ensemble."""
+        self._un_seul_agent_au_tour()
+        self.env.update(DRAIN_APPEL_DELAI='1', DRAIN_MARGE_LOCALE='2')
+        debut = time.monotonic()
+        proc = subprocess.Popen(['bash', str(SCRIPT), 'agents', 'redemarrer'],
+                                env=self.env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True,
+                                start_new_session=True)
+        try:
+            _, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, 9)
+            proc.communicate()
+            self.fail('drain call outlived its deadline with a live SSH client')
+        ecoule = time.monotonic() - debut
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('appel de drain expiré', stderr)
+        self.assertGreaterEqual(ecoule, 2.5,
+                                'la borne locale doit inclure DRAIN_MARGE_LOCALE')
+
+    def test_interruption_is_forwarded_to_the_stalled_ssh_child(self):
+        """#2198/N1 : le client lance son enfant dans une nouvelle session ;
+        un SIGINT reçu par le client doit être transmis à cet enfant, sinon
+        le ssh reste orphelin."""
+        self._un_seul_agent_au_tour()
+        self.env.update(DRAIN_APPEL_DELAI='30',
+                        FAKE_STALL_STARTED=str(self.state / 'ssh-commence'),
+                        FAKE_SIGNAL_FILE=str(self.state / 'signal'))
+        proc = subprocess.Popen(['bash', str(SCRIPT), 'agents', 'redemarrer'],
+                                env=self.env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True,
+                                start_new_session=True)
+        try:
+            limite = time.monotonic() + 10
+            while not (self.state / 'ssh-commence').exists() \
+                    and time.monotonic() < limite:
+                time.sleep(0.05)
+            self.assertTrue((self.state / 'ssh-commence').exists())
+            os.killpg(proc.pid, signal.SIGINT)
+            _, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, 9)
+            proc.communicate()
+            self.fail('interrupted drain call did not end')
+        self.assertTrue((self.state / 'signal').exists(), stderr)
+        self.assertEqual((self.state / 'signal').read_text(), str(signal.SIGINT))
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_reads_are_bounded_by_their_own_deadline(self):
+        """#2198/N4 : list/show/--help ont une borne plus courte que celle des
+        gestes de drain ; une lecture lente ne bloque pas le balayage."""
+        self.env.update(DRAIN_APPEL_DELAI='10', DRAIN_MARGE_LOCALE='1',
+                        DRAIN_LECTURE_DELAI='1')
+        debut = time.monotonic()
+        p = self.run_vm(scenario='show-lent')
+        ecoule = time.monotonic() - debut
+        self.assertNotEqual(p.returncode, 0)
+        self.assertLess(ecoule, 5,
+                        'show doit être coupé par DRAIN_LECTURE_DELAI, pas par '
+                        'DRAIN_APPEL_DELAI')
+
+    def test_failed_lift_is_not_announced_before_the_exit_retry(self):
+        """#2198/N3 : « NON levé » n'apparaît qu'après la dernière tentative
+        du trap EXIT ; une levée qui réussit à la seconde passe ne l'affiche
+        pas et ne laisse pas de pause. #2498 : les passes du trap précèdent le
+        verdict, une levée réussie rend donc 0."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        p = self.run_vm(scenario='resume-error-deux-fois')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn('drain NON levé', p.stderr)
+        self.assertNotIn('NON levé', p.stderr)
+        self.assertNotIn('pause à lever à la main', p.stderr)
+        self.assertFalse((self.state / 'pause-dev9').exists())
+        reprises = [l for l in self.operateur().splitlines()
+                    if l.startswith('resume dev9')]
+        self.assertEqual(len(reprises), 3,
+                         'une levée dans la boucle, deux passes du trap EXIT')
 
     def test_drain_carries_a_deadline_and_the_operator_actor(self):
         """#2184/R3 et N6 : la pose porte une échéance absolue et l'acteur

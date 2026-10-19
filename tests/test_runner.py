@@ -16,7 +16,7 @@ from ameesh import adapters, db as db_mod, mail, registry
 from ameesh import platform as os_layer
 from ameesh.runner import AgentWorker, Runner, _AsyncLog
 
-from .support import PgTestCase
+from .support import FAKEBIN, PgTestCase
 
 HARNESSES = {
     "claude": {"session": "claude-sess-1", "reprise": ["--resume", "claude-sess-1"]},
@@ -45,6 +45,101 @@ def arret_de_bail(ligne: str) -> bool:
     """
     return (any(p in ligne for p in LIGNES_ARRET)
             and any(m in ligne for m in ARRETS_DE_BAIL))
+
+
+class HorlogeSimulee:
+    """#2600 : horloge de bail simulée, sans dépendance à l'ordonnanceur.
+
+    `time()` date l'échéance en base, `monotonic()` la borne locale du bail ;
+    les deux avancent ensemble, uniquement quand le test le décide (le plus
+    souvent parce qu'une attente simulée consomme son délai). Aucun test de
+    bail, de battement ou de veilleur n'a besoin d'un bail réel de quelques
+    secondes contre l'horloge d'une CI chargée.
+    """
+
+    def __init__(self, maintenant: float | None = None, limite: int = 1000):
+        self.maintenant = time.time() if maintenant is None else float(maintenant)
+        self.monotone = self.maintenant
+        self.attentes: list[float | None] = []
+        self.limite = limite
+
+    def time(self) -> float:
+        return self.maintenant
+
+    def monotonic(self) -> float:
+        return self.monotone
+
+    def avance(self, secondes: float) -> None:
+        secondes = max(0.0, float(secondes))
+        self.maintenant += secondes
+        self.monotone += secondes
+
+    def consomme(self, timeout: float | None) -> None:
+        """Compte et consomme une attente ; garde-fou contre une boucle à vide."""
+        self.attentes.append(timeout)
+        if len(self.attentes) > self.limite:
+            raise AssertionError(
+                "garde-fou #2600 : %d attentes simulées sans progrès"
+                % self.limite)
+        if timeout:
+            self.avance(timeout)
+
+
+class EvenementSimule:
+    """Événement de réveil dont `wait` consomme le délai sur l'horloge simulée.
+
+    Remplace l'`Event` réel d'un battement ou d'un veilleur : `wait` ne dort
+    pas, avance l'horloge du délai demandé, puis laisse un callback décider de
+    l'état (renouvellement, arrêt). C'est ce qui rend le témoin déterministe.
+    """
+
+    def __init__(self, horloge: HorlogeSimulee, apres=None):
+        self.horloge = horloge
+        self.apres = apres
+        self.attentes: list[float | None] = []
+        self._set = False
+
+    def is_set(self) -> bool:
+        return self._set
+
+    def set(self) -> None:
+        self._set = True
+
+    def clear(self) -> None:
+        self._set = False
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.attentes.append(timeout)
+        self.horloge.consomme(timeout)
+        if self.apres is not None:
+            self.apres(self.horloge)
+        return self._set
+
+
+class AttenteDuRetourDeBailTest(unittest.TestCase):
+    def test_l_echeance_est_relue_sur_l_horloge_du_worker(self):
+        """#2634 : `--once`, bail non rendu. `lease_held_until` est pris sur
+        l'horloge du worker (#2600) ; `_await_release` le relisait sur
+        `time.monotonic()`. Ici l'horloge simulée est loin de la monotone
+        réelle : l'attente doit finir à l'échéance simulée, après 30 s
+        simulées, et non tourner jusqu'au garde-fou."""
+        import types
+        horloge = HorlogeSimulee(maintenant=1e12)
+        worker = types.SimpleNamespace(
+            name="solo", clock=horloge, heartbeat_thread=None, renewals=[],
+            lease_held_until=horloge.monotonic() + 30.0)
+        essais = []
+        worker.release_lease = lambda: essais.append(horloge.monotonic()) and False
+        ticks = []
+        runner = types.SimpleNamespace(RELEASE_RETRY_S=Runner.RELEASE_RETRY_S,
+                                       stop=EvenementSimule(horloge))
+        with mock.patch("ameesh.runner.log_async"):
+            Runner._await_release(runner, worker,
+                                  types.SimpleNamespace(tick=lambda: ticks.append(1)))
+        self.assertEqual(horloge.monotonic(), worker.lease_held_until)
+        self.assertEqual(runner.stop.attentes, [Runner.RELEASE_RETRY_S] * 6)
+        self.assertEqual(len(essais), 6)
+        self.assertEqual(len(ticks), 6)
 
 
 class RaisonsDArretDeBailTest(unittest.TestCase):
@@ -177,11 +272,13 @@ class RunnerTest(PgTestCase):
 
     def test_battement_arrete_le_harnais_si_la_base_reste_injoignable(self):
         """Sonde codex3 (5) : un DbError ne doit pas laisser le harnais sans bail."""
+        horloge = HorlogeSimulee()
         runner = Runner(self.cfg, self.db, once=True)
+        runner.clock = horloge
         worker = AgentWorker(
             runner,
             {"name": "bravo", "harness": "claude"},
-            {"lease_epoch": 1, "lease_expires_ts": time.time() + 3600},
+            {"lease_epoch": 1, "lease_expires_ts": horloge.time() + 3600},
         )
         with mock.patch.object(registry, "renew", side_effect=db_mod.DbError("base absente")):
             self.assertTrue(worker.renew())    # 1er échec : sursis
@@ -191,15 +288,96 @@ class RunnerTest(PgTestCase):
 
     def test_battement_arrete_le_harnais_a_l_echeance_connue(self):
         """Même avec un seul échec, si l'échéance du bail est atteinte on arrête."""
+        horloge = HorlogeSimulee()
         runner = Runner(self.cfg, self.db, once=True)
+        runner.clock = horloge
         worker = AgentWorker(
             runner,
             {"name": "charlie", "harness": "claude"},
-            {"lease_epoch": 1, "lease_expires_ts": time.time() - 1},
+            {"lease_epoch": 1, "lease_expires_ts": horloge.time() - 1},
         )
         with mock.patch.object(registry, "renew", side_effect=db_mod.DbError("base absente")):
             self.assertFalse(worker.renew())
         self.assertTrue(worker.lease_lost.is_set())
+
+    def test_le_battement_couvre_la_preparation_du_tour(self):
+        """#2544 : le battement de bail couvre la préparation du tour.
+
+        Run 39158768160 (psql 6/16) : sous charge, la préparation d'un tour
+        dépassait le bail de 3 s avant que le battement ne démarre ; le veilleur
+        tuait le worker avant le `Popen` et le tour ne démarrait jamais. Le bail
+        protège le tour entier : son renouvellement doit commencer avec la
+        préparation, pas une fois le harnais publié.
+
+        #2597 : il couvre aussi l'après-harnais (nettoyage, compta, fin de
+        tour). Run 39181194843 : le tour démarrait et finissait, puis le
+        veilleur tuait le worker pendant la compta. Le battement s'arrêtait à
+        la sortie du harnais ; il court désormais jusqu'à la sortie de
+        `_run_turn`.
+
+        #2600 : horloge simulée et gelée. La préparation attend le premier
+        renouvellement (preuve que le battement tourne avant elle), puis la
+        compta d'après harnais en attend un nouveau (preuve qu'il tourne
+        encore là, #2597). Aucun bail réel de 3 s ne juge le témoin.
+        """
+        cwd = self._cwd("lent")
+        self.register("lent", "claude", cwd=cwd, prompt="tour préparé lentement")
+        runner = Runner(self.cfg, self.db, once=True)
+        runner.lease_ttl = 3.0
+        lease = registry.claim(self.db, "lent", runner.runner_id, 3.0)
+        self.assertIsNotNone(lease)
+        # Gelée, calée sur l'échéance rendue par la base : le veilleur ne peut
+        # pas expirer, et le témoin ne dépend pas de l'écart d'horloges.
+        horloge = HorlogeSimulee(float(lease["lease_expires_ts"]) - runner.lease_ttl)
+        runner.clock = horloge
+        worker = AgentWorker(runner, registry.get(self.db, "lent"), lease)
+        self.addCleanup(worker.watchdog_stop.set)
+        worker.ensure_watchdog()
+        renouvele = threading.Event()
+        vrai_renew = AgentWorker.renew
+
+        def renew_espion(self_):
+            resultat = vrai_renew(self_)
+            if resultat:
+                renouvele.set()
+            return resultat
+
+        ouverture = AgentWorker._ouverture
+
+        def lente(self_):
+            # La préparation précède le Popen : le battement doit déjà avoir
+            # renouvelé le bail, sinon l'échéance tomberait pendant ce bloc.
+            self.assertTrue(
+                renouvele.wait(10.0),
+                "aucun renouvellement pendant la préparation du tour : le "
+                "battement ne la couvre pas")
+            return ouverture(self_)
+
+        fin_de_tour = registry.end_turn
+
+        def fin_lente(*args, **kwargs):
+            # Après-harnais : le battement doit encore renouveler ici (#2597).
+            renouvele.clear()
+            self.assertTrue(
+                renouvele.wait(10.0),
+                "le battement s'est arrêté à la sortie du harnais, avant la "
+                "compta d'après tour")
+            return fin_de_tour(*args, **kwargs)
+
+        with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN,
+                                          "AMEESH_TEST_LOG": self.turns_log}), \
+                mock.patch.object(AgentWorker, "renew", renew_espion), \
+                mock.patch.object(AgentWorker, "_ouverture", lente), \
+                mock.patch.object(registry, "end_turn", fin_lente):
+            ok = worker.run_turn({"kind": "prompt", "prompt": "consigne", "ids": []})
+        # Le tour est fini : ce témoin ne rend pas le bail comme la boucle de
+        # service, donc le veilleur ne doit plus juger l'échéance ensuite.
+        worker.watchdog_stop.set()
+        self.assertTrue(ok, "le tour n'a pas démarré : le bail n'a pas survécu "
+                            "à la préparation")
+        self.assertFalse(worker.lease_lost.is_set(),
+                         "le veilleur a tué le worker pendant la préparation du tour")
+        self.assertEqual(len(self.turns()), 1, "le harnais n'a pas été lancé")
 
     def test_dossier_absent_marque_bloque(self):
         self.register("sansdossier", "claude", cwd=os.path.join(self.tmp, "jamais-cree"),
@@ -255,18 +433,26 @@ class RunnerTest(PgTestCase):
         self.assertEqual(registry.get(self.db, "vivant")["lease_owner"], "runner-actif")
 
     def test_bail_perdu_interrompt_le_tour(self):
-        """Si le bail est volé, le harnais est terminé et le tour n'est pas compté."""
+        """Si le bail est volé, le harnais est terminé et le tour n'est pas compté.
+
+        #2600 : le harnais dort 60 s et les attentes sont larges (30 s) au lieu
+        d'une mesure de 7 s contre l'ordonnanceur. Le bail de bout en bout vaut
+        20 s, pas 3 s : la préparation et le choix du tour ne doivent plus
+        courir contre l'horloge sous charge (la cadence courte est couverte par
+        les témoins à horloge simulée). Un battement qui ne verrait pas le vol
+        laisserait le tour aller au bout : le témoin resterait rouge par
+        `turns == 0`, sans faux rouge de charge.
+        """
         cwd = self._cwd("vole")
         self.register("vole", "claude", cwd=cwd, prompt="long tour")
-        env = self.env(AMEESH_TEST_SLEEP="12", AMEESH_LEASE_TTL="3")
-        proc = self.runner_popen("--agents", "vole", "--lease-ttl", "3", "--poll", "2", env=env)
+        env = self.env(AMEESH_TEST_SLEEP="60", AMEESH_LEASE_TTL="20")
+        proc = self.runner_popen("--agents", "vole", "--lease-ttl", "20", "--poll", "2", env=env)
         lignes: list[str] = []
-        threading.Thread(
-            target=lambda: [lignes.append(line) for line in proc.stdout], daemon=True
-        ).start()
+        lecteur = threading.Thread(
+            target=lambda: lignes.extend(proc.stdout or ()), daemon=True)
+        lecteur.start()
         try:
-            self.wait_for(lambda: len(self.turns()) == 1, timeout=20)  # le tour a démarré
-            debut = time.monotonic()
+            self.wait_for(lambda: len(self.turns()) == 1, timeout=30)  # le tour a démarré
             self.db.execute(
                 "UPDATE agent_registry SET lease_owner = 'voleur', "
                 "lease_epoch = lease_epoch + 1, lease_expires_at = now() + interval '60 seconds', "
@@ -282,17 +468,13 @@ class RunnerTest(PgTestCase):
             # sans arrêter quand le bail court encore.
             self.wait_for(
                 lambda: any(arret_de_bail(l) for l in lignes),
-                timeout=10, msg=lambda: "".join(lignes))
-            self.assertLess(
-                time.monotonic() - debut, 7.0,
-                "le harnais aurait dû être terminé par le battement de bail (12 s de sommeil)",
-            )
+                timeout=30, msg=lambda: "".join(lignes))
         finally:
             proc.terminate()
-            proc.wait(timeout=10)
+            proc.wait(timeout=30)
+            lecteur.join(timeout=10)
         # Arrêt propre, jamais une mort par signal : un fil démon encore dans un
         # `print` à la finalisation faisait abandonner CPython (SIGABRT, core).
-        time.sleep(0.2)  # le fil lecteur finit de recueillir la sortie
         self.assertGreaterEqual(proc.returncode, 0, "code %r\n%s" % (proc.returncode, "".join(lignes)))
         self.assertNotIn("exiting immediately", "".join(lignes))  # arrêt propre, sans repli
         # end_turn est fencé : le tour volé n'est pas compté
@@ -510,22 +692,43 @@ class RunnerTest(PgTestCase):
         self.assertIsNone(row["current_prompt"])
 
     def test_renouvellement_borne_par_l_echeance_meme_si_l_appel_bloque(self):
-        """Sonde codex3 : un renew qui pend ne dépasse pas l'échéance du bail."""
+        """Sonde codex3 : un renew qui pend ne dépasse pas l'échéance du bail.
+
+        #2600 : l'échéance est simulée (0,5 s de budget) ; seule la borne
+        d'attente réelle de `_renew_call` reste à mesurer, avec une marge
+        large, sans dépendre d'un bail réel.
+        """
+        horloge = HorlogeSimulee()
         runner = Runner(self.cfg, self.db, once=True)
+        runner.clock = horloge
         worker = AgentWorker(
             runner,
             {"name": "golf", "harness": "claude"},
-            {"lease_epoch": 1, "lease_expires_ts": time.time() + 1},
+            {"lease_epoch": 1, "lease_expires_ts": horloge.time() + 0.5},
         )
 
         def bloque(*_args, **_kwargs):
             time.sleep(30)
-            return time.time() + 300
+            return horloge.time() + 300
 
-        debut = time.monotonic()
+        fini = threading.Event()
+        resultat: dict = {}
+
+        def renouveler() -> None:
+            resultat["ok"] = worker.renew()
+            fini.set()
+
         with mock.patch.object(registry, "renew", side_effect=bloque):
-            self.assertFalse(worker.renew())
-        self.assertLess(time.monotonic() - debut, 3.0)
+            thread = threading.Thread(target=renouveler, daemon=True)
+            thread.start()
+            # Borne de sûreté : si l'appel n'était pas borné, il durerait les
+            # 30 s du faux `renew` au lieu de rendre la main après le budget.
+            self.assertTrue(fini.wait(3.0),
+                            "l'appel a survécu à l'échéance du bail")
+            thread.join(timeout=1.0)
+        self.assertFalse(resultat.get("ok"))
+        self.assertTrue(any(t.is_alive() for t in worker.renewals),
+                        "l'appel de base doit rester détaché après le budget")
         self.assertTrue(worker.lease_lost.is_set())
 
     def test_le_harnais_recoit_son_bail_dans_l_environnement(self):
@@ -653,111 +856,123 @@ class RunnerTest(PgTestCase):
         Réveil tardif : l'échéance est déjà passée, on n'appelle même pas
         `registry.renew` — on arrête le harnais immédiatement.
         """
+        horloge = HorlogeSimulee()
         runner = Runner(self.cfg, self.db, once=True)
+        runner.clock = horloge
         worker = AgentWorker(
             runner,
             {"name": "india", "harness": "claude"},
-            {"lease_epoch": 1, "lease_expires_ts": time.time() - 1},
+            {"lease_epoch": 1, "lease_expires_ts": horloge.time() - 1},
         )
-        debut = time.monotonic()
         with mock.patch.object(registry, "renew") as appel:
             self.assertFalse(worker.renew())
-        self.assertLess(time.monotonic() - debut, 0.3)
         appel.assert_not_called()
         self.assertTrue(worker.lease_lost.is_set())
 
     def test_budget_borne_par_le_temps_restant_sans_marge(self):
         """Le budget d'appel vaut le temps restant, pas un plancher de 0,5 s.
 
-        Horloge simulée (#2483) : sous charge CI, 0,3 s de marge s'écoulaient
+        Horloge simulée (#2600) : sous charge CI, 0,3 s de marge s'écoulaient
         entre la création du worker et les appels, et le budget valait 0.
         """
+        horloge = HorlogeSimulee()
         runner = Runner(self.cfg, self.db, once=True)
-        maintenant = time.time()
-        with mock.patch("ameesh.runner.time.time", return_value=maintenant):
-            worker = AgentWorker(
-                runner,
-                {"name": "juliette", "harness": "claude"},
-                {"lease_epoch": 1, "lease_expires_ts": maintenant + 0.3},
-            )
-            self.assertLessEqual(worker.call_budget(), 0.4)
-            self.assertGreater(worker.call_budget(), 0.0)
-            expire = AgentWorker(
-                runner,
-                {"name": "kilo", "harness": "claude"},
-                {"lease_epoch": 1, "lease_expires_ts": maintenant - 5},
-            )
-            self.assertTrue(expire.deadline_passed())
-            self.assertEqual(expire.call_budget(), 0.0)  # aucun plancher au-delà
+        runner.clock = horloge
+        worker = AgentWorker(
+            runner,
+            {"name": "juliette", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": horloge.time() + 0.3},
+        )
+        self.assertLessEqual(worker.call_budget(), 0.4)
+        self.assertGreater(worker.call_budget(), 0.0)
+        expire = AgentWorker(
+            runner,
+            {"name": "kilo", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": horloge.time() - 5},
+        )
+        self.assertTrue(expire.deadline_passed())
+        self.assertEqual(expire.call_budget(), 0.0)  # aucun plancher au-delà
 
-            # entré juste avant l'échéance : le budget vaut le temps restant exact
-            juste = AgentWorker(
-                runner,
-                {"name": "lima", "harness": "claude"},
-                {"lease_epoch": 1, "lease_expires_ts": maintenant + 0.02},
-            )
-            self.assertLessEqual(juste.call_budget(), 0.03)
+        # entré juste avant l'échéance : le budget vaut le temps restant exact
+        juste = AgentWorker(
+            runner,
+            {"name": "lima", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": horloge.time() + 0.02},
+        )
+        self.assertLessEqual(juste.call_budget(), 0.03)
 
     def test_appel_entame_juste_avant_l_echeance_ne_survit_pas(self):
-        """Verdict codex3 B5a : entré 20 ms avant l'échéance, l'appel est coupé."""
+        """Verdict codex3 B5a : entré 20 ms avant l'échéance, l'appel est coupé.
+
+        #2600 : l'échéance est simulée ; le budget d'appel (0,05 s) est réel
+        et mesuré avec une marge large, sans bail réel de quelques secondes.
+        """
+        horloge = HorlogeSimulee()
         runner = Runner(self.cfg, self.db, once=True)
+        runner.clock = horloge
         worker = AgentWorker(
             runner,
             {"name": "mike", "harness": "claude"},
-            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.05},
+            {"lease_epoch": 1, "lease_expires_ts": horloge.time() + 0.05},
         )
 
         def bloque(*_args, **_kwargs):
             time.sleep(5)
-            return time.time() + 300
+            return horloge.time() + 300
 
         debut = time.monotonic()
         with mock.patch.object(registry, "renew", side_effect=bloque):
             self.assertFalse(worker.renew())
         ecoule = time.monotonic() - debut
         self.assertTrue(worker.lease_lost.is_set())
-        self.assertLess(ecoule, 0.4, "l'appel ne doit pas survivre à l'échéance")
+        self.assertLess(ecoule, 2.0, "l'appel ne doit pas survivre à l'échéance")
 
     def test_battement_se_reveille_a_l_echeance_du_bail(self):
-        """B5a : with a long interval, the heartbeat still wakes at the deadline."""
+        """B5a : with a long interval, the heartbeat still wakes at the deadline.
+
+        #2600 : le battement est exécuté sur une horloge simulée, sans fil ni
+        attente réelle ; l'échéance est atteinte au premier réveil.
+        """
+        horloge = HorlogeSimulee()
         runner = Runner(self.cfg, self.db, once=True)
+        runner.lease_ttl = 300.0  # intervalle nominal de 100 s
+        runner.clock = horloge
         worker = AgentWorker(
             runner,
             {"name": "delta", "harness": "claude"},
-            {"lease_epoch": 1, "lease_expires_ts": time.time() + 1},
+            {"lease_epoch": 1, "lease_expires_ts": horloge.time() + 1},
         )
-        stop = threading.Event()
-        with mock.patch.object(registry, "renew", side_effect=db_mod.DbError("base absente")):
-            thread = threading.Thread(target=worker._heartbeat, args=(stop,), daemon=True)
-            thread.start()
-            self.wait_for(lambda: worker.lease_lost.is_set(), timeout=5)
-            stop.set()
-            thread.join(timeout=5)
-        self.assertFalse(thread.is_alive())
+        stop = EvenementSimule(horloge)
+        with mock.patch.object(AgentWorker, "ensure_watchdog"), \
+                mock.patch.object(registry, "renew",
+                                  side_effect=db_mod.DbError("base absente")):
+            worker._heartbeat(stop)
+        self.assertTrue(worker.lease_lost.is_set())
+        self.assertLessEqual(horloge.attentes[0], 1.0,
+                             "le battement a dormi au-delà de l'échéance")
 
     def test_battement_renouvelle_avant_l_echeance_d_un_bail_court(self):
         """#2483 : un bail de 3 s ne peut pas attendre un battement de 3 s.
 
         Le plancher de 3 s dormait jusqu'à l'échéance même ; sous charge CI le
         harnais n'était pas encore publié et le watchdog tuait le tour (run
-        39133881211).
+        39133881211). #2600 : horloge simulée, un seul tour de boucle.
         """
+        horloge = HorlogeSimulee()
         runner = Runner(self.cfg, self.db, once=True)
         runner.lease_ttl = 3.0  # comme --lease-ttl 3 des témoins de bail perdu
-        maintenant = time.time()
+        runner.clock = horloge
         worker = AgentWorker(
             runner,
             {"name": "romeo", "harness": "claude"},
-            {"lease_epoch": 1, "lease_expires_ts": maintenant + 3},
+            {"lease_epoch": 1, "lease_expires_ts": horloge.time() + 3},
         )
-        stop = mock.Mock()
-        stop.wait.return_value = False  # un tour de boucle, puis renew() coupe
+        stop = EvenementSimule(horloge)
         with mock.patch.object(AgentWorker, "ensure_watchdog"), \
-                mock.patch.object(AgentWorker, "renew", return_value=False) as renew, \
-                mock.patch("ameesh.runner.time.time", return_value=maintenant):
+                mock.patch.object(AgentWorker, "renew", return_value=False) as renew:
             worker._heartbeat(stop)
         renew.assert_called_once()
-        attente = stop.wait.call_args[0][0]
+        attente = horloge.attentes[0]
         self.assertGreater(attente, 0.0)
         self.assertLessEqual(
             attente, 1.1,
@@ -771,41 +986,51 @@ class RunnerTest(PgTestCase):
         l'ancien harnais vivant et `lease_lost=False` après l'échéance, pendant
         qu'un vrai remplaçant réclamait l'agent. Ici le vrai `_heartbeat` reçoit
         l'attente calculée : elle vaut le temps restant (~20 ms), et exactement
-        0 une fois l'échéance passée.
+        0 une fois l'échéance passée. #2600 : horloge simulée.
         """
+        horloge = HorlogeSimulee()
         runner = Runner(self.cfg, self.db, once=True)
+        runner.clock = horloge
         worker = AgentWorker(
             runner,
             {"name": "papa", "harness": "claude"},
-            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.02},
+            {"lease_epoch": 1, "lease_expires_ts": horloge.time() + 0.02},
         )
         self.assertLessEqual(worker.wait_timeout(300), 0.03)
         self.assertGreaterEqual(worker.wait_timeout(300), 0.0)
 
-        stop = mock.Mock()
-        stop.wait.return_value = False  # un tour de boucle, puis renew() coupe
-        with mock.patch.object(AgentWorker, "renew", return_value=False) as renew:
+        stop = EvenementSimule(horloge)
+        with mock.patch.object(AgentWorker, "ensure_watchdog"), \
+                mock.patch.object(AgentWorker, "renew", return_value=False) as renew:
             worker._heartbeat(stop)
         renew.assert_called_once()
-        attente = stop.wait.call_args[0][0]
+        attente = horloge.attentes[0]
         self.assertLessEqual(attente, 0.03, "le battement dort au-delà de l'échéance")
         self.assertGreaterEqual(attente, 0.0)
 
         expire = AgentWorker(
             runner,
             {"name": "quebec", "harness": "claude"},
-            {"lease_epoch": 1, "lease_expires_ts": time.time() - 1},
+            {"lease_epoch": 1, "lease_expires_ts": horloge.time() - 1},
         )
         self.assertEqual(expire.wait_timeout(300), 0.0)  # aucun plancher
-        stop_expire = mock.Mock()
-        stop_expire.wait.return_value = False
-        with mock.patch.object(AgentWorker, "renew", return_value=False) as renew2:
+        stop_expire = EvenementSimule(horloge)
+        with mock.patch.object(AgentWorker, "ensure_watchdog"), \
+                mock.patch.object(AgentWorker, "renew", return_value=False) as renew2:
             expire._heartbeat(stop_expire)
-        self.assertEqual(stop_expire.wait.call_args[0][0], 0.0)
+        self.assertEqual(horloge.attentes[-1], 0.0)
         renew2.assert_called_once()
 
     def test_branche_bail_perdu_ne_perd_pas_la_consigne(self):
-        """Sonde codex3 (2) : la clôture d'un tour au bail perdu restaure la consigne."""
+        """Sonde codex3 (2) : la clôture d'un tour au bail perdu restaure la consigne.
+
+        #2537 : en service, l'exécuteur reprend l'agent dès la passe suivante
+        (reprise voulue, R5) et consomme la consigne restaurée ; un témoin qui
+        échantillonne `pending_prompt` ne voit qu'un état transitoire et peut
+        le rater sous charge CI. Le témoin fait donc UN seul tour (`--once`) :
+        aucune reprise ne consomme la consigne, et l'état final se lit, stable,
+        après la sortie de l'exécuteur.
+        """
         cwd = self._cwd("perdu")
         self.register("perdu", "claude", cwd=cwd, prompt="consigne du tour perdu")
         # Le témoin mesure la clôture au bail perdu, pas la porte d'hôte réelle
@@ -815,11 +1040,15 @@ class RunnerTest(PgTestCase):
         gate_state = os.path.join(self.tmp, "gate-available.json")
         with open(gate_state, "w", encoding="utf-8") as fh:
             fh.write('{"schema": "ameesh-host-state/1", "state": "available", "seq": 1}\n')
-        env = self.env(AMEESH_TEST_SLEEP="120", AMEESH_LEASE_TTL="3",
+        # #2600 : bail de 20 s, pas 3 s — sous 8 passes parallèles, la
+        # résolution du harnais et le pick dépassaient 3 s et le veilleur tuait
+        # avant le tour. La cadence courte est couverte par les témoins à
+        # horloge simulée ; ce témoin de bout en bout vérifie la restauration.
+        env = self.env(AMEESH_TEST_SLEEP="300", AMEESH_LEASE_TTL="20",
                        AMEESH_HOST_GATE="file", AMEESH_HOST_GATE_PATH=gate_state,
                        AMEESH_HOST_GATE_ACK=os.path.join(self.tmp, "gate-ack", "ack.json"),
                        AMEESH_HOST_GATE_FALLBACK="available")
-        proc = self.runner_popen("--agents", "perdu", "--lease-ttl", "3", "--poll", "2", env=env)
+        proc = self.runner_popen("--once", "--agents", "perdu", "--lease-ttl", "20", env=env)
         # Le tuyau est lu en continu : un tampon plein ne bloque plus
         # l'exécuteur, et le témoin peut nommer sa sortie au refus.
         sortie_lignes: list[str] = []
@@ -831,7 +1060,7 @@ class RunnerTest(PgTestCase):
             if proc.poll() is None:
                 proc.terminate()
             try:
-                proc.wait(timeout=10)
+                proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
@@ -840,15 +1069,17 @@ class RunnerTest(PgTestCase):
                 proc.stdout.close()
 
         try:
-            self.wait_for(lambda: len(self.turns()) == 1, timeout=30)
+            self.wait_for(lambda: len(self.turns()) == 1, timeout=60)
             self.db.execute(
                 "UPDATE agent_registry SET lease_expires_at = now() - interval '1 second' "
                 "WHERE name = 'perdu'")
-            # Le harnais dort 120 s : un arrêt manqué à la perte du bail échoue
-            # donc encore dans cette borne. Sous charge CI, l'ordonnancement
-            # peut retarder le battement : 90 s, et la sortie nomme la cause.
-            self.wait_for(
-                lambda: registry.get(self.db, "perdu")["pending_prompt"] is not None, timeout=90)
+            # Le harnais dort 300 s : un arrêt manqué à la perte du bail laisse
+            # l'exécuteur vivant au-delà de cette borne. `--once` sort juste
+            # après le tour : sa sortie est le repère stable (rien ne vient
+            # reprendre la consigne restaurée). Sous charge CI, le battement
+            # peut tarder : 120 s, et la sortie nomme la cause.
+            self.wait_for(lambda: proc.poll() is not None, timeout=120)
+            proc.wait(timeout=30)
         except AssertionError as exc:
             arreter()
             self.fail("%s\nsortie de l'exécuteur :\n%s"
@@ -859,6 +1090,9 @@ class RunnerTest(PgTestCase):
         # pas de mort par signal à l'arrêt (SIGABRT du fil `journal`, 2026-10-05)
         self.assertGreaterEqual(proc.returncode, 0, "code %r\n%s" % (proc.returncode, sortie))
         self.assertNotIn("exiting immediately", sortie)
+        # la perte de bail est nommée (toute issue admise par #2497)
+        self.assertTrue(any(m in sortie for m in ARRETS_DE_BAIL),
+                        "perte de bail non nommée :\n%s" % sortie)
         row = registry.get(self.db, "perdu")
         self.assertEqual(row["pending_prompt"], "consigne du tour perdu")
         self.assertIsNone(row["current_prompt"])
@@ -1116,33 +1350,47 @@ class RunnerTest(PgTestCase):
 
         Le diagnostic d'une erreur non définitive passe par une file bornée
         (perte comptée) : `renew` rend la main tout de suite, puis l'échéance
-        tue quand même le harnais.
+        tue quand même le harnais. #2600 : l'échéance est simulée, la borne
+        réelle (10 s) laisse une marge large au puits bloqué (30 s).
         """
+        horloge = HorlogeSimulee()
         proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
         runner = Runner(self.cfg, self.db, once=True)
+        runner.clock = horloge
         worker = AgentWorker(
             runner,
             {"name": "xray", "harness": "claude"},
-            {"lease_epoch": 1, "lease_expires_ts": time.time() + 30},
+            {"lease_epoch": 1, "lease_expires_ts": horloge.time() + 30},
         )
         worker.proc = proc
         worker.pgid = proc.pid
         bloque = threading.Event()
 
         def puits_bloque(message):
-            bloque.wait(2)  # le puits ne rend pas la main
+            bloque.wait(30)  # le puits ne rend pas la main
 
         try:
             with mock.patch("ameesh.runner.log", side_effect=puits_bloque), \
                     mock.patch.object(registry, "renew",
                                       side_effect=db_mod.DbError("base injoignable")):
-                debut = time.monotonic()
-                self.assertTrue(worker.renew())  # 1er échec : non définitif
-                self.assertLess(time.monotonic() - debut, 0.3,
+                fini = threading.Event()
+                resultat: dict = {}
+
+                def renouveler() -> None:
+                    resultat["ok"] = worker.renew()
+                    fini.set()
+
+                thread = threading.Thread(target=renouveler, daemon=True)
+                thread.start()
+                # Borne de sûreté : un `renew` qui attendrait le puits
+                # bloquerait ici les 30 s de `puits_bloque`.
+                self.assertTrue(fini.wait(10.0),
                                 "le journal bloqué immobilise le battement")
+                thread.join(timeout=1.0)
+                self.assertTrue(resultat.get("ok"))  # 1er échec : non définitif
                 self.assertFalse(worker.lease_lost.is_set())
                 # l'échéance tombe : le battement doit encore pouvoir arrêter
-                worker.lease_deadline = time.time() - 1
+                worker.lease_deadline = horloge.time() - 1
                 bloque.set()  # libère le puits pour la fin du test
                 self.assertFalse(worker.renew())
             self.assertTrue(worker.lease_lost.is_set())
@@ -1158,54 +1406,77 @@ class RunnerTest(PgTestCase):
         indépendant du battement.
 
         Même si `renew` ne rend jamais la main (journal, requête, fichier),
-        le harnais est arrêté à l'échéance connue du bail.
+        le harnais est arrêté à l'échéance connue du bail. #2600 : le veilleur
+        est exécuté sur une horloge simulée, le battement reste réellement
+        bloqué dans `renew` ; aucune attente réelle de bail.
         """
+        horloge = HorlogeSimulee()
         proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
         runner = Runner(self.cfg, self.db, once=True)
+        runner.clock = horloge
         worker = AgentWorker(
             runner,
             {"name": "whiskey", "harness": "claude"},
-            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.3},
+            {"lease_epoch": 1, "lease_expires_ts": horloge.time() + 0.3},
         )
         worker.proc = proc
         worker.pgid = proc.pid
+        worker.watchdog_stop = EvenementSimule(horloge)
         bloque = threading.Event()
+        dans_renew = threading.Event()
         stop = threading.Event()
+
+        def renew_bloque():
+            dans_renew.set()
+            return bloque.wait(10)
+
         try:
-            with mock.patch.object(AgentWorker, "renew",
-                                   side_effect=lambda: bloque.wait(5)):
+            with mock.patch.object(AgentWorker, "ensure_watchdog"), \
+                    mock.patch.object(AgentWorker, "renew", side_effect=renew_bloque):
                 thread = threading.Thread(target=worker._heartbeat, args=(stop,), daemon=True)
                 thread.start()
-                self.wait_for(lambda: worker.lease_lost.is_set(), timeout=5, interval=0.01)
-                # La coupe est un effet du veilleur, distinct de `lease_lost` :
-                # on attend la sortie du processus plutôt qu'une durée fixe
-                # (test instable sous charge CPU, constat mesh-design).
-                self.wait_for(lambda: proc.poll() is not None, timeout=10, interval=0.02)
+                self.assertTrue(dans_renew.wait(10.0),
+                                "le battement n'est pas entré dans renew")
+                worker._deadline_watchdog()
+            self.assertTrue(worker.lease_lost.is_set())
+            self.wait_for(lambda: proc.poll() is not None, timeout=5, interval=0.02)
             self.assertIsNotNone(proc.poll(), "le veilleur doit tuer à l'échéance")
         finally:
-            bloque.set()
             stop.set()
+            bloque.set()
             if proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=5)
 
     def test_veilleur_ne_tue_pas_un_bail_renouvele(self):
         """Le veilleur n'est pas un minuteur : une échéance repoussée par un
-        renouvellement réussi ne doit pas tuer le harnais."""
+        renouvellement réussi ne doit pas tuer le harnais.
+
+        #2600 : l'horloge avance dans le `wait` du veilleur ; un callback simule
+        le renouvellement (échéance repoussée) bien au-delà de l'ancienne.
+        """
+        horloge = HorlogeSimulee()
         proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
         runner = Runner(self.cfg, self.db, once=True)
+        runner.clock = horloge
         worker = AgentWorker(
             runner,
             {"name": "yankee", "harness": "claude"},
-            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.6},
+            {"lease_epoch": 1, "lease_expires_ts": horloge.time() + 0.6},
         )
         worker.proc = proc
         worker.pgid = proc.pid
+        ancienne = worker.lease_deadline
+
+        def renouvellement(h):
+            if h.maintenant >= ancienne:
+                worker.lease_deadline = h.maintenant + 1.5  # renouvellement réussi
+            if len(h.attentes) >= 5:
+                worker.watchdog_stop.set()
+
+        worker.watchdog_stop = EvenementSimule(horloge, apres=renouvellement)
         try:
-            worker.ensure_watchdog()
-            time.sleep(0.1)
-            worker.lease_deadline = time.time() + 1.5  # renouvellement réussi
-            time.sleep(0.6)  # bien au-delà de l'ancienne échéance
+            worker._deadline_watchdog()
             self.assertFalse(worker.lease_lost.is_set(), "un bail renouvelé a été tué")
             self.assertIsNone(proc.poll(), "le harnais doit rester vivant")
         finally:
@@ -1221,33 +1492,33 @@ class RunnerTest(PgTestCase):
         Un harnais qui ignore SIGTERM vit pendant les 3 s de grâce ; si le bail
         expire dans cette fenêtre, un remplaçant peut le réclamer. Le veilleur
         doit rester actif jusqu'à la mort du harnais ou le relâchement du bail.
+        #2600 : l'échéance du veilleur est simulée ; l'escalade réelle reste
+        mesurée sur la mort du processus.
         """
+        horloge = HorlogeSimulee()
         proc = subprocess.Popen(
             [sys.executable, "-c",
              "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN);"
              " time.sleep(60)"],
             start_new_session=True)
         runner = Runner(self.cfg, self.db, once=True)
+        runner.clock = horloge
         worker = AgentWorker(
             runner,
             {"name": "zulu", "harness": "claude"},
-            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.3},
+            {"lease_epoch": 1, "lease_expires_ts": horloge.time() + 0.3},
         )
         worker.proc = proc
         worker.pgid = proc.pid
-        worker.ensure_watchdog()
+        worker.watchdog_stop = EvenementSimule(horloge)
         try:
             worker.stopping.set()
-            arret = threading.Thread(target=worker.terminate, daemon=True)
-            debut = time.monotonic()
+            arret = threading.Thread(target=worker.terminate,
+                                     kwargs={"grace": 60}, daemon=True)
             arret.start()
-            self.wait_for(lambda: worker.lease_lost.is_set(), timeout=3, interval=0.01)
-            # La coupe est un effet du veilleur, distinct de `lease_lost` :
-            # on attend la sortie du processus (test stable sous charge) tout en
-            # exigeant qu'elle ait lieu pendant les 3 s de grâce SIGTERM.
+            worker._deadline_watchdog()
+            self.assertTrue(worker.lease_lost.is_set())
             self.wait_for(lambda: proc.poll() is not None, timeout=5, interval=0.02)
-            self.assertLess(time.monotonic() - debut, 3.5,
-                            "le veilleur doit tuer pendant la grâce")
             arret.join(timeout=5)
         finally:
             worker.watchdog_stop.set()

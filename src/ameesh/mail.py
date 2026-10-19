@@ -373,6 +373,19 @@ def history(db: Db, recipient: str, limit: int = 50) -> list[dict]:
     return storage.of(db).mailbox.history(recipient, limit)
 
 
+def review_requests(db: Db, recipient: str, lot: int | str) -> list[dict]:
+    """#2504 : les demandes de relecture du destinataire pour ce lot.
+
+    Lues par une requête filtrée sur (destinataire, `kind = 'request'`, lot),
+    jamais par `history` : cette dernière borne aux N derniers messages avant
+    tout filtrage, si bien qu'une demande ancienne du même lot disparaissait
+    sous un fort volume de courrier et une re-désignation en renvoyait une
+    seconde. Aucune borne ici : le lot est la portée."""
+    from .agent_names import resolve as resolve_agent_name
+    recipient = resolve_agent_name(recipient, db=db, operation="mail.review_requests")
+    return storage.of(db).mailbox.review_requests(recipient, str(int(lot)))
+
+
 def pending_recipients(db: Db) -> list[str]:
     return storage.of(db).mailbox.pending_recipients()
 
