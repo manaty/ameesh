@@ -916,11 +916,18 @@ its folder) and the policy: never a key, never a path, never what a credential
 contains. Simulation (`ameesh resume`, L39) writes nothing.
 
 **Identity of the mesh.** The claim's mesh identity is **read from the
-database**: `ameesh_events_cluster()` (cluster, timeline and the journal's own
-identifier), falling back to `system_identifier` + `current_database()` +
-`current_schema()`. It is never derived from the DSN: a mesh reached through
-pgbouncer and the same mesh reached over direct TCP are one mesh, while two
-databases or two schemas are two meshes. This is what #1883 could not see: its
+database** and **stable**: the cluster's `system_identifier` and the random
+identifier of the event journal (`ameesh_events_journal`, 0448), written
+`mesh:<system_identifier>:j:<journal>` — read from
+`ameesh_events_cluster()` and normalised, or from those two parts directly.
+The **timeline** is deliberately not part of it: a failover or a
+point-in-time recovery starts a new timeline while the journal, and so the
+mesh, stays the same (#2592). There is only this one form: it is never
+derived from the DSN (a mesh reached through pgbouncer and the same mesh over
+direct TCP are one mesh), and there is no second fallback key that would vary
+with the role's privileges; if the stable identity cannot be read, no claim
+is written rather than a claim under a different identity. Two databases or
+two schemas are two meshes. This is what #1883 could not see: its
 `account_identities` compare fingerprints inside ONE database.
 
 **Report or refuse.** A credential claimed, within the hour, by **another**
