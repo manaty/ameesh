@@ -241,12 +241,20 @@ class ShadowPassageTest(PgTestCase):
         return dict(state, plans=[plan])
 
     def numbered_packet(self, lots, name="paquet-97-nexlink", *, branch_at=None,
-                        merge_at=None, merge=True):
+                        merge_at=None, merge=True, manifest=True):
         """A numbered packet (`integration/paquet-<n>-nexlink`, #2733)."""
         branch = "integration/" + name
         self.project_repo.git("checkout", "-qb", branch, "main")
-        self.write_manifest(name, lots)
-        self.project_repo.commit("composition %s" % name, at=branch_at)
+        if manifest:
+            self.write_manifest(name, lots)
+            self.project_repo.commit("composition %s" % name, at=branch_at)
+        else:
+            # The numbered composer declares its units in the commit trailers.
+            for lot in lots:
+                self.project_repo.write("packet/%s.txt" % lot, "%s\n" % lot)
+                self.project_repo.commit(
+                    "composition %s #%d\n\nameesh-work: %d" % (name, lot, lot),
+                    at=branch_at)
         self.project_repo.git("checkout", "-q", "main")
         if merge:
             self.project_repo.git("merge", "--no-ff", "-m",
@@ -417,6 +425,19 @@ class ShadowPassageTest(PgTestCase):
         comparison = comparisons[0]
         self.assertEqual(comparison["packet"]["tail"], "paquet-97-nexlink")
         self.assertEqual(comparison["packet"]["stamp"], "20261018-1102")
+        self.assertEqual((comparison["missing"], comparison["extra"]), ([], []))
+
+    def test_a_numbered_packet_without_manifest_uses_work_trailers(self):
+        """#2733 : le composeur numéroté n'écrit pas de manifeste."""
+        state = self.state_with_members(self.item["id"])
+        self.numbered_packet([self.item["id"]], merge_at=self.now + 120,
+                             manifest=False)
+        rules = types.SimpleNamespace(zone=lambda: ZoneInfo("Europe/Paris"))
+        comparisons = self.shadow.compare(state, rules)
+        self.assertEqual(len(comparisons), 1)
+        comparison = comparisons[0]
+        self.assertEqual(comparison["packet"]["manifest"], None)
+        self.assertEqual(comparison["packet"]["lots"], [self.item["id"]])
         self.assertEqual((comparison["missing"], comparison["extra"]), ([], []))
 
     def test_open_numbered_packet_is_read_with_its_head_date(self):

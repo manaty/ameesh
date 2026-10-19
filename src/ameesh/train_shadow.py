@@ -38,6 +38,7 @@ MAX_COMPARISONS = 48
 _PACKET = re.compile(r"integration/(paquet-[^\s,()]+)")
 _STAMP = re.compile(r"(\d{8}-\d{4})")
 _LOT = re.compile(r"#(\d+)")
+_WORK = re.compile(r"^ameesh-work: (\d+)$", re.M)
 #: an open packet branch whose last composition before the cutoff is older
 #: than this window was abandoned, not in flight. An unproven lot stays an
 #: extra: the shadow prefers a visible disagreement to a masked one (#2682).
@@ -381,7 +382,10 @@ class Passage:
         earlier cutoff. A packet whose own manifest is unreadable is kept:
         its lots are unknown, which must stay visible in the comparison.
         A numbered packet (`integration/paquet-<n>-nexlink`, #2733) carries no
-        hour: its stamp is the merge commit date, read in the plan zone.
+        hour: its stamp is the merge commit date, read in the plan zone. The
+        numbered composer writes no manifest; its lots are then the
+        ``ameesh-work:`` trailers of the commits between the merge's first
+        parent and its branch head, the exact composition it merged.
         """
         log = resolutions._run(clone, "log", "--first-parent", "-n", "80",
                                "--format=%H%x1f%P%x1f%s%x1f%ct", base)
@@ -401,13 +405,19 @@ class Passage:
             named = _STAMP.search(tail)
             stamp = named.group(1) if named else _stamp_of(created, zone)
             parents = raw_parents.split()
-            lots = _manifest_lots(clone, sha, tail)
+            branch_head = parents[1] if len(parents) > 1 else sha
+            manifest_lots = _manifest_lots(clone, sha, tail)
+            lots = manifest_lots
+            if lots is None and len(parents) > 1:
+                # The numbered composer declares its units in the merge
+                # trailers, not in a manifest file.
+                lots = _commit_lots(clone, parents[0], branch_head)
             packets.append(dict(sha=sha, stamp=stamp,
                                 created_ts=created,
                                 branch="integration/" + tail, tail=tail,
-                                branch_head=(parents[1] if len(parents) > 1 else sha),
+                                branch_head=branch_head,
                                 manifest=("reviews/integration-%s.md" % tail
-                                          if lots is not None else None),
+                                          if manifest_lots is not None else None),
                                 lots=sorted(set(lots or ()))))
         packets.reverse()  # oldest first, like the plans
         return packets
@@ -547,6 +557,20 @@ def _manifest_lots(clone, sha, tail):
     if manifest.returncode:
         return None
     return parse_manifest(resolutions._text(manifest))
+
+
+def _commit_lots(clone, base, head):
+    """The lots declared by ``ameesh-work:`` trailers between ``base`` and ``head``.
+
+    The numbered composer writes no manifest: the exact composition it merged
+    is the branch's own range and its trailers. None when the range cannot be
+    read, never a set inferred from another packet.
+    """
+    log = resolutions._run(clone, "log", "--format=%B", "%s..%s" % (base, head))
+    if log.returncode:
+        return None
+    return sorted({int(match.group(1))
+                   for match in _WORK.finditer(resolutions._text(log))})
 
 
 def _member(row, *, origin, proof):
