@@ -1079,6 +1079,23 @@ class ReveilTest(_Base):
                     if e["note"].startswith("wake: scheduled wake delivered")]
         self.assertEqual(len(consumed), 1)
 
+    def test_reveil_programme_sur_executeur_medie(self):
+        """#2613 : le runner médié ne refuse plus le réveil programmé ; les
+        trois opérations de wake passent par le contrat (due_wakes,
+        claim_wake, consume_wake), pas seulement par un exécuteur local."""
+        worker = self._worker("r7m")
+        lot = work.add(self.db, title="séance owner", assignee="r7m",
+                       force=_FORCE)["id"]
+        work.note(self.db, lot, "hold: séance owner", actor="r7m",
+                  wake_ts=time.time() - 1)
+        with mock.patch.object(storage, "is_remote", return_value=True):
+            spec = self.pick(worker)
+        self.assertIsNotNone(spec, "un exécuteur médié délivre le réveil (#2613)")
+        self.assertEqual((spec["kind"], spec["lot"]), ("idle", str(lot)))
+        self.assertIn("Scheduled wake", spec["prompt"])
+        self.assertIsNotNone(work.get(self.db, lot)["wake_ts"],
+                             "la délivrance médiée ne consomme pas l'échéance")
+
     def test_reveil_programme_perdu_au_drainage_est_redelivre(self):
         """#2466 B1 (cx2) : si le drainage refuse le tour entre le choix et le
         lancement, le claim expire et le réveil est délivré de nouveau."""
