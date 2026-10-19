@@ -352,12 +352,15 @@ ameesh work list [--state S] [--assignee A] [--limit N] [--stale-after S] [--jso
 ameesh work show <id> [--json]
 ameesh work move <id> <intake|build|qa|merged|promoted|blocked|waiting_human> [--note N] [--actor A]
 ameesh work move <id> merged --correct REASON [--actor A]
-ameesh work merged <id> --sha SHA [--migration-landed N] [--note N] [--actor A]
+ameesh work merged <id> (--sha SHA | --pr OWNER/REPO#N) [--migration-landed N]
+                     [--note N] [--actor A]
 ameesh work assign <id> <agent> [--externe] [--actor A] [--claim] [--branch agent/…] [--target BRANCH]
 ameesh work dependencies <id> [--add ID|--remove ID] [--actor A]   # blocking prerequisites (L385)
 ameesh work migration <id> [--number N] [--release] [--repo R]   # reserve a migration number (L122)
 ameesh work set-app <id> <project> [--actor A] | backfill-app [--dry-run]
 ameesh work link <id> [CARD] [--none] [--actor A] | close <id> (--abandoned | --superseded-by ID | --delivered --sha SHA | --done)
+ameesh work packet record <carrier> [--repo R] [--base SHA] [--head REF] [--dry-run] [--json]
+ameesh work packet show <lot|carrier> [--json]   # recorded package composition (#2443)
 ameesh work sync-merges [--target T] [--dry-run] [--json]   # close frozen lots whose content is merged (L29)
 ameesh work sync-packets [--target T] [--dry-run] [--json] # close the units of merged packages (manifest, #2426)
 ameesh work sync-github [--dry-run] [--json]          # close lots whose PR is merged (read-only)
@@ -401,7 +404,11 @@ with a journal entry (#333). `work link` attaches a lot to a WorkPackage card
 `work close` closes an abandoned, superseded or delivered-outside-target lot
 (`--delivered --sha <reviewed head>`: the `delivered` milestone carries the
 head and counts as a delivery in `estimates`, #988), and `work sync-merges`
-closes the frozen lots whose content is already merged (L29). `work schedule`
+closes the frozen lots whose content is already merged (L29), including a
+unit linked to a merged package by `work packet record` (#2443). `work packet
+record` reads the package's composition commits (`ameesh-work:` trailers) and
+writes the link — never the manifest; `work packet show` prints it.
+`work schedule`
 proposes the planned dates of open assigned lots at the p80 of the L157
 reference table (`--apply` writes), and `work measure` records the actual time
 per phase and the merged diff size. `work project-github` projects the lots (or
@@ -490,6 +497,19 @@ created branch, already an ancestor of its target, is not a merge.
 A configured `ameesh.target` that does not resolve is reported as an error,
 never silently replaced by `main`.
 
+**Stacked PRs.** Before merging a PR whose base is not the repository's
+default branch, the fire (direct `gh pr merge`), `work merge-pr` and the merge
+queue verify that this base is not already merged into the default branch:
+merging there would land the content on a dead branch and lose it
+(home#112/#113 after `canon/2452` was merged). The refusal names the fix
+(`gh pr edit --base <default> N`, then freeze and re-review). A `gh pr merge`
+run by hand outside ameesh — office — keeps that check manual:
+
+```
+git -C <clone> merge-base --is-ancestor origin/<base> origin/<default> \
+  && gh pr edit <N> --repo <owner/repo> --base <default>
+```
+
 **Merges without a PR or a branch.** The same check also covers open lots
 without a branch whose assignee is on the host: a merge commit of the target,
 made after the lot was created, designates the lot with an `ameesh-work: <id>`
@@ -498,9 +518,18 @@ line, or with `#<id>` in its subject when the repository opts in
 The closed lot records the merge commit and a note saying how the merge was
 found. By hand, `work merged <id> --sha SHA` moves a lot from any open state
 (`intake`, `build`, `qa`, `blocked`, `waiting_human`) to `merged` at once,
-with its `merged` milestone; a closed lot is never reopened. A lot set to
-`promoted` by mistake goes back with `work move <id> merged --correct
-"reason"`, logged, for humans and orchestrator or design agents only.
+with its `merged` milestone; a closed lot is never reopened. When the lot's
+PR lives in another repository than the lot's (the canon `manaty/home`, for
+example), `work merged <id> --pr OWNER/REPO#N` reads it with `gh`: the PR must
+be `MERGED`, its head must be the lot's freeze (else its recorded branch),
+and GitHub must report its merge commit; that commit must be in the
+repository's default branch (`gh repo view` then `gh api compare`: `behind`
+or `identical`, any doubt refuses — a merged stacked base that never entered
+the default does not deliver). `--sha` is only an equality check; without a
+reported merge commit, the declaration is refused.
+A lot set to `promoted` by mistake goes back with `work move <id> merged
+--correct "reason"`, logged, for humans and orchestrator or design agents
+only.
 
 **Actor.** Without `--actor`, `work` commands record the session's bound
 identity (`AGENT_MAIL_NAME`, or a session binding), else `inconnu` with a

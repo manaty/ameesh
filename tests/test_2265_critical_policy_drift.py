@@ -26,7 +26,7 @@ class ReviewPolicyFixture:
                   "actor": actor, "at_ts": index, "id": index}
                  for index, actor in enumerate(actors, 1)]
         with mock.patch.object(merge_queue, "actor_family",
-                               side_effect=lambda _db, name: self.FAMILIES.get(name, "")):
+                               side_effect=lambda _db, name, **_: self.FAMILIES.get(name, "")):
             return merge_queue.review_gate(None, marks, self.HEAD, klass=klass,
                                            item={"assignee": "author"})
 

@@ -84,15 +84,28 @@ class Housekeeping(interface.Housekeeping):
         return [_data(dict(r)) for r in rows]
 
     def summary(self, host, since_s) -> list[dict]:
+        # #2617: an unattributed /tmp entry is signaled again every 12 h; in
+        # the 24 h window each path counts once, with its latest size, or the
+        # report shows its volume twice.
         where, params = "", [float(since_s)]
         if host:
             where = " AND host = %s"
             params.append(host)
         return self.db.query(
-            "SELECT host, kind, action, count(*)::int AS n,"
-            " coalesce(sum(bytes), 0)::bigint AS bytes FROM housekeeping_log"
+            "WITH recent AS ("
+            " SELECT host, kind, action, path, bytes, at, id FROM housekeeping_log"
             " WHERE at >= now() - make_interval(secs => %s) AND kind <> 'mesure'" + where +
-            " GROUP BY host, kind, action ORDER BY host, kind, action", tuple(params))
+            "), signaled_once AS ("
+            " SELECT DISTINCT ON (host, path) host, kind, action, bytes FROM recent"
+            " WHERE kind = 'orphan' AND action = 'signaled'"
+            " ORDER BY host, path, at DESC, id DESC)"
+            " SELECT host, kind, action, count(*)::int AS n,"
+            " coalesce(sum(bytes), 0)::bigint AS bytes FROM ("
+            " SELECT host, kind, action, bytes FROM recent"
+            " WHERE NOT (kind = 'orphan' AND action = 'signaled')"
+            " UNION ALL SELECT host, kind, action, bytes FROM signaled_once"
+            ") AS lignes GROUP BY host, kind, action ORDER BY host, kind, action",
+            tuple(params))
 
     def last_measure(self, host) -> list[dict]:
         where, params = "", []

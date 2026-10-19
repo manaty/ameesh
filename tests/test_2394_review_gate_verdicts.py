@@ -185,7 +185,7 @@ class GateTest(unittest.TestCase):
                   "actor": actor, "at_ts": index, "id": index}
                  for index, actor in enumerate(actors, 1)]
         with mock.patch.object(merge_queue, "actor_family",
-                               side_effect=lambda _db, name: FAMILIES.get(name, "")):
+                               side_effect=lambda _db, name, **_: FAMILIES.get(name, "")):
             return merge_queue.review_gate(None, marks, HEAD, klass=klass,
                                            item={"assignee": "author"})
 
@@ -243,7 +243,7 @@ class GateTest(unittest.TestCase):
         marks = [{"kind": "verdict", "verdict": "ok", "sha": HEAD,
                   "actor": "codex", "at_ts": 1, "id": 1}]
 
-        def family(_db, name):
+        def family(_db, name, **kwargs):
             if name == "author":
                 return "deepseek"
             raise merge_queue.RegistryReadError(

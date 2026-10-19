@@ -25,8 +25,11 @@ class MultiReservationTest(PgTestCase):
         super().setUp()
         self.repo = _depot(os.path.join(self.tmp, "nexlink"), "manaty/nexlink",
                            NEXLINK.directory, ["527_base.sql"])
+        # #2620 : le numéro exact se lit sur la cible ; le dépôt du banc est
+        # sur `develop`, sans `origin/HEAD` — déclarer la cible du lot.
         self.lot = work.add(self.db, title="CIV-3", issue_ref="manaty/nexlink#589",
-                            app="nexlink", actor="mesh-design")
+                            app="nexlink", actor="mesh-design",
+                            branch="lot/civ-3", branch_target="develop")
 
     def reserve(self, number=None, **kwargs):
         return work.reserve_migration(self.db, self.lot["id"], number,
@@ -61,7 +64,8 @@ class MultiReservationTest(PgTestCase):
         self.assertEqual(self.numbers(self.reserve(529)), [528, 529])
         # un autre lot ne peut pas prendre 529
         other = work.add(self.db, title="autre", issue_ref="manaty/nexlink#590",
-                         app="nexlink", actor="mesh-design")
+                         app="nexlink", actor="mesh-design",
+                         branch="lot/autre", branch_target="develop")
         with self.assertRaises(work.WorkError) as ctx:
             work.reserve_migration(self.db, other["id"], 529, repo=self.repo)
         self.assertIn("lot #%d" % self.lot["id"], str(ctx.exception))

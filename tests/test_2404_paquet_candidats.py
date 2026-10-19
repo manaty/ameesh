@@ -23,6 +23,8 @@ from unittest import mock
 
 from ameesh import lot_class, merge_queue, packet_candidates, resolutions, storage, work
 
+from .support import patch_families
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -189,6 +191,9 @@ class InventoryTest(unittest.TestCase):
         self.families = {"author": "deepseek", "reviewer": "claude"}
         self.class_calls = []
         self.head_classes: dict[str, tuple] = {}
+        # #2664 : le banc n'a pas de canon Git ; les familles lues par la
+        # porte sont épinglées, les familles d'acteurs restent simulées.
+        patch_families(self)
 
     def inventory(self, *, family=None, **kwargs):
         def fake_class(db, lot, **rest):
@@ -203,7 +208,7 @@ class InventoryTest(unittest.TestCase):
                         lot, [{"path": "src/ameesh/x.py", "class": "light", "rule": None}]),
                     "light_reviews": 1}
 
-        def fake_family(db, name):
+        def fake_family(db, name, **kw):
             return self.families.get(name, "")
 
         with mock.patch.object(storage, "of", return_value=self.store), \
@@ -249,7 +254,7 @@ class InventoryTest(unittest.TestCase):
     def test_unreadable_registry_is_an_error_not_a_verdicts_missing_wait(self):
         # #2521 : une lecture du registre impossible ne doit pas se lire
         # « verdicts-missing » (le lot serait écarté du paquet comme sans avis).
-        def unreadable(db, name):
+        def unreadable(db, name, **kw):
             raise merge_queue.RegistryReadError(
                 'cannot read the agent registry for %s: column "aliases" does not exist'
                 % name)

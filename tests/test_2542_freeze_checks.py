@@ -271,6 +271,18 @@ class CliTest(PgTestCase):
         self.assertIn("static checks not run", proc.stderr)
         self.assertEqual(len(self.frozen()), 1)
 
+    def test_la_prevalidation_est_appelee_apres_le_gel_sans_le_defaire(self):
+        # #2644 : le jalon est écrit avant la prévalidation ; un rouge ou une
+        # indisponibilité ne change pas le sort du gel. Le geste est un vrai
+        # sous-processus : on lit sa trace au journal, pas un mock.
+        sha = self.repo.commit(script=GREEN)
+        proc = self.freeze(sha)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual([m["sha"] for m in self.frozen()], [sha])
+        notes = [e.get("note") or "" for e in work.events(self.db, self.lot)]
+        self.assertTrue(any(n.startswith("prevalidation") for n in notes), notes)
+        self.assertNotIn("prevalidation: ", proc.stderr)
+
     def test_options_du_gel_refusees_hors_gel(self):
         proc = self.mesh("work", "milestone", str(self.lot), "verdict", "ok", "--sha", "a" * 40,
                          "--actor", "rev", "--no-static-checks", "x")
