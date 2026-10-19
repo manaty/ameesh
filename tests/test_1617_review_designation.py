@@ -197,6 +197,7 @@ class SelectionTest(unittest.TestCase):
             ))
         self.assertEqual(picked["state"], rd.DESIGNATED)
         self.assertEqual([r["family"] for r in picked["reviewers"]], ["claude", "codex"])
+        self.assertEqual(picked["families"], ["claude", "codex"])
         self.assertNotIn("deepseek", {r["family"] for r in picked["reviewers"]})
 
     def test_corrector_become_author_is_never_designated(self):
@@ -212,11 +213,13 @@ class SelectionTest(unittest.TestCase):
         one = rd.select(families=FAMILIES, required=1, authors=authors, candidates=pool)
         self.assertEqual(one["state"], rd.DESIGNATED)
         self.assertEqual([r["name"] for r in one["reviewers"]], ["codex-one"])
+        self.assertEqual(one["families"], ["codex"])
         # Deux avis hors claude et hors deepseek : la seule famille restante ne suffit pas.
         two = rd.select(families=FAMILIES, required=2, authors=authors, candidates=pool)
         self.assertEqual(two["state"], rd.WAITING)
         self.assertEqual(two["missing"], 1)
         self.assertEqual(two["reviewers"], [])
+        self.assertEqual(two["families"], ["codex"])
 
     def test_author_with_unknown_family_waits_instead_of_guessing(self):
         # codex-two est peut-être de la famille réelle de l'auteur : on attend.
@@ -284,6 +287,7 @@ class SelectionTest(unittest.TestCase):
                                   row("claude-two", harness="claude", session="claude")))
         self.assertEqual(picked["state"], rd.WAITING)
         self.assertEqual(picked["missing"], 1)
+        self.assertEqual(picked["families"], ["claude"])
         self.assertIn("claude", picked["why"])
         self.assertIn("deepseek", picked["why"])
 
@@ -390,11 +394,51 @@ class MessageTest(unittest.TestCase):
         self.assertIn("ameesh work milestone 1617 verdict ok|blocked --sha " + SHA_A, text)
         self.assertIn("git diff %s..%s" % (SHA_B[:12], SHA_A[:12]), text)
         self.assertIn("canon@deadbeef", text)
-        self.assertIn("you then become the author", text)
+        self.assertIn("you become the author of your fix", text)
         # #1534 N6 : le courrier de désignation couvre la règle home#81 entière
         self.assertIn("~50 lines", text)
         self.assertIn("second family", text)
         self.assertIn("ameesh provenance show", text)
+
+    def test_reviewer_message_refuses_a_fix_that_leaves_too_few_families(self):
+        # #2670, cas #2664 : deux avis requis, deux familles éligibles ; une
+        # correction qui fait du relecteur un auteur laisserait une seule
+        # famille et rendrait la porte insatisfaisable.
+        text = rd.reviewer_message(
+            LOT, freeze={"id": 42, "sha": SHA_A}, required=2, rank=2,
+            reviewer={"name": "rev-codex", "family": "codex"},
+            authors=[{"name": "mty-amh-impl-02", "family": "deepseek"}],
+            eligible_families=2)
+        self.assertIn("do not push a correction that makes you an author", text)
+        self.assertIn("1 independent family", text)
+        self.assertIn("2 required opinion", text)
+        self.assertIn("#2670", text)
+
+    def test_reviewer_message_allows_a_fix_with_a_spare_family(self):
+        # Trois familles pour deux avis : la correction laisse deux familles.
+        text = rd.reviewer_message(
+            LOT, freeze={"id": 42, "sha": SHA_A}, required=2, rank=2,
+            reviewer={"name": "rev-codex", "family": "codex"},
+            authors=[{"name": "mty-amh-impl-02", "family": "deepseek"}],
+            eligible_families=3)
+        self.assertIn("is allowed", text)
+        self.assertIn("2 independent families", text)
+        self.assertIn("#2670", text)
+
+    def test_reviewer_message_states_the_rule_without_a_count(self):
+        # Appel direct sans le compte : la règle est dite, jamais devinée.
+        text = rd.reviewer_message(
+            LOT, freeze={"id": 42, "sha": SHA_A}, required=2, rank=2,
+            reviewer={"name": "rev-codex", "family": "codex"},
+            authors=[{"name": "mty-amh-impl-02", "family": "deepseek"}])
+        self.assertIn("fewer independent families than required opinions", text)
+        self.assertIn("#2670", text)
+
+    def test_manual_reviewer_message_carries_the_family_rule(self):
+        text = rd.manual_reviewer_message({"id": 7, "title": "t"})
+        self.assertIn("fewer independent families", text)
+        self.assertIn("#2670", text)
+        self.assertIn("#2638", text)
 
     def test_capacity_message_refuses_implicit_admission(self):
         text = rd.capacity_message(LOT, freeze={"id": 42, "sha": SHA_A}, required=2,
@@ -447,6 +491,10 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual({m["to"] for m in out["messages"]}, {"claude-one", "codex-one"})
         for _to, body in self.port.messages:
             self.assertIn(SHA_A, body)
+            # #2670 : deux familles pour deux avis, une correction qui fait du
+            # relecteur un auteur laisserait la porte insatisfaisable.
+            self.assertIn("do not push a correction that makes you an author", body)
+            self.assertIn("1 independent family", body)
         self.assertEqual(len(self.port.commits), 1)
 
     def test_the_required_override_reads_the_critical_floor(self):

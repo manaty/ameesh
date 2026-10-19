@@ -137,11 +137,23 @@ class SloDeliveryTest(unittest.TestCase):
             self.run_briefs([alert], now=12000)
         self.assertEqual(self.recipients(), ["pilot"])
 
-    def test_home_desk_still_receives_operational_escalation(self):
+    def test_home_project_is_not_an_exception(self):
+        # #2640: there is no `home` project (canon lots are `app=ameesh`,
+        # branch `canon/…`, #2511); the old exception could never fire.
         self.alert.update(project="home", level=3, targets=["bureau", "auditeur"])
         self.run_briefs()
-        self.assertEqual(self.recipients(), ["auditeur", "bureau"])
-        self.thread.assert_not_called()
+        self.assertEqual(self.recipients(), ["auditeur"])
+        self.thread.assert_called_once()
+
+    def test_human_lot_keeps_delivery_across_an_absent_pass(self):
+        # #2640: a human-assigned lot carries its holder in `responsible`,
+        # not `agent`; the state must keep the real assignee.
+        self.item.update(assignee="human:bob")
+        self.alert.update(agent=None, responsible="human:bob", level=2, targets=["pilot"])
+        self.run_briefs()
+        self.run_briefs([])
+        self.run_briefs()
+        self.assertEqual(self.recipients(), ["pilot"])
 
     def test_external_bureau_cannot_be_reintroduced_as_pilot(self):
         self.alert.update(level=3, targets=["pilot", "bureau"], orchestrators=["bureau"])

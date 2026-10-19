@@ -438,11 +438,16 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
       that prove an independent family cover a seat; only the **missing** seats
       are designated, never a manual reviewer removed or overridden.
 
-    Returns `{state, required, reviewers, missing, manual, why, forbidden}`:
-    `waiting` when independent families are missing or an author family is
-    unknown, with the missing count — never an implicit admission. `reviewers`
-    names only the automatic reviewers of this call; `manual` the manual seats
-    that count.
+    Returns `{state, required, reviewers, missing, manual, why, forbidden,
+    families}`: `waiting` when independent families are missing or an author
+    family is unknown, with the missing count — never an implicit admission.
+    `reviewers` names only the automatic reviewers of this call; `manual` the
+    manual seats that count; `families` the eligible automatic families
+    (outside the authors and the manual seats). With the manual seats, that
+    count is the independent families available on this head: a reviewer's
+    correction that makes the reviewer an author of the head removes one, so
+    it is receivable only if the rest still covers the required opinions
+    (canon §2, #2670).
     """
     if type(required) is not int or required not in (0, 1, 2):
         raise DesignationError("required reviews must be 0, 1 or 2, not %r" % (required,))
@@ -450,7 +455,7 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     seats = manual_seats(already, authors=authors, families=families)
     out = {"state": NONE, "required": required, "reviewers": [], "missing": 0,
            "manual": seats, "why": "no review required",
-           "forbidden": sorted(forbidden)}
+           "forbidden": sorted(forbidden), "families": []}
     if required == 0:
         return out
     remaining = max(required - len(seats), 0)
@@ -494,6 +499,7 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     ordered.sort(key=lambda c: (_advance_of(c, pace), c.load, c.name))
     chosen = ordered[:remaining]
     out["reviewers"] = [{"name": c.name, "family": c.family} for c in chosen]
+    out["families"] = sorted(best)
     if len(chosen) < remaining:
         out.update({
             "state": WAITING,
@@ -524,13 +530,20 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
 
 def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
                      reviewer: Mapping, authors: Iterable = (), base: str = "",
-                     risk: str = "", policy_ref: str = "") -> str:
+                     risk: str = "", policy_ref: str = "",
+                     eligible_families: Optional[int] = None) -> str:
     """The mail that hands the reviewer the exact head and its place.
 
     The SHA is written in full, with its `frozen` milestone: the verdict will
     have to cite it as-is (`ameesh work milestone <lot> verdict ok --sha <sha>`).
-    The reviewer who fixes becomes an author of their fix: their own opinion no
-    longer counts (canon §2), the next selection will discard them.
+    A first-round correction under the §2 threshold keeps the reviewer's family
+    eligible (#2638); a correction that makes the reviewer an author removes
+    that family from the next designation. `eligible_families` is the number of
+    independent families available on this head (automatic and manual seats):
+    if a correction that makes the reviewer an author would leave fewer than
+    `required` families, the mail tells the reviewer not to push it and to
+    return it to the author instead (canon §2, #2670). Without the count, the
+    mail states the rule alone.
     """
     sha = str((freeze or {}).get("sha") or "")
     fid = (freeze or {}).get("id")
@@ -561,13 +574,39 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
         "- render the verdict: `ameesh work milestone %s verdict ok|blocked --sha %s`;"
         % (row.get("id"), sha),
         "- fix a blocking defect yourself and push to the lot branch "
-        "(canon §2): you then become the author of your fix, your opinion on the "
-        "new head no longer counts, another reviewer takes over;",
+        "(canon §2): a **first-round** correction under ~50 lines and without a "
+        "design change keeps your family eligible (#2638); otherwise you become "
+        "the author of your fix, your opinion on the new head no longer counts, "
+        "another reviewer takes over;",
         "- a fix longer than ~50 lines, or a design change, goes back to the author;",
         "- in a sensitive class, the second family reviews the lot **with** your fix, "
         "in the same round, distinct from every author;",
         "- your commits carry their exact origin (`ameesh provenance show --commit "
-        "<sha>`): by fixing you become an author of the new head;",
+        "<sha>`): the next designation reads it to tell a first-round fix from an "
+        "authored head;",
+    ]
+    if eligible_families is not None:
+        available = max(int(eligible_families), 0)
+        remaining = max(available - 1, 0)
+        if remaining < required:
+            lines.append(
+                "- **do not push a correction that makes you an author**: it "
+                "would leave %d independent famil%s for %d required opinion(s), "
+                "and the merge gate could not be satisfied — return the defect "
+                "to the author, who fixes it and freezes a new head (canon §2, "
+                "#2670);" % (remaining, "y" if remaining == 1 else "ies", required))
+        else:
+            lines.append(
+                "- a correction that makes you an author is allowed: %d "
+                "independent famil%s would remain for %d required opinion(s) "
+                "(canon §2, #2670);"
+                % (remaining, "y" if remaining == 1 else "ies", required))
+    else:
+        lines.append(
+            "- do not push a correction that would leave fewer independent "
+            "families than required opinions (canon §2, #2670): return it to "
+            "the author, who fixes it and freezes a new head;")
+    lines += [
         "- a non-blocking defect goes to the backlog, it does not block the merge;",
         "- do not rerun the suites: targeted tests are the author's job, CI "
         "runs on the frozen head once the required opinions are acquired.",
@@ -623,8 +662,10 @@ def manual_reviewer_message(lot: Mapping, *, freeze: Optional[Mapping] = None,
         "To do:",
         "- read the diff of the frozen head and check the edge cases;",
         "- a blocking defect: fix it yourself and push to the lot branch "
-        "(canon §2); a fix longer than ~50 lines, or a design change, goes back "
-        "to the author;",
+        "(canon §2); a first-round fix under ~50 lines and without a design "
+        "change keeps your family eligible (#2638); a longer fix, a design "
+        "change, or a correction that would leave fewer independent families "
+        "than required opinions goes back to the author (canon §2, #2670);",
         "- a non-blocking defect goes to the backlog, it does not block the merge;",
         "- do not rerun the suites: targeted tests are the author's job, CI runs "
         "on the frozen head once the required opinions are acquired.",
@@ -879,6 +920,11 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     messages = []
     if state == DESIGNATED:
         first_rank = len(selection.get("manual") or ()) + 1
+        # The independent families available on this head: the manual seats and
+        # the automatic families. A reviewer's authoring correction removes its
+        # own family from the next designation (canon §2, #2670).
+        eligible_families = (len(selection.get("manual") or ())
+                             + len(selection.get("families") or ()))
         for rank, reviewer in enumerate(selection["reviewers"], start=first_rank):
             messages.append({
                 "to": reviewer["name"],
@@ -886,7 +932,8 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
                 "kind": REQUEST_KIND,
                 "body": reviewer_message(item, freeze=freeze, required=required,
                                          rank=rank, reviewer=reviewer, authors=authors,
-                                         base=base, risk=risk, policy_ref=policy_ref),
+                                         base=base, risk=risk, policy_ref=policy_ref,
+                                         eligible_families=eligible_families),
             })
     else:
         messages.append({
