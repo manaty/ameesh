@@ -194,6 +194,30 @@ class InterruptionTest(PgTestCase):
         finally:
             worker.watchdog_stop.set()
 
+    def test_un_tour_ordinaire_apres_une_preemption_tourne(self):
+        """#2729 : le latch de préemption est consommé au début de chaque tour.
+
+        Il ne l'était qu'au tour `urgent` : après une préemption, le moniteur
+        tuait chaque tour ordinaire à la seconde, sans fin (185 tours sur
+        mty-amh-impl-01, 19/10). Ce qui reste du tour préempté ne doit pas
+        atteindre le suivant.
+        """
+        runner, worker = self._worker()
+        worker.preempting.set()  # ce qui restait après un tour préempté
+        env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
+               "AMEESH_TEST_SLEEP": "0"}
+        try:
+            with mock.patch.dict(os.environ, env, clear=False):
+                self.assertTrue(worker.run_turn(
+                    {"kind": "prompt", "prompt": "après la préemption", "ids": []}),
+                    "le tour ordinaire a été tué par le latch de préemption")
+            self.assertFalse(worker.preempting.is_set())
+            ligne = registry.get(self.db, "l11")
+            self.assertEqual(ligne["status"], "idle")
+            self.assertNotIn("preemption", ligne["status_text"] or "")
+        finally:
+            worker.watchdog_stop.set()
+
 
 class RotationTest(PgTestCase):
     def _worker(self, name: str = "rot"):

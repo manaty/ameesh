@@ -375,6 +375,13 @@ test (three messages → three notifications) caught the bug.
   probes; the **parameterized** test suite (`StopTriggersTest`) replays for
   each trigger the three scenarios — published harness, saturated log,
   late-published `Popen`.
+* **Priority preemption latch (#2729)** — the `preempting` latch is cleared at
+  the start of **every** turn, not only of a priority turn: left set by a
+  preempted turn, it killed each following turn within a second (185 turns on
+  19/10). A preempted turn writes its series as a suffix of `status_text`
+  (`turn interrupted: priority message [preemptions x5 since …]`); five
+  consecutive preemptions without a finished turn raise the
+  `preemption_streak` alert (read in `ameesh alerts`, not pushed by default).
 * **`canon sync` by the runner (spec §4.4)**: when a canon is configured,
   the runner launches `canon sync` for its host **at startup**, then
   periodically (`AMEESH_CANON_SYNC_INTERVAL`, default 300 s; 0 = only at
