@@ -43,7 +43,8 @@ sur `b40f10dabf76` (dev1 04:38:43Z, cx1 04:38:08Z).
 Chaque commit de composition a le lot en second parent, son sujet nomme le lot
 et son SHA, et il porte un trailer `ameesh-work: <lot>` (relu par
 `scripts/paquet-compose.py --units` : 10 unités, 10 lots portés). Aucun conflit
-de composition, aucune résolution, aucune adaptation de test. Une seule
+de composition, aucune résolution ; une adaptation de banc après le rouge CI
+du 07:42 (voir « Rouge CI du run 39216153057 »). Une seule
 migration SQL additive : **0467** (#2658), numéro réservé L122 ; #1484 modifie
 `deploy/sql/role-release-controller.sql` sans nouveau numéro.
 
@@ -71,6 +72,23 @@ migration SQL additive : **0467** (#2658), numéro réservé L122 ; #1484 modifi
 | #2629, #2653 | `missing-branch` : lot de canon (home), sans branche ameesh à composer |
 | #2648 | `verdicts-missing` sur `7e0db389ceb2` (aucun) |
 | #2668 | `blocked-verdict` sur `60cbca35fb7b` |
+
+## Rouge CI du run 39216153057 — correction du banc
+
+Trois rouges, même cause, sur `tests.test_1467_train_runner` (psycopg 2/8) :
+les trois passages qui publient recevaient la notification
+« prévalidation indisponible, publication maintenue: MechanicsAbsent:
+processus/mecanique.yaml is absent at <sha> » (#2644, accroche du train) et
+tombaient sur `self.assertEqual(self.notices, [])`. Le canon du banc est un
+dépôt minimal sans `processus/mecanique.yaml` ; le port relit ce canon et dit
+son indisponibilité.
+
+Correction (adaptation de test, §2, sans avis) : `setUp` double
+`prevalidation_calls.gate_train` en vert, le banc reste hermétique (aucun plan
+ni hôte réel) ; la couverture du port reste dans
+`tests/test_2644_prevalidation_calls.py` et `tests/test_1467_train_runtime.py`.
+Aucun code produit modifié. Vérifié localement : module
+`test_1467_train_runner` complet, **34 tests OK** en psql et psycopg.
 
 ## Contrôles
 
@@ -100,6 +118,8 @@ migration SQL additive : **0467** (#2658), numéro réservé L122 ; #1484 modifi
   `test_2664_familles_canon`, `test_2601_packet_watch`,
   `test_2404_paquet_candidats`, `test_l232b_bootstrap_installer`,
   `test_plan_git`.
+- Après correction du rouge : module `test_1467_train_runner` complet,
+  **34 tests OK** en psql et psycopg, 0 échec.
 - Suite complète unique demandée sur la tête finale (`ci-full-<sha>`), avec la
   revue unitaire du paquet pour seul avis de la demande de CI (§12,
   `--full --avis 0`).
