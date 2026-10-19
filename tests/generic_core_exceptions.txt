@@ -2,6 +2,7 @@
 # L97 baseline (#114). Each count is an allowance, never a whole-file exclusion.
 # Remove/reduce rows as coupling is extracted; review any baseline change.
 # path relative to src/ameesh : motif : occurrence count : reason
+account_claims.py : sha : 1 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 accounts.py : sha : 2 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 acp.py : sha : 8 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 actions.py : github : 1 : Legacy coupling or vocabulary; extract or generalize in L98-L104
@@ -46,8 +47,8 @@ canon_sync.py : github : 3 : Canon, identity or memory infrastructure; git remai
 ci.py : PR : 14 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 ci.py : gel : 1 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 ci.py : gh : 46 : Legacy coupling or vocabulary; extract or generalize in L98-L104
-ci.py : github : 65 : Legacy coupling or vocabulary; extract or generalize in L98-L104
-ci.py : sha : 183 : Legacy coupling or vocabulary; extract or generalize in L98-L104
+ci.py : github : 67 : Legacy coupling or vocabulary; extract or generalize in L98-L104
+ci.py : sha : 185 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 ci_parts.py : github : 1 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 ci_parts.py : sha : 14 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 cli.py : sha : 1 : Legacy coupling or vocabulary; extract or generalize in L98-L104
@@ -71,7 +72,7 @@ discovery/base.py : sha : 2 : Legacy coupling or vocabulary; extract or generali
 docker_storage.py : docker : 12 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 exploitation.py : docker : 7 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 exploitation.py : github : 3 : Legacy coupling or vocabulary; extract or generalize in L98-L104
-exploitation.py : sha : 4 : Legacy coupling or vocabulary; extract or generalize in L98-L104
+exploitation.py : sha : 3 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 exploitation.py : worktree : 4 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 fastmail.py : sha : 2 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 fire.py : PR : 25 : Legacy coupling or vocabulary; extract or generalize in L98-L104
@@ -79,6 +80,8 @@ fire.py : gh : 105 : Legacy coupling or vocabulary; extract or generalize in L98
 fire.py : github : 26 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 fire.py : sha : 96 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 fire.py : state:merged : 11 : Legacy coupling or vocabulary; extract or generalize in L98-L104
+freeze_checks.py : sha : 16 : Legacy coupling or vocabulary; extract or generalize in L98-L104
+freeze_checks.py : worktree : 4 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 github_cli.py : gh : 1 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 github_cli.py : github : 17 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 github_identity.py : fusion : 1 : Legacy coupling or vocabulary; extract or generalize in L98-L104
@@ -98,7 +101,7 @@ housekeeping.py : docker : 41 : Legacy coupling or vocabulary; extract or genera
 housekeeping.py : npm : 3 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 housekeeping.py : pnpm : 2 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 housekeeping.py : sha : 1 : Legacy coupling or vocabulary; extract or generalize in L98-L104
-housekeeping.py : worktree : 98 : Legacy coupling or vocabulary; extract or generalize in L98-L104
+housekeeping.py : worktree : 106 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 housekeeping.py : yarn : 2 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 housekeeping_discovery.py : worktree : 11 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 incident.py : github : 1 : Legacy coupling or vocabulary; extract or generalize in L98-L104
@@ -143,14 +146,14 @@ merge_queue.py : PR : 5 : Legacy coupling or vocabulary; extract or generalize i
 merge_queue.py : docker : 1 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 merge_queue.py : gh : 3 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 merge_queue.py : github : 18 : Legacy coupling or vocabulary; extract or generalize in L98-L104
-merge_queue.py : sha : 63 : Legacy coupling or vocabulary; extract or generalize in L98-L104
+merge_queue.py : sha : 67 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 merge_queue.py : state:merged : 1 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 mesh_cli.py : PR : 3 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 mesh_cli.py : gel : 1 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 mesh_cli.py : github : 2 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 mesh_cli.py : module-import : 1 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 mesh_cli.py : pr_ref : 2 : Legacy coupling or vocabulary; extract or generalize in L98-L104
-mesh_cli.py : sha : 13 : Legacy coupling or vocabulary; extract or generalize in L98-L104
+mesh_cli.py : sha : 15 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 mesh_cli.py : state:build : 1 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 mesh_cli.py : state:merged : 2 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 mesh_cli.py : worktree : 8 : Legacy coupling or vocabulary; extract or generalize in L98-L104
@@ -168,7 +171,7 @@ offload.py : sha : 2 : Legacy coupling or vocabulary; extract or generalize in L
 offload.py : worktree : 1 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 oidc.py : sha : 1 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 p256.py : sha : 2 : Legacy coupling or vocabulary; extract or generalize in L98-L104
-packet_candidates.py : sha : 7 : Legacy coupling or vocabulary; extract or generalize in L98-L104
+packet_candidates.py : sha : 45 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 packet_candidates.py : state:qa : 1 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 packet_close.py : sha : 10 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 packet_close.py : state:merged : 3 : Legacy coupling or vocabulary; extract or generalize in L98-L104
@@ -185,7 +188,7 @@ plan_git.py : PR : 6 : Legacy coupling or vocabulary; extract or generalize in L
 plan_git.py : gh : 5 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 plan_git.py : github : 16 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 plan_git.py : sha : 143 : Legacy coupling or vocabulary; extract or generalize in L98-L104
-plan_git.py : state:merged : 32 : Legacy coupling or vocabulary; extract or generalize in L98-L104
+plan_git.py : state:merged : 33 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 plan_github.py : PR : 7 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 plan_github.py : fusion : 1 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 plan_github.py : gh : 96 : Legacy coupling or vocabulary; extract or generalize in L98-L104
@@ -258,7 +261,7 @@ resources.py : docker : 18 : Legacy coupling or vocabulary; extract or generaliz
 resources.py : worktree : 1 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 review.py : review-policy : 7 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 review_designation.py : sha : 40 : Legacy coupling or vocabulary; extract or generalize in L98-L104
-review_designation_activation.py : sha : 27 : Legacy coupling or vocabulary; extract or generalize in L98-L104
+review_designation_activation.py : sha : 30 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 review_designation_pg.py : gel : 2 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 review_designation_pg.py : sha : 18 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 review_lot.py : PR : 1 : Legacy coupling or vocabulary; extract or generalize in L98-L104
@@ -353,7 +356,7 @@ train_runtime.py : github : 1 : Legacy coupling or vocabulary; extract or genera
 train_shadow.py : sha : 9 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 train_transport_journal.py : sha : 8 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 train_transports.py : sha : 5 : Legacy coupling or vocabulary; extract or generalize in L98-L104
-verdict_carry.py : sha : 16 : Legacy coupling or vocabulary; extract or generalize in L98-L104
+verdict_carry.py : sha : 22 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 versions.py : PR : 3 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 versions.py : gh : 10 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 versions.py : github : 40 : Legacy coupling or vocabulary; extract or generalize in L98-L104
@@ -370,7 +373,7 @@ work.py : fusion : 1 : Legacy coupling or vocabulary; extract or generalize in L
 work.py : github : 5 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 work.py : module-import : 1 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 work.py : pr_ref : 15 : Legacy coupling or vocabulary; extract or generalize in L98-L104
-work.py : sha : 36 : Legacy coupling or vocabulary; extract or generalize in L98-L104
+work.py : sha : 37 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 work.py : state:build : 10 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 work.py : state:intake : 5 : Legacy coupling or vocabulary; extract or generalize in L98-L104
 work.py : state:merged : 13 : Legacy coupling or vocabulary; extract or generalize in L98-L104
