@@ -155,6 +155,18 @@ class CanonPriorityTest(unittest.TestCase):
         self.assertTrue(merge_queue.critical_scope(klass))
         self.assertEqual(merge_queue.required_verdicts(klass), 2)
 
+    def test_the_ameesh_fallback_holds_in_subpackages(self):
+        # Revue dev2 : l'ancrage sous src/ameesh/ vaut à toute profondeur,
+        # comme `(^|/)` avant #2696 — l'identité et la garde d'hôte de
+        # l'exécuteur médié gardent deux avis.
+        for path in ("src/ameesh/mediated_executor/identity.py",
+                     "src/ameesh/mediated_executor/host_gate.py"):
+            with self.subTest(path=path):
+                source = canon(rules=[{"paths": [path], "class": "sensitive"}])
+                klass = lot_class.class_of_paths([source], "ameesh", [path])
+                self.assertTrue(merge_queue.critical_scope(klass))
+                self.assertEqual(merge_queue.required_verdicts(klass), 2)
+
     def test_an_ameesh_test_name_is_not_a_host_path(self):
         # Le motif `host[-_]` est ancré sous src/ameesh/ : un fichier de test
         # `test_host_gate.py` n'est pas un chemin de prod.

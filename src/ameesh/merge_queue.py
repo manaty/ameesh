@@ -115,16 +115,17 @@ def latest_verdict(rows: list[dict]) -> dict | None:
 CRITICAL_SCOPE = (
     # SQL, migrations, stockage — les noms ameesh sont ancrés sous src/ameesh/ ;
     # `supabase/`, `*.sql` et `deploy/sql/` restent globaux (SQL dans tout projet).
-    re.compile(r"^src/ameesh/(?:migrations?|storage)(?:/|$)|"
-               r"^src/ameesh/(?:migrations|db)\.py$|"
+    re.compile(r"^src/ameesh/(?:[^/]+/)*(?:migrations?|storage)(?:/|$)|"
+               r"^src/ameesh/(?:[^/]+/)*(?:migrations|db)\.py$|"
                r"(?:^|/)supabase/|\.sql$|^deploy/sql/"),
     # sécurité : droits, identité, clés, secrets, décisions ; garde cgroup
     # DeepSeek (#2282 : le préchargement Node et son module Python). Noms
-    # ameesh ancrés sous src/ameesh/ (#2696).
-    re.compile(r"^src/ameesh/(?:approve|auth|authority|identity|signing|cose|p256|jcs|"
+    # ameesh ancrés sous src/ameesh/, à toute profondeur comme avant #2696
+    # (`mediated_executor/identity.py`, `mediated_executor/host_gate.py`).
+    re.compile(r"^src/ameesh/(?:[^/]+/)*(?:approve|auth|authority|identity|signing|cose|p256|jcs|"
                r"decisions|visibility|auth_failure|dsn|assignments)(?:/|\.py$|$)|"
-               r"^src/ameesh/deepseek_cgroup\.(?:cjs|py)$|"
-               r"^src/ameesh/(?:keys?|secrets?)(?:/|$)|"
+               r"^src/ameesh/(?:[^/]+/)*deepseek_cgroup\.(?:cjs|py)$|"
+               r"^src/ameesh/(?:[^/]+/)*(?:keys?|secrets?)(?:/|$)|"
                r"^src/ameesh/(?:approve_check|approve_client|config)\.py$"),
     # prod, infra, déploiement, hôtes et relais — dont la porte de fusion.
     # Les chemins ameesh sont ancrés sous src/ameesh/ ; les domaines génériques
@@ -132,11 +133,11 @@ CRITICAL_SCOPE = (
     re.compile(r"(?:^|/)(?:deploy|infra|lab|bin)(?:/|$)|(?:^|/)\.github/|"
                r"(?:^|/)scripts/(?:ci|deploy|compute|test)|"
                r"(?:^|/)(?:Dockerfile|pyproject\.toml)$|"
-               r"^src/ameesh/host[-_]|^src/ameesh/(?:hostcheck|exploitation|relay|serve|"
+               r"^src/ameesh/(?:[^/]+/)*host[-_]|^src/ameesh/(?:[^/]+/)*(?:hostcheck|exploitation|relay|serve|"
                r"progress_serve|relocation|placement|merge_queue|land|fire)\.py$|"
                # la porte de fusion hors API, la classe du lot et son classement
                # (#2249 ; ligne perdue dans une composition, restaurée #2374)
-               r"^src/ameesh/(?:merge_pr|lot_class|review)\.py$|"
+               r"^src/ameesh/(?:[^/]+/)*(?:merge_pr|lot_class|review)\.py$|"
                # ce qui entre dans un paquet : la liste calculée des lots
                # prêts et ses remises (#2496)
                r"^src/ameesh/packet_candidates\.py$|^scripts/paquet-candidats\.py$|"
