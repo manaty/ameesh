@@ -112,21 +112,27 @@ def default_base(cfg, item: dict, repo: str) -> Optional[str]:
         return None
 
 
-def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=()) -> str:
-    """Le dépôt local qui contient le commit gelé `frozen`, ou "" (#2559).
+def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=(),
+                    overview: list | None = None) -> tuple[str, str]:
+    """Le dépôt local qui contient le commit gelé `frozen`, et ce commit résolu.
 
     L'hôte qui lit un lot (alerte SLO, vue) n'est pas forcément celui de son
     auteur : `radar` ne connaît pas toujours le dépôt du projet. On essaie donc,
     dans l'ordre, le dossier de travail de l'assigné (registre), le dépôt du
     projet (`repository`), tout dossier de travail local du registre, les
     chemins `extra_paths` de l'appelant, puis le dossier courant. Le premier
-    dont le dépôt résout `frozen` en commit gagne ; aucun : "" — l'appelant ne
-    conclut pas (jamais de classe rassurante par défaut). Lecture seule."""
+    dont le dépôt résout `frozen` en commit gagne.
+
+    Rend `(dépôt, commit complet)` — le SHA résolu, jamais le préfixe reçu
+    (#2564) — ou `("", "")` si aucun dépôt ne le résout : l'appelant ne conclut
+    pas (jamais de classe rassurante par défaut). `overview` réutilise les
+    lignes de `registry.overview` déjà lues par l'appelant (une passe = une
+    lecture pour N lots, #2564) ; `None` les relit. Lecture seule."""
     from . import registry
 
     frozen = str(frozen or "").strip()
     if not frozen:
-        return ""
+        return "", ""
     candidates = []
     assignee = str((item or {}).get("assignee") or "").strip()
     try:
@@ -139,7 +145,8 @@ def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=()) -> str:
     except Exception:  # noqa: BLE001 - pas de réglage radar : les autres pistes
         pass
     try:
-        candidates.extend(str(row.get("cwd") or "") for row in registry.overview(db))
+        rows = registry.overview(db) if overview is None else overview
+        candidates.extend(str(row.get("cwd") or "") for row in rows)
     except Exception:  # noqa: BLE001 - registre illisible : les autres pistes
         pass
     candidates.extend(extra_paths or ())
@@ -160,11 +167,12 @@ def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=()) -> str:
             continue
         seen.add(root)
         try:
-            if plan_git._commit(root, frozen):
-                return root
+            commit = plan_git._commit(root, frozen)
         except Exception:  # noqa: BLE001 - commit illisible : piste suivante
             continue
-    return ""
+        if commit:
+            return root, commit
+    return "", ""
 
 
 def _doubtful_files(paths) -> list:

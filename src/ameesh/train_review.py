@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from .train import TrainError
 
 SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
-FAMILIES = {"claude", "codex", "deepseek"}
 MARK_FIELDS = ("id", "actor", "at_ts", "sha", "verdict")
 
 
@@ -32,7 +31,7 @@ class Receipt:
     record: str                  # exact provenance record, never free-form note
     milestone: dict | None = None
 
-    def known(self, families=FAMILIES):
+    def known(self, families):
         return (all(isinstance(value, str) and value.strip() for value in (
             self.subject, self.commit, self.actor, self.session, self.turn, self.record))
                 and SHA.fullmatch(self.commit) is not None and self.harness in families)

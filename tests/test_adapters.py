@@ -128,9 +128,11 @@ class AdapterTest(unittest.TestCase):
                     adapter = adapters.adapter_for(harness)
                     self.assertEqual(adapter.spec.key, harness)
                     self.assertEqual(adapter.spec.binary, adapters.DEFAULT_BIN[harness])
-                    # sans session, aucun drapeau de session ne traîne
-                    self.assertNotIn(adapter.spec.session_flag[0],
-                                     adapter.interactive_command())
+                    # sans session, aucun drapeau de session ne traîne (un
+                    # harnais sans session interactive refuse avant, #2706)
+                    if adapter.spec.attach:
+                        self.assertNotIn(adapter.spec.session_flag[0],
+                                         adapter.interactive_command())
                     # la session se place avant le texte
                     argv = adapter.command("fais X", "s-1")
                     self.assertEqual(argv[-1], "fais X")
@@ -145,8 +147,13 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual(codex.interactive_command("t1"),
                              [codex.binary, "--no-daemon", "resume", "t1"])
             dsh = adapters.adapter_for("deepseek")
-            self.assertEqual(dsh.interactive_command("d1"),
-                             [dsh.binary, "--profile", "agent", "--session-id", "d1"])
+            # #2706 : dsh n'a pas de profil interactif (son profil `agent` est
+            # headless et exige une tâche) ; le descripteur refuse l'attachement
+            # au lieu de lancer une commande qui échouerait après le bail.
+            self.assertFalse(dsh.spec.attach)
+            with self.assertRaises(adapters.HarnessMissing) as ctx:
+                dsh.interactive_command("d1")
+            self.assertIn("no interactive session", str(ctx.exception))
 
 
 if __name__ == "__main__":

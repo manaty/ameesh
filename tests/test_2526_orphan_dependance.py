@@ -45,9 +45,14 @@ class OrphanLotDependanceTest(PgTestCase):
         # fusionnée (#2252) : toujours pas d'alerte.
         self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s", (amont["id"],))
         self.assertEqual(self._alerts(), [])
-        # Bloqueur fusionné : l'attente tombe, l'agent n'a toujours pas tourné,
-        # le lot redevient orphelin `sans_tour`.
+        # Bloqueur fusionné : l'attente tombe. L'inactivité repart de la levée
+        # (#2623) : le lot n'est pas orphelin à la seconde de la fusion.
         self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s", (amont["id"],))
+        self.assertEqual(self._alerts(), [])
+        # Levée vieillie au-delà du seuil : le lot redevient orphelin
+        # `sans_tour`, l'agent n'a toujours pas tourné.
+        self.db.execute("UPDATE work_item_milestones SET at = now() - interval '2 hours'"
+                        " WHERE work_item_id = %s AND kind = 'merged'", (amont["id"],))
         alertes = self._alerts()
         self.assertEqual([(a["lot"], a["reason"]) for a in alertes],
                          [(bloque["id"], "sans_tour")])
