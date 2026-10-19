@@ -507,11 +507,15 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     return out
 
 
-def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None) -> dict | None:
+def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
+                         overview=None) -> dict | None:
     """La porte des avis du dernier gel d'un lot, lue comme la composition du
     paquet (`packet_candidates`) : dépôt retrouvé par le commit gelé (#2559,
-    l'hôte qui lit le lot n'est pas toujours celui de son auteur), classe du
-    diff gelé, puis `review_gate`.
+    l'hôte qui lit le lot n'est pas toujours celui de son auteur), gel résolu
+    en commit complet puis classe du diff gelé, puis `review_gate`.
+
+    `overview` : les lignes de `registry.overview` déjà lues par l'appelant
+    (une passe SLO sur N lots = une lecture, #2564) ; `None` les relit.
 
     Rend None quand la lecture n'est pas concluante (pas de gel, dépôt
     introuvable, classe en doute sans chemin lisible) : l'appelant ne doit
@@ -520,7 +524,13 @@ def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None) -> dict | No
 
     freeze = plan_git.latest_freeze(marks or ())
     frozen = str((freeze or {}).get("sha") or "").strip()
-    repo = lot_class.repo_for_freeze(db, cfg, item, frozen) if frozen else ""
+    repo, resolved = (lot_class.repo_for_freeze(db, cfg, item, frozen,
+                                                overview=overview)
+                      if frozen else ("", ""))
+    if resolved:
+        # #2564 : la classe et la porte lisent le commit complet, jamais le
+        # préfixe saisi dans le jalon de gel.
+        frozen = resolved
     try:
         # Comme la file : origin/<cible> avant la branche locale, qui peut
         # encore contenir dans le diff des changements déjà fusionnés (#2207).
