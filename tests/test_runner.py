@@ -283,10 +283,16 @@ class RunnerTest(PgTestCase):
         protège le tour entier : son renouvellement doit commencer avec la
         préparation, pas une fois le harnais publié.
 
+        #2597 : il couvre aussi l'après-harnais (nettoyage, compta, fin de
+        tour). Run 39181194843 : le tour démarrait et finissait, puis le
+        veilleur tuait le worker pendant la compta. Le battement s'arrêtait à
+        la sortie du harnais ; il court désormais jusqu'à la sortie de
+        `_run_turn`.
+
         #2600 : horloge simulée et gelée. La préparation attend le premier
-        renouvellement (preuve que le battement tourne avant elle), sans
-        dormir plus que le bail ni laisser le veilleur juger une horloge
-        réelle : le témoin ne dépend plus de la charge de la CI.
+        renouvellement (preuve que le battement tourne avant elle), puis la
+        compta d'après harnais en attend un nouveau (preuve qu'il tourne
+        encore là, #2597). Aucun bail réel de 3 s ne juge le témoin.
         """
         cwd = self._cwd("lent")
         self.register("lent", "claude", cwd=cwd, prompt="tour préparé lentement")
@@ -321,11 +327,26 @@ class RunnerTest(PgTestCase):
                 "battement ne la couvre pas")
             return ouverture(self_)
 
+        fin_de_tour = registry.end_turn
+
+        def fin_lente(*args, **kwargs):
+            # Après-harnais : le battement doit encore renouveler ici (#2597).
+            renouvele.clear()
+            self.assertTrue(
+                renouvele.wait(10.0),
+                "le battement s'est arrêté à la sortie du harnais, avant la "
+                "compta d'après tour")
+            return fin_de_tour(*args, **kwargs)
+
         with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN,
                                           "AMEESH_TEST_LOG": self.turns_log}), \
                 mock.patch.object(AgentWorker, "renew", renew_espion), \
-                mock.patch.object(AgentWorker, "_ouverture", lente):
+                mock.patch.object(AgentWorker, "_ouverture", lente), \
+                mock.patch.object(registry, "end_turn", fin_lente):
             ok = worker.run_turn({"kind": "prompt", "prompt": "consigne", "ids": []})
+        # Le tour est fini : ce témoin ne rend pas le bail comme la boucle de
+        # service, donc le veilleur ne doit plus juger l'échéance ensuite.
+        worker.watchdog_stop.set()
         self.assertTrue(ok, "le tour n'a pas démarré : le bail n'a pas survécu "
                             "à la préparation")
         self.assertFalse(worker.lease_lost.is_set(),
