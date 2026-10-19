@@ -78,6 +78,9 @@ class RuleTest(unittest.TestCase):
                               side_effect=lambda db, n, text, actor="": self.ops.note(
                                   n, "", text, actor)),
             mock.patch.object(review_lot, "_turns_harness", return_value="codex"),
+            # #2664 : banc sans canon ; familles compilées épinglées.
+            mock.patch.object(review_lot, "compiled_families",
+                              return_value=("claude", "codex", "deepseek")),
             mock.patch.object(registry, "get",
                               side_effect=lambda db, name: {"harness": "deepseek"}
                               if name == "a1" else None),
@@ -179,7 +182,8 @@ class RuleTest(unittest.TestCase):
     def test_auteur_humain_sans_harnais_ne_promet_pas_un_refus(self):
         body = review_lot.body_of(
             self.item, LOT, klass={"class": "sensitive", "critical": True},
-            author={"name": "human:smichea", "harness": ""})
+            author={"name": "human:smichea", "harness": ""},
+            families=("claude", "codex", "deepseek"))
         self.assertNotIn("Famille de l'auteur non tracée", body)
         self.assertNotIn("sera refusé", body)
         self.assertIn("clore cette mission** : `ameesh work close <id> --done`", body)
@@ -187,7 +191,8 @@ class RuleTest(unittest.TestCase):
     def test_tiers_qui_regele_ne_donne_pas_sa_famille_a_lauteur(self):
         body = review_lot.body_of(
             self.item, LOT, klass={"class": "sensitive", "critical": True},
-            author={"name": "a1", "harness": "", "refroze": "claude1"})
+            author={"name": "a1", "harness": "", "refroze": "claude1"},
+            families=("claude", "codex", "deepseek"))
         self.assertIn("Famille de l'auteur non tracée", body)
         self.assertIn("codex et claude", body)
         self.assertNotIn("codex et deepseek", body)
@@ -277,15 +282,16 @@ class RuleTest(unittest.TestCase):
     def test_echeance_et_familles(self):
         self.assertEqual(review_lot.deadline(datetime(2026, 10, 13, 2, 0)),
                          "2026-10-13 23:59 Europe/Paris")
-        self.assertEqual(review_lot.reviewer_family("deepseek"), "codex")
-        self.assertEqual(review_lot.reviewer_family("claude"), "codex")
-        self.assertEqual(review_lot.reviewer_family("codex"), "claude")
-        self.assertIn("codex", review_lot.reviewer_family(""))
+        F = ("claude", "codex", "deepseek")
+        self.assertEqual(review_lot.reviewer_family("deepseek", F), "codex")
+        self.assertEqual(review_lot.reviewer_family("claude", F), "codex")
+        self.assertEqual(review_lot.reviewer_family("codex", F), "claude")
+        self.assertIn("codex", review_lot.reviewer_family("", F))
         # #2374 : deux familles distinctes, hors de l'auteur, pour la porte
-        self.assertEqual(review_lot.review_families("deepseek"), ("codex", "claude"))
-        self.assertEqual(review_lot.review_families("claude"), ("codex", "deepseek"))
-        self.assertEqual(review_lot.review_families("codex"), ("claude", "deepseek"))
-        self.assertEqual(review_lot.review_families(""), ("codex", "claude"))
+        self.assertEqual(review_lot.review_families("deepseek", F), ("codex", "claude"))
+        self.assertEqual(review_lot.review_families("claude", F), ("codex", "deepseek"))
+        self.assertEqual(review_lot.review_families("codex", F), ("claude", "deepseek"))
+        self.assertEqual(review_lot.review_families("", F), ("codex", "claude"))
         self.assertEqual(review_lot.ref_of(539), "review-after-merge:#539")
 
 

@@ -40,6 +40,37 @@ def verdict(sha, at, id=2, actor="cx1", kind="ok"):
             "actor": actor, "verdict": kind}
 
 
+class RemoteBranchRevertTest(unittest.TestCase):
+    def test_remote_head_reverted_does_not_close_stale_branch(self):
+        """#2654 : une tête distante ancêtre mais annulée n'est pas livrée."""
+        with tempfile.TemporaryDirectory() as repo:
+            def git(*args):
+                return _git(repo, *args).stdout.strip()
+
+            def commit(name):
+                with open(os.path.join(repo, name), "w") as fh:
+                    fh.write(name + "\n")
+                git("add", name)
+                git("commit", "-qm", name)
+                return git("rev-parse", "HEAD")
+
+            git("init", "-q", "-b", "main")
+            commit("base")
+            old = commit("old")
+            git("branch", "agent/reused", old)
+            new = commit("new")
+            git("revert", "--no-edit", new)
+            bare = os.path.join(repo, "forge.git")
+            git("init", "-q", "--bare", bare)
+            git("remote", "add", "origin", bare)
+            git("push", "-q", "origin", new + ":refs/heads/agent/reused")
+            self.assertEqual(plan_git.probe(repo, new, "main")["how"], "reverted")
+            found = plan_git.branch_probe(repo, "agent/reused", "main", seen_head=old)
+            self.assertFalse(found["merged"], found)
+            self.assertEqual(found["tip"], new)
+            self.assertTrue(found["ahead"])
+
+
 class FreezeCandidateTest(unittest.TestCase):
     def test_commit_id_et_meme_commit(self):
         self.assertEqual(plan_git.commit_id(" 86EBEBEDb8 "), "86ebebedb8")

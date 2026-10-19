@@ -14,6 +14,8 @@
 #
 # The timer ticks every five minutes; `ameesh release tick` decides from the
 # compiled `mechanics.cutoffs` and does nothing outside a cutoff window.
+# #2601: the same tick runs the "missed slot" packet alert when the host file
+# declares `packet_watch` (composer and pilot as `notify`).
 [Unit]
 Description=ameesh release at the compiled canon cutoffs (#2448)
 After=network-online.target

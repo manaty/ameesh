@@ -964,8 +964,12 @@ class Replayer:
     `.git/ameesh-rr-v4/<commit>` (the target's, `attributes_tree`): a replay
     sees the pair's resolution only, never another pair's nor a replaced one."""
 
-    def __init__(self, repo: str, path: str, *, script: str | None = "auto") -> None:
+    def __init__(self, repo: str, path: str, *, script: str | None = "auto",
+                 target: str = "") -> None:
         self.repo, self.path, self.script = repo, path, script
+        #: #2673: la cible déclarée du projet (`radar.projects.target`) que le
+        #: clone doit porter ; vide : sa branche par défaut.
+        self.target = (target or "").strip()
         #: attribute keys already read, per target tree (`attributes_key`)
         self._attr_keys: dict = {}
 
@@ -1005,6 +1009,46 @@ class Replayer:
                 _check(_run(self.path, "checkout", "-q", "-f", "--detach", head), "checkout")
             else:
                 _run(self.path, "reset", "-q", "--hard")
+            self.declare_target()
+
+    def _declared_ref(self) -> str:
+        """La branche à déclarer dans le clone : la cible du projet quand elle
+        nomme une branche récupérée, sinon la branche par défaut du clone."""
+        if self.target:
+            name = plan_git.short_branch(self.target)
+            if name and plan_git._commit(self.path, "refs/remotes/origin/" + name):
+                return "origin/" + name
+            if plan_git._commit(self.path, self.target):
+                return self.target
+            return self.target
+        for candidate in plan_git.DEFAULT_TARGETS:
+            if plan_git._commit(self.path, candidate):
+                return candidate
+        return ""
+
+    def declare_target(self) -> str:
+        """#2673 : écrit `ameesh.target` dans le clone (création/rafraîchissement).
+
+        Un clone radar hérite de `origin/HEAD` du checkout source : quand
+        celui-ci est détaché sur une release, `plan_git.default_target` y lit
+        `release/*` et `lot_class` classe « release » les lots sans cible. Si
+        la clé manque, la cible du projet est écrite, sinon la branche par
+        défaut du clone (`origin/main`, puis main/master). Une cible déjà posée
+        n'est jamais écrasée (geste d'exploitation, #2673). Rend la cible
+        écrite, vide si le clone n'existe pas ou n'offre aucune branche."""
+        if not os.path.isdir(os.path.join(self.path, ".git")):
+            return ""
+        if os.path.realpath(self.path) == os.path.realpath(self.repo):
+            # le clone est le dépôt source : jamais de configuration chez lui
+            return ""
+        configured = plan_git.declared_target(self.path) or ""
+        if configured:
+            return configured
+        value = self._declared_ref()
+        if not value:
+            return ""
+        _check(_run(self.path, "config", plan_git.TARGET_GIT_KEY, value), "config")
+        return value
 
     def _rr_cache(self) -> str:
         return os.path.join(self.path, ".git", "rr-cache")
@@ -1068,6 +1112,7 @@ class Replayer:
         url = plan_git._out(self.repo, "remote", "get-url", "origin")
         if url:
             _run(self.path, "fetch", "--quiet", url, *specs, timeout=FETCH_TIMEOUT)
+        self.declare_target()
 
     def _empty_cache(self) -> None:
         shutil.rmtree(self._rr_cache(), ignore_errors=True)

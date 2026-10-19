@@ -103,10 +103,14 @@ CATCH_UP_MAX_ATTEMPTS = 3
 #: l'échéance du canon §2 : le jour même de la fusion, heure de Paris
 TZ = "Europe/Paris"
 HOUR = "23:59"
-#: les familles de modèle connues du mesh
-FAMILIES = ("claude", "codex", "deepseek")
-#: la famille de relecture opposée à celle de l'auteur (règle du pilote,
-#: 2026-10-13) : codex si l'auteur est Claude ou DeepSeek, sinon Claude.
+#: les familles de modèle du mesh ne sont plus recopiées ici : elles viennent
+#: du canon compilé (`compiled_families`, lu au dernier commit audité de
+#: l'hôte), et sans lecture aucune famille n'est supposée (#2449/#2664).
+#: la famille de relecture opposée à celle de l'auteur (règle du pilote du
+#: 2026-10-13) : codex si l'auteur est Claude ou DeepSeek, sinon Claude. C'est
+#: une règle pilote datée, hors `processus/mecanique.yaml` (décision
+#: mesh-design du 19/10) ; elle deviendra sans objet quand #2642 aura retiré
+#: la relecture après fusion — son retrait ira alors au panier.
 OPPOSITE = {"claude": "codex", "deepseek": "codex", "codex": "claude"}
 UNKNOWN_FAMILY = "codex ou claude"
 #: avis requis pour la relecture après fusion : un pour un lot léger, deux
@@ -133,9 +137,11 @@ FREEZE_TURN_WINDOW_S = 1800.0
 BLOCKING = ("un défaut **bloquant** (B, P1) trouvé après la fusion ouvre aussitôt un lot de "
             "correction, qui passe avant tout nouveau travail ; un défaut **non bloquant** "
             "(N, P2, P3) ne crée pas de lot : il va au backlog "
-            "(`ameesh work backlog add --title … --value … --score …`), regroupé avec les "
-            "autres défauts mineurs du même chantier (canon §2, owner du 15/10/2026 ; sur "
-            "ameesh, un P2 de la classe sensible bloque encore)")
+            "(`ameesh work backlog add --title … --value … --score … --review-of <lot>`), "
+            "regroupé avec les autres défauts mineurs du même chantier — sous le seuil de "
+            "lot du canon, une ligne du panier du chantier — et un défaut trouvé en "
+            "relisant une suite d'avis ne crée rien (canon §2, owner du 15/10/2026 puis du "
+            "19/10/2026 ; sur ameesh, un P2 de la classe sensible bloque encore)")
 
 
 def ref_of(lot: int) -> str:
@@ -154,39 +160,131 @@ def deadline(now: Optional[datetime] = None) -> str:
     return "%s %s %s" % (now.date().isoformat(), HOUR, TZ)
 
 
-def family_of(harness: Optional[str]) -> str:
+class FamiliesError(Exception):
+    """Les familles de modèle du canon compilé ne peuvent pas être lues."""
+
+
+#: le document compilé est immuable par commit : un canon lu une fois est
+#: relu seulement pour un nouveau commit audité (#2664).
+_FAMILIES_CACHE: dict = {}
+
+
+def _families_at(repo: str, commit: str) -> tuple:
+    """Les familles du document global (`reviews.families`) à ce commit exact."""
+    key = (str(repo), str(commit))
+    if key not in _FAMILIES_CACHE:
+        from . import mechanics
+        _FAMILIES_CACHE[key] = tuple(mechanics.load_global(repo, commit).families)
+    return _FAMILIES_CACHE[key]
+
+
+def compiled_families(db, cfg=None) -> tuple:
+    """Les familles de modèle du canon compilé, au dernier commit audité.
+
+    Le canon n'est pas recopié ici (#2449) : `processus/mecanique.yaml` est
+    compilé par `mechanics.load_global`, au commit que l'hôte a réellement
+    audité (`canon_state.last_good_commit`, #2447 B2) et non à la référence
+    configurée, qui peut être en avance d'un fetch sans synchro. Un état
+    enregistré fait foi même si le passage courant est invalide ; sans état du
+    tout (banc, premier démarrage), le commit exact de la source est le seul
+    connu.
+
+    Lève `FamiliesError` quand aucun canon ne donne de familles lisibles : une
+    seule synchro ratée ne bloque pas les fusions tant qu'un commit audité
+    reste lisible ; en l'absence de tout commit lisible, l'appelant échoue
+    fermé et nomme le canon. Rend un tuple non vide, dans l'ordre du canon.
+    """
+    from . import canon as canon_mod
+    from . import canon_sync
+
+    cfg = cfg if cfg is not None else getattr(db, "cfg", None)
+    if cfg is None or not str(getattr(cfg, "canon", "") or "").strip():
+        raise FamiliesError("no canon configured: the model families are unknown")
+    try:
+        canons = canon_mod.load_configured(cfg)
+    except Exception as exc:  # noqa: BLE001 - canon illisible : diagnostic rendu
+        raise FamiliesError("cannot read the configured canon: %s: %s"
+                            % (type(exc).__name__, str(exc)[:200])) from exc
+    if not canons:
+        raise FamiliesError("no readable canon configured: the model families are unknown")
+    errors = []
+    for canon in canons:
+        root = str(getattr(canon, "root", "") or "") or "canon"
+        for source in getattr(canon, "sources", ()) or ():
+            if getattr(source, "mode", "") != "git" \
+                    or not getattr(source, "repo", "") \
+                    or not getattr(source, "commit", ""):
+                errors.append("%s: canon source is not an exact Git commit" % root)
+                continue
+            if getattr(source, "prefix", ""):
+                errors.append("%s: canon under a sub-directory, mechanics are read"
+                              " at the Git root only" % getattr(source, "repo", ""))
+                continue
+            try:
+                commit = canon_sync.audited_commit(db, cfg, canon, source)
+            except Exception as exc:  # noqa: BLE001 - état illisible : canon suivant
+                errors.append("%s: cannot read the audited commit: %s" % (root, exc))
+                continue
+            if not commit:
+                errors.append("%s: no audited commit readable" % root)
+                continue
+            try:
+                return _families_at(source.repo, commit)
+            except Exception as exc:  # noqa: BLE001 - document illisible : suivant
+                errors.append("%s@%s: %s"
+                              % (source.repo, commit[:12], str(exc)[:240]))
+    raise FamiliesError("; ".join(errors[:4])
+                        or "no canon declares the model families")
+
+
+def family_of(harness: Optional[str], families) -> str:
     """La famille de modèle d'un harnais (`claude`, `codex`, `deepseek`), ou "".
 
     Le harnais peut être un nom précis (`claude-opus-5-5`, `deepseek-flash`) :
-    la famille est celle du mot qu'il porte. Un harnais inconnu ne rend pas une
-    famille par défaut : l'indépendance d'un avis ne se suppose pas (#1374)."""
+    la famille est celle du mot qu'il porte, **dans les familles du canon**
+    (`compiled_families`). Un harnais inconnu, ou un canon illisible (liste
+    vide), ne rend pas une famille par défaut : l'indépendance d'un avis ne se
+    suppose pas (#1374/#2664)."""
     text = (harness or "").strip().lower()
-    for family in FAMILIES:
-        if family in text:
+    for family in families or ():
+        family = str(family or "").strip().lower()
+        if family and family in text:
             return family
     return ""
 
 
-def reviewer_family(harness: Optional[str]) -> str:
-    """La famille de relecture opposée au harnais de l'auteur."""
-    return OPPOSITE.get(family_of(harness), UNKNOWN_FAMILY)
+def reviewer_family(harness: Optional[str], families) -> str:
+    """La famille de relecture opposée au harnais de l'auteur.
+
+    `OPPOSITE` est la règle pilote du 13/10 ; si la famille opposée n'est pas
+    déclarée par le canon, elle n'est pas proposée (aucune famille supposée)."""
+    known = tuple(families or ())
+    family = family_of(harness, known)
+    if not family:
+        return UNKNOWN_FAMILY
+    opposite = OPPOSITE.get(family)
+    return opposite if opposite in known else UNKNOWN_FAMILY
 
 
-def review_families(harness: Optional[str]) -> tuple:
+def review_families(harness: Optional[str], families) -> tuple:
     """Les deux familles d'une relecture sensible, hors de celle de l'auteur.
 
     La première est la famille opposée à l'auteur (`reviewer_family`) ; la
-    seconde est la première des familles connues qui n'est ni celle de
+    seconde est la première des familles du canon qui n'est ni celle de
     l'auteur ni la première. Un harnais inconnu laisse les deux familles
-    ouvertes, sans supposer l'indépendance (#2374)."""
-    author = family_of(harness)
-    first = reviewer_family(harness)
+    ouvertes, dans l'ordre historique d'affichage, sans supposer
+    l'indépendance (#2374)."""
+    known = tuple(str(f or "").strip().lower() for f in (families or ()) if f)
+    author = family_of(harness, known)
+    first = reviewer_family(harness, known)
     if first == UNKNOWN_FAMILY:
-        return ("codex", "claude")
-    for family in FAMILIES:
+        preferred = tuple(f for f in ("codex", "claude") if f in known)
+        return (preferred + tuple(f for f in known if f not in preferred))[:2]
+    for family in known:
         if family not in (author, first):
             return (first, family)
     return (first,)
+
 
 
 def _critical_changed(klass) -> bool:
@@ -420,6 +518,23 @@ def review_ref(item: dict) -> str:
     return ""
 
 
+def _required_family(db, item: dict, families) -> Optional[str]:
+    """`required_family` avec les familles du canon déjà lues."""
+    ref = review_ref(item)
+    if not ref:
+        return None
+    try:
+        lot = int(ref[len(PREFIX):].strip().lstrip("#"))
+        source = work.get(db, lot)
+        if source is None:
+            return ""
+        family = reviewer_family(_author_at_freeze(db, lot, source).get("harness"),
+                                 families)
+    except Exception:  # noqa: BLE001 - lecture impossible : famille inconnue
+        return ""
+    return "" if family == UNKNOWN_FAMILY else family
+
+
 def required_family(db, item: dict) -> Optional[str]:
     """La famille de harnais qu'exige la prise d'un lot de relecture (#2377).
 
@@ -431,21 +546,18 @@ def required_family(db, item: dict) -> Optional[str]:
     opposée à celle de l'auteur au gel (`reviewer_family`), celle que le canon
     §2 demande au relecteur.
 
-    La lecture réutilise `_author_at_freeze` : c'est la même preuve que celle
-    qui a écrit le corps du lot (gel, acteur, tours tracés), jamais le registre
-    courant — il ne dit rien du harnais qui a produit le travail (#1053)."""
-    ref = review_ref(item)
-    if not ref:
+    Les familles viennent du canon compilé (`compiled_families`, #2664) ; un
+    canon illisible rend la famille inconnue, jamais supposée. La lecture
+    réutilise `_author_at_freeze` : c'est la même preuve que celle qui a écrit
+    le corps du lot (gel, acteur, tours tracés), jamais le registre courant —
+    il ne dit rien du harnais qui a produit le travail (#1053)."""
+    if not review_ref(item):
         return None
     try:
-        lot = int(ref[len(PREFIX):].strip().lstrip("#"))
-        source = work.get(db, lot)
-        if source is None:
-            return ""
-        family = reviewer_family(_author_at_freeze(db, lot, source).get("harness"))
-    except Exception:  # noqa: BLE001 - lecture impossible : famille inconnue
+        families = compiled_families(db)
+    except FamiliesError:
         return ""
-    return "" if family == UNKNOWN_FAMILY else family
+    return _required_family(db, item, families)
 
 
 def may_take(db, item: dict, agent: dict) -> bool:
@@ -454,15 +566,23 @@ def may_take(db, item: dict, agent: dict) -> bool:
     Hors lot de relecture, oui, sans autre condition. Pour un lot de
     relecture, seule la famille opposée à celle de l'auteur au gel le prend ;
     la session vivante du preneur fait foi (`registry.live_harness`, #1037),
-    et un harnais hors des familles connues (`family_of`) ne compte pas.
-    Famille de l'auteur inconnue ou famille du preneur inconnue : non — la
-    prise ne devine jamais une indépendance d'avis (#1374)."""
-    family = required_family(db, item)
+    et un harnais hors des familles du canon (`family_of`) ne compte pas.
+    Famille de l'auteur inconnue, canon illisible ou famille du preneur
+    inconnue : non — la prise ne devine jamais une indépendance d'avis
+    (#1374/#2664)."""
+    if not review_ref(item):
+        return True
+    try:
+        families = compiled_families(db)
+    except FamiliesError:
+        return False
+    family = _required_family(db, item, families)
     if family is None:
         return True
     from . import registry
-    mine = family_of(registry.live_harness(agent or {}))
+    mine = family_of(registry.live_harness(agent or {}), families)
     return bool(family) and family == mine
+
 
 
 def title_of(item: dict, lot: int) -> str:
@@ -472,14 +592,15 @@ def title_of(item: dict, lot: int) -> str:
 
 
 def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
-            target: str = "", author: Optional[dict] = None, family: str = "") -> str:
+            target: str = "", author: Optional[dict] = None, family: str = "",
+            families=()) -> str:
     """Le corps du lot de relecture : quoi relire, par qui, avant quand."""
     author = author or {}
     who = author.get("name") or "inconnu"
     # #2384 : la famille se lit sur le harnais du gel, jamais sur le texte
     # affiché (le nom d'un tiers qui a reposé le gel peut contenir un mot de
     # famille) ; le corps doit annoncer exactement ce que la garde relira.
-    author_family = family_of(author.get("harness"))
+    author_family = family_of(author.get("harness"), families)
     harness = author.get("harness") or UNTRACED
     if author.get("refroze"):
         # #1859 : un tiers a reposé le gel ; il n'est pas l'auteur
@@ -487,7 +608,8 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
     where = "PR #%s" % pr if pr else (merged_sha[:12] if merged_sha else "?")
     why = " ".join(str((klass or {}).get("why") or "").split())
     critical = bool((klass or {}).get("critical"))
-    families = review_families(author.get("harness")) if critical else ()
+    pair = review_families(author.get("harness"), families) if critical else ()
+
     author_human = who.lower().startswith(work.HUMAN_PREFIX)
     untraced = critical and not author_family and not author_human
     lines = [
@@ -519,14 +641,15 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
     if critical:
         lines.extend([
             "- Relecteurs : **deux familles distinctes**, hors de celle de l'auteur — "
-            "%s (règle du pilote du 13/10)." % " et ".join(families),
+            "%s (règle du pilote du 13/10)." % (" et ".join(pair) or
+                                                 "familles non lisibles au canon"),
             "- Avis requis : **%d** verdicts indépendants sur la fusion ; le lot n'est "
             "clos qu'après le second." % CRITICAL_REVIEWS,
         ])
     else:
         lines.append(
             "- Relecteur : une **autre famille de modèle** — %s (règle du pilote du 13/10)."
-            % (family or reviewer_family(harness)))
+            % (family or reviewer_family(author.get("harness"), families)))
     lines.extend([
         "- Échéance : **%s**, le jour même de la fusion." % deadline(),
         "",
@@ -619,8 +742,12 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
                    + "porte de fusion : chemin critique, deux avis requis",
         })
     review_class = str(klass.get("class") or "")
+    # #2642 : le plancher léger vient du canon quand la classe le porte (le
+    # lecteur `lot_class` l'a lu pour ce même diff) ; le plancher historique
+    # d'un avis reste le repli d'une classe sans paramètre, jamais zéro.
     reviews = (CRITICAL_REVIEWS if critical
-               else LIGHT_REVIEWS if merged_class == lot_class.LIGHT else 0)
+               else int(klass.get("light_reviews") or LIGHT_REVIEWS)
+               if merged_class == lot_class.LIGHT else 0)
     out = {"lot": lot, "id": None, "created": False, "class": review_class,
            "merged_class": merged_class, "critical": critical,
            "reviews": reviews, "why": ""}
@@ -649,8 +776,15 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
         out["why"] = "lot de relecture déjà marqué au journal de #%d" % lot
         return out
     author = _author_at_freeze(db, lot, item)
-    family = reviewer_family(author.get("harness"))
-    author_family = family_of(author.get("harness"))
+    # #2664 : familles du canon compilé ; un canon illisible laisse la famille
+    # inconnue (le corps et la marque le disent, la garde de livraison refuse
+    # `--done` à deux avis). L'ouverture d'une relecture reste un fait dû.
+    try:
+        families = compiled_families(db)
+    except FamiliesError:
+        families = ()
+    family = reviewer_family(author.get("harness"), families)
+    author_family = family_of(author.get("harness"), families)
     mark = requirement_mark(lot, required=reviews, merged_sha=merged_sha,
                             author=author.get("name") or "",
                             author_family=author_family)
@@ -659,7 +793,8 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
             db, title=title_of(item, lot), type="evolution", source=ref,
             app=str(item.get("app") or ""),
             body=body_of(item, lot, klass=klass, merged_sha=merged_sha, pr=pr,
-                         target=target, author=author, family=family),
+                         target=target, author=author, family=family,
+                         families=families),
             issue_ref=ref, actor=actor, mark_item_id=lot,
             mark_note="%s lot #{lot} ouvert (classe %s, %d avis, relecture due %s) — %s"
                       % (ref, review_class, reviews, deadline(), mark))

@@ -210,10 +210,10 @@ class DeclarationFusionTest(unittest.TestCase):
                     "detail": "new freeze declared in the meantime: not closed, review again"}
         with mock.patch.object(work, "get", return_value=self.item), \
                 mock.patch.object(work, "close_merged", return_value=refrozen):
-            done = work.merged(object(), 1400, sha=sha, repo=self.repo, actor="dev3",
-                               announce=constats.append)
-        self.assertEqual(done["result"], "refrozen")
-        self.assertEqual(done["item"]["state"], "build")
+            with self.assertRaisesRegex(work.WorkError, "new freeze declared"):
+                work.merged(object(), 1400, sha=sha, repo=self.repo, actor="dev3",
+                            announce=constats.append)
+        self.assertEqual(self.item["state"], "build")
         self.assertEqual(len(constats), 1)
 
 

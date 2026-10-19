@@ -16,7 +16,7 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import lot_class, merge_queue
+from ameesh import lot_class, mechanics, merge_queue
 
 HEAD = "a" * 40
 FAMILIES = {"author": "deepseek", "codex": "codex", "claude": "claude",
@@ -31,7 +31,12 @@ class CanonScaleTest(unittest.TestCase):
     """Le nombre d'avis de chaque classe, sur le barème du canon."""
 
     def test_light_and_normal(self):
+        # Un lot léger sans chemin changé n'a rien à relire ; avec un diff, le
+        # plancher déclaré au canon s'applique (#2642).
         self.assertEqual(merge_queue.required_verdicts({"class": "light"}), 0)
+        self.assertEqual(merge_queue.required_verdicts(
+            {"class": "light", "files": [entry("docs/x.md", cls="light")],
+             "light_reviews": 1}), 1)
         self.assertEqual(merge_queue.required_verdicts({"class": "normal"}), 1)
 
     def test_sensitive_needs_one_review(self):
@@ -128,6 +133,34 @@ class ClassReaderTest(unittest.TestCase):
         self.assertTrue(undeclared["doubt"])
         self.assertEqual(merge_queue.required_verdicts(undeclared), 2)
 
+    def test_the_class_reader_carries_the_light_floor(self):
+        # #2642 : la porte lit la classe, donc le plancher lu par mechanics au
+        # même commit ; la classe reste légère et l'avis est exigé.
+        source = types.SimpleNamespace(mode="git", repo="fixture",
+                                       commit=HEAD, prefix="")
+        canon = types.SimpleNamespace(root="fixture", sources=[source], federation={
+            "review_policies": {"risk_classes": {"projects": {"ameesh": {
+                "default": "light", "rules": []}}}}})
+        with mock.patch.object(mechanics, "light_reviews_at", return_value=1):
+            klass = lot_class.class_of_paths([canon], "ameesh", ["docs/x.md"])
+        self.assertEqual(klass["class"], "light")
+        self.assertFalse(klass["doubt"])
+        self.assertEqual(klass["light_reviews"], 1)
+        self.assertEqual(merge_queue.required_verdicts(klass), 1)
+
+    def test_an_unreadable_light_floor_is_a_doubt_not_zero(self):
+        source = types.SimpleNamespace(mode="git", repo="fixture",
+                                       commit=HEAD, prefix="")
+        canon = types.SimpleNamespace(root="fixture", sources=[source], federation={
+            "review_policies": {"risk_classes": {"projects": {"ameesh": {
+                "default": "light", "rules": []}}}}})
+        with mock.patch.object(mechanics, "light_reviews_at",
+                               side_effect=mechanics.MechanicsError("bad doc")):
+            klass = lot_class.class_of_paths([canon], "ameesh", ["docs/x.md"])
+        self.assertTrue(klass["doubt"])
+        self.assertEqual(klass["class"], "sensitive")
+        self.assertEqual(merge_queue.required_verdicts(klass), 1)
+
 
     def test_no_readable_canon_keeps_paths_from_the_lot_diff(self):
         for path, required in (("src/ameesh/db.py", 2),
@@ -152,7 +185,7 @@ class GateTest(unittest.TestCase):
                   "actor": actor, "at_ts": index, "id": index}
                  for index, actor in enumerate(actors, 1)]
         with mock.patch.object(merge_queue, "actor_family",
-                               side_effect=lambda _db, name: FAMILIES.get(name, "")):
+                               side_effect=lambda _db, name, **_: FAMILIES.get(name, "")):
             return merge_queue.review_gate(None, marks, HEAD, klass=klass,
                                            item={"assignee": "author"})
 
@@ -167,6 +200,21 @@ class GateTest(unittest.TestCase):
                 self.assertFalse(self.gate(klass, "same")["ok"])
                 self.assertFalse(self.gate(klass, "unknown")["ok"])
                 self.assertFalse(self.gate(klass, "author")["ok"])
+
+    def test_a_light_lot_keeps_its_class_and_needs_the_declared_review(self):
+        # #2642 : le plancher léger ne reclasse pas le lot ; il exige l'avis
+        # d'une autre famille comme la porte d'une classe sensible.
+        klass = {"class": "light", "doubt": False,
+                 "files": [entry("docs/guide.md", cls="light")],
+                 "light_reviews": 1}
+        self.assertEqual(self.gate(klass)["class"], "light")
+        self.assertEqual(self.gate(klass)["required"], 1)
+        self.assertTrue(self.gate(klass, "codex")["ok"])
+        self.assertFalse(self.gate(klass, "author")["ok"])
+        # §2 : un avis d'une **autre famille** que celle de l'auteur, même
+        # quand la classe reste légère.
+        self.assertFalse(self.gate(klass, "same")["ok"])
+        self.assertFalse(self.gate(klass, "unknown")["ok"])
 
     def test_the_merge_gate_keeps_two_distinct_families(self):
         klass = {"class": "sensitive",
@@ -195,7 +243,7 @@ class GateTest(unittest.TestCase):
         marks = [{"kind": "verdict", "verdict": "ok", "sha": HEAD,
                   "actor": "codex", "at_ts": 1, "id": 1}]
 
-        def family(_db, name):
+        def family(_db, name, **kwargs):
             if name == "author":
                 return "deepseek"
             raise merge_queue.RegistryReadError(

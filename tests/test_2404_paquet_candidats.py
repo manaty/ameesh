@@ -23,6 +23,8 @@ from unittest import mock
 
 from ameesh import lot_class, merge_queue, packet_candidates, resolutions, storage, work
 
+from .support import patch_families
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -189,6 +191,9 @@ class InventoryTest(unittest.TestCase):
         self.families = {"author": "deepseek", "reviewer": "claude"}
         self.class_calls = []
         self.head_classes: dict[str, tuple] = {}
+        # #2664 : le banc n'a pas de canon Git ; les familles lues par la
+        # porte sont épinglées, les familles d'acteurs restent simulées.
+        patch_families(self)
 
     def inventory(self, *, family=None, **kwargs):
         def fake_class(db, lot, **rest):
@@ -197,12 +202,13 @@ class InventoryTest(unittest.TestCase):
             if rest.get("head") in self.head_classes:
                 cls, files = self.head_classes[rest["head"]]
                 return {"lot": lot, "class": cls, "doubt": False, "why": "test",
-                        "files": files}
+                        "files": files, "light_reviews": 1}
             return {"lot": lot, "class": self.classes[lot], "doubt": False,
                     "why": "test", "files": self.files.get(
-                        lot, [{"path": "src/ameesh/x.py", "class": "light", "rule": None}])}
+                        lot, [{"path": "src/ameesh/x.py", "class": "light", "rule": None}]),
+                    "light_reviews": 1}
 
-        def fake_family(db, name):
+        def fake_family(db, name, **kw):
             return self.families.get(name, "")
 
         with mock.patch.object(storage, "of", return_value=self.store), \
@@ -248,7 +254,7 @@ class InventoryTest(unittest.TestCase):
     def test_unreadable_registry_is_an_error_not_a_verdicts_missing_wait(self):
         # #2521 : une lecture du registre impossible ne doit pas se lire
         # « verdicts-missing » (le lot serait écarté du paquet comme sans avis).
-        def unreadable(db, name):
+        def unreadable(db, name, **kw):
             raise merge_queue.RegistryReadError(
                 'cannot read the agent registry for %s: column "aliases" does not exist'
                 % name)
@@ -270,10 +276,14 @@ class InventoryTest(unittest.TestCase):
         cause = next(cause for cause in entry["causes"] if cause["code"] == "conflict")
         self.assertEqual(cause["files"], ["shared.py"])
 
-    def test_light_lot_without_verdict_is_ready(self):
+    def test_light_lot_needs_the_declared_review(self):
+        # #2642 : un lot léger n'entre plus au paquet sans l'avis d'une autre
+        # famille ; le plancher est déclaré au canon (light_reviews: 1).
         entry = self.by_id(self.inventory())[5]
-        self.assertTrue(entry["ready"], entry["causes"])
-        self.assertEqual(entry["gate"]["required"], 0)
+        self.assertFalse(entry["ready"], entry["causes"])
+        self.assertIn("verdicts-missing",
+                      [cause["code"] for cause in entry["causes"]])
+        self.assertEqual(entry["gate"]["required"], 1)
 
     def test_packet_vehicle_is_not_a_unit(self):
         entry = self.by_id(self.inventory())[6]
@@ -404,6 +414,22 @@ class RemiseTest(InventoryTest):
         self.assertIn(4, payload["ready"])
         self.assertIn("remise refs/ameesh/resolutions/4/main-abc",
                       candidates_script.render(payload))
+
+    def test_remise_class_reads_the_package_target_not_origin_head(self):
+        """#2574 : la remise d'un lot sans `branch_target` se classe avec la
+        cible du paquet, comme sa tête gelée — jamais avec `origin/HEAD` du
+        clone radar, resté sur une release."""
+        base = _git(self.repo, "rev-parse", "main^")
+        _git(self.repo, "update-ref", "refs/remotes/origin/release/1.11.0", base)
+        _git(self.repo, "symbolic-ref", "refs/remotes/origin/HEAD",
+             "refs/remotes/origin/release/1.11.0")
+        sha = self._remise(4, "main-abc", {"shared.py": "FOUR MAIN\ntwo\n"}, verdict="ok")
+        payload = self.inventory()
+        call = next(rest for lot, rest in self.class_calls
+                    if lot == 4 and rest.get("head") == sha)
+        self.assertEqual(call["item"]["branch_target"], "main")
+        self.assertEqual(call["base"], payload["base"])
+        self.assertTrue(self.by_id(payload)[4]["ready"])
 
     def test_ready_lot_source_is_its_published_head(self):
         entry = self.by_id(self.inventory())[1]

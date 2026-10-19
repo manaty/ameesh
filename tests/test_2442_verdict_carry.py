@@ -24,7 +24,7 @@ from unittest import mock
 from ameesh import db as db_mod
 from ameesh import lot_class, merge_queue, plan_git, registry, verdict_carry, work
 
-from .support import PgTestCase
+from .support import PgTestCase, patch_families
 
 A = "a" * 40
 B = "b" * 40
@@ -36,7 +36,7 @@ ENV = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid"
 FAM = {"author": "deepseek", "rev1": "claude", "rev2": "codex"}
 
 
-def _family(db, name):
+def _family(db, name, **kw):
     return FAM.get(str(name or "").strip(), "")
 
 
@@ -342,6 +342,9 @@ class CarryTest(PgTestCase):
             registry.upsert(cls.db, name, harness=harness, host="pc")
 
     def setUp(self) -> None:
+        # #2664 : le banc n'a pas de canon Git, les familles compilées sont
+        # épinglées ; le registre seedé en setUpClass reste en place.
+        patch_families(self)
         self.repo = Repo()
         self.addCleanup(self.repo.cleanup)
         self.lot = work.add(self.db, title="un lot", branch="lot/9-x",

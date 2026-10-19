@@ -687,8 +687,13 @@ def cmd_list(bk) -> int:
             extra.append("lease:%s" % row["lease_owner"])
         if row.get("status_text"):
             extra.append(row["status_text"])
-        print("%-20s %-9s seen %5ss ago  unread:%-3d %s%s" % (
+        # #2689 : distinguer le courrier qui ouvrira un tour (L125) de celui
+        # qu'un tour lira plus tard — un « unread:6 » de copies/radars ne doit
+        # plus faire passer un agent au repos pour bloqué.
+        passive = int(row.get("passive_unread") or 0)
+        print("%-20s %-9s seen %5ss ago  unread:%-3d%s %s%s" % (
             row["name"], row.get("tool", "?"), age, row.get("unread", 0),
+            "  passive:%-3d" % passive if passive else "",
             row.get("cwd") or "", ("  " + " ".join(extra)) if extra else "",
         ))
     return 0
@@ -1944,6 +1949,14 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     print("agents     : %d" % agents)
     print("unread     : %d" % unread)
     print(host_measures_line(cfg))
+    # #2580 : un compte déclaré aussi par un autre mesh de l'hôte — signalé,
+    # sans changer le verdict par défaut (refuser arrêterait les deux meshes).
+    try:
+        from . import account_claims
+        for line in account_claims.doctor_lines(cfg, db=db):
+            print("accounts   : %s" % line)
+    except (OSError, ValueError) as exc:
+        print("accounts   : unreadable (%s)" % exc)
     # L106 : un agent mené sans unité d'exécuteur ne repart pas après une
     # coupure de l'hôte (signalé, sans changer le verdict)
     from . import hostcheck

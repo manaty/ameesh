@@ -605,14 +605,62 @@ def _method(project, info: dict) -> str:
     return allowed[0] if allowed else "merge"
 
 
-def _merge_pr(slug: str, status: dict, sha: str, method: str, *, gh) -> tuple:
+def _stacked_base_guard(slug: str, status: dict, target: str, default: str, *,
+                        gh) -> str:
+    """#2603 : refuse une fusion sur une base de travail déjà fusionnée dans la
+    cible par défaut (home#112/#113 après canon/2452) : le contenu atterrirait
+    sur une branche morte. La comparaison GitHub `base...default` rend `ahead`
+    ou `identical` quand la base est un ancêtre de la cible par défaut. Une
+    lecture impossible refuse : le doute ne fusionne pas sur une base morte."""
+    base = merge_queue._remote_branch(status.get("base") or "")
+    target = merge_queue._remote_branch(target or "")
+    default = merge_queue._remote_branch(default or "")
+    if not base or not target or base != target:
+        return ""
+    if not default:
+        return ("PR #%s targets %s, and the repository's default target is unknown: "
+                "nothing merged — read the default branch by hand"
+                % (status.get("number"), base))
+    if base == default:
+        return ""
+    proc = gh(["api", "repos/%s/compare/%s...%s" % (
+        slug, quote(base, safe=""), quote(default, safe=""))])
+    if proc.returncode != 0:
+        return ("PR #%s targets %s, not the default target %s, and the comparison cannot be "
+                "read (%s): nothing merged on a possibly dead base — check the PR by hand"
+                % (status.get("number"), base, default,
+                   (proc.stderr or proc.stdout or "").strip()[:200]))
+    try:
+        compared = land._json(proc, "gh api compare %s...%s" % (base, default), dict)
+    except land.LandError as exc:
+        return ("PR #%s targets %s, not the default target %s, and the comparison is "
+                "unreadable (%s): nothing merged on a possibly dead base"
+                % (status.get("number"), base, default, exc))
+    comparison = str(compared.get("status") or "")
+    if comparison not in ("ahead", "identical", "behind", "diverged"):
+        return ("PR #%s: comparison of %s with %s unreadable: nothing merged"
+                % (status.get("number"), base, default))
+    if comparison in ("ahead", "identical"):
+        return ("PR #%s targets %s, already merged into %s: merging it there would land its "
+                "content on a dead branch — retarget it (`gh pr edit --base %s %s`), then "
+                "freeze and re-review" % (status.get("number"), base, default, default,
+                                          status.get("number")))
+    return ""
+
+
+def _merge_pr(slug: str, status: dict, sha: str, method: str, *, gh,
+              target: str = "", default: str = "") -> tuple:
     """Fusionne la PR **maintenant**, sur la tête exacte `sha` (#1374, P1-4).
 
     C'est ce geste, et lui seul, qui est lié au feu : `--match-head-commit`
     est vérifié par GitHub au moment de la fusion, pas à l'armement. Laisser
     une auto-fusion armée entre deux passages ferait fusionner une tête
     poussée après le feu (GitHub ne la désarme pas pour un push d'un compte
-    avec droit d'écriture). Rend `(ok, detail)`."""
+    avec droit d'écriture). Rend `(ok, detail)`. #2603 : une base de travail
+    déjà fusionnée dans la cible par défaut refuse avant l'appel."""
+    refusal = _stacked_base_guard(slug, status, target, default, gh=gh)
+    if refusal:
+        return False, refusal
     proc = gh(["pr", "merge", str(status["number"]), "--repo", slug, "--%s" % method,
                "--match-head-commit", sha], timeout=120.0)
     if proc.returncode == 0:
@@ -645,14 +693,23 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
     verdict reste exigé. Une cible `release/*` (classe release) n'est jamais
     une auto-fusion : c'est la procédure de release du pilote.
 
+    #2505 : la cible de la classe est celle que la file va fusionner, donc
+    `origin/<cible>` quand elle existe (#2207, `merge_queue._class_base`) ;
+    la cible **locale** du checkout ne sert qu'à défaut. Un `main` local en
+    retard y ajouterait des commits déjà fusionnés, dont des chemins
+    sensibles, et surclasserait le lot au-dessus de ses vrais avis.
+
     Cette porte s'évalue **avant** toute PR, toute entrée en file et toute CI :
     un feu peut être enregistré au gel, mais rien ne part avant les avis."""
     lot = int(row["id"])
     freeze = freeze_of(marks)
     frozen = _norm((freeze or {}).get("sha"))
     head = merge_queue.pinned(repo, frozen) if repo else None
+    base = target or None
+    if repo and target:
+        base = merge_queue._class_base(repo, target) or target
     klass = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=repo or None,
-                             base=target or None, head=head)
+                             base=base, head=head)
     if str(klass.get("class") or "") == lot_class.RELEASE:
         return False, ("class: release (%s) — the release procedure belongs to the pilot: "
                        "a fire never arms an automatic merge on a release"
@@ -1506,7 +1563,17 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
     if not branch:
         out.update(result="no-branch", detail="lot without branch: no PR to arm")
         return out
-    work_repo = _checkout(repo) if repo else _repo_of(db, row)
+    work_repo = _repo_of(db, row) if repo is None else _checkout(repo)
+    # #2535 : un `--repo` explicite qui n'est pas un checkout est un refus,
+    # jamais un repli silencieux sur le clone que le projet déclare
+    # (`radar.projects.<p>.repo`). Le pilote qui se trompe de dépôt verrait
+    # sinon le feu lire une autre copie que celle demandée et rendre un
+    # verdict de préparation trompeur.
+    if repo is not None and work_repo is None:
+        out.update(result="no-repository", detail=(
+            "--repo %s is not a git checkout: pass a path inside the lot's repository "
+            "(#2535: refusing to read the project's declared clone instead)" % repo))
+        return out
     slug = _slug(cfg, row, work_repo)
     if not slug:
         out.update(result="no-repository", detail="no GitHub repository known for this lot")
@@ -1751,7 +1818,9 @@ def _merge_direct(cfg, db, row: dict, marks: list, fire: dict, status: dict, *, 
     try:
         if not _renew(handle) or not _renew(cible, land.LOCK_TTL_S):
             return {"lot": lot, "result": "busy"}
-        ok, error = _merge_pr(slug, status, head, _method(project, info), gh=gh)
+        ok, error = _merge_pr(slug, status, head, _method(project, info), gh=gh,
+                              target=target,
+                              default=str(info.get("default_branch") or ""))
         if ok:
             out.update(result="merged", detail=error, sha=head)
             try:
@@ -1822,7 +1891,9 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
         return out
     from . import radar, resolutions
     name = project.name if project is not None else os.path.basename((repo or "project").rstrip("/"))
-    clone = resolutions.Replayer(repo, radar.clone_dir(cfg, name)) if repo else None
+    clone = resolutions.Replayer(
+        repo, radar.clone_dir(cfg, name),
+        target=getattr(project, "target", "") or "") if repo else None
     try:
         entered = merge_queue.enter(db, lot, repo=repo, actor=work.SYSTEM_SENDER,
                                     project=project, clone=clone, cfg=cfg)
