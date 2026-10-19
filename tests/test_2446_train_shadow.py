@@ -14,13 +14,13 @@ import subprocess
 import tempfile
 import types
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import partial
 from unittest import mock
 from zoneinfo import ZoneInfo
 
 from ameesh import (mechanics, merge_queue, plan_git, radar, storage,
-                    train_initial, train_shadow, work)
+                    train_incidents, train_initial, train_shadow, work)
 from .support import PgTestCase
 from .test_1467_train_review import author
 from .test_2446_train_assembly import MECHANICS, _Repo
@@ -47,22 +47,31 @@ review_policies:
 
 
 class ProjectRepo:
-    def __init__(self, root):
+    def __init__(self, root, *, base_at=None):
         self.root = root
         os.makedirs(root)
         self.env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
                         GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
         self.git("init", "-q", "-b", "main")
         self.write("README", "base\n")
-        self.commit("base")
+        self.commit("base", at=base_at)
         self.origin = root + ".git"
         subprocess.run(["git", "init", "-q", "--bare", self.origin], check=True)
         self.git("remote", "add", "origin", self.origin)
         self.git("push", "-q", "origin", "main")
 
-    def git(self, *args):
+    @staticmethod
+    def date_env(at):
+        if at is None:
+            return {}
+        stamp = datetime.fromtimestamp(float(at), timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        return {"GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp}
+
+    def git(self, *args, env=None):
+        merged = dict(self.env, **(env or {}))
         proc = subprocess.run(["git", "-C", self.root, *args], capture_output=True,
-                              text=True, env=self.env)
+                              text=True, env=merged)
         if proc.returncode:
             raise AssertionError("git %s: %s" % (" ".join(args), proc.stderr))
         return proc.stdout.strip()
@@ -73,9 +82,9 @@ class ProjectRepo:
         with open(path, "w", encoding="utf-8") as target:
             target.write(text)
 
-    def commit(self, message):
+    def commit(self, message, *, at=None):
         self.git("add", "-A")
-        self.git("commit", "-qm", message)
+        self.git("commit", "-qm", message, env=self.date_env(at))
         return self.git("rev-parse", "HEAD")
 
     def branch(self):
@@ -142,7 +151,10 @@ class ShadowPassageTest(PgTestCase):
     def setUp(self):
         super().setUp()
         self.db.execute("TRUNCATE merge_locks RESTART IDENTITY CASCADE")
-        self.project_repo = ProjectRepo(os.path.join(self.tmp, "project"))
+        self.now = datetime(2026, 10, 18, 11, 0,
+                            tzinfo=ZoneInfo("Europe/Paris")).timestamp()
+        self.project_repo = ProjectRepo(os.path.join(self.tmp, "project"),
+                                        base_at=self.now - 86400)
         self.base = self.project_repo.git("rev-parse", "main")
         self.head = self.project_repo.branch()
         self.canon = _Repo(os.path.join(self.tmp, "canon"), federation_text=FEDERATION)
@@ -155,8 +167,6 @@ class ShadowPassageTest(PgTestCase):
                                            actor="fixture", verdict=None, note="")
         self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s",
                         (self.item["id"],))
-        self.now = datetime(2026, 10, 18, 11, 0,
-                            tzinfo=ZoneInfo("Europe/Paris")).timestamp()
         self.notices = []
         self.receipts = {sha: dataclasses.asdict(author(sha)) for sha in (self.base, self.head)}
         provider = types.SimpleNamespace(
@@ -176,19 +186,210 @@ class ShadowPassageTest(PgTestCase):
             initial=train_initial.Boundary(self.now - 60),
             notify=self.notices.append)
 
-    def manual_packet(self, lots, stamp="20261018-1100"):
-        self.project_repo.git("checkout", "-qb",
-                              "integration/paquet-h-" + stamp, "main")
-        self.project_repo.write("reviews/integration-paquet-h-%s.md" % stamp,
-                                "# Paquet %s\n\n## Admissions\n\n%s\n\n"
-                                % (stamp, "\n".join("- #%d" % lot for lot in lots)))
-        self.project_repo.commit("composition %s" % stamp)
+    @staticmethod
+    def tail_of(stamp):
+        return "paquet-h-" + stamp
+
+    @classmethod
+    def branch_of(cls, stamp):
+        return "integration/" + cls.tail_of(stamp)
+
+    def write_manifest(self, tail, lots, *, name=None):
+        path = "reviews/%s.md" % (name or "integration-" + tail)
+        self.project_repo.write(path, "# Paquet %s\n\n## Admissions\n\n%s\n\n"
+                                % (tail, "\n".join("- #%d" % lot for lot in lots)))
+        return path
+
+    def open_packet(self, lots, stamp="20261018-1000", *, at=None, name=None):
+        """A packet branch pushed but not merged: the composer is still on it."""
+        branch = self.branch_of(stamp)
+        self.project_repo.git("checkout", "-qb", branch, "main")
+        self.write_manifest(self.tail_of(stamp), lots, name=name)
+        self.project_repo.commit("composition %s" % stamp, at=at)
+        self.project_repo.git("checkout", "-q", "main")
+        self.project_repo.git("push", "-q", "origin", branch)
+        return branch
+
+    def enrich_packet(self, branch, lots, *, at=None, name=None):
+        """The composer adds a lot to an already pushed packet branch."""
+        self.project_repo.git("checkout", "-q", branch)
+        self.write_manifest(branch.split("/", 1)[1], lots, name=name)
+        self.project_repo.commit("composition enrichie", at=at)
+        self.project_repo.git("checkout", "-q", "main")
+        self.project_repo.git("push", "-q", "origin", branch)
+
+    def manual_packet(self, lots, stamp="20261018-1100", *, branch_at=None,
+                      merge_at=None):
+        branch = self.branch_of(stamp)
+        self.project_repo.git("checkout", "-qb", branch, "main")
+        self.write_manifest(self.tail_of(stamp), lots)
+        self.project_repo.commit("composition %s" % stamp, at=branch_at)
         self.project_repo.git("checkout", "-q", "main")
         self.project_repo.git("merge", "--no-ff", "-m",
-                              "Merge pull request #1 from manaty/integration/paquet-h-" + stamp,
-                              "integration/paquet-h-" + stamp)
-        self.project_repo.git("push", "-q", "origin", "main",
-                              "integration/paquet-h-" + stamp)
+                              "Merge pull request #1 from manaty/" + branch, branch,
+                              env=self.project_repo.date_env(merge_at))
+        self.project_repo.git("push", "-q", "origin", "main", branch)
+        return branch
+
+    def state_with_members(self, *lots, stamp="20261018-1100"):
+        self.shadow.scheduled_step(self.db, self.now)
+        state = self.shadow.store.load()
+        plan = dict(state["plans"][-1])
+        plan.update(local_stamp=stamp, cutoff=self.now,
+                    members=[dict(work_item_id=lot) for lot in lots],
+                    deferred=[])
+        return dict(state, plans=[plan])
+
+    def test_shadow_incident_facts_are_empty_and_never_raise(self):
+        """#2682 : le consommateur d'incidents interroge l'ombre sans lever."""
+        calls = []
+
+        class Consumer:
+            INTEGRATION = {"o/r": "main"}
+
+            def consume(self, db, *, lands, diagnoses, links_for):
+                calls.append(db)
+                return []
+
+        fallback = lambda repo, head: [{"sha": head}]  # noqa: E731
+        reader = self.shadow.incident_facts(self.db, fallback=fallback)
+        self.assertIsInstance(reader, train_shadow.NoTrainFacts)
+        self.assertEqual((reader.repo, reader.target), ("o/r", "main"))
+        self.assertEqual(reader.lands("o/r", "a" * 40), [{"sha": "a" * 40}])
+        self.assertIsNone(reader.diagnoses("o/r", "a" * 40))
+        self.assertIsNone(reader.links_for("o/r", "a" * 40))
+        self.assertEqual(train_incidents.consume(
+            self.db, (self.shadow,), consumer=Consumer()), [])
+        self.assertEqual(calls, [self.db])
+
+    def test_a_lot_added_to_a_packet_after_the_cutoff_stays_an_extra(self):
+        """B1 dev4/cx3 : le manifeste final ne prouve pas la composition au cutoff."""
+        state = self.state_with_members(11, 22)
+        cutoff = self.now
+        branch = self.open_packet([11], stamp="20261018-1000", at=cutoff - 3600)
+        self.enrich_packet(branch, [11, 22], at=cutoff + 1200)
+        self.project_repo.git("checkout", "-q", "main")
+        self.project_repo.git("merge", "--no-ff", "-m",
+                              "Merge pull request #1 from manaty/" + branch, branch,
+                              env=self.project_repo.date_env(cutoff + 1800))
+        self.project_repo.git("push", "-q", "origin", "main", branch)
+        self.manual_packet([11], stamp="20261018-1100",
+                           branch_at=cutoff + 1860, merge_at=cutoff + 1920)
+        comparisons = self.shadow.compare(state, None)
+        comparison = next(row for row in comparisons
+                          if row["packet"]["stamp"] == "20261018-1100")
+        self.assertEqual(comparison["extra"], [22])
+        self.assertEqual(comparison["carried"], {})
+        self.assertEqual(comparison["explanations"]["22"],
+                         "train would include it; composer did not")
+
+    def test_a_variant_manifest_is_never_a_carrier_and_the_extra_is_unknown(self):
+        """B2 cx3 : pas de repli sur un manifeste voisin (ni names[-1])."""
+        state = self.state_with_members(11, 22)
+        cutoff = self.now
+        branch = self.open_packet(
+            [22], stamp="20261018-1000", at=cutoff - 3600,
+            name="integration-paquet-h-20261018-1000c")
+        self.project_repo.git("merge", "--no-ff", "-m",
+                              "Merge pull request #1 from manaty/" + branch, branch,
+                              env=self.project_repo.date_env(cutoff + 1800))
+        self.project_repo.git("push", "-q", "origin", "main", branch)
+        self.manual_packet([11], stamp="20261018-1100",
+                           branch_at=cutoff + 1860, merge_at=cutoff + 1920)
+        comparisons = self.shadow.compare(state, None)
+        comparison = next(row for row in comparisons
+                          if row["packet"]["stamp"] == "20261018-1100")
+        self.assertEqual(comparison["extra"], [22])
+        self.assertEqual(comparison["carried"], {})
+        self.assertIn("porteur inconnu", comparison["explanations"]["22"])
+
+    def test_a_carrier_without_commit_before_the_cutoff_keeps_the_extra_unknown(self):
+        """Sans composition prouvée au cutoff, le lot reste extra/inconnu."""
+        state = self.state_with_members(11, 22)
+        cutoff = self.now
+        branch = self.open_packet([22], stamp="20261018-1000", at=cutoff + 1200)
+        self.project_repo.git("merge", "--no-ff", "-m",
+                              "Merge pull request #1 from manaty/" + branch, branch,
+                              env=self.project_repo.date_env(cutoff + 1800))
+        self.project_repo.git("push", "-q", "origin", "main", branch)
+        self.manual_packet([11], stamp="20261018-1100",
+                           branch_at=cutoff + 1860, merge_at=cutoff + 1920)
+        comparisons = self.shadow.compare(state, None)
+        comparison = next(row for row in comparisons
+                          if row["packet"]["stamp"] == "20261018-1100")
+        self.assertEqual(comparison["extra"], [22])
+        self.assertEqual(comparison["carried"], {})
+        self.assertIn("porteur inconnu", comparison["explanations"]["22"])
+
+    def test_a_lot_composed_in_an_open_packet_before_the_cutoff_is_carried(self):
+        state = self.state_with_members(11, 22)
+        cutoff = self.now
+        self.open_packet([22], stamp="20261018-1000", at=cutoff - 900)
+        self.manual_packet([11], stamp="20261018-1100",
+                           branch_at=cutoff + 60, merge_at=cutoff + 120)
+        comparisons = self.shadow.compare(state, None)
+        self.assertEqual(len(comparisons), 1)
+        comparison = comparisons[0]
+        self.assertEqual(comparison["packet"]["stamp"], "20261018-1100")
+        self.assertEqual(comparison["missing"], [])
+        self.assertEqual(comparison["extra"], [])
+        self.assertEqual(comparison["carried"],
+                         {"22": "integration/paquet-h-20261018-1000"})
+        self.assertEqual(comparison["explanations"]["22"],
+                         "porté par integration/paquet-h-20261018-1000 en vol")
+
+    def test_an_open_packet_created_after_the_cutoff_does_not_mask_the_extra(self):
+        state = self.state_with_members(11, 22)
+        cutoff = self.now
+        self.open_packet([22], stamp="20261018-1000", at=cutoff + 1200)
+        self.manual_packet([11], stamp="20261018-1100",
+                           branch_at=cutoff + 60, merge_at=cutoff + 120)
+        comparisons = self.shadow.compare(state, None)
+        comparison = comparisons[0]
+        self.assertEqual(comparison["extra"], [22])
+        self.assertEqual(comparison["carried"], {})
+
+    def test_an_abandoned_open_packet_is_not_a_carrier(self):
+        """Des branches integration/** jamais fusionnées ne masquent pas un écart."""
+        state = self.state_with_members(11, 22)
+        cutoff = self.now
+        self.open_packet([22], stamp="20261015-2310", at=cutoff - 2 * 86400)
+        self.manual_packet([11], stamp="20261018-1100",
+                           branch_at=cutoff + 60, merge_at=cutoff + 120)
+        comparisons = self.shadow.compare(state, None)
+        comparison = comparisons[0]
+        self.assertEqual(comparison["extra"], [22])
+        self.assertEqual(comparison["carried"], {})
+        self.assertEqual(comparison["explanations"]["22"],
+                         "train would include it; composer did not")
+
+    def test_a_packet_merged_before_the_cutoff_is_not_a_carrier(self):
+        state = self.state_with_members(11, 22)
+        cutoff = self.now
+        self.manual_packet([22], stamp="20261018-1000",
+                           branch_at=cutoff - 3600, merge_at=cutoff - 600)
+        self.manual_packet([11], stamp="20261018-1100",
+                           branch_at=cutoff + 60, merge_at=cutoff + 120)
+        comparisons = self.shadow.compare(state, None)
+        comparison = next(row for row in comparisons
+                          if row["packet"]["stamp"] == "20261018-1100")
+        self.assertEqual(comparison["extra"], [22])
+        self.assertEqual(comparison["carried"], {})
+
+    def test_open_packets_lists_only_branches_not_landed(self):
+        self.shadow.scheduled_step(self.db, self.now)
+        branch = self.open_packet([999], stamp="20261018-1000",
+                                  at=self.now - 900)
+        base = self.project_repo.git("rev-parse", "main")
+        opened = self.shadow.open_packets(self.shadow.clone_path, base)
+        self.assertEqual([row["branch"] for row in opened], [branch])
+        self.assertEqual(opened[0]["tail"], "paquet-h-20261018-1000")
+        self.project_repo.git("merge", "--no-ff", "-m",
+                              "Merge pull request #1 from manaty/" + branch, branch,
+                              env=self.project_repo.date_env(self.now + 60))
+        self.project_repo.git("push", "-q", "origin", "main")
+        base = self.project_repo.git("rev-parse", "main")
+        self.assertEqual(self.shadow.open_packets(self.shadow.clone_path, base), [])
 
     def test_shadow_plan_is_read_only_and_compares_equal_to_the_composer(self):
         result, deadline = self.shadow.scheduled_step(self.db, self.now)
