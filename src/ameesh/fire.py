@@ -708,8 +708,9 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
     base = target or None
     if repo and target:
         base = merge_queue._class_base(repo, target) or target
+    base_sha = merge_queue.pinned(repo, base) if (repo and base) else None
     klass = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=repo or None,
-                             base=base, head=head)
+                             base=base, base_sha=base_sha, head=head)
     if str(klass.get("class") or "") == lot_class.RELEASE:
         return False, ("class: release (%s) — the release procedure belongs to the pilot: "
                        "a fire never arms an automatic merge on a release"
