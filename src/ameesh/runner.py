@@ -1468,10 +1468,19 @@ class AgentWorker(threading.Thread):
                         self.preempting.clear()
                 return "steered"
         try:
-            if driver.interrupt():
-                log_async("[%s] resident turn interrupted (preemption)"
-                          % self.name)
-                return "interrupted"
+            # A late steer may have released the barrier after its generation
+            # closed. Do not let its fallback interrupt the next runner turn.
+            # Keep the barrier through admission: _begin_turn_generation must
+            # not publish the next generation between this check and interrupt.
+            with self._steer_lock:
+                with self.lock:
+                    if (not self._turn_live or self._turn_generation != generation
+                            or self.resident is not rp):
+                        return "deferred"
+                if driver.interrupt():
+                    log_async("[%s] resident turn interrupted (preemption)"
+                              % self.name)
+                    return "interrupted"
         except Exception as exc:
             log_async("[%s] resident interrupt failed (%s)"
                       % (self.name, " ".join(str(exc).split())[:120]))

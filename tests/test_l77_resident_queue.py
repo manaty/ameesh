@@ -451,6 +451,26 @@ class PreemptResidentTest(unittest.TestCase):
             worker._solde_steers(False, worker._turn_generation)
         release.assert_called_once()
 
+    def test_a_late_steer_cannot_interrupt_the_next_generation(self):
+        """B8 : le repli d'un ancien moniteur ne touche pas le tour suivant."""
+        from unittest import mock
+        driver = _FakeDriver()
+        worker = self._worker(driver)
+        self._preempting(worker)
+        worker._preempt_row = self._row()
+        generation = worker._turn_generation
+
+        def late_steer(*args):
+            # Le steer tardif a libéré sa barrière, le runner a ouvert le
+            # tour suivant avant que l'ancien moniteur reprenne son repli.
+            worker._turn_generation += 1
+            worker._turn_live = True
+            return False
+
+        with mock.patch.object(worker, "_steer_human", side_effect=late_steer):
+            self.assertEqual(worker._preempt_resident(generation), "deferred")
+        self.assertEqual(driver.interrupted, 0)
+
     def test_a_turn_result_without_the_steered_input_releases(self):
         """B8 : un ACK tardif n'est jamais soldé par le tour qui l'a précédé."""
         from types import SimpleNamespace
