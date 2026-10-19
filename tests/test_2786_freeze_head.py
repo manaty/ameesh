@@ -91,6 +91,14 @@ class FreezeHeadWriteTest(PgTestCase):
         self.assertEqual(row["sha"], HEAD)
         self.assertEqual([m["sha"] for m in self.freezes()], [HEAD])
 
+    def test_une_marque_fournie_par_l_appelant_est_ignoree(self):
+        # #2786 (5), avis dev4 : `--note "ameesh-freeze-absent: main"` ne doit
+        # pas contourner le garde #2784. Aucun dépôt ne porte ce commit : le
+        # gel s'écrit, mais la preuve d'absence ne se décrète pas.
+        row = self.freeze(HEAD, note="ameesh-freeze-absent: main\nrevue demandée")
+        self.assertNotIn(work.FREEZE_ABSENT_MARK, row["note"])
+        self.assertIn("revue demandée", row["note"])
+
     def test_une_abreviation_est_resolue_dans_le_depot_de_l_auteur(self):
         repo = tempfile.mkdtemp(prefix="ameesh-2786-")
         self.addCleanup(shutil.rmtree, repo, True)
@@ -278,6 +286,112 @@ class SweepDoubtTest(_SweepBase):
         entry = self.entry(report, item)
         self.assertEqual(entry["result"], "merged")
         self.assertEqual(work.get(self.db, item["id"])["state"], "merged")
+
+
+class StaleCloneTest(PgTestCase):
+    """Avis cx1 (2026-10-19) : la marque d'absence se lit sur la cible
+    **publiée rafraîchie**, jamais sur un `origin/<branche>` périmé.
+
+    Scène : la forge porte déjà B sur `main`, le clone de l'auteur est resté à
+    A. Accepter le gel B puis écrire « main absent » rendrait B livrable au
+    balayage rafraîchi, alors qu'il n'a jamais eu de commit propre. Un fetch
+    en échec ne doit produire aucune marque d'absence."""
+
+    def setUp(self):
+        super().setUp()
+        self.forge = os.path.join(self.tmp, "forge.git")
+        os.makedirs(self.forge)
+        git(self.forge, "init", "-q", "--bare", "-b", "main")
+        self.author = os.path.join(self.tmp, "auteur")
+        git(self.tmp, "clone", "-q", self.forge, self.author)
+        registry.upsert(self.db, "author", harness="deepseek", host=self.cfg.host,
+                        cwd=self.author)
+        # A : le socle publié.
+        with open(os.path.join(self.author, "socle"), "w", encoding="utf-8") as fh:
+            fh.write("socle\n")
+        git(self.author, "add", "socle")
+        git(self.author, "commit", "-qm", "socle")
+        self.base = git(self.author, "rev-parse", "HEAD")
+        git(self.author, "push", "-q", "origin", "HEAD:refs/heads/main")
+        # B : le commit du lot, sur sa branche (pas encore publié).
+        git(self.author, "checkout", "-q", "-b", "lot/2786-stale")
+        with open(os.path.join(self.author, "lot"), "w", encoding="utf-8") as fh:
+            fh.write("lot\n")
+        git(self.author, "add", "lot")
+        git(self.author, "commit", "-qm", "lot")
+        self.frozen = git(self.author, "rev-parse", "HEAD")
+        self.item = work.add(self.db, title="lot périmé", assignee="author",
+                             actor="orch")
+        for state in ("build", "qa"):
+            work.move(self.db, self.item["id"], state, actor="orch")
+
+    def publish_already(self) -> None:
+        """La forge porte B sur `main` ; le clone de l'auteur reste à A."""
+        git(self.author, "push", "-q", "origin", "HEAD:refs/heads/main")
+        git(self.author, "update-ref", "refs/remotes/origin/main", self.base)
+
+    def freezes(self) -> list:
+        return [m for m in work.milestones(self.db, self.item["id"])
+                if m["kind"] == "frozen"]
+
+    def entry(self, report) -> dict:
+        return next(r for r in report["results"]
+                    if r["work_item"] == self.item["id"])
+
+    def test_un_gel_deja_publie_est_refuse_malgre_un_clone_perime(self):
+        # la forge porte déjà B, le clone de l'auteur croit encore A
+        self.publish_already()
+        self.assertEqual(git(self.forge, "rev-parse", "refs/heads/main"),
+                         self.frozen)
+        self.assertEqual(git(self.author, "rev-parse", "origin/main"), self.base)
+        with self.assertRaises(work.WorkError) as caught:
+            work.milestone(self.db, self.item["id"], "frozen", sha=self.frozen,
+                           actor="auteur", repo=self.author)
+        self.assertIn("already-in-target", str(caught.exception))
+        self.assertEqual(self.freezes(), [])
+
+    def test_une_forge_illisible_n_ecrit_pas_de_marque_d_absence(self):
+        self.publish_already()
+        # le fetch échoue : aucune preuve d'absence, donc aucune marque — même
+        # si l'`origin/main` local (périmé) ne porte pas le gel.
+        git(self.author, "remote", "set-url", "origin",
+            os.path.join(self.tmp, "forge-absente.git"))
+        row = work.milestone(self.db, self.item["id"], "frozen", sha=self.frozen,
+                             actor="auteur", repo=self.author)
+        self.assertNotIn(work.FREEZE_ABSENT_MARK, row["note"])
+        # la forge redevient lisible : le balayage rafraîchi voit B déjà dans
+        # `main` et ne le compte pas comme une livraison.
+        git(self.author, "remote", "set-url", "origin", self.forge)
+        report = plan_git.sync_branches(self.db, host=self.cfg.host)
+        entry = self.entry(report)
+        self.assertNotEqual(entry["result"], "merged")
+        self.assertEqual(work.get(self.db, self.item["id"])["state"], "qa")
+        probe = plan_git.sync_merges(self.db, self.author, target="origin/main")
+        content = self.entry(probe)
+        self.assertNotEqual(content["result"], "merged")
+        self.assertIn("already an ancestor", content["detail"])
+
+    def test_un_gel_reellement_absent_de_la_forge_reste_livrable(self):
+        # contrôle : le clone est à jour (origin/main = A), le gel est absent
+        # de la cible publiée — la marque est écrite, l'avance rapide qui suit
+        # reste une livraison malgré la date du commit.
+        row = work.milestone(self.db, self.item["id"], "frozen", sha=self.frozen,
+                             actor="auteur", repo=self.author)
+        self.assertIn("ameesh-freeze-absent: main", row["note"])
+        git(self.author, "push", "-q", "origin", "HEAD:refs/heads/main")
+        report = plan_git.sync_branches(self.db, host=self.cfg.host)
+        self.assertEqual(self.entry(report)["result"], "merged")
+        self.assertEqual(work.get(self.db, self.item["id"])["state"], "merged")
+
+    def test_une_marque_fournie_est_remplacee_par_la_preuve_calculee(self):
+        # avis dev4 : la marque de l'appelant ne contourne pas le gel ; la
+        # seule marque écrite est celle que la cible publiée rafraîchie prouve.
+        row = work.milestone(
+            self.db, self.item["id"], "frozen", sha=self.frozen, actor="auteur",
+            repo=self.author, note="ameesh-freeze-absent: develop\nrevue demandée")
+        self.assertIn("ameesh-freeze-absent: main", row["note"])
+        self.assertNotIn("develop", row["note"])
+        self.assertIn("revue demandée", row["note"])
 
 
 class _Port:

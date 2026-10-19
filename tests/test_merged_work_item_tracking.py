@@ -1513,10 +1513,13 @@ class ContentDeliveryTest(_Base):
         for state in ("build", "qa"):
             work.move(self.db, item["id"], state)
         # #2786 (5) : les tests livrent dans `develop` AVANT de geler. La
-        # marque dit ce que le gel réel aurait écrit : `develop` ne portait
-        # pas encore le commit, donc la livraison constatée reste prouvable.
-        work.milestone(self.db, item["id"], "frozen", sha=sha, actor="ouvrier",
-                       note="ameesh-freeze-absent: develop")
+        # marque, écrite ici au stockage, dit ce que le gel réel aurait écrit :
+        # `develop` ne portait pas encore le commit, donc la livraison
+        # constatée reste prouvable. `work.milestone` ignore désormais une
+        # marque d'appelant (avis dev4) : le scénario se pose au stockage.
+        storage.of(self.db).work.add_milestone(
+            item["id"], "frozen", sha=sha, actor="ouvrier", verdict=None,
+            note="ameesh-freeze-absent: develop")
         return item
 
     def sync(self, **kw):

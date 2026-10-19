@@ -2342,7 +2342,7 @@ def published_target(repo: str, target: str) -> str:
     return target
 
 
-def _refresh_clone(repo: str, target: str | None, refreshed: dict) -> dict:
+def refresh_clone(repo: str, target: str | None, refreshed: dict) -> dict:
     """#2302 : rafraîchit le clone avant de sonder, au plus une fois par
     relevé et par remote. Best-effort : rend `{remote: erreur}` et ne lève
     jamais — un fetch refusé laisse le relevé continuer sur les refs lues."""
@@ -2358,6 +2358,38 @@ def _refresh_clone(repo: str, target: str | None, refreshed: dict) -> dict:
         if refreshed[key]:
             errors[remote] = refreshed[key]
     return errors
+
+
+def integration_tips(repo: str, *, refreshed: dict | None = None) -> dict[str, str] | None:
+    """Les têtes des branches d'intégration **publiées** (#2786 (5)).
+
+    Une ref `origin/<branche>` périmée ne prouve pas qu'un gel en était absent
+    au moment où il a été posé : un clone d'auteur en retard garde `main` à A
+    alors que la forge porte déjà le commit gelé B, et la marque d'absence
+    rendrait B livrable alors qu'il n'a jamais eu de commit propre (avis cx1).
+    Quand `origin` existe, le clone est donc rafraîchi (fetch borné, au plus
+    une fois par relevé via `refreshed`) avant la lecture. Un fetch en échec
+    rend `None` : l'appelant n'écrit alors **aucune** marque d'absence.
+
+    Sans remote `origin`, rend les refs locales des branches d'intégration :
+    il n'y a aucune cible publiée à rafraîchir, le clone est la référence."""
+    fresh = refreshed if refreshed is not None else {}
+    if _out(repo, "remote", "get-url", "origin") is None:
+        prefix = "refs/heads/"
+    else:
+        if refresh_clone(repo, "", fresh).get("origin"):
+            return None
+        prefix = _REMOTE_REFS + "origin/"
+    out = _out(repo, "for-each-ref", "--format=%(refname) %(objectname)", prefix)
+    tips: dict[str, str] = {}
+    for line in (out or "").splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        name = parts[0][len(prefix):]
+        if name and integration_branch(name):
+            tips[name] = parts[1].lower()
+    return tips
 
 
 def _repo_slug(repo: str) -> str | None:
@@ -2603,7 +2635,7 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             # #2302 : un clone que personne ne fetch garde une cible et des
             # branches périmées ; le rafraîchir une fois par relevé est ce qui
             # permet de constater la fusion d'un paquet.
-            _refresh_clone(repo, "", refreshed)
+            refresh_clone(repo, "", refreshed)
             # #746 : une cible déclarée — celle du lot, ou `ameesh.target` du
             # dépôt — fait foi ; sinon la cible par défaut du clone
             # (`origin/HEAD`, figé à sa création), puis les refs d'intégration
@@ -2628,7 +2660,7 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                 primary, explicit = targets[repo], declared[repo]
             # #2302 : la cible peut nommer un autre remote ; la ref publiée
             # (origin/<branche>) est préférée à une branche locale périmée.
-            _refresh_clone(repo, primary, refreshed)
+            refresh_clone(repo, primary, refreshed)
             primary = published_target(repo, primary)
             # #990 : la liste dépend de la cible primaire, propre au lot — un
             # cache par dépôt la figerait pour les lots suivants

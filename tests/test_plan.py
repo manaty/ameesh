@@ -1150,10 +1150,13 @@ class ContentMergeTest(_PlanDb):
         for state in ("build", "qa"):
             work.move(self.db, item["id"], state)
         # #2786 (5) : les tests fusionnent dans `main` AVANT de geler. La
-        # marque dit ce que le gel réel aurait écrit : `main` ne portait pas
-        # encore le commit, donc la livraison constatée reste prouvable.
-        work.milestone(self.db, item["id"], "frozen", sha=sha, actor="ouvrier",
-                       note="ameesh-freeze-absent: main")
+        # marque, écrite ici au stockage, dit ce que le gel réel aurait écrit :
+        # `main` ne portait pas encore le commit, donc la livraison constatée
+        # reste prouvable. `work.milestone` ignore désormais une marque
+        # d'appelant (avis dev4) : le scénario se pose au niveau stockage.
+        storage.of(self.db).work.add_milestone(
+            item["id"], "frozen", sha=sha, actor="ouvrier", verdict=None,
+            note="ameesh-freeze-absent: main")
         return item
 
     def run_sync(self, **kwargs) -> dict:
@@ -1526,8 +1529,11 @@ class ContentMergeTest(_PlanDb):
         git(self.repo, "merge", "-q", "--ff-only", "lot/x")
         git(self.repo, "checkout", "-q", "lot/x")
         latest = self.commit("src/x.py", "x=2\n", "nouveau travail gelé")
-        work.milestone(self.db, item["id"], "frozen", sha=latest, actor="ouvrier",
-                       note="ameesh-freeze-absent: main")
+        # #2786 (5) : la marque est posée au stockage, comme l'aurait fait le
+        # gel réel avant la fusion (avis dev4 : `work.milestone` l'ignore).
+        storage.of(self.db).work.add_milestone(
+            item["id"], "frozen", sha=latest, actor="ouvrier", verdict=None,
+            note="ameesh-freeze-absent: main")
         result = self.run_sync()[item["id"]]
         self.assertEqual(result["result"], "open", result)
         self.assertEqual(result["sha"], latest)

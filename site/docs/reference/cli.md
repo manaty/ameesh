@@ -382,6 +382,9 @@ ameesh work milestone <id> <frozen|verdict> [ok|blocked] [--sha SHA] [--note N] 
         # frozen SHA: full 40-hex commit, or a 12+ hex abbreviation resolved in
         # the author's repository and written full; HEAD/a branch is refused,
         # and a legacy non-full freeze is a doubt, never a merge (#2786)
+        # the target is read published and refreshed (bounded fetch of origin);
+        # a stale clone neither accepts an already-delivered freeze nor writes
+        # the absence mark that would make it look delivered (#2786, cx1)
 ameesh work backlog add --title T --value "expected value" --score 1-100
                         [--priority 1|2|3] [--source S] [--team T] [--requires CAP …]
                         [--body B] [--package CARD] [--json]

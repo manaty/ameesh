@@ -329,6 +329,13 @@ dans leur propre clone : un gel « HEAD » vaut doute, jamais une livraison, et
 dont le commit est **déjà ancêtre de la cible** au moment du gel (aucun
 commit propre, cas #2784) est refusé à l'écriture ; et le balayage ne compte
 pas comme livraison un gel qui était déjà dans la cible quand il a été posé.
+La cible est lue **publiée et rafraîchie** (fetch borné de `origin`) : un
+clone d'auteur en retard sur la forge ne peut ni accepter un gel déjà livré
+ni écrire la preuve d'absence qui le rendrait livrable. Quand la forge est
+illisible, le gel s'écrit sans cette preuve — le balayage doute, il ne
+devine pas. La preuve d'absence est une ligne machine : une
+`ameesh-freeze-absent:` fournie dans `--note` est ignorée, jamais recopiée
+(sinon n'importe quel appelant contournerait le refus #2784).
 Les durées `demande → gel`, `gel → revue`, `gel → fusion` et le nombre de
 verdicts bloqués se lisent dans `ameesh work list` (colonne DÉLAI), `ameesh work
 show` (frise complète) et le pied de `ameesh list` ; la forme complète est
