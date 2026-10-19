@@ -5,13 +5,14 @@ Witnesses of the lot: with a DeepSeek author and one review, Codex 16 points
 ahead and Claude at its pace designates Claude, even when Codex's agents are
 less loaded; two required reviews still take Claude and Codex whatever the
 pace; unreadable gauges keep the load rule. A stale reading (#1561) is
-neutral, and the pace never removes an eligible family.
+neutral, and the pace never removes an eligible family. The scale is raw:
+nominal multiplier and default ceiling, so declared ×10 profiles cannot invert
+the comparison (B of mesh-design on 4123b99).
 """
 from __future__ import annotations
 
 import unittest
 
-from ameesh import accounts
 from ameesh import review_designation as rd
 from ameesh import review_pace
 
@@ -56,16 +57,6 @@ class FamilyAdvanceTest(unittest.TestCase):
         advances = review_pace.family_advances(
             [gauge("codex", "secondaire", 0.35, 0.19)], now=NOW)
         self.assertAlmostEqual(advances["codex"], 0.16, places=6)
-
-    def test_the_account_pace_multiplier_is_read(self):
-        # #1075: the Codex primary doubles the elapsed share; the family
-        # reading follows the declared profile instead of the nominal pace.
-        profiles = accounts.parse({"codex": [
-            {"name": "secondaire", "type": "config_dir", "path": "/tmp/nope",
-             "pace_multiplier": 2.0}]})
-        advances = review_pace.family_advances(
-            [gauge("codex", "secondaire", 0.35, 0.19)], now=NOW, profiles=profiles)
-        self.assertAlmostEqual(advances["codex"], -0.03, places=6)
 
     def test_a_stale_reading_is_neutral(self):
         stale_claude = [

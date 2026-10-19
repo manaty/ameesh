@@ -6,12 +6,14 @@ review, the designation must prefer the one **furthest behind its plan**, so
 that a family is not exhausted before the end of the week. The load of the
 agents only breaks a tie.
 
-The reading is the one of `accounts` (canon §7, #1606 point 6):
+The reading is the **raw** pace (canon §7, #1606 point 6):
 
 - the window published by the harness and its reset date (`cost.Gauge`);
-- the plan pace, `min(ceiling, elapsed × multiplier + margin)`, with the
-  account's `pace_multiplier` and `pace_ceiling` when the host declares them
-  (defaults of `accounts`/`cost` otherwise);
+- the nominal pace, `min(cost.PACE_CEILING, elapsed + cost.PACE_MARGIN)`: the
+  **same scale for every family**. The account's declared
+  `pace_multiplier`/`pace_ceiling` are deliberately not read — a declared ×10
+  made Claude look further behind than Codex and inverted the intended
+  witness (B of mesh-design on 4123b99, 19/10/2026);
 - the reserve kept for the critical agents (`accounts.RESERVE`), deducted like
   a non-critical turn does (#2648): a reviewer stops below the pace, never at
   it.
@@ -84,44 +86,27 @@ def gauge_of(row: Mapping) -> Optional[cost.Gauge]:
                       source=str(row.get("source") or ""))
 
 
-def declared_profiles(cfg) -> dict:
-    """`{harness: [Profile]}` declared by the host, empty on a broken config.
+def account_advance(gauges: Sequence[cost.Gauge], *, now: float) -> Optional[float]:
+    """The raw advance of one account, in points, or None when it is stale.
 
-    The gauge history is shared by the mesh, the account settings are local:
-    a host that declares neither Claude nor Codex reads their gauges with the
-    defaults, which is the reading of `accounts` without a declared profile.
-    """
-    try:
-        return accounts.parse(getattr(cfg, "accounts", None) or {})
-    except accounts.AccountError:
-        return {}
-
-
-def account_advance(gauges: Sequence[cost.Gauge], *, now: float,
-                    profile: Optional[accounts.Profile] = None) -> Optional[float]:
-    """The advance of one account, in points, or None when the reading is stale.
-
-    It is `used_at − held_cap` on the **binding window** (the largest advance).
-    `held_cap` carries the account's `pace_multiplier`/`pace_ceiling` and the
-    reserve of the critical agents (`accounts.RESERVE`), exactly like the
-    pause of a non-critical turn.
+    It is `used_at − held_cap` on the **binding window** (the largest advance),
+    with the nominal multiplier and the default ceiling; the reserve of the
+    critical agents (`accounts.RESERVE`) is the only deduction. The same scale
+    applies to every family, whatever its declared profile says.
     """
     gauges = list(gauges or ())
     if not gauges or cost.stale_reading(gauges, now):
         return None
-    multiplier = profile.pace_multiplier if profile is not None else 1.0
-    ceiling = profile.pace_ceiling if profile is not None else cost.PACE_CEILING
-    advances = [gauge.used_at(now) - gauge.held_cap(
-        now, accounts.RESERVE, multiplier, ceiling) for gauge in gauges]
+    advances = [gauge.used_at(now) - gauge.held_cap(now, accounts.RESERVE)
+                for gauge in gauges]
     return max(advances) if advances else None
 
 
-def family_advances(rows, *, now: float, profiles: Optional[Mapping] = None) -> dict:
-    """`{family: advance}` for the families with a current reading.
+def family_advances(rows, *, now: float) -> dict:
+    """`{family: advance}` for the families with a current raw reading.
 
-    `rows` are the gauge-history rows (`operations.latest_gauges`), `profiles`
-    the declared `{harness: [Profile]}` (absent: defaults). A harness that has
-    named account readings drops its anonymous ones, like
+    `rows` are the gauge-history rows (`operations.latest_gauges`). A harness
+    that has named account readings drops its anonymous ones, like
     `sous_utilisation.latest_account_gauges`: they are the default account,
     already counted. A family's value is the **largest** current account
     advance (the most constrained one); an account with a stale reading is
@@ -141,19 +126,9 @@ def family_advances(rows, *, now: float, profiles: Optional[Mapping] = None) -> 
         if gauge is None:
             continue
         grouped.setdefault((harness, account), []).append(gauge)
-    profiles = profiles or {}
     out: dict = {}
-    for (harness, account), gauges in grouped.items():
-        items = profiles.get(harness) or []
-        profile = None
-        if account:
-            profile = accounts.by_name(items, account)
-        elif len(items) == 1:
-            profile = items[0]
-        elif items:
-            # the anonymous readings belong to the harness's default account
-            profile = accounts.primary_of(harness, items)
-        advance = account_advance(gauges, now=now, profile=profile)
+    for (harness, _account), gauges in grouped.items():
+        advance = account_advance(gauges, now=now)
         if advance is None:
             continue
         current = out.get(harness)

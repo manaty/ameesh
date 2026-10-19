@@ -248,10 +248,14 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertEqual([m["recipient"] for m in self.mailbox()],
                          [out["reviewers"][0]["name"]])
 
-    def test_the_freeze_prefers_the_family_behind_its_plan_pace(self):
-        # #2668: one review due; Codex is 16 points ahead of its plan pace and
-        # Claude is at its pace. Claude must be designated even though Codex's
-        # agent is less loaded; with no current reading, the load rule returns.
+    def test_the_freeze_prefers_the_raw_plan_pace_over_declared_multipliers(self):
+        # #2668: one review due; Codex is 16 points ahead of its raw plan pace
+        # and Claude is at its pace. Claude must be designated even though
+        # Codex's agent is less loaded. The declared ×10 (Claude) and ×3
+        # (Codex) profiles are deliberately ignored: with them Claude would
+        # look 20 points behind and Codex 21.8, designating Codex, the inverse
+        # of the witness (B of mesh-design on 4123b99). With no current
+        # reading, the load rule returns.
         self.repo.write("docs/guide.md", "base\n")
         self.base = self.repo.commit("docs base")
         self.repo.write("docs/guide.md", "lot\n")
@@ -262,7 +266,16 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         text = MECHANICS.replace("  distinct_families: true",
                                  "  distinct_families: true\n  light_reviews: 1")
         self.canon = _Canon(os.path.join(self.tmp, "canon-pace"), mechanics=text)
-        self.cfg = dataclasses.replace(self.cfg, canon=self.canon.root, canon_ref="HEAD")
+        self.cfg = dataclasses.replace(
+            self.cfg, canon=self.canon.root, canon_ref="HEAD",
+            accounts={
+                "claude": [{"name": "secondaire", "type": "config_dir",
+                            "path": os.path.join(self.tmp, "claude-10"),
+                            "pace_multiplier": 10.0}],
+                "codex": [{"name": "secondaire", "type": "config_dir",
+                           "path": os.path.join(self.tmp, "codex-3"),
+                           "pace_multiplier": 3.0}],
+            })
         for index in range(5):
             extra = work.add(self.db, title="load %d" % index, app="ameesh",
                              assignee="r1")

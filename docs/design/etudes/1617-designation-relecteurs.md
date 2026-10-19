@@ -60,9 +60,14 @@ The auditor found Codex at 35 % of its weekly window after 19 % of the week
 without a Codex opinion). The designation used to break ties by load alone,
 which ignored the plans. `src/ameesh/review_pace.py` now reads the shared
 gauge history and gives each family its **advance** over the plan pace, in
-points: `used_at − held_cap`, where `held_cap` is the pace of a non-critical
-turn (the account's `pace_multiplier`/`pace_ceiling`, the 10-point reserve
-kept for critical agents, #2648). Positive is ahead, negative is behind.
+points: `used_at − held_cap`, where `held_cap` is the **raw** pace of a
+non-critical turn (nominal multiplier, default ceiling, and the 10-point
+reserve kept for critical agents, #2648). Positive is ahead, negative is
+behind. The declared `pace_multiplier`/`pace_ceiling` are deliberately not
+read: with the real ×10 (Claude) and ×3 (Codex) profiles, Claude looked 20
+points behind and Codex 21.8, designating Codex — the inverse of the witness.
+The same raw scale applies to every family (B of mesh-design on 4123b99,
+19/10/2026).
 
 When several families are eligible for one opinion, the selection prefers the
 family furthest behind; the agent load only breaks a tie. A family's value is
@@ -74,11 +79,13 @@ The pace never makes a family ineligible: two required opinions still take two
 distinct families, whatever their pace.
 
 Witnesses: a DeepSeek author, one opinion, Codex 16 points ahead and Claude at
-its pace designates Claude even when Codex's agent is less loaded; two
-opinions designate Claude and Codex whatever the pace; unreadable gauges keep
-the previous load rule. The thresholds are not local: the families and the
-required number come from the compiled canon (`mechanics`), the pace
-parameters from `accounts`/`cost`.
+its pace designates Claude even when Codex's agent is less loaded — including
+with the real ×10/×3 declared profiles, which the raw scale ignores (the
+integration test sets them); two opinions designate Claude and Codex whatever
+the pace; unreadable gauges keep the previous load rule. The thresholds are
+not local: the families and the required number come from the compiled canon
+(`mechanics`), the scale from `cost`, the reserve from `accounts`; no declared
+profile multiplier is read.
 
 ## The wiring contract (to be qualified with #1616 and #1467)
 
@@ -304,15 +311,16 @@ session directory, and a sibling of another project is refused; a policy that
 arrives later is retried on the same freeze (the runner call included); the CLI
 freeze (light explanation included) and the recovery command.
 
-`tests/test_2668_designation_pace.py` — 14 targeted tests, without a database:
-the plan advance with the pace and the critical reserve (Codex 16 points ahead
-when 19 % of the week is elapsed), a stale reading neutral (#1561), the
-family's most constrained account, the anonymous readings dropped when named
-accounts exist, one opinion preferring the family behind even when its agent is
-more loaded, two opinions keeping two distinct families, and the load rule
-when no reading is current. One integration test in the activation file adds a
-current Claude/Codex gauge pair and checks the same choice on a real freeze,
-then removes the readings and checks that the load rule returns.
+`tests/test_2668_designation_pace.py` — 13 targeted tests, without a database:
+the raw plan advance with the critical reserve (Codex 16 points ahead when
+19 % of the week is elapsed, multiplier 1 and default ceiling), a stale
+reading neutral (#1561), the family's most constrained account, the anonymous
+readings dropped when named accounts exist, one opinion preferring the family
+behind even when its agent is more loaded, two opinions keeping two distinct
+families, and the load rule when no reading is current. One integration test
+in the activation file adds a current Claude/Codex gauge pair and declared
+×10/×3 profiles, checks that the raw pace still designates Claude on a real
+freeze, then removes the readings and checks that the load rule returns.
 
 ## Verdict carry and the freeze designation (#2442 × #2487)
 

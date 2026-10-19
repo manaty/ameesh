@@ -744,24 +744,24 @@ def _loads(db) -> dict:
     return out
 
 
-def _advances(cfg, db) -> dict:
-    """The plan advance of each family, from the shared gauge history (#2668).
+def _advances(db) -> dict:
+    """The raw plan advance of each family, from the shared gauge history (#2668).
 
     The history (`quota_gauge_readings`) is read by every host of the mesh, so
     a DeepSeek host can compare the Claude and Codex plans even when it
-    declares neither account. The local host's declared profiles provide the
-    `pace_multiplier`/`pace_ceiling` when it has them; otherwise the defaults
-    of `accounts` apply, and the gauge's own window and reset are always the
-    exact ones. Unreadable: an empty mapping, the selection keeps its load
-    rule — never a failed freeze.
+    declares neither account. The reading is the raw pace: nominal multiplier
+    and default ceiling, the same scale for every family; the declared
+    `pace_multiplier`/`pace_ceiling` are deliberately not read (B of
+    mesh-design on 4123b99). The gauge's own window and reset are the exact
+    ones. Unreadable: an empty mapping, the selection keeps its load rule —
+    never a failed freeze.
     """
     try:
         from . import review_pace, sous_utilisation
 
         rows = storage.of(db).operations.latest_gauges(
             since_s=sous_utilisation.PLAN_GAUGES_SINCE_S)
-        return review_pace.family_advances(
-            rows, now=time.time(), profiles=review_pace.declared_profiles(cfg))
+        return review_pace.family_advances(rows, now=time.time())
     except Exception:  # noqa: BLE001 - unreadable gauges: neutral, load decides
         return {}
 
@@ -940,7 +940,7 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                   unknown_authors=unknown, candidates=candidates, notify=notify,
                   manual=manual, waiver=waiver,
                   manual_seats=_manual_seats(manual, listing, authors, families),
-                  advances=_advances(cfg, db))
+                  advances=_advances(db))
 
 
 # --------------------------------------------------------------------------
