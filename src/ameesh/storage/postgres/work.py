@@ -46,7 +46,8 @@ _COLUMNS_TEMPLATE = """
     extract(epoch from updated_at)::float8 as updated_ts,
     extract(epoch from closed_at)::float8  as closed_ts,
     extract(epoch from delegated_at)::float8 as delegated_ts,
-    extract(epoch from due_at)::float8 as due_ts
+    extract(epoch from due_at)::float8 as due_ts,
+    __WAKE__
 """
 
 
@@ -98,6 +99,29 @@ def has_migration_slots(db) -> bool:
     return found
 
 
+def has_wake_at(db) -> bool:
+    """#2466 : les colonnes `wake_at`/`wake_claim_at` existent-elles (0466) ?
+
+    Même règle que `has_reviewer` : seule la réponse positive est mise en
+    cache ; un exécuteur démarré avant la migration voit les colonnes dès
+    qu'elles sont appliquées, sans redémarrage. Les deux colonnes viennent de
+    la même migration : les exiger ensemble évite d'utiliser un schéma
+    intermédiaire (wake_at seul) avec le code du claim."""
+    if getattr(db, "_has_wake_at", False):
+        return True
+    rows = db.query(
+        "SELECT count(*)::int AS n FROM information_schema.columns"
+        " WHERE table_schema = current_schema() AND table_name = 'work_items'"
+        "   AND column_name IN ('wake_at', 'wake_claim_at')")
+    found = bool(rows) and int(rows[0]["n"]) == 2
+    if found:
+        try:
+            db._has_wake_at = True
+        except Exception:  # objet sans attributs (proxy) : on relira
+            pass
+    return found
+
+
 def item_columns(db, ref: str | None = None) -> str:
     """Les colonnes d'un lot ; `reviewer` quand 0421 est appliquée, `''` sinon
     (les lectures d'avant la migration ne cassent pas, #705).
@@ -114,7 +138,8 @@ def item_columns(db, ref: str | None = None) -> str:
     budget L61, et la sonde de table y coûterait justement l'aller-retour
     qu'il économise. Ces vues rendent `[]` et se replient sur le scalaire
     (`work.migration_line`), jamais sur une erreur : sur une base d'avant
-    0419, la liste est de toute façon vide."""
+    0419, la liste est de toute façon vide. #2466 : `wake_ts` suit le même
+    chemin, NULL sur une base d'avant 0466."""
     if ref:
         reviewer = "coalesce(to_jsonb(%s)->>'reviewer', '') AS reviewer" % ref
     elif has_reviewer(db):
@@ -136,9 +161,12 @@ def item_columns(db, ref: str | None = None) -> str:
             " AS migrations")
     else:
         migrations = "'[]'::jsonb AS migrations"
+    wake = ("extract(epoch from (to_jsonb(%s)->>'wake_at')::timestamptz)::float8"
+            " as wake_ts" % (ref or "work_items"))
     return (_COLUMNS_TEMPLATE
             .replace("__REVIEWER__", reviewer + ", " + reviewers)
-            .replace("__MIGRATIONS__", migrations))
+            .replace("__MIGRATIONS__", migrations)
+            .replace("__WAKE__", wake))
 
 
 def has_reviewers(db) -> bool:
@@ -1396,6 +1424,56 @@ class WorkItems(interface.WorkItems):
         self._event(int(item_id), state, text, actor)
         self.db.execute("UPDATE work_items SET updated_at = now() WHERE id = %s",
                         (int(item_id),))
+
+    def note_with_wake(self, item_id, state, text, actor, wake_ts, *, once=False) -> None:
+        """#2466 : la note et l'échéance de réveil, sous le même verrou."""
+        if not has_wake_at(self.db):
+            raise DbError("work_items.wake_at is missing: apply migration 0466 "
+                          "(`ameesh migrate`) before scheduling a wake")
+        with self.db.transaction() as tx:
+            rows = tx.query("SELECT state FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                            (int(item_id),))
+            if not rows:
+                raise DbError("lot %s not found" % item_id)
+            if once and tx.query("SELECT id FROM work_item_events"
+                                 " WHERE work_item_id = %s AND note = %s LIMIT 1",
+                                 (int(item_id), text)):
+                return
+            WorkItems(tx)._event(int(item_id), rows[0]["state"], text, actor)
+            # l'échéance est écrite avec la note : jamais une retenue dont
+            # l'échéance s'est perdue.
+            tx.execute(
+                "UPDATE work_items SET wake_at = to_timestamp(%s),"
+                "       wake_claim_at = NULL, updated_at = now() WHERE id = %s",
+                (float(wake_ts), int(item_id)))
+
+    def schedule_wake(self, item_id, wake_ts, *, text, actor) -> dict | None:
+        """#2466 : pose (ou efface) le réveil programmé et journalise, atomique."""
+        if not has_wake_at(self.db):
+            raise DbError("work_items.wake_at is missing: apply migration 0466 "
+                          "(`ameesh migrate`) before scheduling a wake")
+        item_id = int(item_id)
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT state, extract(epoch from wake_at)::float8 AS wake_ts"
+                "  FROM work_items WHERE id = %s AND state NOT IN"
+                " ('merged', 'promoted', 'closed') FOR NO KEY UPDATE",
+                (item_id,))
+            if not rows:
+                return None
+            tx.execute(
+                "INSERT INTO work_item_events (work_item_id, state, note, actor) "
+                "VALUES (%s, %s, %s, %s)",
+                (item_id, rows[0]["state"], text or "", actor or ""))
+            if wake_ts is None:
+                tx.execute("UPDATE work_items SET wake_at = NULL,"
+                           "       wake_claim_at = NULL, updated_at = now()"
+                           " WHERE id = %s", (item_id,))
+            else:
+                tx.execute("UPDATE work_items SET wake_at = to_timestamp(%s),"
+                           "       wake_claim_at = NULL, updated_at = now()"
+                           " WHERE id = %s", (float(wake_ts), item_id))
+        return self.get(item_id)
 
     def log_review_attempt(self, item_id, state, text, actor) -> None:
         """L539 (#1104) : journalise une tentative de rattrapage sans création.
