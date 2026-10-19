@@ -2143,6 +2143,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                       % ", ".join(r.get("name") for r in outcome.get("reviewers") or ()))
             elif state == "unavailable":
                 print("review designation unavailable: %s" % (outcome.get("why") or ""))
+            elif state == "none":
+                # #2561: a light lot has no pre-merge reviewer; say why instead
+                # of printing nothing and letting "no reviewer" look like a failure
+                print("review: none — %s" % (outcome.get("why") or ""))
             return 0
         print(USAGE_HINT % "unknown work subcommand", file=sys.stderr)
         return 2
