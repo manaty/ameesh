@@ -2094,9 +2094,12 @@ class WorkItems(Domain):
         d'un chantier, ou ouvre ce panier ; rend le panier.
 
         Le panier est un lot `improvement` en `intake`, sans assigné, dont la
-        `source` vaut `key` et l'équipe `team`. La ligne s'ajoute au corps ; la
-        valeur du panier est la plus haute de ses lignes, sa priorité la plus
-        haute (le plus petit nombre), ses capacités exigées l'union des leurs ;
+        `source` vaut `key` : la clé seule le désigne, l'équipe d'une ligne
+        n'ouvre pas un second panier. La ligne s'ajoute au corps ; la valeur
+        du panier est la plus haute de ses lignes, sa priorité la plus haute
+        (le plus petit nombre), ses capacités exigées l'union des leurs, son
+        équipe la première donnée (`team` de la ligne qui l'ouvre, sinon
+        d'une suivante) ;
         `note` (qui commence par `BASKET_LINE_NOTE`) va au journal. Un panier
         déjà pris (assigné, ou sorti d'`intake`) est fermé aux lignes : la
         suivante ouvre un nouveau panier. Deux ajouts simultanés sur la même

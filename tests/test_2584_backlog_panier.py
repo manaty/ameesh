@@ -106,6 +106,8 @@ class ReviewOriginTest(unittest.TestCase):
             ({"source": "#2577 dry-run complet du delta, 2026-10-19"}, None),
             ({"source": "relecture manaty/nexlink#1669"}, None),
             ({"source": "relecture de la PR #1943 (N1)"}, None),
+            ({"source": "relecture de la pull request #1943 (N1)"}, None),
+            ({"source": "en allant relire #2580 (N1)"}, 2580),
             ({"source": "relecture de la PR #1943, lot #313 (N1)"}, 313),
             ({"title": "N2 : issue #77 citée", "source": "finding"}, None),
             ({"source": "constat de l'auditeur", "title": "Dette #12 à rembourser"}, None),
@@ -215,6 +217,16 @@ class BasketTest(_Base):
         self.assertTrue(g["basket_opened"])
         self.assertNotEqual(g["id"], a["id"])
         self.assertNotIn("N : g", work.get(self.db, a["id"])["body"])
+
+    def test_the_key_alone_makes_the_basket_whatever_the_team(self):
+        source = self.lot("Ajouter l'export des comptes")
+        first = self.element("N1 : sans équipe", 5, review_of=source["id"])
+        second = self.element("N2 : équipe donnée", 5, review_of=source["id"], team="ameesh")
+        third = self.element("N3 : autre équipe", 5, review_of=source["id"], team="nexlink")
+        self.assertEqual({first["id"], second["id"], third["id"]}, {first["id"]})
+        self.assertEqual(self.improvements(), [first["id"]])
+        # le panier ouvert sans équipe prend la première donnée, puis la garde
+        self.assertEqual(work.get(self.db, first["id"])["team"], "ameesh")
 
     def test_package_is_the_workstream(self):
         storage.of(self.db).packages.upsert({"id": "WP-EXPORT", "kind": "lot",

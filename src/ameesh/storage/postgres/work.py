@@ -2469,12 +2469,13 @@ class WorkItems(interface.WorkItems):
                      "current_schema() || ':backlog-basket:' || %s, 0))", (key,))
             # Une prise concurrente (`assign_capped`) attend le verrou de
             # ligne ; gagnée avant nous, la ligne ne vérifie plus le filtre :
-            # le panier pris reste fermé aux lignes.
+            # le panier pris reste fermé aux lignes. La clé seule fait le
+            # panier : l'équipe d'une ligne n'en ouvre pas un second.
             rows = tx.query(
                 "SELECT id FROM work_items"
                 " WHERE type = 'improvement' AND source = %s AND state = 'intake'"
-                "   AND assignee IS NULL AND team IS NOT DISTINCT FROM %s"
-                " ORDER BY id LIMIT 1 FOR NO KEY UPDATE", (key, team))
+                "   AND assignee IS NULL"
+                " ORDER BY id LIMIT 1 FOR NO KEY UPDATE", (key,))
             opened = not rows
             if opened:
                 rows = tx.query(
@@ -2497,10 +2498,11 @@ class WorkItems(interface.WorkItems):
                     "       required_capabilities = (SELECT array_agg(DISTINCT c ORDER BY c)"
                     "            FROM unnest(coalesce(required_capabilities, '{}'::text[])"
                     "                        || coalesce(%s::text[], '{}'::text[])) AS c),"
+                    "       team = coalesce(team, %s),"
                     "       updated_at = now()"
                     " WHERE id = %s RETURNING id",
                     (line, "\n" + line, int(value_score), int(priority), int(priority),
-                     caps, int(rows[0]["id"])))
+                     caps, team, int(rows[0]["id"])))
             item_id = int(rows[0]["id"])
             WorkItems(tx)._event(item_id, "intake", note, actor)
             rows = tx.query(
