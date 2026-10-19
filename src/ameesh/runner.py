@@ -5504,6 +5504,12 @@ class AgentWorker(threading.Thread):
         — la préparation en fait partie — donc le battement démarre ici, avant
         elle, et la couvre jusqu'à la sortie du tour, y compris les retours
         anticipés.
+
+        #2597 : il couvre aussi l'après-harnais (nettoyage, compta, fin de tour).
+        Il s'arrêtait dès la sortie du harnais alors que le veilleur jugeait
+        encore l'échéance : une compta lente sous charge laissait expirer le bail
+        (run 39181194843, psql 6/16 : « harness not yet published » après
+        « end of turn »). Seule cette sortie l'arrête.
         """
         #: #2466 : vrai dès que le harnais du tour est réellement lancé (Popen
         #: ou processus résident) ; l'échéance d'un réveil programmé n'est
@@ -5514,12 +5520,11 @@ class AgentWorker(threading.Thread):
                                                  daemon=True)
         self.heartbeat_thread.start()
         try:
-            return self._run_turn_sous_battement(spec, heartbeat_done)
+            return self._run_turn_sous_battement(spec)
         finally:
             heartbeat_done.set()
 
-    def _run_turn_sous_battement(self, spec: dict,
-                                 heartbeat_done: threading.Event) -> bool:
+    def _run_turn_sous_battement(self, spec: dict) -> bool:
         if spec.get("lot_switch_failed"):
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             return False
@@ -6180,7 +6185,6 @@ class AgentWorker(threading.Thread):
             echec_lancement = str(exc)
             result_code = 127
         finally:
-            heartbeat_done.set()
             preempt_done.set()
             pgid = self.pgid
             if rp is not None:
