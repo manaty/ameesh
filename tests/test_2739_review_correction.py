@@ -14,7 +14,7 @@ on the first pushed SHA; and the family stays eligible through another agent.
 from __future__ import annotations
 
 import os
-from unittest import TestCase
+from unittest import TestCase, mock
 
 from ameesh import merge_queue, registry, work
 from ameesh import review_designation as rd
@@ -169,20 +169,43 @@ class GateCorrectorTest(PgTestCase):
         self.assertFalse(out["ok"], out)
         self.assertIn(self.frozen[:12], out["error"])
 
-    def test_a_manual_corrector_removed_from_the_column_still_does_not_count(self):
-        # #2739: the pilot retired the manual seat after the correction
-        # (#2076). The journal keeps the designation, so the corrector stays
-        # recognizable and the gate still refuses its verdict.
+    def _designation_note(self, actor):
+        # The pilot retired the manual seat after the correction (#2076); the
+        # journal line is the only trace left.
         self.db.execute(
             "UPDATE work_items SET reviewers = ARRAY[]::text[], reviewer = ''"
             " WHERE id = %s", (self.lot,))
         self.db.execute(
             "INSERT INTO work_item_events (work_item_id, state, note, actor,"
             " created_at) VALUES (%s, 'qa', 'reviewer cx2 designated',"
-            " 'mesh-design', now() - interval '10 minutes')", (self.lot,))
-        out = self.gate()
+            " %s, now() - interval '10 minutes')", (self.lot, actor))
+
+    def test_a_manual_corrector_removed_from_the_column_still_does_not_count(self):
+        # #2739: the pilot retired the manual seat after the correction
+        # (#2076). The journal keeps the designation, so the corrector stays
+        # recognizable and the gate still refuses its verdict.
+        self._designation_note("mesh-design")
+        with mock.patch("ameesh.assignments.is_orchestrator",
+                        side_effect=lambda cfg, db, name, **kw: name == "mesh-design"):
+            out = self.gate()
         self.assertFalse(out.get("error"), out)
         self.assertEqual(out["corrections"], ["cx2"])
         self.assertTrue(out["ok"], out["why"])
         self.assertEqual([entry["actor"] for entry in out["accepted"]],
                          ["cx3", "dev1"])
+
+    def test_a_free_note_is_not_a_designation(self):
+        # #2739: the line is only a text. A free note by an ordinary agent is
+        # identical to a designation; only the system, a human or a declared
+        # orchestrator/design agent can make a reviewer.
+        from ameesh.review_designation_activation import _journal_reviewers
+
+        self._designation_note("cx3")
+        with mock.patch("ameesh.assignments.is_orchestrator", return_value=False):
+            self.assertEqual(_journal_reviewers(self.db, self.lot), [])
+        self.db.execute("DELETE FROM work_item_events WHERE note = %s",
+                        ("reviewer cx2 designated",))
+        self._designation_note("mesh-design")
+        with mock.patch("ameesh.assignments.is_orchestrator",
+                        side_effect=lambda cfg, db, name, **kw: name == "mesh-design"):
+            self.assertEqual(_journal_reviewers(self.db, self.lot), ["cx2"])

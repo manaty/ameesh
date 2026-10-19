@@ -569,6 +569,29 @@ def _range(repo: str, base: str, head: str) -> tuple[str, list, list]:
 # the authors: one reading shared with the train and the merge gate (#2681)
 # --------------------------------------------------------------------------
 
+def _designation_authority(db, actor: str) -> bool:
+    """May `actor` have written a `reviewer X designated` journal line (#2739)?
+
+    The line is only a text: any agent can copy it in a free note, so the text
+    alone proves nothing. The write path (`work.designate_reviewer`) already
+    admits only the system, a human, or an orchestrator/design agent; the
+    journal read applies the same authority, so an ordinary agent's note cannot
+    make itself a designated reviewer (and excuse its own commit as a fix).
+    """
+    actor = str(actor or "").strip()
+    if not actor:
+        return False
+    if actor == work.SYSTEM_SENDER or actor.startswith(work.HUMAN_PREFIX):
+        return True
+    try:
+        from . import assignments
+        return assignments.is_orchestrator(
+            getattr(db, "cfg", None), db, actor,
+            roles=work.CORRECTOR_ROLES, history=False)
+    except Exception:  # noqa: BLE001 - unreadable authority: no name counted
+        return False
+
+
 def _journal_reviewers(db, lot: int, *, until=None) -> list:
     """The reviewer names designated by hand in the lot journal (#2739).
 
@@ -576,8 +599,10 @@ def _journal_reviewers(db, lot: int, *, until=None) -> list:
     a manual seat and the column no longer carries the name. The journal keeps
     the designation (`reviewer X designated`), so a manual reviewer who pushed
     a first-round correction stays recognizable after their seat is retired,
-    exactly like the automatic names of the marks (#2638). With `until` (the
-    freeze instant), a reviewer named after the freeze is ignored: they did not
+    exactly like the automatic names of the marks (#2638). Only a line written
+    by a designation authority counts (`_designation_authority`): a free note
+    carrying the same words is not a designation. With `until` (the freeze
+    instant), a reviewer named after the freeze is ignored: they did not
     review that head.
     """
     names: list[str] = []
@@ -588,6 +613,8 @@ def _journal_reviewers(db, lot: int, *, until=None) -> list:
     for event in events:
         note = str((event or {}).get("note") or "").strip()
         if not note.startswith("reviewer ") or not note.endswith(" designated"):
+            continue
+        if not _designation_authority(db, (event or {}).get("actor")):
             continue
         if until is not None:
             try:
