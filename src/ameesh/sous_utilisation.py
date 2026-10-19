@@ -275,7 +275,9 @@ def plan_underused(db, listing: list, now: float, *,
     le plafond du compte nommé par le relevé remplacent les 90 % et le ×1 en
     dur ; un compte absent, inconnu ou ambigu garde les défauts. #2233 : les
     plafonds fixes et courts de `accounts.limits` bloquent aussi une fausse
-    promesse de capacité sur une autre fenêtre du même compte."""
+    promesse de capacité sur une autre fenêtre du même compte. #2648 : ce
+    seuil et le `pace_cap` annoncé sont ceux de la pause d'un agent non
+    critique (réserve des critiques déduite), jamais le plafond ordinaire."""
     used_max = max(0.0, float(used_pct)) / 100.0
     gap_min = max(0.0, float(pace_gap_pct)) / 100.0
     if (tail_s <= 0 or used_max <= 0) and gap_min <= 0:
@@ -315,8 +317,15 @@ def plan_underused(db, listing: list, now: float, *,
                     continue
             # Comme avant #2233, aucun relèvement de fin de fenêtre sans
             # preuve fraîche ; les plafonds fixes et courts viennent de limits.
-            caps = accounts_mod.limits(profile, measured, now, ceilings={
-                g.key: accounts_mod.Ceiling(ceiling) for g in measured})
+            # #2648 : même éligible que la pause d'un agent non critique — la
+            # réserve des critiques (10 points) comprise. Sans elle, une
+            # fenêtre dans cette bande (ex. seven_day à 83 % pour un rythme
+            # ramené à 80 %) laissait annoncer une capacité qu'aucun agent ne
+            # pouvait consommer : la pause jugeait le compte au seuil.
+            caps = accounts_mod.limits(profile, measured, now, reserve=True,
+                                       ceilings={
+                                           g.key: accounts_mod.Ceiling(ceiling)
+                                           for g in measured})
             if any(g.used_at(now) >= caps[g.key][0] for g, _ in blocking):
                 continue
         for gauge, seen in live:
@@ -328,7 +337,9 @@ def plan_underused(db, listing: list, now: float, *,
             resets_at, unused = expiring(gauge, now)
             remaining = resets_at - now
             elapsed = gauge.elapsed(now)
-            cap = gauge.pace_cap(now, multiplier, ceiling)
+            # #2648 : le rythme annoncé est celui de la pause d'un
+            # non-critique (réserve déduite), pas le plafond ordinaire.
+            cap = gauge.held_cap(now, accounts_mod.RESERVE, multiplier, ceiling)
             used = float(gauge.used or 0.0)
             reason = None
             tail = min(float(tail_s), PLAN_TAIL_MAX_FRACTION * gauge.window_s)

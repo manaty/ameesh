@@ -14,7 +14,7 @@
     "binary_env": ["AMEESH_DSH_BIN", "AGENT_MESH_DSH_BIN"],
     "launcher": ["--profile", "agent"],
     "command": ["--json"],
-    "interactive": [],
+    "interactive": null,
     "session": {"flag": ["--session-id"]},
     "stream": "dsh-json",
     "env": {"DSH_PERMISSION_MODE": "danger-full-access"},

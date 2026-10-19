@@ -1353,6 +1353,163 @@ class ContentMergeTest(_PlanDb):
         self.assertEqual(done["result"], "refrozen")
         self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
 
+    # -- #2744 : blocked et hold non levé retiennent la fermeture par contenu --
+    def _delivered(self, name: str) -> dict:
+        """Un lot gelé dont le contenu est déjà dans `main`, encore en `qa`."""
+        git(self.repo, "checkout", "-q", "-b", "lot/%s" % name)
+        sha = self.commit("src/%s.py" % name, "%s = 1\n" % name, name)
+        git(self.repo, "checkout", "-q", "main")
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet %s" % name,
+            "lot/%s" % name)
+        return self.frozen(name, sha)
+
+    def test_2744_un_lot_blocked_n_est_pas_ferme_par_le_contenu(self):
+        from ameesh import mail
+        item = self._delivered("bloque")
+        work.move(self.db, item["id"], "blocked", note="passe réelle due",
+                  actor="dev-a")
+        dry = self.run_sync(dry_run=True)[item["id"]]
+        self.assertEqual(dry["result"], "would-withhold")
+        self.assertEqual(mail.unread(self.db, "dev-a"), [])
+        result = self.run_sync()[item["id"]]
+        self.assertEqual(result["result"], "withheld")
+        self.assertEqual(result["retention"]["what"], "blocked")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "blocked")
+        self.assertIn("contenu fusionné, fermeture retenue", result["detail"])
+        notes = [e["note"] or "" for e in work.events(self.db, item["id"])]
+        self.assertTrue(any("contenu fusionné, fermeture retenue" in n for n in notes),
+                        notes)
+        [row] = mail.unread(self.db, "dev-a")
+        self.assertEqual(row["kind"], "event")
+        self.assertIn("closure is withheld", row["body"])
+        # le balayage suivant ne double ni la note ni le courrier
+        self.run_sync()
+        self.assertEqual(len(mail.unread(self.db, "dev-a")), 1)
+
+    def test_2744_un_hold_non_leve_retient_la_fermeture_puis_la_leve(self):
+        item = self._delivered("hold")
+        work.note(self.db, item["id"], "hold: passe réelle due", actor="dev-a")
+        result = self.run_sync()[item["id"]]
+        self.assertEqual((result["result"], result["retention"]["what"]),
+                         ("withheld", "hold"))
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+        self.assertIn("passe réelle due", result["detail"])
+        # levée explicite par un pilote : le contenu ferme
+        work.note(self.db, item["id"], "unhold: passe faite", actor="human:alice")
+        self.assertEqual(self.run_sync()[item["id"]]["result"], "merged")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "merged")
+
+    def test_2744_un_lot_bloque_pendant_le_releve_n_est_pas_ferme(self):
+        """B1 cx2 : qa → blocked pendant les sondes Git. La ligne du début de
+        balayage est périmée ; la garde relue sous le verrou du lot refuse."""
+        item = self._delivered("course-bloquee")
+        real = plan_git.probe
+        moved = []
+
+        def probe(repo, sha, target, *, lot=None):
+            if lot == item["id"] and not moved:
+                moved.append(True)
+                work.move(self.db, item["id"], "blocked", note="pendant le relevé",
+                          actor="dev-a")
+            return real(repo, sha, target, lot=lot)
+
+        with mock.patch.object(plan_git, "probe", side_effect=probe):
+            result = self.run_sync()[item["id"]]
+        self.assertEqual(result["result"], "withheld")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "blocked")
+        self.assertIn("état blocked", result["detail"])
+
+    def test_2744_un_journal_illisible_ne_ferme_pas(self):
+        """B2 cx2 : une lecture des retenues en erreur retient la fermeture ;
+        elle ne doit jamais laisser croire à l'absence de hold."""
+        item = self._delivered("journal-ko")
+        st = storage.of(self.db)
+        with mock.patch.object(type(st.progress), "lot_hold_events",
+                               side_effect=RuntimeError("panne journal")):
+            result = self.run_sync()[item["id"]]
+        self.assertEqual(result["result"], "error")
+        self.assertEqual(result["retention"]["what"], "unreadable")
+        self.assertIn("journal des retenues illisible", result["detail"])
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+
+    def test_2744_une_note_de_hold_prend_le_verrou_de_ligne(self):
+        """B1 cx2 (structure) : hold et fermeture partagent le verrou de ligne ;
+        une note `hold:` concurrente attend la fin de la transaction qui tient
+        le lot, elle ne se glisse pas entre la lecture et la fermeture."""
+        item = self.frozen("hold-verrou", "e" * 40)
+        writer = db_mod.connect(self.cfg)
+        done, errors = [], []
+
+        def hold():
+            try:
+                done.append(work.note(writer, item["id"],
+                                      "hold: pendant la fermeture", actor="dev-a"))
+            except Exception as exc:  # noqa: BLE001 - rapporté par le test
+                errors.append(repr(exc))
+
+        thread = threading.Thread(target=hold)
+        blocker = db_mod.connect(self.cfg)
+        try:
+            with blocker.transaction() as tx:
+                tx.query("SELECT id FROM work_items WHERE id = %s FOR UPDATE",
+                         (item["id"],))
+                thread.start()
+                self._wait_lock("SELECT migration_repo FROM work_items WHERE id =")
+                self.assertEqual(done, [])
+            thread.join(10)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(done, [True])
+            self.assertTrue(any("hold: pendant la fermeture" in (e["note"] or "")
+                                for e in work.events(self.db, item["id"])))
+        finally:
+            thread.join(10)
+            blocker.close()
+            writer.close()
+
+    def test_2744_la_garde_prend_le_verrou_depot_avant_le_lot(self):
+        """Une transition qui tient le dépôt peut encore verrouiller le lot
+        pendant que la fermeture attend ce dépôt : aucun cycle de verrous."""
+        item = self._delivered("ordre-verrous")
+        self.db.execute("UPDATE work_items SET migration = 987, migration_repo = %s WHERE id = %s",
+                        ("acme/web", item["id"]))
+        blocker, closer = db_mod.connect(self.cfg), db_mod.connect(self.cfg)
+        results, errors = [], []
+
+        def close():
+            try:
+                results.append(work.close_merged(
+                    closer, item["id"], sha="a" * 40,
+                    content_guard=plan_git.content_retention))
+            except Exception as exc:
+                errors.append(repr(exc))
+
+        thread = threading.Thread(target=close)
+        try:
+            with blocker.transaction() as tx:
+                tx.execute("SELECT pg_advisory_xact_lock(hashtextextended("
+                           "current_schema() || ':migration-repo:' || %s, 0))",
+                           ("github.com/acme/web",))
+                thread.start()
+                self._wait_lock("pg_advisory_xact_lock(hashtextextended(")
+                tx.execute("SET LOCAL lock_timeout = '500ms'")
+                tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                         (item["id"],))
+            thread.join(10)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(results[0]["result"], "merged")
+        finally:
+            thread.join(10)
+            blocker.close()
+            closer.close()
+
+    def test_2744_un_lot_qa_sans_hold_ferme_comme_avant(self):
+        item = self._delivered("sans-hold")
+        result = self.run_sync()[item["id"]]
+        self.assertEqual((result["result"], result["how"]), ("merged", "ancestor"))
+        self.assertEqual(work.get(self.db, item["id"])["state"], "merged")
+
     # -- revue codex1 (750c221), sondes reprises telles quelles -----------------
     def test_seul_le_dernier_gel_compte(self):
         """P2-1 : un gel antérieur déjà fusionné ne ferme pas un lot regelé

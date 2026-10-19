@@ -2,7 +2,9 @@
 """L82: native handoff, a hard duration cap and duplicate refusal."""
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import io
 import json
 import os
 import subprocess
@@ -87,6 +89,31 @@ class AttachTest(PgTestCase):
                                             "AMEESH_TEST_LOG": self.turns_log})
         patch.start()
         self.addCleanup(patch.stop)
+
+    def test_deepseek_refuses_before_the_lease_without_an_interactive_session(self):
+        # #2706 : dsh `--profile agent` est headless et exige une tâche. Attach
+        # ne doit ni prendre le bail, ni lancer le binaire, ni réveiller l'agent
+        # pour rendre le bail 4 s plus tard ; et un permission_mode legacy ne
+        # doit pas produire d'avertissement pour un harnais sans mode interactif.
+        cwd = os.path.join(self.tmp, "work", "dsh82")
+        os.makedirs(cwd, exist_ok=True)
+        self.register("dsh82", "deepseek", cwd=cwd)
+        state = self.cfg.agent_dir("dsh82")
+        os.makedirs(state, exist_ok=True)
+        with open(os.path.join(state, "permission_mode"), "w", encoding="utf-8") as fh:
+            fh.write("bypassPermissions\n")
+        err = io.StringIO()
+        with mock.patch.object(registry, "attach_claim",
+                               side_effect=AssertionError("attach took the lease")) as claim, \
+                contextlib.redirect_stderr(err):
+            code = run_attach(self.cfg, self.db, "dsh82")
+        self.assertEqual(code, 1)
+        claim.assert_not_called()
+        self.assertIn("no interactive session", err.getvalue())
+        self.assertIn("deepseek", err.getvalue())
+        self.assertNotIn("not bound to a harness", err.getvalue())
+        self.assertEqual(self.turns(), [])
+        self.assertIsNone(registry.get(self.db, "dsh82")["lease_owner"])
 
     def test_max_stops_the_harness_warns_and_returns_the_lease(self):
         with mock.patch.dict(os.environ, {"AMEESH_TEST_SLEEP": "20"}), \

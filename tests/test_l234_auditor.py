@@ -15,7 +15,8 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import auditor, backlog, canon as canon_mod
+from ameesh import auditor, backlog, canon as canon_mod, work
+from .support import FIXTURE_BUILD_CAP
 from ameesh.runner import AgentWorker, Runner
 from ameesh.platform import audit_guard
 
@@ -41,6 +42,10 @@ class AuditorTest(unittest.TestCase):
                                  side_effect=lambda db, name: self.rows.get(name))
         self.getter.start()
         self.addCleanup(self.getter.stop)
+        # #2451 : plafond §4 de fixture (le canon compilé en vrai)
+        cap = mock.patch.object(work, "build_limit", return_value=FIXTURE_BUILD_CAP)
+        cap.start()
+        self.addCleanup(cap.stop)
         available = mock.patch("ameesh.platform.audit_guard.available", return_value=True)
         available.start()
         self.addCleanup(available.stop)

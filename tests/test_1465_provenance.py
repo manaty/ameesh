@@ -157,9 +157,15 @@ class PgProvenanceTest(PgTestCase):
         # un autre commit reste inconnu : pas de voisin, pas de repli
         self.assertIsNone(prov.receipt_for_commit(self.db, SHA1_FULL))
 
+    def _verdict(self, sha=SHA1[:12]):
+        # #2674 : une abréviation doit se résoudre ; ce témoin simule un dépôt
+        # qui la connaît (le commit est fictif).
+        with mock.patch("ameesh.freeze_checks.commit_in", return_value=SHA1):
+            return work.milestone(self.db, int(self.lot["id"]), "verdict", sha=sha,
+                                  actor="mty-amh-impl-07", verdict="ok")
+
     def test_milestone_receipt_copies_the_declared_facts(self):
-        mark = work.milestone(self.db, int(self.lot["id"]), "verdict", sha=SHA1[:12],
-                              actor="mty-amh-impl-07", verdict="ok")
+        mark = self._verdict()
         self.assertIsNone(prov.receipt_for_milestone(self.db, mark["id"]))
         self._receipt("milestone:%d" % mark["id"], SHA1, work_item_id=int(self.lot["id"]))
         recu = prov.receipt_for_milestone(self.db, mark["id"])
@@ -178,8 +184,7 @@ class PgProvenanceTest(PgTestCase):
         self.assertEqual(recu["harness"], "deepseek")
 
     def test_milestone_proof_must_match_the_mark(self):
-        mark = work.milestone(self.db, int(self.lot["id"]), "verdict", sha=SHA1[:12],
-                              actor="mty-amh-impl-07", verdict="ok")
+        mark = self._verdict()
         # acteur de la preuve différent de l'acteur du jalon : refus
         self._receipt("milestone:%d" % mark["id"], SHA1, actor="autre-agent")
         with self.assertRaises(prov.ProvenanceError):

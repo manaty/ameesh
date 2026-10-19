@@ -319,6 +319,7 @@ def _assemble(kind: str, blocks: Sequence[str], remaining: int) -> str:
         parts.append(adapters.MAIL_REMAINING % remaining)
     parts.append(footer)
     parts.append(adapters.TMP_NOTE)  # L162 : $TMPDIR, jamais /tmp en dur
+    parts.append(adapters.VENV_NOTE)  # #2763 : jamais pip dans le venv partagé
     # L159b: with a lending VM, heavy suites go there; otherwise L131, heavy
     # suites capped per host by `ameesh heavy`
     parts.append(adapters.offload_note() or adapters.HEAVY_NOTE)
@@ -384,6 +385,15 @@ def review_requests(db: Db, recipient: str, lot: int | str) -> list[dict]:
     from .agent_names import resolve as resolve_agent_name
     recipient = resolve_agent_name(recipient, db=db, operation="mail.review_requests")
     return storage.of(db).mailbox.review_requests(recipient, str(int(lot)))
+
+
+def delivered_for_lot(db: Db, recipient: str, lot, limit: int) -> list[dict]:
+    """#2539 : les derniers messages déjà remis de ce lot, filtrés dans la
+    requête (destinataire + lot), sans fenêtre de temps. Non admis en mode
+    médié (contrat fermé) : l'appelant retombe sur les non-lus."""
+    from .agent_names import resolve as resolve_agent_name
+    recipient = resolve_agent_name(recipient, db=db, operation="mail.delivered_for_lot")
+    return storage.of(db).mailbox.delivered_for_lot(recipient, str(lot or "").strip(), limit)
 
 
 def pending_recipients(db: Db) -> list[str]:

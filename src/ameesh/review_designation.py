@@ -57,10 +57,6 @@ NONE = "none"
 REQUEST_KIND = "request"
 #: a harness that is not a model family (registry without a session)
 PLACEHOLDER_FAMILIES = frozenset(("", "none", "other", "unknown", "inconnu"))
-#: fallback families as long as the compiled canon (#1616) does not declare
-#: them: same values as `train_review.FAMILIES`, to be passed as a parameter as
-#: soon as the machine declaration "families and independence" is available
-KNOWN_FAMILIES = frozenset(("claude", "codex", "deepseek"))
 #: the registry states that forbid designation
 UNAVAILABLE_STATUS = frozenset(("stopped", "paused"))
 #: the `status_text` prefixes of an operations or budget pause
@@ -207,15 +203,14 @@ class Candidate:
     load: int = 0
     model: str = ""
 
-    def eligible(self, *, forbidden_names, forbidden_families,
-                 families=KNOWN_FAMILIES) -> bool:
+    def eligible(self, *, forbidden_names, forbidden_families, families) -> bool:
         name = (self.name or "").strip()
         family = (self.family or "").strip().lower()
         return bool(name) and self.available and family in families \
             and name not in forbidden_names and family not in forbidden_families
 
 
-def live_family(row: Mapping, *, families=KNOWN_FAMILIES) -> str:
+def live_family(row: Mapping, *, families) -> str:
     """The real family of a registry row, never the declared label.
 
     `registry.live_harness` (imported locally here so the module remains
@@ -250,7 +245,7 @@ def is_available(row: Mapping) -> bool:
 
 
 def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping] = None,
-                             project: str = "", families=KNOWN_FAMILIES) -> list[Candidate]:
+                             project: str = "", families) -> list[Candidate]:
     """The candidates of a project: real family, availability, load of open lots.
 
     `loads` maps a name to the number of open lots (`build`/`qa`); when absent,
@@ -314,8 +309,24 @@ def unknown_families(authors: Iterable) -> list[str]:
                    in PLACEHOLDER_FAMILIES})
 
 
-def manual_seats(already: Iterable, *, authors: Iterable = (),
-                 families=KNOWN_FAMILIES) -> list:
+def names_of(rows: Iterable) -> set:
+    """The names carried by `{name, ...}` rows or bare strings, stripped.
+
+    The selection applies it to its `fixers` input: a corrector is a name, not
+    a family, and the same rows may be read from a journal mark (strings) or
+    from the frozen range (mappings).
+    """
+    names = set()
+    for row in rows or ():
+        name = str((row or {}).get("name") or "").strip() if isinstance(row, Mapping) \
+            else str(row or "").strip()
+        if name:
+            names.add(name)
+    return names
+
+
+def manual_seats(already: Iterable, *, authors: Iterable = (), fixers: Iterable = (),
+                 families) -> list:
     """The manual reviewers that can count toward the required opinions.
 
     A manual reviewer is kept in the column whatever happens (`#2627`); this
@@ -323,8 +334,13 @@ def manual_seats(already: Iterable, *, authors: Iterable = (),
     distinct from every author's family, distinct from the other manual
     reviewers, and not an author itself. An unknown family, or the author's
     family, does not prove independence: the seat remains to designate.
+
+    `fixers` are the agents who pushed a designated reviewer's small
+    first-round correction (#2739): their family stays eligible (#2638), but
+    the agent itself cannot count a seat — it would be reviewing its own fix.
     """
     names, forbidden = families_of(authors)
+    fixer_names = names_of(fixers)
     if unknown_families(authors):
         # An author of unknown family makes every reviewer's independence
         # unprovable: no manual reviewer can cover a seat either (#2627).
@@ -336,7 +352,7 @@ def manual_seats(already: Iterable, *, authors: Iterable = (),
         row = dict(row or {})
         name = str(row.get("name") or "").strip()
         family = str(row.get("family") or "").strip().lower()
-        if (not name or name in seen_names or name in names
+        if (not name or name in seen_names or name in names or name in fixer_names
                 or not family or family in PLACEHOLDER_FAMILIES
                 or family not in families or family in covered):
             continue
@@ -414,16 +430,17 @@ def _advance_of(candidate, pace: Mapping) -> float:
 
 
 def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
-           families=KNOWN_FAMILIES, already: Iterable = (),
+           families, already: Iterable = (), fixers: Iterable = (),
            advances: Optional[Mapping] = None) -> dict:
     """Chooses `required` (1 or 2) independent reviewers, by plan pace then load.
 
-    - each reviewer's family differs from that of **every** author or fixer, and
-      for two opinions the two families differ from each other (canon §2);
+    - each reviewer's family differs from that of **every** author, and for two
+      opinions the two families differ from each other (canon §2);
     - the family comes from the real session (`Candidate.family`), never from
       the name;
-    - an unavailable candidate, without a known family, or an author itself is
-      discarded;
+    - an unavailable candidate, without a known family, an author itself, or an
+      agent that pushed a reviewer's small correction is discarded: its family
+      stays eligible (#2638), the agent does not review its own fix (#2739);
     - an author whose real family is unknown (empty or a label) makes the
       designation **wait**: without it, a reviewer's independence is not proven
       (canon §2);
@@ -441,21 +458,32 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
       the families; the selection is deterministic;
     - `already` names the manual reviewers already designated (#2627). The ones
       that prove an independent family cover a seat; only the **missing** seats
-      are designated, never a manual reviewer removed or overridden.
+      are designated, never a manual reviewer removed or overridden;
+    - `fixers` names the agents held out of the authors by #2638 (a designated
+      reviewer's small first-round correction). Their family stays a candidate
+      family, but the exact agent is never designated again: it would review
+      its own fix (#2739).
 
-    Returns `{state, required, reviewers, missing, manual, why, forbidden}`:
-    `waiting` when independent families are missing or an author family is
-    unknown, with the missing count — never an implicit admission. `reviewers`
-    names only the automatic reviewers of this call; `manual` the manual seats
-    that count.
+    Returns `{state, required, reviewers, missing, manual, why, forbidden,
+    families, fixers}`: `waiting` when independent families are missing or an author
+    family is unknown, with the missing count — never an implicit admission.
+    `reviewers` names only the automatic reviewers of this call; `manual` the
+    manual seats that count; `families` the eligible automatic families
+    (outside the authors and the manual seats). With the manual seats, that
+    count is the independent families available on this head: a reviewer's
+    correction that makes the reviewer an author of the head removes one, so
+    it is receivable only if the rest still covers the required opinions
+    (canon §2, #2670).
     """
     if type(required) is not int or required not in (0, 1, 2):
         raise DesignationError("required reviews must be 0, 1 or 2, not %r" % (required,))
     names, forbidden = families_of(authors)
-    seats = manual_seats(already, authors=authors, families=families)
+    fixer_names = names_of(fixers)
+    seats = manual_seats(already, authors=authors, fixers=fixers, families=families)
     out = {"state": NONE, "required": required, "reviewers": [], "missing": 0,
            "manual": seats, "why": "no review required",
-           "forbidden": sorted(forbidden)}
+           "forbidden": sorted(forbidden), "families": [],
+           "fixers": sorted(fixer_names)}
     if required == 0:
         return out
     remaining = max(required - len(seats), 0)
@@ -473,7 +501,7 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     seat_names = {row["name"] for row in seats}
     seat_families = {row["family"] for row in seats}
     eligible = [c for c in candidates or ()
-                if c.eligible(forbidden_names=names | seat_names,
+                if c.eligible(forbidden_names=names | seat_names | fixer_names,
                               forbidden_families=forbidden | seat_families,
                               families=families)]
     # #2668: a family's advance over its plan pace (points), lower is further
@@ -499,21 +527,27 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     ordered.sort(key=lambda c: (_advance_of(c, pace), c.load, c.name))
     chosen = ordered[:remaining]
     out["reviewers"] = [{"name": c.name, "family": c.family} for c in chosen]
+    out["families"] = sorted(best)
     if len(chosen) < remaining:
+        missing_why = ("%d independent %s missing: %d eligible famil%s (%s), "
+                       "forbidden %s" % (
+                           remaining - len(chosen),
+                           "review" if remaining == 1 else "reviews",
+                           len(ordered), "y" if len(ordered) == 1 else "ies",
+                           ", ".join(sorted(best)) or "none",
+                           ", ".join(sorted(forbidden | seat_families)) or "none"))
+        if fixer_names:
+            missing_why += " (corrector(s) excluded: %s)" % ", ".join(sorted(fixer_names))
         out.update({
             "state": WAITING,
             "missing": remaining - len(chosen),
             "reviewers": [],
-            "why": ("%d independent %s missing: %d eligible famil%s (%s), "
-                    "forbidden %s" % (
-                        remaining - len(chosen),
-                        "review" if remaining == 1 else "reviews",
-                        len(ordered), "y" if len(ordered) == 1 else "ies",
-                        ", ".join(sorted(best)) or "none",
-                        ", ".join(sorted(forbidden | seat_families)) or "none")),
+            "why": missing_why,
         })
         return out
     why = "designated %d reviewer(s)" % len(chosen)
+    if fixer_names:
+        why += " (corrector(s) excluded: %s)" % ", ".join(sorted(fixer_names))
     if pace:
         reading = ["%s %+.0f pt" % (c.family.strip().lower(), _advance_of(c, pace) * 100)
                    for c in chosen if c.family.strip().lower() in pace]
@@ -529,13 +563,20 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
 
 def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
                      reviewer: Mapping, authors: Iterable = (), base: str = "",
-                     risk: str = "", policy_ref: str = "") -> str:
+                     risk: str = "", policy_ref: str = "",
+                     eligible_families: Optional[int] = None) -> str:
     """The mail that hands the reviewer the exact head and its place.
 
     The SHA is written in full, with its `frozen` milestone: the verdict will
     have to cite it as-is (`ameesh work milestone <lot> verdict ok --sha <sha>`).
-    The reviewer who fixes becomes an author of their fix: their own opinion no
-    longer counts (canon §2), the next selection will discard them.
+    A first-round correction under the §2 threshold keeps the reviewer's family
+    eligible (#2638); a correction that makes the reviewer an author removes
+    that family from the next designation. `eligible_families` is the number of
+    independent families available on this head (automatic and manual seats):
+    if a correction that makes the reviewer an author would leave fewer than
+    `required` families, the mail tells the reviewer not to push it and to
+    return it to the author instead (canon §2, #2670). Without the count, the
+    mail states the rule alone.
     """
     sha = str((freeze or {}).get("sha") or "")
     fid = (freeze or {}).get("id")
@@ -566,13 +607,39 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
         "- render the verdict: `ameesh work milestone %s verdict ok|blocked --sha %s`;"
         % (row.get("id"), sha),
         "- fix a blocking defect yourself and push to the lot branch "
-        "(canon §2): you then become the author of your fix, your opinion on the "
-        "new head no longer counts, another reviewer takes over;",
+        "(canon §2): a **first-round** correction under ~50 lines and without a "
+        "design change keeps your family eligible (#2638); otherwise you become "
+        "the author of your fix, your opinion on the new head no longer counts, "
+        "another reviewer takes over;",
         "- a fix longer than ~50 lines, or a design change, goes back to the author;",
         "- in a sensitive class, the second family reviews the lot **with** your fix, "
         "in the same round, distinct from every author;",
         "- your commits carry their exact origin (`ameesh provenance show --commit "
-        "<sha>`): by fixing you become an author of the new head;",
+        "<sha>`): the next designation reads it to tell a first-round fix from an "
+        "authored head;",
+    ]
+    if eligible_families is not None:
+        available = max(int(eligible_families), 0)
+        remaining = max(available - 1, 0)
+        if remaining < required:
+            lines.append(
+                "- **do not push a correction that makes you an author**: it "
+                "would leave %d independent famil%s for %d required opinion(s), "
+                "and the merge gate could not be satisfied — return the defect "
+                "to the author, who fixes it and freezes a new head (canon §2, "
+                "#2670);" % (remaining, "y" if remaining == 1 else "ies", required))
+        else:
+            lines.append(
+                "- a correction that makes you an author is allowed: %d "
+                "independent famil%s would remain for %d required opinion(s) "
+                "(canon §2, #2670);"
+                % (remaining, "y" if remaining == 1 else "ies", required))
+    else:
+        lines.append(
+            "- do not push a correction that would leave fewer independent "
+            "families than required opinions (canon §2, #2670): return it to "
+            "the author, who fixes it and freezes a new head;")
+    lines += [
         "- a non-blocking defect goes to the backlog, it does not block the merge;",
         "- do not rerun the suites: targeted tests are the author's job, CI "
         "runs on the frozen head once the required opinions are acquired.",
@@ -628,8 +695,10 @@ def manual_reviewer_message(lot: Mapping, *, freeze: Optional[Mapping] = None,
         "To do:",
         "- read the diff of the frozen head and check the edge cases;",
         "- a blocking defect: fix it yourself and push to the lot branch "
-        "(canon §2); a fix longer than ~50 lines, or a design change, goes back "
-        "to the author;",
+        "(canon §2); a first-round fix under ~50 lines and without a design "
+        "change keeps your family eligible (#2638); a longer fix, a design "
+        "change, or a correction that would leave fewer independent families "
+        "than required opinions goes back to the author (canon §2, #2670);",
         "- a non-blocking defect goes to the backlog, it does not block the merge;",
         "- do not rerun the suites: targeted tests are the author's job, CI runs "
         "on the frozen head once the required opinions are acquired.",
@@ -761,8 +830,8 @@ class Port(Protocol):
 def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
           freeze_sha: str, authors: Iterable = (), candidates: Iterable = (), risk: str = "light",
           base: str = "", policy_ref: str = "", notify: str = "",
-          unknown_authors: Iterable = (), families=KNOWN_FAMILIES,
-          already: Iterable = (), required: Optional[int] = None,
+          unknown_authors: Iterable = (), families,
+          already: Iterable = (), fixers: Iterable = (), required: Optional[int] = None,
           advances: Optional[Mapping] = None) -> dict:
     """Designates the reviewers of the lot's latest freeze, or says why it waits.
 
@@ -789,6 +858,10 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     that prove an independent family cover a seat, and only the missing seats
     are selected. None is ever removed, and two manual reviewers of the same
     family count one seat.
+
+    `fixers` names the agents whose small first-round correction was held out
+    of the authors (#2638): their family stays eligible for the review, but the
+    exact agent is never designated again (#2739).
 
     `advances` maps a family to its advance over the plan pace, in points
     (`review_pace`, #2668), or to a `{scope: advance}` mapping whose scoped
@@ -866,7 +939,8 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
                      "missing": required, "manual": [], "why": why}
     else:
         selection = select(required=required, authors=authors, candidates=candidates,
-                           families=families, already=already, advances=advances)
+                           families=families, already=already, fixers=fixers,
+                           advances=advances)
     if selection["state"] == WAITING and existing:
         # The waiting state of this freeze is already recorded and notified: we
         # do not send a second one, but the selection was retried — if capacity
@@ -884,6 +958,11 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     messages = []
     if state == DESIGNATED:
         first_rank = len(selection.get("manual") or ()) + 1
+        # The independent families available on this head: the manual seats and
+        # the automatic families. A reviewer's authoring correction removes its
+        # own family from the next designation (canon §2, #2670).
+        eligible_families = (len(selection.get("manual") or ())
+                             + len(selection.get("families") or ()))
         for rank, reviewer in enumerate(selection["reviewers"], start=first_rank):
             messages.append({
                 "to": reviewer["name"],
@@ -891,7 +970,8 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
                 "kind": REQUEST_KIND,
                 "body": reviewer_message(item, freeze=freeze, required=required,
                                          rank=rank, reviewer=reviewer, authors=authors,
-                                         base=base, risk=risk, policy_ref=policy_ref),
+                                         base=base, risk=risk, policy_ref=policy_ref,
+                                         eligible_families=eligible_families),
             })
     else:
         messages.append({

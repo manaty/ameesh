@@ -307,5 +307,61 @@ class RequiredFullCiTest(unittest.TestCase):
         self.assertIn("once gh works", text)
 
 
+def _suite_row(run_id, workflow="tests", event="push", conclusion="success"):
+    return {"databaseId": run_id, "workflowName": workflow, "name": workflow,
+            "event": event, "status": "completed", "conclusion": conclusion,
+            "headSha": "a" * 40,
+            "url": "https://github.com/o/ameesh/actions/runs/%d" % run_id}
+
+
+class CommitSuiteReaderTest(unittest.TestCase):
+    """#2692: every run of the exact commit, jobs included.
+
+    A packet head's full suite may be split over runs (the PR matrix, the
+    packet gate's flow checks): the reader keeps each run's jobs, and a run
+    that executed nothing is an empty proof, never a failed read.
+    """
+
+    project = radar.Project("a", "/r", github="o/ameesh")
+
+    def test_each_run_keeps_its_jobs_and_the_repository_is_named(self):
+        gh = _gh([_suite_row(501, event="pull_request"),
+                  _suite_row(502, workflow="paquet")],
+                 jobs={"501": [_job("plan"), _job("tests")],
+                       "502": [_job("tests (flux) psql 1/16")]})
+        out = radar.commit_suite(self.project, "a" * 40, gh=gh)
+        self.assertEqual(out["head"], "a" * 40)
+        self.assertEqual([run["id"] for run in out["runs"]], [501, 502])
+        self.assertEqual([run["event"] for run in out["runs"]],
+                         ["pull_request", "push"])
+        self.assertEqual([job["name"] for job in out["runs"][1]["jobs"]],
+                         ["tests (flux) psql 1/16"])
+        views = [argv for argv in gh.calls if argv[:2] == ["run", "view"]]
+        self.assertEqual(len(views), 2)
+        for argv in views:
+            self.assertEqual(argv[argv.index("--repo") + 1], "o/ameesh")
+
+    def test_a_run_without_jobs_is_kept_empty_not_failed(self):
+        gh = _gh([_suite_row(501), _suite_row(502, workflow="paquet",
+                                             conclusion="skipped")],
+                 jobs={"501": [_job("tests")]})
+        out = radar.commit_suite(self.project, "a" * 40, gh=gh)
+        self.assertEqual(out["runs"][1]["jobs"], [])
+        # a skipped workflow executed nothing: no job read is spent on it
+        self.assertEqual(len([argv for argv in gh.calls if argv[:2] == ["run", "view"]]), 1)
+
+    def test_an_unreadable_or_wrong_commit_read_is_refused(self):
+        with self.assertRaises(plan_github.GithubError):
+            radar.commit_suite(self.project, "a" * 40,
+                               gh=_gh([_suite_row(501)],
+                                      jobs={"501": [{"name": "tests"}]}))
+        wrong = dict(_suite_row(501), headSha="b" * 40)
+        with self.assertRaises(plan_github.GithubError):
+            radar.commit_suite(self.project, "a" * 40, gh=_gh([wrong]))
+        malformed = [_suite_row(run_id) for run_id in range(1, 101)]
+        with self.assertRaises(plan_github.GithubError):
+            radar.commit_suite(self.project, "a" * 40, gh=_gh(malformed))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

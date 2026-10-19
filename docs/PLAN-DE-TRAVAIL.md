@@ -193,6 +193,18 @@ all idempotent, which set the lot to `merged` with its `merged` milestone
    conditioned in the database on the examined freeze: a new
    freeze declared in the meantime prevents it (`refrozen`).
 
+   A closure by content is **withheld** (#2744) while the lot is `blocked` or
+   carries an unlifted `hold: …` note (#1664): the merge proof stays in the
+   sweep report (`how`, `ref`, `target`), the journal receives once
+   `contenu fusionné, fermeture retenue : <motif>`, the hold holder (or the
+   agent who blocked the lot) is woken, and the lot stays open. An `unhold:`
+   note or a state change lifts the hold; the next sweep closes. The check and
+   the closure share the lot's row lock — hold/lift notes and state changes
+   take it too — so a retention cannot slip between the journal read and the
+   close. A journal read error is an explicit `error` (the lot stays open,
+   never closes), not a silent hold. The same guard covers `sync-branches`
+   and the units of `sync-packets`.
+
    A package's units are closed by its manifest, without a card or
    `package_id`: on the target, `reviews/**paquet**.md` lists the composed
    units. `ameesh work sync-packets --git-dir D [--target T]` (read-only)
@@ -401,8 +413,12 @@ is assumed (§7), every item stays a lot as before.
 ### WIP limit: at most 2 lots in `build` per agent (§4)
 
 Owner 14/10/2026, canon §4: an agent holds at most
-`ameesh.work.BUILD_LIMIT` (2) lots in `build`, **all projects
-confused** (the cap is global, not per team). Two guards:
+`build.max_in_build` lots in `build` (2 today), **all projects
+confused** (the cap is global, not per team). Since #2451 the value is
+read from the compiled canon (`ameesh.work.build_limit`, global
+document of `processus/mecanique.yaml`); without a readable canon the
+sweep and the automatic pick-up refuse rather than assume a cap. Two
+guards:
 
 * **the automatic pick-up refuses the third lot**: the count and the
   assignment are written in one transaction under the agent's advisory

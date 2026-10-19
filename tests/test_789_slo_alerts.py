@@ -36,6 +36,15 @@ def _seuils(**kw):
     return out
 
 
+#: #2739 : les dépôts du banc doivent committer sous une identité d'agent ; le
+#: runner impose `ameesh-dev3` dans l'environnement, qui écraserait la config
+#: locale du dépôt. Sans identité d'agent, la porte ne peut pas attribuer la
+#: plage gelée et refuse en échec fermé.
+_GIT_DEV1 = dict(os.environ, GIT_AUTHOR_NAME="dev1",
+                 GIT_AUTHOR_EMAIL="dev1@ameesh.invalid",
+                 GIT_COMMITTER_NAME="dev1", GIT_COMMITTER_EMAIL="dev1@ameesh.invalid")
+
+
 class _Base(PgTestCase):
     def setUp(self):
         super().setUp()
@@ -238,23 +247,40 @@ class ReviewGateRepositoryTest(_Base):
         self.addCleanup(subprocess.run, ["rm", "-rf", base])
         repo = os.path.join(base, "repo")
         subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True)
-        for key, value in (("user.email", "t@t"), ("user.name", "t")):
+        # #2739 : le committer doit être un agent pour que la porte lise la
+        # plage gelée sans inventer d'auteur ; l'assigné du lot est `dev1`.
+        for key, value in (("user.email", "dev1@ameesh.invalid"), ("user.name", "dev1")):
             subprocess.run(["git", "-C", repo, "config", key, value], check=True)
         os.makedirs(os.path.join(repo, "docs"))
         with open(os.path.join(repo, "docs", "notes.md"), "w") as fh:
             fh.write("base\n")
         subprocess.run(["git", "-C", repo, "add", "."], check=True)
-        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "base"], check=True)
+        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "base"], check=True,
+                       env=_GIT_DEV1)
         subprocess.run(["git", "-C", repo, "checkout", "-q", "-b", "lot"], check=True)
         os.makedirs(os.path.join(repo, "src", "ameesh"))
         with open(os.path.join(repo, "src", "ameesh", "db.py"), "w") as fh:
             fh.write("# critique\n")
         subprocess.run(["git", "-C", repo, "add", "."], check=True)
-        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "gel"], check=True)
+        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "gel"], check=True,
+                       env=_GIT_DEV1)
         sha = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
                              check=True, capture_output=True, text=True).stdout.strip()
         subprocess.run(["git", "-C", repo, "checkout", "-q", "main"], check=True)
         return repo, sha
+
+    def _freeze_and_qa(self, lot, sha, *, verdict_s=3000.0):
+        """Le lot passe en qa, gelé sur `sha`, avec un verdict `ok` ancien."""
+        work.move(self.db, lot["id"], "build")
+        work.move(self.db, lot["id"], "qa")
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, at, sha, actor)"
+            " VALUES (%s, 'frozen', now() - make_interval(secs => 4000), %s, 'dev1')",
+            (lot["id"], sha))
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, at, sha, actor, verdict)"
+            " VALUES (%s, 'verdict', now() - make_interval(secs => %s), %s, 'cx', 'ok')",
+            (lot["id"], float(verdict_s), sha))
 
     def test_depot_du_gel_retrouve_par_un_autre_agent_local(self):
         """Le dépôt n'est pas dans le radar de l'hôte : le dossier de travail
@@ -265,7 +291,52 @@ class ReviewGateRepositoryTest(_Base):
         item = work.get(self.db, self.lot["id"])
         self.assertFalse((registry.get(self.db, "dev1") or {}).get("cwd"))
         self.assertEqual(lot_class.repo_for_freeze(self.db, self.cfg, item, sha),
-                         os.path.realpath(repo))
+                         (os.path.realpath(repo), sha))
+
+    def test_le_gel_abrege_est_resolu_avant_la_classe(self):
+        """#2564 : `repo_for_freeze` rend le SHA complet, et `of_lot` reçoit ce
+        SHA — jamais le préfixe saisi dans le jalon de gel."""
+        repo, sha = self._frozen_repo()
+        registry.upsert(self.db, "orch", harness="claude", host=self.cfg.host,
+                        cwd=repo)
+        registry.upsert(self.db, "cx", harness="codex", host=self.cfg.host)
+        item = work.get(self.db, self.lot["id"])
+        self.assertEqual(lot_class.repo_for_freeze(self.db, self.cfg, item, sha[:12]),
+                         (os.path.realpath(repo), sha))
+        marks = [{"kind": "frozen", "sha": sha[:12], "actor": "dev1", "at_ts": 1},
+                 {"kind": "verdict", "sha": sha[:12], "actor": "cx", "verdict": "ok",
+                  "at_ts": 2}]
+        with mock.patch("ameesh.lot_class.of_lot", wraps=lot_class.of_lot) as classe:
+            gate = merge_queue.review_gate_for_item(self.db, self.cfg, item, marks)
+        self.assertIsNotNone(gate)
+        self.assertEqual(classe.call_args.kwargs["head"], sha)
+
+    def test_une_passe_sur_deux_lots_lit_le_registre_une_fois(self):
+        """#2564 : la porte est interrogée pour chaque lot en attente de
+        fusion, mais `registry.overview` n'est lu qu'une fois par passe."""
+        repo, sha = self._frozen_repo()
+        registry.upsert(self.db, "orch", harness="claude", host=self.cfg.host,
+                        cwd=repo)
+        registry.upsert(self.db, "cx", harness="codex", host=self.cfg.host)
+        lots = [self.lot, work.add(self.db, title="un second lot SLO",
+                                   assignee="dev1")]
+        for lot in lots:
+            self._freeze_and_qa(lot, sha)
+        self.now = time.time()
+        listing = storage.of(self.db).operations.listing()
+        calls = []
+        real = registry.overview
+
+        def counting(db):
+            calls.append(db)
+            return real(db)
+
+        with mock.patch("ameesh.registry.overview", side_effect=counting), \
+                mock.patch("ameesh.exploitation._review_gate_open",
+                           wraps=exploitation._review_gate_open) as gate_open:
+            exploitation._slo_breaches(self.cfg, self.db, listing, now=self.now)
+        self.assertEqual(gate_open.call_count, 2)
+        self.assertEqual(len(calls), 1)
 
     def test_un_avis_sur_chemin_critique_ne_fait_pas_le_go(self):
         """Un avis indépendant sur `db.py` ne suffit pas : la porte exige deux
@@ -305,7 +376,8 @@ class ReviewGateRepositoryTest(_Base):
         subprocess.run(["git", "-C", repo, "checkout", "-q", "lot"], check=True)
         with open(os.path.join(repo, "docs", "notes.md"), "a") as fh:
             fh.write("suite\n")
-        subprocess.run(["git", "-C", repo, "commit", "-qam", "notes"], check=True)
+        subprocess.run(["git", "-C", repo, "commit", "-qam", "notes"], check=True,
+                       env=_GIT_DEV1)
         sha = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
                              check=True, capture_output=True, text=True).stdout.strip()
         registry.upsert(self.db, "orch", harness="claude", host=self.cfg.host,

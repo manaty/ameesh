@@ -40,6 +40,7 @@ test_2446_train_initial  # stockage : frontière d'activation et reçus de file 
 test_2446_train_service_lease  # stockage : bail de service, même runner/incarnations distinctes (#2446)
 test_2446_train_shadow  # stockage : plan ombre sur file, historique et préparation réels (#2446)
 test_423_agent_aliases  # storage: alias namespace guards, audit, same fenced lease/session and canon sync (#423)
+test_1022_creneau_landed  # storage: une fusion lande le creneau de migration, une liberation sans atterrissage le libere (#1022)
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
 test_508_runner_liveness  # #508 : preuve de vie groupée à l’heure DB, sans bail
 test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)

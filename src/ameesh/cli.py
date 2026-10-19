@@ -1916,6 +1916,11 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     except db_mod.DbError:
         pass
     verdict = 0
+    # #2763 : installation éditable, ou ameesh chargé hors du venv déployé
+    from . import venv_guard
+    for problem in venv_guard.installation_problems():
+        print("install    : KO — %s (reinstall the deployed src-<sha>)" % problem)
+        verdict = 1
     from . import db_capacity
     try:
         capacity = db_capacity.read(db)
