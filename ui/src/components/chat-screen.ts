@@ -36,9 +36,10 @@ export class AmeeshChat extends ReadView {
   sending = false;
   /** Code of the last refused send, shown under the form. */
   failed = "";
-  //: one key per message: a retry after an uncertain failure replays it, never
-  //: sends it twice; a new text, or a delivered one, takes a fresh key
-  #key: { text: string; key: string } | null = null;
+  //: one key per target and message: a retry after an uncertain failure replays
+  //: it, never sends it twice; another target, a new text, or a delivered one
+  //: takes a fresh key
+  #key: { agent: string; lot: string; text: string; key: string } | null = null;
 
   protected async load(client: Client, signal: AbortSignal) {
     const [me, detail, overview] = await Promise.all([
@@ -87,7 +88,10 @@ export class AmeeshChat extends ReadView {
     const client = this.api;
     const text = this.draft.trim();
     if (!client || !text || this.sending || !this.agent) return;
-    if (this.#key?.text !== text) this.#key = { text, key: idempotencyKey() };
+    if (this.#key?.text !== text || this.#key.agent !== this.agent
+        || this.#key.lot !== this.lot) {
+      this.#key = { agent: this.agent, lot: this.lot, text, key: idempotencyKey() };
+    }
     this.sending = true; this.failed = "";
     try {
       const lot = /^[1-9][0-9]{0,8}$/.test(this.lot) ? Number(this.lot) : null;
@@ -101,6 +105,14 @@ export class AmeeshChat extends ReadView {
       await this.refresh();
     } catch (error) {
       this.failed = error instanceof ApiError ? error.code : "network";
+      // The API stores a refusal under its key and replays it: keeping that key
+      // would refuse the same message again after the cause is fixed. Keep it
+      // only while the outcome is unknown (network, 5xx, first request still
+      // running); a deterministic answer releases it.
+      if (error instanceof ApiError && error.status < 500
+          && error.code !== "idempotency_in_progress") {
+        this.#key = null;
+      }
     } finally {
       this.sending = false;
     }
