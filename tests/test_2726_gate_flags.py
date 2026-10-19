@@ -67,6 +67,17 @@ class GateFlagsTest(TestCase):
 
 
 class ClassFlagsTest(TestCase):
+    def test_distinct_families_keeps_the_strictest_canon_in_either_order(self):
+        for flags in ((True, False), (False, True), (False, False)):
+            with self.subTest(flags=flags), \
+                    mock.patch.object(mechanics, "light_reviews_at", return_value=0), \
+                    mock.patch.object(mechanics, "review_flags_at",
+                                      side_effect=[(False, flag) for flag in flags]):
+                klass = lot_class.class_of_paths(
+                    [canon_fixture(), canon_fixture()], "ameesh", ["docs/x.md"])
+            self.assertFalse(klass["doubt"], klass)
+            self.assertEqual(klass["distinct_families"], any(flags))
+
     def test_the_class_reader_carries_the_compiled_flags(self):
         with mock.patch.object(mechanics, "light_reviews_at", return_value=0), \
                 mock.patch.object(mechanics, "review_flags_at",

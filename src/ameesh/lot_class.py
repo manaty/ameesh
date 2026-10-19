@@ -239,7 +239,7 @@ def _review_flags(canons) -> tuple[bool, bool, str]:
     un problème que l'appelant traduit en doute, jamais en repli rassurant.
     """
     from . import mechanics
-    exclude, distinct = False, True
+    exclude, distinct = False, None
     for canon in canons or ():
         for source in getattr(canon, "sources", ()) or ():
             if (getattr(source, "mode", "") != "git" or not source.repo
@@ -253,8 +253,8 @@ def _review_flags(canons) -> tuple[bool, bool, str]:
             except mechanics.MechanicsError as exc:
                 return True, True, str(exc)
             exclude = exclude or declared_exclude
-            distinct = distinct and declared_distinct
-    return exclude, distinct, ""
+            distinct = declared_distinct if distinct is None else distinct or declared_distinct
+    return exclude, True if distinct is None else distinct, ""
 
 
 def _train_reviews(federation, project: Optional[str], paths) -> tuple[int, str]:
