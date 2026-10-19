@@ -159,6 +159,9 @@ class InventoryTest(unittest.TestCase):
         # 9. contenu déjà dans la cible (tête ancêtre de main)
         rows.append(branch(9, "lot/9-merged", {"merged.py": "x\n"},
                            verdicts=("reviewer",)))
+        # 12. machinerie des paquets : train_reviews=2, un seul avis (#2696)
+        rows.append(branch(12, "lot/12-train", {"src/ameesh/resolutions.py": "x\n"},
+                           verdicts=("reviewer",)))
         # un lot d'un autre projet ne doit jamais apparaître
         rows.append(row(10, "lot/10-other", app="nexlink"))
 
@@ -183,11 +186,16 @@ class InventoryTest(unittest.TestCase):
                                progress=FakeProgress(self.marks))
         self.classes = {
             1: "normal", 2: "normal", 3: "sensitive", 4: "normal", 5: "light",
-            6: "light", 7: "normal", 8: "normal", 9: "light",
+            6: "light", 7: "normal", 8: "normal", 9: "light", 12: "sensitive",
         }
         self.files = {
             3: [{"path": "migrations/0009_x.sql", "class": "sensitive", "rule": None}],
+            12: [{"path": "src/ameesh/resolutions.py", "class": "sensitive",
+                  "rule": None}],
         }
+        # #2696 : le classement porte train_reviews ; la porte et la liste des
+        # prêts doivent lire le même nombre.
+        self.train_reviews = {12: 2}
         self.families = {"author": "deepseek", "reviewer": "claude"}
         self.class_calls = []
         self.head_classes: dict[str, tuple] = {}
@@ -202,11 +210,13 @@ class InventoryTest(unittest.TestCase):
             if rest.get("head") in self.head_classes:
                 cls, files = self.head_classes[rest["head"]]
                 return {"lot": lot, "class": cls, "doubt": False, "why": "test",
-                        "files": files, "light_reviews": 1}
+                        "files": files, "light_reviews": 1,
+                        "train_reviews": self.train_reviews.get(lot, 0)}
             return {"lot": lot, "class": self.classes[lot], "doubt": False,
                     "why": "test", "files": self.files.get(
                         lot, [{"path": "src/ameesh/x.py", "class": "light", "rule": None}]),
-                    "light_reviews": 1}
+                    "light_reviews": 1,
+                    "train_reviews": self.train_reviews.get(lot, 0)}
 
         def fake_family(db, name, **kw):
             return self.families.get(name, "")
@@ -270,6 +280,14 @@ class InventoryTest(unittest.TestCase):
         self.assertFalse(entry["ready"])
         self.assertIn("verdicts-missing", [cause["code"] for cause in entry["causes"]])
         self.assertGreaterEqual(entry["gate"]["required"], 2)
+
+    def test_train_machinery_with_one_verdict_is_not_ready(self):
+        # #2696 : train_reviews=2 pour la machinerie des paquets ; un seul avis
+        # ne rend pas le lot prêt, même si sa classe est sensible.
+        entry = self.by_id(self.inventory())[12]
+        self.assertFalse(entry["ready"], entry["causes"])
+        self.assertIn("verdicts-missing", [cause["code"] for cause in entry["causes"]])
+        self.assertEqual(entry["gate"]["required"], 2)
 
     def test_unreadable_registry_is_an_error_not_a_verdicts_missing_wait(self):
         # #2521 : une lecture du registre impossible ne doit pas se lire
