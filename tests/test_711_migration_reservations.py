@@ -107,8 +107,10 @@ class ScopedReservationsTest(PgTestCase):
     def test_unique_index_blocks_legacy_explicit_collision(self):
         work.set_branch(self.db, self.b['id'], 'agent/b', target='develop', actor='dev')
         self.reserve()
-        with self.assertRaises(DbError):
+        # #2481 : la collision est rendue lisible, avec le lot tenant.
+        with self.assertRaises(work.WorkError) as refused:
             work.reserve_migration(self.db, self.b['id'], 377, repo=self.repo)
+        self.assertIn("lot #%d" % self.a['id'], str(refused.exception))
         self.assertIsNone(work.get(self.db, self.b['id'])['migration'])
 
     def test_target_advance_releases_other_lots_and_requalifies_slots(self):
@@ -228,8 +230,11 @@ class ScopedReservationsTest(PgTestCase):
     def test_unknown_legacy_target_cannot_take_named_number(self):
         self.reserve()
         legacy = self.lot('legacy without project', None)
-        with self.assertRaises(DbError):
+        # #2481 : la collision de créneau est maintenant rendue lisible par
+        # `work.reserve_migration` (lot tenant nommé), comme l'index scalaire.
+        with self.assertRaises(work.WorkError) as refused_by_name:
             work.reserve_migration(self.db, legacy['id'], 377, repo=self.repo)
+        self.assertIn("lot #%d" % self.a['id'], str(refused_by_name.exception))
         self.assertIsNone(work.get(self.db, legacy['id'])['migration'])
         # A pre-0419 client writes the old projection without a repo lock.
         # The compatibility guard still refuses the duplicate atomically.
