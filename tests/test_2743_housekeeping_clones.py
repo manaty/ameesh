@@ -102,6 +102,45 @@ class CloneReapTest(PgTestCase):
         self.assertIn("alternate dependent", row["detail"])
         self.assertTrue(os.path.isdir(source))
 
+    def test_a_dependent_nested_in_another_checkout_is_seen(self):
+        """cx2 #115192: the other checkout's tree is not abandoned.
+
+        The candidate source is `a-<lot>`; an unrelated checkout
+        `other-checkout` contains a `--shared` clone of the source.  The
+        inventory must enter the other checkout's working tree, otherwise
+        the source looks free and removing it would break the nested clone.
+        """
+        _sans_processus(self)
+        lot = self.ended_lot()
+        source = self.clone("a-%s-source" % lot)
+        other = self.clone("other-checkout")
+        nested = os.path.join(other, "nested")
+        subprocess.run(["git", "clone", "-q", "--shared", source, nested],
+                       check=True, capture_output=True, cwd=self.tmp)
+        copies, complete, why = clones._dependency_inventory(
+            self.cfg, (self.root,), self.agents, ())
+        self.assertTrue(complete, why)
+        dependents, doubt = clones._dependents(copies, [source])
+        self.assertEqual(doubt, "")
+        self.assertIn(hk._real(nested),
+                      {hk._real(path) for path in dependents[source]})
+        row = self.plan_for(source)
+        self.assertEqual(row["action"], "garde")
+        self.assertIn("alternate dependent", row["detail"])
+        self.assertTrue(os.path.isdir(source))
+
+    def test_the_removal_recheck_sees_a_dependent_in_another_checkout(self):
+        _sans_processus(self)
+        lot = self.ended_lot()
+        source = self.clone("a-%s-source" % lot)
+        other = self.clone("other-checkout")
+        subprocess.run(["git", "clone", "-q", "--shared", source,
+                        os.path.join(other, "nested")],
+                       check=True, capture_output=True, cwd=self.tmp)
+        why = clones._removal_check(source, self.cfg, (), (), (self.root,),
+                                    self.agents)
+        self.assertIn("alternate dependent", why)
+
     def test_a_bare_shared_repository_is_seen_as_a_dependent(self):
         _sans_processus(self)
         lot = self.ended_lot()
@@ -260,6 +299,25 @@ class CloneReapTest(PgTestCase):
         self.assertEqual(row["action"], "garde")
         self.assertIn("project.clone", row["detail"])
         self.assertTrue(os.path.isdir(source))
+
+    def test_an_unreadable_radar_top_is_a_doubt(self):
+        _sans_processus(self)
+        self.ended_lot()
+        radar = os.path.join(self.cfg.state_dir, "radar")
+        os.makedirs(radar)
+        real_stat = clones.os.stat
+
+        def fake_stat(path, *args, **kwargs):
+            if os.path.abspath(os.fspath(path)) == os.path.abspath(radar):
+                raise PermissionError(13, "permission denied")
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(clones.os, "stat", side_effect=fake_stat):
+            copies, complete, why = clones._dependency_inventory(
+                self.cfg, (self.root,), self.agents, ())
+        self.assertFalse(complete)
+        self.assertIn("unreadable top", why)
+        self.assertIn("radar", why)
 
     def test_a_lot_named_only_by_a_lot_branch_is_attributed(self):
         _sans_processus(self)

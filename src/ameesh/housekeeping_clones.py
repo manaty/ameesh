@@ -26,13 +26,13 @@ A clone is removed only when ALL of this is proved:
   go with it);
 * no other clone has an ``.git/objects/info/alternates`` entry pointing at
   its object directory (#2738): deleting it would break that clone. The
-  dependency inventory walks the work roots and the radar/train trees
-  recursively — a dependent nested under a plain container or a **bare**
-  repository is seen — and reads the object directories of the registered
-  agent checkouts; it does not enter a Git copy's working tree (a nested
-  copy inside a candidate is already a blocking guard), nor build output and
-  cache directories. A bounded, mount-crossing or unreadable inventory is a
-  **doubt**: nothing is removed, and the reason is reported;
+  dependency inventory walks the work roots, the radar/train trees and the
+  registered agent checkouts recursively — a dependent nested under a plain
+  container, a **bare** repository or **another checkout's working tree** is
+  seen — skipping only a Git copy's ``.git`` metadata and the build output
+  and cache directories (a bare repository has no working tree to enter). A
+  bounded, mount-crossing or unreadable inventory is a **doubt**: nothing is
+  removed, and the reason is reported;
 * no process of the user works in it, and its name is not the name of a
   registered agent's checkout;
 * the candidate inventory and the dependency inventory are both complete:
@@ -64,9 +64,11 @@ CLONE_IDLE_S = 24 * 3600.0
 CLONE_LIMIT = 2000
 #: bound of the whole clone pass (heavy Git checks included)
 CLONE_BUDGET_S = 60.0
-#: bound of the recursive Git-copy inventory that proves dependencies
-DEPENDENCY_LIMIT = 100_000
-DEPENDENCY_BUDGET_S = 30.0
+#: bound of the recursive Git-copy inventory that proves dependencies (the
+#: whole tree of the work roots and agent checkouts is entered, not only
+#: their containers: a dependent can be nested in another checkout)
+DEPENDENCY_LIMIT = 300_000
+DEPENDENCY_BUDGET_S = 60.0
 #: regenerable directories never entered by the dependency inventory
 DEPENDENCY_SKIP = (".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache",
                    ".ruff_cache", ".tox", ".nox", "htmlcov", "_site")
@@ -275,13 +277,18 @@ def _linked_objects(path: str) -> tuple[str, str]:
 
 
 def _git_objects(path: str) -> tuple[str, str]:
-    """Object directory of the Git copy at `path`, or ('', doubt)."""
-    if hk._bare_git_copy(path):
-        return _real(os.path.join(path, "objects")), ""
+    """Object directory of the Git copy at `path`, or ('', doubt).
+
+    The `.git` marker is read first: most directories of an inventory are
+    not Git copies, and a missing marker is answered with one `lstat`; the
+    bare-repository signature is only tried after it.
+    """
     marker = os.path.join(path, ".git")
     try:
         mode = os.lstat(marker).st_mode
     except FileNotFoundError:
+        if hk._bare_git_copy(path):
+            return _real(os.path.join(path, "objects")), ""
         return "", ""
     except OSError as exc:
         return "", "Git marker unreadable (%s)" % (exc.strerror or exc)
@@ -292,16 +299,34 @@ def _git_objects(path: str) -> tuple[str, str]:
     return "", "Git marker is neither a file nor a directory"
 
 
+def _inventory_top(path: str) -> tuple[bool, str]:
+    """Is `path` a directory the dependency inventory must walk? (yes, why).
+
+    A missing top is absent (radar/trains need not exist), a top that is not
+    a directory is skipped, but an unreadable top is a **doubt**: it could
+    hide a dependent, so the inventory is incomplete and nothing is removed.
+    """
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return False, ""
+    except OSError as exc:
+        return False, "unreadable top %s (%s)" % (path, exc.strerror or exc)
+    return stat.S_ISDIR(st.st_mode), ""
+
+
 def _dependency_inventory(cfg, roots, agents, rules) -> tuple[list[tuple[str, str]], bool, str]:
     """Every Git copy whose alternates could depend on a candidate: (copies, complete, why).
 
-    Perimeter: the work roots and the radar/train trees **recursively** (so a
-    dependent nested under a container or a bare repository is seen), plus
-    the common object directories of the registered agents' checkouts. Build
+    Perimeter: the work roots, the radar/train trees and the registered
+    agents' checkouts **recursively**, including the working tree of every
+    Git copy (a dependent can be nested in another checkout, not only in a
+    plain container or a bare repository). Only `.git` metadata is skipped
+    inside a copy, and a bare repository has no working tree to enter. Build
     output directories are not entered (they are regenerable and never hold a
     clone whose objects a candidate owns); symbolic links are not followed,
-    like the rest of the housekeeping. A bound, an unreadable directory or an
-    unreadable marker makes the inventory incomplete: the caller then removes
+    like the rest of the housekeeping. A bound, an unreadable top, directory
+    or marker makes the inventory incomplete: the caller then removes
     nothing.
     """
     seen: set[str] = set()
@@ -310,20 +335,25 @@ def _dependency_inventory(cfg, roots, agents, rules) -> tuple[list[tuple[str, st
     budget = build_artifacts.Budget(DEPENDENCY_BUDGET_S)
     opened = 0
 
-    def add(path: str) -> str:
-        real = _real(path)
-        if real in seen:
-            return ""
-        seen.add(real)
+    def add(path: str) -> tuple[str, str]:
+        """Add a copy to the inventory: (objects, why); objects '' = no copy.
+
+        `path` is already canonical (the walk never follows a symbolic link),
+        so the inventory need not resolve it again for every directory.
+        """
+        if path in seen:
+            return "", ""
+        seen.add(path)
         objects, why = _git_objects(path)
         if why:
-            return why
+            return "", why
         if objects:
             copies.append((path, objects))
-        return ""
+        return objects, ""
 
     def walk(top: str) -> str:
         nonlocal opened
+        top = _real(top)
         stack = [top]
         try:
             device = os.lstat(top).st_dev
@@ -331,24 +361,20 @@ def _dependency_inventory(cfg, roots, agents, rules) -> tuple[list[tuple[str, st
             return "unreadable root %s (%s)" % (top, exc.strerror or exc)
         while stack:
             current = stack.pop()
-            real = _real(current)
-            if real in walked:
+            if current in walked:
                 continue
-            walked.add(real)
+            walked.add(current)
             if budget.expired():
                 return "time budget of the dependency inventory reached"
             opened += 1
             if opened > DEPENDENCY_LIMIT:
                 return "more than %d directories in the dependency inventory" % DEPENDENCY_LIMIT
-            why = add(current)
+            objects, why = add(current)
             if why:
                 return why
-            if _git_objects(current)[0]:
-                # A Git copy is a proof point (its alternates file is read);
-                # its working tree is not entered: source trees are huge, and
-                # a nested copy inside a candidate is already a blocking
-                # guard of `_git_copies_report`. Plain containers are walked,
-                # so a dependent nested under them is seen.
+            if objects and hk._bare_git_copy(current):
+                # A bare repository has no working tree; its objects are the
+                # proof point, there is no checkout under it to search.
                 continue
             try:
                 with os.scandir(current) as children:
@@ -359,11 +385,11 @@ def _dependency_inventory(cfg, roots, agents, rules) -> tuple[list[tuple[str, st
                 if entry.name == ".git":
                     continue
                 try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
                     st = entry.stat(follow_symlinks=False)
                 except OSError as exc:
                     return "unreadable entry %s (%s)" % (entry.path, exc.strerror or exc)
-                if not stat.S_ISDIR(st.st_mode):
-                    continue
                 if st.st_dev != device:
                     return "mount point inside %s: %s" % (top, entry.path)
                 if entry.name in DEPENDENCY_SKIP:
@@ -373,23 +399,34 @@ def _dependency_inventory(cfg, roots, agents, rules) -> tuple[list[tuple[str, st
                 stack.append(entry.path)
         return ""
 
-    tops = [hk._expand(root) for root in roots or () if os.path.isdir(hk._expand(root))]
-    for base in (os.path.join(cfg.state_dir, "radar"),
-                 os.path.join(cfg.state_dir, "trains")):
-        if os.path.isdir(base):
-            tops.append(base)
-    for top in tops:
-        why = walk(top)
+    tops: list[str] = []
+    for root in roots or ():
+        path = hk._expand(root)
+        present, why = _inventory_top(path)
         if why:
             return copies, False, why
+        if present:
+            tops.append(path)
     for cwd in (agents or {}).values():
         if not cwd:
             continue
-        objects, why = _git_objects(cwd)
+        path = hk._expand(cwd)
+        present, why = _inventory_top(path)
         if why:
-            return copies, False, "%s: %s" % (cwd, why)
-        if objects:
-            copies.append((cwd, objects))
+            return copies, False, why
+        if present:
+            tops.append(path)
+    for base in (os.path.join(cfg.state_dir, "radar"),
+                 os.path.join(cfg.state_dir, "trains")):
+        present, why = _inventory_top(base)
+        if why:
+            return copies, False, why
+        if present:
+            tops.append(base)
+    for top in dict.fromkeys(tops):
+        why = walk(top)
+        if why:
+            return copies, False, why
     return copies, True, ""
 
 
