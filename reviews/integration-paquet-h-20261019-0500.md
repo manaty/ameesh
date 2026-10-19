@@ -56,10 +56,16 @@ Chaque commit de composition a le lot en second parent, son sujet nomme le lot
 et son SHA, et il porte un trailer `ameesh-work: <lot>`. Aucun conflit de
 composition rencontré, aucune résolution ni adaptation.
 
-## Correctifs CI (#2481, droits de lecture)
+## Correctifs CI
 
-Le run complet `39193274744` sur `fcd424ae70` a rougi deux contrôles du rôle QA
-isolé (`tests.test_420_qa_role.QaEvidenceTest`, psycopg 6/8) :
+Le run complet `39193274744` sur `fcd424ae70` a enregistré trois rouges
+(psycopg 6/8 et 7/8) ; le courrier de suivi n'en citait que les deux premiers,
+le troisième a été relevé au verdict avant l'abandon du run. Aucun code
+produit n'est modifié, aucune migration.
+
+### #2481 — droits de lecture des créneaux de migration
+
+Deux contrôles du rôle QA isolé (`tests.test_420_qa_role.QaEvidenceTest`) :
 `permission denied for table work_migration_reservations` à l'appel de
 `it.record_qa` → `work.get`. #2481 fait projeter à la ligne complète du lot ses
 créneaux de migration (`work_migration_reservations`), mais
@@ -68,7 +74,7 @@ créneaux de migration (`work_migration_reservations`), mais
 mise en cache sur la connexion partagée du banc, faisait ensuite lire la table
 au rôle isolé.
 
-Correctif en droits seuls, sans code produit :
+Correctif en droits seuls :
 
 - `deploy/sql/role-module-writers.sql` : GRANT SELECT conditionnel sur
   `work_migration_reservations` aux deux rôles d'écriture isolés (table absente
@@ -78,12 +84,22 @@ Correctif en droits seuls, sans code produit :
 - `tests/test_l56_role_executor.py` : garde de contrat — le script appliqué
   donne bien SELECT à `ameesh_it_qa` sur la table.
 
-Vérifications locales : `tests.test_420_qa_role.QaEvidenceTest` (les deux
-contrôles rouges) **2 OK** ;
+### #2584 — `work.backlog_basket_add` classée refusée
+
+`tests.test_l107_executor_contract.TableTest.test_l_interface_entiere_est_classee`
+(psycopg 7/8) : #2584 ajoute l'opération d'interface `work.backlog_basket_add`
+sans la classer dans `mediated_executor/contract.json`. Elle rejoint les
+refusées du domaine `work` (hors du sous-ensemble de l'exécuteur médié, comme
+`work.backlog_add`) ; compteurs du doc : **397 refusées, interface 464**.
+Adaptation mécanique de composition, sans avis nouveau (§2/§11 bis).
+
+### Vérifications
+
+`tests.test_420_qa_role.QaEvidenceTest` (les deux rouges) **2 OK** ;
 `test_module_writer_role_contract_and_executor_separation` **1 OK** (script
-appliqué deux fois, audit compris). Une suite complète unique est redemandée
-sur la tête de ce correctif ; l'ancienne tête `fcd424ae70` et son run sont
-abandonnés.
+appliqué deux fois, audit compris) ; `tests.test_l107_executor_contract`
+**22 OK**. Une suite complète unique est redemandée sur la tête de ces
+correctifs ; l'ancienne tête `fcd424ae70` et son run sont abandonnés.
 
 ## Contrôles
 
@@ -95,7 +111,7 @@ abandonnés.
   (hors #2466, écarté).
 - `paquet-inclusion` (tête de ce manifeste, `--ready-file` + admissions) :
   **rc 0** — 11 lots attendus, 11 compositions, 0 défaut.
-- `git diff --check` vert ; aucune migration SQL (46 fichiers, +4381/−537
+- `git diff --check` vert ; aucune migration SQL (48 fichiers, +4384/−539
   hors manifeste).
 - Suite complète unique demandée sur la tête finale de ce manifeste
   (`ci-full-<sha>`), avec la revue unitaire du paquet pour seul avis de la
