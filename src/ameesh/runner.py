@@ -10544,6 +10544,12 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         return 1
     try:
         adapter = adapters.adapter_for(agent.get("harness") or "other")
+        # #2706 : refus AVANT le bail. `dsh --profile agent` est headless et
+        # exige une tâche : l'ancien code prenait le bail, lançait la commande
+        # sans texte, puis le rendait en 4 s après « a task is required »,
+        # ayant réveillé l'agent pour rien. Un harnais sans session interactive
+        # doit refuser d'emblée, sans toucher au bail ni à la session.
+        adapter.require_interactive()
     except adapters.HarnessMissing as exc:
         print("attach: %s" % exc, file=sys.stderr)
         return 1
