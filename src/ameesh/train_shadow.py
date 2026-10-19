@@ -37,8 +37,8 @@ MAX_PLANS = 24
 MAX_COMPARISONS = 48
 _PACKET = re.compile(r"integration/(paquet-[^\s,()]+)")
 _STAMP = re.compile(r"(\d{8}-\d{4})")
-_LOT = re.compile(r"#(\d+)")
 _WORK = re.compile(r"^ameesh-work: (\d+)$", re.M)
+_LOT = re.compile(r"#(\d+)")
 #: an open packet branch whose last composition before the cutoff is older
 #: than this window was abandoned, not in flight. An unproven lot stays an
 #: extra: the shadow prefers a visible disagreement to a masked one (#2682).
@@ -294,14 +294,20 @@ class Passage:
                             or seen.add(row["work_item_id"]))]
         deferred.sort(key=lambda row: (row["work_item_id"], row["origin"]))
         stamp = datetime.fromtimestamp(slot, rules.zone()).strftime("%Y%m%d-%H%M")
+        # #2727: main commits unknown to the target are a mechanical member of
+        # the next packet, without review or a build lot. It is recorded only
+        # when a packet has members: an empty cutoff composes nothing.
+        sync = repository.main_sync(self.project.target, base) if members else None
         plan = dict(schema=SCHEMA, project=self.project.name,
                     target=merge_queue._remote_branch(self.project.target),
                     cutoff=float(slot), local_stamp=stamp, base=base,
                     created_ts=float(now), members=members, deferred=deferred,
+                    sync=sync,
                     rules=dict(commit=rules.commit, ci_packet=rules.ci_packet,
                                merge_named_fire=rules.merge_named_fire))
-        self.notify("shadow plan %s: %d member(s), %d deferred"
-                    % (stamp, len(members), len(deferred)))
+        self.notify("shadow plan %s: %d member(s), %d deferred%s"
+                    % (stamp, len(members), len(deferred),
+                       ", sync main %s" % sync["sha"][:12] if sync else ""))
         return plan
 
     # -- comparison with the human composer ---------------------------------
@@ -352,12 +358,41 @@ class Passage:
                 repository.clone.path, plan, history, open_packets, packet)
             carried = {lot: in_flight[lot] for lot in extras if lot in in_flight}
             extra = [lot for lot in extras if lot not in carried]
+            # #2727: the manual composer may have synced main as a lot while
+            # the train does it mechanically. The exact main sha proves the
+            # equivalence only when the packet commit is a pure sync (see
+            # _manual_sync); an unproven one keeps its lots missing.
+            plan_sync = (plan.get("sync") or {}).get("sha") or ""
+            manual_sync = (_manual_sync(repository.clone.path, plan["base"],
+                                        packet["sha"], plan_sync)
+                           if plan_sync else None)
+            proven = manual_sync if manual_sync and manual_sync["pure"] else None
+            sync = dict(plan=plan_sync or None,
+                        manual=(manual_sync or {}).get("sha"),
+                        lots=sorted((proven or {}).get("lots") or ()))
+            if manual_sync is not None and proven is None:
+                sync["refused"] = dict(
+                    commit=manual_sync["commit"],
+                    lots=sorted(manual_sync.get("lots") or ()),
+                    pure=False,
+                    reason=manual_sync.get("reason") or "sync not proven")
+            for lot in sync["lots"]:
+                if lot in missing:
+                    missing.remove(lot)
+            missing.sort()
             reasons = {str(row["work_item_id"]): row["reason"]
                        for row in plan.get("deferred", [])}
             explanations = {}
             for lot in missing:
                 explanations[str(lot)] = reasons.get(
                     str(lot), "not a candidate of the train at this cutoff")
+            for lot in sync["lots"]:
+                explanations[str(lot)] = (
+                    "synchro main %s mécanique (même apport que le train)"
+                    % plan_sync[:12])
+            if plan_sync and manual_sync is None:
+                sync["difference"] = ("le paquet manuel n'a pas apporté main "
+                                      "%s" % plan_sync[:12])
             for lot in extra:
                 explanations[str(lot)] = (
                     "porteur inconnu: paquet en vol non prouvé au créneau"
@@ -368,7 +403,7 @@ class Passage:
                 packet=packet, plan=dict(cutoff=plan["cutoff"],
                                          local_stamp=plan["local_stamp"],
                                          matched=plan.get("matched")),
-                missing=missing, extra=extra,
+                missing=missing, extra=extra, sync=sync,
                 carried={str(lot): carrier for lot, carrier in sorted(carried.items())},
                 explanations=explanations))
         return comparisons
@@ -574,6 +609,72 @@ def _commit_lots(clone, base, head):
         return None
     return sorted({int(match.group(1))
                    for match in _WORK.finditer(resolutions._text(log))})
+
+def _manual_sync(clone, base, head, sha):
+    """The packet commit that merged ``sha`` (main), with its pure-sync proof.
+
+    The exact main parent and the ``ameesh-work`` trailer do not prove a sync:
+    the commit may add unreviewed files or resolve the merge by hand. A commit
+    proves it only when it has exactly two parents (the packet side, then the
+    exact main sha), carries a single work trailer, and its tree equals the
+    clean merge of those parents. An unproven sync exempts nothing: its lots
+    stay missing, and the reason is kept on the comparison.
+    """
+    log = resolutions._run(clone, "rev-list", "--parents", "%s..%s" % (base, head))
+    if log.returncode:
+        raise train.TrainError("cannot read the packet ancestry for the main sync")
+    proofs = []
+    for line in resolutions._text(log).splitlines():
+        fields = line.split()
+        if len(fields) < 2 or sha not in fields[1:]:
+            continue
+        proofs.append(_sync_proof(clone, fields[0], fields[1:], sha))
+    if not proofs:
+        return None
+    pure = [proof for proof in proofs if proof["pure"]]
+    refused = [proof for proof in proofs if not proof["pure"]]
+    exempt = {lot for proof in pure for lot in proof["lots"]}
+    # A lot named by an impure merge stays missing even when another commit
+    # happened to merge the same main sha cleanly.
+    exempt -= {lot for proof in refused for lot in proof["lots"]}
+    chosen = pure[0] if pure else refused[0]
+    result = dict(commit=chosen["commit"], sha=sha, lots=sorted(exempt),
+                  pure=bool(pure))
+    if not pure:
+        result["reason"] = chosen["reason"]
+    return result
+
+
+def _sync_proof(clone, commit, parents, sha):
+    """One commit's local proof that it only merged ``sha`` into its parent."""
+    proof = dict(commit=commit, parents=parents, lots=[], pure=False, reason="")
+    body = resolutions._run(clone, "show", "-s", "--format=%B", commit)
+    if body.returncode:
+        raise train.TrainError("cannot read the packet main sync commit")
+    proof["lots"] = [int(match.group(1))
+                     for match in _WORK.finditer(resolutions._text(body))]
+    if len(parents) != 2 or parents[1] != sha:
+        proof["reason"] = "not a two-parent merge of the packet side and main"
+        return proof
+    if len(proof["lots"]) != 1:
+        proof["reason"] = ("mechanical sync carries %d ameesh-work trailers"
+                           % len(proof["lots"]))
+        return proof
+    clean = resolutions._run(clone, "merge-tree", "--write-tree", parents[0], sha)
+    if clean.returncode == 1:
+        proof["reason"] = "main merge is not clean"
+        return proof
+    if clean.returncode != 0:
+        raise train.TrainError("cannot compute the clean main merge")
+    expected = resolutions._text(clean).splitlines()
+    actual = resolutions._run(clone, "rev-parse", commit + "^{tree}")
+    if actual.returncode:
+        raise train.TrainError("cannot read the packet main sync tree")
+    if not expected or expected[0].strip() != resolutions._text(actual).strip():
+        proof["reason"] = "tree differs from the clean main merge"
+        return proof
+    proof["pure"] = True
+    return proof
 
 
 def _member(row, *, origin, proof):
