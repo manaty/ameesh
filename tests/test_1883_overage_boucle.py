@@ -653,18 +653,22 @@ class IdentiteComptesTest(_Base):
 
     def test_la_simulation_ne_publie_pas(self):
         """L39 : `ameesh resume` ne publie ni empreinte ni retenue — aucune
-        écriture partagée."""
+        écriture partagée, et aucune revendication de compte de l'hôte
+        (#2580)."""
         b = _dossier(os.path.join(self.tmp, "comptes", "codex-2"), creds="auth.json")
         items = self._declares(b)
         now = float(int(time.time()))
         _journal(items[0].path, week=(34, now + 6 * DAY))
         _journal(items[1].path, week=(5, now + 6 * DAY))
+        registre = os.path.join(self.tmp, "registre-2580")
+        cfg = dataclasses.replace(self.cfg, account_registry=registre)
         accounts.choose(self.db, self.cfg.host, "codex", items, self._book(),
-                        now=now, simulate=True)
+                        now=now, simulate=True, cfg=cfg)
         store = storage.of(self.db).accounts
         self.assertEqual(store.identities(self.cfg.host, "codex",
                                           now - accounts.IDENTITY_WINDOW_S), {})
         self.assertEqual(store.holds(self.cfg.host, "codex"), {})
+        self.assertFalse(os.path.exists(registre))
 
 
 class AlerteOverageTest(_Base):
