@@ -107,11 +107,6 @@ class NoLocalDefaultTest(unittest.TestCase):
         self.assertFalse(hasattr(review_designation, "KNOWN_FAMILIES"))
 
     def test_independence_parameters_have_no_default(self):
-        for function in (train_review.qualify, train_review.qualify_recorded):
-            params = inspect.signature(function).parameters
-            for name in ("families", "exclude_author_family", "distinct_families"):
-                with self.subTest(function=function.__name__, name=name):
-                    self.assertIs(params[name].default, inspect.Parameter.empty)
         self.assertIs(inspect.signature(train_review.Receipt.known)
                       .parameters["families"].default, inspect.Parameter.empty)
         for function in (review_designation.select, review_designation.apply,
@@ -122,18 +117,29 @@ class NoLocalDefaultTest(unittest.TestCase):
                 self.assertIs(inspect.signature(function).parameters["families"].default,
                               inspect.Parameter.empty)
 
-    def test_history_reader_requires_compiled_rules(self):
-        with self.assertRaisesRegex(train.TrainError, "compiled canon review rules"):
-            train_history.Recorded(None, "/nonexistent", provider=object(),
-                                   review_rules=None)
+    def test_history_reader_takes_families_from_the_canon(self):
+        # sans règles explicites, les familles viennent du lecteur du canon
+        # (`review_lot.compiled_families`, #2664), jamais d'un défaut local
+        with mock.patch("ameesh.review_lot.compiled_families",
+                        return_value=("codex", "claude")):
+            history = train_history.Recorded(None, "/nonexistent", provider=object())
+        self.assertEqual(history.families, ("codex", "claude"))
+        with mock.patch("ameesh.review_lot.compiled_families",
+                        side_effect=mechanics.MechanicsError("absent")):
+            history = train_history.Recorded(None, "/nonexistent", provider=object())
+        self.assertEqual(history.families, ())
 
-    def test_policy_adapter_accepts_the_reader_schema_only(self):
+    def test_policy_adapter_accepts_the_reader_schemas_only(self):
+        # les deux schémas du lecteur (/1, /2 prévalidation, #2698), rien d'autre
         rules = SimpleNamespace(schema=mechanics.SCHEMA, commit="a" * 40,
                                 project="ameesh", review_policy=None)
-        self.assertEqual(train_policy.Compiled(rules).commit, "a" * 40)
+        for schema in (mechanics.SCHEMA, mechanics.SCHEMA_PREVALIDATION):
+            with self.subTest(schema=schema):
+                self.assertEqual(train_policy.Compiled(SimpleNamespace(**{
+                    **rules.__dict__, "schema": schema})).commit, "a" * 40)
         with self.assertRaises(train.TrainError):
             train_policy.Compiled(SimpleNamespace(**{
-                **rules.__dict__, "schema": mechanics.SCHEMA_PREVALIDATION}))
+                **rules.__dict__, "schema": "ameesh-mechanics/99"}))
 
 
 class GuardTest(unittest.TestCase):

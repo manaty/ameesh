@@ -13,7 +13,7 @@ import types
 from datetime import datetime
 from unittest import mock
 
-from ameesh import (db as db_mod, prevalidation_calls, radar, storage, train, train_ci,
+from ameesh import (db as db_mod, prevalidation_calls, radar, registry, storage, train, train_ci,
                     train_fire, train_candidates, train_git, train_policy, train_runner,
                     train_transports, train_transport_journal, work)
 
@@ -94,15 +94,21 @@ class TrainRunnerTest(PgTestCase):
         self.assertNotEqual(subprocess.run(["git", "-C", self.host, "cat-file", "-e", self.head],
                                           capture_output=True).returncode, 0)
         self.ops = storage.of(self.db).work
+        registry.upsert(self.db, "author", harness="deepseek", host="fixture",
+                        cwd=self.host, status="idle")
         item = work.add(self.db, title="runner fixture", app=self.project.name, source="fixture",
-                        actor="fixture", branch="lot/member", branch_target="main")
+                        actor="fixture", assignee="author", branch="lot/member",
+                        branch_target="main")
         mark = self.ops.add_milestone(item["id"], "frozen", sha=self.head, actor="fixture",
                                       verdict=None, note="")
         from ameesh import merge_queue
         self.ops.queue_add(item["id"], target="main", frozen_sha=self.head, note="", actor="fixture",
                            source=merge_queue.source_of(self.host), frozen_id=mark["id"])
-        self.receipts = {"commit:" + self.head: dataclasses.asdict(author(self.head))}
-        for reader, family in (("r1", "claude"), ("r2", "deepseek")):
+        self.db.execute("INSERT INTO turn_costs (agent, harness, session, recorded_at)"
+                        " VALUES ('author', 'deepseek', 's-author', now())")
+        self.receipts = {"commit:" + self.head:
+                         dataclasses.asdict(author(self.head, harness="deepseek"))}
+        for reader, family in (("r1", "claude"), ("r2", "codex")):
             mark = self.ops.add_milestone(item["id"], "verdict", sha=self.head,
                                           actor=reader, verdict="ok", note="")
             _, receipt = verdict(mark["id"], reader, family, commit=self.head)
@@ -277,7 +283,7 @@ class TrainRunnerTest(PgTestCase):
         self.assertEqual(result["result"], "ci", result)
         plan, epoch = result["plan"], passage.epoch
         self.assertEqual(plan["proof"]["members"][0]["policy"]["reviews"], 2)
-        self.assertIn(self.head, plan["proof"]["members"][0]["history"]["reviews"]["coverage"])
+        self.assertTrue(plan["proof"]["members"][0]["history"]["reviews"]["gate"]["ok"])
         self.assertEqual(self.git(self.origin, "rev-parse", plan["branch"]), plan["head"])
         other_db = db_mod.connect(self.__class__.cfg)
         self.addCleanup(other_db.close)
@@ -413,19 +419,27 @@ class TrainRunnerTest(PgTestCase):
     def test_missing_member_history_defers_dependents_and_publishes_independent_member(self):
         original = self.ops.queue(None)[0]
         added = []
-        for branch, base in (("lot/dependent", self.head), ("lot/independent", self.base)):
+        for branch, base, agent in (("lot/dependent", self.head, "dep"),
+                                    ("lot/independent", self.base, "indep")):
+            registry.upsert(self.db, agent, harness="deepseek", host="fixture",
+                            cwd=self.host, status="idle")
+            self.db.execute("INSERT INTO turn_costs (agent, harness, session, recorded_at)"
+                            " VALUES (%s, 'deepseek', %s, now())",
+                            (agent, "s-" + agent))
             self.git(self.publisher, "checkout", "-qb", branch, base)
             self.write(branch.rsplit("/", 1)[1], "independent reviewed fixture\n")
             head = self.commit(branch)
             self.git(self.publisher, "push", "-q", "origin", branch)
             item = work.add(self.db, title=branch, app=self.project.name, source="fixture",
-                            actor="fixture", branch=branch, branch_target="main")
-            freeze = self.ops.add_milestone(item["id"], "frozen", sha=head, actor="fixture",
+                            actor="fixture", assignee=agent, branch=branch,
+                            branch_target="main")
+            freeze = self.ops.add_milestone(item["id"], "frozen", sha=head, actor=agent,
                                            verdict=None, note="")
             member = self.ops.queue_add(item["id"], target="main", frozen_sha=head,
                 note="", actor="fixture", source=original["source"], frozen_id=freeze["id"])
-            self.receipts["commit:" + head] = dataclasses.asdict(author(head))
-            for reader, family in (("r1", "claude"), ("r2", "deepseek")):
+            self.receipts["commit:" + head] = dataclasses.asdict(
+                author(head, actor=agent, harness="deepseek"))
+            for reader, family in (("r1", "claude"), ("r2", "codex")):
                 mark = self.ops.add_milestone(item["id"], "verdict", sha=head,
                     actor=reader, verdict="ok", note="")
                 _, receipt = verdict(mark["id"], reader, family, commit=head)
@@ -556,11 +570,18 @@ class TrainRunnerTest(PgTestCase):
     def test_compiled_families_are_used_by_real_historical_admission(self):
         rules = FixtureMechanics(self.publisher, self.base, self.project.name)
         rules.families = ("codex", "claude")
+        # L'auteur est rattaché à codex par le journal et le reçu ; les avis
+        # sont claude et codex, donc un seul est indépendant sous la famille
+        # compilée : la porte refuse avant tout effet.
+        self.db.execute("UPDATE turn_costs SET harness = 'codex' WHERE agent = 'author'")
+        self.receipts["commit:" + self.head] = dataclasses.asdict(
+            author(self.head, harness="codex"))
         self.mechanics.load.side_effect = None
         self.mechanics.load.return_value = rules
         result = self.passage().step(self.db, self.now)
         self.assertEqual(result["result"], "empty", result)
-        self.assertIn("missing independent", result["selection"][0]["reason"])
+        self.assertIn("2 independent review verdict(s) required",
+                      result["selection"][0]["reason"])
         self.assertEqual(self.api_calls, [])
 
     def test_lost_member_history_during_ci_preserves_plan_until_terminal_outcome(self):

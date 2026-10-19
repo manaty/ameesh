@@ -145,7 +145,9 @@ class Ports(Protocol):
     def entries(self) -> list[dict]: ...
     def dependencies(self, rows: list[dict]) -> list[dict]: ...
     def qualify(self, rows: list[dict], base: str, mode: str) -> dict: ...
-    def compose(self, base: str, rows: list[dict], nonce: str) -> dict: ...
+    def sync(self, base: str) -> dict | None: ...
+    def compose(self, base: str, rows: list[dict], nonce: str,
+                sync: dict | None = None) -> dict: ...
     def validate_transports(self, plan: dict) -> list[dict]: ...
     def publish(self, plan: dict, epoch: int) -> None: ...
     def start_ci(self, plan: dict) -> None: ...
@@ -176,7 +178,10 @@ class Engine:
         number = len(state["attempts"]) + 1
         nonce = digest([self.source, self.target, state["base"], state["started_ts"],
                         [identity(r) for r in members], proof, number])
-        merged = self.ports.compose(state["base"], members, nonce)
+        sync = self.ports.sync(state["base"])
+        merged = (self.ports.compose(state["base"], members, nonce, sync=sync)
+                  if sync is not None
+                  else self.ports.compose(state["base"], members, nonce))
         # The adapter refuses conflicts unless their exact merged delta is
         # reviewed. No implicit rerere approval and no inferred CI transfer.
         for field in ("head", "tree"):
@@ -192,6 +197,17 @@ class Engine:
                     nonce=nonce,
                     branch="integration/train-%s-%s" % (state["stamp"], token[:16]),
                     id=token, created_ts=now)
+        if sync is not None:
+            receipt = merged.get("sync")
+            if not isinstance(receipt, dict) or receipt.get("ref") != sync.get("ref") \
+                    or receipt.get("sha") != sync.get("sha") \
+                    or receipt.get("base") != state["base"]:
+                raise TrainError("compose returned no exact main sync receipt")
+            for field in ("head", "tree"):
+                value = receipt.get(field, "")
+                if not merge_queue._HEX.fullmatch(value) or len(value) not in (40, 64):
+                    raise TrainError("compose returned no full main sync %s" % field)
+            plan["sync"] = copy.deepcopy(receipt)
         if "transports" in merged:
             if not isinstance(merged["transports"], list) or not merged["transports"]:
                 raise TrainError("nonempty structured composition transports required")

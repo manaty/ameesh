@@ -134,8 +134,12 @@ class Compiled(Versioned):
     the standalone reader. Classification/counts belong to mechanics alone.
     """
 
+    #: #2698 : les schémas que `mechanics.load` accepte, dont /2 (bloc
+    #: prevalidation, home#120) ; un littéral /1 refusait tout canon ≥ 946011a3.
+    SCHEMAS = (mechanics.SCHEMA, mechanics.SCHEMA_PREVALIDATION)
+
     def __init__(self, rules):
-        if rules.schema != mechanics.SCHEMA or not SHA.fullmatch(rules.commit):
+        if rules.schema not in self.SCHEMAS or not SHA.fullmatch(rules.commit):
             raise TrainError("exact compiled canon mechanics required")
         self.mechanics = rules
         self.commit, self.project = rules.commit, rules.project

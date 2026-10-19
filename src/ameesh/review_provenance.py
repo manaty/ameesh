@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#1465 — le fournisseur exact d'origine d'un commit et d'un jalon.
 
-Contrat importable pour le qualificateur du train (#1467,
-`train_review.qualify`). Pour chaque sujet, il rend un reçu aux champs de
+Contrat importable pour le lecteur du train (#1467/#2681,
+`review_authors` et `merge_queue.review_gate`). Pour chaque sujet, il rend un reçu aux champs de
 `train_review.Receipt` — `subject`, `commit`, `actor`, `session`, `turn`,
 `harness`, `record`, `milestone` — ou `None` quand la source manque.
 

@@ -90,8 +90,11 @@ class Runtime:
             raise TrainError("missing structured historical admission evidence")
         return proof
 
-    def compose(self, base, rows, nonce):
-        return self.repository.compose(self.target_branch, base, rows, nonce)
+    def sync(self, base):
+        return self.repository.main_sync(self.target_branch, base)
+
+    def compose(self, base, rows, nonce, sync=None):
+        return self.repository.compose(self.target_branch, base, rows, nonce, sync=sync)
 
     def validate_transports(self, plan):
         self._belongs(plan)
