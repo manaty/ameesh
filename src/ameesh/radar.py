@@ -1739,21 +1739,24 @@ def _full_suite_ids(gh, slug: str, declared) -> dict:
     return out
 
 
-def _run_jobs(gh, run: dict, slug: str) -> list:
+def _run_jobs(gh, run: dict, slug: str, *, empty_ok: bool = False) -> list:
     """L756 (#566): les jobs d'une exécution, pour refuser un vert sans tests.
 
     Rend `[(nom, statut, conclusion)]`. Une lecture impossible, vide ou
     tronquée lève `GithubError` : un job qu'on ne peut pas lire ne vaut jamais
-    vert. Le dépôt est nommé (`--repo`), jamais déduit du répertoire courant :
-    `Gh.run` ne fixe ni `cwd` ni `GH_REPO`, et `gh run view` sans `--repo`
-    échoue hors d'un clone (« failed to determine base repo ») — R2 de
+    vert. `empty_ok` distingue la lecture de tous les runs d'un commit
+    (#2692), où une exécution sautée sans job ne prouve rien, sans être une
+    lecture ratée. Le dépôt est nommé (`--repo`), jamais déduit du répertoire
+    courant : `Gh.run` ne fixe ni `cwd` ni `GH_REPO`, et `gh run view` sans
+    `--repo` échoue hors d'un clone (« failed to determine base repo ») — R2 de
     mty-amh-qa-01 sur PR manaty/ameesh#633."""
     from . import plan_github
     run_id = run.get("databaseId")
     if type(run_id) is not int or run_id <= 0:
         raise plan_github.GithubError("gh run view: missing or invalid run id")
     data = plan_github._json(gh, ["run", "view", str(run_id), "--repo", slug, "--json", "jobs"])
-    if not isinstance(data, dict) or not isinstance(data.get("jobs"), list) or not data["jobs"]:
+    if (not isinstance(data, dict) or not isinstance(data.get("jobs"), list)
+            or (not data["jobs"] and not empty_ok)):
         raise plan_github.GithubError("gh run view: no readable job for run %s" % run_id)
     if len(data["jobs"]) >= 100:
         raise plan_github.GithubError("gh run view: result may be truncated; cannot certify "
@@ -1765,6 +1768,55 @@ def _run_jobs(gh, run: dict, slug: str) -> list:
             raise plan_github.GithubError("gh run view: invalid job")
         out.append((job["name"], job["status"], (job.get("conclusion") or "").lower()))
     return out
+
+
+def commit_suite(project: Project, sha: str, gh=None) -> dict:
+    """#2692: les exécutions et leurs jobs sur le commit exact `sha`.
+
+    Une suite complète de paquet peut être répartie sur plusieurs exécutions
+    (le run `pull_request` de la PR porte la matrice, le portier `paquet` les
+    flux) : l'appelant compare les **jobs**, jamais un nom de workflow ni un
+    seul run vert. Rend `{head, runs: [{id, url, workflow, event, conclusion,
+    jobs: [{name, status, conclusion}]}]}` ; une lecture impossible ou
+    tronquée lève `GithubError`, une exécution sans job est gardée vide (elle
+    ne prouve aucun job)."""
+    from . import plan_github
+    slug = github_slug(project)
+    if not slug:
+        raise plan_github.GithubError("project %s declares no GitHub repository"
+                                      % project.name)
+    gh = gh or plan_github.Gh()
+    rows = plan_github._json(gh, ["run", "list", "--repo", slug, "--commit", sha,
+                                  "--limit", "100", "--json",
+                                  "databaseId,workflowName,name,event,status,conclusion,"
+                                  "headSha,url"])
+    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+        raise plan_github.GithubError("gh run list: unexpected output")
+    if len(rows) >= 100:
+        raise plan_github.GithubError("gh run list: result may be truncated; cannot certify "
+                                      "the full suite")
+    if any(r.get("headSha") != sha for r in rows):
+        raise plan_github.GithubError("gh run list: a run does not match the frozen commit")
+    runs = []
+    for run in rows:
+        run_id = run.get("databaseId")
+        if type(run_id) is not int or run_id <= 0:
+            raise plan_github.GithubError("gh run list: missing or invalid run id")
+        run_conclusion = (run.get("conclusion") or "").lower()
+        # A skipped workflow executed no job: reading its (empty) job list
+        # would spend an API call to prove nothing.
+        jobs = [] if run_conclusion == "skipped" else _run_jobs(
+            gh, run, slug, empty_ok=True)
+        runs.append({
+            "id": run_id,
+            "url": run.get("url") or "",
+            "workflow": run.get("workflowName") or run.get("name") or "",
+            "event": run.get("event") or "",
+            "conclusion": run_conclusion,
+            "jobs": [dict(name=name, status=status, conclusion=conclusion)
+                     for name, status, conclusion in jobs],
+        })
+    return {"head": sha, "runs": runs}
 
 
 def _job_matches(required: str, job_name: str) -> bool:

@@ -250,6 +250,7 @@ def _dry_run(cfg, project, *, now, version, as_json: bool) -> int:
         "direct": plan.direct, "included": plan.included,
         "excluded": plan.excluded, "migrations": plan.migrations,
         "notes": plan.notes, "empty": plan.empty,
+        "tree_green": plan.tree_green,
     }
     if as_json:
         print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
@@ -260,9 +261,15 @@ def _dry_run(cfg, project, *, now, version, as_json: bool) -> int:
     else:
         print("release %s — coupure %s — cible %s @ %s"
               % (plan.version, plan.cutoff_label, project.target, plan.head[:12]))
-        print("CI verte: %s%s" % ("oui" if plan.green else "non",
-                                  "" if plan.green else
-                                  " ; dernier vert " + (plan.last_green or "?")[:12]))
+        if plan.tree_green:
+            print("CI tête en cours ; arbre = tête de paquet %s, suite complète verte "
+                  "(%s)" % (plan.tree_green["head"][:12], ", ".join(
+                      run["url"] or "run %s" % run["id"]
+                      for run in plan.tree_green["runs"])))
+        else:
+            print("CI verte: %s%s" % ("oui" if plan.green else "non",
+                                      "" if plan.green else
+                                      " ; dernier vert " + (plan.last_green or "?")[:12]))
         print("paquets: %s" % (", ".join(
             "%s%s" % (packet.package, " (#%d)" % packet.pr if packet.pr else "")
             for packet in plan.packets) or "aucun"))

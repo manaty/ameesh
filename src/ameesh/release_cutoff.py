@@ -421,6 +421,16 @@ def ci_reading(project: "ProjectRelease", sha: str) -> dict:
         raise TransientReleaseError("CI of %s unreadable: %s" % (sha[:12], exc)) from exc
 
 
+def suite_reading(project: "ProjectRelease", sha: str) -> dict:
+    """The runs and jobs of the exact head (#2692); a failed read is transient."""
+    target = radar.Project(name=project.name, repo=project.repo, target=project.target,
+                           github=project.github)
+    try:
+        return radar.commit_suite(target, sha)
+    except plan_github.GithubError as exc:
+        raise TransientReleaseError("CI jobs of %s unreadable: %s" % (sha[:12], exc)) from exc
+
+
 def _release_commit(repo: str, sha: str) -> bool:
     """A `[skip ci]` release commit inherits its first parent's CI state."""
     message = _git(repo, "log", "-1", "--format=%B", sha).stdout or ""
@@ -914,6 +924,9 @@ class Plan:
     notes: str
     # N4: the base carries the previous tag's exact tree, nothing to release.
     empty: bool = False
+    #: #2692: the target head's CI is still in progress, but its tree is the
+    #: packet head's green content; the evidence (head, runs) or None.
+    tree_green: dict | None = None
 
 
 def same_tree(repo: str, left: str, right: str) -> bool:
@@ -924,6 +937,153 @@ def same_tree(repo: str, left: str, right: str) -> bool:
     return trees[0].stdout.strip() == trees[1].stdout.strip()
 
 
+def packet_head(repo: str, sha: str) -> str | None:
+    """The head a packet merge integrated, when the merge carries its tree.
+
+    A packet merge `M = merge(main, H)` has the packet head as second parent
+    (`H`). A conflict resolution makes M's tree differ from H's: the CI of H
+    then proves nothing about the merged content and no proof is inherited
+    (#2692). A fast-forward has no merge commit (and its exact CI is H's).
+    """
+    subject = _out(repo, "log", "-1", "--format=%s", sha)
+    if not _PACKAGE_MERGE.match(subject):
+        return None
+    parents = _out(repo, "rev-list", "--parents", "-n", "1", sha).split()
+    if len(parents) != 3:
+        return None
+    head = parents[2]
+    return head if same_tree(repo, sha, head) else None
+
+
+def _same_job(required: str, actual: str) -> bool:
+    """A job the target ran, as the packet head names it.
+
+    GitHub surfaces a reusable workflow's jobs under the caller job, and the
+    flow check runs under `tests (flux) …`: the same job may be prefixed. The
+    required name stays exact otherwise (`tests` never catches a flow run).
+    """
+    return (actual == required or actual.endswith(" / " + required)
+            or actual.endswith(" " + required))
+
+
+def _full_suite_run(suite: dict) -> dict | None:
+    """The run of a commit that carries the target's full suite.
+
+    The target's suite is the run with the most jobs (the matrix run). Tied
+    runs with the same job set are re-runs of that suite (one is enough);
+    tied runs with a different job set are ambiguous and prove nothing. A run
+    without jobs (a skipped workflow) certifies nothing.
+    """
+    runs = [run for run in suite.get("runs") or ()
+            if run.get("conclusion") == "success" and run.get("jobs")]
+    if not runs:
+        return None
+    best = max(runs, key=lambda run: (len(run["jobs"]), -int(run["id"])))
+    ties = [run for run in runs if len(run["jobs"]) == len(best["jobs"])]
+    names = {job["name"] for job in best["jobs"]}
+    if any({job["name"] for job in run["jobs"]} != names for run in ties):
+        return None
+    return best
+
+
+def _suite_proof(reference: dict, candidate: dict) -> dict | None:
+    """The candidate proves the target's full suite, job by job.
+
+    Every job that ran green in the target's full-suite run must exist on the
+    candidate under the same name (a caller/flow prefix is allowed), be
+    completed, and be green. The target's suite is re-read on the last green
+    commit, so a packet that changes the job set (a workflow edit, a reduced
+    matrix) inherits nothing: it needs its own green target CI. Returns
+    `{reference_run, runs}` when the proof holds, else None.
+    """
+    reference_run = _full_suite_run(reference)
+    if reference_run is None:
+        return None
+    # Only the jobs that actually ran prove the target's suite. A job skipped
+    # on the target (a doc lane, a version lane) executed nothing: its absence
+    # on the packet head is not a hole, and a tolerated failure certifies
+    # nothing either.
+    required = {}
+    for job in reference_run["jobs"]:
+        if job["conclusion"] == "success":
+            required[job["name"]] = "success"
+    candidates = [(run, job) for run in candidate.get("runs") or ()
+                  for job in run.get("jobs") or ()]
+    proof_runs: dict[int, dict] = {}
+    for name, conclusion in required.items():
+        hits = [(run, job) for run, job in candidates if _same_job(name, job["name"])]
+        if not hits or any(job.get("status") != "completed" for _, job in hits):
+            return None
+        if not any(job["conclusion"] == "success" for _, job in hits):
+            return None
+        if any(job["conclusion"] not in radar.CI_PASSING for _, job in hits):
+            return None
+        for run, job in hits:
+            if job["conclusion"] == "success":
+                proof_runs[int(run["id"])] = run
+    if not proof_runs:
+        return None
+    return {"reference_run": reference_run,
+            "runs": [proof_runs[key] for key in sorted(proof_runs)]}
+
+
+def _run_evidence(run: dict) -> dict:
+    """The durable identity of a run cited by the notes and the report."""
+    return {"id": run["id"], "url": run["url"], "workflow": run["workflow"],
+            "event": run["event"], "jobs": len(run["jobs"])}
+
+
+def tree_green(repo: str, project: "ProjectRelease", sha: str, reference: str | None,
+               reading: dict | None = None) -> dict | None:
+    """#2692: the head's tree is content a green packet head validated.
+
+    Only a head whose own CI is still in progress may inherit (a concluded red
+    stays red, even with an equal tree). The packet merge must carry the
+    packet head's exact tree (no conflict resolution), that head must be green,
+    and its jobs must prove the same full suite as the target's last green
+    commit. Returns the evidence or None; a read failure stays transient.
+    """
+    own = ci_reading(project, sha) if reading is None else reading
+    if own.get("green") or own.get("failed") or own.get("missing"):
+        return None
+    if not own.get("pending"):
+        return None
+    if not reference or reference == sha:
+        return None
+    head = packet_head(repo, sha)
+    if head is None:
+        return None
+    head_reading = ci_reading(project, head)
+    if not head_reading.get("green"):
+        return None
+    candidate = suite_reading(project, head)
+    # The target's suite is read on its last green commit; a release commit
+    # inherits its first parent's content and has no run of its own.
+    cursor = reference
+    for _ in range(4):
+        proof = _suite_proof(suite_reading(project, cursor), candidate)
+        if proof is not None:
+            tree = _out(repo, "rev-parse", "--verify", "%s^{tree}" % sha)
+            return {"head": head, "tree": tree, "reference": cursor,
+                    "reference_run": _run_evidence(proof["reference_run"]),
+                    "runs": [_run_evidence(run) for run in proof["runs"]]}
+        parent = _out(repo, "rev-parse", "--verify", "%s^1" % cursor)
+        if not parent:
+            break
+        cursor = parent
+    return None
+
+
+def tree_proof_text(head: str, proof: dict) -> str:
+    """The validation line cited in the release notes (SHA and run, #2692)."""
+    runs = ", ".join(run["url"] or "run %s" % run["id"] for run in proof["runs"])
+    reference = proof["reference_run"]
+    return ("tree of %s equals packet head %s, whose full suite (same jobs as the "
+            "target's green %s) is green: %s%s"
+            % (head[:12], proof["head"][:12], proof["reference"][:12], runs,
+               "; reference run %s" % reference["url"] if reference.get("url") else ""))
+
+
 def build_plan(cfg, project: ProjectRelease, *, now: float,
                version: str | None = None) -> Plan:
     rules, source = compiled_rules(cfg, project.name)
@@ -932,8 +1092,15 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
     head = commit_of(project.repo, "%s/%s" % (project.remote, project.target))
     reading = ci_reading(project, head)
     green = commit_is_green(project.repo, project, head, reading=reading)
+    tree_proof = None
     if not green:
         green_commit = last_green(project.repo, head, project)
+        # #2692: a packet merge whose tree is the green packet head's content
+        # is green while the target's own CI is still in progress.
+        tree_proof = tree_green(project.repo, project, head, green_commit,
+                                reading=reading)
+        if tree_proof is not None:
+            green, green_commit = True, head
     else:
         green_commit = head
     base = green_commit or head
@@ -979,13 +1146,16 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
         project=project, repo=project.repo, since=since, target=base, version=version,
         cutoff_label=cutoff_label, cutoff_at=cutoff_at, rules=rules, previous=previous,
         floor=floor, floor_reason=floor_reason, packets=packets, direct=direct,
-        migrations=migrations, version_bump=project.version_bump)
+        migrations=migrations,
+        runs=[tree_proof_text(head, tree_proof)] if tree_proof else None,
+        version_bump=project.version_bump)
     return Plan(project=project, rules=rules, canon_commit=source.commit,
                 cutoff_at=cutoff_at, cutoff_label=cutoff_label, head=head, ci=reading,
                 green=green, last_green=green_commit, base=base, current_version=current,
                 previous=previous, version=version, floor=floor, floor_reason=floor_reason,
                 packets=packets, direct=direct, migrations=migrations,
-                included=included, excluded=excluded, notes=notes)
+                included=included, excluded=excluded, notes=notes,
+                tree_green=tree_proof)
 
 
 # --------------------------------------------------------------------------
@@ -1376,7 +1546,13 @@ def _report_body(project: ProjectRelease, plan: Plan | None, *, result: str,
         lines.append("Avant: %s (tag %s, commit %s)."
                      % (previous["version"], previous["tag"], previous["commit"][:12]))
     lines.append("Après: %s (commit %s)." % (version, release_sha[:12]))
-    if plan and plan.ci:
+    if plan and plan.tree_green:
+        proof = plan.tree_green
+        lines.append("CI tête: en cours ; arbre identique à la tête de paquet %s, "
+                     "suite complète verte (preuve %s)."
+                     % (proof["head"][:12], ", ".join(
+                         run["url"] or "run %s" % run["id"] for run in proof["runs"])))
+    elif plan and plan.ci:
         lines.append("CI tête: %s%s." % (
             "verte" if plan.ci.get("green") else "non verte",
             " ; dernier vert %s" % plan.last_green[:12]
@@ -1583,7 +1759,14 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
         return report
 
     deviations = []
-    if not plan.green:
+    if plan.tree_green:
+        deviations.append(
+            "tête %s: CI en cours, arbre identique à la tête de paquet %s "
+            "(suite complète verte, %s)"
+            % (plan.head[:12], plan.tree_green["head"][:12],
+               ", ".join(run["url"] or "run %s" % run["id"]
+                         for run in plan.tree_green["runs"])))
+    elif not plan.green:
         deviations.append("tête %s non verte: release sur le dernier commit vert %s"
                           % (plan.head[:12], plan.base[:12]))
     version_sha = create_version_commit(project, plan)
@@ -1647,6 +1830,7 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
               "direct": plan.direct, "included": plan.included,
               "excluded": plan.excluded, "migrations": plan.migrations,
               "notes": plan.notes, "staging": staging, "started_at": started,
+              "tree_green": plan.tree_green,
               "deviations": deviations}
     return finish(cfg, db, project, report, state, state_slot, at, label, rules,
                   plan.previous, plan, staging, no_staging)
