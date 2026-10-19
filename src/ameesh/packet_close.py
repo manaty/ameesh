@@ -331,7 +331,8 @@ def sync_project(cfg, db, project, *, dry_run: bool = False, actor: str = "") ->
     # `land.fresh_target` fetche `refs/heads/<branche>` : une cible écrite
     # `origin/main`, `refs/remotes/origin/main`… perd ses préfixes
     target = plan_git.short_branch(target) or target
-    replayer = resolutions.Replayer(repo, radar.clone_dir(cfg, project.name))
+    replayer = resolutions.Replayer(repo, radar.clone_dir(cfg, project.name),
+                                    target=project.target)
     replayer.ensure()
     tip = land.fresh_target(replayer, project, target)
     return sync(db, replayer.path, target=tip, dry_run=dry_run, actor=actor)

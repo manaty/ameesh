@@ -1891,7 +1891,9 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
         return out
     from . import radar, resolutions
     name = project.name if project is not None else os.path.basename((repo or "project").rstrip("/"))
-    clone = resolutions.Replayer(repo, radar.clone_dir(cfg, name)) if repo else None
+    clone = resolutions.Replayer(
+        repo, radar.clone_dir(cfg, name),
+        target=getattr(project, "target", "") or "") if repo else None
     try:
         entered = merge_queue.enter(db, lot, repo=repo, actor=work.SYSTEM_SENDER,
                                     project=project, clone=clone, cfg=cfg)
