@@ -81,27 +81,22 @@ class PlanUnderusedTest(_Base):
         # la projection au rythme actuel : 20 % en 3/7 → 47 % à l'échéance
         self.assertAlmostEqual(alerte["lost_at_pace"], 1 - 0.2 * 7 / 3, places=2)
         self.assertIn("estimated loss", alerte["detail"])
-        self.assertIn("allowed pace of 53 %", alerte["detail"])
+        self.assertIn("projected loss 53 %", alerte["detail"])
         # `since` : le début de la fenêtre — stable tant qu'elle dure
         self.assertAlmostEqual(alerte["since"], self.now + 4 * JOUR - 7 * JOUR, places=0)
         # seuil réglable, et 0 désactive
-        self.assertEqual(self.alertes(plan_pace_gap_pct=40), [])
+        self.assertEqual(self.alertes(plan_pace_gap_pct=60), [])
         self.assertEqual(self.alertes(plan_pace_gap_pct=0), [])
 
-    def test_le_rythme_percu_suit_le_multiplicateur_du_profil(self):
-        # #1028 P3 : 30 % utilisés à 3/7 écoulés — écart 23 points au rythme
-        # nominal (sous le seuil de 25, pas d'alerte), 60 points au rythme du
-        # compte primaire Codex (2 × 3/7 + 10, plafonné à 90 %) → alerte.
-        self.jauge("codex", "codex-10080min", 0.30, 4 * JOUR, 7 * JOUR, account="primaire")
+    def test_le_multiplicateur_ne_change_pas_la_projection_reelle(self):
+        # #2757 : la capacité permise ne prédit pas le débit réel.
+        self.jauge("codex", "codex-10080min", 0.45, 4 * JOUR, 7 * JOUR, account="primaire")
         self.assertEqual(self.alertes(), [])
         cfg = dataclasses.replace(self.cfg, accounts={"codex": [
             {"name": "primaire", "pace_multiplier": 2.0}, {"name": "secondaire"}]})
         out = _types(exploitation.alerts(cfg, self.db, now=self.now, **_seuils()),
                      "plan_underused")
-        self.assertEqual([(a["account"], a["reason"]) for a in out],
-                         [("primaire", "sous_rythme")])
-        self.assertAlmostEqual(out[0]["pace_cap"], 0.90, places=4)
-        self.assertIn("allowed pace of 90 %", out[0]["detail"])
+        self.assertEqual(out, [])
 
     def test_debut_de_fenetre_et_fenetre_courte_hors_rythme(self):
         # 10 % écoulés seulement : l'écart ne dit encore rien
