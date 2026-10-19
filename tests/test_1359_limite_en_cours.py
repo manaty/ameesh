@@ -12,6 +12,7 @@ l'exception pilote explicite, et les compteurs de `ameesh list` / progress.
 """
 from __future__ import annotations
 
+import os
 import time
 from unittest import mock
 
@@ -19,21 +20,21 @@ from ameesh import backlog, handoff, notify, progress, registry, storage, work, 
 from ameesh.db import DbError
 from ameesh.storage import interface
 
-from .support import PgTestCase
+from .support import FIXTURE_BUILD_CAP, PgTestCase, mechanics_canon
 
 HEURE = 3600.0
 
 
-#: plafond §4 de fixture, posé à la place du canon compilé (#2451)
-CAP = 2
+#: plafond §4 de fixture (`support.FIXTURE_BUILD_CAP`, à la place du canon, #2451)
+CAP = FIXTURE_BUILD_CAP
 
 
 class _Base(PgTestCase):
-    def setUp(self):
-        super().setUp()
-        patch = mock.patch.object(work, "build_limit", return_value=CAP)
-        patch.start()
-        self.addCleanup(patch.stop)
+    def canon_env(self) -> dict:
+        """Un sous-processus ne voit pas le plafond de fixture : il lit un canon
+        Git minimal (`support.mechanics_canon`, plafond 2), comme en vrai."""
+        root = mechanics_canon(os.path.join(self.tmp, "canon"))
+        return self.env(AMEESH_CANON=root, AMEESH_CANON_REF="HEAD")
 
     def agent(self, name, harness="deepseek", *, status="idle", team="ameesh",
               since_s=2 * HEURE):
@@ -603,6 +604,10 @@ class BalayageTest(_Base):
         for i in range(3):
             lot = self.build(self.lot("cli %d" % i, assignee="dev1"))
         proc = self.mesh("work", "wip")
+        # #2451 : sans canon, le balayage refuse au lieu de supposer un plafond
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("build.max_in_build", proc.stderr)
+        proc = self.mesh("work", "wip", env=self.canon_env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("dry run: nothing written", proc.stdout)
         self.assertEqual(self.builds_of("dev1"), 3)
@@ -698,7 +703,12 @@ class CompteursTest(_Base):
         for i in range(3):
             self.build(self.lot("occupé %d" % i, assignee="dev1"))
         self.build(self.lot("un seul", assignee="dev2"))
+        # #2451 : sans canon, la vue montre l'en-cours sans juger le dépassement
         proc = self.mesh("list")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("§4 cap unknown", proc.stdout)
+        self.assertNotIn("3!", proc.stdout)
+        proc = self.mesh("list", env=self.canon_env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
         lines = proc.stdout.splitlines()
         header = lines[0]

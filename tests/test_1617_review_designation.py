@@ -14,6 +14,9 @@ import unittest
 
 from ameesh import review_designation as rd
 
+#: #2451 : familles explicites ; l'activation passe celles du canon compilé
+FAMILIES = ("claude", "codex", "deepseek")
+
 SHA_A = "a" * 40
 SHA_B = "b" * 40
 SHA_C = "c" * 40
@@ -34,7 +37,7 @@ def row(name, *, team="ameesh", harness="deepseek", session="", status="idle",
 
 
 def candidates(*rows, project="ameesh", loads=None):
-    return rd.candidates_from_registry(rows, project=project, loads=loads)
+    return rd.candidates_from_registry(rows, families=FAMILIES, project=project, loads=loads)
 
 
 class FakePort:
@@ -174,7 +177,7 @@ class SelectionTest(unittest.TestCase):
     """Familles réelles, indépendance, disponibilité, charge, attente."""
 
     def test_two_reviews_go_to_two_distinct_families_outside_the_author(self):
-        picked = rd.select(
+        picked = rd.select(families=FAMILIES,
             required=2,
             authors=[{"name": "mty-amh-impl-02", "family": "deepseek"}],
             candidates=candidates(
@@ -197,11 +200,11 @@ class SelectionTest(unittest.TestCase):
             row("codex-one", harness="codex", session="codex"),
             row("deepseek-one", harness="deepseek", session="deepseek"),
         )
-        one = rd.select(required=1, authors=authors, candidates=pool)
+        one = rd.select(families=FAMILIES, required=1, authors=authors, candidates=pool)
         self.assertEqual(one["state"], rd.DESIGNATED)
         self.assertEqual([r["name"] for r in one["reviewers"]], ["codex-one"])
         # Deux avis hors claude et hors deepseek : la seule famille restante ne suffit pas.
-        two = rd.select(required=2, authors=authors, candidates=pool)
+        two = rd.select(families=FAMILIES, required=2, authors=authors, candidates=pool)
         self.assertEqual(two["state"], rd.WAITING)
         self.assertEqual(two["missing"], 1)
         self.assertEqual(two["reviewers"], [])
@@ -209,7 +212,7 @@ class SelectionTest(unittest.TestCase):
     def test_author_with_unknown_family_waits_instead_of_guessing(self):
         # codex-two est peut-être de la famille réelle de l'auteur : on attend.
         for family in ("", "unknown"):
-            picked = rd.select(
+            picked = rd.select(families=FAMILIES,
                 required=1,
                 authors=[{"name": "codex-one", "family": family}],
                 candidates=candidates(row("codex-one", harness="codex", session="codex"),
@@ -229,7 +232,7 @@ class SelectionTest(unittest.TestCase):
             row("deepseek-ok", harness="deepseek", session="deepseek", status="idle"),
             loads={"claude-stopped": 0, "codex-paused": 0, "claude-busy": 3,
                    "deepseek-ok": 0})
-        picked = rd.select(required=1,
+        picked = rd.select(families=FAMILIES, required=1,
                            authors=[{"name": "impl-02", "family": "deepseek"}],
                            candidates=pool)
         self.assertEqual([r["name"] for r in picked["reviewers"]], ["claude-busy"])
@@ -240,11 +243,11 @@ class SelectionTest(unittest.TestCase):
             row("claude-light", harness="claude", session="claude"),
             row("codex-light", harness="codex", session="codex"),
             loads={"claude-heavy": 7, "claude-light": 1, "codex-light": 1})
-        picked = rd.select(required=1,
+        picked = rd.select(families=FAMILIES, required=1,
                            authors=[{"name": "impl-02", "family": "deepseek"}],
                            candidates=pool)
         self.assertEqual([r["name"] for r in picked["reviewers"]], ["claude-light"])
-        two = rd.select(required=2,
+        two = rd.select(families=FAMILIES, required=2,
                         authors=[{"name": "impl-02", "family": "deepseek"}],
                         candidates=pool)
         self.assertEqual([r["name"] for r in two["reviewers"]], ["claude-light", "codex-light"])
@@ -257,7 +260,7 @@ class SelectionTest(unittest.TestCase):
             row("claude-bis", harness="other", session=""),
             row("veille", harness="deepseek", session="", status="running", team="ameesh"),
         )
-        picked = rd.select(required=1,
+        picked = rd.select(families=FAMILIES, required=1,
                            authors=[{"name": "impl-02", "family": "deepseek"}],
                            candidates=pool)
         # `codex3` tourne sous claude (L242b) : sa famille est claude, pas son nom.
@@ -265,7 +268,7 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(picked["reviewers"][0]["family"], "claude")
 
     def test_waiting_is_explicit(self):
-        picked = rd.select(
+        picked = rd.select(families=FAMILIES,
             required=2,
             authors=[{"name": "impl-02", "family": "deepseek"}],
             candidates=candidates(row("claude-one", harness="claude", session="claude"),
@@ -278,7 +281,7 @@ class SelectionTest(unittest.TestCase):
     def test_required_must_be_zero_one_or_two(self):
         for value in (3, -1, True, "1"):
             with self.subTest(value=value), self.assertRaises(rd.DesignationError):
-                rd.select(required=value, authors=[], candidates=[])
+                rd.select(families=FAMILIES, required=value, authors=[], candidates=[])
 
     def test_project_restricts_to_the_team(self):
         rows = [row("am-1", team="ameesh", harness="claude", session="claude"),
@@ -306,7 +309,7 @@ class NexlinkPolicyTest(unittest.TestCase):
                 row("nx-codex", team="nexlink", harness="codex", session="codex"),
                 row("am-claude", team="ameesh", harness="claude", session="claude")]
         pool = candidates(*rows, project="nexlink")
-        picked = rd.select(required=2,
+        picked = rd.select(families=FAMILIES, required=2,
                            authors=[{"name": "nx-codex", "family": "codex"}],
                            candidates=pool)
         self.assertEqual({r["family"] for r in picked["reviewers"]},
@@ -361,7 +364,7 @@ class ApplyTest(unittest.TestCase):
             # l'appelant collecte ses entrées sur le dernier gel qu'il voit
             latest = self.port.latest_freeze(LOT["id"]) or {}
             args["freeze_sha"] = latest.get("sha") or SHA_A
-        return rd.apply(LOT, **args)
+        return rd.apply(LOT, **dict({"families": FAMILIES}, **args))
 
     def test_an_abbreviated_freeze_is_the_same_head(self):
         # #1775 N1 : un jalon frozen peut porter un SHA abrégé alors que le

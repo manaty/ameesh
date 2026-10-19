@@ -11,7 +11,7 @@ from unittest import mock
 from ameesh import storage, train, train_history, work
 from .support import PgTestCase
 from .test_1467_train import row
-from .test_1467_train_review import author, verdict
+from .test_1467_train_review import RULES, author, verdict
 
 
 class RecordedHistoryTest(unittest.TestCase):
@@ -43,7 +43,7 @@ class RecordedHistoryTest(unittest.TestCase):
         self.provider = types.SimpleNamespace(ProvenanceError=RuntimeError,
             receipt_for_commit=lambda db, sha: self.receipts.get("commit:" + sha),
             receipt_for_milestone=lambda db, mid: self.receipts.get("milestone:%s" % mid))
-        self.history = train_history.Recorded(None, self.path, provider=self.provider)
+        self.history = train_history.Recorded(None, self.path, provider=self.provider, review_rules=RULES)
 
     def git(self, *args):
         return subprocess.check_output(["git", "-C", self.path, *args],
@@ -95,7 +95,7 @@ class RecordedHistoryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as clone:
             subprocess.run(["git", "clone", "-q", "--depth", "1", "file://" + self.path,
                             clone], check=True, capture_output=True)
-            history = train_history.Recorded(None, clone, provider=self.provider)
+            history = train_history.Recorded(None, clone, provider=self.provider, review_rules=RULES)
             with self.assertRaisesRegex(train.TrainError, "shallow clone refused"):
                 history.qualify(self.entry, self.base, required=2)
 

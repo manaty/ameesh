@@ -17,11 +17,13 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 import uuid
 
 from ameesh import config as config_mod
 from ameesh import db as db_mod
 from ameesh import migrations
+from ameesh import work as work_mod
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(REPO, "src")
@@ -345,6 +347,25 @@ def noter_tables(cls) -> None:
               file=sys.stderr)
 
 
+#: #2451 : plafond §4 de fixture pour les tests en processus. Le plafond réel
+#: vient du canon compilé (`work.build_limit`) ; sa lecture est couverte par
+#: test_2451_canon_consommateurs, et un test en sous-processus pointe
+#: `AMEESH_CANON` vers `mechanics_canon()`.
+FIXTURE_BUILD_CAP = 2
+
+
+def mechanics_canon(root: str) -> str:
+    """Un canon Git minimal portant `processus/mecanique.yaml` (#2451).
+
+    Le document et la fédération sont ceux de test_l1616_mechanics (plafond 2,
+    familles claude/codex/deepseek) ; `members: []` en fait une racine de
+    canon chargeable par `canon.load_configured` (AMEESH_CANON + _REF=HEAD)."""
+    from .test_l1616_mechanics import FEDERATION, _Repo
+    os.makedirs(root, exist_ok=True)
+    _Repo(root, federation_text=FEDERATION + "members: []\n")
+    return root
+
+
 class PgTestCase(unittest.TestCase):
     """Base : un schéma migré, un bac à sable disque, des utilitaires CLI."""
 
@@ -398,6 +419,9 @@ class PgTestCase(unittest.TestCase):
     # -- utilitaires -------------------------------------------------------
     def setUp(self) -> None:
         """Chaque test part d'une base et d'un disque propres."""
+        cap = mock.patch.object(work_mod, "build_limit", return_value=FIXTURE_BUILD_CAP)
+        cap.start()
+        self.addCleanup(cap.stop)
         self.db.execute(
             "TRUNCATE agent_registry, key_holders, key_events, agent_mailbox, mesh_approvals, "
             "work_items, work_item_events, work_item_milestones, work_packages, "

@@ -14,6 +14,9 @@ from __future__ import annotations
 import unittest
 
 from ameesh import review_designation as rd
+
+#: #2451 : familles explicites ; l'activation passe celles du canon compilé
+FAMILIES = ("claude", "codex", "deepseek")
 from ameesh import review_designation_pg as pg
 from ameesh import registry, storage, work
 
@@ -88,7 +91,7 @@ class Test1617ReviewDesignationPg(PgTestCase):
         if freeze_sha is None:
             # l'appelant collecte ses entrées sur le dernier gel qu'il voit
             freeze_sha = (pg.PgPort(self.db).latest_freeze(self.lot) or {}).get("sha", "")
-        return rd.apply(dict(self.item, state="build"), policy=policy, paths=list(paths),
+        return rd.apply(dict(self.item, state="build"), families=FAMILIES, policy=policy, paths=list(paths),
                         port=port, freeze_sha=freeze_sha,
                         authors=authors or [{"name": "author", "family": "deepseek"}],
                         candidates=candidates, risk=risk, base="c" * 40,
@@ -387,7 +390,7 @@ class Test1617FrozenHook(PgTestCase):
     def designated(self, tx, milestone, threads):
         """Le raccord réel : le port écrit dans la transaction du jalon."""
         return rd.apply(
-            dict(self.item, state="build"), policy=RULES,
+            dict(self.item, state="build"), families=FAMILIES, policy=RULES,
             paths=["src/ameesh/db.py"], port=pg.PgPort(tx, after_commit=threads),
             freeze_sha=milestone["sha"],  # les entrées valent pour CE gel
             authors=[{"name": "author", "family": "deepseek"}],
@@ -450,7 +453,7 @@ class Test1617FrozenHook(PgTestCase):
         """Gel par le hook sans relecteur désignable, notifiant `notify`."""
         def hook(tx, milestone, threads):
             seen["out"] = rd.apply(
-                dict(self.item, state="build"), policy=RULES,
+                dict(self.item, state="build"), families=FAMILIES, policy=RULES,
                 paths=["src/ameesh/db.py"], port=pg.PgPort(tx, after_commit=threads),
                 freeze_sha=milestone["sha"],
                 authors=[{"name": "author", "family": "deepseek"}], candidates=[],
