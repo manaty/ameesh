@@ -829,6 +829,20 @@ def light_reviews_at(repo: str, commit: str) -> int:
     return load_global(repo, commit).light_reviews
 
 
+@functools.lru_cache(maxsize=256)
+def review_flags_at(repo: str, commit: str) -> tuple[bool, bool]:
+    """Les drapeaux `reviews` au commit exact (#2726).
+
+    `(exclude_author_family, distinct_families)`, lus dans le même document
+    `mechanismes` que le plancher léger et la politique de classe. Le lecteur
+    de classe les porte dans `klass` ; la porte de fusion et le train les
+    appliquent au lieu de supposer un repli. `MechanicsAbsent` et
+    `MechanicsError` remontent tels quels, comme `light_reviews_at`.
+    """
+    document = load_global(repo, commit)
+    return document.exclude_author_family, document.distinct_families
+
+
 def _federation(repo: str, commit: str) -> dict:
     try:
         parsed = canon.load_yaml(_regular_blob(repo, commit, FEDERATION_PATH),

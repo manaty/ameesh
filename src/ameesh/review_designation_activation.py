@@ -661,6 +661,23 @@ def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
             if str(value).strip() and str(value).strip() != author}
 
 
+def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
+                        repo: str, base: str, head: str, *, families=()) -> tuple[list, list, list]:
+    """`(auteurs, inconnus, correcteurs)` de la plage gelée `base..head` (#2681/#2739).
+
+    La même lecture partagée que la désignation (`review_authors.reading`),
+    offerte à la porte de fusion : quand l'appelant ne passe pas les auteurs,
+    elle les lit elle-même sur la plage exacte et exclut tous les auteurs
+    reconnus, pas seulement l'assigné (#2726). `milestone` est le gel du lot
+    quand la tête est celle-là ; il laisse `_designated_reviewers` reconnaître
+    un correcteur retiré par une désignation ultérieure. Ne lève pas sur un
+    inconnu : l'appelant décide (la porte refuse fermé, le train lève).
+    """
+    _start, _paths, commits = _range(repo, base, head)
+    return review_authors.reading(db, item, milestone, commits, repo,
+                                  families=families)
+
+
 def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
                         repo: str, base: str, head: str, *, families=()) -> list:
     """The designated reviewers' small first-round corrections of `base..head`.
@@ -672,9 +689,8 @@ def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
     designation. The caller (the merge gate) handles an unreadable range as it
     must; this reader invents no name.
     """
-    _start, _paths, commits = _range(repo, base, head)
-    _authors_, unknown, correctors = review_authors.reading(
-        db, item, milestone, commits, repo, families=families)
+    _authors, unknown, correctors = attribution_of_head(
+        db, item, milestone, repo, base, head, families=families)
     if unknown:
         raise ActivationError("author provenance unknown for frozen commit(s): %s"
                               % ", ".join(unknown))

@@ -225,6 +225,38 @@ def _light_reviews(canons) -> tuple[int, str]:
     return value, ""
 
 
+def _review_flags(canons) -> tuple[bool, bool, str]:
+    """Les drapeaux d'avis du canon compilé, au même commit que la classe (#2726).
+
+    `reviews.exclude_author_family` et `reviews.distinct_families` sont lus par
+    le lecteur strict `mechanics` : la porte de fusion et le train les
+    appliquent, ils ne sont pas recopiés ici. Le plus strict l'emporte entre
+    canons : une exclusion demandée par un canon s'applique, et une double
+    famille n'est levée que si tous les documents la lèvent. Rend
+    `(exclude, distinct, problème)` : sans document mécanique (canon
+    antérieur), le repli est le comportement historique (pas d'exclusion de
+    famille, deux familles distinctes) ; un document présent et illisible rend
+    un problème que l'appelant traduit en doute, jamais en repli rassurant.
+    """
+    from . import mechanics
+    exclude, distinct = False, True
+    for canon in canons or ():
+        for source in getattr(canon, "sources", ()) or ():
+            if (getattr(source, "mode", "") != "git" or not source.repo
+                    or not source.commit or getattr(source, "prefix", "")):
+                continue
+            try:
+                declared_exclude, declared_distinct = mechanics.review_flags_at(
+                    source.repo, source.commit)
+            except mechanics.MechanicsAbsent:
+                continue
+            except mechanics.MechanicsError as exc:
+                return True, True, str(exc)
+            exclude = exclude or declared_exclude
+            distinct = distinct and declared_distinct
+    return exclude, distinct, ""
+
+
 def _train_reviews(federation, project: Optional[str], paths) -> tuple[int, str]:
     """Le nombre d'avis déclaré par chemin (`train_reviews`, PR85).
 
@@ -286,7 +318,8 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
     """La classe des `paths` pour `project`, lue dans tous les canons.
 
     Rend `{class, why, files, policy_ref, doubt, project, light_reviews,
-    train_reviews}` ; une politique illisible, un projet que **aucun** canon
+    train_reviews, exclude_author_family, distinct_families}` ; une politique
+    illisible, un projet que **aucun** canon
     ne déclare (sans repli déclaré) ou des chemins inclassables rendent
     `sensitive` avec `doubt` — jamais une classe rassurante par défaut. Un
     canon qui déclare d'autres projets sans repli ne dit rien de celui-ci : il
@@ -295,16 +328,27 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
     `light`, le plancher ne reclasse pas. `train_reviews` est le plus grand
     nombre d'avis déclaré par chemin (`train_reviews`, #2696) : la porte et
     `paquet-candidats` lisent le même nombre que la désignation au gel.
+    `exclude_author_family` et `distinct_families` sont les drapeaux compilés
+    du canon (#2726) : la porte exclut la famille d'un auteur et la double
+    famille au compte d'avis requis au lieu de supposer un repli.
     `project` permet à la porte de n'appliquer ses motifs de secours qu'au
     projet ameesh, dont ils décrivent les chemins (#2696, cas pilote Nexlink).
     """
     canons = tuple(canons or ())
     light_reviews, light_problem = _light_reviews(canons)
+    exclude_author_family, distinct_families, flags_problem = _review_flags(canons)
     if light_problem:
         return {"class": SENSITIVE, "files": _doubtful_files(paths),
                 "policy_ref": "", "doubt": True, "project": project or "",
                 "light_reviews": light_reviews, "train_reviews": 0,
+                "exclude_author_family": True, "distinct_families": True,
                 "why": "review light floor unreadable: %s" % light_problem}
+    if flags_problem:
+        return {"class": SENSITIVE, "files": _doubtful_files(paths),
+                "policy_ref": "", "doubt": True, "project": project or "",
+                "light_reviews": light_reviews, "train_reviews": 0,
+                "exclude_author_family": True, "distinct_families": True,
+                "why": "review flags unreadable: %s" % flags_problem}
     worst, why, files, ref = LIGHT, "", [], ""
     critical_paths = set()
     files_by_path = {}
@@ -324,6 +368,8 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
                     "project": project or "",
                     "light_reviews": light_reviews,
                     "train_reviews": train_reviews,
+                    "exclude_author_family": exclude_author_family,
+                    "distinct_families": distinct_families,
                     "why": "review policy unreadable (%s): %s"
                            % (root or "canon", errors[0][2])}
         covered = True
@@ -335,6 +381,8 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
                     "project": project or "",
                     "light_reviews": light_reviews,
                     "train_reviews": train_reviews,
+                    "exclude_author_family": exclude_author_family,
+                    "distinct_families": distinct_families,
                     "why": "cannot classify the change: %s" % exc}
         declared, declared_problem = _train_reviews(
             federation, project, [entry["path"] for entry in result["files"]])
@@ -344,6 +392,8 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
                     "project": project or "",
                     "light_reviews": light_reviews,
                     "train_reviews": train_reviews,
+                    "exclude_author_family": exclude_author_family,
+                    "distinct_families": distinct_families,
                     "why": "review train counts unreadable (%s): %s"
                            % (root or "canon", declared_problem)}
         train_reviews = max(train_reviews, declared)
@@ -365,6 +415,8 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
         return {"class": SENSITIVE, "files": _doubtful_files(paths), "policy_ref": "",
                 "doubt": True, "project": project or "", "light_reviews": light_reviews,
                 "train_reviews": 0,
+                "exclude_author_family": exclude_author_family,
+                "distinct_families": distinct_families,
                 "why": "project %r is not declared by any canon (no fallback policy)"
                        % (project,)}
     # Le maximum du lot ne suffit pas : une exception de la porte (Markdown
@@ -375,7 +427,9 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
             entry["critical"] = True
     return {"class": worst, "why": why, "files": files, "policy_ref": ref,
             "doubt": False, "project": project or "", "light_reviews": light_reviews,
-            "train_reviews": train_reviews}
+            "train_reviews": train_reviews,
+            "exclude_author_family": exclude_author_family,
+            "distinct_families": distinct_families}
 
 
 def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
@@ -394,13 +448,15 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     l'appelant. Rend aussi `files`, `policy_ref`, `target`, `frozen_sha`,
     `why` et `doubt` (vrai quand la classe vient d'une lecture impossible, pas
     d'une politique), `light_reviews` (le plancher d'avis d'un lot léger,
-    #2642) et `train_reviews` avec `project` (le barème par chemin et le
-    projet qui décide du repli de la porte, #2696) pour la trace.
+    #2642), `train_reviews` avec `project` (le barème par chemin et le
+    projet qui décide du repli de la porte, #2696) et les drapeaux compilés
+    `exclude_author_family` / `distinct_families` (#2726) pour la trace.
     """
     out: dict = {"lot": int(lot), "class": SENSITIVE, "why": "", "files": [],
                  "policy_ref": "", "repo": repo or "", "target": base or "",
                  "base_sha": "", "frozen_sha": head or "", "doubt": True,
-                 "project": ""}
+                 "project": "", "exclude_author_family": False,
+                 "distinct_families": True}
     row = item if item is not None else work.get(db, lot)
     if row is None:
         out["why"] = "lot #%d not found" % lot

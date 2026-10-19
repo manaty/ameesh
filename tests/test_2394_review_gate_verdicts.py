@@ -141,7 +141,9 @@ class ClassReaderTest(unittest.TestCase):
         canon = types.SimpleNamespace(root="fixture", sources=[source], federation={
             "review_policies": {"risk_classes": {"projects": {"ameesh": {
                 "default": "light", "rules": []}}}}})
-        with mock.patch.object(mechanics, "light_reviews_at", return_value=1):
+        with mock.patch.object(mechanics, "light_reviews_at", return_value=1), \
+                mock.patch.object(mechanics, "review_flags_at",
+                                  return_value=(False, True)):
             klass = lot_class.class_of_paths([canon], "ameesh", ["docs/x.md"])
         self.assertEqual(klass["class"], "light")
         self.assertFalse(klass["doubt"])
@@ -155,7 +157,9 @@ class ClassReaderTest(unittest.TestCase):
             "review_policies": {"risk_classes": {"projects": {"ameesh": {
                 "default": "light", "rules": []}}}}})
         with mock.patch.object(mechanics, "light_reviews_at",
-                               side_effect=mechanics.MechanicsError("bad doc")):
+                               side_effect=mechanics.MechanicsError("bad doc")), \
+                mock.patch.object(mechanics, "review_flags_at",
+                                  return_value=(False, True)):
             klass = lot_class.class_of_paths([canon], "ameesh", ["docs/x.md"])
         self.assertTrue(klass["doubt"])
         self.assertEqual(klass["class"], "sensitive")
