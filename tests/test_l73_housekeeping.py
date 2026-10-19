@@ -999,9 +999,7 @@ class MenageDbTest(PgTestCase):
         registry.upsert(self.db, "a1", harness="claude", host="pc")
         systeme = os.path.join(self.tmp, "tmp-systeme")
         os.makedirs(systeme)
-        old = os.environ.get("AMEESH_SYSTEM_TMP")
-        os.environ["AMEESH_SYSTEM_TMP"] = systeme
-        self.addCleanup(lambda: os.environ.__setitem__("AMEESH_SYSTEM_TMP", old or ""))
+        _pose_system_tmp(self, systeme)
         main = _repo(self.tmp)
         root = os.path.join(systeme, "nu")
         os.makedirs(root)
@@ -1062,9 +1060,7 @@ class MenageDbTest(PgTestCase):
         registry.upsert(self.db, "a1", harness="claude", host="pc")
         systeme = os.path.join(self.tmp, "tmp-systeme")
         os.makedirs(systeme)
-        old = os.environ.get("AMEESH_SYSTEM_TMP")
-        os.environ["AMEESH_SYSTEM_TMP"] = systeme
-        self.addCleanup(lambda: os.environ.__setitem__("AMEESH_SYSTEM_TMP", old or ""))
+        _pose_system_tmp(self, systeme)
         _repo(self.tmp)
         root = os.path.join(systeme, "imbrique")
         os.makedirs(root)
@@ -1095,9 +1091,7 @@ class MenageDbTest(PgTestCase):
         registry.upsert(self.db, "a1", harness="claude", host="pc")
         systeme = os.path.join(self.tmp, "tmp-systeme")
         os.makedirs(systeme)
-        old = os.environ.get("AMEESH_SYSTEM_TMP")
-        os.environ["AMEESH_SYSTEM_TMP"] = systeme
-        self.addCleanup(lambda: os.environ.__setitem__("AMEESH_SYSTEM_TMP", old or ""))
+        _pose_system_tmp(self, systeme)
         _repo(self.tmp)
         root = os.path.join(systeme, "imbrique-propre")
         os.makedirs(root)

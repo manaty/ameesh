@@ -2011,12 +2011,24 @@ class AgentWorker(threading.Thread):
            lui ; plusieurs lots distincts = ambigu, None.
         2. Sinon, l'unique lot ouvert assigné à l'agent ; plusieurs = None.
         Un tour dont le lot est inconnu ne déclenche jamais de rotation.
+
+        #2527 : un message seulement informatif (`_informative_message`) ne
+        porte pas le lot du tour : un avis sur le lot d'un autre n'ouvre ni
+        ne met de côté aucune session.
         """
         ops = storage.of(self.db).operations
         try:
             ids = [int(i) for i in spec.get("ids") or []]
-            if ids:
+            rows = spec.get("rows") or []
+            if rows:
+                utiles = [r for r in rows if not self._informative_message(r)]
+                if not utiles:
+                    return None   # que des avis : le tour reste où il est
+                lots = sorted({str(r.get("work_item_id") or "").strip()
+                               for r in utiles} - {""})
+            elif ids:
                 lots = ops.message_lots(ids)
+            if rows or ids:
                 if len(lots) == 1:
                     return lots[0]
                 if len(lots) > 1:
@@ -2033,6 +2045,19 @@ class AgentWorker(threading.Thread):
         if len(actifs) == 1:
             return str(actifs[0]["id"])
         return None
+
+    def _informative_message(self, row: dict) -> bool:
+        """#2527 : ce message n'est qu'un avis, il ne choisit pas le lot du
+        tour — message passif (L125 : accusé, copie, diffusion, radar…) ou
+        avis d'une prise automatique (L165) d'un lot par un AUTRE agent. Les
+        vrais échanges sur un lot (consigne, feu, CI, verdict) gardent la
+        rotation."""
+        if mail.passive_reason(row):
+            return True
+        payload = mail.message_payload(row)
+        prise = payload.get("lot_take") if isinstance(payload, dict) else None
+        return (mail.is_event(row) and isinstance(prise, dict)
+                and str(prise.get("agent") or "") != self.name)
 
     def _note_delegate_turn(self, spec: dict) -> None:
         """L40 (0030) : le tour qui commence compte pour les lots délégués à
@@ -9431,14 +9456,18 @@ class Runner:
                     pass
 
     def account_claims_once(self) -> None:
-        """#313 (décision 0033) : revendique, dans le registre de l'hôte, les
-        identifiants des comptes de cette configuration, puis journalise ceux
-        qu'un autre mesh de l'hôte déclare aussi — au premier passage, puis à
-        chaque changement. Ne lève jamais."""
+        """#313/#2580 (décision 0033) : revendique, dans le registre de
+        l'hôte, les identifiants des comptes de cette configuration, puis
+        journalise ceux qu'un autre mesh de l'hôte déclare aussi — au premier
+        passage, puis à chaque changement. Ne lève jamais."""
         from . import account_claims
         try:
-            account_claims.refresh(self.cfg)
-            partages = account_claims.shared(self.cfg)
+            if not account_claims.refresh(self.cfg, db=self.db):
+                log_async("mesh identity unreadable from the database: provider "
+                          "accounts of this configuration are not claimed on the "
+                          "host, a shared account would not be detected")
+                return
+            partages = account_claims.shared(self.cfg, db=self.db)
         except (OSError, ValueError) as exc:
             log_async("account registry of this host unusable (%s): a provider "
                       "account declared by another mesh is not detected" % exc)
@@ -9448,13 +9477,14 @@ class Runner:
         if vus == getattr(self, "_accounts_shared", None):
             return
         self._accounts_shared = vus
-        strict = account_claims.policy(self.cfg) == "strict"
+        strict = account_claims.refuses(self.cfg)
         for harness, account, others in sorted(vus):
             log_async("%s account %s: credentials also declared by another mesh of "
                       "this host: %s — decision 0033, one organisation per account; "
                       "%s" % (harness, account, others,
-                              "refused here (account_sharing: strict)" if strict
-                              else "reported only (account_sharing: report)"))
+                              "refused here (%s)" % account_claims.policy_name(self.cfg)
+                              if strict else
+                              "reported only (accounts_shared: report)"))
 
     def start_account_claims(self) -> threading.Thread | None:
         """#313 : revendications au démarrage, puis toutes les

@@ -212,7 +212,6 @@ BLOCKING_B = re.compile(r"(?:^|[\s\[(\"«])B[0-9]*\b")
 SENSITIVE_P2 = re.compile(r"p2[^.;\n]{0,30}sensible|sensible[^.;\n]{0,30}p2", re.I)
 #: a review-after-merge lot is the rule, not a review follow-up
 REVIEW_LOT_TITLE = re.compile(r"^\s*revue\s*#", re.I)
-REVIEW_REF = "review-after-merge:"
 
 
 def followup_hint(*, title: str, source: str = "", issue_ref: str = "",
@@ -246,7 +245,11 @@ def followup_hint(*, title: str, source: str = "", issue_ref: str = "",
     text = " ".join([str(title or ""), str(source or "")]).strip()
     if not text:
         return ""
-    if str(issue_ref or "").startswith(REVIEW_REF) \
+    # #2560 : la référence de relecture se lit comme partout ailleurs
+    # (`review_lot.review_ref`) : issue_ref d'abord, puis la source des lots
+    # historiques (#1218, #1231, #1269) qui ne l'ont que là.
+    from . import review_lot
+    if review_lot.review_ref({"issue_ref": issue_ref, "source": source}) \
             or REVIEW_LOT_TITLE.search(str(title or "")):
         return ""                       # the review-after-merge lot is the rule
     # A suite-of-**tests** phrase must not serve as a marker: it is neutralised,
