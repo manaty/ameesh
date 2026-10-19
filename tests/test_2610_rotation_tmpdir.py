@@ -60,6 +60,37 @@ class RotationTmpdirTest(PgTestCase):
         finally:
             worker.watchdog_stop.set()
 
+    def test_une_session_inconnue_apres_resume_non_produit_garde_le_tmpdir(self):
+        """#2619 : quand le résumé de rotation n'a pas pu être produit et que
+        la session est perdue, le brief `ameesh` qui ouvre la suite continue le
+        MÊME travail ; il ne vide pas le dossier temporaire. Seule une vraie
+        session neuve le vide."""
+        worker = self._worker()
+        env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log}
+        try:
+            with mock.patch.dict(os.environ, env, clear=False):
+                self.assertTrue(worker.run_turn(
+                    {"kind": "prompt", "prompt": "premier tour", "ids": []}))
+                tmp = menage.turn_env(
+                    worker.cfg, worker.runner.housekeeping_policy(), worker.name,
+                    {})["TMPDIR"]
+                temoin = os.path.join(tmp, "analyse-en-cours.md")
+                with open(temoin, "w", encoding="utf-8") as fh:
+                    fh.write("travail en cours, gardé dans $TMPDIR")
+                perdue = worker.current_session()
+                # le harnais ne connaît plus la session (résumé non produit) :
+                # le brief déterministe ouvre la suite, sans nouvelle session
+                worker._ecarte_session_inconnue(perdue, connue=None)
+                self.assertTrue(worker.run_turn(
+                    {"kind": "prompt", "prompt": "suite du travail", "ids": []}))
+                self.assertTrue(
+                    os.path.exists(temoin),
+                    "le brief de continuation a vidé le dossier temporaire")
+                self.assertEqual(worker.resume_origin, "ameesh")
+                self.assertFalse(worker.resume_continuation)
+        finally:
+            worker.watchdog_stop.set()
+
 
 if __name__ == "__main__":
     unittest.main()

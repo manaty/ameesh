@@ -343,6 +343,9 @@ ameesh attach <agent> [--wait] [--ttl S] [--max 2h]  # bounded native session (L
 The runner finishes its turn (`--wait`), puts the resident to sleep, then
 hands over the lease. A second attach is refused. Closing the native session
 returns the lease; pending inputs wake the resident on the same session.
+A harness that declares no interactive session is refused before the lease is
+taken — DeepSeek/dsh is headless-only (`dsh --profile agent` requires a task),
+so `ameesh attach` and `ameesh chat` are unavailable for it (#2706).
 The interactive session ends after two hours by default; `--max 30m` or
 `--max 4h` changes that limit. A notice precedes expiry (exit code 124), and
 inputs waiting more than ten minutes produce an alert without being consumed.

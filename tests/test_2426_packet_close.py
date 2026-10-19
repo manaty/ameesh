@@ -170,6 +170,18 @@ class PacketCloseTest(_PlanDb):
             % first["id"])
         self.assertEqual(self.sync()["results"][0]["result"], "merged")
 
+    def test_2744_un_lot_blocked_n_est_pas_ferme_par_le_paquet(self):
+        """#2744 : une unité bloquée garde sa fermeture, le contenu du paquet
+        n'est qu'une preuve de livraison."""
+        first = self.item("unité bloquée")
+        [unit] = self.package([first])
+        self.freeze(first, unit["source"])
+        work.move(self.db, first["id"], "blocked", note="passe réelle due",
+                  actor="dev-a")
+        report = self.by_lot(self.sync())
+        self.assertEqual(report[first["id"]]["result"], "withheld")
+        self.assertEqual(work.get(self.db, first["id"])["state"], "blocked")
+
     def test_une_ligne_de_retrait_ne_ferme_pas(self):
         first, second = self.item("livrée"), self.item("reportée")
         units = self.package([first, second], withdrawn={second["id"]})

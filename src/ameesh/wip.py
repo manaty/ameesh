@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Limite d'en-cours (§4 du canon, owner 14/10/2026) : au plus
-`work.BUILD_LIMIT` lots en `build` par agent.
+`work.build_limit(cfg)` lots en `build` par agent — `build.max_in_build` du
+canon compilé (#2451) ; sans lui, le balayage refuse au lieu de supposer.
 
   ameesh work wip [--apply] [--limit N] [--json] [--actor A]
   ameesh work return <id> [--reason T] [--actor A]
@@ -62,7 +63,7 @@ DEFAULT_MAX_RETURNS = 10
 RETURN_NOTE = work.RETURN_NOTE
 
 
-def return_message(item: dict, held: int) -> str:
+def return_message(item: dict, held: int, cap: int) -> str:
     """Le courrier à l'agent dont un lot retourne à la file."""
     branch = (item.get("branch") or "").strip()
     head = (item.get("branch_head") or "").strip()
@@ -77,7 +78,7 @@ def return_message(item: dict, held: int) -> str:
             "You can hand a lot back yourself: ameesh work return <id>.\n"
             "If the pilot wants you to keep it, the exception is explicit: ameesh work "
             "assign %d %s --wip-exception \"why\"." % (
-                int(item["id"]), int(held), work.BUILD_LIMIT, kept,
+                int(item["id"]), int(held), int(cap), kept,
                 int(item["id"]), item.get("assignee") or "you"))
 
 
@@ -101,12 +102,17 @@ def sweep(cfg, db: Db, *, dry_run: bool = False, limit: int = DEFAULT_MAX_RETURN
     encore le plafond en lots sans exception. Un lot qui a bougé, une exception
     posée entre la lecture et l'écriture ou un agent redescendu au plafond par
     un balayage concurrent ne rendent donc rien ; un lot déjà rendu (ou repris
-    entre-temps) ne compte pas."""
+    entre-temps) ne compte pas.
+
+    Le plafond vient du canon compilé (`work.build_limit`) ; sans document
+    lisible, `mechanics.MechanicsError` remonte avant toute lecture ou
+    écriture."""
     from . import mail
 
     out: list = []
     if limit is not None and int(limit) <= 0:
         return out
+    cap = work.build_limit(cfg)
     st = storage.of(db)
     builds: dict = {}
     for row in st.operations.build_lots_activity(None):
@@ -116,12 +122,12 @@ def sweep(cfg, db: Db, *, dry_run: bool = False, limit: int = DEFAULT_MAX_RETURN
         builds.setdefault(assignee, []).append(row)
     for agent in sorted(builds):
         lots = builds[agent]
-        if len(lots) <= work.BUILD_LIMIT:
+        if len(lots) <= cap:
             continue
         excepted = set(st.work.wip_exceptions([int(l["id"]) for l in lots],
                                               work.WIP_EXCEPTION_MARK, work.ASSIGN_NOTES))
         free = [l for l in lots if int(l["id"]) not in excepted]
-        excess = len(free) - work.BUILD_LIMIT
+        excess = len(free) - cap
         if excess <= 0:
             continue
         free.sort(key=lambda l: (_activity(l), int(l["id"])))
@@ -140,22 +146,22 @@ def sweep(cfg, db: Db, *, dry_run: bool = False, limit: int = DEFAULT_MAX_RETURN
                             "dry_run": True, "activity_ts": _activity(row)})
                 continue
             note = ("%s by %s (§4: %d lots in build, at most %d kept) — least recently "
-                    "active" % (RETURN_NOTE, actor, len(lots), work.BUILD_LIMIT))
+                    "active" % (RETURN_NOTE, actor, len(lots), cap))
             done = st.work.unassign_surplus(int(item["id"]), current=agent,
                                             marker=work.WIP_EXCEPTION_MARK,
                                             prefixes=work.ASSIGN_NOTES,
-                                            max_build=work.BUILD_LIMIT,
+                                            max_build=cap,
                                             note=note, actor=actor)
             if done is None:            # lot bougé, exception, ou plus de surplus
-                if st.work.count_builds(agent) <= work.BUILD_LIMIT:
+                if st.work.count_builds(agent) <= cap:
                     break               # l'agent est redescendu au plafond
                 continue
             rendus += 1
             message_id = mail.send(
-                db, SENDER, agent, return_message(done, len(lots)), kind="event",
+                db, SENDER, agent, return_message(done, len(lots), cap), kind="event",
                 work_item_id=str(done["id"]),
                 payload={"wip_return": {"lot": int(done["id"]), "agent": agent,
-                                        "limit": work.BUILD_LIMIT,
+                                        "limit": cap,
                                         "activity_ts": _activity(row)}})
             out.append({"item": done, "agent": agent, "message_id": message_id,
                         "dry_run": False, "activity_ts": _activity(row)})
@@ -179,8 +185,9 @@ def notify_settings(args) -> dict | None:
 
 def add_parsers(work_sub, func) -> None:
     p = work_sub.add_parser(
-        "wip", help="WIP limit (§4 canon): at most %d lots in build per agent, "
-                    "surplus returned to the team queue" % work.BUILD_LIMIT)
+        "wip", help="WIP limit (§4 canon): lots in build per agent capped by the "
+                    "compiled canon (build.max_in_build), surplus returned to the "
+                    "team queue")
     p.add_argument("--apply", action="store_true",
                    help="return the lots (default: dry run, nothing written)")
     p.add_argument("--limit", type=int, default=DEFAULT_MAX_RETURNS,
@@ -217,13 +224,19 @@ def run(db: Db, args, cfg=None) -> int:
               "(ameesh work list --state build)")
         return 0
     limit = int(getattr(args, "limit", DEFAULT_MAX_RETURNS) or 0)
-    rows = sweep(cfg, db, dry_run=not args.apply, limit=limit,
-                 actor=args.actor or SENDER)
+    from . import mechanics
+    try:
+        rows = sweep(cfg, db, dry_run=not args.apply, limit=limit,
+                     actor=args.actor or SENDER)
+    except mechanics.MechanicsError as exc:
+        print("error: WIP cap unavailable (§4, build.max_in_build): %s" % exc,
+              file=sys.stderr)
+        return 1
     if args.json:
         print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
         return 0
     if not rows:
-        print("WIP: no lot beyond %d in build" % work.BUILD_LIMIT)
+        print("WIP: no lot beyond the canon cap in build")
         return 0
     now = time.time()
     for row in rows:

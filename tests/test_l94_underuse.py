@@ -67,25 +67,26 @@ class PlanUnderusedTest(_Base):
                       "plan_underused")
 
     def test_sous_rythme_sur_sept_jours(self):
-        # 3 jours écoulés sur 7 : rythme permis 53 % ; 20 % utilisés → écart 33
-        self.jauge("codex", "codex-10080min", 0.20, 4 * JOUR, 7 * JOUR, account="primaire")
+        # 3 jours écoulés sur 7 : rythme permis 53 %, moins les 10 points de
+        # réserve des non-critiques = 43 % ; 10 % utilisés → écart 33
+        self.jauge("codex", "codex-10080min", 0.10, 4 * JOUR, 7 * JOUR, account="primaire")
         self.jauge("codex", "codex-10080min", 0.45, 4 * JOUR, 7 * JOUR, account="secondaire")
         out = self.alertes()
         self.assertEqual([(a["account"], a["reason"]) for a in out],
                          [("primaire", "sous_rythme")])
         alerte = out[0]
         self.assertEqual((alerte["harness"], alerte["gauge"], alerte["value"]),
-                         ("codex", "codex-10080min", 80))
-        self.assertAlmostEqual(alerte["lost"], 0.8)
-        self.assertAlmostEqual(alerte["pace_cap"], 3 / 7 + 0.10, places=2)
-        # la projection au rythme actuel : 20 % en 3/7 → 47 % à l'échéance
-        self.assertAlmostEqual(alerte["lost_at_pace"], 1 - 0.2 * 7 / 3, places=2)
+                         ("codex", "codex-10080min", 90))
+        self.assertAlmostEqual(alerte["lost"], 0.9)
+        self.assertAlmostEqual(alerte["pace_cap"], 3 / 7, places=2)
+        # la projection au rythme actuel : 10 % en 3/7 → 23 % à l'échéance
+        self.assertAlmostEqual(alerte["lost_at_pace"], 1 - 0.1 * 7 / 3, places=2)
         self.assertIn("estimated loss", alerte["detail"])
-        self.assertIn("projected loss 53 %", alerte["detail"])
+        self.assertIn("projected loss 77 %", alerte["detail"])
         # `since` : le début de la fenêtre — stable tant qu'elle dure
         self.assertAlmostEqual(alerte["since"], self.now + 4 * JOUR - 7 * JOUR, places=0)
         # seuil réglable, et 0 désactive
-        self.assertEqual(self.alertes(plan_pace_gap_pct=60), [])
+        self.assertEqual(self.alertes(plan_pace_gap_pct=80), [])
         self.assertEqual(self.alertes(plan_pace_gap_pct=0), [])
 
     def test_le_multiplicateur_ne_change_pas_la_projection_reelle(self):
@@ -107,7 +108,10 @@ class PlanUnderusedTest(_Base):
 
     def test_fin_de_fenetre(self):
         self.jauge("claude", "five_hour", 0.10, 30 * 60, 5 * HEURE, account="primaire")
-        self.jauge("claude", "seven_day", 0.70, 2 * JOUR, 7 * JOUR, account="primaire")
+        # 5/7 écoulés : la réserve des non-critiques plafonne le rythme à 71 %.
+        # 60 % laissent la fenêtre de 5 h utilisable sans alerte de sous-rythme
+        # (écart 11 points, sous le seuil de 25) ; 70 % la bloqueraient.
+        self.jauge("claude", "seven_day", 0.60, 2 * JOUR, 7 * JOUR, account="primaire")
         out = self.alertes()
         self.assertEqual([(a["gauge"], a["reason"]) for a in out],
                          [("five_hour", "fin_de_fenetre")])
@@ -141,7 +145,7 @@ class PlanUnderusedTest(_Base):
         # relevé sans compte d'un harnais qui a des comptes : c'est le défaut,
         # déjà compté
         self.jauge("codex", "codex-10080min", 0.20, 4 * JOUR, 7 * JOUR)
-        self.jauge("codex", "codex-10080min", 0.20, 4 * JOUR, 7 * JOUR, account="primaire")
+        self.jauge("codex", "codex-10080min", 0.10, 4 * JOUR, 7 * JOUR, account="primaire")
         self.assertEqual([a["account"] for a in self.alertes()], ["primaire"])
 
     def test_sans_comptes_et_contexte(self):
@@ -190,7 +194,7 @@ class PlanUnderusedTest(_Base):
         self.assertIn("about $12.50 estimated per token over 24 h", alerte["detail"])
 
     def test_cle_de_dedoublonnage_par_compte(self):
-        self.jauge("codex", "codex-10080min", 0.20, 4 * JOUR, 7 * JOUR, account="primaire")
+        self.jauge("codex", "codex-10080min", 0.10, 4 * JOUR, 7 * JOUR, account="primaire")
         self.jauge("codex", "codex-10080min", 0.10, 4 * JOUR, 7 * JOUR, account="secondaire")
         out = self.alertes()
         self.assertEqual(len({exploitation.alert_key(a) for a in out}), 2)
@@ -625,7 +629,8 @@ class NotifyTest(_Base):
                       resume.body)
 
     def test_envoi_puis_resolution(self):
-        self.jauge("codex", "codex-10080min", 0.20, 4 * JOUR, 7 * JOUR, account="primaire")
+        # #2648 : 3/7 écoulés, rythme 53 % − 10 points = 43 % ; 10 % utilisés.
+        self.jauge("codex", "codex-10080min", 0.10, 4 * JOUR, 7 * JOUR, account="primaire")
         self.agent("codex2", "codex")
         envois = []
 

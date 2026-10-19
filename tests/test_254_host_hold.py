@@ -135,7 +135,9 @@ class HostHoldTest(_Base):
         self.hold("vm")
         self.assertEqual(_types(self.alerts(), "idle_capacity"), [])
         # a plan whose agents are all held loses nothing by negligence
-        self.jauge("claude", "seven_day", 0.20, 4 * JOUR, 7 * JOUR, account="primaire")
+        # #2648 : 3/7 écoulés, rythme 53 % − 10 points de réserve = 43 % ;
+        # 10 % utilisés laissent l'écart de 25 points qui alerte.
+        self.jauge("claude", "seven_day", 0.10, 4 * JOUR, 7 * JOUR, account="primaire")
         self.assertEqual(_types(self.alerts(), "plan_underused"), [])
         self.hosts.release("vm", author="human:proprio")
         self.assertEqual(len(_types(self.alerts(), "plan_underused")), 1)

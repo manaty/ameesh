@@ -115,8 +115,13 @@ class DetachSweepTest(_Base):
                 self.assertEqual(self.sync()["merged"], 0)
                 self.assertEqual(work.get(self.db, n)["state"], "blocked")
                 self.assertIsNone(work.get(self.db, n)["branch"])
-                # Le retour explicite rétablit aussi cette preuve de livraison.
+                # Le retour explicite rétablit la preuve de livraison ; #2744
+                # retient la fermeture d'un lot blocked, que la levée du
+                # blocage laisse le relevé suivant consommer.
                 work.set_branch(self.db, n, name, target, actor="pilote")
+                self.assertEqual(self.sync()["merged"], 0)
+                self.assertEqual(work.get(self.db, n)["state"], "blocked")
+                work.move(self.db, n, "qa", actor="claude1")
                 self.assertEqual(self.sync()["merged"], 1)
                 _git(self.repo, "checkout", "-q", "develop")
 
@@ -128,6 +133,11 @@ class DetachSweepTest(_Base):
         work.detach_branch(self.db, n, name, reason="PR supplantée")
         _git(self.repo, "merge", "-q", "--no-ff", "-m",
              "Merge branch '%s'\n\nameesh-work: %d" % (name, n), name)
+        # #2744 : la citation reste une preuve, mais un lot blocked garde sa
+        # fermeture tant qu'il n'est pas débloqué.
+        self.assertEqual(self.sync()["merged"], 0)
+        self.assertEqual(work.get(self.db, n)["state"], "blocked")
+        work.move(self.db, n, "qa", actor="claude1")
         self.assertEqual(self.sync()["merged"], 1)
 
     def test_pr_d_une_branche_detachee_ne_designe_plus_le_lot(self):

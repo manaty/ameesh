@@ -1116,6 +1116,13 @@ class Mailbox(Domain):
         sortait de la fenêtre et une re-désignation renvoyait un doublon."""
 
     @abc.abstractmethod
+    def delivered_for_lot(self, recipient: str, lot: str, limit: int) -> list[dict]:
+        """Messages déjà remis d'un lot, du plus récent au plus ancien, bornés
+        par `limit`. Filtre destinataire ET lot dans la requête, sans fenêtre
+        de temps : un verdict ancien reste lisible dans le brief de son lot.
+        Non admis en mode médié (contrat fermé) : l'appelant garde les non-lus."""
+
+    @abc.abstractmethod
     def pending_recipients(self) -> list[str]:
         """Destinataires qui ont du courrier non remis."""
 
@@ -1698,6 +1705,15 @@ class WorkItems(Domain):
         """L539 : les lots portant exactement cette `issue_ref`, **quel que
         soit leur état** — l'identité d'un lot de relecture après fusion
         survit à sa fermeture, sinon un second lot serait ouvert."""
+
+    @abc.abstractmethod
+    def lock(self, item_id: int) -> dict | None:
+        """Le lot, verrouillé `FOR UPDATE` jusqu'à la fin de la transaction
+        courante ; None s'il n'existe pas. #2744 : c'est le verrou commun des
+        écritures de retenue (les notes `hold:`/`unhold:` le prennent avant
+        `note`, les transitions par leur UPDATE) et de la fermeture par
+        contenu — une retenue ne se glisse pas entre la lecture du journal et
+        la fermeture."""
 
     @abc.abstractmethod
     def get(self, item_id: int) -> dict | None:

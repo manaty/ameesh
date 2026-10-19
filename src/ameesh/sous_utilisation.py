@@ -316,7 +316,9 @@ def plan_underused(db, listing: list, now: float, *,
     le plafond du compte nommé par le relevé remplacent les 90 % et le ×1 en
     dur ; un compte absent, inconnu ou ambigu garde les défauts. #2233 : les
     plafonds fixes et courts de `accounts.limits` bloquent aussi une fausse
-    promesse de capacité sur une autre fenêtre du même compte. #2757 :
+    promesse de capacité sur une autre fenêtre du même compte. #2648 :
+    la réserve des critiques est déduite du seuil de pause et du pace_cap
+    annoncé pour les non-critiques. #2757 :
     le déclenchement dépend de la perte projetée au débit récent, avec repli
     explicite sur la moyenne de fenêtre si les relevés sont insuffisants ;
     le plafond autorisé reste une limite de capacité, pas une prévision."""
@@ -360,8 +362,15 @@ def plan_underused(db, listing: list, now: float, *,
                     continue
             # Comme avant #2233, aucun relèvement de fin de fenêtre sans
             # preuve fraîche ; les plafonds fixes et courts viennent de limits.
-            caps = accounts_mod.limits(profile, measured, now, ceilings={
-                g.key: accounts_mod.Ceiling(ceiling) for g in measured})
+            # #2648 : même éligible que la pause d'un agent non critique — la
+            # réserve des critiques (10 points) comprise. Sans elle, une
+            # fenêtre dans cette bande (ex. seven_day à 83 % pour un rythme
+            # ramené à 80 %) laissait annoncer une capacité qu'aucun agent ne
+            # pouvait consommer : la pause jugeait le compte au seuil.
+            caps = accounts_mod.limits(profile, measured, now, reserve=True,
+                                       ceilings={
+                                           g.key: accounts_mod.Ceiling(ceiling)
+                                           for g in measured})
             if any(g.used_at(now) >= caps[g.key][0] for g, _ in blocking):
                 continue
         for gauge, seen in live:
@@ -373,7 +382,9 @@ def plan_underused(db, listing: list, now: float, *,
             resets_at, unused = expiring(gauge, now)
             remaining = resets_at - now
             elapsed = gauge.elapsed(now)
-            cap = gauge.pace_cap(now, multiplier, ceiling)
+            # #2648 : le rythme annoncé est celui de la pause d'un
+            # non-critique (réserve déduite), pas le plafond ordinaire.
+            cap = gauge.held_cap(now, accounts_mod.RESERVE, multiplier, ceiling)
             used = float(gauge.used or 0.0)
             if history is None:
                 try:
