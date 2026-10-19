@@ -522,6 +522,29 @@ class Agents(interface.Agents):
             (status, status_text, error, stop_reason, name),
         )
 
+    def set_status_text(self, name, status_text) -> bool:
+        # #2789 : `agent-mail status`, appelé PENDANT un tour, posait `idle`
+        # sans bail — l'agent paraissait au repos, son tour courant compris
+        # (impl-01, 19/10 23:29). Un agent `execute` ne reçoit que le texte,
+        # et seulement hors blocage ou arrêt (leur texte est un marqueur
+        # relu par l'exécuteur). Un agent `externe` garde la règle d'avant.
+        rows = self.db.query(
+            """
+            UPDATE agent_registry
+               SET status = CASE WHEN mode = 'execute' THEN status ELSE 'idle' END,
+                   status_text = %s,
+                   last_error = CASE WHEN mode = 'execute' THEN last_error END,
+                   stop_reason = CASE WHEN mode = 'execute' THEN stop_reason END,
+                   last_seen = now(),
+                   updated_at = now()
+             WHERE name = %s
+               AND (mode <> 'execute' OR status IN ('running', 'idle', 'queued'))
+            RETURNING name
+            """,
+            (status_text, name),
+        )
+        return bool(rows)
+
     def set_mode(self, name, mode) -> bool:
         rows = self.db.query(
             "UPDATE agent_registry SET mode = %s, updated_at = now() WHERE name = %s"

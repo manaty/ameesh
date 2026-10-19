@@ -520,6 +520,14 @@ def set_status(
     storage.of(db).agents.set_status(name, status, status_text, error, stop_reason)
 
 
+def set_status_text(db: Db, name: str, status_text: str) -> bool:
+    """`agent-mail status` (#2789) : le texte seul pour un agent `execute`,
+    dont le statut appartient à l'exécuteur (voir `Agents.set_status_text`)."""
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.set_status_text")
+    return storage.of(db).agents.set_status_text(name, status_text)
+
+
 def set_mode(db: Db, name: str, mode: str) -> bool:
     """Change le mode d'un agent (`ameesh set <agent> mode=…`, L37)."""
     from .agent_names import resolve as resolve_agent_name

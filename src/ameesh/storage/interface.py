@@ -322,6 +322,13 @@ class Agents(Domain):
         gardé que pour `stopped` / `dead`."""
 
     @abc.abstractmethod
+    def set_status_text(self, name: str, status_text: str) -> bool:
+        """`agent-mail status` (#2789) : le texte affiché, posé par l'agent.
+        Un agent `execute` garde son statut, que seul l'exécuteur écrit ;
+        faux si rien n'est écrit (agent inconnu, ou texte marqueur d'un
+        blocage ou d'un arrêt)."""
+
+    @abc.abstractmethod
     def set_mode(self, name: str, mode: str) -> bool:
         """Pose le mode (`execute` | `externe`, L37) ; faux si l'agent est inconnu."""
 

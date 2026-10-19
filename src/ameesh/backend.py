@@ -398,7 +398,8 @@ class PgBackend:
 
     def set_status(self, name: str, text: str) -> None:
         registry.upsert(self.db, name, host=self.cfg.host)
-        registry.set_status(self.db, name, "idle", status_text=text)
+        # #2789 : jamais `idle` posé sur un agent en tour (voir set_status_text)
+        registry.set_status_text(self.db, name, text)
 
     # -- état local --------------------------------------------------------
     def stop_counter(self, name: str, reset: bool = False, bump: bool = False) -> int:
