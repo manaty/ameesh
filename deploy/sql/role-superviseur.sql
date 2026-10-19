@@ -157,6 +157,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'placement_profile', 'lease_expires_ts', 'last_seen_ts',
         'last_turn_ts', 'key_ready', 'has_owner_key',
         'ephemeral_expires_ts', 'responsible_ok', 'unread',
+        -- #2689 : non-lus passifs (copies, accusés, radars), un compteur — la
+        -- même règle L125 que l'exécuteur, sans contenu
+        'passive_unread',
         -- L26 (0027), désormais exposés par la vue : réglages sans contenu
         'session_policy', 'effort', 'tier', 'session_work_item',
         'status_since', 'restart_requested_at', 'session_reset_at',
