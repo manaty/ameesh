@@ -2010,13 +2010,14 @@ def _resume_review_after_merge(db, item_id, *, sha: str = "", pr_ref=None,
 def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source: str = "",
                  pr_ref: str | None = None, frozen_id: int | None = None,
                  declared: bool = False, extra: str = "", repo: str | None = None,
-                 landed: tuple[int, str] | None = None, unfrozen: bool = False) -> dict:
+                 landed: tuple[int, str] | None = None, unfrozen: bool = False,
+                 content_guard=None) -> dict:
     """Fusion constatée : le lot passe `merged` et son jalon `merged` est posé.
 
     Idempotent : un lot déjà fusionné reste tel quel (`already`). Jamais de
     réouverture silencieuse : un lot fermé (abandonné, remplacé) n'est pas
     touché, le constat est rendu (`refused`) pour être dit à l'appelant. Rend
-    `{id, result: merged|already|refused|refrozen, detail, item}`.
+    `{id, result: merged|already|refused|refrozen|withheld, detail, item}`.
 
     `frozen_id` (preuve par le contenu) : le jalon `frozen` examiné ; si ce
     n'est plus le dernier gel du lot au moment d'écrire, rien n'est fermé
@@ -2026,6 +2027,13 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
 
     `landed` (#1567) : `(numéro, dépôt)` du numéro réellement atterri, écrit
     dans la transaction de la fusion ; l'appelant l'a validé et réservé.
+
+    `content_guard` (#2744) : callable `(storage, row) -> retention | None`,
+    appelé **sous le verrou de ligne du lot**, juste avant la fermeture ; une
+    retenue rend `withheld` sans rien écrire. Le verrou est aussi pris par les
+    notes `hold:`/`unhold:` (`work.note` le prend avant `note`) et par les
+    transitions d'état : une retenue ne peut plus se glisser entre la lecture
+    du journal et la fermeture.
 
     La note du journal et du jalon dit comment la fusion est connue :
     « fusion constatée par <source> », ou « fusion déclarée par … »
@@ -2088,6 +2096,19 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             from . import work_dependencies
             with db.transaction() as tx:
                 work_dependencies.lock(tx)
+                if content_guard is not None and not storage.is_remote(db):
+                    locked = storage.of(tx).work.lock(item_id)
+                    if locked is not None:
+                        retention = content_guard(storage.of(tx), locked)
+                        if retention is not None:
+                            if retention.get("what") == "unreadable":
+                                return {"id": int(item_id), "result": "error",
+                                        "item": locked, "retention": retention,
+                                        "detail": retention.get("motif")}
+                            return {"id": int(item_id), "result": "withheld",
+                                    "item": locked, "retention": retention,
+                                    "detail": "content merged, closure withheld: %s"
+                                              % retention.get("motif")}
                 row = storage.of(tx).work.close_merged(
                     item_id, current=state, sha=sha, actor=actor, note=note, pr_ref=pr_ref,
                     frozen_id=frozen_id, landed=landed, unfrozen=unfrozen)
@@ -2989,7 +3010,21 @@ def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False
                                            float(wake_ts))
     else:
         options = {"once": True} if once else {}
-        storage.of(db).work.note(item_id, item["state"], text, actor, **options)
+        from . import planned_waits
+        # #2744 : une retenue (hold/levée) prend le verrou de ligne avant son
+        # écriture, commun avec la fermeture par contenu (work.close_merged).
+        # Jamais sur une connexion médiée : `note` y est une opération du
+        # contrat, sans ce verrou (la fermeture par contenu est serveur).
+        if (planned_waits.is_hold_note(text) or planned_waits.is_lift_note(text)) \
+                and not storage.is_remote(db):
+            with db.transaction() as tx:
+                locked = storage.of(tx).work.lock(item_id)
+                if locked is None:
+                    raise WorkError("lot %s not found" % item_id)
+                storage.of(tx).work.note(item_id, locked["state"], text, actor,
+                                         **options)
+        else:
+            storage.of(db).work.note(item_id, item["state"], text, actor, **options)
     return True
 
 

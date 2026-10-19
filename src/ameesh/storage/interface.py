@@ -1707,6 +1707,15 @@ class WorkItems(Domain):
         survit à sa fermeture, sinon un second lot serait ouvert."""
 
     @abc.abstractmethod
+    def lock(self, item_id: int) -> dict | None:
+        """Le lot, verrouillé `FOR UPDATE` jusqu'à la fin de la transaction
+        courante ; None s'il n'existe pas. #2744 : c'est le verrou commun des
+        écritures de retenue (les notes `hold:`/`unhold:` le prennent avant
+        `note`, les transitions par leur UPDATE) et de la fermeture par
+        contenu — une retenue ne se glisse pas entre la lecture du journal et
+        la fermeture."""
+
+    @abc.abstractmethod
     def get(self, item_id: int) -> dict | None:
         """Un lot, ou None. #1922/B5 : le lot porte `workflow_ref` (la
         révision Process pinnée, '' quand il n'y en a pas — y compris sur une
