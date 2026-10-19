@@ -13,6 +13,7 @@ import dataclasses
 import os
 import shutil
 import subprocess
+import time
 import types
 from unittest import mock
 
@@ -143,6 +144,9 @@ class _ActivationFixture:
         self.db.execute("DELETE FROM turn_costs")
         self.db.execute("DELETE FROM provenance_receipts")
         self.db.execute("DELETE FROM canon_state")
+        # #2668: the gauge history is shared by the mesh; a test must not
+        # inherit another test's plan pace (or the host's live readings)
+        self.db.execute("DELETE FROM quota_gauge_readings")
         self.repo = _Repo(os.path.join(self.tmp, "depot"))
         self.repo.write("src/ameesh/work.py", "base\n")
         self.base = self.repo.commit("base")
@@ -243,6 +247,66 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertNotEqual(out["reviewers"][0]["family"], "deepseek")
         self.assertEqual([m["recipient"] for m in self.mailbox()],
                          [out["reviewers"][0]["name"]])
+
+    def test_the_freeze_prefers_the_raw_plan_pace_over_declared_multipliers(self):
+        # #2668: one review due; Codex is 16 points ahead of its raw plan pace
+        # and Claude is at its pace. Claude must be designated even though
+        # Codex's agent is less loaded. The declared ×10 (Claude) and ×3
+        # (Codex) profiles are deliberately ignored: with them Claude would
+        # look 20 points behind and Codex 21.8, designating Codex, the inverse
+        # of the witness (B of mesh-design on 4123b99). A Fable-only bucket
+        # at 95 % is ignored for this Claude agent (no model declared), so it
+        # cannot contaminate its general reading (cx3 B). With no current
+        # reading, the load rule returns.
+        self.repo.write("docs/guide.md", "base\n")
+        self.base = self.repo.commit("docs base")
+        self.repo.write("docs/guide.md", "lot\n")
+        self.frozen = self.repo.commit("docs lot")
+        self.db.execute("UPDATE work_items SET branch_target = %s WHERE id = %s",
+                        (self.base, self.lot))
+        self.receipts()
+        text = MECHANICS.replace("  distinct_families: true",
+                                 "  distinct_families: true\n  light_reviews: 1")
+        self.canon = _Canon(os.path.join(self.tmp, "canon-pace"), mechanics=text)
+        self.cfg = dataclasses.replace(
+            self.cfg, canon=self.canon.root, canon_ref="HEAD",
+            accounts={
+                "claude": [{"name": "secondaire", "type": "config_dir",
+                            "path": os.path.join(self.tmp, "claude-10"),
+                            "pace_multiplier": 10.0}],
+                "codex": [{"name": "secondaire", "type": "config_dir",
+                           "path": os.path.join(self.tmp, "codex-3"),
+                           "pace_multiplier": 3.0}],
+            })
+        for index in range(5):
+            extra = work.add(self.db, title="load %d" % index, app="ameesh",
+                             assignee="r1")
+            work.move(self.db, extra["id"], "build")
+        now = time.time()
+        week = 7 * 86400.0
+        self.db.execute(
+            "INSERT INTO quota_gauge_readings"
+            " (harness, gauge_key, used, resets_at, window_s, account, produced_at, source)"
+            " VALUES ('codex', 'seven_day', 0.35, to_timestamp(%s), %s, 'secondaire',"
+            "         to_timestamp(%s), 'test'),"
+            "        ('claude', 'seven_day', 0.60, to_timestamp(%s), %s, 'secondaire',"
+            "         to_timestamp(%s), 'test'),"
+            "        ('claude', 'seven_day@fable', 0.95, to_timestamp(%s), %s,"
+            "         'secondaire', to_timestamp(%s), 'test')",
+            (now + 0.81 * week, week, now, now + 0.40 * week, week, now,
+             now + 0.40 * week, week, now))
+        _, out = self.freeze()
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        self.assertEqual(out["required"], 1)
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1"])
+        # stale/absent readings are neutral: the load decides again
+        self.db.execute("DELETE FROM quota_gauge_readings")
+        self.repo.write("docs/guide.md", "another lot\n")
+        self.frozen = self.repo.commit("another lot")
+        self.receipts()
+        _, again = self.freeze()
+        self.assertEqual(again["state"], rd.DESIGNATED, again)
+        self.assertEqual([r["name"] for r in again["reviewers"]], ["r2"])
 
     def test_the_freeze_designates_two_real_families_without_an_agent(self):
         _, out = self.freeze()
