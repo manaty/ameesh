@@ -1020,7 +1020,10 @@ class Replayer:
                 return "origin/" + name
             if plan_git._commit(self.path, self.target):
                 return self.target
-            return self.target
+            # #2680 : une cible irrésolue ne s'écrit pas. Écrite, elle ne serait
+            # jamais écrasée et `default_target` lèverait MergeProbeError au
+            # lieu de retomber sur origin/HEAD/main.
+            return ""
         for candidate in plan_git.DEFAULT_TARGETS:
             if plan_git._commit(self.path, candidate):
                 return candidate
@@ -1035,7 +1038,8 @@ class Replayer:
         la clé manque, la cible du projet est écrite, sinon la branche par
         défaut du clone (`origin/main`, puis main/master). Une cible déjà posée
         n'est jamais écrasée (geste d'exploitation, #2673). Rend la cible
-        écrite, vide si le clone n'existe pas ou n'offre aucune branche."""
+        écrite, vide si le clone n'existe pas, si la cible du projet ne s'y
+        résout pas (#2680) ou s'il n'offre aucune branche."""
         if not os.path.isdir(os.path.join(self.path, ".git")):
             return ""
         if os.path.realpath(self.path) == os.path.realpath(self.repo):
@@ -1112,7 +1116,15 @@ class Replayer:
         url = plan_git._out(self.repo, "remote", "get-url", "origin")
         if url:
             _run(self.path, "fetch", "--quiet", url, *specs, timeout=FETCH_TIMEOUT)
-        self.declare_target()
+        try:
+            self.declare_target()
+        except GitError as exc:
+            # #2680 : deux fetch concurrents peuvent se heurter au verrou de
+            # `git config` (`.git/config.lock`) à la première écriture. Le
+            # fetch lui-même est fait ; la cible sera déclarée à la passe
+            # suivante, jamais au prix d'une erreur pour cet échec transitoire.
+            if "could not lock config file" not in str(exc):
+                raise
 
     def _empty_cache(self) -> None:
         shutil.rmtree(self._rr_cache(), ignore_errors=True)
