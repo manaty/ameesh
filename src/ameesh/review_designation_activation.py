@@ -607,8 +607,11 @@ def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
     must; this reader invents no name.
     """
     _start, _paths, commits = _range(repo, base, head)
-    _authors_, _unknown, correctors = review_authors.reading(
+    _authors_, unknown, correctors = review_authors.reading(
         db, item, milestone, commits, repo, families=families)
+    if unknown:
+        raise ActivationError("author provenance unknown for frozen commit(s): %s"
+                              % ", ".join(unknown))
     return correctors
 
 
