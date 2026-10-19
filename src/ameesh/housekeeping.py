@@ -1883,11 +1883,14 @@ def unsaved_git_work(path: str, rules=()) -> str:
     return ""
 
 
-def tmp_recovery_command(path: str) -> str:
+def tmp_recovery_command(path: str, *,
+                         report: tuple[list[str], str] | None = None) -> str:
     """#2493 : the commands that inspect a temporary directory before a human
     moves or removes it (never a blind `rm -rf`). Git copies get the
-    saved-work checks; a plain directory just its listing."""
-    copies = _git_copies(path)
+    saved-work checks; a plain directory just its listing. `report` (#2556)
+    is the `_git_copies_report` already read for this entry, so a pass does
+    not walk a deep tree once per helper."""
+    copies = _git_copies_report(path)[0] if report is None else report[0]
     if not copies:
         return "ls -la -- %s" % shlex.quote(path)
     commands = []
@@ -2000,7 +2003,8 @@ def _git_copy_work(copy: str, entry: str, rules=()) -> str:
     return ""
 
 
-def tmp_git_work(path: str, rules=()) -> str:
+def tmp_git_work(path: str, rules=(), *,
+                 report: tuple[list[str], str] | None = None) -> str:
     """#2493 (N2) : why a Git copy inside a temporary directory must be kept,
     empty when every copy is safe to recover: the saved-work guards of
     `_git_copy_work` (clean, pushed or integrated, no ignored file outside
@@ -2009,8 +2013,9 @@ def tmp_git_work(path: str, rules=()) -> str:
     whose common repository is inside it) and no process inside.
     A directory is never deleted merely because its agent left the registry;
     this check is the second condition. A bare repository, or a directory
-    tree whose copies could not all be inspected (#2525), keeps it."""
-    copies, doubt = _git_copies_report(path)
+    tree whose copies could not all be inspected (#2525), keeps it.
+    `report` (#2556) reuses the `_git_copies_report` of the pass."""
+    copies, doubt = _git_copies_report(path) if report is None else report
     for copy in copies:
         work = _git_copy_work(copy, path, rules)
         if work:
@@ -2022,14 +2027,17 @@ def tmp_git_work(path: str, rules=()) -> str:
     return ""
 
 
-def recover_tmp_git_copies(path: str) -> tuple[bool, str, list[str]]:
+def recover_tmp_git_copies(path: str, *,
+                           report: tuple[list[str], str] | None = None
+                           ) -> tuple[bool, str, list[str]]:
     """#2493 (N2) : remove the linked worktrees of `path` with `git worktree
     remove` (never `--force`, its own checks still apply), after `tmp_git_work`
     proved them saved. Clones stay for `_safe_rmtree`; a bare repository is a
     doubt and never gets here. An inspection cut short by a doubt removes
-    nothing (#2525). (ok, error, common repositories to prune)."""
+    nothing (#2525). `report` (#2556) reuses the `_git_copies_report` of the
+    pass. (ok, error, common repositories to prune)."""
     repos: list[str] = []
-    copies, doubt = _git_copies_report(path)
+    copies, doubt = _git_copies_report(path) if report is None else report
     if doubt:
         return False, "git copies not fully inspected (%s)" % doubt, []
     for copy in copies:
@@ -3759,9 +3767,11 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                 size = (size_of(full) if changed or previous.get("bytes") is None
                         else int(previous["bytes"]))
                 first_seen = data.get("first_seen") or now
+                # #2556 : la commande d'inspection est la même pour l'entrée
+                # journalisée et pour la liste ; un seul parcours des copies.
+                command = tmp_recovery_command(full)
                 if changed or now - float((previous or {}).get("at_ts") or 0) \
                         >= UNOWNED_REFRESH_S:
-                    command = tmp_recovery_command(full)
                     entries.append({
                         "kind": "tmp", "action": "unowned", "path": full,
                         "bytes": size, "agent": agent,
@@ -3772,7 +3782,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                                  "first_seen": first_seen, "command": command}})
                 unowned.append({"path": full, "bytes": size, "agent": agent,
                                 "first_seen": first_seen,
-                                "command": tmp_recovery_command(full)})
+                                "command": command})
                 continue
             why = tmp_problem(full, owner, key, registered=not orphan,
                               idle_after=policy.orphan_idle, now=now)
@@ -3808,14 +3818,16 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                         continue
                     if copies:
                         work = tmp_git_work(
-                            full, build_artifacts.rules_of(policy.artifacts))
+                            full, build_artifacts.rules_of(policy.artifacts),
+                            report=(copies, doubt))
                         if work:
-                            command = tmp_recovery_command(full)
+                            command = tmp_recovery_command(full, report=(copies, doubt))
                             skipped.append("tmp %s kept: git work — %s ; inspect "
                                            "with: %s" % (full, work, command))
                             continue
                         if not dry_run:
-                            ok, error, git_repos = recover_tmp_git_copies(full)
+                            ok, error, git_repos = recover_tmp_git_copies(
+                                full, report=(copies, doubt))
                             if not ok:
                                 skipped.append("tmp %s kept: git worktree removal "
                                                "refused — %s" % (full, error))
