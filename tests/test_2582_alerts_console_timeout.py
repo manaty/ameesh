@@ -130,11 +130,17 @@ class SnapshotStaysReadable(PgTestCase):
         with mock.patch.object(pgbouncer_local, "admin_dsn", return_value="admin"), \
                 mock.patch.object(pgbouncer_local, "read", side_effect=read), \
                 mock.patch.object(pgbouncer_local, "PROBE_TIMEOUT_S", 0.05):
+            # La borne porte sur la sonde : le relevé complet dépend du pilote
+            # (psql : plusieurs secondes sur un hôte chargé) et n'est pas le
+            # sujet du témoin. La lecture de la console reste bloquée 5 s.
+            with self.assertRaises(db_mod.Unavailable):
+                pgbouncer_local.probe(self.cfg)
+            probe_elapsed = time.monotonic() - started
             alerts = exploitation.alerts(self.cfg, self.db, local_pool=True,
                                          **self.seuils)
-            elapsed = time.monotonic() - started
         self.assertFalse(self.release.is_set(), "the snapshot waited for the console")
-        self.assertLess(elapsed, 2.0)
+        self.assertLess(probe_elapsed, 1.0,
+                        "the probe must not wait for the console")
         types = {a["type"]: a for a in alerts}
         self.assertIn("stale_lot", types, "the other families stay readable")
         self.assertEqual(types["stale_lot"]["lot"], lot["id"])
