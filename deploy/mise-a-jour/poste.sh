@@ -13,7 +13,8 @@
 #                migrations de REF (défaut HEAD, comme installer), lancées
 #                depuis son instantané AVANT de l'installer : base du mesh
 #                (UNE fois), puis ancienne
-#                base ; refusé si l'une n'est pas additive (voir MIGRER_APRES) ;
+#                base ; refusé si l'une n'est pas additive — garde inconditionnelle,
+#                MIGRER_APRES ne la désactive jamais (docs/BASCULE.md, L232b) ;
 #                --additif-seulement garde ce refus même quand REF est déjà
 #                installé (staging : des VM tournent encore le code précédent) ;
 #                si la sonde d'auto-prise du code installé échoue après la

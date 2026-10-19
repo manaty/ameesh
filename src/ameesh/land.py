@@ -747,7 +747,8 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
         return {"lot": lot, "result": "busy"}
     locks[key] = epoch
     if replayer is None:
-        replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name))
+        replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name),
+                                        target=project.target)
     landing = _Landing(db, project, row, key, owner, epoch, locks, projects,
                        cfg=cfg, clone=getattr(replayer, "path", None), replayer=replayer,
                        parts=parts)
@@ -1020,6 +1021,50 @@ def pr_view(slug: str, number, gh=_gh) -> dict:
             "state": data.get("state")}
 
 
+def merged_base(replayer, project, branch: str) -> str:
+    """#2603 : la cible par défaut du dépôt, quand `branch` y est déjà
+    fusionnée ; sinon "".
+
+    La file exige déjà que la PR vise la cible du lot (`branch`) ; restait le
+    cas d'une cible de travail elle-même déjà fusionnée dans la cible par
+    défaut : fusionner la PR dessus pose le contenu sur une branche morte
+    (home#112/#113 après la fusion de canon/2452). La cible par défaut est lue
+    dans le dépôt du projet ; une cible configurée introuvable refuse
+    (`LandError`) plutôt que de laisser fusionner à l'aveugle. Un `fetch`
+    impossible refuse : relire la seule cible du lot ne prouve pas que la
+    branche par défaut est lisible."""
+    from . import resolutions
+
+    base = _branch_of(branch or "")
+    try:
+        default = _branch_of(plan_git.default_target(project.repo) or "")
+    except plan_git.MergeProbeError as exc:
+        raise LandError("cannot read the default target of %s: %s: not landing on %s"
+                        % (project.repo, exc, base or "?")) from exc
+    if not base:
+        return ""
+    if not default:
+        raise LandError("cannot determine the default target of %s: not landing on %s"
+                        % (project.repo, base))
+    if base == default:
+        return ""
+    url = _origin(project) or project.repo
+    refs = ("refs/ameesh/land/base", "refs/ameesh/land/default")
+    proc = resolutions._run(replayer.path, "fetch", "--quiet", "--no-tags", url,
+                            "+refs/heads/%s:%s" % (base, refs[0]),
+                            "+refs/heads/%s:%s" % (default, refs[1]),
+                            timeout=FETCH_TIMEOUT)
+    if proc.returncode != 0:
+        raise LandError("cannot compare stacked base %s with %s: %s"
+                        % (base, default, resolutions._err(proc)[:200]))
+    compared = resolutions._run(replayer.path, "merge-base", "--is-ancestor",
+                                refs[0], refs[1])
+    if compared.returncode not in (0, 1):
+        raise LandError("cannot compare stacked base %s with %s: %s"
+                        % (base, default, resolutions._err(compared)[:200]))
+    return default if compared.returncode == 0 else ""
+
+
 def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
     project, row, lot = landing.project, landing.row, landing.lot
     branch = _branch_of(row["target"])
@@ -1064,6 +1109,13 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
         return landing.eject("PR #%s targets %s, not %s" % (
             status["number"], status.get("base") or "?", branch),
             "Point the PR at %s, freeze again, then ameesh work queue add %d." % (branch, lot))
+    stale_base = merged_base(replayer, project, branch)
+    if stale_base:
+        return landing.eject(
+            "PR #%s targets %s, already merged into %s: merging it there would land its "
+            "content on a dead branch" % (status["number"], branch, stale_base),
+            "Retarget the PR (`gh pr edit --base %s %s`), freeze again, then "
+            "ameesh work queue add %d." % (stale_base, status["number"], lot))
     if not merge_queue._same(status["head"], row.get("landing_sha")):
         return landing.eject("its branch moved while ameesh was landing it (%s)"
                              % (status["head"] or "?")[:12],

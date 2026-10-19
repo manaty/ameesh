@@ -36,6 +36,7 @@ import os
 import re
 import time
 from typing import Sequence
+from urllib.parse import quote
 
 from . import storage
 from .db import Db, DbError, is_unique_violation
@@ -596,6 +597,8 @@ def detach_branch(db: Db, item_id: int, branch: str | None = None, *, reason: st
 
 #: le dépôt d'un lot, lu dans son issue : `owner/repo#N`
 _ISSUE_REPO_RE = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#[0-9]+$")
+#: #2603 : une PR fusionnée hors du dépôt du lot, `owner/repo#N`
+_PR_REF_RE = re.compile(r"^(?P<slug>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(?P<number>[0-9]+)$")
 
 
 def lot_repository(item: dict, cfg=None) -> str:
@@ -617,6 +620,16 @@ def lot_repository(item: dict, cfg=None) -> str:
             return repo_key(repo)
     raise WorkError("lot #%s has no repository: link its issue first "
                     "(`ameesh work link %s owner/repo#N`)" % (item["id"], item["id"]))
+
+
+def _migration_target(item: dict, checkout: str, cfg=None) -> str:
+    """La cible du lot pour l'invariant des numéros de migration (#2620) :
+    `branch_target`, sinon la cible de son projet, sinon celle du dépôt —
+    exactement celle que lisent la file de fusion et la classe de revue.
+    Chaîne vide quand aucune n'est connue."""
+    from . import lot_class
+
+    return str(lot_class.default_base(cfg, item, checkout) or "").strip()
 
 
 def _short_repo(repo) -> str:
@@ -662,30 +675,36 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
                       release: bool = False, repo: str | None = None,
                       actor: str = "", cfg=None,
                       skip_branches: tuple[str, ...] = (),
-                      skip_worktree: bool = False) -> dict:
-    """L122, #443, #2481 : réserve au lot le numéro de sa migration, avant
-    d'écrire le fichier, dans le dépôt du lot (`lot_repository`) : le dossier
-    et la numérotation sont les siens, jamais ceux d'ameesh pour un autre
-    dépôt. `repo` : un clone local de ce dépôt (défaut : celui que l'hôte
-    déclare, sinon le dépôt git courant) ; son `origin` doit être le dépôt du
-    lot. Sans `number` : le prochain libre, au-delà des numéros du dépôt
-    (arbre, toutes ses branches) et de ceux déjà réservés pour ce dépôt.
-    `number` est refusé s'il existe déjà dans le dépôt ou s'il est réservé par
-    un autre lot (index uniques (dépôt, numéro) : la base tranche, même entre
-    deux réservations simultanées). Un lot qui a déjà une réservation garde
-    les précédentes : un second numéro s'ajoute (liste `migrations`), il ne
+                      skip_worktree: bool = False,
+                      target: str | None = None) -> dict:
+    """L122, #443, #2481, #2620 : réserve au lot le numéro de sa migration,
+    avant d'écrire le fichier, dans le dépôt du lot (`lot_repository`) : le
+    dossier et la numérotation sont les siens, jamais ceux d'ameesh pour un
+    autre dépôt. `repo` : un clone local de ce dépôt (défaut : celui que
+    l'hôte déclare, sinon le dépôt git courant) ; son `origin` doit être le
+    dépôt du lot. Sans `number` : le prochain libre, au-delà des numéros du
+    dépôt (arbre, toutes ses branches) et de ceux déjà réservés pour ce dépôt.
+    `number` est refusé s'il existe déjà **sur la branche cible du lot** —
+    `branch_target`, sinon la cible de son projet, sinon celle du dépôt,
+    `origin/` publiée d'abord (#2620 : l'arbre de travail, le paquet installé
+    et les autres branches ne comptent pas ; une branche non fusionnée sera
+    renumérotée à sa fusion, #2400) — ou s'il est réservé par un autre lot
+    (index uniques (dépôt, numéro) : la base tranche, même entre deux
+    réservations simultanées). Un lot qui a déjà une réservation garde les
+    précédentes : un second numéro s'ajoute (liste `migrations`), il ne
     remplace plus la première (#2481). `release` libère toutes les
     réservations, ou seulement `number`, y compris sur un lot déjà terminal
     (#956 : un lot fusionné gardait sa réservation et bloquait le numéro).
-    `skip_branches` (#1603) : branches supplémentaires ignorées par le scan,
-    en plus de celle du lot — la branche d'intégration d'un paquet en
-    composition, dont les fichiers renumérotés ne doivent pas compter contre
-    la réservation. `skip_worktree` (#2400) : ignorer l'arbre de travail du
-    clone de lecture — le train y compose justement la migration à réserver.
-    Rend le lot, avec `migration_file` et la liste `migrations`. Une
-    correction concurrente de `issue_ref` pendant le scan du dépôt est
-    refusée (#1830 : `issue reference changed meanwhile, retry`), jamais
-    écrite en silence."""
+    `skip_branches` (#1603) : branches supplémentaires ignorées par le scan du
+    prochain libre, en plus de celle du lot — la branche d'intégration d'un
+    paquet en composition, dont les fichiers renumérotés ne doivent pas compter
+    contre la réservation. `skip_worktree` (#2400) : ignorer l'arbre de travail
+    du clone de lecture — le train y compose justement la migration à réserver.
+    `target` (#2620) : la cible à lire pour un numéro exact quand l'appelant la
+    connaît déjà (le train compose une cible explicite), sinon celle du lot.
+    Rend le lot, avec `migration_file` et la liste `migrations`. Une correction
+    concurrente de `issue_ref` pendant le scan du dépôt est refusée (#1830 :
+    `issue reference changed meanwhile, retry`), jamais écrite en silence."""
     from . import migrations
 
     item = get(db, item_id)
@@ -743,13 +762,28 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
     if trunks:
         # ignorer le tronc cacherait les migrations déjà fusionnées (#1603)
         raise WorkError("--skip-branch %s: a trunk branch is always scanned" % trunks[0])
-    present = migrations.repo_numbers(checkout, layout, skip_branch=item.get("branch"),
-                                      also_skip=tuple(skip_branches),
-                                      worktree=not skip_worktree)
     if number is None:
+        present = migrations.repo_numbers(checkout, layout, skip_branch=item.get("branch"),
+                                          also_skip=tuple(skip_branches),
+                                          worktree=not skip_worktree)
         floor = max(present or [0]) + 1
         note = "migration %%(number)0%dd reserved (%s)" % (layout.width, slug)
     else:
+        number = int(number)
+        # #2620 : un numéro exact se lit sur la cible seule. Une branche non
+        # fusionnée qui porte le même numéro ne l'a pas fait atterrir : elle
+        # sera renumérotée à sa fusion (#2400), elle ne bloque pas ce lot.
+        target = (target or "").strip() or _migration_target(item, checkout, cfg)
+        present = migrations.target_numbers(checkout, layout, target)
+        if present is None:
+            raise WorkError(
+                "migration %s: %s of lot #%s is unknown in %s — an exact number is checked "
+                "against the target branch only (#2620); fetch it (`git fetch origin`) or "
+                "name the target (`ameesh work branch %s <branch> --target <target>`, or "
+                "`git config ameesh.target <target>`)"
+                % (layout.label(number),
+                   ("target branch %r" % target) if target else "no target branch",
+                   item_id, checkout, item_id))
         if number in present:
             raise WorkError("migration %s already in %s (%s): choose another number" % (
                 layout.label(number), slug, ", ".join(sorted(present[number])[:3])))
@@ -2162,11 +2196,138 @@ def _declared_merge_commit(item: dict, sha: str, *, repo: str | None = None,
         raise WorkError("%s: merge declaration refused: %s" % (label, exc)) from exc
 
 
-def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
+def _merged_pr(item: dict, ref: str, *, sha: str = "", db=None, announce=None,
+               gh=None) -> tuple[str, str, int | None]:
+    """#2603 : preuve d'une PR fusionnée hors du dépôt du lot (canon, home).
+
+    `--pr owner/repo#N` : lit la PR par `gh`, exige l'état MERGED et rend
+    `(commit de fusion, référence de la PR, id du gel vérifié)`. La tête de
+    la PR doit être le gel du lot (ou, sans gel, sa branche) : une PR
+    quelconque ne ferme pas un lot. GitHub doit rendre le commit de fusion,
+    et ce commit doit être entré dans la branche par défaut du dépôt de la PR
+    (`compare` `behind`/`identical`) : une PR fusionnée sur une base morte
+    n'est pas livrée (home#112/#113). `--sha` n'est qu'un contrôle d'égalité.
+    Aucune écriture."""
+    from . import land, plan_git
+
+    match = _PR_REF_RE.match((ref or "").strip())
+    if not match:
+        raise WorkError("--pr: owner/repo#N (the merged PR of the lot), not %r" % (ref,))
+    slug = match.group("slug")
+    number = int(match.group("number"))
+    pr_ref = "%s#%d" % (slug, number)
+    reader = gh or land._gh
+    try:
+        proc = reader(["pr", "view", str(number), "--repo", slug, "--json",
+                       "number,state,title,mergeCommit,headRefOid,headRefName,"
+                       "baseRefName,url"])
+    except OSError as exc:
+        raise WorkError("--pr %s: `gh pr view` unavailable: %s" % (pr_ref, exc)) from exc
+    if proc.returncode != 0:
+        raise WorkError("--pr %s: `gh pr view` failed: %s"
+                        % (pr_ref, (proc.stderr or proc.stdout or "").strip()[:300]))
+    try:
+        data = land._json(proc, "gh pr view", dict)
+    except Exception as exc:  # noqa: BLE001 - a malformed view proves nothing
+        raise WorkError("--pr %s: unreadable PR view: %s" % (pr_ref, exc)) from exc
+    state = str(data.get("state") or "").upper()
+    if state != "MERGED":
+        raise WorkError("--pr %s is %s, not merged: nothing declared"
+                        % (pr_ref, state or "?"))
+    merge = str(((data.get("mergeCommit") or {}) or {}).get("oid") or "").strip().lower()
+    if not merge:
+        # #2603 (cx2) : GitHub rend `merge_commit_sha` même en squash/rebase ;
+        # un --sha déclaré ne prouve pas, à lui seul, l'entrée dans la cible.
+        # Sans commit de fusion, rien n'est déclaré.
+        raise WorkError("--pr %s: no merge commit reported by GitHub: nothing declared "
+                        "(--sha is only an equality check)" % pr_ref)
+    head = str(data.get("headRefOid") or "").strip().lower()
+    if not head:
+        raise WorkError("--pr %s: unreadable head" % pr_ref)
+    frozen = ""
+    freeze = None
+    if db is not None:
+        try:
+            freeze = plan_git.latest_freeze(milestones(db, int(item["id"])))
+        except Exception as exc:  # noqa: BLE001 - a doubt never closes a lot
+            raise WorkError("--pr %s: lot #%s milestones unreadable: %s"
+                            % (pr_ref, item["id"], type(exc).__name__)) from exc
+        if freeze is not None:
+            frozen = str(freeze.get("sha") or "").strip().lower()
+            if not frozen:
+                raise WorkError("--pr %s: the latest freeze of lot #%s has no commit: "
+                                "nothing declared" % (pr_ref, item["id"]))
+    if frozen:
+        if head != frozen:
+            raise WorkError("--pr %s head is %s, the lot is frozen on %s: nothing declared"
+                            % (pr_ref, head[:12], frozen[:12]))
+    elif item.get("branch"):
+        branch = str(data.get("headRefName") or "").strip()
+        if branch != item["branch"]:
+            raise WorkError("--pr %s head branch is %s, the lot is on %s: nothing declared"
+                            % (pr_ref, branch or "?", item["branch"]))
+    else:
+        raise WorkError("--pr %s: lot #%s has neither a freeze nor a branch to link the "
+                        "PR: nothing declared" % (pr_ref, item["id"]))
+    if sha and sha != merge:
+        raise WorkError("--sha %s differs from the PR merge commit %s: nothing declared"
+                        % (sha[:12], merge[:12]))
+    # #2603 (cx2 B) : la fusion constatée doit être une livraison réelle dans
+    # la cible du dépôt de la PR. Une base morte fusionnée plus tard dans le
+    # défaut reste livrée (le commit y est alors ancêtre) ; une base morte qui
+    # n'y est pas entrée ne ferme pas le lot (home#112/#113).
+    base = str(data.get("baseRefName") or "").strip()
+    try:
+        proc = reader(["repo", "view", slug, "--json", "defaultBranchRef"])
+    except OSError as exc:
+        raise WorkError("--pr %s: `gh repo view` unavailable: %s" % (pr_ref, exc)) from exc
+    if proc.returncode != 0:
+        raise WorkError("--pr %s: cannot read the default branch of %s: %s: nothing declared"
+                        % (pr_ref, slug, (proc.stderr or proc.stdout or "").strip()[:300]))
+    try:
+        repo_view = land._json(proc, "gh repo view", dict)
+    except Exception as exc:  # noqa: BLE001 - a malformed view proves nothing
+        raise WorkError("--pr %s: unreadable repository view: %s" % (pr_ref, exc)) from exc
+    default = str(((repo_view.get("defaultBranchRef") or {}) or {}).get("name")
+                  or "").strip()
+    if not default:
+        raise WorkError("--pr %s: %s reports no default branch: nothing declared"
+                        % (pr_ref, slug))
+    try:
+        proc = reader(["api", "repos/%s/compare/%s...%s"
+                       % (slug, quote(default, safe=""), quote(merge, safe=""))])
+    except OSError as exc:
+        raise WorkError("--pr %s: `gh api compare` unavailable: %s"
+                        % (pr_ref, exc)) from exc
+    if proc.returncode != 0:
+        raise WorkError("--pr %s: comparison of %s with %s unreadable: %s: nothing declared"
+                        % (pr_ref, merge[:12], default,
+                           (proc.stderr or proc.stdout or "").strip()[:300]))
+    try:
+        compared = land._json(proc, "gh api compare", dict)
+    except Exception as exc:  # noqa: BLE001 - a malformed comparison proves nothing
+        raise WorkError("--pr %s: comparison of %s with %s unreadable: %s: nothing declared"
+                        % (pr_ref, merge[:12], default, exc)) from exc
+    status = str(compared.get("status") or "").strip().lower()
+    if status not in ("behind", "identical"):
+        raise WorkError(
+            "--pr %s: merged into %s, commit %s is not in %s (%s): content not delivered "
+            "(home#112/#113); nothing declared"
+            % (pr_ref, base or "?", merge[:12], default, status or "unknown"))
+    if announce is not None:
+        announce({"id": int(item["id"]), "app": item.get("app") or "",
+                  "title": item.get("title") or "", "sha": merge,
+                  "subject": str(data.get("title") or ""),
+                  "how": "merged PR %s" % pr_ref})
+    return merge, pr_ref, int(freeze["id"]) if freeze is not None else None
+
+
+def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = "",
            repo: str | None = None, migration_landed: int | None = None, cfg=None,
-           announce=None) -> dict:
-    """`ameesh work merged <id> --sha S` : une fusion faite hors PR et sans gel
-    (fusion locale sur la branche cible) se déclare en une fois.
+           announce=None, pr: str | None = None) -> dict:
+    """`ameesh work merged <id> --sha S | --pr owner/repo#N` : une fusion faite
+    hors PR et sans gel (fusion locale sur la branche cible), ou une PR
+    fusionnée hors du dépôt du lot (#2603), se déclare en une fois.
 
     Le lot passe `merged` depuis tout état ouvert (intake, build, qa,
     blocked, waiting_human) ; son jalon `merged` reçoit le commit de fusion et
@@ -2175,6 +2336,14 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
     remplacé) n'est jamais rouvert : WorkError. Rend le constat de
     `close_merged`. Le commit doit être lisible dans le dépôt du lot, désigner
     ce lot et être entré dans sa cible ; aucune lecture réseau ni force.
+
+    `pr="owner/repo#N"` (#2603) : la preuve est la PR fusionnée d'un AUTRE
+    dépôt que celui du lot (une PR du canon pour un lot d'ameesh) ; sa tête
+    doit être le gel du lot, GitHub doit rendre son commit de fusion, et ce
+    commit doit être entré dans la branche par défaut du dépôt de la PR
+    (`compare` `behind`/`identical`, un doute refuse) ; `--sha` n'est qu'un
+    contrôle d'égalité avec ce commit. La lecture de la PR passe par `gh` ;
+    aucune écriture avant le constat.
 
     `announce` (facultatif, #1400) : le callback du constat, appelé avec
     `{id, app, title, sha, subject, how}` après la lecture de la preuve (une
@@ -2188,17 +2357,28 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
     lieu de 457). Il est écrit dans la transaction de la fusion ; sur un lot
     déjà fusionné ou promu, il enregistre (ou corrige) le fait après coup,
     journalisé."""
+    pr_text = (pr or "").strip()
     text = (sha or "").strip().lower()
-    if not _SHA_RE.match(text):
+    if not text and not pr_text:
+        raise WorkError("--sha: the merge commit (7 to 64 hex characters); for a PR of "
+                        "another repository, give --pr owner/repo#N")
+    if text and not _SHA_RE.match(text):
         raise WorkError("--sha: the merge commit (7 to 64 hex characters), not %r"
                         % (sha,))
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
+    pr_ref = None
+    proof_guard = {}
     # Preserve idempotency and the closed-lot diagnostic without requiring
     # that an old clone or object still be available.
     if item["state"] not in (*MERGED_STATES, "closed"):
-        text = _declared_merge_commit(item, text, repo=repo, cfg=cfg, announce=announce)
+        if pr_text:
+            text, pr_ref, frozen_id = _merged_pr(
+                item, pr_text, sha=text, db=db, announce=announce)
+            proof_guard = {"frozen_id": frozen_id, "unfrozen": frozen_id is None}
+        else:
+            text = _declared_merge_commit(item, text, repo=repo, cfg=cfg, announce=announce)
     landed = None
     if migration_landed is not None:
         number = _landed_number(migration_landed)
@@ -2218,7 +2398,7 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
     try:
         done = close_merged(db, item_id, sha=text, actor=actor,
                             source=actor or UNKNOWN_ACTOR, declared=True, extra=extra,
-                            landed=landed)
+                            landed=landed, pr_ref=pr_ref, **proof_guard)
     except DbError as exc:
         # #1567 : course perdue sur l'index unique (dépôt, numéro atterri) —
         # message lisible plutôt que la DbError brute ; la pré-vérification a
@@ -2231,6 +2411,8 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
         # un balayage a pu fusionner le lot après notre lecture : le numéro
         # déclaré est enregistré (ou corrige celui déjà tenu) après coup
         return _record_landed(db, done["item"], landed, actor=actor, cfg=cfg)
+    if done["result"] == "refrozen":
+        raise WorkError(done["detail"])
     if done["result"] == "refused":
         item = done["item"]
         if item["state"] != "closed":
@@ -2238,6 +2420,8 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "",
         raise WorkError("lot %s closed (%s): not reopened; see ameesh work show %s"
                         % (item_id, close_how(item.get("close_reason"),
                                               item.get("superseded_by")), item_id))
+    if text:
+        done["sha"] = text
     return done
 
 

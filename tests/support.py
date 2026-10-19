@@ -19,6 +19,7 @@ import time
 import unittest
 from unittest import mock
 import uuid
+from unittest import mock
 
 from ameesh import config as config_mod
 from ameesh import db as db_mod
@@ -371,6 +372,20 @@ def mechanics_canon(root: str) -> str:
     return root
 
 
+def patch_families(testcase, families=("claude", "codex", "deepseek")):
+    """Épingle les familles compilées d'un banc sans canon Git (#2664).
+
+    Le lecteur `review_lot.compiled_families` est patché pour la durée du test ;
+    les témoins du lecteur construisent leur propre canon et ne passent pas
+    par ici. Rend le patcheur, déjà arrêté au `cleanup` du test.
+    """
+    patcher = mock.patch("ameesh.review_lot.compiled_families",
+                         return_value=tuple(families))
+    patcher.start()
+    testcase.addCleanup(patcher.stop)
+    return patcher
+
+
 class PgTestCase(unittest.TestCase):
     """Base : un schéma migré, un bac à sable disque, des utilitaires CLI."""
 
@@ -436,6 +451,12 @@ class PgTestCase(unittest.TestCase):
         os.makedirs(self.tmp, exist_ok=True)
         for path in (self.state, self.v0state, self.conf):
             os.makedirs(path, exist_ok=True)
+        # #2664 : ces bancs n'ont pas de canon Git configuré ; les familles
+        # compilées y sont épinglées aux trois familles déclarées, comme sur un
+        # hôte équipé. Le lecteur du canon a ses propres témoins, et un test
+        # d'échec fermé défait ce patch localement.
+        patch_families(self)
+
 
     @classmethod
     def env(cls, **extra: str) -> dict:

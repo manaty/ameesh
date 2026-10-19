@@ -5,10 +5,14 @@ Canon §2 requires, for a frozen sensitive lot, "a review by another model
 family (two for SQL, security or prod)". Until now an agent chose the reviewer
 by hand, and on 15/10 eighteen lots waited without a reviewer, for up to 42 h.
 This module does the **selection**: it takes the versioned policy
-(`review_policies.train_reviews`, read by #1616/#1467), the exact frozen head
-and the registry, and returns either designated reviewers with their mail, or
+(`review_policies.train_reviews`, read by #1616/#1467), the exact frozen head,
+the registry and, since #2668, the plan advance of each family
+(`review_pace`), and returns either designated reviewers with their mail, or
 an **explicit waiting state** with a capacity notification — never an implicit
-admission.
+admission. The family furthest behind its plan comes first, the load only
+breaking a tie; an unreadable plan reading is neutral (#1561), and the pace
+never makes an eligible family ineligible: two opinions still take two
+distinct families.
 
 What the module deliberately does not do:
 
@@ -36,6 +40,7 @@ for a freeze that is no longer the latest: no return to an old head.
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping, Optional, Protocol, Sequence
@@ -183,9 +188,11 @@ class Candidate:
     """A possible reviewer, as the registry describes it.
 
     `family` is the **real** family of the session
-    (`registry.live_harness`); `available` and `load` come from the registry
-    and from the number of open lots. The module completes nothing: an empty
-    family or a harness outside the known families makes the candidate
+    (`registry.live_harness`); `available`, `load` and `model` come from the
+    registry and from the number of open lots. `model` is only used to choose
+    the model-scoped gauges that apply to this reviewer (#2668); it never
+    changes the family or the eligibility. The module completes nothing: an
+    empty family or a harness outside the known families makes the candidate
     ineligible.
     """
 
@@ -193,6 +200,7 @@ class Candidate:
     family: str
     available: bool = True
     load: int = 0
+    model: str = ""
 
     def eligible(self, *, forbidden_names, forbidden_families, families) -> bool:
         name = (self.name or "").strip()
@@ -258,8 +266,11 @@ def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping
             load = int(loads.get(name, 0))
         except (TypeError, ValueError):
             load = 0
+        row = dict(row or {})
+        model = str(row.get("model") or row.get("session_model") or "").strip()
         out.append(Candidate(name=name, family=live_family(row, families=families),
-                             available=is_available(row), load=max(load, 0)))
+                             available=is_available(row), load=max(load, 0),
+                             model=model))
     return out
 
 
@@ -329,9 +340,77 @@ def manual_seats(already: Iterable, *, authors: Iterable = (),
     return seats
 
 
+def _finite(value) -> Optional[float]:
+    """A finite float, or None; a malformed advance is ignored, never guessed."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _normalise_advances(advances) -> dict:
+    """`{family: advance}` or `{family: {scope: advance}}`, numbers only.
+
+    A flat value is the family's general advance; a nested mapping carries the
+    general `""` key and one key per model scope (`fable`), so a candidate's
+    model can pick the gauges that apply to it (#2668, cx3 B/P1). A nested
+    `None` means the family carries that scope but no account has a current
+    applicable reading: the model is neutral, never rescued by the general
+    reading of an account whose scoped window is stale.
+    """
+    out: dict = {}
+    for family, value in (advances or {}).items():
+        family = str(family or "").strip().lower()
+        if not family:
+            continue
+        if isinstance(value, Mapping):
+            nested = {}
+            for scope, number in value.items():
+                scope = str(scope or "").strip().lower()
+                if number is None:
+                    nested[scope] = None
+                    continue
+                number = _finite(number)
+                if number is not None:
+                    nested[scope] = number
+            if nested:
+                out[family] = nested
+        else:
+            number = _finite(value)
+            if number is not None:
+                out[family] = number
+    return out
+
+
+def _advance_of(candidate, pace: Mapping) -> float:
+    """The advance applicable to one candidate, model-scoped gauges included.
+
+    A scope counts when its name is part of the candidate's model, the rule of
+    `accounts.model_scoped`; the general `""` reading is used only when no
+    scope matches. A matching scope with no current reading (`None`) makes the
+    candidate neutral (0) — it does not fall back to the general reading of a
+    stale account (cx3 B/P1). A family absent from `pace` is neutral too.
+    """
+    entry = pace.get((candidate.family or "").strip().lower())
+    if entry is None:
+        return 0.0
+    if not isinstance(entry, Mapping):
+        return entry
+    model = str(getattr(candidate, "model", "") or "").strip().lower()
+    matching = [value for scope, value in entry.items()
+                if scope and scope in model]
+    if matching:
+        values = [value for value in matching if value is not None]
+        return max(values) if values else 0.0
+    general = entry.get("")
+    return general if general is not None else 0.0
+
+
 def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
-           families, already: Iterable = ()) -> dict:
-    """Chooses `required` (1 or 2) independent and least-loaded reviewers.
+           families, already: Iterable = (),
+           advances: Optional[Mapping] = None) -> dict:
+    """Chooses `required` (1 or 2) independent reviewers, by plan pace then load.
 
     - each reviewer's family differs from that of **every** author or fixer, and
       for two opinions the two families differ from each other (canon §2);
@@ -342,7 +421,18 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     - an author whose real family is unknown (empty or a label) makes the
       designation **wait**: without it, a reviewer's independence is not proven
       (canon §2);
-    - at equal load, the order of names decides: the selection is deterministic;
+    - `advances` maps a family to its advance over the plan pace, in points
+      (`review_pace`; positive = ahead, negative = behind). A family value may
+      be a `{scope: advance}` mapping: the general `""` plus the model-scoped
+      buckets, selected by the candidate's `model` (a `fable` bucket counts
+      only for a Fable reviewer, never for another model or an unknown one).
+      When several families are eligible, the family **furthest behind** comes
+      first; an absent reading is neutral (0, at its pace), so the other
+      criteria decide (#2668, #1561). Never a reason to discard an eligible
+      family: two opinions still take two distinct families;
+    - the load of the agent only breaks a pace tie (least loaded first), then
+      the name: the same order chooses the family's representative and orders
+      the families; the selection is deterministic;
     - `already` names the manual reviewers already designated (#2627). The ones
       that prove an independent family cover a seat; only the **missing** seats
       are designated, never a manual reviewer removed or overridden.
@@ -380,15 +470,27 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
                 if c.eligible(forbidden_names=names | seat_names,
                               forbidden_families=forbidden | seat_families,
                               families=families)]
-    # a single candidate per family: the least loaded, then the name
+    # #2668: a family's advance over its plan pace (points), lower is further
+    # behind. An unreadable or stale reading (#1561) is neutral: 0, as if at
+    # pace, so the load and the name decide. A model-scoped value is selected
+    # by the candidate's own model.
+    pace = _normalise_advances(advances)
+    # a single candidate per family: the applicable pace first (cx3 B/P1: a
+    # Fable bucket must not make a less-loaded Fable agent hide a further
+    # behind Opus agent of the same family), then the least loaded, then the
+    # name.
     best: dict[str, Candidate] = {}
     for candidate in eligible:
         family = candidate.family.strip().lower()
         current = best.get(family)
-        if current is None or (candidate.load, candidate.name) < (current.load, current.name):
+        if current is None or ((_advance_of(candidate, pace), candidate.load,
+                                candidate.name)
+                               < (_advance_of(current, pace), current.load,
+                                  current.name)):
             best[family] = candidate
     ordered = [best[family] for family in sorted(best)]
-    ordered.sort(key=lambda c: (c.load, c.name))
+    # pace first, then load, then name; a family absent from `pace` is neutral
+    ordered.sort(key=lambda c: (_advance_of(c, pace), c.load, c.name))
     chosen = ordered[:remaining]
     out["reviewers"] = [{"name": c.name, "family": c.family} for c in chosen]
     if len(chosen) < remaining:
@@ -405,8 +507,13 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
                         ", ".join(sorted(forbidden | seat_families)) or "none")),
         })
         return out
-    out.update({"state": DESIGNATED,
-                "why": "designated %d reviewer(s)" % len(chosen)})
+    why = "designated %d reviewer(s)" % len(chosen)
+    if pace:
+        reading = ["%s %+.0f pt" % (c.family.strip().lower(), _advance_of(c, pace) * 100)
+                   for c in chosen if c.family.strip().lower() in pace]
+        if reading:
+            why += " (plan pace: %s)" % ", ".join(reading)
+    out.update({"state": DESIGNATED, "why": why})
     return out
 
 
@@ -649,7 +756,8 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
           freeze_sha: str, authors: Iterable = (), candidates: Iterable = (), risk: str = "light",
           base: str = "", policy_ref: str = "", notify: str = "",
           unknown_authors: Iterable = (), families,
-          already: Iterable = (), required: Optional[int] = None) -> dict:
+          already: Iterable = (), required: Optional[int] = None,
+          advances: Optional[Mapping] = None) -> dict:
     """Designates the reviewers of the lot's latest freeze, or says why it waits.
 
     `policy` carries the already parsed rules (`Rule` or `{rules: [...]}`
@@ -675,6 +783,13 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     that prove an independent family cover a seat, and only the missing seats
     are selected. None is ever removed, and two manual reviewers of the same
     family count one seat.
+
+    `advances` maps a family to its advance over the plan pace, in points
+    (`review_pace`, #2668), or to a `{scope: advance}` mapping whose scoped
+    buckets are selected by the candidate's model: the selection prefers the
+    family furthest behind, the load only breaking a tie. A family without a
+    current reading is neutral, and the pace never makes an eligible family
+    ineligible: two required opinions still take two distinct families.
 
     The freeze is re-read **once**, and the provided inputs (paths, authors,
     class) are those of this freeze: if the `Port` refuses a freeze that has
@@ -745,7 +860,7 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
                      "missing": required, "manual": [], "why": why}
     else:
         selection = select(required=required, authors=authors, candidates=candidates,
-                           families=families, already=already)
+                           families=families, already=already, advances=advances)
     if selection["state"] == WAITING and existing:
         # The waiting state of this freeze is already recorded and notified: we
         # do not send a second one, but the selection was retried — if capacity

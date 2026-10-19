@@ -426,6 +426,47 @@ class PolitiqueTest(_Base):
         with self.assertRaises(accounts.AccountError):
             accounts.launch_env({}, {"claude": [fresh]}, fresh)
 
+    def _use(self, cfg, **patches):
+        """`ameesh accounts use claude secondaire` dans le mesh B : le
+        résultat (code ou exception) et le profil passé à `force`."""
+        import contextlib, io, types
+        from ameesh import mesh_cli
+
+        class _Conn(_Db):
+            def close(self):
+                pass
+
+        args = types.SimpleNamespace(accounts_command="use", harness="claude",
+                                     account="secondaire")
+        with mock.patch.object(mesh_cli, "_open", return_value=_Conn(MESH_B)), \
+                mock.patch.object(mesh_cli.fil, "record"), \
+                mock.patch.object(mesh_cli.accounts_mod, "force",
+                                  **(patches or {"wraps": accounts.force})) as force, \
+                contextlib.redirect_stdout(io.StringIO()):
+            try:
+                out = mesh_cli.cmd_accounts(cfg, args)
+            except accounts.AccountError as exc:
+                out = exc
+        (profil,) = force.call_args.args[3]
+        return out, profil
+
+    def test_use_refuse_un_compte_refuse(self):
+        # #2572 (#313 N2) : le forçage d'un compte refusé par la politique de
+        # partage est refusé à la commande, avec sa raison, avant toute
+        # écriture de l'état des comptes.
+        for cfg in (self.cfg(self.secondaire(), sharing="strict"),
+                    self.cfg(self.secondaire(), shared="refuse")):
+            exc, profil = self._use(cfg)
+            self.assertIsInstance(exc, accounts.AccountError)
+            self.assertIn("unusable", str(exc))
+            self.assertIn(profil.refused, str(exc))
+            self.assertIn("another mesh of this host", str(exc))
+
+    def test_use_en_report_force_le_compte(self):
+        code, profil = self._use(self.cfg(self.secondaire()), return_value=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(profil.refused, "")
+
 
 class AlerteTest(_Base):
     def test_alerte_account_shared(self):

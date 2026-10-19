@@ -177,7 +177,8 @@ class Passage:
                              repo=directory, cache=train_ci.parts_cache(self.cfg))
         # The radar, another target, and another runner may all replay merges
         # concurrently. They must never reset this passage's worktree.
-        clone = resolutions.Replayer(self.project.repo, directory, script=None)
+        clone = resolutions.Replayer(self.project.repo, directory, script=None,
+                                     target=self.project.target)
         transports = (None if self.transports is None else
                       lambda **context: self.transports(db, **context))
         # #2400: composition moves the L122 reservation before publication and
@@ -197,10 +198,32 @@ class Passage:
             preparation = train_candidates.Preparation(db, self.project,
                 repository=repository, history=history, policy=requirement)
             enrollment = train_candidates.Enrollment(preparation, admissions, initial=self.initial)
+        def prevalidate(head, base):
+            """#2644 : la prévalidation de la composition, avant publication."""
+            from . import prevalidation, prevalidation_calls
+            try:
+                result = prevalidation_calls.gate_train(
+                    self.cfg, repo=clone.path, head=head, base=base,
+                    canon_repo=self.policy_path, canon_commit=self.policy_commit,
+                    project=self.project.name,
+                    repo_slug=radar.github_slug(self.project), say=self.notify)
+            except prevalidation.PrevalidationError as exc:
+                if exc.cause == "run-red":
+                    # Un rouge exécuté n'est pas une publication incertaine :
+                    # l'Engine l'arrête (paused, réservation rendue).
+                    raise train.PrevalidationRed(exc.why or "prevalidation red") from exc
+                raise train.TrainError(
+                    "prevalidation refused (%s): %s"
+                    % (exc.cause, exc.why or "")) from exc
+            if result.get("state") == "unavailable":
+                self.notify("prévalidation indisponible, publication maintenue: %s"
+                            % (result.get("why") or result.get("cause") or "?"), result)
+            return result
+
         return train_runtime.Runtime(ledger=ledger, repository=repository, ci=ci,
             fires=authority, admissions=admissions,
             target=target, policy=policy, notify=self.notify, inventory=inventory,
-            enrollment=enrollment, migrations=migrations)
+            enrollment=enrollment, migrations=migrations, prevalidation=prevalidate)
 
     def step(self, db, now):
         """One bounded event/pass; never wait for CI and never retain ``db``."""

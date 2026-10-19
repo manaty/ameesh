@@ -16,7 +16,7 @@ from ameesh import train, train_migrations, work
 
 from .support import PgTestCase
 from .test_l160b_radar import _git, _write
-from .test_l122_numeros_de_migration import NEXLINK, _depot
+from .test_l122_numeros_de_migration import NEXLINK, _commit, _depot
 
 
 class Recorder:
@@ -262,6 +262,20 @@ class AllocatorTest(PgTestCase):
         self.assertEqual(item["state"], "merged")
         self.assertEqual((item["migration"], item["migration_landed"]), (None, 517))
         self.assertEqual(_git(self.repo, "rev-parse", "develop"), head)
+
+    def test_the_train_reads_the_target_it_composes(self):
+        """#2620 : le train passe la cible qu'il compose ; le défaut du clone
+        (`main`, qui porte 517) ne refuse pas un numéro libre sur `develop`."""
+        _git(self.repo, "checkout", "-q", "-b", "main", "develop")
+        _commit(self.repo, NEXLINK.directory, "517_main.sql")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "config", "ameesh.target", "main")
+        lot = work.add(self.db, title="lot 2620", issue_ref="manaty/nexlink#2620",
+                       actor="test", branch="lot/2620")
+        row = dict(work_item_id=lot["id"], branch="lot/2620", target="develop")
+        train_migrations.Allocator(self.db).reserve(row, self.repo, 525, 517, self.layout)
+        item = work.get(self.db, lot["id"])
+        self.assertEqual((item["migration"], item["migration_repo"]), (517, "manaty/nexlink"))
 
     def test_two_reservations_land_and_are_both_released(self):
         """#2481 : le plan porte une correspondance par migration ; le lot est

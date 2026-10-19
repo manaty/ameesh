@@ -427,6 +427,37 @@ dossier courant. La lecture reste locale : récupérer la cible au préalable
 si nécessaire. Un commit sans rattachement ne ferme pas le lot.
 L'alerte `stale_lot` rappelle cette commande pour un lot inactif.
 
+Une PR fusionnée dans un **autre dépôt** que celui du lot (le canon
+`manaty/home`, par exemple) se déclare de même, avec `--pr` :
+
+```
+ameesh work merged <id> --pr manaty/home#111 [--note "…"]
+```
+
+`gh pr view` doit rendre la PR `MERGED` ; sa tête doit être le gel du lot
+(ou, sans gel, sa branche). GitHub doit rendre son commit de fusion
+(`mergeCommit`), et ce commit doit être entré dans la branche par défaut du
+dépôt de la PR : `gh repo view` résout cette branche, puis
+`gh api repos/<dépôt>/compare/<défaut>...<merge>` doit rendre `behind` ou
+`identical` (un doute refuse). Une PR fusionnée sur une base morte puis
+refusionnée dans le défaut passe ; sinon le contenu n'est pas livré
+(home#112/#113). `--sha` n'est qu'un contrôle d'égalité avec le commit de
+fusion ; absent de la vue GitHub, il refuse.
+
+**PR empilée sur une base déjà fusionnée.** Avant de fusionner une PR dont la
+base n'est pas la branche par défaut, vérifier que cette base n'est pas déjà
+entrée dans la branche par défaut : sinon la fusion pose le contenu sur une
+branche morte et il est perdu (home#112/#113 après la fusion de canon/2452).
+La garde est mécanique dans le feu (fusion directe `gh pr merge`), dans la
+file de fusion et dans `ameesh work merge-pr` (refus nommé, avec la commande
+de correction) ; pour une fusion `gh` directe hors ameesh — bureau —, la
+vérification reste manuelle :
+
+```
+git -C <clone> merge-base --is-ancestor origin/<base> origin/<défaut> \
+  && gh pr edit <N> --repo <owner/repo> --base <défaut>
+```
+
 Autres fermetures : `ameesh work close <id> --abandoned | --superseded-by
 <id> | --done` (`--done` : lot livré sans fusion, sans branche). Un lot passé
 `promoted` par erreur : `ameesh work move <id> merged
@@ -485,8 +516,9 @@ paquet.
 Un créneau manqué ne reste pas muet (#2601) : sur l'hôte opérateur, chaque
 `ameesh release tick` (minuteur de 5 min) relit la cadence compilée
 (`packets.cutoffs`) ; passé la grâce (15 min par défaut), si aucun porteur
-`integration/paquet*` n'est ouvert ni tout juste fusionné pour le projet et que
-la liste calculée rend au moins un lot prêt, une alerte urgente part, une fois
+`integration/paquet*` n'est ouvert ni tout juste fusionné pour le projet,
+qu'aucun paquet n'a déjà fusionné pendant le créneau et que la liste calculée
+rend au moins un lot prêt, une alerte urgente part, une fois
 par créneau, aux destinataires de `packet_watch.projects.<projet>.notify` (le
 composeur et le pilote). `ameesh release packet-watch --dry-run` montre ce qui
 partirait.
@@ -787,13 +819,19 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    dépôt, refus ; la clé est en minuscules, une seule suite par dépôt), avec
    son dossier et sa largeur (`src/ameesh/migrations` sur 4 chiffres pour
    ameesh, `supabase/migrations` sur 3 pour nexlink ; un autre dépôt se
-   déclare dans `radar.projects.<p>` avec `github` et `migrations`). Le
-   numéro passe au-delà de tout fichier numéroté (`N_…`) de l'arbre et de toutes les branches
-   d'un clone local du dépôt (locales et distantes, sans fetch : faire
-   `git fetch` avant ; `--repo <clone>`, défaut : le clone déclaré à l'hôte,
-   sinon le dépôt courant, dont l'`origin` doit être le dépôt du lot sur
-   l'hôte github.com exactement), et
-   des numéros déjà réservés pour ce dépôt. Chaque dépôt a sa suite : la
+   déclare dans `radar.projects.<p>` avec `github` et `migrations`). Sans
+   numéro, le prochain libre passe au-delà de tout fichier numéroté (`N_…`)
+   de l'arbre et de toutes les branches d'un clone local du dépôt (locales et
+   distantes, sans fetch : faire `git fetch` avant ; `--repo <clone>`, défaut :
+   le clone déclaré à l'hôte, sinon le dépôt courant, dont l'`origin` doit
+   être le dépôt du lot sur l'hôte github.com exactement), et
+   des numéros déjà réservés pour ce dépôt. `--number N` réserve un numéro
+   précis : il est refusé s'il existe déjà **sur la branche cible du lot**
+   (#2620 : sa `branch_target`, sinon la cible du projet, sinon celle du
+   dépôt, `origin/` publiée d'abord ; l'arbre de travail, le paquet installé
+   et les branches non fusionnées ne comptent pas — un paquet renumérote une
+   migration à sa fusion, #2400) ou s'il est réservé par un autre lot. Chaque
+   dépôt a sa suite : la
    même valeur peut être réservée dans ameesh et dans nexlink. L'unicité
    (dépôt, numéro) est garantie en base (index scalaire et index partiel des
    créneaux réservés) : deux réservations simultanées ne prennent jamais le
@@ -802,19 +840,23 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    s'épuise la commande rend « reservation contention, retry » (jamais
    l'erreur brute de l'index). Seule la violation d'unicité de ces index
    déclenche un réessai ; une autre erreur qui le nomme remonte. La commande est
-   idempotente ; `--number N` réserve un numéro précis (refusé s'il existe
-   déjà dans le dépôt, hors la branche du lot, ou s'il est réservé ailleurs).
-   Un lot qui ajoute plusieurs migrations en réserve plusieurs (#2481) :
-   chaque `--number` s'ajoute à sa liste `migrations`, le premier numéro
-   restant la réservation principale lue par les clients d'avant #2481 ;
-   `--release --number N` ne libère que ce numéro, `--release` les libère
-   tous. `--skip-branch BRANCHE` (répétable, #1603) ajoute une
-   branche au scan ignoré, en plus de celle du lot : à la composition d'un
-   paquet, la branche d'intégration porte déjà les fichiers renumérotés et
-   ferait refuser le numéro ; l'option ne dispense pas de la réservation (un
+   idempotente ; `--number N` réserve un numéro précis, refusé s'il existe
+   déjà sur la branche cible du lot (`branch_target`, sinon la cible du
+   projet, sinon celle du dépôt, `origin/` publiée d'abord ; les branches non
+   fusionnées ne comptent pas, #2620) ou s'il est réservé ailleurs. Un lot qui
+   ajoute plusieurs migrations en réserve plusieurs (#2481) : chaque
+   `--number` s'ajoute à sa liste `migrations`, le premier numéro restant la
+   réservation principale lue par les clients d'avant #2481 ; `--release
+   --number N` ne libère que ce numéro, `--release` les libère tous.
+   `--skip-branch BRANCHE` (répétable, #1603) ajoute une branche au scan
+   ignoré, en plus de celle du lot : à la composition d'un paquet, la branche
+   d'intégration porte déjà les fichiers renumérotés et ferait choisir un
+   numéro au-delà pour l'allocation du prochain libre ; l'option ne dispense
+   pas de la réservation (un
    numéro retenu par un autre lot reste refusé), et une branche de tronc
    (`main`, `master`, `develop`, la branche par défaut d'`origin`) ne s'ignore
-   jamais. Un lot dont l'`issue_ref`
+   jamais. Une réservation à numéro exact lit la cible seule : `--skip-branch`
+   n'y change rien. Un lot dont l'`issue_ref`
    désigne un autre dépôt se corrige avant de réserver :
    `ameesh work issue-ref <lot> owner/repo#N` (ou `--none` pour effacer),
    réservé aux correcteurs comme `work set-app` et journalisé ; refusé tant

@@ -3666,7 +3666,11 @@ class Housekeeping(Domain):
     @abc.abstractmethod
     def summary(self, host: str | None, since_s: float) -> list[dict]:
         """Par (hôte, kind, action) : nombre de lignes et octets, sur les
-        `since_s` dernières secondes (les bilans `mesure` exclus)."""
+        `since_s` dernières secondes (les bilans `mesure` exclus).
+
+        #2617 : un signalement `orphan` (ré-écrit toutes les 12 h pour une
+        entrée non attribuée) compte une fois par chemin, avec sa dernière
+        taille ; les autres actions comptent leurs lignes."""
 
     @abc.abstractmethod
     def last_measure(self, host: str | None) -> list[dict]:

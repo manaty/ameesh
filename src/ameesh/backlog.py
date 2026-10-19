@@ -1138,9 +1138,15 @@ def _propose_reviews(db, st, listing, *, pool, room, dry_run=False, canons=(),
                 # pas la production) ; famille d'auteur inconnue, toute famille
                 # connue fait l'affaire
                 author_info = review_lot._author_at_freeze(db, lot, item)
-                want = review_lot.reviewer_family(author_info.get("harness"))
+                # #2664 : les familles viennent du canon compilé, au dernier
+                # commit audité ; illisible -> aucune proposition (fail closed).
+                try:
+                    families = review_lot.compiled_families(db)
+                except review_lot.FamiliesError:
+                    continue
+                want = review_lot.reviewer_family(author_info.get("harness"), families)
                 if want == review_lot.UNKNOWN_FAMILY:
-                    ok = mine in ("codex", "claude")
+                    ok = bool(review_lot.family_of(mine, families))
                 else:
                     ok = mine == want
                 if not ok:
