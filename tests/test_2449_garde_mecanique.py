@@ -50,7 +50,8 @@ def reader_keys() -> set[str]:
             ("ci", mechanics._CI_KEYS),
             ("reviews", mechanics._REVIEWS_KEYS),
             ("merge", mechanics._MERGE_KEYS),
-            ("prevalidation", mechanics._PREVALIDATION_KEYS)):
+            ("prevalidation", mechanics._PREVALIDATION_KEYS),
+            ("backlog", mechanics._BACKLOG_KEYS)):
         keys |= {"%s.%s" % (block, name) for name in names}
     return keys
 
@@ -66,7 +67,8 @@ class SchemaCoverageTest(unittest.TestCase):
         # le lecteur ne peut pas ajouter un bloc sans que la garde le voie
         self.assertEqual(set(mechanics._DOCUMENT_KEYS),
                          {"schema", "timezone", "cutoffs", "packets", "build",
-                          "ci", "reviews", "merge", "prevalidation", "projects"})
+                          "ci", "reviews", "merge", "prevalidation", "backlog",
+                          "projects"})
         self.assertLessEqual(set(mechanics._OVERRIDE_KEYS),
                              set(mechanics._DOCUMENT_KEYS))
 
@@ -109,6 +111,7 @@ POSITIVE = {
     "prevalidation.parts_script":
         '# prevalidation\nparts_script = "scripts/test-parts.py"\n',
     "prevalidation.timeout_seconds": "# prevalidation\ntimeout_seconds = 7200\n",
+    "backlog.lot_min_value": "BACKLOG_LOT_MIN_VALUE = 30\n",
     "projects": 'PROJECT_OVERRIDES = {"ameesh": {"build": {"max_in_build": 3}}}\n',
 }
 

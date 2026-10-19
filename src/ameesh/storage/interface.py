@@ -68,8 +68,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    delays timeline link_package by_package close_merged close
                    refresh_package_parents delegate current_delegation
                    mark_delegate_turn due_delegations resolve_delegation
-                   overdue_delegations returned_delegations backlog_add backlog
-                   auto_takes_since unassigned_lots issue_feed set_issue_ref set_estimate
+                   overdue_delegations returned_delegations backlog_add
+                   backlog_basket_add backlog auto_takes_since unassigned_lots issue_feed set_issue_ref set_estimate
                    estimates mark_started estimate_history
    packages       all get upsert retire lock_sync
    actions         get recent attempts events log_event last_event_note
@@ -194,6 +194,9 @@ AUTO_TAKE_NOTE = "prise automatique"
 HANDOFF_NOTE = "pause budget (reprise) : lot repris"
 ASSIGN_NOTE_PREFIXES = ("assigned to ", "assigné à ", "created and assigned to ",
                         DELEGATED_NOTE, LOT_TAKE_NOTE, AUTO_TAKE_NOTE, HANDOFF_NOTE)
+#: #2584 : début de la note de journal d'une ligne de panier (`backlog_basket_add`)
+#: — le compte des lignes d'un panier se lit sur ce préfixe
+BASKET_LINE_NOTE = "basket line"
 
 
 class Domain(abc.ABC):
@@ -2089,6 +2092,29 @@ class WorkItems(Domain):
         assigné, et sa première ligne de journal ; rend le lot.
 
         `app`: its project (L118c), empty when unknown."""
+
+    @abc.abstractmethod
+    def backlog_basket_add(self, *, key: str, title: str, expected_value: str, line: str,
+                           value_score: int, priority: int, team: str | None,
+                           required_capabilities: list | None, package_id: str | None,
+                           package_parent: str | None, note: str, actor: str,
+                           app: str = "") -> dict:
+        """#2584 (canon §2 l.129) : ajoute une ligne au panier ouvert `key`
+        d'un chantier, ou ouvre ce panier ; rend le panier.
+
+        Le panier est un lot `improvement` en `intake`, sans assigné, dont la
+        `source` vaut `key` : la clé seule le désigne, l'équipe d'une ligne
+        n'ouvre pas un second panier. La ligne s'ajoute au corps ; la valeur
+        du panier est la plus haute de ses lignes, sa priorité la plus haute
+        (le plus petit nombre), ses capacités exigées l'union des leurs, son
+        équipe la première donnée (`team` de la ligne qui l'ouvre, sinon
+        d'une suivante) ;
+        `note` (qui commence par `BASKET_LINE_NOTE`) va au journal. Un panier
+        déjà pris (assigné, ou sorti d'`intake`) est fermé aux lignes : la
+        suivante ouvre un nouveau panier. Deux ajouts simultanés sur la même
+        clé n'ouvrent jamais deux paniers (un écrivain par clé). Le lot rendu
+        porte `basket_lines` (lignes au journal du panier) et `basket_opened`
+        (vrai si cet ajout l'a ouvert)."""
 
     @abc.abstractmethod
     def backlog(self, *, open_only: bool, limit: int,

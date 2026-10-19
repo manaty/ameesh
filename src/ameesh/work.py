@@ -1512,6 +1512,15 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
         # dernière attribution, restent en place.
         row = set_branch(db, item_id, branch, branch_target, actor=actor)
         return {"item": row, "check": check, "previous": previous}
+    if not previous and takes_rule(check):
+        # #2584 (canon §2 l.129) : un élément du backlog sous le seuil de lot
+        # du canon ne se confie pas à un agent tant qu'un lot de roadmap de
+        # son projet est prenable — même règle que la prise au repos.
+        from . import backlog
+        refusal = backlog.assign_refusal(
+            db, item, cfg=cfg if cfg is not None else getattr(db, "cfg", None))
+        if refusal:
+            raise WorkError(refusal)
     note = "assigned to %s%s (before: %s)%s" % (
         check["assignee"],
         " — external session, owner %s" % check["responsible"] if check["externe"] else "",
