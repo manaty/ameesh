@@ -105,6 +105,9 @@ class ReviewOriginTest(unittest.TestCase):
             # un constat, une issue GitHub, une source sans relecture : rien
             ({"source": "#2577 dry-run complet du delta, 2026-10-19"}, None),
             ({"source": "relecture manaty/nexlink#1669"}, None),
+            ({"source": "relecture de la PR #1943 (N1)"}, None),
+            ({"source": "relecture de la PR #1943, lot #313 (N1)"}, 313),
+            ({"title": "N2 : issue #77 citée", "source": "finding"}, None),
             ({"source": "constat de l'auditeur", "title": "Dette #12 à rembourser"}, None),
         ]
         for kw, expected in cases:

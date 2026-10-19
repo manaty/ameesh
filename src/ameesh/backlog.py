@@ -371,6 +371,17 @@ REVIEW_WORDS = re.compile(
     r"\b(?:relectures?|relu|relue|relus|verdicts?|reviews?|reviewed|avis|r[0-9])\b", re.I)
 #: une référence de lot `#N` (jamais `owner/repo#N`, une issue GitHub)
 LOT_REF = re.compile(r"(?<![\w/])#([0-9]+)\b")
+#: ce qui précède un `#N` qui n'est pas un lot : « PR #1943 », « issue #12 »
+NOT_LOT_REF = re.compile(r"\b(?:prs?|pull|issues?)\s*$", re.I)
+
+
+def _lot_ref(text: str) -> int | None:
+    """Le premier `#N` de `text` qui désigne un lot (ni PR, ni issue)."""
+    text = str(text or "")
+    for match in LOT_REF.finditer(text):
+        if not NOT_LOT_REF.search(text[:match.start()]):
+            return int(match.group(1))
+    return None
 
 
 def review_origin(*, title: str = "", source: str = "") -> int | None:
@@ -387,13 +398,11 @@ def review_origin(*, title: str = "", source: str = "") -> int | None:
         if match:
             return int(match.group(0))
     if REVIEW_WORDS.search(source):
-        match = LOT_REF.search(source)
-        if match:
-            return int(match.group(1))
+        lot = _lot_ref(source)
+        if lot is not None:
+            return lot
     if followup_hint(title=title):
-        match = LOT_REF.search(str(title or ""))
-        if match:
-            return int(match.group(1))
+        return _lot_ref(title)
     return None
 
 
