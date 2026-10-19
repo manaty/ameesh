@@ -2598,7 +2598,8 @@ class AgentWorker(threading.Thread):
     def _lot_brief(self, lot: str, courant: str, out: dict) -> str | None:
         """#794 : le brief MINIMAL d'une session neuve dédiée au lot `lot` :
         canon, fiche du lot, diff de sa branche, fil du lot réduit aux
-        décisions et messages non lus (décision du bureau, 2026-10-13)."""
+        décisions, messages non lus et courriers déjà livrés pour ce lot
+        (#2539 ; décision du bureau, 2026-10-13)."""
         try:
             from . import reprise, work as work_mod
             item = work_mod.get(self.db, int(lot)) if str(lot).isdigit() else None
@@ -4413,11 +4414,9 @@ class AgentWorker(threading.Thread):
         témoin. Le réglage `lot_wake=off` ne l'éteint pas : c'est un geste
         posé, pas une relance d'inactivité. Les gardes de `_pick` (arrêt,
         budget, porte et pression d'hôte, authentification) sont déjà passées ;
-        un lot sans dossier reste armé (#811)."""
-        if storage.is_remote(self.db):
-            # L109 : le contrat de l'exécuteur médié ne porte pas encore
-            # l'échéance de lot ; le réveil reste porté par un exécuteur local.
-            return None
+        un lot sans dossier reste armé (#811). Sur un exécuteur médié, les
+        trois opérations passent par le contrat
+        (`lot_sessions.due_wakes/claim_wake/consume_wake`, #2613)."""
         if time.monotonic() - getattr(self, "_scheduled_wake_checked",
                                       float("-inf")) < self.SCHEDULED_WAKE_CHECK_S:
             return None

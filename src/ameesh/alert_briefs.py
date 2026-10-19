@@ -290,6 +290,9 @@ def _slo_breach(alert: dict) -> str:
     holder = " --if-holder %s" % who if who else ""
     waiting = alert.get("waiting") or {}
     what = waiting.get("what") if isinstance(waiting, dict) else None
+    # #2511 : le lot cible le dépôt canon (manaty/home) ; un paquet ameesh ne
+    # le porte pas, la fusion est celle du bureau.
+    canon = bool(isinstance(waiting, dict) and waiting.get("canon"))
     # #2378 : une demande ouverte et échue (sinon le lot serait en attente
     # prévue) ; les cibles sont passées au pilote à toute étape
     # (`exploitation._slo_targets`), le brief les suit. Sans demande,
@@ -302,7 +305,17 @@ def _slo_breach(alert: dict) -> str:
         # addressed to the pilot never reaches the assignee.
         what = None
     if what in ("merge", "merge-approval", "merge-outcome"):
-        if level >= 3:
+        if canon:
+            if level >= 3:
+                move = ("bureau: merge it directly — its `canon/…` branch targets the canon "
+                        "repository (manaty/home), which an ameesh package does not carry; "
+                        "auditor: see that the bureau does it, do not reassign or nudge the "
+                        "holder")
+            else:
+                move = ("bureau: merge it directly — its `canon/…` branch targets the canon "
+                        "repository (manaty/home), outside the ameesh package; the "
+                        "pilot/composer cannot carry it, do not wait for them")
+        elif level >= 3:
             move = ("bureau or auditor: the lot waits for its merge vehicle/package — "
                     "the composer/pilot carries it, and reassigning or nudging its holder "
                     "does not advance it; push the pilot/composer to include it in the next "

@@ -15,7 +15,7 @@ import tempfile
 from unittest import TestCase
 
 from ameesh import registry
-from ameesh import review_designation_activation as act
+from ameesh import review_authors, review_designation_activation as act
 from ameesh import review_designation as rd
 from ameesh import review_designation_pg as pg
 
@@ -35,7 +35,7 @@ class DesignPathTest(TestCase):
                 with self.subTest(path=path):
                     repo.write(path, "design\n")
                     sha = repo.commit("design")
-                    self.assertEqual(act._change(root, sha), (1, True))
+                    self.assertEqual(review_authors.change(root, sha), (1, True))
 
 
 
