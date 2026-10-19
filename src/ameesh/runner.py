@@ -5396,6 +5396,13 @@ class AgentWorker(threading.Thread):
                             % (self.name, entry["path"], entry.get("bytes"),
                                entry.get("detail", "").rpartition(" : ")[2],
                                (entry.get("data") or {}).get("command")))
+                    elif (entry.get("kind") == "tmp"
+                          and entry.get("detail")
+                          == "new session: temporary directory emptied"):
+                        # #2610 : trace au journal du vidage, pour mesurer les
+                        # rotations qui l'auraient encore déclenché.
+                        log("[%s] new session: temporary directory emptied (%s, %s bytes)"
+                            % (self.name, entry.get("path"), entry.get("bytes")))
         except Exception as exc:
             log("[%s] cleanup after turn %s failed (%s)" % (self.name, turn_id[:8], exc))
 
@@ -5730,9 +5737,16 @@ class AgentWorker(threading.Thread):
                 # session neuve : dossier temporaire vidé — jamais sous le travail
                 # de fond d'un tour précédent encore en délai de grâce
                 fond = getattr(self.runner, "background", None)
+                # #2610 : une rotation ouvre la session neuve sur le résumé d'un
+                # travail EN COURS ; le dossier temporaire de l'agent est gardé
+                # (le résumé peut désigner ses fichiers). Le vidage reste pour
+                # une vraie session neuve (démarrage, fin de lot, redémarrage).
+                suite_de_rotation = bool(self.resume_summary) \
+                    and self.resume_origin == "agent"
                 menage_tour = menage_mod.Turn.begin(
                     self.cfg, self.runner.housekeeping_policy(), self.name, cwd,
-                    new_session=not session and not (fond and fond.has_jobs(self.name))
+                    new_session=not session and not suite_de_rotation
+                    and not (fond and fond.has_jobs(self.name))
                     and self.resident is None,
                     base_env=env)
                 env.update(menage_tour.env)
