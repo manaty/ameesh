@@ -2458,6 +2458,63 @@ class WorkItems(interface.WorkItems):
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
             return item
 
+    def backlog_basket_add(self, *, key, title, expected_value, line, value_score, priority,
+                           team, required_capabilities, package_id, package_parent, note,
+                           actor, app="") -> dict:
+        caps = _catalog._text_array(required_capabilities) if required_capabilities else None
+        with self.db.transaction() as tx:
+            # #2584 : un seul écrivain par clé de panier — deux ajouts
+            # simultanés n'ouvrent jamais deux paniers du même chantier.
+            tx.query("SELECT pg_advisory_xact_lock(hashtextextended("
+                     "current_schema() || ':backlog-basket:' || %s, 0))", (key,))
+            # Une prise concurrente (`assign_capped`) attend le verrou de
+            # ligne ; gagnée avant nous, la ligne ne vérifie plus le filtre :
+            # le panier pris reste fermé aux lignes.
+            rows = tx.query(
+                "SELECT id FROM work_items"
+                " WHERE type = 'improvement' AND source = %s AND state = 'intake'"
+                "   AND assignee IS NULL AND team IS NOT DISTINCT FROM %s"
+                " ORDER BY id LIMIT 1 FOR NO KEY UPDATE", (key, team))
+            opened = not rows
+            if opened:
+                rows = tx.query(
+                    "INSERT INTO work_items"
+                    "    (type, source, title, body, state, expected_value, value_score,"
+                    "     priority, team, required_capabilities, package_id, package_parent,"
+                    "     app)"
+                    " VALUES ('improvement', %s, %s, %s, 'intake', %s, %s, %s, %s,"
+                    "         %s::text[], %s, %s, %s)"
+                    " RETURNING id",
+                    (key, title, line, expected_value, int(value_score), int(priority),
+                     team, caps, package_id, package_parent, app or ""))
+            else:
+                tx.query(
+                    "UPDATE work_items"
+                    "   SET body = CASE WHEN btrim(coalesce(body, '')) = '' THEN %s"
+                    "                   ELSE body || %s END,"
+                    "       value_score = greatest(coalesce(value_score, 0), %s),"
+                    "       priority = least(coalesce(priority, %s), %s),"
+                    "       required_capabilities = (SELECT array_agg(DISTINCT c ORDER BY c)"
+                    "            FROM unnest(coalesce(required_capabilities, '{}'::text[])"
+                    "                        || coalesce(%s::text[], '{}'::text[])) AS c),"
+                    "       updated_at = now()"
+                    " WHERE id = %s RETURNING id",
+                    (line, "\n" + line, int(value_score), int(priority), int(priority),
+                     caps, int(rows[0]["id"])))
+            item_id = int(rows[0]["id"])
+            WorkItems(tx)._event(item_id, "intake", note, actor)
+            rows = tx.query(
+                "SELECT " + item_columns(self.db) + ","
+                "       (SELECT count(*) FROM work_item_events e"
+                "         WHERE e.work_item_id = work_items.id"
+                "           AND starts_with(e.note, %s))::bigint AS basket_lines"
+                "  FROM work_items WHERE id = %s",
+                (interface.BASKET_LINE_NOTE, item_id))
+            item = dict(rows[0])
+            item["basket_lines"] = int(item.get("basket_lines") or 0)
+            item["basket_opened"] = opened
+            return item
+
     def backlog(self, *, open_only, limit, ready_only=False) -> list[dict]:
         # §4 : un élément `build` RENDU à la file (limite d'en-cours) reste
         # prenable, comme un lot de l'équipe ; un `build` en cours, non.
