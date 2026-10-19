@@ -395,7 +395,8 @@ class HarnessMissing(RuntimeError):
 
     L106 : c'est une erreur de l'HÔTE (installation, PATH, interpréteur), pas
     de l'agent — l'exécuteur pose « hôte non prêt » et réessaie, sans compter
-    d'échec rapide (L48)."""
+    d'échec rapide (L48). Sert aussi aux capacités absentes d'un descripteur
+    (session interactive non déclarée, #2706) : on refuse avant d'agir."""
 
 
 # --------------------------------------------------------------------------
@@ -1146,6 +1147,21 @@ class HarnessAdapter:
         argv += ["--prompt", text]
         return argv
 
+    def require_interactive(self) -> None:
+        """Refuse un harnais qui ne déclare **aucune** session interactive.
+
+        `ameesh.interactive` est la liste d'arguments de la session (un `[]`
+        légitime) ; `null` (ou absent en ACP) la refuse. Le refus doit tomber
+        avant toute prise de bail : lancer une commande headless sans tâche
+        (dsh `--profile agent`, #2706) ne fait que rendre le bail en quelques
+        secondes, après avoir réveillé l'agent pour rien.
+        """
+        if not self.spec.attach:
+            raise HarnessMissing(
+                "harness %s declares no interactive session (descriptor's "
+                "`ameesh.interactive` is null): `ameesh attach` and `ameesh chat` "
+                "are unavailable for it" % self.key)
+
     def interactive_command(self, session_id: str | None = None, *,
                             permission_mode: str | None = None) -> list[str]:
         """Commande d'une session **interactive** sur la même session (attach, C9).
@@ -1155,10 +1171,7 @@ class HarnessAdapter:
         déclare pas `ameesh.interactive` (typiquement un agent ACP) refuse.
         L223: the permission mode (`permission_mode()`) follows `interactive`.
         """
-        if not self.spec.attach:
-            raise HarnessMissing(
-                "descriptor %s declares no interactive command: "
-                "`ameesh attach` is not available for this harness" % self.key)
+        self.require_interactive()
         argv = [self.binary, *self.spec.launcher, *self.spec.interactive]
         mode = self.permission_mode(permission_mode)
         if mode:

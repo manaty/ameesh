@@ -1118,6 +1118,8 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
         "milestones": plan["milestones"],
         "epics": plan["epics"],
         "stale_after_s": int(threshold),
+        # #2451 (champ ajouté) : plafond §4 du canon compilé ; null s'il est illisible
+        "build_cap": _build_cap(cfg),
         "actions": [build_action(r) for r in action_rows],
         "budget": dict(build_budget(cost_rows, gauges, now, hourly_cap=hourly,
                                     paid_harnesses=paid, real=real, accounts=accounts),
@@ -1154,10 +1156,21 @@ def _duration(seconds) -> str:
     return "%d d %d h" % (seconds // 86400, (seconds % 86400) // 3600)
 
 
-def _wip_label(builds: int) -> str:
+def _build_cap(cfg) -> int | None:
+    """§4 : le plafond du canon compilé (`work.build_limit`, #2451), ou None.
+
+    Le tableau de bord n'agit pas : sans document lisible, il affiche
+    l'en-cours sans juger le dépassement plutôt que de supposer un plafond."""
+    from . import mechanics
+    try:
+        return work_mod.build_limit(cfg)
+    except mechanics.MechanicsError:
+        return None
+
+
+def _wip_label(builds: int, cap: int | None) -> str:
     """§4 : l'en-cours d'un agent, et le dépassement du plafond s'il y en a un."""
-    cap = work_mod.BUILD_LIMIT
-    if builds > cap:
+    if cap is not None and builds > cap:
         return "%d lots in build (above the §4 cap of %d)" % (builds, cap)
     return "%d lot(s) in build" % builds
 
@@ -1302,7 +1315,8 @@ def format_text(snap: dict, width: int | None = None) -> str:
                             " for %s" % _duration(now - since) if since else ""), "  ")
         line("%s · %s · effort %s · %s" % (
             agent["harness"] or "?", agent["model"] or "default",
-            agent["effort"] or "default", _wip_label(agent.get("builds") or 0)), "    ")
+            agent["effort"] or "default", _wip_label(agent.get("builds") or 0,
+                                                 snap.get("build_cap"))), "    ")
         turn = agent.get("turn")
         if turn:
             line("turn: %s" % (turn["task"] or turn["label"] or "running"), "    ")

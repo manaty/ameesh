@@ -935,8 +935,8 @@ class CloseGuardWitnessTest(_Witness):
         sha = "6" * 40
         lot, review = self.critical_review(sha)
         work.assign(self.db, review, "codex1", actor="orch")
-        self.verdict(lot, "bad0000", "codex1")
-        self.verdict(lot, "bad0000", "claude2")
+        self.verdict(lot, "bad" + "0" * 37, "codex1")
+        self.verdict(lot, "bad" + "0" * 37, "claude2")
         with self.assertRaises(work.WorkError):
             work.close(self.db, review, done=True, actor="codex1")
         self.verdict(lot, sha, "codex1")
@@ -964,7 +964,7 @@ class CloseGuardWitnessTest(_Witness):
             self.db, lot=lot, klass={"class": "light", "why": "policy"},
             merged_sha=sha)
         work.assign(self.db, out["id"], "codex1", actor="orch")
-        self.verdict(lot, "bad0000", "codex1")
+        self.verdict(lot, "bad" + "0" * 37, "codex1")
         with self.assertRaises(work.WorkError):
             work.close(self.db, out["id"], done=True, actor="codex1")
         self.verdict(lot, sha, "codex1")

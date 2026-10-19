@@ -220,9 +220,11 @@ class RapportTest(_Base):
         texte = accounts.format_rows(lignes)
         self.assertIn("lost at reset if nothing changes: codex-300min 100% "
                       "in 52 min", texte)
+        # #2648 : le rythme du next choice est celui de la pause d'un
+        # non-critique — réserve des 10 points déduite (14 % et 43 %).
         self.assertIn("next choice for a new session: codex-10080min 5% "
-                      "used (pace 24%), losing its budget fastest; ahead of: "
-                      "primaire codex-10080min 20% used (pace 53%)", texte)
+                      "used (pace 14%), losing its budget fastest; ahead of: "
+                      "primaire codex-10080min 20% used (pace 43%)", texte)
         # lecture seule : aucun relevé écrit (L71)
         self.assertEqual(self.db.query("SELECT count(*) AS n FROM quota_gauge_readings")[0]["n"],
                          0)

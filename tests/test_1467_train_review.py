@@ -29,15 +29,19 @@ def verdict(number, actor, harness, *, commit=HEAD, status="ok"):
     return mark, proof
 
 
+#: #2451 : familles explicites ; le passage raccordé les lit au canon compilé
+FAMILIES = ("claude", "codex", "deepseek")
+
+
 class ReceiptShapeTest(unittest.TestCase):
     def test_known_receipt_requires_every_exact_field_and_a_known_family(self):
         valid = author()
-        self.assertTrue(valid.known())
+        self.assertTrue(valid.known(FAMILIES))
         for field, value in (("session", ""), ("turn", ""), ("record", ""),
                              ("harness", "unknown")):
             with self.subTest(field=field):
                 altered = dataclasses.replace(valid, **{field: value})
-                self.assertFalse(altered.known())
+                self.assertFalse(altered.known(FAMILIES))
 
     def test_order_is_the_exact_verdict_identity_and_date(self):
         self.assertEqual(_order(dict(id=2, actor="r", at_ts=1.5)), (1.5, 2))
