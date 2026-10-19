@@ -42,6 +42,8 @@ exec %s "$@"
 """
 
 _VENV_NAME = re.compile(r"venv(?:-[0-9a-z.]+)?")
+#: instantané de déploiement écrit par `poste.sh`/`vm.sh` (git archive)
+_SOURCE_NAME = re.compile(r"src-[0-9a-z]+")
 
 
 def _real(path: str) -> str:
@@ -143,6 +145,23 @@ def shim_dir(cfg) -> str:
     return os.path.join(cfg.state_dir, ".menage", SHIM_DIR)
 
 
+def _from_deployed_snapshot(charge: str, prefix: str) -> bool:
+    """Le code chargé vient-il d'un instantané de déploiement `src-<sha>` ?
+
+    `poste.sh install/migrer` sonde le code cible avec
+    `PYTHONPATH=$PARTAGE/src-<sha>/src "$VENV/bin/python" -m ameesh` (le venv
+    n'est pas encore installé) : cet instantané est voisin du venv, et sa
+    présence n'est pas l'écart que `doctor` doit signaler. Un worktree
+    quelconque, ou un `.menage/tmp/...`, reste signalé.
+    """
+    if not prefix:
+        return False
+    parent = os.path.dirname(_real(prefix))
+    snapshot = os.path.dirname(os.path.dirname(charge))
+    return (os.path.dirname(snapshot) == parent
+            and _SOURCE_NAME.fullmatch(os.path.basename(snapshot)) is not None)
+
+
 def installation_problems(prefix: str | None = None) -> list:
     """Écarts d'installation du venv d'ameesh : éditable, ou paquet chargé
     hors du site-packages du venv. Liste vide : installation saine."""
@@ -169,6 +188,7 @@ def installation_problems(prefix: str | None = None) -> list:
         # (CI, worktree) lancé avec PYTHONPATH=src n'a rien à comparer
         installe = {_real(s) for s in sites
                     if glob.glob(os.path.join(s, "ameesh-*.dist-info"))}
-        if installe and os.path.dirname(charge) not in installe:
+        if installe and os.path.dirname(charge) not in installe \
+                and not _from_deployed_snapshot(charge, prefix):
             problemes.append("ameesh loaded outside the venv: %s" % charge)
     return problemes

@@ -103,8 +103,9 @@ class ScrubTest(Banc):
             trouve = shutil.which(nom, path=env["PATH"])
             self.assertEqual(str(shims / nom), trouve)
             self.assertIn(str(self.vivant / "bin" / nom), Path(trouve).read_text())
-        # ni pip ni python3 du venv vivant
-        self.assertIsNone(shutil.which("pip", path=env["PATH"]))
+        # ni pip ni python3 du venv vivant (un pip système peut rester)
+        self.assertNotEqual(str(self.vivant / "bin" / "pip"),
+                            shutil.which("pip", path=env["PATH"]))
         # idempotent
         with self.en_venv(self.vivant):
             again = venv_guard.scrub(dict(env), str(shims))
@@ -172,6 +173,25 @@ class DoctorTest(Banc):
     def test_venv_doutils_sans_ameesh_installe_reste_vert(self):
         self.site(self.vivant)                 # CI : PYTHONPATH=src, rien d'installé
         self.assertEqual([], venv_guard.installation_problems(str(self.vivant)))
+
+    def test_src_de_deploiement_autorise_et_worktree_signale(self):
+        # `poste.sh` sonde le code cible depuis son instantané src-<sha>,
+        # voisin du venv, avant de l'installer (B/P1 de la revue #2763)
+        site = self.site(self.vivant)
+        (site / "ameesh-1.13.0.dist-info").mkdir()
+        import ameesh
+        deploye = self.share / "src-abc1234" / "src" / "ameesh" / "__init__.py"
+        deploye.parent.mkdir(parents=True)
+        deploye.write_text("")
+        with mock.patch.object(ameesh, "__file__", str(deploye)):
+            self.assertEqual([], venv_guard.installation_problems(str(self.vivant)))
+        # un worktree de relecture, même chargé par PYTHONPATH, reste signalé
+        worktree = self.base / "worktree" / "src" / "ameesh" / "__init__.py"
+        worktree.parent.mkdir(parents=True)
+        worktree.write_text("")
+        with mock.patch.object(ameesh, "__file__", str(worktree)):
+            problemes = venv_guard.installation_problems(str(self.vivant))
+        self.assertTrue(any("loaded outside the venv" in p for p in problemes))
 
     def test_doctor_rouge_sur_un_ecart(self):
         texte = (ROOT / "src/ameesh/cli.py").read_text()
