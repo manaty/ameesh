@@ -738,7 +738,221 @@ def source_of(repo: str) -> str:
     return normalize_source("%s%s/%s" % (host.lower(), ":%d" % int(port) if port else "", path))
 
 
-def fetch_fresh(repo: str, names, clone=None) -> tuple[dict, str]:
+def _unreadable_objects(where: str, revs, base: str | None = None) -> list[str] | None:
+    """Les objets que `where` ne peut pas lire pour `revs`.
+
+    `revs` : une tête, ou plusieurs dont on vérifie l'union. Le clone radar
+    est un `git clone --shared` : ses objets viennent par alternates du
+    checkout des agents, et un élagage de celui-ci (`gc`, ménage disque)
+    retire ceux que seul le clone partagé utilisait. Un
+    `rev-list --objects --missing=print` nomme les objets absents de la
+    fermeture **complète** des têtes : ceux de la cible et de la base de
+    fusion comptent aussi, puisque `merge-tree` lit les trois côtés.
+
+    Avec `base` (la cible), le parcours est borné à ce que lit réellement la
+    fusion d'essai : l'histoire propre des têtes (`--not base`), puis les
+    arbres des trois côtés — têtes, cible et commits de bord (`--boundary`,
+    dont les bases de fusion). La fermeture complète coûte 20 à 40 s sur
+    Nexlink à chaque fetch, la version bornée moins d'une seconde.
+
+    Une exception : plusieurs bases de fusion. `merge-tree` les fusionne
+    récursivement pour construire sa base virtuelle ; l'ancêtre propre de ces
+    bases n'apparaît alors ni dans l'histoire propre des têtes ni dans les
+    arbres de bord. Dès que `merge-base --all` nomme plus d'une base pour une
+    tête, le garde revient à la fermeture complète : mieux vaut un parcours
+    lent qu'une tête rendue que la fusion ne peut pas lire.
+
+    `None` quand le parcours lui-même échoue : l'appelant le traite comme un
+    manque à réparer, jamais comme une tête lisible."""
+    from . import resolutions
+    revs = [revs] if isinstance(revs, str) else list(revs)
+    revs = list(dict.fromkeys(revs))
+    if not revs:
+        return []
+    for rev in revs:
+        if plan_git._commit(where, rev) is None:
+            return [rev]      # une tête manquante arrête rev-list : on la nomme
+    if base and plan_git._commit(where, base) is None:
+        return [base]
+    if not base:
+        walks = [["rev-list", "--objects", "--missing=print", *revs]]
+    else:
+        proc = resolutions._run(where, "rev-list", "--boundary", *revs, "--not", base)
+        if proc.returncode:
+            return None
+        boundary = [line[1:] for line in resolutions._text(proc).splitlines()
+                    if line.startswith("-")]
+        for rev in revs:
+            if rev == base:
+                continue
+            proc = resolutions._run(where, "merge-base", "--all", rev, base)
+            if proc.returncode not in (0, 1):
+                return None
+            if len(resolutions._text(proc).split()) > 1:
+                # bases multiples : leur fusion récursive lit leur ancêtre
+                walks = [["rev-list", "--objects", "--missing=print",
+                          *sorted(set(revs) | {base})]]
+                break
+        else:
+            walks = [
+                ["rev-list", "--objects", "--missing=print", *revs, "--not", base],
+                ["rev-list", "--objects", "--missing=print", "--no-walk",
+                 *sorted(set(revs) | {base} | set(boundary))],
+            ]
+    missing = []
+    for args in walks:
+        proc = resolutions._run(where, *args)
+        if proc.returncode:
+            return None
+        for line in resolutions._text(proc).splitlines():
+            if not line.startswith("?"):
+                continue
+            fields = line[1:].split()
+            if fields and fields[0] not in missing:
+                missing.append(fields[0])
+    return missing
+
+
+def _refetch_tip_objects(where: str, url: str, branch: str) -> str:
+    """Refait le fetch de `branch` dans `where`, sans négociation.
+
+    Le clone lit ses objets par alternates : un fetch ordinaire peut répondre
+    « à jour » (la tête est lisible par les alternates) ou déposer un pack dont
+    `unpack-objects` saute les objets déjà fournis par eux — la tête reste
+    alors une ref sur des objets prêtés. `--refetch` force le transfert, et
+    `transfer.unpackLimit=1` garde le pack : `index-pack` l'écrit même quand
+    les alternates connaissent déjà ses objets, donc le clone les possède.
+    La ref de file est retirée d'abord, pour que le fetch ne soit pas un
+    simple « à jour ». Le pack couvre l'histoire de la branche (aucune
+    négociation) : cette réparation est rare et vaut mieux qu'un lot écarté
+    pour un objet absent. `--no-auto-gc` et `--no-auto-maintenance` évitent
+    qu'un repack détaché du clone ne coure pendant que la fusion d'essai lit
+    ses objets. Rend le message d'erreur de git, vide si le fetch a réussi."""
+    from . import resolutions
+    name = _remote_branch(branch)
+    ref = QUEUE_REF + name
+    resolutions._run(where, "update-ref", "-d", ref)
+    proc = resolutions._run(where, "-c", "transfer.unpackLimit=1",
+                            "fetch", "--quiet", "--no-tags", "--refetch",
+                            "--no-auto-gc", "--no-auto-maintenance", url,
+                            "+refs/heads/%s:%s" % (name, ref), timeout=FETCH_TIMEOUT)
+    return resolutions._err(proc)[:300] if proc.returncode else ""
+
+
+def _clone_base(where: str, base: str | None) -> str | None:
+    """Le commit de cible dont les objets sont vérifiés avec ceux des têtes.
+
+    `base` (la cible du même fetch) d'abord, puis la cible déclarée du clone,
+    puis sa branche par défaut. La cible et la base de fusion comptent : la
+    fusion d'essai lit leur côté de chaque conflit, et un blob d'ancêtre
+    commun absent fait échouer `merge-tree` même quand la tête est complète
+    (B1 de la relecture #2738). Aucun commit lisible : None, le garde ne
+    couvre alors que les têtes fournies."""
+    def first(candidates) -> str | None:
+        for candidate in candidates:
+            if not candidate:
+                continue
+            commit = plan_git._commit(where, candidate)
+            if commit:
+                return commit
+        return None
+    if base:
+        name = _remote_branch(base)
+        commit = first([QUEUE_REF + name, "origin/" + name, name, base])
+        if commit:
+            return commit
+    declared = plan_git.declared_target(where)
+    if declared:
+        commit = first([QUEUE_REF + _remote_branch(declared), declared])
+        if commit:
+            return commit
+    try:
+        default = plan_git.default_target(where)
+    except Exception:  # noqa: BLE001 - cible déclarée introuvable (#2680)
+        default = None
+    if default:
+        commit = first([default, QUEUE_REF + _remote_branch(default)])
+        if commit:
+            return commit
+    return first(plan_git.DEFAULT_TARGETS)
+
+
+def _guarantee_tip_objects(clone, url: str, names, tips: dict, base: str | None) -> dict:
+    """Ne rend que des têtes dont la fermeture est lisible dans le clone.
+
+    #2738 : une tête fraîche peut n'être qu'une ref sur des objets prêtés par
+    les alternates ; si la source les a élagués, la fusion d'essai et les
+    lectures de gel échouent (« blob absent du clone de calcul ») et
+    `paquet-candidats.py` écarte un lot prêt en erreur de lecture. Le garde
+    vérifie l'union des objets lus par la fusion d'essai — histoire propre des
+    têtes, arbres des têtes, de la cible et des bases de fusion, ou fermeture
+    complète si les bases sont multiples —, répare chaque branche
+    dont des objets manquent, puis re-vérifie. Une erreur Git du garde devient
+    une `QueueError` (B2), jamais une exception qui ferait planter l'appelant."""
+    label = ", ".join(names[:5]) + (" …" if len(names) > 5 else "")
+    try:
+        return _verified_tips(clone, url, names, tips, base)
+    except (GitError, OSError) as exc:
+        raise QueueError("cannot guarantee the objects of %s in the radar clone (%s): "
+                         "retry once the remote and the clone answer"
+                         % (label or "the fetched branches", str(exc)[:300])) from exc
+
+
+def _verified_tips(clone, url: str, names, tips: dict, base: str | None) -> dict:
+    """Le corps du garde de `_guarantee_tip_objects` (hors traduction d'erreurs)."""
+    base_branch = _remote_branch(base) if base else ""
+    base_commit = _clone_base(clone.path, base)
+
+    def wanted() -> list[str]:
+        revs = {tips[name] for name in names if tips.get(name)}
+        if base_commit:
+            revs.add(base_commit)
+        return sorted(revs)
+
+    revs = wanted()
+    missing = _unreadable_objects(clone.path, revs, base_commit) if revs else []
+    if missing == []:
+        return tips
+    # chemin rare : nommer la branche qui porte chaque objet manquant et la
+    # refaire. Une tête peut changer (la branche a bougé) ; les entrées de
+    # `tips` de la même branche suivent.
+    repaired: set = set()
+    for tip in revs:
+        branch = next((name for name in names if tips.get(name) == tip), "")
+        if not branch and tip == base_commit:
+            branch = base_branch
+        if not branch or _remote_branch(branch) in repaired:
+            continue
+        if _unreadable_objects(clone.path, tip) == []:
+            continue
+        repaired.add(_remote_branch(branch))
+        error = _refetch_tip_objects(clone.path, url, branch)
+        if error:
+            raise QueueError(
+                "cannot fetch %s from origin for the objects of its head %s (%s): "
+                "try again once the remote answers" % (branch, tip[:12], error))
+        fresh = plan_git._commit(clone.path, QUEUE_REF + _remote_branch(branch)) or tip
+        for name in names:
+            if _remote_branch(name) == _remote_branch(branch):
+                tips[name] = fresh
+        if _remote_branch(branch) == base_branch:
+            base_commit = fresh
+    revs = wanted()
+    missing = _unreadable_objects(clone.path, revs, base_commit) if revs else []
+    if missing == []:
+        return tips
+    detail = ("walk impossible" if missing is None
+              else "%d unreadable, first %s" % (len(missing), missing[0][:12]))
+    label = ", ".join(names[:5]) + (" …" if len(names) > 5 else "")
+    raise QueueError(
+        "cannot guarantee the objects of %s in the radar clone (%s, after an explicit "
+        "fetch from origin): the shared clone reads the agents' objects (git clone "
+        "--shared) and they were pruned; fetch the branch again in the source, or "
+        "recreate the clone" % (label or "the fetched branches", detail))
+
+
+def fetch_fresh(repo: str, names, clone=None,
+                base: str | None = None) -> tuple[dict, str]:
     """({name: commit, or None if there is no such branch}, repository holding
     them) of the branches `names` (lot branches or targets), read fresh. With
     an `origin`, they are listed on it, then fetched from it now into the
@@ -747,7 +961,15 @@ def fetch_fresh(repo: str, names, clone=None) -> tuple[dict, str]:
     `origin/<branch>` counts, since another host may have pushed since. No
     clone, or a remote that does not answer, raises QueueError: no fetch, no
     tip. Without an `origin`, `repo` is the only copy and its local branches
-    are the tips."""
+    are the tips.
+
+    #2738 : les objets de chaque tête sont vérifiés dans le clone avant d'être
+    rendus, avec ceux de la cible (B1 : la fusion lit la base et l'ancêtre
+    commun) ; s'ils manquent (source élaguée, alternates), un `--refetch`
+    explicite de la branche les rapatrie, sinon QueueError. `base` nomme la
+    cible du même fetch, pour la vérifier et la réparer comme les têtes. Une
+    tête rendue est donc lisible par la fusion d'essai et les lectures de
+    gel, jamais une ref sur des objets absents."""
     from . import resolutions
     names = sorted({n for n in names if n})
     remote = {n: _remote_branch(n) for n in names}
@@ -784,8 +1006,9 @@ def fetch_fresh(repo: str, names, clone=None) -> tuple[dict, str]:
     if failed is not None:
         raise QueueError("cannot fetch %s from origin (%s): try again once the remote answers"
                          % (what, failed[:300]))
-    return {n: plan_git._commit(clone.path, QUEUE_REF + remote[n]) if remote[n] in present
-            else None for n in names}, clone.path
+    tips = {n: plan_git._commit(clone.path, QUEUE_REF + remote[n]) if remote[n] in present
+            else None for n in names}
+    return _guarantee_tip_objects(clone, url, names, tips, base), clone.path
 
 
 def branch_tip(repo: str, branch: str, clone=None) -> tuple[str | None, str]:
@@ -910,7 +1133,7 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     # lisaient sur une cible périmée (P2-1 de la R1).
     names = [row["branch"]] + ([target] if target else [])
     try:
-        tips, where = fetch_fresh(repo, names, clone)
+        tips, where = fetch_fresh(repo, names, clone, base=target)
     except QueueError as exc:
         raise QueueError("cannot fetch branch %s%s from origin: %s"
                          % (row["branch"], " and target %s" % target if target else "",

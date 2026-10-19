@@ -296,6 +296,25 @@ class InventoryTest(unittest.TestCase):
         cause = next(cause for cause in entry["causes"] if cause["code"] == "conflict")
         self.assertEqual(cause["files"], ["shared.py"])
 
+    def test_missing_freeze_blob_is_refetched_before_the_conflict_read(self):
+        """#2738 : la tête du gel n'est qu'une ref sur des objets prêtés par le
+        checkout des agents ; quand un blob de sa fusion a disparu (source
+        élaguée), la fusion d'essai devient une erreur de lecture. Le fetch
+        doit rapatrier les objets du gel avant de conclure."""
+        tip = self.tips[4]
+        self.clone.ensure()          # clone partagé, objets prêtés
+        # l'objet que l'élagage de la source aurait retiré : le blob du gel
+        # n'est plus lisible nulle part, le commit et l'arbre le restent
+        blob = _git(self.repo, "rev-parse", tip + ":shared.py")
+        path = os.path.join(self.repo, ".git", "objects", blob[:2], blob[2:])
+        self.assertTrue(os.path.isfile(path), "le blob doit être loose pour ce témoin")
+        os.unlink(path)
+        payload = self.inventory()
+        entry = self.by_id(payload)[4]
+        self.assertEqual(entry["error"], "")
+        self.assertIn("conflict", [cause["code"] for cause in entry["causes"]])
+        self.assertEqual(payload["errors"], [])
+
     def test_light_lot_needs_the_declared_review(self):
         # #2642 : un lot léger n'entre plus au paquet sans l'avis d'une autre
         # famille ; le plancher est déclaré au canon (light_reviews: 1).
