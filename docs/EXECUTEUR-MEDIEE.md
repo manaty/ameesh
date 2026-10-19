@@ -6,7 +6,8 @@ Contrat figé par le lot L107 (version `1.0.0`, schéma
 qui porte deux ajouts — l'expiration médiée des fils (#499, voir « Contrat 1.2 »)
 et l'aperçu d'activité (#1349, voir « Aperçu d'activité ») — puis par la
 résolution d'alias des agents (#423, version `1.3.0`, compatible : voir
-« Contrat 1.3 »).
+« Contrat 1.3 »), puis par le réveil programmé médié (#2613, version
+`1.4.0`, compatible : voir « Contrat 1.4 »).
 Étude et décision : `docs/design/etudes/executeur-mediee.md`,
 `docs/design/decisions/00xx-executeur-mediee.md`.
 
@@ -19,7 +20,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 67 opérations et la liste des 403 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 70 opérations et la liste des 401 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -62,12 +63,12 @@ Les portées :
 - **S** : l'agent et l'epoch sont tirés du jeton de session.
 - **aggregate** : une donnée agrégée.
 
-Comptes : 67 opérations, dont 26 lectures et 41 écritures. 57 passent par
+Comptes : 70 opérations, dont 27 lectures et 43 écritures. 60 passent par
 `op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Sept
 lignes de `op` sont marquées `session: true` (contrats 1.1, 1.2 et 1.3) :
 elles sont servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (470
+signature et les mêmes types. Il vérifie aussi que l'interface entière (471
 opérations) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
@@ -359,6 +360,39 @@ L'ajout est compatible : la version passe à `1.3.0` et une septième ligne de
   auditée (`agent_name_resolutions`) ; elle ne donne aucun droit : les gardes
   d'autorité restent sur les opérations qui les portent.
 
+## Contrat 1.4 : réveil programmé d'un exécuteur médié (#2613)
+
+Le réveil programmé d'un lot (#2466, `wake_at`, `wake_claim_at`) est porté
+par le runner. Sur un exécuteur médié, les trois opérations qui le lisent et
+le consomment passent désormais par le contrat, au lieu d'être refusées :
+
+- **`lot_sessions.due_wakes`** (lecture, portée A, `param_agent: name`) :
+  `name`, `now`, `claim_ttl_s` (120 s par défaut). Rend les réveils échus des
+  lots ouverts de l'agent, par échéance puis priorité ; un claim plus récent
+  que `claim_ttl_s` écarte le lot (livraison en cours).
+- **`lot_sessions.claim_wake`** (écriture, portée B, enveloppe de bail) :
+  `name`, `lot`, `now`, `claim_ttl_s`. Pose le bail de livraison
+  (`wake_claim_at`) et écrit la ligne `wake: scheduled wake delivered` au
+  journal ; l'échéance reste armée. Rend `{id, state, title, wake_ts}` ou
+  `null` si le réveil n'est plus dû, déjà réclamé, réassigné ou fini.
+- **`lot_sessions.consume_wake`** (écriture, portée B, enveloppe de bail) :
+  `name`, `lot`, `wake_ts`. Efface l'échéance réclamée **seulement** si elle
+  porte encore le même `wake_ts` ; une échéance reposée entre-temps est
+  conservée. Rend `true` si elle a été consommée.
+
+La délivrance est un bail, pas une consommation : un drainage, un arrêt ou
+une panne entre le choix du tour et le lancement du harnais laisse le claim
+expirer ; le réveil est alors délivré de nouveau, sans doublon de témoin
+(une ligne `wake:` par délivrance). Le runner local et le runner médié
+suivent le même chemin ; seule la couche de stockage diffère. Les opérations
+de session mises de côté (`lot_sessions.actionable`, `listing`, `note_wake`,
+`purge`, `switch`) restent refusées : elles portent l'état de session du
+runner du mesh, pas le réveil. L'ajout est compatible : la version passe à
+`1.4.0`, et aucune opération n'est retirée. Déployer le serveur avant les
+nouveaux exécuteurs : un ancien serveur refuse les trois opérations, le
+runner journalise la lecture impossible et le réveil reste armé, sans perte
+ni blocage du harnais.
+
 ## Porte d'hôte
 
 Le runner Compute écrit `ameesh-host-state/1`. Ce message porte `state`
@@ -546,7 +580,7 @@ Le client vit dans `src/ameesh/storage/remote/` :
 
 | Fichier | Rôle |
 |---|---|
-| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 67 opérations), `LeaseBook` (carnet des baux) |
+| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 70 opérations), `LeaseBook` (carnet des baux) |
 | `http.py` | `HttpTransport(ExecTransport)`, `StaticTokenSource`, `FileTokenSource` |
 | `events.py` | `RemoteSubscription` : SSE, repli en attente longue, curseur gardé |
 | `__init__.py` | `connect(cfg)`, `set_token_source_factory` (point d'attache de L110) |

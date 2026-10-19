@@ -212,6 +212,10 @@ class InventoryTest(unittest.TestCase):
             return self.families.get(name, "")
 
         with mock.patch.object(storage, "of", return_value=self.store), \
+                mock.patch.object(work, "get",
+                                  side_effect=lambda db, lot: next(
+                                      (dict(row) for row in self.rows
+                                       if row["id"] == int(lot)), None)), \
                 mock.patch.object(lot_class, "of_lot", side_effect=fake_class), \
                 mock.patch.object(merge_queue, "actor_family",
                                   side_effect=family or fake_family):
@@ -244,6 +248,22 @@ class InventoryTest(unittest.TestCase):
         entry = self.by_id(self.inventory())[2]
         self.assertFalse(entry["ready"])
         self.assertIn("freeze-not-head", [cause["code"] for cause in entry["causes"]])
+
+    def test_pilot_waiver_covers_the_frozen_head_after_an_older_verdict(self):
+        """#2681 : le gel déclaré l'emporte sur un avis antérieur quand le
+        pilote a posé `-none` ; la porte honore la même dispense."""
+        self.marks[2].append({"id": 2000, "work_item_id": 2, "kind": "frozen",
+                              "sha": self.tips[2], "actor": "author",
+                              "verdict": None, "at_ts": 2000.0})
+        entry = self.by_id(self.inventory())[2]
+        self.assertIn("freeze-after-verdict",
+                      [cause["code"] for cause in entry["causes"]])
+        row = next(row for row in self.rows if row["id"] == 2)
+        row["reviewer"] = work.REVIEWER_NONE
+        entry = self.by_id(self.inventory())[2]
+        self.assertTrue(entry["ready"], entry["causes"])
+        self.assertEqual(entry["frozen_sha"], self.tips[2])
+        self.assertIn("verdict-not-required", entry["freeze"]["notes"])
 
     def test_missing_required_verdicts_is_named(self):
         entry = self.by_id(self.inventory())[3]
