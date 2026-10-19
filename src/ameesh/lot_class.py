@@ -89,9 +89,16 @@ def repository(cfg, item: dict) -> Optional[str]:
     return getattr(project, "repo", None) or None
 
 
-def default_base(cfg, item: dict, repo: str) -> Optional[str]:
+def default_base(cfg, item: dict, repo: str, *, declared_only: bool = False) -> Optional[str]:
     """La cible du lot : `branch_target`, puis la cible du projet, puis celle
-    du dépôt (`plan_git.default_target`, `origin/HEAD` ou main/master)."""
+    du dépôt (`plan_git.default_target`, `origin/HEAD` ou main/master).
+
+    `declared_only` (#2660) : ne retenir que les cibles **déclarées** — lot,
+    projet, puis `git config ameesh.target` — et rendre None sans elles,
+    jamais la branche par défaut du clone. Un clone nexlink a `origin/HEAD`
+    sur main alors que son projet intègre sur develop : ce repli ferait
+    vérifier un numéro de migration contre la mauvaise branche en silence.
+    """
     explicit = str(item.get("branch_target") or "").strip()
     if explicit:
         return explicit
@@ -106,6 +113,11 @@ def default_base(cfg, item: dict, repo: str) -> Optional[str]:
     target = str(getattr(project, "target", "") or "").strip() if project is not None else ""
     if target:
         return target
+    if declared_only:
+        try:
+            return plan_git.declared_target(repo)
+        except Exception:  # noqa: BLE001 - dépôt illisible : l'appelant doutera
+            return None
     try:
         return plan_git.default_target(repo)
     except Exception:  # noqa: BLE001 - dépôt illisible : l'appelant doutera
@@ -306,7 +318,7 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     """
     out: dict = {"lot": int(lot), "class": SENSITIVE, "why": "", "files": [],
                  "policy_ref": "", "repo": repo or "", "target": base or "",
-                 "frozen_sha": head or "", "doubt": True}
+                 "base_sha": "", "frozen_sha": head or "", "doubt": True}
     row = item if item is not None else work.get(db, lot)
     if row is None:
         out["why"] = "lot #%d not found" % lot
@@ -348,6 +360,7 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     if not base:
         base = landing
     out["target"] = base or ""
+    out["base_sha"] = str(base or "")
     reason = release_reason(row, base)
     if reason:
         out.update({"class": RELEASE, "why": reason, "doubt": False})
@@ -356,6 +369,7 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     if not revision:
         out["why"] = "no target branch: freeze the lot or name its target"
         return out
+    out["base_sha"] = str(revision)
     try:
         paths = canon_mod.git_range_paths(repo, revision, head)
     except canon_mod.GitError as exc:

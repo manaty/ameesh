@@ -157,6 +157,9 @@ class Inputs:
     policy: Policy
     authors: list
     unknown_authors: list
+    #: designated reviewers' small first-round corrections (#2638): never
+    #: designated again, their family stays eligible (#2739)
+    correctors: list
     candidates: list
     notify: str
     manual: list = field(default_factory=list)
@@ -566,6 +569,65 @@ def _range(repo: str, base: str, head: str, *, bounded: bool = True) -> tuple[st
 # the authors: one reading shared with the train and the merge gate (#2681)
 # --------------------------------------------------------------------------
 
+def _designation_authority(db, actor: str) -> bool:
+    """May `actor` have written a `reviewer X designated` journal line (#2739)?
+
+    The line is only a text: any agent can copy it in a free note, so the text
+    alone proves nothing. The write path (`work.designate_reviewer`) already
+    admits only the system, a human, or an orchestrator/design agent; the
+    journal read applies the same authority, so an ordinary agent's note cannot
+    make itself a designated reviewer (and excuse its own commit as a fix).
+    """
+    actor = str(actor or "").strip()
+    if not actor:
+        return False
+    if actor == work.SYSTEM_SENDER or actor.startswith(work.HUMAN_PREFIX):
+        return True
+    try:
+        from . import assignments
+        return assignments.is_orchestrator(
+            getattr(db, "cfg", None), db, actor,
+            roles=work.CORRECTOR_ROLES, history=False)
+    except Exception:  # noqa: BLE001 - unreadable authority: no name counted
+        return False
+
+
+def _journal_reviewers(db, lot: int, *, until=None) -> list:
+    """The reviewer names designated by hand in the lot journal (#2739).
+
+    `work_items.reviewers` is the live column; `work reviewer --remove` retires
+    a manual seat and the column no longer carries the name. The journal keeps
+    the designation (`reviewer X designated`), so a manual reviewer who pushed
+    a first-round correction stays recognizable after their seat is retired,
+    exactly like the automatic names of the marks (#2638). Only a line written
+    by a designation authority counts (`_designation_authority`): a free note
+    carrying the same words is not a designation. With `until` (the freeze
+    instant), a reviewer named after the freeze is ignored: they did not
+    review that head.
+    """
+    names: list[str] = []
+    try:
+        events = storage.of(db).work.events(int(lot), 500) or []
+    except Exception:  # noqa: BLE001 - unreadable journal: no manual name
+        return names
+    for event in events:
+        note = str((event or {}).get("note") or "").strip()
+        if not note.startswith("reviewer ") or not note.endswith(" designated"):
+            continue
+        if not _designation_authority(db, (event or {}).get("actor")):
+            continue
+        if until is not None:
+            try:
+                if float((event or {}).get("created_ts") or 0.0) > float(until):
+                    continue
+            except (TypeError, ValueError):
+                continue
+        name = note[len("reviewer "):-len(" designated")].strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
 def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
                           author: str) -> set[str]:
     """The names designated as reviewers of the lot, automatic or manual.
@@ -573,7 +635,9 @@ def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
     The current column holds the previous freeze's automatic names and the
     manual exception; the journal marks keep the names a later freeze retired.
     A reviewer who pushed a first-round correction must stay recognizable after
-    the freeze that retired them (#2638). The lot author is never a reviewer.
+    the freeze that retired them (#2638) — including a **manual** reviewer
+    whose seat was retired from the column (#2739), read from the journal. The
+    lot author is never a reviewer.
     """
     names: list[str] = []
     lot = int((item or {}).get("id") or 0)
@@ -583,6 +647,11 @@ def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
     except Exception:  # noqa: BLE001 - unreadable journal: no automatic name
         pass
     try:
+        names.extend(_journal_reviewers(db, lot,
+                                        until=(milestone or {}).get("at_ts")))
+    except Exception:  # noqa: BLE001 - unreadable journal: no manual name
+        pass
+    try:
         from .work_reviewers import designated
 
         names.extend(designated(dict(item or {})))
@@ -590,6 +659,26 @@ def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
         pass
     return {str(value).strip() for value in names
             if str(value).strip() and str(value).strip() != author}
+
+
+def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
+                        repo: str, base: str, head: str, *, families=()) -> list:
+    """The designated reviewers' small first-round corrections of `base..head`.
+
+    Read from the exact frozen commits and their provenance receipts, never
+    from a designation mark: a head re-integrated under a new SHA is read as it
+    stands (#2739). `milestone` is the lot's freeze when it is this head; it
+    lets `_designated_reviewers` recognise a corrector retired by a later
+    designation. The caller (the merge gate) handles an unreadable range as it
+    must; this reader invents no name.
+    """
+    _start, _paths, commits = _range(repo, base, head)
+    _authors_, unknown, correctors = review_authors.reading(
+        db, item, milestone, commits, repo, families=families)
+    if unknown:
+        raise ActivationError("author provenance unknown for frozen commit(s): %s"
+                              % ", ".join(unknown))
+    return correctors
 
 
 # --------------------------------------------------------------------------
@@ -699,16 +788,20 @@ def _waiver(item: Mapping) -> bool:
 
 
 def _manual_seats(manual: Sequence[str], listing: Sequence[Mapping],
-                  authors: Sequence[Mapping], families) -> list:
+                  authors: Sequence[Mapping], families, *,
+                  correctors: Sequence[Mapping] = ()) -> list:
     """The manual reviewers that cover a required seat (#2627).
 
     A manual reviewer is always kept in the column; this only says which ones
     count: a known family of the compiled policy, distinct from every author's
     family and from the other manual reviewers. An unknown family, or the
     author's family, does not prove independence: the seat remains missing and
-    is designated automatically. The list is ordered like the column.
+    is designated automatically. A corrector cannot count its own seat either
+    (#2739): its family stays eligible, its name does not. The list is ordered
+    like the column.
     """
     forbidden_names, forbidden_families = rd.families_of(authors)
+    forbidden_names = forbidden_names | rd.names_of(correctors)
     rows = {str((row or {}).get("name") or ""): row for row in listing or ()}
     covered = set(forbidden_families)
     seats = []
@@ -803,8 +896,8 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                       commits=commits,
                       policy=Policy(rules=(), families=(), risk="light", required=0,
                                     ref="", commit="", source=""),
-                      authors=[], unknown_authors=[], candidates=[], notify="",
-                      manual=manual, waiver=waiver)
+                      authors=[], unknown_authors=[], correctors=[], candidates=[],
+                      notify="", manual=manual, waiver=waiver)
     policy = _policy(cfg, db, project, paths)
     if isinstance(policy, Unavailable):
         return policy
@@ -818,14 +911,15 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         # project's agents, so the two roles never collapse into one mail
         candidates = [candidate for candidate in candidates
                       if candidate.name != notify]
-    authors, unknown = review_authors.authors(db, item, freeze, commits, repo,
-                                              families=policy.families,
-                                              trace=True)
+    authors, unknown, correctors = review_authors.reading(
+        db, item, freeze, commits, repo, families=policy.families, trace=True)
     return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=paths,
                   commits=commits, policy=policy, authors=authors,
-                  unknown_authors=unknown, candidates=candidates, notify=notify,
+                  unknown_authors=unknown, correctors=correctors,
+                  candidates=candidates, notify=notify,
                   manual=manual, waiver=waiver,
-                  manual_seats=_manual_seats(manual, listing, authors, families),
+                  manual_seats=_manual_seats(manual, listing, authors, families,
+                                             correctors=correctors),
                   advances=_advances(db))
 
 
@@ -1209,8 +1303,8 @@ def _selection(inputs: Inputs, port, *, force: bool = False) -> dict:
         risk=inputs.policy.risk, base=inputs.base, policy_ref=inputs.policy.ref,
         notify=inputs.notify, unknown_authors=inputs.unknown_authors,
         families=inputs.policy.families,
-        already=inputs.manual_seats, required=inputs.policy.required,
-        advances=inputs.advances)
+        already=inputs.manual_seats, fixers=inputs.correctors,
+        required=inputs.policy.required, advances=inputs.advances)
 
 
 def carried_plan(cfg, db, lot: int, sha: str) -> Optional[dict]:

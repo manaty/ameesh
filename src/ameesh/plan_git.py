@@ -39,6 +39,13 @@ qui a un tel gel, la fusion est constatée, dans cet ordre :
 La fermeture est conditionnée en base au gel examiné : si un nouveau gel est
 déclaré entre l'examen et l'écriture, rien n'est fermé (`refrozen`).
 
+#2443 : une unité dont la composition de paquet est enregistrée
+(`work_packet_members`) est d'abord prouvée par son commit de composition,
+dans la cible (`ameesh-work`, revert #1825 compris) : un jalon `frozen` n'est
+pas nécessaire, ce qui couvre le cas #2366. La preuve est écartée si le gel
+effectif courant de l'unité n'est plus celui de la composition (re-gel), et le
+relevé retombe alors sur le gel déclaré.
+
 Lecture seule du dépôt (`git merge-base`, `rev-list`, `log -p`, `patch-id`) ;
 la cible est lue telle que le clone la connaît. Deux exceptions, bornées et
 best-effort :
@@ -653,6 +660,71 @@ def _content_refs(row: dict, target: str | None, *, declared_repo: str | None,
     return to_try
 
 
+def _packet_delivery(repo: str, lot: int, members: list[dict], refs: list[tuple],
+                     marks: list[dict], *, default: str | None) -> dict | None:
+    """#2443 : l'unité a-t-elle été livrée par un paquet composé ?
+
+    `members` sont les appartenances enregistrées (`work_packet_members`) ;
+    seule une ref qui ferme est examinée. Le commit de composition (`unit_sha`)
+    doit être entré dans cette ref (`probe`, revert #1825 compris). La preuve
+    n'est retenue que si le gel effectif courant de l'unité est encore celui de
+    la composition — le gel enregistré, ou la tête composée elle-même quand
+    aucun gel n'existait alors ; un nouveau gel rend la preuve périmée et le
+    lot retombe sur le relevé de son gel.
+
+    Rend `{ref, proof, member, target, off_target}` ou None.
+    """
+    if not members or not refs:
+        return None
+    target_ref = refs[0][0]
+    try:
+        candidate = freeze_candidate(marks, repo=repo, target=target_ref)
+    except (MergeProbeError, GitError):
+        return None                       # gel courant illisible : jamais de preuve
+    current = commit_id(candidate.get("sha"))
+    # Sans gel effectif, seule l'absence de tout gel/avis (`no-verdict`) laisse
+    # la composition conclure : un avis bloqué, un gel postérieur à l'avis ou
+    # un avis sans commit déclarent une tête que la composition ne couvre pas.
+    undecided = not current and bool(
+        set(candidate.get("causes") or ()) - {"no-verdict"})
+    for member in members:
+        unit = commit_id(member.get("unit_sha"))
+        if not unit:
+            continue
+        recorded = commit_id(member.get("frozen_sha"))
+        source = commit_id(member.get("source_sha"))
+        if current:
+            if not (same_commit(current, recorded) or same_commit(current, source)):
+                continue                 # un nouveau gel : la composition est périmée
+            # Le gel capturé par record peut avoir avancé APRÈS la composition.
+            # Son identité avec le gel courant ne prouve donc pas sa livraison :
+            # la source réellement composée doit aussi en porter le contenu.
+            if not same_commit(current, source):
+                if not source:
+                    continue
+                try:
+                    if not probe(repo, current, source, lot=lot)["merged"]:
+                        continue
+                except (MergeProbeError, GitError):
+                    continue
+        elif recorded:
+            continue                     # le gel enregistré a disparu : ne pas conclure
+        elif undecided:
+            continue                     # une déclaration existe, sans gel lisible
+        for ref, off, closes in refs:
+            if not closes:
+                continue
+            try:
+                proof = probe(repo, unit, ref, lot=lot)
+            except (MergeProbeError, GitError):
+                continue
+            if not proof["merged"]:
+                continue
+            return {"ref": ref, "proof": proof, "member": member, "target": ref,
+                    "off_target": default if off else None}
+    return None
+
+
 #: #2744 : états qui retiennent la fermeture par le contenu — le lot peut être
 #: livré sans être clos (une passe, une décision ou un déblocage restent dus).
 CONTENT_HELD_STATES = ("blocked",)
@@ -831,6 +903,18 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
     declared: dict = {}
     for ms in st.progress.lot_milestones([int(r["id"]) for r in rows]):
         declared.setdefault(int(ms["work_item_id"]), []).append(ms)
+    # #2443 : l'appartenance enregistrée à la composition, lue une fois pour
+    # tous les lots examinés. Une base d'avant 0465 ne fait pas échouer le
+    # relevé : le repli par le gel reste inchangé, l'absence est dite.
+    packet_error = ""
+    packets: dict[int, list[dict]] = {}
+    try:
+        from .db import DbError
+        members = st.work.packet_members(item_ids=[int(r["id"]) for r in rows])
+    except DbError as exc:                     # table absente (schéma ancien)
+        members, packet_error = [], str(exc)
+    for member in members:
+        packets.setdefault(int(member["work_item_id"]), []).append(member)
     results: list[dict] = []
     for row in sorted(rows, key=lambda r: int(r["id"])):
         lot = int(row["id"])
@@ -864,15 +948,72 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
                  "detail": unchecked or (
                      "last freeze has no commit (milestone frozen --sha)" if freeze
                      else "no freeze declared (milestone frozen --sha)")}
-        if not sha:
-            results.append(entry)
-            continue
+        # #2443 : ne pas sortir sur l'absence de gel déclaré avant d'avoir
+        # examiné une composition de paquet — c'est la voie du cas #2366.
+
         refs = _content_refs(row, target, declared_repo=declared_repo, default=default,
                              candidates=candidates)
         if not refs:
             entry.update(result="no-target",
                          detail="no target: `git config %s <branch>` in %s, or --target"
                                 % (TARGET_GIT_KEY, repo_dir))
+            results.append(entry)
+            continue
+        composition = _packet_delivery(repo_dir, lot, packets.get(lot, []), refs,
+                                       declared.get(lot, []), default=default)
+        if composition is not None:
+            member = composition["member"]
+            entry.update(target=composition["target"],
+                         off_target=composition["off_target"], how="composition",
+                         ref=composition["proof"]["ref"], sha=member["unit_sha"],
+                         packet=int(member["package_id"]), result="open",
+                         detail=("%s is the composition unit of package #%s (%s) in %s"
+                                 % ((member["unit_sha"] or "")[:12],
+                                    member["package_id"],
+                                    member.get("package_branch") or "?",
+                                    composition["target"])),
+                         composition={"package": int(member["package_id"]),
+                                      "branch": member.get("package_branch") or "",
+                                      "unit": member["unit_sha"]})
+            if dry_run:
+                # #2744 : la même retenue que la fermeture par le gel.
+                retention = content_retention(st, row)
+                if retention is not None:
+                    mark_retained(entry, retention, target=composition["target"],
+                                  dry_run=True)
+                    results.append(entry)
+                    continue
+                entry["result"] = "would-merge"
+            else:
+                done = work_mod.close_merged(
+                    db, lot, sha=entry["ref"] or "", actor="composition:%s"
+                    % member["package_id"],
+                    source="package composition #%s (%s)"
+                    % (member["package_id"], member.get("package_branch") or "?"),
+                    frozen_id=int(freeze["id"]) if freeze else None,
+                    # #2444 : aucun gel déclaré examiné (gel d'origine verdict) ;
+                    # un gel apparu entre-temps refuse la fermeture.
+                    unfrozen=freeze is None,
+                    repo=repo_dir,      # L539 : dépôt du relevé, indice de classe
+                    content_guard=content_retention)   # #2744 : verrou commun avec le hold
+                entry["result"] = done["result"]
+                if done["result"] in ("withheld", "error"):
+                    mark_retained(entry, done["retention"],
+                                  target=composition["target"])
+                    if done["result"] == "withheld":
+                        record_content_withheld(
+                            db, st, row, entry, done["retention"],
+                            target=composition["target"],
+                            actor="composition:%s" % member["package_id"])
+                else:
+                    entry["detail"] = "%s — %s" % (entry["detail"], done["detail"])
+            results.append(entry)
+            continue
+        if not sha:
+            if packets.get(lot):
+                entry["detail"] += ("; recorded packet composition #%s not delivered yet"
+                                    % ", #".join(str(m["package_id"])
+                                                 for m in packets[lot]))
             results.append(entry)
             continue
         found_target = None              # la ref qui a livré le gel
@@ -951,10 +1092,13 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
             else:
                 entry["detail"] = "%s — %s" % (entry["detail"], done["detail"])
         results.append(entry)
-    return {"git_dir": repo_dir, "target": target if target is not None else (default or ""),
-            "auto": target is None, "off_target": default if target is None else None,
-            "dry_run": bool(dry_run), "results": results,
-            "merged": sum(1 for r in results if r["result"] == "merged")}
+    report = {"git_dir": repo_dir, "target": target if target is not None else (default or ""),
+              "auto": target is None, "off_target": default if target is None else None,
+              "dry_run": bool(dry_run), "results": results,
+              "merged": sum(1 for r in results if r["result"] == "merged")}
+    if packet_error:
+        report["packet_error"] = packet_error
+    return report
 
 
 # --------------------------------------------------------------------------

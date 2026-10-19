@@ -355,7 +355,8 @@ class DelaysTest(PgTestCase):
         self.assertEqual(work.last_milestone(row)[0], "freeze")
         self.assertIsNotNone(row["frozen_ts"])
         self.assertIsNone(row["reviewed_ts"])
-        work.milestone(self.db, item["id"], "verdict", verdict="blocked")
+        work.milestone(self.db, item["id"], "verdict", verdict="blocked",
+                       sha="a" * 40)
         row = work.timeline(self.db, item["id"])
         self.assertEqual(work.last_milestone(row)[0], "review")
         self.assertIsNotNone(row["reviewed_ts"])

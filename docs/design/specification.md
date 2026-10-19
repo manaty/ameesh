@@ -311,6 +311,13 @@ couvre pas `docs/a.md` (écrire `docs/**`).
 par trigger ; `frozen` (branche gelée pour la revue) et `verdict` (`ok` ou
 `blocked`, avec le commit relu) se déclarent par
 `ameesh work milestone <id> frozen|verdict [ok|blocked] --sha S [--note …]`.
+Un `verdict` **exige** que `--sha` nomme la tête relue : le commit complet, ou
+une abréviation d'au moins 12 caractères hexadécimaux résolue dans un dépôt
+(`--repo` s'il est nommé, sinon le répertoire courant, le dépôt du projet ou
+celui de l'assigné) ou dans la tête gelée courante. Sans elle, le jalon est
+refusé et la tête gelée proposée ; les anciens verdicts sans SHA restent
+lisibles mais ne comptent pas à la porte, et `ameesh work show` les signale
+(« avis non rattaché à une tête »).
 Les durées `demande → gel`, `gel → revue`, `gel → fusion` et le nombre de
 verdicts bloqués se lisent dans `ameesh work list` (colonne DÉLAI), `ameesh work
 show` (frise complète) et le pied de `ameesh list` ; la forme complète est

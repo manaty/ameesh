@@ -110,7 +110,7 @@ class NextChoiceReserveTest(unittest.TestCase):
         # fenêtre longue à 71 % d'écoulé, 30 % utilisés : sous-rythme.
         [alerte] = self._alerts([_gauge(0.30, 2 * DAY)])
         self.assertAlmostEqual(alerte["pace_cap"], 0.7142857, places=4)
-        self.assertIn("allowed pace of 71 %", alerte["detail"])
+        self.assertIn("projected loss 58 %", alerte["detail"])
 
 
 if __name__ == "__main__":       # pragma: no cover
