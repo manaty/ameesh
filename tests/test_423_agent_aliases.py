@@ -404,6 +404,23 @@ class SessionCommandAliasTest(PgTestCase):
             "SELECT 1 FROM agent_name_resolutions WHERE supplied_name = 'another-name' "
             "AND primary_name = 'worker' AND operation = 'exploitation.restart'"))
 
+    def test_stop_by_alias_bad_reason_has_no_side_effects(self):
+        """#2488 : un motif invalide ne produit même pas d'audit d'alias."""
+        before = self._ligne()
+        audit_before = self.db.query("SELECT * FROM agent_name_resolutions ORDER BY id")
+        for reason in (None, "", " \t\n ", "x" * (exploitation.STOP_REASON_MAX + 1)):
+            with self.subTest(reason=reason):
+                with self.assertRaises(exploitation.StopRefused) as ctx:
+                    exploitation.stop(self.cfg, self.db, "another-name", reason,
+                                      actor="human:proprio")
+                self.assertEqual(ctx.exception.code, "bad_reason")
+                self.assertEqual(self.db.query(
+                    "SELECT * FROM agent_name_resolutions ORDER BY id"), audit_before)
+                self.assertEqual(self._ligne(), before)
+                entries = fil.transport_for(self.cfg).read(
+                    fil.ThreadRef(fil.project_for(self.cfg)))
+                self.assertEqual(entries, [])
+
     def test_stop_by_alias_reports_and_traces_primary(self):
         """N2 de #423 (#1955) : `stop` résout l'alias à l'entrée ; le champ
         rendu et le texte du fil nomment le primaire, jamais l'orthographe

@@ -42,8 +42,9 @@ read and returns a decision:
   author or corrector of the head; an author whose real family is unknown
   (empty or label) makes the designation **wait** — ruling them out by their
   name alone would let through a reviewer from their real family (B3, Claude
-  dev1 review). A single candidate per family (the least loaded), then the
-  least loaded families; at equal load, the order of the names decides.
+  dev1 review). A single candidate per family (the least loaded). Since
+  #2668, the family furthest behind its plan pace comes first
+  (`review_pace`), the load only breaking that tie, then the name.
 - **explicit wait**: if independent families are missing, or an author's family
   is unknown, the state is `waiting` with the missing number, and a **capacity
   notification** goes to the pilot — never an implicit admission.
@@ -51,6 +52,54 @@ read and returns a decision:
   **exact** SHA to review, the verdict command on that SHA, and the rule of §2
   (fixing a blocker oneself makes one an author: their review no longer counts,
   another reviewer takes over).
+
+## Plan pace tie-break (#2668, 19 October 2026)
+
+The auditor found Codex at 35 % of its weekly window after 19 % of the week
+(the pace was heading to the ceiling around 21/10, then about three days
+without a Codex opinion). The designation used to break ties by load alone,
+which ignored the plans. `src/ameesh/review_pace.py` now reads the shared
+gauge history and gives each family its **advance** over the plan pace, in
+points: `used_at − held_cap`, where `held_cap` is the **raw** pace of a
+non-critical turn (nominal multiplier, default ceiling, and the 10-point
+reserve kept for critical agents, #2648). Positive is ahead, negative is
+behind. The declared `pace_multiplier`/`pace_ceiling` are deliberately not
+read: with the real ×10 (Claude) and ×3 (Codex) profiles, Claude looked 20
+points behind and Codex 21.8, designating Codex — the inverse of the witness.
+The same raw scale applies to every family (B of mesh-design on 4123b99,
+19/10/2026).
+
+When several families are eligible for one opinion, the selection prefers the
+family furthest behind; the agent load only breaks a tie. A family's value is
+its most constrained current account (a fresh sibling does not hide a plan
+that is ahead). A **model-scoped** bucket (`seven_day@fable`) is kept with its
+scope: it counts only for a candidate whose model contains that scope
+(`fable` in `fable` or `claude-fable`, the rule of `accounts.model_scoped`),
+added to the general windows; a reviewer of another model, or of an unknown
+model, sees the general windows only. A family with only scoped readings is
+neutral for them, never contaminated by a bucket that applies to one model.
+The family's own representative is chosen by the **applicable pace before the
+load**: a less-loaded Fable agent cannot hide a further-behind Opus agent of
+the same family (cx3 B/P1, first case). A scope carried by the family but
+with no current applicable reading is stored as `None`: that model is neutral
+(0), never rescued by the general reading of an account whose scoped window is
+stale (second case). Validity is per model and per account. A stale reading
+(#1561: a dated window reset while another is open, or a reading older than
+its shortest window) is **neutral**, as is an absent reading: the family is
+absent from the mapping, and the load decides. The pace never makes a family
+ineligible: two required opinions still take two distinct families, whatever
+their pace.
+
+Witnesses: a DeepSeek author, one opinion, Codex 16 points ahead and Claude at
+its pace designates Claude even when Codex's agent is less loaded — including
+with the real ×10/×3 declared profiles, which the raw scale ignores, and a
+Fable-only bucket at 95 % that the Claude agent (no declared model) does not
+see (the integration test sets both); a Fable reviewer, by contrast, sees the
+bucket; two opinions designate Claude and Codex whatever the pace; unreadable
+gauges keep the previous load rule. The thresholds are
+not local: the families and the required number come from the compiled canon
+(`mechanics`), the scale from `cost`, the reserve from `accounts`; no declared
+profile multiplier is read.
 
 ## The wiring contract (to be qualified with #1616 and #1467)
 
@@ -275,6 +324,23 @@ outcome once; a freeze run outside the lot worktree finds it beside the agent's
 session directory, and a sibling of another project is refused; a policy that
 arrives later is retried on the same freeze (the runner call included); the CLI
 freeze (light explanation included) and the recovery command.
+
+`tests/test_2668_designation_pace.py` — 18 targeted tests, without a database:
+the raw plan advance with the critical reserve (Codex 16 points ahead when
+19 % of the week is elapsed, multiplier 1 and default ceiling), a stale
+reading neutral (#1561), the family's most constrained account, the anonymous
+readings dropped when named accounts exist, a model-scoped `seven_day@fable`
+bucket that counts for a Fable candidate and not for an Opus one (a
+scoped-only family is neutral for another model), the family reduction by
+applicable pace before load (a less-loaded Fable agent does not hide a
+further-behind Opus one), a stale scope kept as `None` (neutral, not rescued
+by the account's general reading) — the two cx3 B/P1 cases — one opinion
+preferring the family behind even when its agent is more loaded, two opinions
+keeping two distinct families, and the load rule when no reading is current.
+One integration test in the activation file adds a current Claude/Codex gauge
+pair, declared ×10/×3 profiles and a Fable-only bucket, checks that the raw
+pace still designates Claude on a real freeze, then removes the readings and
+checks that the load rule returns.
 
 ## Verdict carry and the freeze designation (#2442 × #2487)
 

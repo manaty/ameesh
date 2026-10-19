@@ -18,6 +18,7 @@
                                                 turn costs and plan gauges
   agent-mesh work add --title T [--type bug|evolution] [--app A] [--assignee N] …
   agent-mesh work list [--state S] | work show <id> | work move <id> <state> | work note <id> "…"
+  agent-mesh work wake <id> --at ISO | --in DURATION | --cancel   scheduled wake, even under hold (#2466)
   agent-mesh work assign <id> <agent> [--externe] [--actor A]   reassign (guarded assignment)
   agent-mesh work merged <id> --sha S | --pr owner/repo#N [--note …]   merge done outside a PR: any open state → merged
   agent-mesh work migration <id> [--number N] [--release [--number N]] [--skip-branch B]   reserve one of the work item's migration numbers (L122, #2481)
@@ -1429,6 +1430,19 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
         print("warning: %s" % warning, file=sys.stderr)
 
 
+def _wake_deadline(args: argparse.Namespace) -> float | None:
+    """#2466 : l'échéance d'un `work wake` / `work note --wake-at`."""
+    at = getattr(args, "wake_at", None)
+    delay = getattr(args, "wake_in", None)
+    if not at and not delay:
+        return None
+    from . import watch
+    try:
+        return watch.parse_wake_deadline(delay, at)
+    except watch.WatchError as exc:
+        raise work.WorkError(str(exc)) from exc
+
+
 def work_rows(db, *, state: str | None = None, assignee: str | None = None,
               limit: int | None = None, threshold: float | None = None,
               cfg=None, freeze: bool = False, repo: str | None = None,
@@ -1444,7 +1458,7 @@ def work_rows(db, *, state: str | None = None, assignee: str | None = None,
     `target` (défaut : la cible du lot, sinon `origin/main`) permettent en plus
     de porter un avis sur un gel republié quand le delta du lot est
     mécaniquement constant (#1905) ; sans `repo`, le champ est inchangé."""
-    from . import plan, plan_git, stagnation
+    from . import merge_queue, plan, plan_git, stagnation
     if threshold is None:
         threshold = stagnation.DEFAULT_THRESHOLD_S
 
@@ -1468,7 +1482,8 @@ def work_rows(db, *, state: str | None = None, assignee: str | None = None,
             for row in rows:
                 row["freeze"] = plan_git.freeze_candidate(
                     marks.get(int(row["id"]), []), repo=repo,
-                    target=target or row.get("branch_target") or plan_git.DEFAULT_TARGET)
+                    target=target or row.get("branch_target") or plan_git.DEFAULT_TARGET,
+                    waived=merge_queue.is_waived(row))
         return rows
 
     # L61 : lectures regroupées — deux allers-retours en tout
@@ -1478,7 +1493,7 @@ def work_rows(db, *, state: str | None = None, assignee: str | None = None,
 def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
                 target: str | None = None) -> dict | None:
     """The object of `ameesh work show --json` (also `GET /api/v1/lots/{id}`)."""
-    from . import canon as canon_mod, plan, stagnation
+    from . import canon as canon_mod, merge_queue, plan, stagnation
 
     def lire(db):
         item = work.get(db, lot_id)
@@ -1489,7 +1504,8 @@ def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
         from . import plan_git
         item["freeze"] = plan_git.freeze_candidate(
             item["milestones"], repo=repo,
-            target=target or item.get("branch_target") or plan_git.DEFAULT_TARGET)
+            target=target or item.get("branch_target") or plan_git.DEFAULT_TARGET,
+            waived=merge_queue.is_waived(item))
         from .modules.storage import ModuleStore
         item["module_milestones"] = ModuleStore(db).milestones(lot_id)
         item["delays"] = work.timeline(db, lot_id)
@@ -1816,6 +1832,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     item["planned"]["delivery"] or "—",
                     " (source: %s)" % item["planned"]["source"]
                     if item["planned"].get("source") else ""))
+            if item.get("wake_ts"):
+                print("wake     : %s (scheduled wake)"
+                      % _fmt_moment(float(item["wake_ts"])))
             est = item["estimate"]
             print("estimate : %s%s" % (est["label"], "".join([
                 " (source: %s)" % est["source"] if est.get("source") else "",
@@ -2032,8 +2051,28 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("%s: %s" % (done["item"].get("app") or "?", done["item"]["title"]))
             return 0
         if args.work_command == "note":
-            work.note(db, args.id, args.text, actor=args.actor)
+            work.note(db, args.id, args.text, actor=args.actor,
+                      wake_ts=_wake_deadline(args))
             print("note added to lot #%d" % args.id)
+            return 0
+        if args.work_command == "wake":
+            if args.cancel:
+                if getattr(args, "wake_at", None) or getattr(args, "wake_in", None):
+                    raise work.WorkError("work wake: --cancel goes alone")
+                item = work.schedule_wake(db, args.id, None, text=args.why,
+                                          actor=args.actor)
+                print("lot #%d: wake cancelled" % item["id"])
+                return 0
+            deadline = _wake_deadline(args)
+            if deadline is None:
+                raise work.WorkError(
+                    "work wake: give --at TIME (ISO with timezone), --in DURATION, "
+                    "or --cancel")
+            item = work.schedule_wake(db, args.id, deadline, text=args.why,
+                                      actor=args.actor)
+            print("lot #%d: wake scheduled for %s"
+                  % (item["id"], time.strftime("%Y-%m-%d %H:%M %Z",
+                                               time.localtime(deadline))))
             return 0
         if args.work_command == "set-app":
             from . import work_projects
@@ -3208,8 +3247,31 @@ def build_parser() -> argparse.ArgumentParser:
         "note", help="journal note; a `hold:`/lift note claiming a pilot is authenticated")
     pw_note.add_argument("id", type=int)
     pw_note.add_argument("text")
+    pw_note.add_argument("--wake-at", default=None, metavar="TIME",
+                         help="#2466: also arm a scheduled wake at this absolute time "
+                              "(ISO 8601 with timezone, e.g. 2026-10-18T13:45:00+02:00); "
+                              "the note carries its deadline and the runner wakes the "
+                              "assignee even under the hold")
+    pw_note.add_argument("--wake-in", dest="wake_in", default=None, metavar="DURATION",
+                         help="#2466: same, relative to now (e.g. 90m, 2h)")
     pw_note.add_argument("--actor", default="")
     pw_note.set_defaults(func=cmd_work)
+    pw_wake = work_sub.add_parser(
+        "wake", help="#2466: arm, replace or cancel a lot's scheduled wake (the runner "
+                     "wakes its assignee at the deadline, even under a hold or in "
+                     "waiting_human/blocked)")
+    pw_wake.add_argument("id", type=int)
+    pw_wake.add_argument("--at", dest="wake_at", default=None, metavar="TIME",
+                         help="absolute deadline, ISO 8601 with timezone "
+                              "(the wake time is not read twice: a timezone is required)")
+    pw_wake.add_argument("--in", dest="wake_in", default=None, metavar="DURATION",
+                         help="deadline relative to now (e.g. 90m, 2h)")
+    pw_wake.add_argument("--cancel", action="store_true",
+                         help="remove the armed wake, journaled")
+    pw_wake.add_argument("--why", default="", metavar="TEXT",
+                         help="why this wake (kept in the lot's journal)")
+    pw_wake.add_argument("--actor", default="")
+    pw_wake.set_defaults(func=cmd_work)
 
     pw_app = work_sub.add_parser("set-app", help="correct a lot's project, with a journal entry")
     pw_app.add_argument("id", type=int)

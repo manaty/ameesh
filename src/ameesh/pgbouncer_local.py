@@ -21,8 +21,15 @@ through this same pool, so `ameesh notify` cannot open its ordinary connection
 while the pool refuses everyone. `notify` therefore reads this console from
 `cfg` alone (`probe`), before and independently of its database pass: the
 warning is routed and pushed even then.
+
+#2582: the console read is bounded by `PROBE_TIMEOUT_S`. A console that
+accepts the socket and stops answering used to hang `ameesh alerts` (and
+`SIGINT` with it) after every other alert family had been read; it now raises
+`Unavailable` and becomes a `pgbouncer_console_unreadable` line.
 """
 from __future__ import annotations
+
+import threading
 
 from pathlib import Path
 
@@ -30,6 +37,17 @@ CONFIG_PATH = '.config/pgbouncer/pgbouncer.ini'
 #: how long the oldest queued client must have waited before warning (seconds)
 WAIT_THRESHOLD_S = 1
 CONNECT_TIMEOUT_S = 5
+#: #2582: hard deadline of one console probe (connection and the three SHOW
+#: queries), in seconds. `connect_timeout` is ignored by libpq on a Unix-domain
+#: socket and the console has no statement timeout: a console that accepts the
+#: connection and stops answering would hang `ameesh alerts` (and the notifier's
+#: local pass) forever. The probe then raises `Unavailable`, which the alert
+#: pass turns into `pgbouncer_console_unreadable` (#1179) instead of blocking
+#: the whole command.
+PROBE_TIMEOUT_S = 5.0
+#: the family named when the console could not be read (#2582): an alert
+#: absent from that pass is not resolved (`--follow`, #1901).
+FAMILY = "pgbouncer_console"
 #: the raised message keeps one bounded line: a console error may be long
 _ERROR_MAX = 200
 
@@ -159,17 +177,72 @@ def line(reading: dict) -> str:
                 reading['servers_active'] + reading['servers_idle'], slots))
 
 
+class _ConsoleProbe:
+    """One blocking console read, off the caller's thread (#2582).
+
+    libpq can block forever on a Unix-domain socket (`connect_timeout` is
+    ignored there) and the console's SHOW commands have no statement timeout.
+    Running the read off-thread lets `probe` abandon it after
+    `PROBE_TIMEOUT_S`; a daemon thread never keeps the process alive, and
+    SIGINT stays handled by the waiting caller."""
+
+    def __init__(self, dsn: str):
+        self.dsn = dsn
+        self.done = threading.Event()
+        self.value: dict | None = None
+        self.error: BaseException | None = None
+        self.thread = threading.Thread(target=self._run, name='pgbouncer-console',
+                                       daemon=True)
+
+    def _run(self) -> None:
+        try:
+            self.value = read(self.dsn)
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the caller
+            self.error = exc
+        finally:
+            self.done.set()
+
+
+#: the one probe in flight. A console that never answers must not add one
+#: thread per pass (`alerts --follow`, the notifier's local pass): the next
+#: pass waits on the same read, then starts a fresh one once it has ended.
+_PROBE_LOCK = threading.Lock()
+_PROBE: _ConsoleProbe | None = None
+
+
+def _read_bounded(dsn: str) -> dict:
+    """`read(dsn)` bounded by `PROBE_TIMEOUT_S` (#2582).
+
+    A console that does not answer raises `db.Unavailable`, the same failure
+    as any unreadable console: the alert pass keeps its other families and
+    reports this one as `pgbouncer_console_unreadable` (#1179)."""
+    global _PROBE
+    with _PROBE_LOCK:
+        probe = _PROBE
+        if probe is None or probe.done.is_set() or probe.dsn != dsn:
+            probe = _PROBE = _ConsoleProbe(dsn)
+            probe.thread.start()
+    if not probe.done.wait(PROBE_TIMEOUT_S):
+        from .db import Unavailable
+        raise Unavailable('pgbouncer admin console: no answer within %gs'
+                          % PROBE_TIMEOUT_S)
+    if probe.error is not None:
+        raise probe.error
+    return probe.value
+
+
 def probe(cfg) -> list[dict]:
     """The local pool warning read from `cfg` alone, at most one.
 
     No mesh database, no storage read: the console's own DSN is derived from
     the configuration. Raises `db.Unavailable` when the console cannot be
-    read, so the caller keeps an active warning instead of resolving it
+    read — including when it does not answer within `PROBE_TIMEOUT_S`
+    (#2582) — so the caller keeps an active warning instead of resolving it
     unobserved."""
     dsn = admin_dsn(cfg)
     if dsn is None:
         return []
-    reading = read(dsn)
+    reading = _read_bounded(dsn)
     if not pressured(reading):
         return []
     return [dict(schema='ameesh-alert/1', type='pgbouncer_pool_waiting', agent=None,

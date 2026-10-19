@@ -709,7 +709,8 @@ class SuperviseurRoleTest(PgTestCase):
             "SELECT name || '|' || status FROM agent_registry ORDER BY name")
         self.assertEqual(lu.returncode, 0, lu.stderr)
         self.assertIn("sup1|", lu.stdout)
-        lu = self.as_supervisor("SELECT name, unread FROM agent_mesh_overview")
+        lu = self.as_supervisor(
+            "SELECT name, unread, passive_unread FROM agent_mesh_overview")
         self.assertEqual(lu.returncode, 0, lu.stderr)
         self.assertIn("sup1", lu.stdout)
         lu = self.as_supervisor("SELECT count(*) FROM schema_migrations")
