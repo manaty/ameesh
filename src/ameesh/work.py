@@ -1104,7 +1104,7 @@ def _reviewer_request(db: Db, item: dict, reviewer: str, who: str) -> dict:
     already covers this reviewer and head is reused, not sent again (#2495).
     """
     from . import mail, plan_git
-    from .review_designation import (REQUEST_HISTORY, REQUEST_KIND, covering_request,
+    from .review_designation import (REQUEST_KIND, covering_request,
                                      manual_reviewer_message)
 
     name = (reviewer or "").strip()
@@ -1116,13 +1116,15 @@ def _reviewer_request(db: Db, item: dict, reviewer: str, who: str) -> dict:
         latest = None
     freeze = ({"id": int(latest["id"]), "sha": str(latest.get("sha") or "")}
               if latest is not None else None)
-    # #2495 : one request per (lot, reviewer, head). A re-designation, or a
-    # designation after the freeze already woke this reviewer, sends nothing.
+    # #2495/#2504 : one request per (lot, reviewer, head). A re-designation, or
+    # a designation after the freeze already woke this reviewer, sends nothing.
+    # The requests are selected per lot in storage: an old one cannot fall out
+    # of a history window under a heavy mailbox.
     try:
-        prior = covering_request(mail.history(db, name, REQUEST_HISTORY),
+        prior = covering_request(mail.review_requests(db, name, int(item["id"])),
                                  lot=int(item["id"]), reviewer=name,
                                  sha=freeze["sha"] if freeze else "")
-    except Exception:  # noqa: BLE001 - unreadable history: send, as before #2495
+    except Exception:  # noqa: BLE001 - unreadable requests: send, as before #2495
         prior = None
     if prior is not None:
         return {"reviewer_request_message_id": int(prior["id"]),

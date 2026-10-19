@@ -198,6 +198,30 @@ class GuardTest(unittest.TestCase):
         with mock.patch.object(freeze_checks.os, "getcwd", return_value=self.repo.root):
             self.assertEqual(freeze_checks.resolve(sha), (self.repo.root, sha))
 
+    def test_depuis_un_sous_repertoire(self):
+        """Le gel depuis src/ voit le script et l'arbre de la racine (#2567)."""
+        sha = self.repo.commit(script=GREEN)
+        sub = os.path.join(self.repo.root, "src")
+        os.makedirs(sub)
+        self.assertTrue(freeze_checks.declared(self.repo.root, sha))
+        self.assertTrue(freeze_checks.declared(sub, sha))
+        self.assertEqual(freeze_checks.run(sub, sha)["result"], "green")
+        with mock.patch.object(freeze_checks.os, "getcwd", return_value=sub):
+            self.assertEqual(freeze_checks.resolve(sha),
+                             (os.path.realpath(self.repo.root), sha))
+
+    def test_depot_nu_reste_lisible(self):
+        """La normalisation de racine ne casse pas un dépôt nu (#2567)."""
+        sha = self.repo.commit(script=GREEN)
+        parent = tempfile.mkdtemp(prefix="ameesh-2542-nu-")
+        self.addCleanup(shutil.rmtree, parent, True)
+        bare = os.path.join(parent, "repo.git")
+        subprocess.run(["git", "clone", "-q", "--bare", self.repo.root, bare],
+                       check=True, env=ENV)
+        self.assertTrue(freeze_checks.declared(bare, sha))
+        self.assertEqual(freeze_checks.run(bare, sha)["result"], "green")
+        self.assertEqual(freeze_checks.resolve(sha, repo=bare), (bare, sha))
+
 
 class CliTest(PgTestCase):
     """Le seul appelant : `ameesh work milestone <lot> frozen`."""

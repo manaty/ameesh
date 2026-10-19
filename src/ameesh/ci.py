@@ -690,6 +690,28 @@ def _message_lots(message: str) -> list:
     return out
 
 
+#: #2546 : les instructions de saut reconnues par GitHub. Un message de tête
+#: qui en porte une — même en citation d'un commit antérieur — ne démarre
+#: aucun workflow `push` ou `pull_request`, l'événement `labeled` de la
+#: demande de CI compris. La forme est volontairement tolérante aux espaces et
+#: à la casse : un marqueur approchant est refusé plutôt que laissé passer.
+SKIP_CI_RE = re.compile(
+    r"\[[ \t]*(?:skip[ \t]+ci|ci[ \t]+skip|no[ \t]+ci|skip[ \t]+actions|"
+    r"actions[ \t]+skip)[ \t]*\]", re.IGNORECASE)
+
+
+def skip_ci_marker(message: str) -> str:
+    """Le marqueur de saut GitHub présent dans `message`, ou `''`."""
+    match = SKIP_CI_RE.search(message or "")
+    return match.group(0) if match else ""
+
+
+def _commit_message(api, repo: str, sha: str) -> str:
+    """Le message complet du commit `sha` (`API commits/{sha}`)."""
+    entry = api("repos/%s/commits/%s" % (repo, sha)) or {}
+    return str(((entry.get("commit") or {}).get("message")) or "")
+
+
 def _files_of(entry: dict) -> list:
     return [str(f.get("filename")) for f in (entry.get("files") or ()) if f.get("filename")]
 
@@ -2488,6 +2510,18 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
                        "re-review, nothing requested"
                        % (branch, head[:12], "--sha" if exempt else "the freeze",
                           tested[:12]))
+    # #2546 : GitHub ne démarre aucun workflow sur une tête dont le message
+    # porte une instruction de saut, `pull_request: labeled` compris. Refuser
+    # ici, avant toute étiquette, évite une demande silencieuse et un faux
+    # diagnostic (paquet h-2000, ~30 min de CI perdues).
+    marker = skip_ci_marker(_commit_message(api, name, head))
+    if marker:
+        raise GelError(
+            "commit %s carries the GitHub skip instruction %s: GitHub starts no "
+            "workflow on this head, the pull_request `labeled` event of this request "
+            "included — rewrite the commit message, push a new head (refreeze it if "
+            "this is not an exception), then request the CI again; nothing requested"
+            % (head[:12], marker))
     frozen_sha = tested
     mode = "full" if full else "lot"
     verdicts = latest_verdicts(db, item_id, frozen_sha, item.get("assignee") or "")

@@ -177,6 +177,9 @@ dans le canon :
   Seuls les comptes, les plafonds, les rôles critiques et les binaires de
   harnais suivent la relecture : la base, le schéma, le dossier d'état et les
   cadences sont ceux du démarrage.
+* Deux meshes sur un même hôte (#313) : un dossier d'identifiants ou un
+  fichier de clé déclaré aussi par un autre mesh est signalé, et refusé avec
+  `"account_sharing": "strict"` — voir [§ 8](#8-one-account-one-mesh-two-meshes-on-one-host-313-decision-0033).
 * Profils (#1466) : un exécuteur peut être lancé sur un fichier nommé
   (`AMEESH_CONFIG`) rangé sous `~/.config/ameesh/runner-profiles/`. Ce
   **profil** est une superposition : les clés qu'il ne déclare pas — les
@@ -876,3 +879,59 @@ anyway, the runner marks its status text ("budget : critical agent: …").
 `ameesh alerts` then raises `critical_budget_pause`. The alert is pushed by
 default and urgent, and is mailed (urgent) to the orchestrators of the
 agent's team and to the auditors.
+
+## 8. One account, one mesh: two meshes on one host (#313, decision 0033)
+
+Decision [0033](design/decisions/0033-isolated-meshes-hosting-and-identity.md):
+a device serving two organisations runs two meshes, with two sets of accounts
+and secrets. On 2026-10-10 the two meshes of pc-smichea still declared the
+same Claude (primary, secondary, tertiary) and Codex credential folders:
+shared quota, sessions in the same folders. Each mesh has its own database, so
+neither the database nor #1883 (which compares the configurations of one
+mesh) can see it. The host can.
+
+**Registry of the host.** Every runner claims the credentials of the accounts
+its configuration declares, in a registry shared by the meshes of the host
+and the user: `account_registry` in the host configuration, by default
+`~/.local/state/ameesh-host/accounts`. A credential is the resolved location
+(`realpath`, links included) of a `config_dir` account's folder (the harness
+default folder for an account without `path`) or of a `key_file`. Each
+credential gets a folder named by its fingerprint; each mesh writes one claim
+file there per configuration, named by its mesh key (L219: host, port,
+database and schema of the DSN, never user or password) and by a fingerprint
+of its configuration file. Two configurations of the **same** mesh (runner
+profiles, #1466) are never a conflict. A claim lives one hour after it is
+written: the runner writes its own at startup and then every 10 minutes, and
+removes those of its own configuration for a credential it no longer declares
+(a corrected configuration takes effect with the hot reload). The registry
+holds fingerprints, account names, the configuration file's name (without its
+folder) and the policy: never a key, never a path, never what a credential
+contains.
+
+**Report or refuse.** A credential claimed, within the hour, by **another**
+mesh is shared. What this mesh does is set by `account_sharing` in its host
+configuration:
+
+* `report` (default): the runner logs it at startup and whenever the set
+  changes ("claude account secondaire: credentials also declared by another
+  mesh of this host: config-ancienne-base.json (mesh 1a2b3c4d) — …"), and
+  `ameesh alerts` raises `account_shared` (pushed by default), one per
+  account, until the other mesh stops declaring it.
+* `strict`: the same, and this mesh **refuses** the account. The refusal is a
+  problem of the profile, like missing credentials: the choice never ranks
+  it, with the budget guard on or off, a turn or `ameesh attach` on it is not
+  started, and `ameesh accounts list` gives the reason.
+
+The policy belongs to each mesh: to keep a credential in mesh A and give it
+up in mesh B, set `strict` in B only. With `strict` in both, neither uses it
+until the configurations are separated. Any other value is refused when the
+configuration is read.
+
+```json
+{"account_sharing": "strict"}
+```
+
+**Limits.** An API key passed by a variable (`key_env`) has no location to
+compare. Two **different** folders logged in to the same provider account are
+not seen either, because ameesh never reads a credential. Both stay the
+owner's to separate: lot #65 (accounts per organisation).

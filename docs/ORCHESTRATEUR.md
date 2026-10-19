@@ -58,6 +58,11 @@ l'orchestrateur de l'équipe en reçoit un courrier (`event`, lié au lot).
   aujourd'hui attend sa date (exemple : un bilan à deux semaines).
 * Réserver un lot à une attribution explicite : capacité exigée `decision` ou
   `production`. Exiger un harnais : capacité `harness:<nom>`.
+* Un lot de relecture après fusion (`review-after-merge:#<lot>`, sur son
+  `issue_ref` ou sa `source`, #2377/#2552) n'est pris que par un agent de la
+  **famille opposée** à celle de l'auteur au gel ; famille de l'auteur
+  inconnue ou non traçable : le lot n'est pas pris au repos et attend une
+  attribution explicite.
 * Projet du lot, clé de la prise : son application (`--app`), sinon son
   équipe. L'agent le prend s'il figure parmi les projets déclarés de sa fiche
   (`projects`, L243) ; hors du projet primaire, il faut en plus que son
@@ -501,9 +506,10 @@ scripts/paquet-inclusion.py --manifest reviews/2026-10-15-paquet-23h.md \
 Il sort `1` si un lot attendu **ou prêt** manque au manifeste (ni composition
 ni « écarté » motivé), ou si le contenu d'un lot composé a disparu de la tête
 (revert non consigné) — l'ascendance d'une tête ne suffit pas après un revert
-(#1638). Sans source de liste attendue ni de liste prête, il sort `2`, sauf
-`--no-expected` qui assume le contrôle partiel ; un fichier de lots prêts
-fourni mais vide est valide. Un contenu *partiel* ou *vide* est listé « à
+(#1638). Sans liste prête, il sort `2` (`--no-ready` est refusé) ; sans liste
+attendue, il sort `2` sauf `--no-expected` explicite. Un fichier de lots prêts
+fourni mais vide est valide. Sur une recomposition, la liste est recalculée sur
+la cible de la recomposition. Un contenu *partiel* ou *vide* est listé « à
 lire » (union, adaptation, remise fraîche) ; `--strict` le rend bloquant.
 Détail, format de la liste attendue et validation sur le paquet 11h :
 `docs/PAQUET-INCLUSION.md`.

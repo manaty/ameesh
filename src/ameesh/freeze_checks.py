@@ -38,7 +38,7 @@ import tempfile
 import time
 
 from . import work
-from .canon import GitError, _git
+from .canon import GitError, _git, git_toplevel
 
 #: le script de contrôles du projet, chemin dépôt lu au commit gelé
 SCRIPT = "scripts/freeze-checks.py"
@@ -83,24 +83,41 @@ def commit_in(repo: str | None, sha: str) -> str | None:
 
 def declared(repo: str, commit: str) -> bool:
     """L'arbre de `commit` porte-t-il le script, en fichier ordinaire ?"""
-    proc = _git(repo, "ls-tree", commit, "--", SCRIPT)
+    # `--full-tree` : les chemins se lisent depuis la racine du dépôt, même
+    # quand `repo` est un sous-répertoire (le gel depuis `src/`, #2567).
+    proc = _git(repo, "ls-tree", "--full-tree", commit, "--", SCRIPT)
     fields = proc.stdout.decode("utf-8", "replace").split(None, 2)
     return proc.returncode == 0 and fields[:2] in (["100644", "blob"], ["100755", "blob"])
+
+
+def _worktree_root(repo: str) -> str:
+    """La racine de l'arbre de travail qui contient `repo`, ou `repo` : un
+    dépôt nu (sans arbre de travail) et un chemin hors dépôt restent tels
+    quels ; un sous-répertoire est ramené à sa racine (#2567)."""
+    top = git_toplevel(repo)
+    if top and os.path.realpath(repo) != top:
+        return top
+    return repo
 
 
 def resolve(sha: str, *, repo: str | None = None,
             project_repo: str | None = None) -> tuple[str | None, str | None]:
     """`(dépôt, commit complet)` où lire les contrôles du SHA gelé, ou
-    `(None, None)`. Un `repo` explicite qui ne porte pas le SHA refuse."""
+    `(None, None)`. Un `repo` explicite qui ne porte pas le SHA refuse ; un
+    sous-répertoire est normalisé vers la racine de son arbre de travail."""
     if repo:
-        commit = commit_in(repo, sha)
+        where = _worktree_root(repo)
+        commit = commit_in(where, sha)
         if commit is None:
             raise Refused("sha-unknown", "%s is not a commit of %s" % (sha, repo))
-        return repo, commit
+        return where, commit
     for candidate in (os.getcwd(), project_repo):
-        commit = commit_in(candidate, sha)
+        if not candidate:
+            continue
+        where = _worktree_root(candidate)
+        commit = commit_in(where, sha)
         if commit is not None:
-            return candidate, commit
+            return where, commit
     return None, None
 
 

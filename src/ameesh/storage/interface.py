@@ -1104,6 +1104,15 @@ class Mailbox(Domain):
         """Derniers messages du destinataire, du plus récent au plus ancien."""
 
     @abc.abstractmethod
+    def review_requests(self, recipient: str, lot: str) -> list[dict]:
+        """#2504 : les demandes de relecture (`kind = 'request'`) du
+        destinataire liées à ce lot, du plus récent au plus ancien.
+
+        Le filtre (destinataire, nature, lot) est fait DANS la requête : un
+        `history` borne avant de filtrer, donc une demande ancienne du même lot
+        sortait de la fenêtre et une re-désignation renvoyait un doublon."""
+
+    @abc.abstractmethod
     def pending_recipients(self) -> list[str]:
         """Destinataires qui ont du courrier non remis."""
 
