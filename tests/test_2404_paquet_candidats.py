@@ -415,6 +415,22 @@ class RemiseTest(InventoryTest):
         self.assertIn("remise refs/ameesh/resolutions/4/main-abc",
                       candidates_script.render(payload))
 
+    def test_remise_class_reads_the_package_target_not_origin_head(self):
+        """#2574 : la remise d'un lot sans `branch_target` se classe avec la
+        cible du paquet, comme sa tête gelée — jamais avec `origin/HEAD` du
+        clone radar, resté sur une release."""
+        base = _git(self.repo, "rev-parse", "main^")
+        _git(self.repo, "update-ref", "refs/remotes/origin/release/1.11.0", base)
+        _git(self.repo, "symbolic-ref", "refs/remotes/origin/HEAD",
+             "refs/remotes/origin/release/1.11.0")
+        sha = self._remise(4, "main-abc", {"shared.py": "FOUR MAIN\ntwo\n"}, verdict="ok")
+        payload = self.inventory()
+        call = next(rest for lot, rest in self.class_calls
+                    if lot == 4 and rest.get("head") == sha)
+        self.assertEqual(call["item"]["branch_target"], "main")
+        self.assertEqual(call["base"], payload["base"])
+        self.assertTrue(self.by_id(payload)[4]["ready"])
+
     def test_ready_lot_source_is_its_published_head(self):
         entry = self.by_id(self.inventory())[1]
         self.assertEqual(entry["source"], self.tips[1])
