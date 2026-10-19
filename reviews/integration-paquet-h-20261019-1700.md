@@ -91,6 +91,10 @@ exclus par la liste calculée ; aucun n'est admis sans porte verte.
 - `scripts/garde-mecanique.py --json` : **0 constat**, 0 exemption inutilisée,
   1 exemption utilisée (au registre).
 - `scripts/doc-links.py` : 171 fichiers, **0 lien cassé**.
+- Adaptation #2744 : `tests/test_2102_detacher_branche.py` — un lot `blocked`
+  garde sa fermeture même sur citation explicite ou réassociation ; la preuve
+  est consommée au relevé suivant après levée du blocage (2 témoins adaptés,
+  module 13 OK, psql/psycopg).
 - Tests ciblés sur l'arbre composé : exécutés sur les modules des 10 unités
   (psql + psycopg), à consigner au fil du run.
 - Suite complète unique demandée sur la tête finale (`ci-full-<sha>`), avec la
