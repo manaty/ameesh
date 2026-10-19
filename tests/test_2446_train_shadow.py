@@ -303,6 +303,24 @@ class ShadowPassageTest(PgTestCase):
         self.assertEqual(comparison["carried"], {})
         self.assertIn("porteur inconnu", comparison["explanations"]["22"])
 
+    def test_a_carrier_without_commit_before_the_cutoff_keeps_the_extra_unknown(self):
+        """Sans composition prouvée au cutoff, le lot reste extra/inconnu."""
+        state = self.state_with_members(11, 22)
+        cutoff = self.now
+        branch = self.open_packet([22], stamp="20261018-1000", at=cutoff + 1200)
+        self.project_repo.git("merge", "--no-ff", "-m",
+                              "Merge pull request #1 from manaty/" + branch, branch,
+                              env=self.project_repo.date_env(cutoff + 1800))
+        self.project_repo.git("push", "-q", "origin", "main", branch)
+        self.manual_packet([11], stamp="20261018-1100",
+                           branch_at=cutoff + 1860, merge_at=cutoff + 1920)
+        comparisons = self.shadow.compare(state, None)
+        comparison = next(row for row in comparisons
+                          if row["packet"]["stamp"] == "20261018-1100")
+        self.assertEqual(comparison["extra"], [22])
+        self.assertEqual(comparison["carried"], {})
+        self.assertIn("porteur inconnu", comparison["explanations"]["22"])
+
     def test_a_lot_composed_in_an_open_packet_before_the_cutoff_is_carried(self):
         state = self.state_with_members(11, 22)
         cutoff = self.now
