@@ -161,3 +161,10 @@ class GateCorrectorTest(PgTestCase):
         self.assertEqual(receipt["actor"], "cx2")
         out = self.gate()
         self.assertEqual(out["corrections"], ["cx2"])
+
+    def test_unreadable_correction_provenance_refuses_the_gate(self):
+        self.db.execute("DELETE FROM provenance_receipts WHERE subject = %s",
+                        ("commit:" + self.frozen,))
+        out = self.gate()
+        self.assertFalse(out["ok"], out)
+        self.assertIn(self.frozen[:12], out["error"])
