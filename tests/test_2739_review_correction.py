@@ -169,6 +169,25 @@ class GateCorrectorTest(PgTestCase):
         self.assertFalse(out["ok"], out)
         self.assertIn(self.frozen[:12], out["error"])
 
+    def test_a_gate_without_a_storage_fails_closed(self):
+        # #2739 / h-2000: a db without `query` (a test fixture, here) cannot
+        # read the frozen range; the absence of a corrector is not proven, so
+        # the gate refuses instead of admitting every verdict.
+        klass = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "src/ameesh/merge_queue.py",
+                            "class": "sensitive",
+                            "rule": ["src/ameesh/merge_queue.py"]}],
+                 "repo": self.repo.root, "target": self.base,
+                 "base_sha": self.base}
+        families = {"author": "deepseek", "cx2": "codex", "cx3": "codex",
+                    "dev1": "claude"}
+        out = merge_queue.review_gate(
+            object(), work.milestones(self.db, self.lot), self.frozen,
+            repo=self.repo.root, klass=klass, item=work.get(self.db, self.lot),
+            family_of=lambda name: families.get(str(name or "").strip(), ""))
+        self.assertFalse(out["ok"], out)
+        self.assertIn("cannot be excluded", out["why"])
+
     def _designation_note(self, actor):
         # The pilot retired the manual seat after the correction (#2076); the
         # journal line is the only trace left.
