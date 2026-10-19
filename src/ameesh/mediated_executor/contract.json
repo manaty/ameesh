@@ -4525,6 +4525,7 @@
     "auto_takes_since",
     "backlog",
     "backlog_add",
+    "backlog_basket_add",
     "by_issue_ref",
     "by_package",
     "claim_review_proposal",

@@ -116,8 +116,10 @@ class ScopedReservationsTest(PgTestCase):
     def test_unique_index_blocks_legacy_explicit_collision(self):
         work.set_branch(self.db, self.b['id'], 'agent/b', target='develop', actor='dev')
         self.reserve()
-        with self.assertRaises(DbError):
+        # #2481 : la collision est rendue lisible, avec le lot tenant.
+        with self.assertRaises(work.WorkError) as refused:
             work.reserve_migration(self.db, self.b['id'], 377, repo=self.repo)
+        self.assertIn("lot #%d" % self.a['id'], str(refused.exception))
         self.assertIsNone(work.get(self.db, self.b['id'])['migration'])
 
     def test_target_advance_releases_other_lots_and_requalifies_slots(self):
@@ -237,8 +239,11 @@ class ScopedReservationsTest(PgTestCase):
     def test_unknown_legacy_target_cannot_take_named_number(self):
         self.reserve()
         legacy = self.lot('legacy without project', None)
-        with self.assertRaises(DbError):
+        # #2481 : la collision de créneau est maintenant rendue lisible par
+        # `work.reserve_migration` (lot tenant nommé), comme l'index scalaire.
+        with self.assertRaises(work.WorkError) as refused_by_name:
             work.reserve_migration(self.db, legacy['id'], 377, repo=self.repo)
+        self.assertIn("lot #%d" % self.a['id'], str(refused_by_name.exception))
         self.assertIsNone(work.get(self.db, legacy['id'])['migration'])
         # A pre-0419 client writes the old projection without a repo lock.
         # The compatibility guard still refuses the duplicate atomically.
@@ -564,9 +569,13 @@ class ScopedReservationsTest(PgTestCase):
                          ('default', 400, 'landed'))
         # Le numéro suivant reste projeté en `reserved` : la garde ne fige pas
         # la projection, elle empêche seulement de rouvrir un numéro consommé.
+        # #2481 : le lot garde sa réservation principale `default` (400,
+        # landed) et le nouveau numéro est AJOUTÉ comme créneau `legacy-401`.
         work.reserve_migration(self.db, self.a['id'], 401, repo=self.repo, actor='dev')
-        renewed = reservations.listing(self.db, self.a['id'])[0]
-        self.assertEqual((renewed['number'], renewed['status']), (401, 'reserved'))
+        renewed = [row for row in reservations.listing(self.db, self.a['id'])
+                   if row['number'] == 401]
+        self.assertEqual([(row['slot'], row['status']) for row in renewed],
+                         [('legacy-401', 'reserved')])
 
     def test_landing_projection_and_null_in_one_statement_lands(self):
         """#1022, copie #879 : la fusion qui remet la projection à NULL lande.
