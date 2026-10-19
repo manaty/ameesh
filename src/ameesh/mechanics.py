@@ -18,7 +18,11 @@ mécanique, ce que l'outillage exécute sans agent :
 - `reviews.families`, `exclude_author_family`, `distinct_families` : les
   familles de modèle et l'indépendance des avis ;
 - `merge.named_fire`, `repeat_freeze`, `on_green_packet`, `post_merge_red` :
-  la fusion du paquet dès la suite verte, sans feu nominatif ni gel répété.
+  la fusion du paquet dès la suite verte, sans feu nominatif ni gel répété ;
+- `backlog.lot_min_value` (#2584, bloc optionnel) : la valeur à partir de
+  laquelle un défaut non bloquant devient un lot (canon §2 l.129, owner
+  19/10/2026) ; en dessous, il rejoint le panier de son chantier. Bloc absent :
+  `None`, et la route du panier reste inactive — aucun seuil n'est supposé.
 
 Les classes sensibles et le nombre d'avis par chemin ne sont pas répétés : ils
 viennent de `federation.yaml` (`review_policies.risk_classes` et
@@ -64,7 +68,7 @@ _LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _SHA = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
 
 _DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "reviews",
-                  "merge", "prevalidation", "projects")
+                  "merge", "prevalidation", "backlog", "projects")
 _OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci")
 _PACKETS_KEYS = ("cutoffs",)
 #: classes du plan L161f qu'un bloc `prevalidation` peut sélectionner
@@ -75,6 +79,9 @@ _BUILD_KEYS = ("max_in_build",)
 _CI_KEYS = ("packet", "incident_label", "environment_red", "faulty_lot")
 _REVIEWS_KEYS = ("families", "exclude_author_family", "distinct_families")
 _MERGE_KEYS = ("named_fire", "repeat_freeze", "on_green_packet", "post_merge_red")
+_BACKLOG_KEYS = ("lot_min_value",)
+#: bornes du score de valeur d'un élément de backlog (`backlog.add`)
+_VALUE_SCORE = (1, 100)
 
 
 class MechanicsError(canon.CanonError):
@@ -153,6 +160,8 @@ class Document:
     packet_cutoffs: tuple[str, ...] = ()
     overrides: tuple[ProjectOverride, ...] = ()
     prevalidation: Prevalidation | None = None
+    #: #2584 : seuil de lot d'un défaut non bloquant ; None = bloc absent
+    backlog_lot_min_value: int | None = None
 
     def override(self, project: str) -> ProjectOverride | None:
         for item in self.overrides:
@@ -183,6 +192,8 @@ class Document:
         if self.prevalidation is not None:
             # absent, la clé n'existe pas : le document sans bloc compile à l'identique
             payload["prevalidation"] = self.prevalidation.to_dict()
+        if self.backlog_lot_min_value is not None:
+            payload["backlog"] = {"lot_min_value": self.backlog_lot_min_value}
         return payload
 
 
@@ -229,6 +240,8 @@ class Mechanics:
     rules: tuple[ReviewRule, ...]
     prevalidation: Prevalidation | None = None
     source: str = ""
+    #: #2584 : seuil de lot d'un défaut non bloquant ; None = bloc absent
+    backlog_lot_min_value: int | None = None
 
     # -- coupures -----------------------------------------------------------
 
@@ -389,6 +402,8 @@ class Mechanics:
         if self.prevalidation is not None:
             # absent, la clé n'existe pas : le document sans bloc compile à l'identique
             payload["prevalidation"] = self.prevalidation.to_dict()
+        if self.backlog_lot_min_value is not None:
+            payload["backlog"] = {"lot_min_value": self.backlog_lot_min_value}
         if self.source:
             payload["source"] = self.source
         return payload
@@ -567,6 +582,18 @@ def _merge(value, where: str) -> tuple[bool, bool, bool, str]:
             post)
 
 
+def _backlog(value, where: str) -> int:
+    """Le bloc `backlog` (#2584, canon §2 l.129) : le seuil de lot, dans les
+    bornes du score de valeur d'un élément (1 à 100)."""
+    data = _mapping(value, where, _BACKLOG_KEYS)
+    threshold = data.get("lot_min_value")
+    low, high = _VALUE_SCORE
+    if type(threshold) is not int or not low <= threshold <= high:
+        raise MechanicsError("%s.lot_min_value: an integer from %d to %d is required"
+                             % (where, low, high))
+    return threshold
+
+
 def _families(value, where: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not value:
         raise MechanicsError("%s: a non-empty list of families is required" % where)
@@ -649,6 +676,10 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
     # `packets` optionnel : absent = aucune cadence (tuple vide explicite), un
     # bloc présent — même vide — est validé strictement et refusé s'il est mal formé.
     packets = _packets(parsed["packets"], source + ".packets") if "packets" in parsed else ()
+    # `backlog` optionnel (#2584) : absent = None, la route du panier reste
+    # inactive ; présent, il est validé strictement.
+    lot_min_value = (_backlog(parsed["backlog"], source + ".backlog")
+                     if "backlog" in parsed else None)
     return Document(
         schema=schema,
         timezone=_timezone(parsed.get("timezone"), source + ".timezone"),
@@ -672,6 +703,7 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
         overrides=_overrides(parsed.get("projects"), source + ".projects"),
         prevalidation=(_prevalidation(parsed["prevalidation"],
                                       source + ".prevalidation") if has_block else None),
+        backlog_lot_min_value=lot_min_value,
     )
 
 
@@ -841,4 +873,5 @@ def load(repo: str, commit: str, project: str) -> Mechanics:
         rules=rules,
         prevalidation=document.prevalidation,
         source="%s@%s:%s" % (repo, commit, PATH),
+        backlog_lot_min_value=document.backlog_lot_min_value,
     )
