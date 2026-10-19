@@ -3114,7 +3114,7 @@ def reviewed_head(db: Db, item: dict, sha: str, *, repo: str | None = None) -> s
         if freeze_checks.commit_in(where, text):
             return text
     frozen = _frozen_head(db, item["id"])
-    if frozen and (frozen.startswith(text) or text.startswith(frozen)):
+    if frozen and frozen.startswith(text):
         return text
     raise _head_refusal(
         db, item,

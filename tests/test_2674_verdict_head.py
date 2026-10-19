@@ -79,6 +79,12 @@ class ReviewedHeadTest(PgTestCase):
         self.assertIn(FROZEN[:12], proc.stderr)
         self.assertEqual(self.verdicts(), [])
 
+    def test_un_identifiant_plus_long_que_la_tete_gelee_est_refuse(self):
+        proc = self.milestone("ok", "--sha", FROZEN + "a")
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("head-unresolved", proc.stderr)
+        self.assertEqual(self.verdicts(), [])
+
     def test_une_abreviation_sans_depot_ni_gel_est_refusee(self):
         lot = work.add(self.db, title="pas encore gelé", app="ameesh",
                        actor="auteur")["id"]
