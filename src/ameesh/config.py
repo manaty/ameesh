@@ -467,6 +467,11 @@ class Config:
     #: de l'hôte opérateur : `host` et `projects` — dépôt, cible, staging,
     #: rapport). Validée par `ameesh.release_cutoff` ; absente = aucune.
     release: dict = field(default_factory=dict)
+    #: #2601 : alerte « créneau manqué » des paquets horaires (clé
+    #: `packet_watch` du fichier de l'hôte opérateur : `host`, `projects` —
+    #: destinataires et grâce). Validée par `ameesh.packet_watch` ; absente =
+    #: aucune alerte.
+    packet_watch: dict = field(default_factory=dict)
     #: #2446 : clé `train` du fichier de configuration de l'HÔTE désigné pour
     #: le service de train (`host`, `mode`, `projects`). Lue telle quelle et
     #: validée par `ameesh.train_assembly`, qui refuse nommément une pièce
