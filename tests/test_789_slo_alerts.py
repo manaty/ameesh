@@ -36,6 +36,15 @@ def _seuils(**kw):
     return out
 
 
+#: #2739 : les dépôts du banc doivent committer sous une identité d'agent ; le
+#: runner impose `ameesh-dev3` dans l'environnement, qui écraserait la config
+#: locale du dépôt. Sans identité d'agent, la porte ne peut pas attribuer la
+#: plage gelée et refuse en échec fermé.
+_GIT_DEV1 = dict(os.environ, GIT_AUTHOR_NAME="dev1",
+                 GIT_AUTHOR_EMAIL="dev1@ameesh.invalid",
+                 GIT_COMMITTER_NAME="dev1", GIT_COMMITTER_EMAIL="dev1@ameesh.invalid")
+
+
 class _Base(PgTestCase):
     def setUp(self):
         super().setUp()
@@ -238,19 +247,23 @@ class ReviewGateRepositoryTest(_Base):
         self.addCleanup(subprocess.run, ["rm", "-rf", base])
         repo = os.path.join(base, "repo")
         subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True)
-        for key, value in (("user.email", "t@t"), ("user.name", "t")):
+        # #2739 : le committer doit être un agent pour que la porte lise la
+        # plage gelée sans inventer d'auteur ; l'assigné du lot est `dev1`.
+        for key, value in (("user.email", "dev1@ameesh.invalid"), ("user.name", "dev1")):
             subprocess.run(["git", "-C", repo, "config", key, value], check=True)
         os.makedirs(os.path.join(repo, "docs"))
         with open(os.path.join(repo, "docs", "notes.md"), "w") as fh:
             fh.write("base\n")
         subprocess.run(["git", "-C", repo, "add", "."], check=True)
-        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "base"], check=True)
+        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "base"], check=True,
+                       env=_GIT_DEV1)
         subprocess.run(["git", "-C", repo, "checkout", "-q", "-b", "lot"], check=True)
         os.makedirs(os.path.join(repo, "src", "ameesh"))
         with open(os.path.join(repo, "src", "ameesh", "db.py"), "w") as fh:
             fh.write("# critique\n")
         subprocess.run(["git", "-C", repo, "add", "."], check=True)
-        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "gel"], check=True)
+        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "gel"], check=True,
+                       env=_GIT_DEV1)
         sha = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
                              check=True, capture_output=True, text=True).stdout.strip()
         subprocess.run(["git", "-C", repo, "checkout", "-q", "main"], check=True)
@@ -363,7 +376,8 @@ class ReviewGateRepositoryTest(_Base):
         subprocess.run(["git", "-C", repo, "checkout", "-q", "lot"], check=True)
         with open(os.path.join(repo, "docs", "notes.md"), "a") as fh:
             fh.write("suite\n")
-        subprocess.run(["git", "-C", repo, "commit", "-qam", "notes"], check=True)
+        subprocess.run(["git", "-C", repo, "commit", "-qam", "notes"], check=True,
+                       env=_GIT_DEV1)
         sha = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
                              check=True, capture_output=True, text=True).stdout.strip()
         registry.upsert(self.db, "orch", harness="claude", host=self.cfg.host,
