@@ -240,6 +240,22 @@ class ShadowPassageTest(PgTestCase):
                     deferred=[])
         return dict(state, plans=[plan])
 
+    def numbered_packet(self, lots, name="paquet-97-nexlink", *, branch_at=None,
+                        merge_at=None, merge=True):
+        """A numbered packet (`integration/paquet-<n>-nexlink`, #2733)."""
+        branch = "integration/" + name
+        self.project_repo.git("checkout", "-qb", branch, "main")
+        self.write_manifest(name, lots)
+        self.project_repo.commit("composition %s" % name, at=branch_at)
+        self.project_repo.git("checkout", "-q", "main")
+        if merge:
+            self.project_repo.git("merge", "--no-ff", "-m",
+                                  "Merge #2732 « paquet 97 (integration/%s) »" % name,
+                                  branch, env=self.project_repo.date_env(merge_at))
+            self.project_repo.git("push", "-q", "origin", "main")
+        self.project_repo.git("push", "-q", "origin", branch)
+        return branch
+
     def test_shadow_incident_facts_are_empty_and_never_raise(self):
         """#2682 : le consommateur d'incidents interroge l'ombre sans lever."""
         calls = []
@@ -390,6 +406,27 @@ class ShadowPassageTest(PgTestCase):
         self.project_repo.git("push", "-q", "origin", "main")
         base = self.project_repo.git("rev-parse", "main")
         self.assertEqual(self.shadow.open_packets(self.shadow.clone_path, base), [])
+
+    def test_a_numbered_manual_packet_is_compared_by_its_merge_date(self):
+        """#2733 : `integration/paquet-<n>-nexlink` n'a pas d'heure dans son nom."""
+        state = self.state_with_members(self.item["id"])
+        self.numbered_packet([self.item["id"]], merge_at=self.now + 120)
+        rules = types.SimpleNamespace(zone=lambda: ZoneInfo("Europe/Paris"))
+        comparisons = self.shadow.compare(state, rules)
+        self.assertEqual(len(comparisons), 1)
+        comparison = comparisons[0]
+        self.assertEqual(comparison["packet"]["tail"], "paquet-97-nexlink")
+        self.assertEqual(comparison["packet"]["stamp"], "20261018-1102")
+        self.assertEqual((comparison["missing"], comparison["extra"]), ([], []))
+
+    def test_open_numbered_packet_is_read_with_its_head_date(self):
+        self.shadow.scheduled_step(self.db, self.now)
+        self.numbered_packet([999], merge=False, branch_at=self.now - 900)
+        base = self.project_repo.git("rev-parse", "main")
+        opened = self.shadow.open_packets(self.shadow.clone_path, base,
+                                          ZoneInfo("Europe/Paris"))
+        self.assertEqual([row["tail"] for row in opened], ["paquet-97-nexlink"])
+        self.assertEqual(opened[0]["stamp"], "20261018-1045")
 
     def test_shadow_plan_is_read_only_and_compares_equal_to_the_composer(self):
         result, deadline = self.shadow.scheduled_step(self.db, self.now)
