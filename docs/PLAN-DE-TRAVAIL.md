@@ -186,6 +186,14 @@ all idempotent, which set the lot to `merged` with its `merged` milestone
    conditioned in the database on the examined freeze: a new
    freeze declared in the meantime prevents it (`refrozen`).
 
+   A closure by content is **withheld** (#2744) while the lot is `blocked` or
+   carries an unlifted `hold: …` note (#1664): the merge proof stays in the
+   sweep report (`how`, `ref`, `target`), the journal receives once
+   `contenu fusionné, fermeture retenue : <motif>`, the hold holder (or the
+   agent who blocked the lot) is woken, and the lot stays open. An `unhold:`
+   note or a state change lifts the hold; the next sweep closes. The same
+   guard covers `sync-branches` and the units of `sync-packets`.
+
    A package's units are closed by its manifest, without a card or
    `package_id`: on the target, `reviews/**paquet**.md` lists the composed
    units. `ameesh work sync-packets --git-dir D [--target T]` (read-only)

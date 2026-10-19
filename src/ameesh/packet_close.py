@@ -270,6 +270,11 @@ def sync(db, repo_dir: str, *, target: str | None = None, dry_run: bool = False,
             entry.update(how="trailer", ref=unit,
                          detail="composition %s carries `ameesh-work: %d`"
                                 % (unit[:12], lot))
+            if plan_git.withhold_content_closure(
+                    db, st, row, entry, target=target,
+                    actor=actor or "packet:%s" % target, dry_run=dry_run) is not None:
+                results.append(entry)
+                continue
             if dry_run:
                 entry["result"] = "would-merge"
                 results.append(entry)
@@ -290,6 +295,11 @@ def sync(db, repo_dir: str, *, target: str | None = None, dry_run: bool = False,
         entry.update(how=found["how"], ref=found["ref"], detail=found["detail"])
         if not found["merged"]:
             entry["result"] = "reverted" if found["how"] == "reverted" else "open"
+            results.append(entry)
+            continue
+        if plan_git.withhold_content_closure(
+                db, st, row, entry, target=target,
+                actor=actor or "packet:%s" % target, dry_run=dry_run) is not None:
             results.append(entry)
             continue
         if dry_run:

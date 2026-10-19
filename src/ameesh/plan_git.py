@@ -53,6 +53,11 @@ best-effort :
   périmée. Un clone que personne ne fetch ne fermait jamais les lots livrés
   par un paquet ; si le fetch échoue, le relevé continue sur les refs lues.
 
+#2744 : une fermeture par contenu est retenue tant que le lot est `blocked`
+ou qu'une note `hold:` n'est pas levée (le contenu fusionné est constaté, le
+journal le dit, le détenteur est réveillé, le lot reste ouvert) ; `sync-branches` et
+les unités de paquet (`sync-packets`) portent la même garde.
+
 Un lot absorbé par un autre ou remplacé se clôt par
 `ameesh work close <id> --superseded-by <id>` ; jamais de réouverture d'un
 lot fermé.
@@ -62,6 +67,7 @@ from __future__ import annotations
 import os
 import re
 
+from . import planned_waits
 from . import storage
 from . import work as work_mod
 from .canon import (FETCH_TIMEOUT, GitError, NO_LAZY_FETCH, _git, _norm_url,
@@ -632,6 +638,127 @@ def _content_refs(row: dict, target: str | None, *, declared_repo: str | None,
     return to_try
 
 
+#: #2744 : états qui retiennent la fermeture par le contenu — le lot peut être
+#: livré sans être clos (une passe, une décision ou un déblocage restent dus).
+CONTENT_HELD_STATES = ("blocked",)
+
+
+def content_retention(st, row: dict) -> dict | None:
+    """#2744 : la retenue qui empêche de fermer un lot par son contenu.
+
+    Un lot `blocked`, ou sous une note `hold: …` non levée (#1664), n'est pas
+    fermé par le contenu : sa livraison est constatée, sa fermeture attend la
+    levée. `planned_waits.explicit_holds` est la seule lecture des hold : une
+    note `unhold:` ou un changement d'état lève la retenue. Rend
+    `{what, motif, by, since}`, ou None."""
+    row = row or {}
+    try:
+        lot = int(row["id"])
+        state = str(row.get("state") or "")
+    except (KeyError, TypeError, ValueError):
+        return None
+    try:
+        events = st.progress.lot_hold_events([lot], planned_waits.HOLD_NOTE_PATTERNS)
+    except Exception:  # noqa: BLE001 — un journal illisible ne bloque pas le relevé
+        events = []
+    held = planned_waits.explicit_holds(events).get(lot)
+    if held:
+        by = str(held.get("by") or "")
+        reason = ""
+        for event in reversed(events):
+            text = str(event.get("note") or "").strip()
+            if planned_waits.is_hold_note(text):
+                reason = " ".join(text.split())
+                if reason[:5].lower() == "hold:":
+                    reason = reason[5:].strip()
+                reason = reason[:160]
+                break
+        motif = "hold" + (" de %s" % by if by else "")
+        if reason:
+            motif += " : %s" % reason
+        return {"what": "hold", "motif": motif, "by": by,
+                "since": held.get("since")}
+    if state in CONTENT_HELD_STATES:
+        transitions = [e for e in events if e.get("state") in CONTENT_HELD_STATES]
+        last = transitions[-1] if transitions else {}
+        by = str(last.get("actor") or row.get("assignee") or "")
+        return {"what": "blocked", "motif": "état %s" % state, "by": by,
+                "since": last.get("created_ts")}
+    return None
+
+
+def withhold_content_closure(db, st, row: dict, entry: dict, *, target: str,
+                             actor: str = "", dry_run: bool = False) -> dict | None:
+    """#2744 : retenir la fermeture d'un lot bloqué ou sous hold non levé.
+
+    Appelé quand une preuve de contenu dit la fusion. Hors `dry_run`, écrit
+    une fois le journal « contenu fusionné, fermeture retenue : <motif> » et
+    réveille le détenteur du hold ou le signaleur ; le lot n'est pas fermé.
+    Le jalon `merged` reste celui de la transition (`close_merged`) : un lot
+    retenu n'est pas fusionné, la frise et les estimations le compteraient
+    livré. Le fait est dans le compte rendu (`how`, `ref`, `target`). Rend
+    l'entrée (`withheld`/`would-withhold`), ou None sans retenue."""
+    retention = content_retention(st, row)
+    if retention is None:
+        return None
+    ref = str(entry.get("ref") or entry.get("sha") or "")
+    text = ("contenu fusionné, fermeture retenue : %s — %s (%s %s)"
+            % (retention["motif"], target, entry.get("how") or "?",
+               ref[:12] or "?"))
+    entry["retention"] = retention
+    entry["result"] = "would-withhold" if dry_run else "withheld"
+    entry["detail"] = "%s — %s" % (entry.get("detail") or "", text)
+    if dry_run:
+        return entry
+    lot = int(row["id"])
+    if not _first_observation(st, lot, text):
+        return entry
+    try:
+        work_mod.note(db, lot, text, actor=actor)
+    except work_mod.WorkError:
+        return entry                    # le lot a changé : rien à journaliser
+    _wake_retention(db, row, retention, entry=entry, target=target)
+    return entry
+
+
+def _first_observation(st, lot: int, text: str) -> bool:
+    """#2744 : cette retenue n'est-elle pas déjà au journal ? (une note et un
+    réveil par observation, pas un par balayage)."""
+    try:
+        return not any((e.get("note") or "").strip() == text
+                       for e in st.work.events(lot, 40))
+    except Exception:  # noqa: BLE001 — une lecture impossible ne bloque pas la note
+        return True
+
+
+def _wake_retention(db, row: dict, retention: dict, *, entry: dict, target: str) -> None:
+    """#2744 : réveille le détenteur du hold, sinon le signaleur du blocage.
+
+    Best-effort : la note est déjà écrite ; un courrier non délivré ne doit pas
+    casser le relevé. Un humain n'est pas réveillé par la boîte aux lettres."""
+    from . import mail
+    recipient = str(retention.get("by") or row.get("assignee") or "").strip()
+    if not recipient or recipient.startswith(work_mod.HUMAN_PREFIX) \
+            or recipient == work_mod.SYSTEM_SENDER:
+        return
+    ref = str(entry.get("ref") or entry.get("sha") or "")
+    body = ("Lot #%d \"%s\": its frozen content is merged into %s (%s, %s), but the "
+            "closure is withheld: %s. The lot stays %s; lift the hold (a state change "
+            "or an `unhold:` note) and the next content sweep will close it."
+            % (int(row["id"]), row.get("title") or "", target,
+               entry.get("how") or "?", ref[:12] or "?", retention["motif"],
+               row.get("state") or "?"))
+    try:
+        mail.send(db, work_mod.SYSTEM_SENDER, recipient, body, kind="event",
+                  work_item_id=str(int(row["id"])),
+                  payload={"closure_withheld": {
+                      "lot": int(row["id"]), "reason": retention["what"],
+                      "target": target, "how": entry.get("how"),
+                      "ref": ref}})
+    except Exception:  # noqa: BLE001 — le journal porte déjà la retenue
+        pass
+
+
 def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool = False,
                 limit: int = 1000) -> dict:
     """Ferme les lots dont le contenu gelé est entré dans la cible.
@@ -762,6 +889,11 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
         entry.update(target=found_target, off_target=off_default, how=found_proof["how"],
                      ref=found_proof["ref"], sha=sha, result="open",
                      detail=found_proof["detail"])
+        if withhold_content_closure(
+                db, st, row, entry, target=found_target,
+                actor="git:%s" % found_target, dry_run=dry_run) is not None:
+            results.append(entry)
+            continue
         if dry_run:
             entry["result"] = "would-merge"
         else:
@@ -2427,6 +2559,11 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                         db, lot, branch, actor=actor or "git:%s" % target,
                         source="the merge sweep: lot/%d branch" % lot)
                 st.work.set_branch_head(lot, branch, found["tip"])
+            results.append(entry)
+            continue
+        if withhold_content_closure(
+                db, st, row, entry, target=target,
+                actor=actor or "git:%s" % target, dry_run=dry_run) is not None:
             results.append(entry)
             continue
         if dry_run:
