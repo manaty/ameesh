@@ -1065,7 +1065,10 @@ def serve_pty(proc, master, *, veille=None, stdin_fd=None, stdout_fd=None,
                     text = veille.due(now=now)
                     if text:
                         try:
-                            os.write(master, ("\r" + text + "\r").encode("utf-8"))
+                            # pas de \r en tête : il soumettrait le brouillon de
+                            # l'humain (ou confirmerait un dialogue de permission)
+                            # avant la ligne de veille
+                            os.write(master, (text + "\r").encode("utf-8"))
                         except OSError:
                             break
                 if proc.poll() is not None:

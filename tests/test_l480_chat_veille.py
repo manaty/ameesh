@@ -267,6 +267,8 @@ class ServePtyTest(unittest.TestCase):
             veille.text = "[veille ameesh] 1 nouvelle décision"
             seen = self._read_until(out_r, b"ECHO:[veille ameesh]")
             self.assertIn(b"ECHO:[veille ameesh] 1 nouvelle d", seen)
+            # pas de \r en tête : aucun tour vide ni brouillon soumis avant la ligne
+            self.assertNotIn(b"ECHO:\r\nECHO:", seen)
             os.write(in_w, b"quit\n")
             thread.join(timeout=10)
             self.assertFalse(thread.is_alive())
