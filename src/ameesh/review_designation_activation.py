@@ -61,6 +61,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass, field
 from typing import Mapping, Optional, Sequence
 
@@ -161,6 +162,9 @@ class Inputs:
     manual_seats: list = field(default_factory=list)
     #: the raw `-none` waiver of the lot (`work reviewer --no-verdict`)
     waiver: bool = False
+    #: {family: advance in points over its plan pace} (#2668); empty when no
+    #: gauge reading is current, which leaves the load to decide
+    advances: dict = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------
@@ -730,6 +734,28 @@ def _loads(db) -> dict:
     return out
 
 
+def _advances(db) -> dict:
+    """The raw plan advance of each family, from the shared gauge history (#2668).
+
+    The history (`quota_gauge_readings`) is read by every host of the mesh, so
+    a DeepSeek host can compare the Claude and Codex plans even when it
+    declares neither account. The reading is the raw pace: nominal multiplier
+    and default ceiling, the same scale for every family; the declared
+    `pace_multiplier`/`pace_ceiling` are deliberately not read (B of
+    mesh-design on 4123b99). The gauge's own window and reset are the exact
+    ones. Unreadable: an empty mapping, the selection keeps its load rule —
+    never a failed freeze.
+    """
+    try:
+        from . import review_pace, sous_utilisation
+
+        rows = storage.of(db).operations.latest_gauges(
+            since_s=sous_utilisation.PLAN_GAUGES_SINCE_S)
+        return review_pace.family_advances(rows, now=time.time())
+    except Exception:  # noqa: BLE001 - unreadable gauges: neutral, load decides
+        return {}
+
+
 def _notify(cfg, db, project: str, listing: Sequence[Mapping]) -> str:
     """The project's orchestrator in the registry, when one is declared."""
     from . import sous_utilisation
@@ -904,7 +930,8 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                   commits=commits, policy=policy, authors=authors,
                   unknown_authors=unknown, candidates=candidates, notify=notify,
                   manual=manual, waiver=waiver,
-                  manual_seats=_manual_seats(manual, listing, authors, families))
+                  manual_seats=_manual_seats(manual, listing, authors, families),
+                  advances=_advances(db))
 
 
 # --------------------------------------------------------------------------
@@ -1287,7 +1314,8 @@ def _selection(inputs: Inputs, port, *, force: bool = False) -> dict:
         risk=inputs.policy.risk, base=inputs.base, policy_ref=inputs.policy.ref,
         notify=inputs.notify, unknown_authors=inputs.unknown_authors,
         families=inputs.policy.families or rd.KNOWN_FAMILIES,
-        already=inputs.manual_seats, required=inputs.policy.required)
+        already=inputs.manual_seats, required=inputs.policy.required,
+        advances=inputs.advances)
 
 
 def carried_plan(cfg, db, lot: int, sha: str) -> Optional[dict]:

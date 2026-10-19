@@ -657,6 +657,10 @@ def fetch_fresh(repo: str, names, clone=None) -> tuple[dict, str]:
     try:
         if not os.path.isdir(os.path.join(clone.path, ".git")):
             clone.ensure()  # an existing clone is not reset: the radar may use it
+        else:
+            # #2673 : un clone déjà créé sans `ameesh.target` (origin/HEAD figé
+            # sur une release) reçoit sa cible ici, sans être réinitialisé.
+            clone.declare_target()
         wanted = sorted(set(remote.values()))
         listing = resolutions._run(clone.path, "ls-remote", url,
                                    *("refs/heads/" + b for b in wanted), timeout=FETCH_TIMEOUT)
@@ -1441,7 +1445,8 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
             live.append(row)
     if live and replayer is None:
         from . import radar
-        replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name))
+        replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name),
+                                        target=project.target)
     # the radar reads the agents' refs, which may be stale either way, or gone
     # (a checkout recreated): each pass fetches the branch of every queued
     # lot and its target, scanned or not, and those tips decide
@@ -1752,7 +1757,8 @@ def working_clone(cfg, repo: str, project) -> tuple:
     rien ne survit à la commande."""
     from . import radar, resolutions
     if project is not None:
-        return resolutions.Replayer(repo, radar.clone_dir(cfg, project.name)), None
+        return resolutions.Replayer(repo, radar.clone_dir(cfg, project.name),
+                                    target=project.target), None
     scratch = tempfile.mkdtemp(prefix="ameesh-queue-")
     return resolutions.Replayer(repo, os.path.join(scratch, "clone")), scratch
 
