@@ -3092,7 +3092,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_mig.add_argument("--number", type=int, default=None,
                         help="reserve this exact number (refused if it already exists on the "
                              "lot's target branch or is reserved by another work item; branches "
-                             "not merged into the target do not count, #2620); added to the "
+                             "not merged into the target do not count, #2620; the target is the "
+                             "lot's, else its project's, else `ameesh.target` — never the clone's "
+                             "`origin/HEAD`, and none declared is a refusal, #2660); added to the "
                              "lot's other reservations (#2481)")
     pw_mig.add_argument("--release", action="store_true",
                         help="release all the lot's reservations, or only --number when given "
