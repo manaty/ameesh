@@ -78,7 +78,9 @@ class PausedAvailabilityTest(PgTestCase):
         # pas une capacité disponible et ne doit pas être proposé.
         now = time.time()
         storage.of(self.db).operations.record_gauges([{
-            "harness": "deepseek", "key": "deepseek-10080min", "used": 0.20,
+            # #2648 : la réserve des non-critiques abaisse le rythme de 10
+            # points ; 10 % à 3/7 laissent l'écart de 25 points qui alerte.
+            "harness": "deepseek", "key": "deepseek-10080min", "used": 0.10,
             "resets_at": now + 4 * 86400, "window_s": 7 * 86400,
             "account": "primaire"}])
         alertes = sous_utilisation.plan_underused(

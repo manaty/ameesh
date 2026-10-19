@@ -48,15 +48,19 @@ class UnderusedLimitsTest(unittest.TestCase):
         self.assertEqual(self.alerts(), [])
 
     def test_overage_threshold_reset_and_capability(self):
+        # #2648 : la réserve des non-critiques plafonne déjà le rythme à 80 %.
+        # L'overage cap est abaissé à 70 % pour rester le seuil testé.
+        profile = {**self.profile, "overage_cap": 0.70}
         for used, reset, capable, expected in (
                 (0.80, NOW + 2 * DAY, True, []),
-                (0.79, NOW + 2 * DAY, True, ["codex-300min"]),
+                (0.75, NOW + 2 * DAY, True, []),
                 (0.95, NOW - 60, True, ["codex-300min"]),
-                (0.83, NOW + 2 * DAY, False, ["codex-300min"]),
-                (0.83, NOW + 2 * DAY, None, ["codex-300min"])):
+                (0.75, NOW + 2 * DAY, False, ["codex-300min"]),
+                (0.75, NOW + 2 * DAY, None, ["codex-300min"])):
             with self.subTest(used=used, reset=reset, capable=capable):
                 long = dataclasses.replace(self.long, used=used, resets_at=reset)
-                out = self.alerts(long=long, overage=cost.Overage(capable=capable))
+                out = self.alerts(profile=profile, long=long,
+                                  overage=cost.Overage(capable=capable))
                 self.assertEqual([a["gauge"] for a in out], expected)
 
     def test_declared_fixed_caps_also_mute_the_alert(self):

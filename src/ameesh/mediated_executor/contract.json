@@ -4548,6 +4548,7 @@
    ],
    "mailbox": [
     "dead_letters",
+    "delivered_for_lot",
     "expire_dead_letters",
     "forward",
     "history",
@@ -4717,6 +4718,7 @@
     "train_fire_give",
     "train_fire_change",
     "link_package",
+    "lock",
     "lock_deep_analysis",
     "log_review_attempt",
     "mark_started",
