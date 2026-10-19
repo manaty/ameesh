@@ -19,7 +19,7 @@
   agent-mesh work add --title T [--type bug|evolution] [--app A] [--assignee N] …
   agent-mesh work list [--state S] | work show <id> | work move <id> <state> | work note <id> "…"
   agent-mesh work assign <id> <agent> [--externe] [--actor A]   reassign (guarded assignment)
-  agent-mesh work merged <id> --sha S [--note …]   merge done outside a PR: any open state → merged
+  agent-mesh work merged <id> --sha S | --pr owner/repo#N [--note …]   merge done outside a PR: any open state → merged
   agent-mesh work migration <id> [--number N] [--release [--number N]] [--skip-branch B]   reserve one of the work item's migration numbers (L122, #2481)
   agent-mesh work issue-ref <id> owner/repo#N | --none   correct the issue reference, journaled (#1603)
   agent-mesh work resolve <id> --with <other> [--done | --abort]   prepared conflict resolution (L160d)
@@ -1993,6 +1993,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     print("warning: %s" % item["reviewer_request_warning"], file=sys.stderr)
             return 0
         if args.work_command == "merged":
+            if not (args.sha or args.pr):
+                print("ameesh work merged: --sha S or --pr owner/repo#N", file=sys.stderr)
+                return 2
+
             def _declare_constat(constat: dict) -> None:
                 # #1400 : le constat (lot/app/titre + sujet du commit, et la
                 # forme de la preuve) est montré AVANT l'écriture ; l'état du
@@ -2002,9 +2006,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("commit %s (%s): %s"
                       % (constat["sha"][:12], constat["how"], constat["subject"]))
 
-            done = work.merged(db, args.id, sha=args.sha, note=args.note or "",
-                               actor=args.actor, repo=args.repo, migration_landed=args.migration_landed,
-                               cfg=cfg, announce=_declare_constat)
+            done = work.merged(db, args.id, sha=args.sha or "", note=args.note or "",
+                               actor=args.actor, repo=args.repo,
+                               migration_landed=args.migration_landed,
+                               cfg=cfg, announce=_declare_constat, pr=args.pr)
             if done["result"] == "already":
                 print("lot #%d already %s: nothing to do" % (args.id, done["item"]["state"]))
             elif done["result"] == "landed":
@@ -2012,7 +2017,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     args.id, done["item"]["state"], done["detail"]))
             else:
                 print("lot #%d → merged (commit %s, declared by %s)" % (
-                    args.id, args.sha.strip().lower()[:12], args.actor))
+                    args.id, (done.get("sha") or args.sha or "?")[:12], args.actor))
                 print("%s: %s" % (done["item"].get("app") or "?", done["item"]["title"]))
             return 0
         if args.work_command == "note":
@@ -3106,9 +3111,16 @@ def build_parser() -> argparse.ArgumentParser:
     pw_reviewers.set_defaults(func=cmd_work)
     pw_merged = work_sub.add_parser(
         "merged", help="declare a work item merged outside a PR and without freeze (local merge "
-                       "on the target): any open state → merged, merged milestone with the commit")
+                       "on the target), or by a merged PR of another repository: any open state "
+                       "→ merged, merged milestone with the commit")
     pw_merged.add_argument("id", type=int)
-    pw_merged.add_argument("--sha", required=True, help="the merge commit")
+    pw_merged.add_argument("--sha", default="",
+                           help="the merge commit (required without --pr; with --pr, an equality "
+                                "check on the reported merge commit)")
+    pw_merged.add_argument("--pr", default=None, metavar="OWNER/REPO#N",
+                           help="#2603: a merged PR outside the lot's repository (canon, home); "
+                                "its head must be the lot's freeze, and its merge commit must be "
+                                "in the repository's default branch")
     pw_merged.add_argument("--migration-landed", type=int, default=None, metavar="N",
                            help="the migration number that actually landed (L122/#1567), when "
                                 "the landing renumbered the reservation; recorded with the "

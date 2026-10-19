@@ -1160,5 +1160,78 @@ class FireDbTest(PgTestCase):
         self.assertTrue(fire.state(self.db, lot)["active"])
 
 
+class StackedBaseMergeTest(unittest.TestCase):
+    """#2603 : le feu ne fusionne pas sur une base de travail déjà fusionnée
+    dans la cible par défaut (le contenu atterrirait sur une branche morte)."""
+
+    def _status(self, base="canon/2452"):
+        return {"number": 112, "base": base}
+
+    def test_a_base_merged_into_the_default_refuses_before_merging(self):
+        calls = []
+
+        def gh(args, **kw):
+            calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, '{"status": "ahead"}', "")
+
+        ok, detail = fire._merge_pr("acme/home", self._status(), A, "merge", gh=gh,
+                                    target="canon/2452", default="main")
+        self.assertFalse(ok)
+        self.assertIn("already merged into main", detail)
+        self.assertIn("gh pr edit --base main 112", detail)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "api")
+
+    def test_a_work_base_not_yet_merged_proceeds(self):
+        calls = []
+
+        def gh(args, **kw):
+            calls.append(list(args))
+            if args[0] == "api":
+                return subprocess.CompletedProcess(args, 0, '{"status": "diverged"}', "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        ok, detail = fire._merge_pr("acme/home", self._status("canon/2453"), A, "merge",
+                                    gh=gh, target="canon/2453", default="main")
+        self.assertTrue(ok, detail)
+        self.assertEqual([c[0] for c in calls], ["api", "pr"])
+
+    def test_a_comparison_without_a_known_status_refuses(self):
+        for payload in ('{}', '{"status": "unknown"}'):
+            with self.subTest(payload=payload):
+                gh = mock.Mock(return_value=subprocess.CompletedProcess(
+                    ["gh"], 0, payload, ""))
+                ok, detail = fire._merge_pr("acme/home", self._status(), A, "merge",
+                    gh=gh, target="canon/2452", default="main")
+                self.assertFalse(ok)
+                self.assertIn("unreadable", detail)
+                self.assertEqual(gh.call_count, 1)
+
+    def test_the_default_base_needs_no_comparison(self):
+        calls = []
+
+        def gh(args, **kw):
+            calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        ok, detail = fire._merge_pr("acme/home", self._status("main"), A, "merge", gh=gh,
+                                    target="main", default="main")
+        self.assertTrue(ok, detail)
+        self.assertEqual([c[0] for c in calls], ["pr"])
+
+    def test_an_unreadable_comparison_refuses_before_merging(self):
+        calls = []
+
+        def gh(args, **kw):
+            calls.append(list(args))
+            return subprocess.CompletedProcess(args, 1, "", "HTTP 403")
+
+        ok, detail = fire._merge_pr("acme/home", self._status(), A, "merge", gh=gh,
+                                    target="canon/2452", default="main")
+        self.assertFalse(ok)
+        self.assertIn("cannot be read", detail)
+        self.assertEqual([c[0] for c in calls], ["api"])
+
+
 if __name__ == "__main__":
     unittest.main()

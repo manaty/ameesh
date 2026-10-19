@@ -427,6 +427,37 @@ dossier courant. La lecture reste locale : récupérer la cible au préalable
 si nécessaire. Un commit sans rattachement ne ferme pas le lot.
 L'alerte `stale_lot` rappelle cette commande pour un lot inactif.
 
+Une PR fusionnée dans un **autre dépôt** que celui du lot (le canon
+`manaty/home`, par exemple) se déclare de même, avec `--pr` :
+
+```
+ameesh work merged <id> --pr manaty/home#111 [--note "…"]
+```
+
+`gh pr view` doit rendre la PR `MERGED` ; sa tête doit être le gel du lot
+(ou, sans gel, sa branche). GitHub doit rendre son commit de fusion
+(`mergeCommit`), et ce commit doit être entré dans la branche par défaut du
+dépôt de la PR : `gh repo view` résout cette branche, puis
+`gh api repos/<dépôt>/compare/<défaut>...<merge>` doit rendre `behind` ou
+`identical` (un doute refuse). Une PR fusionnée sur une base morte puis
+refusionnée dans le défaut passe ; sinon le contenu n'est pas livré
+(home#112/#113). `--sha` n'est qu'un contrôle d'égalité avec le commit de
+fusion ; absent de la vue GitHub, il refuse.
+
+**PR empilée sur une base déjà fusionnée.** Avant de fusionner une PR dont la
+base n'est pas la branche par défaut, vérifier que cette base n'est pas déjà
+entrée dans la branche par défaut : sinon la fusion pose le contenu sur une
+branche morte et il est perdu (home#112/#113 après la fusion de canon/2452).
+La garde est mécanique dans le feu (fusion directe `gh pr merge`), dans la
+file de fusion et dans `ameesh work merge-pr` (refus nommé, avec la commande
+de correction) ; pour une fusion `gh` directe hors ameesh — bureau —, la
+vérification reste manuelle :
+
+```
+git -C <clone> merge-base --is-ancestor origin/<base> origin/<défaut> \
+  && gh pr edit <N> --repo <owner/repo> --base <défaut>
+```
+
 Autres fermetures : `ameesh work close <id> --abandoned | --superseded-by
 <id> | --done` (`--done` : lot livré sans fusion, sans branche). Un lot passé
 `promoted` par erreur : `ameesh work move <id> merged
