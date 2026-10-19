@@ -142,9 +142,9 @@ class _ActivationFixture:
         self.db.execute("DELETE FROM provenance_receipts")
         self.db.execute("DELETE FROM canon_state")
         self.repo = _Repo(os.path.join(self.tmp, "depot"))
-        self.repo.write("src/ameesh/db.py", "base\n")
+        self.repo.write("src/ameesh/work.py", "base\n")
         self.base = self.repo.commit("base")
-        self.repo.write("src/ameesh/db.py", "lot\n")
+        self.repo.write("src/ameesh/work.py", "lot\n")
         self.frozen = self.repo.commit("lot")
         self.canon = _Canon(os.path.join(self.tmp, "canon"))
         self.cfg = dataclasses.replace(self.cfg, canon=self.canon.root, canon_ref="HEAD")
@@ -248,7 +248,7 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertEqual(out["state"], rd.DESIGNATED, out)
         self.assertEqual(designated(work.get(self.db, self.lot)), ["r1", "r2"])
         # a new head, no independent reviewer left: the old names must go
-        self.repo.write("src/ameesh/db.py", "another lot\n")
+        self.repo.write("src/ameesh/work.py", "another lot\n")
         self.frozen = self.repo.commit("another lot")
         self.receipts()
         for name in ("r1", "r2"):
@@ -273,7 +273,7 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         # capacity is back, but the head moves before the delayed recovery sync
         for name, harness in (("r1", "claude"), ("r2", "codex")):
             registry.upsert(self.db, name, harness=harness)
-        self.repo.write("src/ameesh/db.py", "new head\n")
+        self.repo.write("src/ameesh/work.py", "new head\n")
         self.frozen = self.repo.commit("new head")
         self.receipts()
         _, frozen_again = self.freeze()
@@ -298,7 +298,7 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertEqual(waiting["state"], rd.WAITING, waiting)
         for name, harness in (("r1", "claude"), ("r2", "codex")):
             registry.upsert(self.db, name, harness=harness)
-        self.repo.write("src/ameesh/db.py", "new head\n")
+        self.repo.write("src/ameesh/work.py", "new head\n")
         self.frozen = self.repo.commit("new head")
         self.receipts()
         _, frozen_again = self.freeze()
@@ -320,7 +320,7 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         first, light = self.freeze()
         self.assertEqual(light["state"], rd.NONE, light)
         self.frozen = lot_head
-        self.repo.write("src/ameesh/db.py", "new head\n")
+        self.repo.write("src/ameesh/work.py", "new head\n")
         self.frozen = self.repo.commit("new head")
         self.receipts()
         _, frozen_again = self.freeze()
@@ -494,16 +494,131 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertIn("author family unknown", out["why"])
         self.assertEqual(out["reviewers"], [])
 
+    def test_a_manual_reviewer_does_not_hide_an_unknown_author_family(self):
+        # Deux manuels de familles distinctes ne prouvent rien si la famille
+        # de l'auteur est inconnue : la designation attend et alerte, elle ne
+        # se declare pas suffisante (#2627).
+        work.move(self.db, self.lot, "qa")
+        work.designate_reviewer(self.cfg, self.db, self.lot, "r1",
+                                actor="human:smichea")
+        work.designate_reviewer(self.cfg, self.db, self.lot, "r2",
+                                actor="human:smichea")
+        self.db.execute("DELETE FROM turn_costs")
+        self.db.execute("UPDATE provenance_receipts SET harness = 'other'")
+        before = len(self.mailbox())
+        _, out = self.freeze()
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.assertIn("author family unknown", out["why"])
+        self.assertEqual(out["reviewers"], [])
+        self.assertEqual([m["recipient"] for m in self.mailbox()[before:]], ["pilot"])
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1", "r2"])
+
     def test_a_manual_reviewer_keeps_the_journaled_exception(self):
         work.move(self.db, self.lot, "qa")
         work.designate_reviewer(self.cfg, self.db, self.lot, "r1",
+                                actor="human:smichea")
+        work.designate_reviewer(self.cfg, self.db, self.lot, "r2",
                                 actor="human:smichea")
         before = len(self.mailbox())
         _, out = self.freeze()
         self.assertEqual(out["state"], "manual", out)
         self.assertEqual(len(self.mailbox()), before)
         self.assertEqual(self.marks(), [])
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1", "r2"])
         self.assertTrue([n for n in self.notes() if "manual reviewer(s)" in n])
+
+    def test_an_insufficient_manual_designation_gets_the_missing_reviewer(self):
+        # #2627 / constat #2551 : deux avis requis, un seul relecteur manuel
+        # (claude). Le manque est désigné, le manuel reste en place.
+        work.move(self.db, self.lot, "qa")
+        work.designate_reviewer(self.cfg, self.db, self.lot, "r1",
+                                actor="human:smichea")
+        before = len(self.mailbox())
+        _, out = self.freeze()
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        self.assertEqual(out["required"], 2)
+        self.assertEqual(out["missing"], 0)
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r2"])
+        self.assertEqual([r["family"] for r in out["reviewers"]], ["codex"])
+        self.assertEqual([m["recipient"] for m in self.mailbox()[before:]], ["r2"])
+        self.assertEqual(self.mailbox()[before]["kind"], "request")
+        self.assertIn("review 2/2", self.mailbox()[before]["body"])
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1", "r2"])
+        mark = pg.designation_of(self.marks()[0])
+        self.assertEqual(mark["state"], rd.DESIGNATED)
+        self.assertEqual([r["name"] for r in mark["reviewers"]], ["r2"])
+        self.assertEqual(mark["required"], 2)
+        self.assertEqual(mark["missing"], 0)
+
+    def test_the_recovery_completes_an_insufficient_manual_designation(self):
+        # Le gel a eu lieu sans designation (hook explicite) : la reprise
+        # `work reviewers --apply` complète le manuel avec la même sélection.
+        work.move(self.db, self.lot, "qa")
+        work.designate_reviewer(self.cfg, self.db, self.lot, "r1",
+                                actor="human:smichea")
+        work.milestone(self.db, self.lot, "frozen", sha=self.frozen,
+                       actor="author",
+                       on_frozen=lambda tx, milestone, threads: None,
+                       after_commit=[])
+        before = len(self.mailbox())
+        out = act.designate(self.cfg, self.db, self.lot)
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r2"])
+        self.assertEqual([m["recipient"] for m in self.mailbox()[before:]], ["r2"])
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1", "r2"])
+
+    def test_a_manual_reviewer_of_the_author_family_does_not_count(self):
+        # Le manuel r1 tourne en realite sous deepseek, la famille de l'auteur :
+        # il ne couvre aucun siege, les deux avis automatiques partent.
+        registry.upsert(self.db, "r3", harness="claude", host=self.cfg.host,
+                        cwd=self.repo.root, status="idle")
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = 'r3'")
+        work.move(self.db, self.lot, "qa")
+        work.designate_reviewer(self.cfg, self.db, self.lot, "r1",
+                                actor="human:smichea")
+        self.db.execute(
+            "UPDATE agent_registry SET session_id='s-r1', session_origin='s-r1',"
+            " session_harness='deepseek' WHERE name='r1'")
+        _, out = self.freeze()
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        self.assertEqual(out["required"], 2)
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r2", "r3"])
+        self.assertEqual([r["family"] for r in out["reviewers"]], ["codex", "claude"])
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1", "r2", "r3"])
+
+    def test_a_manual_waiver_is_never_overridden(self):
+        # #1979 : la dispense `-none` est un geste d'autorite. Un gel renouvele
+        # de la MEME tete la garde (`_lapse_waiver`), et la designation
+        # n'ajoute ni relecteur, ni courrier, ni marque.
+        work.move(self.db, self.lot, "qa")
+        self.freeze()
+        work.waive_review(self.cfg, self.db, self.lot, actor="human:smichea")
+        before_mail = len(self.mailbox())
+        before_marks = len(self.marks())
+        _, out = self.freeze()
+        self.assertEqual(out["state"], "manual", out)
+        self.assertIn("-none", out["why"])
+        self.assertEqual(len(self.mailbox()), before_mail)
+        self.assertEqual(len(self.marks()), before_marks)
+        raw = self.db.query("SELECT reviewers FROM work_items WHERE id = %s",
+                            (self.lot,))[0]["reviewers"]
+        self.assertEqual(list(raw), ["-none"])
+
+    def test_the_critical_floor_of_the_merge_gate_is_the_requirement(self):
+        # #2627 : le canon peut ne declarer qu'un avis sur exploitation.py ;
+        # la porte de fusion en exige deux (chemin critique). La designation
+        # doit lire le meme besoin que le feu, sinon le lot reste court.
+        self.repo.write("src/ameesh/exploitation.py", "lot\n")
+        self.frozen = self.repo.commit("critical path")
+        self.receipts()
+        canon = _Canon(os.path.join(self.tmp, "canon-un-avis"),
+                       federation=FEDERATION.replace("            reviews: 2",
+                                                     "            reviews: 1"))
+        cfg = dataclasses.replace(self.cfg, canon=canon.root, canon_ref="HEAD")
+        _, out = self.freeze(cfg=cfg)
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        self.assertEqual(out["required"], 2)
+        self.assertEqual(len(out["reviewers"]), 2)
 
     def test_no_canon_is_silent_and_keeps_the_freeze(self):
         cfg = dataclasses.replace(self.cfg, canon="")

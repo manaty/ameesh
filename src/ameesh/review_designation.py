@@ -296,8 +296,40 @@ def unknown_families(authors: Iterable) -> list[str]:
                    in PLACEHOLDER_FAMILIES})
 
 
+def manual_seats(already: Iterable, *, authors: Iterable = (),
+                 families=KNOWN_FAMILIES) -> list:
+    """The manual reviewers that can count toward the required opinions.
+
+    A manual reviewer is kept in the column whatever happens (`#2627`); this
+    helper only says which ones cover a seat: a known family from the policy,
+    distinct from every author's family, distinct from the other manual
+    reviewers, and not an author itself. An unknown family, or the author's
+    family, does not prove independence: the seat remains to designate.
+    """
+    names, forbidden = families_of(authors)
+    if unknown_families(authors):
+        # An author of unknown family makes every reviewer's independence
+        # unprovable: no manual reviewer can cover a seat either (#2627).
+        return []
+    covered = set(forbidden)
+    seats = []
+    seen_names = set()
+    for row in already or ():
+        row = dict(row or {})
+        name = str(row.get("name") or "").strip()
+        family = str(row.get("family") or "").strip().lower()
+        if (not name or name in seen_names or name in names
+                or not family or family in PLACEHOLDER_FAMILIES
+                or family not in families or family in covered):
+            continue
+        seen_names.add(name)
+        covered.add(family)
+        seats.append({"name": name, "family": family})
+    return seats
+
+
 def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
-           families=KNOWN_FAMILIES) -> dict:
+           families=KNOWN_FAMILIES, already: Iterable = ()) -> dict:
     """Chooses `required` (1 or 2) independent and least-loaded reviewers.
 
     - each reviewer's family differs from that of **every** author or fixer, and
@@ -309,28 +341,43 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     - an author whose real family is unknown (empty or a label) makes the
       designation **wait**: without it, a reviewer's independence is not proven
       (canon §2);
-    - at equal load, the order of names decides: the selection is deterministic.
+    - at equal load, the order of names decides: the selection is deterministic;
+    - `already` names the manual reviewers already designated (#2627). The ones
+      that prove an independent family cover a seat; only the **missing** seats
+      are designated, never a manual reviewer removed or overridden.
 
-    Returns `{state, required, reviewers, missing, why, forbidden}`: `waiting`
-    when independent families are missing or an author family is unknown, with
-    the missing count — never an implicit admission.
+    Returns `{state, required, reviewers, missing, manual, why, forbidden}`:
+    `waiting` when independent families are missing or an author family is
+    unknown, with the missing count — never an implicit admission. `reviewers`
+    names only the automatic reviewers of this call; `manual` the manual seats
+    that count.
     """
     if type(required) is not int or required not in (0, 1, 2):
         raise DesignationError("required reviews must be 0, 1 or 2, not %r" % (required,))
     names, forbidden = families_of(authors)
+    seats = manual_seats(already, authors=authors, families=families)
     out = {"state": NONE, "required": required, "reviewers": [], "missing": 0,
-           "why": "no review required", "forbidden": sorted(forbidden)}
+           "manual": seats, "why": "no review required",
+           "forbidden": sorted(forbidden)}
     if required == 0:
+        return out
+    remaining = max(required - len(seats), 0)
+    if remaining == 0:
+        out.update({"state": DESIGNATED, "missing": 0,
+                    "why": "manual reviewer(s) already cover the required reviews"})
         return out
     unknown = unknown_families(authors)
     if unknown:
         # An author with no known real family: independence is not proven,
         # so we wait instead of discarding the only name (canon §2).
-        out.update({"state": WAITING, "missing": required,
+        out.update({"state": WAITING, "missing": remaining,
                     "why": "author family unknown: %s" % ", ".join(unknown)})
         return out
+    seat_names = {row["name"] for row in seats}
+    seat_families = {row["family"] for row in seats}
     eligible = [c for c in candidates or ()
-                if c.eligible(forbidden_names=names, forbidden_families=forbidden,
+                if c.eligible(forbidden_names=names | seat_names,
+                              forbidden_families=forbidden | seat_families,
                               families=families)]
     # a single candidate per family: the least loaded, then the name
     best: dict[str, Candidate] = {}
@@ -341,19 +388,20 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
             best[family] = candidate
     ordered = [best[family] for family in sorted(best)]
     ordered.sort(key=lambda c: (c.load, c.name))
-    chosen = ordered[:required]
+    chosen = ordered[:remaining]
     out["reviewers"] = [{"name": c.name, "family": c.family} for c in chosen]
-    if len(chosen) < required:
+    if len(chosen) < remaining:
         out.update({
             "state": WAITING,
-            "missing": required - len(chosen),
+            "missing": remaining - len(chosen),
             "reviewers": [],
             "why": ("%d independent %s missing: %d eligible famil%s (%s), "
                     "forbidden %s" % (
-                        required - len(chosen), "review" if required == 1 else "reviews",
+                        remaining - len(chosen),
+                        "review" if remaining == 1 else "reviews",
                         len(ordered), "y" if len(ordered) == 1 else "ies",
                         ", ".join(sorted(best)) or "none",
-                        ", ".join(sorted(forbidden)) or "none")),
+                        ", ".join(sorted(forbidden | seat_families)) or "none")),
         })
         return out
     out.update({"state": DESIGNATED,
@@ -599,7 +647,8 @@ class Port(Protocol):
 def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
           freeze_sha: str, authors: Iterable = (), candidates: Iterable = (), risk: str = "light",
           base: str = "", policy_ref: str = "", notify: str = "",
-          unknown_authors: Iterable = (), families=KNOWN_FAMILIES) -> dict:
+          unknown_authors: Iterable = (), families=KNOWN_FAMILIES,
+          already: Iterable = (), required: Optional[int] = None) -> dict:
     """Designates the reviewers of the lot's latest freeze, or says why it waits.
 
     `policy` carries the already parsed rules (`Rule` or `{rules: [...]}`
@@ -613,6 +662,13 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     (#1465) is unknown: without it, a reviewer's independence cannot be
     established, so the designation waits instead of guessing — an explicit
     state, never a fallback.
+
+    `already` carries the manual reviewers already designated (#2627): the ones
+    that prove an independent family cover a seat, and only the missing seats
+    are selected. None is ever removed, and two manual reviewers of the same
+    family count one seat. `required` overrides the count read from the rules
+    when the caller has a compiled need (the critical floor of the merge gate,
+    #2627); it must still be 0, 1 or 2.
 
     The freeze is re-read **once**, and the provided inputs (paths, authors,
     class) are those of this freeze: if the `Port` refuses a freeze that has
@@ -654,7 +710,9 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
             "the inputs of lot #%d were collected for freeze %s, the last freeze is %s:"
             " nothing written; recollect the paths, authors and class of the new"
             " freeze, then retry" % (lot, expected[:12], sha[:12]))
-    required = required_count(rules, paths)
+    required = required_count(rules, paths) if required is None else required
+    if type(required) is not int or required not in (0, 1, 2):
+        raise DesignationError("required reviews must be 0, 1 or 2, not %r" % (required,))
     if risk != "light" and required == 0:
         raise DesignationError(
             "review count unknown for a non-light lot (#%d, class %s)" % (lot, risk))
@@ -672,10 +730,10 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         why = ("author provenance unknown for %d commit(s) of the frozen range: %s"
                % (len(unknown), ", ".join(unknown[:5])))
         selection = {"state": WAITING, "required": required, "reviewers": [],
-                     "missing": required, "why": why}
+                     "missing": required, "manual": [], "why": why}
     else:
         selection = select(required=required, authors=authors, candidates=candidates,
-                           families=families)
+                           families=families, already=already)
     if selection["state"] == WAITING and existing:
         # The waiting state of this freeze is already recorded and notified: we
         # do not send a second one, but the selection was retried — if capacity
@@ -684,9 +742,16 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         out["replayed"] = True
         return out
     state = selection["state"]
+    if state == DESIGNATED and not selection["reviewers"]:
+        # The manual reviewers already cover every required seat (#2627): no
+        # automatic reviewer, no mail, no designation mark to write.
+        return {"state": "manual", "required": required, "reviewers": [],
+                "missing": 0, "manual": [dict(row) for row in selection["manual"]],
+                "why": selection["why"], "freeze": freeze}
     messages = []
     if state == DESIGNATED:
-        for rank, reviewer in enumerate(selection["reviewers"], start=1):
+        first_rank = len(selection.get("manual") or ()) + 1
+        for rank, reviewer in enumerate(selection["reviewers"], start=first_rank):
             messages.append({
                 "to": reviewer["name"],
                 "family": reviewer["family"],
