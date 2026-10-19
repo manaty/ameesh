@@ -306,7 +306,7 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     """
     out: dict = {"lot": int(lot), "class": SENSITIVE, "why": "", "files": [],
                  "policy_ref": "", "repo": repo or "", "target": base or "",
-                 "frozen_sha": head or "", "doubt": True}
+                 "base_sha": "", "frozen_sha": head or "", "doubt": True}
     row = item if item is not None else work.get(db, lot)
     if row is None:
         out["why"] = "lot #%d not found" % lot
@@ -348,6 +348,7 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     if not base:
         base = landing
     out["target"] = base or ""
+    out["base_sha"] = str(base or "")
     reason = release_reason(row, base)
     if reason:
         out.update({"class": RELEASE, "why": reason, "doubt": False})
@@ -356,6 +357,7 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     if not revision:
         out["why"] = "no target branch: freeze the lot or name its target"
         return out
+    out["base_sha"] = str(revision)
     try:
         paths = canon_mod.git_range_paths(repo, revision, head)
     except canon_mod.GitError as exc:

@@ -157,6 +157,9 @@ class Inputs:
     policy: Policy
     authors: list
     unknown_authors: list
+    #: designated reviewers' small first-round corrections (#2638): never
+    #: designated again, their family stays eligible (#2739)
+    correctors: list
     candidates: list
     notify: str
     manual: list = field(default_factory=list)
@@ -592,6 +595,23 @@ def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
             if str(value).strip() and str(value).strip() != author}
 
 
+def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
+                        repo: str, base: str, head: str, *, families=()) -> list:
+    """The designated reviewers' small first-round corrections of `base..head`.
+
+    Read from the exact frozen commits and their provenance receipts, never
+    from a designation mark: a head re-integrated under a new SHA is read as it
+    stands (#2739). `milestone` is the lot's freeze when it is this head; it
+    lets `_designated_reviewers` recognise a corrector retired by a later
+    designation. The caller (the merge gate) handles an unreadable range as it
+    must; this reader invents no name.
+    """
+    _start, _paths, commits = _range(repo, base, head)
+    _authors_, _unknown, correctors = review_authors.reading(
+        db, item, milestone, commits, repo, families=families)
+    return correctors
+
+
 # --------------------------------------------------------------------------
 # the candidates: real session family, availability, open-lot load
 # --------------------------------------------------------------------------
@@ -699,16 +719,20 @@ def _waiver(item: Mapping) -> bool:
 
 
 def _manual_seats(manual: Sequence[str], listing: Sequence[Mapping],
-                  authors: Sequence[Mapping], families) -> list:
+                  authors: Sequence[Mapping], families, *,
+                  correctors: Sequence[Mapping] = ()) -> list:
     """The manual reviewers that cover a required seat (#2627).
 
     A manual reviewer is always kept in the column; this only says which ones
     count: a known family of the compiled policy, distinct from every author's
     family and from the other manual reviewers. An unknown family, or the
     author's family, does not prove independence: the seat remains missing and
-    is designated automatically. The list is ordered like the column.
+    is designated automatically. A corrector cannot count its own seat either
+    (#2739): its family stays eligible, its name does not. The list is ordered
+    like the column.
     """
     forbidden_names, forbidden_families = rd.families_of(authors)
+    forbidden_names = forbidden_names | rd.names_of(correctors)
     rows = {str((row or {}).get("name") or ""): row for row in listing or ()}
     covered = set(forbidden_families)
     seats = []
@@ -790,8 +814,8 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                       commits=commits,
                       policy=Policy(rules=(), families=(), risk="light", required=0,
                                     ref="", commit="", source=""),
-                      authors=[], unknown_authors=[], candidates=[], notify="",
-                      manual=manual, waiver=waiver)
+                      authors=[], unknown_authors=[], correctors=[], candidates=[],
+                      notify="", manual=manual, waiver=waiver)
     policy = _policy(cfg, db, project, paths)
     if isinstance(policy, Unavailable):
         return policy
@@ -805,14 +829,15 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         # project's agents, so the two roles never collapse into one mail
         candidates = [candidate for candidate in candidates
                       if candidate.name != notify]
-    authors, unknown = review_authors.authors(db, item, freeze, commits, repo,
-                                              families=policy.families,
-                                              trace=True)
+    authors, unknown, correctors = review_authors.reading(
+        db, item, freeze, commits, repo, families=policy.families, trace=True)
     return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=paths,
                   commits=commits, policy=policy, authors=authors,
-                  unknown_authors=unknown, candidates=candidates, notify=notify,
+                  unknown_authors=unknown, correctors=correctors,
+                  candidates=candidates, notify=notify,
                   manual=manual, waiver=waiver,
-                  manual_seats=_manual_seats(manual, listing, authors, families),
+                  manual_seats=_manual_seats(manual, listing, authors, families,
+                                             correctors=correctors),
                   advances=_advances(db))
 
 
@@ -1196,8 +1221,8 @@ def _selection(inputs: Inputs, port, *, force: bool = False) -> dict:
         risk=inputs.policy.risk, base=inputs.base, policy_ref=inputs.policy.ref,
         notify=inputs.notify, unknown_authors=inputs.unknown_authors,
         families=inputs.policy.families,
-        already=inputs.manual_seats, required=inputs.policy.required,
-        advances=inputs.advances)
+        already=inputs.manual_seats, fixers=inputs.correctors,
+        required=inputs.policy.required, advances=inputs.advances)
 
 
 def carried_plan(cfg, db, lot: int, sha: str) -> Optional[dict]:
