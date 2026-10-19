@@ -18,12 +18,19 @@ poste : un dossier par identifiant — l'empreinte de l'emplacement résolu
 revendication par mesh et par configuration :
 `<empreinte du mesh>.<empreinte de la configuration>.json`.
 
-L'identité du mesh est **lue en base** (`ameesh_events_cluster()`, sinon
-`system_identifier` + `current_database()` + `current_schema()`) : jamais
-dérivée du DSN. Deux façons de joindre la même base (pgbouncer, TCP direct)
-sont le même mesh ; deux bases ou deux schémas sont deux meshes. Deux
-configurations d'un même mesh (profils d'exécuteur, #1466) ne sont donc jamais
-en conflit. Une revendication vit `CLAIM_WINDOW_S` après sa dernière écriture.
+L'identité du mesh est **lue en base** et **stable** : le
+`system_identifier` du cluster et le journal aléatoire d'`ameesh_events_journal`
+(0448), sous la forme `mesh:<system_identifier>:j:<journal>`, lue par
+`ameesh_events_cluster()` puis normalisée, ou par ses deux parties lues
+directement. La **timeline** n'y entre pas : elle change à une bascule ou après
+un point-in-time recovery alors que le mesh — le journal d'un schéma dans un
+cluster — reste le même (#2592, N1). Une seule forme : jamais dérivée du DSN
+(pgbouncer et TCP direct désignent le même mesh), jamais un repli qui
+changerait de clé selon les droits du rôle ; si l'identité stable est
+illisible, aucune revendication n'est écrite (#2592, N2). Deux bases ou deux
+schémas sont deux meshes ; deux configurations d'un même mesh (profils
+d'exécuteur, #1466) ne sont donc jamais en conflit. Une revendication vit
+`CLAIM_WINDOW_S` après sa dernière écriture.
 
 Les revendications sont écrites là où #1883 publie ses identités
 (`_publish_identities`, donc par TOUT processus qui place un tour), et par
@@ -58,9 +65,11 @@ import re
 import tempfile
 import time
 
-#: version du format : la v2 porte l'hôte et l'identité de mesh lue en base ;
-#: les revendications v1 (clé L219 dérivée du DSN) sont ignorées.
-SCHEMA = "ameesh-account-claim/2"
+#: version du format : la v3 fixe l'identité de mesh canonique, stable sur une
+#: bascule ou un PITR (`system_identifier` + journal, sans timeline) ; les
+#: revendications v1 (clé L219 dérivée du DSN) et v2 (identité brute, timeline
+#: incluse) sont ignorées.
+SCHEMA = "ameesh-account-claim/3"
 #: registre par défaut : le registre d'hôte historique de #313, sous le
 #: dossier d'état XDG de l'utilisateur, jamais sous le `state_dir` d'un mesh
 #: (deux meshes peuvent en avoir deux) ; voir `default_registry`.
@@ -72,6 +81,10 @@ CLAIM_WINDOW_S = 3600.0
 REFRESH_S = 600.0
 
 _CLAIM_RE = re.compile(r"^([0-9a-f]{16})\.([0-9a-f]{16})\.json$")
+#: forme rendue par `ameesh_events_cluster()` (0396/0448) :
+#: `<system_identifier en hex>t<timeline>j<journal>` ; le journal fait 16
+#: chiffres hexadécimaux (0448). Une autre forme n'est pas devinée.
+_CLUSTER_RE = re.compile(r"^([0-9a-f]+)t[0-9a-f]+j([0-9a-f]{16})$", re.IGNORECASE)
 #: attribut porté par la connexion : l'identité du mesh ne change pas pendant
 #: la vie d'un processus, une seule lecture de base suffit
 _IDENTITY_ATTR = "_ameesh_account_claim_mesh"
@@ -125,7 +138,7 @@ def _fingerprint(text: str) -> str:
 def mesh_hash(identity: str) -> str:
     """L'empreinte d'une identité de mesh — jamais l'identité en clair dans le
     registre (elle décrit l'infrastructure, pas un compte)."""
-    return _fingerprint("ameesh-account-claim/2:mesh\x00" + str(identity))[:16]
+    return _fingerprint("%s:mesh\x00" % SCHEMA + str(identity))[:16]
 
 
 def remember(identity: str | None) -> None:
@@ -149,44 +162,62 @@ def _db_of(source):
     return getattr(source, "db", None)
 
 
+def _canonical_mesh(cluster: str | None) -> str | None:
+    """L'identité stable d'un mesh depuis `ameesh_events_cluster()` : le
+    `system_identifier` et le journal, sans la timeline (qui change à une
+    bascule ou à un PITR alors que le journal, lui, est conservé). Une forme
+    inconnue rend None : on ne devine jamais une identité de mesh."""
+    if not cluster:
+        return None
+    match = _CLUSTER_RE.match(str(cluster).strip())
+    if not match:
+        return None
+    return "mesh:%s:j:%s" % (match.group(1).lower(), match.group(2).lower())
+
+
 def _read_identity(db) -> str | None:
-    """L'identité du mesh LUE EN BASE : le journal d'événements (cluster,
-    timeline, journal), sinon `system_identifier` + base + schéma. Jamais le
-    DSN : pgbouncer et TCP direct désignent le même mesh."""
+    """L'identité stable du mesh LUE EN BASE, sous UNE seule forme
+    (`mesh:<system_identifier>:j:<journal>`) : `ameesh_events_cluster()`
+    normalisé, sinon ses deux parties lues directement. Jamais le DSN, jamais
+    la timeline, jamais un repli qui changerait de clé selon les droits du
+    rôle : illisible, None (aucune revendication, voir `mesh_identity`)."""
     try:
         rows = db.query("select ameesh_events_cluster() as cluster")
-        if rows and rows[0].get("cluster"):
-            return str(rows[0]["cluster"])
+        identity = _canonical_mesh(rows[0].get("cluster") if rows else None)
+        if identity:
+            return identity
     except Exception:  # noqa: BLE001 — fonction absente, droits, pilote médié
         pass
     try:
+        # Les deux parties stables, pour un rôle qui lit le journal sans
+        # pouvoir exécuter `ameesh_events_cluster()` : même forme canonique.
         rows = db.query(
             "select (select to_hex(system_identifier) from pg_control_system())"
-            " as system_identifier, current_database() as database,"
-            " current_schema() as schema")
+            " as system_identifier,"
+            " (select journal from ameesh_events_journal where one) as journal")
         if rows:
             row = rows[0]
-            if row.get("system_identifier"):
-                return "db:%s:%s:%s" % (row["system_identifier"],
-                                        row.get("database") or "",
-                                        row.get("schema") or "")
-    except Exception:  # noqa: BLE001 — droits sur pg_control_system
+            if row.get("system_identifier") and row.get("journal"):
+                return "mesh:%s:j:%s" % (
+                    str(row["system_identifier"]).lower(),
+                    str(row["journal"]).lower())
+    except Exception:  # noqa: BLE001 — droits, journal absent (avant 0448)
         pass
     # L109 : une connexion médiée n'a pas de SQL ; `events.bounds` est
     # l'opération du contrat qui porte déjà `ameesh_events_cluster()`.
     try:
         from . import storage
-        cluster = storage.of(db).events.bounds().get("cluster")
-        if cluster:
-            return str(cluster)
+        identity = _canonical_mesh(storage.of(db).events.bounds().get("cluster"))
+        if identity:
+            return identity
     except Exception:  # noqa: BLE001 — base sans journal, session sans jeton
         pass
     return None
 
 
 def mesh_identity(source=None) -> str | None:
-    """L'identité brute du mesh de cette connexion (`source` : db ou store),
-    lue une fois en base et retenue sur la connexion. None si elle est
+    """L'identité canonique du mesh de cette connexion (`source` : db ou
+    store), lue une fois en base et retenue sur la connexion. None si elle est
     illisible : on n'écrit alors aucune revendication (mieux vaut ne pas
     détecter que d'attribuer un compte au mauvais mesh)."""
     db = _db_of(source)

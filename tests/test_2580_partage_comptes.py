@@ -35,28 +35,32 @@ from .test_l30_accounts import _Base as _PgBase, _dossier
 
 HOUR = 3600.0
 MESH_A = "16ABCDEFt0000abcdj1111222233334444"
+#: le même mesh (même cluster, même journal) après une bascule ou un PITR : la
+#: timeline a changé, pas l'identité (#2592 N1)
+MESH_A_AUTRE_TIMELINE = "16ABCDEFt00000002j1111222233334444"
 MESH_B = "16ABCDEFt0000abcdj5555666677778888"
+#: la forme canonique : system_identifier + journal, sans timeline (#2592)
+MESH_A_CANONIQUE = "mesh:16abcdef:j:1111222233334444"
 
 
 class _Db:
     """Une connexion factice : l'identité du mesh est celle que la base rend."""
 
-    def __init__(self, cluster=MESH_A, *, system_identifier="aabbccdd",
-                 database="ameesh", schema="public"):
+    def __init__(self, cluster=MESH_A, *, system_identifier="16abcdef",
+                 journal="1111222233334444"):
         self.cluster = cluster
         self.system_identifier = system_identifier
-        self.database = database
-        self.schema = schema
+        self.journal = journal
         self.calls: list[str] = []
 
     def query(self, sql, params=()):
         self.calls.append(sql)
         if "ameesh_events_cluster" in sql:
             return [{"cluster": self.cluster}]
-        if "pg_control_system" in sql:
+        if "ameesh_events_journal" in sql:
             return [{"system_identifier": self.system_identifier,
-                     "database": self.database, "schema": self.schema}]
-        return [{"database": self.database, "schema": self.schema}]
+                     "journal": self.journal}]
+        return []
 
 
 class _Base(unittest.TestCase):
@@ -126,12 +130,46 @@ class DeuxMeshesTest(_Base):
         vu = account_claims.shared(autre, db=db_b, now=self.now)
         self.assertEqual([p["account"] for p in vu], ["secondaire"])
 
-    def test_identite_fallback_system_identifier(self):
-        db = _Db(cluster=None)
-        self.assertEqual(account_claims.mesh_identity(db), "db:aabbccdd:ameesh:public")
+    def test_identite_canonique_une_seule_forme(self):
+        """#2592 N2 : le cluster et les deux parties stables du même mesh
+        donnent la MÊME clé, quel que soit le droit du rôle à lire l'un ou
+        l'autre."""
+        self.assertEqual(account_claims.mesh_identity(_Db(MESH_A)),
+                         MESH_A_CANONIQUE)
+        self.assertEqual(account_claims.mesh_identity(_Db(cluster=None)),
+                         MESH_A_CANONIQUE)
         cfg = self.cfg(self.secondaire())
-        self.assertTrue(account_claims.refresh(cfg, db=db, now=self.now))
-        self.assertTrue(account_claims.shared(cfg, db=_Db(cluster=None), now=self.now) == [])
+        self.assertTrue(account_claims.refresh(cfg, db=_Db(cluster=None),
+                                               now=self.now))
+        self.assertEqual(account_claims.shared(cfg, db=_Db(MESH_A), now=self.now), [])
+
+    def test_bascule_timeline_reste_le_meme_mesh(self):
+        """#2592 N1 : une bascule ou un PITR change la timeline, pas le mesh."""
+        self.assertEqual(account_claims.mesh_identity(_Db(MESH_A)),
+                         account_claims.mesh_identity(_Db(MESH_A_AUTRE_TIMELINE)))
+        un = self.cfg(self.secondaire())
+        deux = self.cfg(self.secondaire(), fichier="config-ancienne-base.json")
+        self.assertTrue(account_claims.refresh(un, db=_Db(MESH_A), now=self.now))
+        self.assertTrue(account_claims.refresh(
+            deux, db=_Db(MESH_A_AUTRE_TIMELINE), now=self.now))
+        self.assertEqual(account_claims.shared(
+            deux, db=_Db(MESH_A_AUTRE_TIMELINE), now=self.now), [])
+
+    def test_revendication_v2_ignoree(self):
+        """La v2 (identité brute, timeline incluse) n'est pas une clé
+        comparable : elle est ignorée, jamais vue comme un autre mesh."""
+        cfg = self.cfg(self.secondaire())
+        self.refresh(cfg, mesh=MESH_A)
+        (chemin,) = self.claims_files()
+        dossier, nom = os.path.split(chemin)
+        (suffixe,) = nom.split(".", 1)[1:]
+        with open(os.path.join(dossier, "0123456789abcdef." + suffixe),
+                  "w", encoding="utf-8") as fh:
+            json.dump({"schema": "ameesh-account-claim/2", "host": "pc-test",
+                       "harness": "claude", "account": "secondaire",
+                       "config": "config.json", "policy": "report",
+                       "seen_at": self.now}, fh)
+        self.assertEqual(self.shared(self.cfg(self.secondaire()), mesh=MESH_A), [])
 
     def test_identite_illisible_n_ecrit_rien(self):
         class _Illisible:
@@ -409,7 +447,17 @@ class BaseTest(_PgBase):
 
     def test_identite_lue_en_base(self):
         cluster = self.db.query("select ameesh_events_cluster() as cluster")[0]["cluster"]
-        self.assertEqual(account_claims.mesh_identity(self.db), cluster)
+        stable = self.db.query(
+            "select (select to_hex(system_identifier) from pg_control_system())"
+            " as system_identifier,"
+            " (select journal from ameesh_events_journal where one) as journal")[0]
+        canonique = "mesh:%s:j:%s" % (stable["system_identifier"],
+                                      stable["journal"])
+        self.assertEqual(account_claims.mesh_identity(self.db), canonique)
+        self.assertNotEqual(canonique, cluster)
+        # la timeline de la base n'est pas dans l'identité du mesh
+        (timeline,) = cluster.split("t", 1)[1].split("j", 1)[:1]
+        self.assertNotIn(timeline, canonique)
 
     def test_le_choix_ecrit_la_revendication(self):
         dossier = _dossier(os.path.join(self.tmp, "comptes", "claude-1"),
