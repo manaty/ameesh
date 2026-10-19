@@ -136,6 +136,11 @@ EMPTY_CODEX_HOME = tempfile.mkdtemp(prefix="ameesh-test-codex-home-")
 # aussi pour les tests qui lisent les jauges dans le processus même
 os.environ["CODEX_HOME"] = EMPTY_CODEX_HOME
 
+#: #2580 : le registre des comptes partagés de l'hôte (XDG) ne doit jamais
+#: écrire dans le `~/.local/state` réel d'un exécuteur de test.
+EMPTY_XDG_STATE = tempfile.mkdtemp(prefix="ameesh-test-xdg-state-")
+os.environ["XDG_STATE_HOME"] = EMPTY_XDG_STATE
+
 #: dossier de descripteurs de harnais vide (L16) : les tests ne voient jamais
 #: ceux de l'hôte, et posent les leurs explicitement quand ils en ont besoin
 EMPTY_HARNESS_DIR = tempfile.mkdtemp(prefix="ameesh-test-harnesses-")

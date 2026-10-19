@@ -177,9 +177,11 @@ dans le canon :
   Seuls les comptes, les plafonds, les rôles critiques et les binaires de
   harnais suivent la relecture : la base, le schéma, le dossier d'état et les
   cadences sont ceux du démarrage.
-* Deux meshes sur un même hôte (#313) : un dossier d'identifiants ou un
-  fichier de clé déclaré aussi par un autre mesh est signalé, et refusé avec
-  `"account_sharing": "strict"` — voir [§ 8](#8-one-account-one-mesh-two-meshes-on-one-host-313-decision-0033).
+* Deux meshes sur un même hôte (#313, #2580) : un dossier d'identifiants, un
+  fichier de clé ou une clé d'API déclaré aussi par un autre mesh est signalé
+  (`ameesh doctor`, `ameesh accounts list`, alerte `account_shared`), et refusé
+  avec `"accounts_shared": "refuse"` (ou `"account_sharing": "strict"`, #313)
+  — voir [§ 8](#8-one-account-one-mesh-two-meshes-on-one-host-313-2580-decision-0033).
 * Profils (#1466) : un exécuteur peut être lancé sur un fichier nommé
   (`AMEESH_CONFIG`) rangé sous `~/.config/ameesh/runner-profiles/`. Ce
   **profil** est une superposition : les clés qu'il ne déclare pas — les
@@ -880,7 +882,7 @@ anyway, the runner marks its status text ("budget : critical agent: …").
 default and urgent, and is mailed (urgent) to the orchestrators of the
 agent's team and to the auditors.
 
-## 8. One account, one mesh: two meshes on one host (#313, decision 0033)
+## 8. One account, one mesh: two meshes on one host (#313, #2580, decision 0033)
 
 Decision [0033](design/decisions/0033-isolated-meshes-hosting-and-identity.md):
 a device serving two organisations runs two meshes, with two sets of accounts
@@ -890,48 +892,65 @@ shared quota, sessions in the same folders. Each mesh has its own database, so
 neither the database nor #1883 (which compares the configurations of one
 mesh) can see it. The host can.
 
-**Registry of the host.** Every runner claims the credentials of the accounts
-its configuration declares, in a registry shared by the meshes of the host
-and the user: `account_registry` in the host configuration, by default
-`~/.local/state/ameesh-host/accounts`. A credential is the resolved location
-(`realpath`, links included) of a `config_dir` account's folder (the harness
-default folder for an account without `path`) or of a `key_file`. Each
-credential gets a folder named by its fingerprint; each mesh writes one claim
-file there per configuration, named by its mesh key (L219: host, port,
-database and schema of the DSN, never user or password) and by a fingerprint
-of its configuration file. Two configurations of the **same** mesh (runner
-profiles, #1466) are never a conflict. A claim lives one hour after it is
-written: the runner writes its own at startup and then every 10 minutes, and
-removes those of its own configuration for a credential it no longer declares
-(a corrected configuration takes effect with the hot reload). The registry
-holds fingerprints, account names, the configuration file's name (without its
-folder) and the policy: never a key, never a path, never what a credential
-contains.
+**Registry of the host.** Every process that publishes account identities
+(#1883, `_publish_identities`) also claims the credentials of the accounts it
+declares, in a registry shared by the meshes of the host and the user:
+`account_registry` in the host configuration, by default
+`$XDG_STATE_HOME/ameesh/account-claims`
+(`~/.local/state/ameesh/account-claims` under the XDG default). The runner
+also claims at startup and then every 10 minutes. A credential is the resolved
+location (`realpath`, links included) of a `config_dir` account's folder (the
+harness default folder for an account without `path`), of a `key_file`, or the
+fingerprint of a `key_env` value — never the value itself. Each credential gets
+a folder named by its fingerprint; each mesh writes one claim file there per
+configuration, named by its mesh identity and by a fingerprint of its
+configuration file. Two configurations of the **same** mesh (runner profiles,
+#1466) are never a conflict. A claim lives one hour after it is written and is
+removed when its configuration no longer declares the credential (a corrected
+configuration takes effect with the hot reload). The registry holds
+fingerprints, account names, the host, the configuration file's name (without
+its folder) and the policy: never a key, never a path, never what a credential
+contains. Simulation (`ameesh resume`, L39) writes nothing.
+
+**Identity of the mesh.** The claim's mesh identity is **read from the
+database**: `ameesh_events_cluster()` (cluster, timeline and the journal's own
+identifier), falling back to `system_identifier` + `current_database()` +
+`current_schema()`. It is never derived from the DSN: a mesh reached through
+pgbouncer and the same mesh reached over direct TCP are one mesh, while two
+databases or two schemas are two meshes. This is what #1883 could not see: its
+`account_identities` compare fingerprints inside ONE database.
 
 **Report or refuse.** A credential claimed, within the hour, by **another**
-mesh is shared. What this mesh does is set by `account_sharing` in its host
-configuration:
+mesh of the same host is shared. By default this mesh only reports it:
 
-* `report` (default): the runner logs it at startup and whenever the set
-  changes ("claude account secondaire: credentials also declared by another
-  mesh of this host: config-ancienne-base.json (mesh 1a2b3c4d) — …"), and
-  `ameesh alerts` raises `account_shared` (pushed by default), one per
-  account, until the other mesh stops declaring it.
-* `strict`: the same, and this mesh **refuses** the account. The refusal is a
-  problem of the profile, like missing credentials: the choice never ranks
-  it, with the budget guard on or off, a turn or `ameesh attach` on it is not
-  started, and `ameesh accounts list` gives the reason.
+* the runner logs it at startup and whenever the set changes ("claude account
+  secondaire: credentials also declared by another mesh of this host:
+  config-ancienne-base.json (mesh 1a2b3c4d) — …");
+* `ameesh alerts` raises `account_shared` (pushed by default), one per account
+  and per day, until the other mesh stops declaring it;
+* `ameesh doctor` prints an `accounts` line and `ameesh accounts list` adds
+  "shared with another mesh of the host" under the account.
 
-The policy belongs to each mesh: to keep a credential in mesh A and give it
-up in mesh B, set `strict` in B only. With `strict` in both, neither uses it
-until the configurations are separated. Any other value is refused when the
-configuration is read.
+Refusal is behind a host key, to be enabled after the separation of #65:
+
+* `accounts_shared: "refuse"` (#2580), the host-level key;
+* `account_sharing: "strict"` (#313), the mesh-level equivalent kept for
+  compatibility.
+
+With either, this mesh **refuses** the account. The refusal is a problem of the
+profile, like missing credentials: the choice never ranks it, with the budget
+guard on or off, a turn or `ameesh attach` on it is not started, and
+`ameesh accounts list` gives the reason. The policy belongs to each mesh: to
+keep a credential in mesh A and give it up in mesh B, set `refuse`/`strict` in
+B only. With it in both, neither uses the account until the configurations are
+separated. Any other value is refused when the configuration is read.
 
 ```json
-{"account_sharing": "strict"}
+{"accounts_shared": "refuse"}
 ```
 
-**Limits.** An API key passed by a variable (`key_env`) has no location to
-compare. Two **different** folders logged in to the same provider account are
-not seen either, because ameesh never reads a credential. Both stay the
-owner's to separate: lot #65 (accounts per organisation).
+**Limits.** Two **different** folders logged in to the same provider account
+are not seen, because ameesh never reads a credential. A `key_env` variable
+that is absent from the executor's environment has no value to fingerprint
+(the launch would fail for the same reason). The separation itself stays the
+owner's: lot #65 (accounts per organisation).

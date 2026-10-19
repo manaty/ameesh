@@ -9427,14 +9427,18 @@ class Runner:
                     pass
 
     def account_claims_once(self) -> None:
-        """#313 (décision 0033) : revendique, dans le registre de l'hôte, les
-        identifiants des comptes de cette configuration, puis journalise ceux
-        qu'un autre mesh de l'hôte déclare aussi — au premier passage, puis à
-        chaque changement. Ne lève jamais."""
+        """#313/#2580 (décision 0033) : revendique, dans le registre de
+        l'hôte, les identifiants des comptes de cette configuration, puis
+        journalise ceux qu'un autre mesh de l'hôte déclare aussi — au premier
+        passage, puis à chaque changement. Ne lève jamais."""
         from . import account_claims
         try:
-            account_claims.refresh(self.cfg)
-            partages = account_claims.shared(self.cfg)
+            if not account_claims.refresh(self.cfg, db=self.db):
+                log_async("mesh identity unreadable from the database: provider "
+                          "accounts of this configuration are not claimed on the "
+                          "host, a shared account would not be detected")
+                return
+            partages = account_claims.shared(self.cfg, db=self.db)
         except (OSError, ValueError) as exc:
             log_async("account registry of this host unusable (%s): a provider "
                       "account declared by another mesh is not detected" % exc)
@@ -9444,13 +9448,14 @@ class Runner:
         if vus == getattr(self, "_accounts_shared", None):
             return
         self._accounts_shared = vus
-        strict = account_claims.policy(self.cfg) == "strict"
+        strict = account_claims.refuses(self.cfg)
         for harness, account, others in sorted(vus):
             log_async("%s account %s: credentials also declared by another mesh of "
                       "this host: %s — decision 0033, one organisation per account; "
                       "%s" % (harness, account, others,
-                              "refused here (account_sharing: strict)" if strict
-                              else "reported only (account_sharing: report)"))
+                              "refused here (%s)" % account_claims.policy_name(self.cfg)
+                              if strict else
+                              "reported only (accounts_shared: report)"))
 
     def start_account_claims(self) -> threading.Thread | None:
         """#313 : revendications au démarrage, puis toutes les
