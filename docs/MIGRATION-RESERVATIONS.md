@@ -8,6 +8,13 @@ git fetch origin
 ameesh work migration 711 --repo /path/to/clone
 ```
 
+The legacy next-free allocation keeps its repository-wide scan (worktree and
+all branches, #1603). An exact number (`--number N`) reads only the lot's
+target branch (#2620: `branch_target`, else the project target, else the
+repository default, published `origin/` first): a number carried by an
+unmerged branch no longer refuses it, since a package renumbers that branch's
+migration when it lands (#2400).
+
 Landing consumers can reserve several symbolic slots in one transaction. Fetch
 the target first, then pass its full commit SHA. Repeat `--slot` in the required
 migration order; numbers are contiguous and the entire batch either succeeds
@@ -99,9 +106,12 @@ the same statement or transaction; a release without landing (lot `closed`, or
 projection cleared while the lot stays open) leaves it `released`. A lot
 returning from `merged` to `blocked` keeps its landed number: the projection
 never turns a landed record back into `reserved`, so the transition cannot
-collide with a number another lot reserved meanwhile. If that lot reserves a
-new number, the record follows the new number as `reserved`. Migration 0420
-and its copy 0432 each carry both rules in full, since unapplied files are not
+collide with a number another lot reserved meanwhile. A lot that already
+landed keeps `landed` when it is closed with `work_items.migration` still
+set (`merged -> closed`): the projection never turns it back into `released`
+either, so the landing record is not lost. If that lot reserves a new number,
+the record follows the new number as `reserved`. Migration 0420, its copy
+0432 and 0467 each carry the rules in full, since unapplied files are not
 guaranteed to be applied in numeric order. Explicit cleanup and landing remain
 possible after the lot is closed or merged. The reservation stays active across
 freeze, review and lot-state changes until explicitly landed, released, or

@@ -2,6 +2,7 @@
 """A manual merge declaration binds local Git evidence to the work item."""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -11,7 +12,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from tests import support  # isolate host config before importing work
-from ameesh import work
+from ameesh import land, work
 
 
 class DeclaredMergeProofTest(unittest.TestCase):
@@ -138,6 +139,174 @@ class DeclaredMergeProofTest(unittest.TestCase):
         self.item["branch"] = "lot/637-x"
         self.git("commit", "--allow-empty", "--allow-empty-message", "-qm", "")
         self.refused(self.git("rev-parse", "HEAD"), "does not designate")
+
+    # -- #2603 : une PR fusionnée hors du dépôt du lot ----------------------
+
+    def pr_view(self, **over):
+        data = {"number": 112, "state": "MERGED",
+                "title": "canon: mécanique et train_reviews",
+                "mergeCommit": {"oid": "b" * 40},
+                "headRefOid": "a" * 40, "headRefName": "canon/2452",
+                "baseRefName": "main",
+                "url": "https://github.com/acme/home/pull/112"}
+        data.update(over)
+        return subprocess.CompletedProcess(["gh"], 0, json.dumps(data), "")
+
+    def _pr_mocks(self, freeze, *, default="main", compare="behind",
+                  repo_rc=0, compare_rc=0, repo_view=None, compare_view=None,
+                  **over):
+        item = dict(self.item, branch="canon/2452")
+        marks = ([{"id": 1, "kind": "frozen", "sha": freeze, "at_ts": 1.0}]
+                 if freeze else [])
+
+        def gh(argv, *args, **kwargs):
+            if argv[:2] == ["pr", "view"]:
+                return self.pr_view(**over)
+            if argv[:2] == ["repo", "view"]:
+                if repo_rc:
+                    return subprocess.CompletedProcess(argv, repo_rc, "", "repo boom")
+                payload = (repo_view if repo_view is not None
+                           else ({"defaultBranchRef": {"name": default}}
+                                 if default is not None else {}))
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+            if argv[:1] == ["api"]:
+                if compare_rc:
+                    return subprocess.CompletedProcess(argv, compare_rc, "", "compare boom")
+                payload = (compare_view if compare_view is not None
+                           else {"status": compare})
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+            raise AssertionError("unexpected gh call: %r" % (argv,))
+
+        return item, [
+            mock.patch.object(work, "get", return_value=item),
+            mock.patch.object(work, "milestones", return_value=marks),
+            mock.patch.object(land, "_gh", side_effect=gh),
+        ]
+
+    def declare_pr(self, *, freeze="a" * 40, sha="", **over):
+        item, patches = self._pr_mocks(freeze, **over)
+        with patches[0], patches[1], patches[2], \
+                mock.patch.object(work, "close_merged", return_value={
+                    "result": "merged", "item": item}) as close:
+            result = work.merged(object(), 637, pr="acme/home#112", sha=sha, actor="cx3")
+        return result, close.call_args.kwargs
+
+    def refused_pr(self, message, *, freeze="a" * 40, sha="", **over):
+        _item, patches = self._pr_mocks(freeze, **over)
+        with patches[0], patches[1], patches[2], \
+                mock.patch.object(work, "close_merged") as close:
+            with self.assertRaisesRegex(work.WorkError, message):
+                work.merged(object(), 637, pr="acme/home#112", sha=sha)
+            close.assert_not_called()
+
+    def test_a_merged_pr_of_another_repository_is_recorded(self):
+        result, args = self.declare_pr()
+        self.assertEqual(result["sha"], "b" * 40)
+        self.assertEqual(args["sha"], "b" * 40)
+        self.assertEqual(args["pr_ref"], "acme/home#112")
+        self.assertTrue(args["declared"])
+        self.assertEqual(args["frozen_id"], 1)
+        self.assertFalse(args["unfrozen"])
+
+    def test_without_a_freeze_the_recorded_branch_links_the_pr(self):
+        result, args = self.declare_pr(freeze="")
+        self.assertEqual(result["sha"], "b" * 40)
+        self.assertEqual(args["pr_ref"], "acme/home#112")
+        self.assertIsNone(args["frozen_id"])
+        self.assertTrue(args["unfrozen"])
+
+    def test_a_freeze_during_pr_declaration_does_not_report_success(self):
+        for freeze in ("a" * 40, ""):
+            with self.subTest(initial_freeze=bool(freeze)):
+                item, patches = self._pr_mocks(freeze)
+
+                def concurrent_freeze(*args, **kwargs):
+                    # The transaction refuses only when given the evidence
+                    # snapshot: otherwise a newer freeze would be closed.
+                    if kwargs.get("frozen_id") == 1 or kwargs.get("unfrozen"):
+                        return {"result": "refrozen", "item": item,
+                                "detail": "new freeze declared in the meantime"}
+                    return {"result": "merged", "item": item}
+
+                with patches[0], patches[1], patches[2], \
+                        mock.patch.object(work, "close_merged", side_effect=concurrent_freeze):
+                    with self.assertRaisesRegex(work.WorkError, "new freeze"):
+                        work.merged(object(), 637, pr="acme/home#112")
+
+    def test_an_unmerged_pr_is_refused(self):
+        self.refused_pr("not merged", state="OPEN")
+
+    def test_a_pr_head_off_the_freeze_is_refused(self):
+        self.refused_pr("frozen on", headRefOid="c" * 40)
+
+    def test_without_a_freeze_the_pr_head_branch_must_be_the_lot_branch(self):
+        self.refused_pr("head branch is", freeze="", headRefName="autre")
+
+    def test_a_sha_that_contradicts_the_pr_is_refused(self):
+        self.refused_pr("differs from the PR merge commit", sha="d" * 40)
+
+    def test_a_missing_merge_commit_is_refused_even_with_sha(self):
+        """cx2 B #2 : GitHub rend `merge_commit_sha` même en squash/rebase ;
+        un --sha déclaré ne remplace pas la preuve du commit de fusion."""
+        self.refused_pr("no merge commit", mergeCommit=None, sha="d" * 40)
+
+    def test_a_reported_squash_merge_commit_is_recorded(self):
+        result, args = self.declare_pr(mergeCommit={"oid": "d" * 40}, sha="d" * 40)
+        self.assertEqual(result["sha"], "d" * 40)
+        self.assertEqual(args["sha"], "d" * 40)
+        self.assertEqual(args["pr_ref"], "acme/home#112")
+
+    def test_a_sha_equal_to_the_merge_commit_is_accepted(self):
+        result, args = self.declare_pr(sha="b" * 40)
+        self.assertEqual(result["sha"], "b" * 40)
+        self.assertEqual(args["sha"], "b" * 40)
+
+    def test_a_merge_commit_outside_the_default_branch_is_refused(self):
+        """cx2 B #1 : une PR fusionnée sur une base morte ne prouve pas la
+        livraison ; le contenu n'est pas entré dans le défaut (home#112/#113)."""
+        self.refused_pr("content not delivered", baseRefName="canon/already-merged",
+                        compare="ahead")
+
+    def test_a_dead_base_later_merged_into_default_passes(self):
+        """Une base morte ensuite refusionnée dans le défaut passe : le commit
+        de fusion y est alors ancêtre (`behind`)."""
+        result, args = self.declare_pr(baseRefName="canon/already-merged",
+                                       compare="behind")
+        self.assertEqual(result["sha"], "b" * 40)
+        self.assertEqual(args["pr_ref"], "acme/home#112")
+
+    def test_an_identical_comparison_passes(self):
+        result, _args = self.declare_pr(compare="identical")
+        self.assertEqual(result["sha"], "b" * 40)
+
+    def test_an_unreadable_default_branch_is_refused(self):
+        self.refused_pr("default branch", repo_rc=1)
+
+    def test_a_missing_default_branch_is_refused(self):
+        self.refused_pr("default branch", default=None)
+
+    def test_an_unreadable_comparison_is_refused(self):
+        self.refused_pr("comparison", compare_rc=1)
+
+    def test_an_unknown_comparison_status_is_refused(self):
+        self.refused_pr("content not delivered", compare="diverged")
+
+    def test_a_pr_without_freeze_nor_branch_is_refused(self):
+        item = dict(self.item, branch=None)
+        with mock.patch.object(work, "get", return_value=item), \
+                mock.patch.object(work, "milestones", return_value=[]), \
+                mock.patch.object(land, "_gh", return_value=self.pr_view()), \
+                mock.patch.object(work, "close_merged") as close:
+            with self.assertRaisesRegex(work.WorkError, "neither a freeze nor a branch"):
+                work.merged(object(), 637, pr="acme/home#112")
+            close.assert_not_called()
+
+    def test_a_pr_ref_without_a_number_is_refused(self):
+        with mock.patch.object(work, "get", return_value=self.item), \
+                mock.patch.object(work, "close_merged") as close:
+            with self.assertRaisesRegex(work.WorkError, "owner/repo#N"):
+                work.merged(object(), 637, pr="acme/home")
+            close.assert_not_called()
 
 
 if __name__ == "__main__":
