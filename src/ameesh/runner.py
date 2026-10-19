@@ -6861,6 +6861,10 @@ RELOADABLE_FIELDS = frozenset({
     # comptes, plafonds et rôles : la décision de pause budget
     "accounts", "budget_usd_per_hour", "budget_usd_per_day", "budget_explicit",
     "critical_agents", "noncritical_hourly_share", "critical_fallback_harnesses",
+    # #2571 (suite de #313/#2580) : le partage des comptes est relu au tour
+    # suivant et à la passe de revendications suivante ; un passage `report` →
+    # `refuse`/`strict` (ou un registre déplacé) ne demande pas de redémarrage.
+    "accounts_shared", "account_sharing", "account_registry",
     # binaires de harnais de l'hôte (L106), lus au lancement de chaque tour
     "harness_bins",
 })
@@ -7777,7 +7781,8 @@ class Runner:
         retiré, un plafond relevé ou un profil corrigé restaient sans effet
         jusqu'au redémarrage, et des agents restaient en pause sur un plafond
         périmé. Seuls les champs de `RELOADABLE_FIELDS` — ceux qui décident une
-        pause budget — suivent le fichier. Tout le reste (identité de l'hôte,
+        pause budget et la lecture des comptes (dont leur partage, #2571) —
+        suivent le fichier. Tout le reste (identité de l'hôte,
         bail, dsn, schéma, dossier d'état, cadences, porte d'hôte) a décidé des
         baux et des connexions en cours : le changer sous un tour actif
         romprait ce qui tourne, il reste figé jusqu'au redémarrage (R1 cx2 et
