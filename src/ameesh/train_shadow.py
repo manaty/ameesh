@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 from . import (land, merge_queue, plan_git, radar, resolutions, train,
                train_admissions, train_candidates, train_git, train_history,
@@ -35,7 +35,7 @@ SCHEMA = "ameesh-train-shadow/1"
 #: and for the preceding ones after a restart.
 MAX_PLANS = 24
 MAX_COMPARISONS = 48
-_PACKET = re.compile(r"integration/(paquet-h-[^\s,()]+)")
+_PACKET = re.compile(r"integration/(paquet-[^\s,()]+)")
 _STAMP = re.compile(r"(\d{8}-\d{4})")
 _WORK = re.compile(r"^ameesh-work: (\d+)$", re.M)
 _LOT = re.compile(r"#(\d+)")
@@ -45,12 +45,20 @@ _LOT = re.compile(r"#(\d+)")
 MAX_FLIGHT_S = 6 * 3600.0
 #: open packet branches are read in a private namespace of the shadow clone;
 #: the shadow never checks them out nor publishes anything.
-_PACKET_HEADS = "refs/heads/integration/paquet-h-"
+#: The composer names both `integration/paquet-h-<stamp>` (hourly) and
+#: `integration/paquet-<n>-nexlink` (#2381, #2733); one prefix covers both.
+_PACKET_HEADS = "refs/heads/integration/paquet-"
 _INFLIGHT = "refs/ameesh/shadow-inflight/"
 
 
 def _atom(tag):
     return re.sub(r"[^A-Za-z0-9_.-]", "_", tag)
+
+
+def _stamp_of(created_ts, zone=None):
+    """The packet stamp of a commit date, in the plan zone (UTC by default)."""
+    return datetime.fromtimestamp(float(created_ts), zone or timezone.utc).strftime(
+        "%Y%m%d-%H%M")
 
 
 class NoTrainFacts:
@@ -318,7 +326,11 @@ class Passage:
         # before it, are history, not an omission of the shadow mode.
         first = min(plan["cutoff"] for plan in plans)
         first_stamp = min(plan["local_stamp"] for plan in plans)
-        history = self.manual_packets(repository.clone.path, base)
+        # The plan stamps use the canon's zone; a numbered packet
+        # (`paquet-<n>-nexlink`) carries no hour, so its merge commit date is
+        # read in the same zone. The tests pass no rules: UTC stays bounded.
+        zone = rules.zone() if rules is not None and hasattr(rules, "zone") else timezone.utc
+        history = self.manual_packets(repository.clone.path, base, zone)
         packets = [packet for packet in history
                    if packet["sha"] not in known and packet["lots"]
                    and packet["created_ts"] >= first
@@ -328,7 +340,7 @@ class Passage:
         # #2682: a packet in flight at the cutoff carries only the lots its
         # manifest had at that cutoff. A later enrichment is not proof, and an
         # unreadable manifest leaves the lot an extra, never a silent carrier.
-        open_packets = self.open_packets(repository.clone.path, base)
+        open_packets = self.open_packets(repository.clone.path, base, zone)
         comparisons = []
         for packet in packets:
             plan = _match(plans, packet)
@@ -397,13 +409,18 @@ class Passage:
         return comparisons
 
     @staticmethod
-    def manual_packets(clone, base):
+    def manual_packets(clone, base, zone=None):
         """The composer's packet merges on the first-parent history of target.
 
         Each entry keeps the exact branch name and its second parent (the
         branch head at merge time), so a carrier can be read as it was at an
         earlier cutoff. A packet whose own manifest is unreadable is kept:
         its lots are unknown, which must stay visible in the comparison.
+        A numbered packet (`integration/paquet-<n>-nexlink`, #2733) carries no
+        hour: its stamp is the merge commit date, read in the plan zone. The
+        numbered composer writes no manifest; its lots are then the
+        ``ameesh-work:`` trailers of the commits between the merge's first
+        parent and its branch head, the exact composition it merged.
         """
         log = resolutions._run(clone, "log", "--first-parent", "-n", "80",
                                "--format=%H%x1f%P%x1f%s%x1f%ct", base)
@@ -419,30 +436,37 @@ class Passage:
             if match is None:
                 continue
             tail = match.group(1)
-            stamp = _STAMP.search(tail)
-            if stamp is None:
-                continue
+            created = float(raw_ts)
+            named = _STAMP.search(tail)
+            stamp = named.group(1) if named else _stamp_of(created, zone)
             parents = raw_parents.split()
-            lots = _manifest_lots(clone, sha, tail)
-            packets.append(dict(sha=sha, stamp=stamp.group(1),
-                                created_ts=float(raw_ts),
+            branch_head = parents[1] if len(parents) > 1 else sha
+            manifest_lots = _manifest_lots(clone, sha, tail)
+            lots = manifest_lots
+            if lots is None and len(parents) > 1:
+                # The numbered composer declares its units in the merge
+                # trailers, not in a manifest file.
+                lots = _commit_lots(clone, parents[0], branch_head)
+            packets.append(dict(sha=sha, stamp=stamp,
+                                created_ts=created,
                                 branch="integration/" + tail, tail=tail,
-                                branch_head=(parents[1] if len(parents) > 1 else sha),
+                                branch_head=branch_head,
                                 manifest=("reviews/integration-%s.md" % tail
-                                          if lots is not None else None),
+                                          if manifest_lots is not None else None),
                                 lots=sorted(set(lots or ()))))
         packets.reverse()  # oldest first, like the plans
         return packets
 
-    def open_packets(self, clone, base):
+    def open_packets(self, clone, base, zone=None):
         """The composer's packet branches still open on the target (#2682).
 
-        Read-only: the ``integration/paquet-h-*`` heads are fetched into a
+        Read-only: the ``integration/paquet-*`` heads are fetched into a
         private namespace of the shadow clone, never checked out nor pushed.
         A branch whose tip is already an ancestor of the target has landed;
         its merge time is what dates its flight. Only branches that are still
         not on the target are listed here; their manifest is read later, at
-        the exact commit that was composed before a plan cutoff.
+        the exact commit that was composed before a plan cutoff. A numbered
+        packet carries no hour: its stamp is the head commit date (#2733).
         """
         url = land._origin(self.project) or merge_queue.source_of(self.project.repo)
         stale = resolutions._run(clone, "for-each-ref", "--format=%(refname)", _INFLIGHT)
@@ -466,19 +490,24 @@ class Passage:
             raise train.TrainError("cannot read the shadow in-flight refs")
         open_packets = []
         for ref in resolutions._text(listed).splitlines():
-            tail = "paquet-h-" + ref[len(_INFLIGHT):]
-            stamp = _STAMP.search(tail)
-            if stamp is None:
-                continue
+            tail = "paquet-" + ref[len(_INFLIGHT):]
             head = plan_git._commit(clone, ref)
             if head is None:
                 raise train.TrainError("open packet ref unreadable")
+            named = _STAMP.search(tail)
+            if named is not None:
+                stamp = named.group(1)
+            else:
+                raw = resolutions._run(clone, "log", "-1", "--format=%ct", head)
+                if raw.returncode:
+                    raise train.TrainError("cannot read an open packet date")
+                stamp = _stamp_of(resolutions._text(raw), zone)
             ancestor = resolutions._run(clone, "merge-base", "--is-ancestor", head, base)
             if ancestor.returncode == 0:
                 continue
             if ancestor.returncode != 1:
                 raise train.TrainError("cannot compare an open packet with the target")
-            open_packets.append(dict(sha=head, stamp=stamp.group(1), tail=tail,
+            open_packets.append(dict(sha=head, stamp=stamp, tail=tail,
                                      branch="integration/" + tail))
         return open_packets
 
@@ -499,7 +528,10 @@ def _in_flight(clone, plan, packets, open_packets, compared):
     stamp = plan["local_stamp"]
     cutoff = plan["cutoff"]
     for packet in packets:
-        if packet["sha"] == compared["sha"] or packet["stamp"] > stamp:
+        # A derived stamp dates the merge/head, not the composition cutoff.
+        # Only a stamp carried by the branch name can exclude this carrier.
+        if packet["sha"] == compared["sha"] or (
+                _STAMP.search(packet["tail"]) and packet["stamp"] > stamp):
             continue
         if packet["created_ts"] <= cutoff:
             continue  # already merged at the cutoff: the shadow saw it on target
@@ -510,7 +542,7 @@ def _in_flight(clone, plan, packets, open_packets, compared):
         for lot in lots:
             carried.setdefault(lot, packet["branch"])
     for packet in open_packets:
-        if packet["stamp"] > stamp:
+        if _STAMP.search(packet["tail"]) and packet["stamp"] > stamp:
             continue
         commit, written = _first_parent_before(clone, packet["sha"], cutoff)
         if commit is None:
@@ -564,6 +596,19 @@ def _manifest_lots(clone, sha, tail):
         return None
     return parse_manifest(resolutions._text(manifest))
 
+
+def _commit_lots(clone, base, head):
+    """The lots declared by ``ameesh-work:`` trailers between ``base`` and ``head``.
+
+    The numbered composer writes no manifest: the exact composition it merged
+    is the branch's own range and its trailers. None when the range cannot be
+    read, never a set inferred from another packet.
+    """
+    log = resolutions._run(clone, "log", "--format=%B", "%s..%s" % (base, head))
+    if log.returncode:
+        return None
+    return sorted({int(match.group(1))
+                   for match in _WORK.finditer(resolutions._text(log))})
 
 def _manual_sync(clone, base, head, sha):
     """The packet commit that merged ``sha`` (main), with its pure-sync proof.
