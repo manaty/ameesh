@@ -435,10 +435,14 @@ ameesh work merged <id> --pr manaty/home#111 [--note "…"]
 ```
 
 `gh pr view` doit rendre la PR `MERGED` ; sa tête doit être le gel du lot
-(ou, sans gel, sa branche), et le commit de fusion de la PR est enregistré.
-`--sha` reste facultatif et, donné aussi, doit concorder ; pour un squash ou
-un rebase (pas de commit de fusion GitHub), `--sha` est le commit atterri et
-devient obligatoire.
+(ou, sans gel, sa branche). GitHub doit rendre son commit de fusion
+(`mergeCommit`), et ce commit doit être entré dans la branche par défaut du
+dépôt de la PR : `gh repo view` résout cette branche, puis
+`gh api repos/<dépôt>/compare/<défaut>...<merge>` doit rendre `behind` ou
+`identical` (un doute refuse). Une PR fusionnée sur une base morte puis
+refusionnée dans le défaut passe ; sinon le contenu n'est pas livré
+(home#112/#113). `--sha` n'est qu'un contrôle d'égalité avec le commit de
+fusion ; absent de la vue GitHub, il refuse.
 
 **PR empilée sur une base déjà fusionnée.** Avant de fusionner une PR dont la
 base n'est pas la branche par défaut, vérifier que cette base n'est pas déjà

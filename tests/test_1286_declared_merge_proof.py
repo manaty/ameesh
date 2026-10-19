@@ -147,18 +147,40 @@ class DeclaredMergeProofTest(unittest.TestCase):
                 "title": "canon: mécanique et train_reviews",
                 "mergeCommit": {"oid": "b" * 40},
                 "headRefOid": "a" * 40, "headRefName": "canon/2452",
+                "baseRefName": "main",
                 "url": "https://github.com/acme/home/pull/112"}
         data.update(over)
         return subprocess.CompletedProcess(["gh"], 0, json.dumps(data), "")
 
-    def _pr_mocks(self, freeze, **over):
+    def _pr_mocks(self, freeze, *, default="main", compare="behind",
+                  repo_rc=0, compare_rc=0, repo_view=None, compare_view=None,
+                  **over):
         item = dict(self.item, branch="canon/2452")
         marks = ([{"id": 1, "kind": "frozen", "sha": freeze, "at_ts": 1.0}]
                  if freeze else [])
+
+        def gh(argv, *args, **kwargs):
+            if argv[:2] == ["pr", "view"]:
+                return self.pr_view(**over)
+            if argv[:2] == ["repo", "view"]:
+                if repo_rc:
+                    return subprocess.CompletedProcess(argv, repo_rc, "", "repo boom")
+                payload = (repo_view if repo_view is not None
+                           else ({"defaultBranchRef": {"name": default}}
+                                 if default is not None else {}))
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+            if argv[:1] == ["api"]:
+                if compare_rc:
+                    return subprocess.CompletedProcess(argv, compare_rc, "", "compare boom")
+                payload = (compare_view if compare_view is not None
+                           else {"status": compare})
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+            raise AssertionError("unexpected gh call: %r" % (argv,))
+
         return item, [
             mock.patch.object(work, "get", return_value=item),
             mock.patch.object(work, "milestones", return_value=marks),
-            mock.patch.object(land, "_gh", return_value=self.pr_view(**over)),
+            mock.patch.object(land, "_gh", side_effect=gh),
         ]
 
     def declare_pr(self, *, freeze="a" * 40, sha="", **over):
@@ -223,16 +245,51 @@ class DeclaredMergeProofTest(unittest.TestCase):
     def test_a_sha_that_contradicts_the_pr_is_refused(self):
         self.refused_pr("differs from the PR merge commit", sha="d" * 40)
 
-    def test_a_pr_without_merge_commit_asks_for_the_sha(self):
-        self.refused_pr("no merge commit", mergeCommit=None)
+    def test_a_missing_merge_commit_is_refused_even_with_sha(self):
+        """cx2 B #2 : GitHub rend `merge_commit_sha` même en squash/rebase ;
+        un --sha déclaré ne remplace pas la preuve du commit de fusion."""
+        self.refused_pr("no merge commit", mergeCommit=None, sha="d" * 40)
 
-    def test_a_squash_merge_uses_the_declared_sha(self):
-        """GitHub ne pose pas de `mergeCommit` sur un squash : le sha déclaré
-        est le commit atterri, la tête de la PR rattache toujours le lot."""
-        result, args = self.declare_pr(mergeCommit=None, sha="d" * 40)
+    def test_a_reported_squash_merge_commit_is_recorded(self):
+        result, args = self.declare_pr(mergeCommit={"oid": "d" * 40}, sha="d" * 40)
         self.assertEqual(result["sha"], "d" * 40)
         self.assertEqual(args["sha"], "d" * 40)
         self.assertEqual(args["pr_ref"], "acme/home#112")
+
+    def test_a_sha_equal_to_the_merge_commit_is_accepted(self):
+        result, args = self.declare_pr(sha="b" * 40)
+        self.assertEqual(result["sha"], "b" * 40)
+        self.assertEqual(args["sha"], "b" * 40)
+
+    def test_a_merge_commit_outside_the_default_branch_is_refused(self):
+        """cx2 B #1 : une PR fusionnée sur une base morte ne prouve pas la
+        livraison ; le contenu n'est pas entré dans le défaut (home#112/#113)."""
+        self.refused_pr("content not delivered", baseRefName="canon/already-merged",
+                        compare="ahead")
+
+    def test_a_dead_base_later_merged_into_default_passes(self):
+        """Une base morte ensuite refusionnée dans le défaut passe : le commit
+        de fusion y est alors ancêtre (`behind`)."""
+        result, args = self.declare_pr(baseRefName="canon/already-merged",
+                                       compare="behind")
+        self.assertEqual(result["sha"], "b" * 40)
+        self.assertEqual(args["pr_ref"], "acme/home#112")
+
+    def test_an_identical_comparison_passes(self):
+        result, _args = self.declare_pr(compare="identical")
+        self.assertEqual(result["sha"], "b" * 40)
+
+    def test_an_unreadable_default_branch_is_refused(self):
+        self.refused_pr("default branch", repo_rc=1)
+
+    def test_a_missing_default_branch_is_refused(self):
+        self.refused_pr("default branch", default=None)
+
+    def test_an_unreadable_comparison_is_refused(self):
+        self.refused_pr("comparison", compare_rc=1)
+
+    def test_an_unknown_comparison_status_is_refused(self):
+        self.refused_pr("content not delivered", compare="diverged")
 
     def test_a_pr_without_freeze_nor_branch_is_refused(self):
         item = dict(self.item, branch=None)

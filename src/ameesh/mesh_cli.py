@@ -3095,10 +3095,12 @@ def build_parser() -> argparse.ArgumentParser:
                        "→ merged, merged milestone with the commit")
     pw_merged.add_argument("id", type=int)
     pw_merged.add_argument("--sha", default="",
-                           help="the merge commit (required without --pr)")
+                           help="the merge commit (required without --pr; with --pr, an equality "
+                                "check on the reported merge commit)")
     pw_merged.add_argument("--pr", default=None, metavar="OWNER/REPO#N",
                            help="#2603: a merged PR outside the lot's repository (canon, home); "
-                                "its head must be the lot's freeze, its merge commit is recorded")
+                                "its head must be the lot's freeze, and its merge commit must be "
+                                "in the repository's default branch")
     pw_merged.add_argument("--migration-landed", type=int, default=None, metavar="N",
                            help="the migration number that actually landed (L122/#1567), when "
                                 "the landing renumbered the reservation; recorded with the "

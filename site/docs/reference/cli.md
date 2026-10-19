@@ -515,9 +515,12 @@ found. By hand, `work merged <id> --sha SHA` moves a lot from any open state
 with its `merged` milestone; a closed lot is never reopened. When the lot's
 PR lives in another repository than the lot's (the canon `manaty/home`, for
 example), `work merged <id> --pr OWNER/REPO#N` reads it with `gh`: the PR must
-be `MERGED`, its head must be the lot's freeze (else its recorded branch) and
-its merge commit is recorded; `--sha` stays optional and, given too, must
-agree (it is the only record for a squash merge, which has no merge commit).
+be `MERGED`, its head must be the lot's freeze (else its recorded branch),
+and GitHub must report its merge commit; that commit must be in the
+repository's default branch (`gh repo view` then `gh api compare`: `behind`
+or `identical`, any doubt refuses — a merged stacked base that never entered
+the default does not deliver). `--sha` is only an equality check; without a
+reported merge commit, the declaration is refused.
 A lot set to `promoted` by mistake goes back with `work move <id> merged
 --correct "reason"`, logged, for humans and orchestrator or design agents
 only.

@@ -36,6 +36,7 @@ import os
 import re
 import time
 from typing import Sequence
+from urllib.parse import quote
 
 from . import storage
 from .db import Db, DbError, is_unique_violation
@@ -2161,8 +2162,12 @@ def _merged_pr(item: dict, ref: str, *, sha: str = "", db=None, announce=None,
 
     `--pr owner/repo#N` : lit la PR par `gh`, exige l'état MERGED et rend
     `(commit de fusion, référence de la PR, id du gel vérifié)`. La tête de
-    la PR doit être le gel du lot (ou, sans gel, sa branche) : une PR quelconque ne ferme pas un
-    lot. Aucune écriture."""
+    la PR doit être le gel du lot (ou, sans gel, sa branche) : une PR
+    quelconque ne ferme pas un lot. GitHub doit rendre le commit de fusion,
+    et ce commit doit être entré dans la branche par défaut du dépôt de la PR
+    (`compare` `behind`/`identical`) : une PR fusionnée sur une base morte
+    n'est pas livrée (home#112/#113). `--sha` n'est qu'un contrôle d'égalité.
+    Aucune écriture."""
     from . import land, plan_git
 
     match = _PR_REF_RE.match((ref or "").strip())
@@ -2174,7 +2179,8 @@ def _merged_pr(item: dict, ref: str, *, sha: str = "", db=None, announce=None,
     reader = gh or land._gh
     try:
         proc = reader(["pr", "view", str(number), "--repo", slug, "--json",
-                       "number,state,title,mergeCommit,headRefOid,headRefName,url"])
+                       "number,state,title,mergeCommit,headRefOid,headRefName,"
+                       "baseRefName,url"])
     except OSError as exc:
         raise WorkError("--pr %s: `gh pr view` unavailable: %s" % (pr_ref, exc)) from exc
     if proc.returncode != 0:
@@ -2189,14 +2195,12 @@ def _merged_pr(item: dict, ref: str, *, sha: str = "", db=None, announce=None,
         raise WorkError("--pr %s is %s, not merged: nothing declared"
                         % (pr_ref, state or "?"))
     merge = str(((data.get("mergeCommit") or {}) or {}).get("oid") or "").strip().lower()
-    if not merge and sha:
-        # squash/rebase : GitHub ne pose pas de commit de fusion ; le sha
-        # déclaré est le commit atterri, et la tête ci-dessous rattache
-        # toujours la PR au gel du lot.
-        merge = sha
     if not merge:
-        raise WorkError("--pr %s: no merge commit (squash/rebase merge?): pass --sha"
-                        % pr_ref)
+        # #2603 (cx2) : GitHub rend `merge_commit_sha` même en squash/rebase ;
+        # un --sha déclaré ne prouve pas, à lui seul, l'entrée dans la cible.
+        # Sans commit de fusion, rien n'est déclaré.
+        raise WorkError("--pr %s: no merge commit reported by GitHub: nothing declared "
+                        "(--sha is only an equality check)" % pr_ref)
     head = str(data.get("headRefOid") or "").strip().lower()
     if not head:
         raise WorkError("--pr %s: unreadable head" % pr_ref)
@@ -2228,6 +2232,48 @@ def _merged_pr(item: dict, ref: str, *, sha: str = "", db=None, announce=None,
     if sha and sha != merge:
         raise WorkError("--sha %s differs from the PR merge commit %s: nothing declared"
                         % (sha[:12], merge[:12]))
+    # #2603 (cx2 B) : la fusion constatée doit être une livraison réelle dans
+    # la cible du dépôt de la PR. Une base morte fusionnée plus tard dans le
+    # défaut reste livrée (le commit y est alors ancêtre) ; une base morte qui
+    # n'y est pas entrée ne ferme pas le lot (home#112/#113).
+    base = str(data.get("baseRefName") or "").strip()
+    try:
+        proc = reader(["repo", "view", slug, "--json", "defaultBranchRef"])
+    except OSError as exc:
+        raise WorkError("--pr %s: `gh repo view` unavailable: %s" % (pr_ref, exc)) from exc
+    if proc.returncode != 0:
+        raise WorkError("--pr %s: cannot read the default branch of %s: %s: nothing declared"
+                        % (pr_ref, slug, (proc.stderr or proc.stdout or "").strip()[:300]))
+    try:
+        repo_view = land._json(proc, "gh repo view", dict)
+    except Exception as exc:  # noqa: BLE001 - a malformed view proves nothing
+        raise WorkError("--pr %s: unreadable repository view: %s" % (pr_ref, exc)) from exc
+    default = str(((repo_view.get("defaultBranchRef") or {}) or {}).get("name")
+                  or "").strip()
+    if not default:
+        raise WorkError("--pr %s: %s reports no default branch: nothing declared"
+                        % (pr_ref, slug))
+    try:
+        proc = reader(["api", "repos/%s/compare/%s...%s"
+                       % (slug, quote(default, safe=""), quote(merge, safe=""))])
+    except OSError as exc:
+        raise WorkError("--pr %s: `gh api compare` unavailable: %s"
+                        % (pr_ref, exc)) from exc
+    if proc.returncode != 0:
+        raise WorkError("--pr %s: comparison of %s with %s unreadable: %s: nothing declared"
+                        % (pr_ref, merge[:12], default,
+                           (proc.stderr or proc.stdout or "").strip()[:300]))
+    try:
+        compared = land._json(proc, "gh api compare", dict)
+    except Exception as exc:  # noqa: BLE001 - a malformed comparison proves nothing
+        raise WorkError("--pr %s: comparison of %s with %s unreadable: %s: nothing declared"
+                        % (pr_ref, merge[:12], default, exc)) from exc
+    status = str(compared.get("status") or "").strip().lower()
+    if status not in ("behind", "identical"):
+        raise WorkError(
+            "--pr %s: merged into %s, commit %s is not in %s (%s): content not delivered "
+            "(home#112/#113); nothing declared"
+            % (pr_ref, base or "?", merge[:12], default, status or "unknown"))
     if announce is not None:
         announce({"id": int(item["id"]), "app": item.get("app") or "",
                   "title": item.get("title") or "", "sha": merge,
@@ -2253,9 +2299,11 @@ def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = 
 
     `pr="owner/repo#N"` (#2603) : la preuve est la PR fusionnée d'un AUTRE
     dépôt que celui du lot (une PR du canon pour un lot d'ameesh) ; sa tête
-    doit être le gel du lot, et `--sha` devient facultatif (le commit de
-    fusion de la PR est retenu ; donné aussi, il doit concorder). La lecture
-    de la PR passe par `gh` ; aucune écriture avant le constat.
+    doit être le gel du lot, GitHub doit rendre son commit de fusion, et ce
+    commit doit être entré dans la branche par défaut du dépôt de la PR
+    (`compare` `behind`/`identical`, un doute refuse) ; `--sha` n'est qu'un
+    contrôle d'égalité avec ce commit. La lecture de la PR passe par `gh` ;
+    aucune écriture avant le constat.
 
     `announce` (facultatif, #1400) : le callback du constat, appelé avec
     `{id, app, title, sha, subject, how}` après la lecture de la preuve (une
