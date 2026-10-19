@@ -126,8 +126,10 @@ class FamiliesTest(unittest.TestCase):
         sys.modules[spec.name] = garde
         self.addCleanup(sys.modules.pop, spec.name, None)
         spec.loader.exec_module(garde)
-        converted = {"src/ameesh/review_lot.py", "src/ameesh/review_provenance.py"}
-        self.assertFalse({item.path for item in garde.EXEMPTIONS} & converted)
+        converted = {("src/ameesh/review_lot.py", "reviews.families"),
+                     ("src/ameesh/review_provenance.py", "reviews.families")}
+        self.assertFalse({(item.path, item.parameter) for item in garde.EXEMPTIONS}
+                         & converted)
         scan = garde.scan_repository(root)
         self.assertEqual(list(scan.findings), [])
         self.assertFalse(scan.unused)
