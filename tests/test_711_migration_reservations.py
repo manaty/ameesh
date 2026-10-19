@@ -21,6 +21,10 @@ class ScopedReservationsTest(PgTestCase):
         super().setUp()
         self.repo = _depot(os.path.join(self.tmp, 'repo'), 'manaty/nexlink', NEXLINK.directory,
                            ['375_base.sql', '376_base.sql'], {'unrelated': ['9000_future.sql']})
+        # #2620 : le numéro exact lit la cible du lot ; ce dépôt n'a que
+        # `develop` (pas d'`origin/HEAD`), la cible est déclarée comme sur un
+        # clone réel de nexlink.
+        _git(self.repo, 'config', 'ameesh.target', 'develop')
         self.sha = reservations._git(self.repo, 'rev-parse', 'HEAD')
         self.a = self.lot('a')
         self.b = self.lot('b')

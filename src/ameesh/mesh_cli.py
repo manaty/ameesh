@@ -3036,9 +3036,10 @@ def build_parser() -> argparse.ArgumentParser:
                           "before writing the file; idempotent, visible in work show")
     pw_mig.add_argument("id", type=int)
     pw_mig.add_argument("--number", type=int, default=None,
-                        help="reserve this exact number (refused if it already exists in the "
-                             "lot's repository or is reserved by another work item); added to "
-                             "the lot's other reservations (#2481)")
+                        help="reserve this exact number (refused if it already exists on the "
+                             "lot's target branch or is reserved by another work item; branches "
+                             "not merged into the target do not count, #2620); added to the "
+                             "lot's other reservations (#2481)")
     pw_mig.add_argument("--release", action="store_true",
                         help="release all the lot's reservations, or only --number when given "
                              "(the work item no longer adds those migrations)")
@@ -3048,10 +3049,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "radar.projects, else the current git repository; its origin "
                              "must be the lot's repository)")
     pw_mig.add_argument("--skip-branch", action="append", default=None, metavar="BRANCH",
-                        help="also ignore this branch in the scan, in addition to the lot's own "
-                             "branch (repeatable): the integration branch of a package being "
-                             "composed, whose renumbered files must not count against the "
-                             "reservation (#1603)")
+                        help="also ignore this branch in the next-free scan, in addition to the "
+                             "lot's own branch (repeatable): the integration branch of a package "
+                             "being composed, whose renumbered files must not count against the "
+                             "reservation (#1603); an exact number reads the target only (#2620)")
     pw_mig.add_argument("--json", action="store_true")
     pw_mig.add_argument("--actor", default="",
                         help="default: the session's bound identity (AGENT_MAIL_NAME)")

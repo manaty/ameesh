@@ -1751,9 +1751,9 @@ class WorkItems(interface.WorkItems):
         terminal (`merged`, `promoted`, `closed`), dans la transaction même de
         la transition : une réservation tenue par un lot fusionné bloquait le
         numéro pour toujours. Le numéro reste protégé tant qu'un fichier le
-        porte, puisque `repo_numbers` compte les fichiers de toutes les
-        branches du dépôt. Tous les créneaux réservés du lot sont rendus, pas
-        seulement le scalaire."""
+        porte sur la cible (réservation à numéro exact, `target_numbers`) ou
+        sur une branche (allocation du prochain libre, `repo_numbers`). Tous
+        les créneaux réservés du lot sont rendus, pas seulement le scalaire."""
         numbers = sorted({int(item["number"]) for item in (row.get("migrations") or ())
                           if item.get("number") is not None})
         if row.get("migration") is not None and int(row["migration"]) not in numbers:

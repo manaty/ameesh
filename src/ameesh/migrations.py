@@ -266,6 +266,49 @@ def repo_numbers(checkout: str, layout: Layout, *, skip_branch: str | None = Non
     return found
 
 
+#: préfixes d'une cible qui nomment sa branche (`origin/x`, `refs/…/x`), #2620
+_TARGET_PREFIXES = ("refs/heads/", "refs/remotes/origin/", "origin/")
+
+
+def target_numbers(checkout: str, layout: Layout, target: str) -> dict[int, list[str]] | None:
+    """Numéro → fichiers que porte la **branche cible** seule (#2620).
+
+    L'unicité d'un numéro de migration est un invariant de la cible : une
+    branche non fusionnée qui porte un numéro ne l'a pas fait atterrir, et un
+    paquet la renumérote à sa fusion (#2400). Refuser une réservation à numéro
+    exact pour un fichier absent de la cible rendait le geste impossible
+    (#2494 refusait `524`, porté par la branche non fusionnée #2299). On ne lit
+    donc que la cible — `origin/<branche>` publiée d'abord (un clone partagé
+    garde sa branche locale figée alors que les agents poussent, #1333), la
+    locale à défaut — jamais l'arbre de travail, le paquet installé, la branche
+    du lot ni une autre branche. Rend None quand aucune ref de la cible
+    n'existe (l'appelant le dit) ; rien n'est récupéré (pas de fetch)."""
+    text = (target or "").strip()
+    if not text:
+        return None
+    name = text
+    for prefix in _TARGET_PREFIXES:
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    for label, ref in (("origin/" + name, "refs/remotes/origin/" + name),
+                       (name, "refs/heads/" + name),
+                       (text, text)):
+        commit = _git(checkout, "rev-parse", "--verify", "--quiet",
+                      ref + "^{commit}").strip()
+        if not commit:
+            continue
+        found: dict[int, list[str]] = {}
+        names = _git(checkout, "ls-tree", "--name-only", commit, layout.directory + "/")
+        for path in names.split():
+            match = _REPO_FILE_RE.match(os.path.basename(path))
+            if match:
+                found.setdefault(int(match.group(1)), []).append(
+                    "%s:%s" % (label, os.path.basename(path)))
+        return found
+    return None
+
+
 def applied(db: PsqlDriver | PsycopgDriver) -> dict[int, str]:
     db.execute(BOOTSTRAP)
     rows = db.query("SELECT version, checksum, name FROM schema_migrations ORDER BY version")
