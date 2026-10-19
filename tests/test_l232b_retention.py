@@ -258,11 +258,14 @@ class RetentionTest(unittest.TestCase):
 
     def test_server_refused_unregistered_dump_fails_the_run_after_prune(self):
         # Un dump non privé n'expire jamais : la course quotidienne doit sortir
-        # non nulle, sans empêcher prune de tourner.
+        # non nulle, sans empêcher prune de tourner. Le script normalise les
+        # modes lisibles (#1305/#1309) : le lien en trop rend le candidat
+        # irréparable par cette normalisation, donc toujours refusé.
         self.artifact(rollback=0)
         retention.protect(self.root, "old", accepted=True)
         public = self.daily("ameesh-public.dump", age=15 * 24 * 3600, now=time.time())
         public.chmod(0o644)
+        os.link(public, self.root / "ameesh-public.dump.lien")
         result = subprocess.run(["sh", "-c", self.server_script()], capture_output=True,
                                 env=dict(os.environ))
         self.assertNotEqual(result.returncode, 0, "a refused candidate must fail the daily run")
