@@ -442,6 +442,20 @@ def write_worktree_marker(cfg: Config, name: str, cwd: str) -> dict:
     return marker
 
 
+def _preemption_generation(worker) -> int:
+    """#2729 : génération des demandes de préemption, lue sous son verrou.
+
+    Point unique des deux lectures de frontière (`pick()` et l'entrée d'un
+    tour direct). Les doublures `SimpleNamespace` de L790 n'ont ni compteur ni
+    verrou : elles partent de zéro.
+    """
+    verrou = getattr(worker, "_preempt_lock", None)
+    if verrou is None:
+        return getattr(worker, "preempt_gen", 0)
+    with verrou:
+        return worker.preempt_gen
+
+
 class AgentWorker(threading.Thread):
     #: nombre d'échecs de battement consécutifs avant d'arrêter le harnais
     MAX_RENEW_FAILURES = 3
@@ -4198,22 +4212,18 @@ class AgentWorker(threading.Thread):
         Le tour porte son lot (`lot`, L26) quand il est déductible."""
         if self._attach_pending():
             return None
+        # #2729 : frontière d'un tour ordinaire, prise AVANT la sélection.
+        # Une demande qui entre pendant `_pick` — après la lecture des
+        # urgents, donc hors de ce que le tour choisi sert — ne doit pas être
+        # effacée au début du tour : elle l'arrête.
+        frontiere = _preemption_generation(self)
         spec = self._pick()
         if spec is not None:
-            # #2729 : la frontière de consommation est la génération des
-            # demandes de préemption lue **aussitôt la sélection faite** (retour
-            # de `_pick`). Une demande antérieure — y compris pendant `_pick` —
-            # est couverte par la sélection : si c'est elle qui a fait choisir
-            # le tour prioritaire, ce tour la sert (et doit pouvoir tourner).
-            # Toute demande postérieure (dispatch pendant la préparation, qui
-            # peut être lente) est un arrêt pour ce tour : elle ne sera pas
-            # effacée à son début.
-            verrou = getattr(self, "_preempt_lock", None)
-            if verrou is None:
-                frontiere = getattr(self, "preempt_gen", 0)
-            else:
-                with verrou:
-                    frontiere = self.preempt_gen
+            # Le tour urgent, lui, sert la demande qui l'a fait choisir : sa
+            # frontière est relue après la sélection, sinon il se tuerait
+            # lui-même. Toute demande postérieure arrête le tour.
+            if spec.get("kind") == "urgent":
+                frontiere = _preemption_generation(self)
             # #408 : le réveil sur un lot actionnable porte déjà son lot
             spec["lot"] = spec.get("lot") or self.turn_lot(spec)
             if self._lot_workdir_blocked(spec.get("lot")):
@@ -4840,13 +4850,7 @@ class AgentWorker(threading.Thread):
         # avant toute préparation. Une demande arrivée ensuite reste un arrêt
         # pour ce tour et ne sera pas effacée à son début.
         if "_preempt_gen" not in spec:
-            verrou = getattr(self, "_preempt_lock", None)
-            if verrou is None:
-                frontiere = getattr(self, "preempt_gen", 0)
-            else:
-                with verrou:
-                    frontiere = self.preempt_gen
-            spec = dict(spec, _preempt_gen=frontiere)
+            spec = dict(spec, _preempt_gen=_preemption_generation(self))
         candidats = spec.get("candidats")
         if self.runner.draining.is_set():
             # Drainage commencé entre le choix du tour et son lancement : rien

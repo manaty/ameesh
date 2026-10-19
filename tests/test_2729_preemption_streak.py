@@ -17,7 +17,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import exploitation, registry
+from ameesh import exploitation, mail, registry
 from ameesh.runner import AgentWorker, Runner
 
 from .support import FAKEBIN, PgTestCase
@@ -183,6 +183,80 @@ class FenetreDeSelectionTest(PgTestCase):
         finally:
             liberer.set()
             worker.watchdog_stop.set()
+
+
+class FrontiereAvantSelectionTest(PgTestCase):
+    """#2729 : la frontière d'un tour ordinaire est figée AVANT `_pick`, donc
+    une demande entrée pendant la sélection n'est pas effacée. Pour un tour
+    urgent, elle est relue après `_pick` : la demande servie ne tue pas le
+    tour qui la sert."""
+
+    def _worker(self) -> AgentWorker:
+        runner = Runner(self.cfg, self.db, once=True)
+        cwd = os.path.join(self.tmp, "work", "l11")
+        os.makedirs(cwd, exist_ok=True)
+        self.register("l11", "claude", cwd=cwd, prompt="tour long")
+        lease = registry.claim(self.db, "l11", runner.runner_id, 3600)
+        worker = AgentWorker(runner, registry.get(self.db, "l11"), lease)
+        self.addCleanup(worker.watchdog_stop.set)
+        return worker
+
+    def _joue(self, worker: AgentWorker, spec: dict, duree: str = "3") -> list:
+        """Lance le tour hors du fil de test et rend son verdict unique."""
+        verdict: list = []
+        env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
+               "AMEESH_TEST_SLEEP": duree}
+        with mock.patch.dict(os.environ, env, clear=False):
+            fil = threading.Thread(
+                target=lambda: verdict.append(worker.run_turn(spec)), daemon=True)
+            fil.start()
+            fil.join(timeout=15)
+        self.assertFalse(fil.is_alive(), "le tour n'a pas rendu la main")
+        return verdict
+
+    def test_une_demande_pendant_pick_n_est_pas_consommee(self):
+        worker = self._worker()
+        lire_consigne = registry.take_pending_prompt
+
+        def selection_avec_demande(*args, **kwargs):
+            # Le dispatch arrive dans `_pick`, après la lecture des urgents :
+            # le tour choisi est ordinaire et ne couvre pas cette demande.
+            worker.request_preempt()
+            return lire_consigne(*args, **kwargs)
+
+        with mock.patch.object(registry, "take_pending_prompt",
+                               side_effect=selection_avec_demande):
+            spec = worker.pick()
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec["kind"], "prompt")
+        self.assertLess(spec["_preempt_gen"], worker.preempt_gen,
+                        "frontière lue après la demande : le début de tour l'effacerait")
+        self.assertEqual(self._joue(worker, spec), [False])
+        self.assertTrue(worker.preempting.is_set())
+
+    def test_un_tour_urgent_ne_se_tue_pas_lui_meme(self):
+        worker = self._worker()
+        mail.send(self.db, "orch", "l11", "prioritaire", kind="event",
+                  payload={"urgent": True})
+        passages: list = []
+
+        def laisser_interrompre(row):
+            passages.append(row)
+            if len(passages) == 1:
+                # La demande entre pendant `_pick`, avant le retour du spec
+                # urgent : elle est couverte par la sélection de ce tour.
+                worker.request_preempt()
+            return True
+
+        with mock.patch.object(worker, "interrupt_allowed",
+                               side_effect=laisser_interrompre):
+            spec = worker.pick()
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec["kind"], "urgent")
+        self.assertEqual(spec["_preempt_gen"], worker.preempt_gen,
+                         "la frontière d'un tour urgent doit être relue après _pick")
+        self.assertEqual(self._joue(worker, spec, "0"), [True])
+        self.assertFalse(worker.preempting.is_set())
 
 
 class BoutEnBoutTest(PgTestCase):
