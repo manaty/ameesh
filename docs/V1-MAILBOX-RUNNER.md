@@ -375,10 +375,13 @@ test (three messages → three notifications) caught the bug.
   probes; the **parameterized** test suite (`StopTriggersTest`) replays for
   each trigger the three scenarios — published harness, saturated log,
   late-published `Popen`.
-* **Priority preemption latch (#2729)** — the `preempting` latch is cleared at
-  the start of **every** turn, not only of a priority turn: left set by a
-  preempted turn, it killed each following turn within a second (185 turns on
-  19/10). A preempted turn writes its series as a suffix of `status_text`
+* **Priority preemption latch (#2729)** — a preemption request is consumed at
+  a turn's start only when it is **older than that turn's selection** (a
+  generation read by `pick()` under the request lock). A request received
+  after selection, including during the possibly slow preparation, still stops
+  the selected turn. Left un-consumed, the latch used to kill each following
+  turn within a second (185 turns on 19/10). A preempted turn writes its series
+  as a suffix of `status_text`
   (`turn interrupted: priority message [preemptions x5 since …]`); five
   consecutive preemptions without a finished turn raise the
   `preemption_streak` alert (read in `ameesh alerts`, not pushed by default).

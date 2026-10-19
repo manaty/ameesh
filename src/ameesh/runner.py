@@ -579,6 +579,15 @@ class AgentWorker(threading.Thread):
         self.watchdog_stop = threading.Event()
         #: message prioritaire : préempte le tour en cours (0018, R19)
         self.preempting = threading.Event()
+        #: #2729 : génération des demandes de préemption. `pick()` fige la
+        #: frontière du tour qu'il sélectionne ; `request_preempt` incrémente
+        #: et pose le drapeau sous le même verrou. Au début du tour, seule une
+        #: demande ANTÉRIEURE à la sélection est un résidu à consommer : une
+        #: demande arrivée depuis est un arrêt pour CE tour, jamais un résidu
+        #: (relecture B1 de #2729 : le clear() fixe effaçait la nouvelle
+        #: préemption reçue pendant la préparation).
+        self.preempt_gen = 0
+        self._preempt_lock = threading.Lock()
         self._refus_vus: set[int] = set()
         #: arrêt demandé avant la publication du Popen (point de passage unique)
         self.stop_requested = threading.Event()
@@ -1414,8 +1423,14 @@ class AgentWorker(threading.Thread):
         Le tour est arrêté (SIGTERM bref puis SIGKILL), sa consigne repart en
         attente, et `pick()` sert le message prioritaire en tête au tour suivant,
         sur la même session.
+
+        #2729 : la génération et le drapeau sont posés sous le même verrou que
+        la consommation du début de tour — une demande ne peut donc pas tomber
+        entre le test de génération et le `clear()`.
         """
-        self.preempting.set()
+        with self._preempt_lock:
+            self.preempt_gen += 1
+            self.preempting.set()
         self.wake.set()
 
     def _preempt_monitor(self, done: threading.Event) -> None:
@@ -4185,6 +4200,20 @@ class AgentWorker(threading.Thread):
             return None
         spec = self._pick()
         if spec is not None:
+            # #2729 : la frontière de consommation est la génération des
+            # demandes de préemption lue **aussitôt la sélection faite** (retour
+            # de `_pick`). Une demande antérieure — y compris pendant `_pick` —
+            # est couverte par la sélection : si c'est elle qui a fait choisir
+            # le tour prioritaire, ce tour la sert (et doit pouvoir tourner).
+            # Toute demande postérieure (dispatch pendant la préparation, qui
+            # peut être lente) est un arrêt pour ce tour : elle ne sera pas
+            # effacée à son début.
+            verrou = getattr(self, "_preempt_lock", None)
+            if verrou is None:
+                frontiere = getattr(self, "preempt_gen", 0)
+            else:
+                with verrou:
+                    frontiere = self.preempt_gen
             # #408 : le réveil sur un lot actionnable porte déjà son lot
             spec["lot"] = spec.get("lot") or self.turn_lot(spec)
             if self._lot_workdir_blocked(spec.get("lot")):
@@ -4194,6 +4223,9 @@ class AgentWorker(threading.Thread):
                     registry.restore_prompt(self.db, self.name, self.runner.runner_id,
                                             self.epoch)
                 return None
+            # transportée par le spec : `rotate_for_lot` et les copies de
+            # `_run_guarded_turn` la gardent (dict(spec, …)).
+            spec["_preempt_gen"] = frontiere
         return spec
 
     def _pick(self) -> dict | None:
@@ -4803,6 +4835,18 @@ class AgentWorker(threading.Thread):
         pas soldée ; elle expire ou change d'epoch, le message est remis plus
         tard et signalé « re-livré » — un doublon signalé, jamais une perte.
         """
+        # #2729 : un appel direct (rotation, compaction, résumé de compte) n'a
+        # pas la frontière figée par `pick()` ; on la fige ici, à l'entrée,
+        # avant toute préparation. Une demande arrivée ensuite reste un arrêt
+        # pour ce tour et ne sera pas effacée à son début.
+        if "_preempt_gen" not in spec:
+            verrou = getattr(self, "_preempt_lock", None)
+            if verrou is None:
+                frontiere = getattr(self, "preempt_gen", 0)
+            else:
+                with verrou:
+                    frontiere = self.preempt_gen
+            spec = dict(spec, _preempt_gen=frontiere)
         candidats = spec.get("candidats")
         if self.runner.draining.is_set():
             # Drainage commencé entre le choix du tour et son lancement : rien
@@ -5864,10 +5908,20 @@ class AgentWorker(threading.Thread):
         # #2729 : le latch de préemption ne vaut que pour le tour qui l'a reçu.
         # Il n'était consommé qu'au tour prioritaire : après une préemption, un
         # tour ordinaire restait tué à la seconde et la boucle ne s'arrêtait
-        # plus (185 tours sur mty-amh-impl-01, 19/10). Tout tour commence donc
-        # drapeau bas ; une demande arrivée pendant CE tour est vue par le
-        # moniteur ci-dessous (et par `kill_if_preempted` à la publication).
-        self.preempting.clear()
+        # plus (185 tours sur mty-amh-impl-01, 19/10).
+        # La consommation est bornée par la GÉNÉRATION figée à la sélection
+        # (`pick()`, ou l'entrée pour un appel direct) : seule une demande
+        # ANTÉRIEURE est un résidu. Une demande arrivée depuis la sélection —
+        # dispatch pendant la préparation — est un arrêt pour CE tour : on ne
+        # l'efface pas, le moniteur ci-dessous la voit (B1 de la relecture).
+        # Le test et le clear sont sous le verrou de `request_preempt` : pas de
+        # course entre « la génération a-t-elle bougé ? » et l'effacement.
+        frontiere = spec.get("_preempt_gen")
+        if frontiere is None:
+            frontiere = getattr(self, "preempt_gen", 0)
+        with self._preempt_lock:
+            if self.preempt_gen <= frontiere:
+                self.preempting.clear()
         threading.Thread(target=self._preempt_monitor, args=(preempt_done,),
                          daemon=True).start()
         from .platform import audit_guard

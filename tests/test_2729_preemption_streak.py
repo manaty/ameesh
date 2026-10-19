@@ -115,6 +115,76 @@ class SerieTest(PgTestCase):
         self.assertAlmostEqual(exploitation.preemption_since(texte), since, delta=1.0)
 
 
+class FenetreDeSelectionTest(PgTestCase):
+    """#2729 B1 : une préemption reçue APRÈS la sélection, pendant la
+    préparation (potentiellement lente) est un arrêt pour le tour sélectionné.
+    La consommation du début de tour ne doit pas l'effacer comme un résidu."""
+
+    def _worker(self) -> AgentWorker:
+        runner = Runner(self.cfg, self.db, once=True)
+        cwd = os.path.join(self.tmp, "work", "l11")
+        os.makedirs(cwd, exist_ok=True)
+        self.register("l11", "claude", cwd=cwd, prompt="tour long")
+        lease = registry.claim(self.db, "l11", runner.runner_id, 3600)
+        worker = AgentWorker(runner, registry.get(self.db, "l11"), lease)
+        self.addCleanup(worker.watchdog_stop.set)
+        return worker
+
+    def test_une_preemption_pendant_la_preparation_interrompt_le_tour(self):
+        worker = self._worker()
+        spec = worker.pick()  # sélection AVANT la demande
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec["kind"], "prompt")
+
+        # Barrière dans la préparation, après la sélection et avant le clear
+        # du début de tour : `_ouverture` est appelée par `_run_turn`.
+        preparation_atteinte = threading.Event()
+        liberer = threading.Event()
+        ouverture = worker._ouverture
+
+        def ouverture_lente():
+            preparation_atteinte.set()
+            self.assertTrue(liberer.wait(5), "barrière de préparation non libérée")
+            return ouverture()
+
+        resultat: list = []
+        env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
+               "AMEESH_TEST_SLEEP": "5"}
+        fil = None
+        try:
+            with mock.patch.dict(os.environ, env, clear=False), \
+                    mock.patch.object(worker, "_ouverture", side_effect=ouverture_lente):
+                fil = threading.Thread(
+                    target=lambda: resultat.append(worker.run_turn(spec)), daemon=True)
+                fil.start()
+                self.assertTrue(preparation_atteinte.wait(5),
+                                "préparation du tour non atteinte")
+                # Ordre déterministe de la relecture : pick() -> préparation ->
+                # request_preempt() (dispatch) -> le début de tour ne doit pas
+                # effacer cette NOUVELLE demande.
+                worker.request_preempt()
+                self.assertTrue(worker.preempting.is_set())
+                liberer.set()
+                fil.join(timeout=10)
+            self.assertFalse(fil.is_alive())
+            self.assertEqual(resultat, [False],
+                             "la préemption reçue pendant la préparation a été effacée")
+            self.assertTrue(worker.preempting.is_set())
+
+            # Reprise normale : aucun nouveau signal ; la demande, désormais
+            # antérieure à la nouvelle sélection, est bien consommée.
+            reprise = worker.pick()
+            self.assertIsNotNone(reprise)
+            env["AMEESH_TEST_SLEEP"] = "0"
+            with mock.patch.dict(os.environ, env, clear=False):
+                self.assertTrue(worker.run_turn(reprise),
+                                "le tour de reprise a été tué par le latch")
+            self.assertFalse(worker.preempting.is_set())
+        finally:
+            liberer.set()
+            worker.watchdog_stop.set()
+
+
 class BoutEnBoutTest(PgTestCase):
     """Le scénario de l'incident, de bout en bout : N préemptions réelles
     lèvent l'alerte, puis un tour ordinaire la résout — sans nouveau
