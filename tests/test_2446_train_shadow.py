@@ -482,3 +482,124 @@ class ShadowPassageTest(PgTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ShadowMainSyncTest(PgTestCase):
+    """#2727 : main en avance est un membre mécanique, pas un lot manquant."""
+
+    def setUp(self):
+        super().setUp()
+        self.db.execute("TRUNCATE merge_locks RESTART IDENTITY CASCADE")
+        self.now = datetime(2026, 10, 18, 11, 0,
+                            tzinfo=ZoneInfo("Europe/Paris")).timestamp()
+        self.project_repo = ProjectRepo(os.path.join(self.tmp, "project"),
+                                        base_at=self.now - 86400)
+        self.project_repo.git("checkout", "-qb", "develop", "main")
+        self.project_repo.git("push", "-q", "origin", "develop")
+        self.project_repo.git("checkout", "-q", "main")
+        self.project_repo.write("prod.txt", "prod\n")
+        self.main_tip = self.project_repo.commit("prod")
+        self.project_repo.git("push", "-q", "origin", "main")
+        self.project_repo.git("checkout", "-q", "develop")
+        self.base = self.project_repo.git("rev-parse", "develop")
+        self.head = self.project_repo.branch()
+        self.canon = _Repo(os.path.join(self.tmp, "canon"), federation_text=FEDERATION)
+        self.commit = self.canon.git("rev-parse", "HEAD")
+        self.item = work.add(self.db, title="shadow sync fixture", app="ameesh",
+                             source="fixture", actor="fixture",
+                             branch="lot/member", branch_target="develop")
+        self.ops = storage.of(self.db).work
+        self.mark = self.ops.add_milestone(self.item["id"], "frozen", sha=self.head,
+                                           actor="fixture", verdict=None, note="")
+        self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s",
+                        (self.item["id"],))
+        self.notices = []
+        self.receipts = {sha: dataclasses.asdict(author(sha)) for sha in (self.base, self.head)}
+        provider = types.SimpleNamespace(
+            ProvenanceError=RuntimeError,
+            receipt_for_commit=lambda db, sha: self.receipts.get(sha),
+            receipt_for_milestone=lambda db, mid: None)
+        candidate = partial(plan_git.freeze_candidate,
+                            repo=self.project_repo.root, target="develop")
+        self.project = radar.Project(name="ameesh", repo=self.project_repo.root,
+                                     target="develop", github="o/r")
+        self.shadow = train_shadow.Passage(
+            types.SimpleNamespace(state_dir=os.path.join(self.tmp, "state"),
+                                  host="h", runner="r"),
+            self.project, policy_path=self.canon.root, policy_commit=self.commit,
+            workflows=(), provider=provider, mechanics=mechanics,
+            repository=self.project_repo.root, candidate=candidate,
+            initial=train_initial.Boundary(self.now - 60),
+            notify=self.notices.append)
+
+    def manual_packet(self, lots, stamp="20261018-1100", *, branch_at=None,
+                      merge_at=None):
+        branch = "integration/paquet-h-" + stamp
+        self.project_repo.git("checkout", "-qb", branch, "develop")
+        self.project_repo.write("reviews/integration-paquet-h-%s.md" % stamp,
+                                "# Paquet\n\n## Admissions\n\n%s\n"
+                                % "\n".join("- #%d" % lot for lot in lots))
+        self.project_repo.commit("composition %s" % stamp, at=branch_at)
+        self.project_repo.git("checkout", "-q", "develop")
+        self.project_repo.git("merge", "--no-ff", "-m",
+                              "Merge pull request #1 from manaty/" + branch, branch,
+                              env=self.project_repo.date_env(merge_at))
+        self.project_repo.git("push", "-q", "origin", "develop", branch)
+        return branch
+
+    def test_plan_carries_main_and_the_comparison_matches_the_manual_sync(self):
+        result, _ = self.shadow.scheduled_step(self.db, self.now)
+        self.assertEqual(result["result"], "shadow-plan", result)
+        self.assertEqual(result["plan"]["sync"],
+                         dict(ref="main", sha=self.main_tip))
+        self.assertEqual([row["work_item_id"] for row in result["plan"]["members"]],
+                         [self.item["id"]])
+        # The composer syncs main with the build lot #2695, then composes the
+        # packet. The train's mechanical main sha is the same one.
+        self.project_repo.git("checkout", "-q", "develop")
+        self.project_repo.git("merge", "--no-ff", "-m",
+                              "Merge main %s dans develop — synchro #2695\n\n"
+                              "ameesh-work: 2695" % self.main_tip, "main")
+        self.project_repo.git("push", "-q", "origin", "develop")
+        self.manual_packet([2695, self.item["id"]])
+        self.shadow.scheduled_step(self.db, self.now + 3600)
+        comparison = self.shadow.store.load()["comparisons"][0]
+        self.assertEqual(comparison["missing"], [])
+        self.assertEqual(comparison["sync"]["plan"], self.main_tip)
+        self.assertEqual(comparison["sync"]["manual"], self.main_tip)
+        self.assertEqual(comparison["sync"]["lots"], [2695])
+        self.assertIn("synchro main", comparison["explanations"]["2695"])
+
+    def manual_sync(self, message, *, extra=None):
+        self.project_repo.git("checkout", "-q", "develop")
+        self.project_repo.git("merge", "--no-ff", "--no-commit", "main")
+        if extra is not None:
+            self.project_repo.write(extra, "not in main\n")
+        self.project_repo.commit(message % self.main_tip)
+        self.project_repo.git("push", "-q", "origin", "develop")
+
+    def test_impure_manual_sync_keeps_its_lot_missing(self):
+        # cx2: merging main then adding an unreviewed file is not a sync. The
+        # exact main parent and the trailer prove nothing without the tree.
+        self.shadow.scheduled_step(self.db, self.now)
+        self.manual_sync("Merge main %s dans develop — synchro #9999\n\n"
+                         "ameesh-work: 9999", extra="unreviewed-feature")
+        self.manual_packet([9999, self.item["id"]])
+        self.shadow.scheduled_step(self.db, self.now + 3600)
+        comparison = self.shadow.store.load()["comparisons"][0]
+        self.assertIn(9999, comparison["missing"])
+        self.assertEqual(comparison["sync"]["lots"], [])
+        self.assertFalse(comparison["sync"]["refused"]["pure"])
+        self.assertIn("tree", comparison["sync"]["refused"]["reason"])
+
+    def test_pure_sync_with_several_trailers_exempts_nothing(self):
+        # dev1: a packet merge with a main parent must not exempt every trailer.
+        self.shadow.scheduled_step(self.db, self.now)
+        self.manual_sync("Merge main %s dans develop\n\n"
+                         "ameesh-work: 9999\nameesh-work: 9998")
+        self.manual_packet([9999, 9998, self.item["id"]])
+        self.shadow.scheduled_step(self.db, self.now + 3600)
+        comparison = self.shadow.store.load()["comparisons"][0]
+        self.assertEqual(comparison["missing"], [9998, 9999])
+        self.assertEqual(comparison["sync"]["lots"], [])
+        self.assertIn("trailer", comparison["sync"]["refused"]["reason"])
