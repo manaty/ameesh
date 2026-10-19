@@ -199,6 +199,29 @@ class SendMailTest(unittest.TestCase):
         self.assertEqual(self._pass(missing), [])
         self.assertEqual(self._pass(report), [])
 
+    def test_legacy_migration_state_without_fingerprint_is_not_resent(self):
+        # #2640: migration/unreserved conflicts had no fingerprint before
+        # #2602; the first pass after the upgrade must not resend the active
+        # notice just because the state has no `fp` yet.
+        import copy
+        report = radar.scan(self.repo, ASSIGNED, migrations=MIG)
+        radar._write_notified(self.cfg, "ameesh",
+                              {"migration:main:0002": {"1": "passive", "3": "passive"}})
+        self.assertEqual([s for s in self._pass(report)
+                          if s["key"] == "migration:main:0002"], [])
+        state = radar.read_notified(self.cfg, "ameesh")["migration:main:0002"]
+        self.assertIn("fp", state)
+        self.assertEqual([s for s in self._pass(report)
+                          if s["key"] == "migration:main:0002"], [])
+        # a changed lot head is still a new input
+        moved = copy.deepcopy(report)
+        for branch in moved["branches"]:
+            if branch["work_item"] == 3:
+                branch["tip"] = "f" * 40
+        self.assertEqual(sorted(s["to"] for s in self._pass(moved)
+                                if s["key"] == "migration:main:0002"),
+                         ["a1", "a1"])
+
     def test_failed_send_is_retried(self):
         report = radar.scan(self.repo, ASSIGNED, migrations=MIG)
         with mock.patch.object(mail, "send", side_effect=RuntimeError("base")):
