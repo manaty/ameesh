@@ -72,7 +72,7 @@ class DiscoveryTest(PgTestCase):
     def discover(self, dry_run=False):
         return discovery.discover(self.db, "pc", self.agents, (self.root,), dry_run=dry_run)
 
-    def test_dry_run_lists_lost_worktrees_clones_and_plain_dirs_without_writing(self):
+    def test_dry_run_lists_lost_worktrees_and_plain_dirs_without_writing(self):
         linked = self.linked("a1-review", "review/topic")
         clone = os.path.join(self.root, "clone")
         _git("clone", "-q", self.main, clone, cwd=self.tmp)
@@ -88,8 +88,11 @@ class DiscoveryTest(PgTestCase):
         report = self.discover(dry_run=True)
         plan = {row["path"]: row for row in report["plan"]}
         self.assertEqual(plan[linked]["action"], "register")
-        for path in (clone, plain, marker_link):
+        for path in (plain, marker_link):
             self.assertEqual(plan[path]["action"], "garde")
+        # #2743: ad-hoc clones belong to `housekeeping_clones`, never to this
+        # discovery (no duplicate report).
+        self.assertNotIn(clone, plan)
         self.assertNotIn(os.path.join(self.root, "symlink"), plan)
         self.assertEqual(report["entries"], [])
         self.assertEqual(self.store.worktrees("pc"), [])
@@ -97,7 +100,7 @@ class DiscoveryTest(PgTestCase):
 
         applied = self.discover()
         self.assertEqual([row["path"] for row in self.store.worktrees("pc")], [linked])
-        self.assertEqual(sum(row["action"] == "signaled" for row in applied["entries"]), 3)
+        self.assertEqual(sum(row["action"] == "signaled" for row in applied["entries"]), 2)
         self.assertTrue(all(os.path.isdir(path) for path in (linked, clone, plain, outside)))
         self.assertFalse(any(row["action"] == "registered" for row in self.discover()["entries"]))
 
