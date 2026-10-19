@@ -107,9 +107,15 @@ def _trailer_members(repo: str, base: str, head: str, vehicle: int) -> list[dict
                            % (base[:12], head[:12]))
     found = []
     for sha in log.split():
-        parents = (plan_git._out(repo, "rev-list", "--parents", "-n", "1", sha)
-                   or "").split()[1:]
-        message = plan_git._out(repo, "log", "-1", "--format=%B", sha) or ""
+        parents_text = plan_git._out(repo, "rev-list", "--parents", "-n", "1", sha)
+        if parents_text is None:
+            raise VehicleError("cannot read the parents of composition commit %s"
+                               % sha[:12])
+        parents = parents_text.split()[1:]
+        message = plan_git._out(repo, "log", "-1", "--format=%B", sha)
+        if message is None:
+            raise VehicleError("cannot read the message of composition commit %s"
+                               % sha[:12])
         lots = []
         for match in plan_git.WORK_TRAILER_RE.finditer(message):
             try:
@@ -155,7 +161,10 @@ def members(db, repo: str, base: str, head: str, vehicle: int) -> list[dict]:
 
 def _changed(repo: str, base: str, tip: str) -> list[str]:
     text = plan_git._out(repo, "diff", "--name-only", base, tip)
-    return [path for path in (text or "").splitlines() if path]
+    if text is None:
+        raise VehicleError("cannot read the changed paths %s..%s"
+                           % (base[:12], tip[:12]))
+    return [path for path in text.splitlines() if path]
 
 
 def _is_review_free(path: str) -> bool:
@@ -231,8 +240,11 @@ def own_changes(repo: str, base: str, head: str, sources) -> dict:
     paths: list[str] = []
     commits: list[str] = []
     for sha in listing.split():
-        parents = (plan_git._out(repo, "rev-list", "--parents", "-n", "1", sha)
-                   or "").split()[1:]
+        parents_text = plan_git._out(repo, "rev-list", "--parents", "-n", "1", sha)
+        if parents_text is None:
+            raise VehicleError("cannot read the parents of vehicle commit %s"
+                               % sha[:12])
+        parents = parents_text.split()[1:]
         if not parents:
             continue
         changed = (_merge_own_paths(repo, parents, sha) if len(parents) >= 2

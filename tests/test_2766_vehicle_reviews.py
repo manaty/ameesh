@@ -439,5 +439,56 @@ class NeedTest(_Base):
         self.head = _commit_all(self.repo, "Merge #102 — r2\n\nameesh-work: 102")
 
 
+class UnreadableGitTest(_Base):
+    """B de dev1 (#2766) : un git illisible ne rend pas un delta vide.
+
+    La porte promet « tout doute refuse » : une lecture qui échoue ne doit
+    jamais se lire comme « aucun chemin », « aucun parent » ou « aucun
+    trailer ». Ces témoins couvrent les lectures fail-open du module.
+    """
+
+    @staticmethod
+    def _failing(*prefix):
+        real = packet_reviews.plan_git._out
+
+        def fake(repo, *args):
+            if tuple(args[:len(prefix)]) == prefix:
+                return None
+            return real(repo, *args)
+
+        return fake
+
+    def test_a_failed_diff_refuses_instead_of_an_empty_delta(self):
+        with self.assertRaisesRegex(packet_reviews.VehicleError, "changed paths"):
+            packet_reviews._changed(self.repo, self.base, "f" * 40)
+
+    def test_a_failed_parent_read_refuses_instead_of_skipping_the_commit(self):
+        _write(self.repo, "src/app.py", "print(1)\n")
+        head = _commit_all(self.repo, "vehicle change")
+        with mock.patch.object(packet_reviews.plan_git, "_out",
+                               side_effect=self._failing("rev-list", "--parents")):
+            with self.assertRaisesRegex(packet_reviews.VehicleError,
+                                        "parents of vehicle commit"):
+                packet_reviews.own_changes(self.repo, self.base, head, [])
+
+    def test_a_failed_composition_parent_read_refuses_instead_of_a_missing_member(self):
+        self.compose()
+        with mock.patch.object(packet_reviews.plan_git, "_out",
+                               side_effect=self._failing("rev-list", "--parents")):
+            with self.assertRaisesRegex(packet_reviews.VehicleError,
+                                        "parents of composition commit"):
+                packet_reviews._trailer_members(
+                    self.repo, self.base, self.head, 999)
+
+    def test_a_failed_composition_message_read_refuses_instead_of_a_missing_member(self):
+        self.compose()
+        with mock.patch.object(packet_reviews.plan_git, "_out",
+                               side_effect=self._failing("log", "-1", "--format=%B")):
+            with self.assertRaisesRegex(packet_reviews.VehicleError,
+                                        "message of composition commit"):
+                packet_reviews._trailer_members(
+                    self.repo, self.base, self.head, 999)
+
+
 if __name__ == "__main__":
     unittest.main()
