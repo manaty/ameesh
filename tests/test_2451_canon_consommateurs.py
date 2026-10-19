@@ -132,8 +132,8 @@ class NoLocalDefaultTest(unittest.TestCase):
                                 project="ameesh", review_policy=None)
         self.assertEqual(train_policy.Compiled(rules).commit, "a" * 40)
         with self.assertRaises(train.TrainError):
-            train_policy.Compiled(SimpleNamespace(rules.__dict__,
-                                                  schema=mechanics.SCHEMA_PREVALIDATION))
+            train_policy.Compiled(SimpleNamespace(**{
+                **rules.__dict__, "schema": mechanics.SCHEMA_PREVALIDATION}))
 
 
 class GuardTest(unittest.TestCase):
