@@ -742,8 +742,12 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
                    + "porte de fusion : chemin critique, deux avis requis",
         })
     review_class = str(klass.get("class") or "")
+    # #2642 : le plancher léger vient du canon quand la classe le porte (le
+    # lecteur `lot_class` l'a lu pour ce même diff) ; le plancher historique
+    # d'un avis reste le repli d'une classe sans paramètre, jamais zéro.
     reviews = (CRITICAL_REVIEWS if critical
-               else LIGHT_REVIEWS if merged_class == lot_class.LIGHT else 0)
+               else int(klass.get("light_reviews") or LIGHT_REVIEWS)
+               if merged_class == lot_class.LIGHT else 0)
     out = {"lot": lot, "id": None, "created": False, "class": review_class,
            "merged_class": merged_class, "critical": critical,
            "reviews": reviews, "why": ""}

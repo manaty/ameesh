@@ -202,10 +202,11 @@ class InventoryTest(unittest.TestCase):
             if rest.get("head") in self.head_classes:
                 cls, files = self.head_classes[rest["head"]]
                 return {"lot": lot, "class": cls, "doubt": False, "why": "test",
-                        "files": files}
+                        "files": files, "light_reviews": 1}
             return {"lot": lot, "class": self.classes[lot], "doubt": False,
                     "why": "test", "files": self.files.get(
-                        lot, [{"path": "src/ameesh/x.py", "class": "light", "rule": None}])}
+                        lot, [{"path": "src/ameesh/x.py", "class": "light", "rule": None}]),
+                    "light_reviews": 1}
 
         def fake_family(db, name, **kw):
             return self.families.get(name, "")
@@ -275,10 +276,14 @@ class InventoryTest(unittest.TestCase):
         cause = next(cause for cause in entry["causes"] if cause["code"] == "conflict")
         self.assertEqual(cause["files"], ["shared.py"])
 
-    def test_light_lot_without_verdict_is_ready(self):
+    def test_light_lot_needs_the_declared_review(self):
+        # #2642 : un lot léger n'entre plus au paquet sans l'avis d'une autre
+        # famille ; le plancher est déclaré au canon (light_reviews: 1).
         entry = self.by_id(self.inventory())[5]
-        self.assertTrue(entry["ready"], entry["causes"])
-        self.assertEqual(entry["gate"]["required"], 0)
+        self.assertFalse(entry["ready"], entry["causes"])
+        self.assertIn("verdicts-missing",
+                      [cause["code"] for cause in entry["causes"]])
+        self.assertEqual(entry["gate"]["required"], 1)
 
     def test_packet_vehicle_is_not_a_unit(self):
         entry = self.by_id(self.inventory())[6]

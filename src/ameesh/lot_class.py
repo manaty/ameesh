@@ -176,15 +176,53 @@ def _doubtful_files(paths) -> list:
             for path in paths or () if str(path or "")]
 
 
+def _light_reviews(canons) -> tuple[int, str]:
+    """Le plancher d'avis d'un lot léger, au même commit que la politique.
+
+    `reviews.light_reviews` du canon (#2642) est lu par le lecteur strict
+    `mechanics`, jamais recopié ici : la porte de fusion et `paquet-candidats`
+    lisent la classe, donc le même plancher que la désignation. Rend
+    `(plancher, problème)` : 0 sans document mécanique (canon antérieur, ou
+    canon en fichiers de travail sans commit exact — la transition bornée à la
+    PR home qui le pose à 1), mais un document présent et illisible rend un
+    problème que l'appelant traduit en doute, jamais en zéro rassurant.
+    """
+    from . import mechanics
+    value = 0
+    for canon in canons or ():
+        for source in getattr(canon, "sources", ()) or ():
+            if (getattr(source, "mode", "") != "git" or not source.repo
+                    or not source.commit or getattr(source, "prefix", "")):
+                continue
+            try:
+                value = max(value, mechanics.light_reviews_at(source.repo,
+                                                              source.commit))
+            except mechanics.MechanicsAbsent:
+                continue
+            except mechanics.MechanicsError as exc:
+                return value, str(exc)
+    return value, ""
+
+
 def class_of_paths(canons, project: Optional[str], paths) -> dict:
     """La classe des `paths` pour `project`, lue dans tous les canons.
 
-    Rend `{class, why, files, policy_ref, doubt}` ; une politique illisible, un
-    projet que **aucun** canon ne déclare (sans repli déclaré) ou des chemins
-    inclassables rendent `sensitive` avec `doubt` — jamais une classe rassurante
-    par défaut. Un canon qui déclare d'autres projets sans repli ne dit rien de
-    celui-ci : il est ignoré, pas compté comme un doute.
+    Rend `{class, why, files, policy_ref, doubt, light_reviews}` ; une
+    politique illisible, un projet que **aucun** canon ne déclare (sans repli
+    déclaré) ou des chemins inclassables rendent `sensitive` avec `doubt` —
+    jamais une classe rassurante par défaut. Un canon qui déclare d'autres
+    projets sans repli ne dit rien de celui-ci : il est ignoré, pas compté
+    comme un doute. `light_reviews` est le plancher d'avis de la classe légère
+    (#2642), lu au même commit ; la classe reste `light`, le plancher ne
+    reclasse pas.
     """
+    canons = tuple(canons or ())
+    light_reviews, light_problem = _light_reviews(canons)
+    if light_problem:
+        return {"class": SENSITIVE, "files": _doubtful_files(paths),
+                "policy_ref": "", "doubt": True,
+                "light_reviews": light_reviews,
+                "why": "review light floor unreadable: %s" % light_problem}
     worst, why, files, ref = LIGHT, "", [], ""
     critical_paths = set()
     files_by_path = {}
@@ -199,8 +237,8 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
             continue
         if errors:
             return {"class": SENSITIVE, "files": _doubtful_files(paths),
-                    "policy_ref": _ref(canon),
-                    "doubt": True,
+                    "policy_ref": _ref(canon), "doubt": True,
+                    "light_reviews": light_reviews,
                     "why": "review policy unreadable (%s): %s"
                            % (root or "canon", errors[0][2])}
         covered = True
@@ -209,6 +247,7 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
         except review_mod.ReviewError as exc:
             return {"class": SENSITIVE, "files": _doubtful_files(paths),
                     "policy_ref": _ref(canon), "doubt": True,
+                    "light_reviews": light_reviews,
                     "why": "cannot classify the change: %s" % exc}
         if not ref:
             ref = _ref(canon)
@@ -226,7 +265,7 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
             why = "policy of %s" % (root or "canon")
     if not covered:
         return {"class": SENSITIVE, "files": _doubtful_files(paths), "policy_ref": "",
-                "doubt": True,
+                "doubt": True, "light_reviews": light_reviews,
                 "why": "project %r is not declared by any canon (no fallback policy)"
                        % (project,)}
     # Le maximum du lot ne suffit pas : une exception de la porte (Markdown
@@ -236,7 +275,7 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
         if entry["path"] in critical_paths:
             entry["critical"] = True
     return {"class": worst, "why": why, "files": files, "policy_ref": ref,
-            "doubt": False}
+            "doubt": False, "light_reviews": light_reviews}
 
 
 def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
@@ -254,7 +293,8 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     `canons` (liste ou lecteur différé) réutilisent les lectures groupées de
     l'appelant. Rend aussi `files`, `policy_ref`, `target`, `frozen_sha`,
     `why` et `doubt` (vrai quand la classe vient d'une lecture impossible, pas
-    d'une politique) pour la trace.
+    d'une politique) et `light_reviews` (le plancher d'avis d'un lot léger,
+    #2642) pour la trace.
     """
     out: dict = {"lot": int(lot), "class": SENSITIVE, "why": "", "files": [],
                  "policy_ref": "", "repo": repo or "", "target": base or "",
