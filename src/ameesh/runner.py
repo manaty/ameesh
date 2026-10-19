@@ -1364,25 +1364,81 @@ class AgentWorker(threading.Thread):
             return True
         return self.retry_due() or self.idle_due()
 
-    def request_preempt(self) -> None:
+    def request_preempt(self, row: dict | None = None) -> None:
         """Un message prioritaire préempte le tour en cours (0018, R19).
 
         Le tour est arrêté (SIGTERM bref puis SIGKILL), sa consigne repart en
         attente, et `pick()` sert le message prioritaire en tête au tour suivant,
         sur la même session.
+
+        L77 : pour un tour **résident**, le message (`row`) est d'abord remis au
+        point sûr (`steer`) si le pilote l'accepte ; sinon le tour résident est
+        interrompu sans tuer le process. Le message non remis est servi au tour
+        suivant, sur la même session.
         """
+        self._preempt_row = row
         self.preempting.set()
         self.wake.set()
+
+    def _preempt_resident(self) -> bool:
+        """L77 : préempte un tour résident sans tuer le process.
+
+        `steer` du message prioritaire si le pilote le propose, sinon
+        `interrupt()`. Rend False quand aucun résident ne porte le tour : le
+        chemin 0018 « un tour par événement » reste alors inchangé.
+        """
+        with self.lock:
+            rp = self.resident
+        if rp is None or not getattr(rp, "alive", False) \
+                or getattr(rp, "closing", False):
+            return False
+        driver = getattr(rp, "driver", None)
+        if driver is None or not getattr(driver, "busy", False):
+            return False
+        row = getattr(self, "_preempt_row", None)
+        self._preempt_row = None
+        if row is not None:
+            try:
+                texte = self._urgent_steer_text(row)
+                if texte and driver.steer(texte) is not None:
+                    log_async("[%s] priority message steered into the resident "
+                              "turn" % self.name)
+                    return True
+            except Exception as exc:  # InputRefused, ResidentBusy, protocole muet
+                log_async("[%s] resident steer refused (%s): interrupting"
+                          % (self.name, " ".join(str(exc).split())[:120]))
+        try:
+            if driver.interrupt():
+                log_async("[%s] resident turn interrupted (preemption)"
+                          % self.name)
+                return True
+        except Exception as exc:
+            log_async("[%s] resident interrupt failed (%s)"
+                      % (self.name, " ".join(str(exc).split())[:120]))
+        return False
+
+    def _urgent_steer_text(self, row: dict) -> str:
+        """Le texte remis au point sûr : l'enveloppe ameesh, puis le corps
+        neutralisé — jamais un en-tête fourni par l'expéditeur."""
+        from . import resident_queue
+        ident = resident_queue.identity_for(
+            row.get("sender") or "", cfg=getattr(self, "cfg", None),
+            canon_id=self._canon_id())
+        return "%s\n%s" % (resident_queue.envelope(ident, self._envelope_token()),
+                           resident_queue.neutralise(row.get("body") or ""))
 
     def _preempt_monitor(self, done: threading.Event) -> None:
         """Arrête le harnais dès qu'un message prioritaire arrive (0018).
 
         Passe par le point de passage unique : signal d'abord, journal borné
         ensuite ; une préemption arrivée avant la publication du `Popen` est
-        rattrapée par `kill_if_stop_requested()`.
+        rattrapée par `kill_if_stop_requested()`. L77 : un tour résident est
+        interrompu à son point sûr, sans tuer le process.
         """
         while not done.wait(0.1):
             if self.preempting.is_set():
+                if self._preempt_resident():
+                    return
                 self.stop_group_now("preemption", grace=1.0)
                 return
             if self.restarting.is_set():
@@ -7979,7 +8035,7 @@ class Runner:
                         log_async("urgent from %s without interruption: sender not "
                                   "allowed to interrupt" % (row.get("sender") or "?"))
             if worker and prioritaire:
-                worker.request_preempt()  # le signal d'abord
+                worker.request_preempt(row)  # le signal d'abord ; L77 : point sûr
                 log_async("priority message for %s: interrupting the turn" % target)
             elif worker:
                 worker.wake.set()
