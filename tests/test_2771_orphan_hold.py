@@ -3,9 +3,10 @@
 
 Un lot dont un pilote a écrit `hold: <raison>` (#1664) attend un geste que son
 détenteur ne peut pas faire (owner, bureau, paquet) : il n'est pas `sans_tour`.
-Même lecture que `stale_lot` et le SLO (`planned_waits.pilot_holds`) : la
-retenue d'un acteur ordinaire ne compte pas, une levée (`unhold:`) ou un
-changement d'état la finit, et `arrete` reste vrai sous retenue.
+Même lecture que `stale_lot` et le SLO (`planned_waits.pilot_holds`) : une
+levée (`unhold:`) ou un changement d'état la finit, et `arrete` reste vrai
+sous retenue. La retenue de l'assigné lui-même (#2764) tient 24 h, puis
+l'alerte revient en la citant ; celle d'un tiers ordinaire ne compte pas.
 """
 from __future__ import annotations
 
@@ -51,10 +52,27 @@ class OrphanLotHoldTest(PgTestCase):
         self._note("hold: gestes owner puis go", "human:proprio")
         self.assertEqual(self._alerts(), [])
 
-    def test_retenue_d_un_acteur_ordinaire_ne_compte_pas(self):
+    def test_retenue_d_un_tiers_ordinaire_ne_compte_pas(self):
+        self.register("voisin", "claude", cwd=self.tmp)
         self._vieillir()
-        self._note("hold: j'attends le paquet", "dort")
+        self._note("hold: j'attends le paquet", "voisin")
         self.assertEqual(self._alerts(), [(self.lot["id"], "sans_tour")])
+
+    def test_retenue_de_l_assigne_tient_jusqu_a_son_terme(self):
+        """Cas #2764 : l'assigné écrit lui-même `hold:` (consigne du réveil)."""
+        self._vieillir()
+        self._note("hold: j'attends la fusion du paquet 99", "dort")
+        self.assertEqual(self._alerts(), [])
+
+    def test_retenue_de_l_assigne_echue_est_citee(self):
+        self._vieillir(30)
+        self._note("hold: j'attends la fusion du paquet 99", "dort", hours=25)
+        alerts = [a for a in exploitation.alerts(self.cfg, self.db)
+                  if a["type"] == "orphan_lot"]
+        self.assertEqual([(a["lot"], a["reason"]) for a in alerts],
+                         [(self.lot["id"], "sans_tour")])
+        self.assertIn("hold of", alerts[0]["detail"])
+        self.assertIn("past the 24h term", alerts[0]["detail"])
 
     def test_levee_rend_l_alerte(self):
         self._vieillir(3)
