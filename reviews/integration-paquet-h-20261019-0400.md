@@ -49,7 +49,12 @@ aucune résolution ni adaptation.
   `8d9c067c`: **8 lots prêts, 19 en attente, 0 lecture en erreur**. Les 7 prêts
   hors incident sont composés ; #2597 est écarté (hors coupure) et #2498
   (non prêt) est écarté avec motif.
-- `paquet-inclusion` (tête `771bf875d287` + ce manifeste) : à compléter.
+- `paquet-inclusion` (tête `f36f69baa325` + ce manifeste) : **rc 0** — 7 lots
+  attendus, 7 entrées de composition (7 compositions, 0 retrait), 6 contenus
+  présents, 1 partiel, aucun défaut. Le partiel #2580 (`docs/COMPTES.md`,
+  `src/ameesh/account_claims.py`, `tests/test_2580_partage_comptes.py`) est le
+  socle remplacé par le delta empilé de #2592 (identité de mesh stable) : ce
+  n'est pas une perte.
 - `git diff --check` vert ; aucune migration (24 fichiers, +1625/−270 hors
   manifeste).
 - Suite complète unique demandée sur la tête de ce manifeste
