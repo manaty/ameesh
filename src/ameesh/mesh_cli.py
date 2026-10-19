@@ -1479,7 +1479,7 @@ def work_rows(db, *, state: str | None = None, assignee: str | None = None,
 def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
                 target: str | None = None) -> dict | None:
     """The object of `ameesh work show --json` (also `GET /api/v1/lots/{id}`)."""
-    from . import canon as canon_mod, plan, stagnation
+    from . import canon as canon_mod, merge_queue, plan, stagnation
 
     def lire(db):
         item = work.get(db, lot_id)

@@ -58,11 +58,11 @@ def _commit_receipt(provider, db, sha: str, *, strict: bool) -> Optional[dict]:
     try:
         row = provider.receipt_for_commit(db, sha)
     except error_type as exc:
-        if strict:
-            raise review_provenance.ProvenanceError(
-                "contradictory historical provenance for commit %s: %s"
-                % (str(sha)[:12], exc)) from exc
-        return None
+        # Une preuve contradictoire n'est jamais une absence : le train refuse,
+        # la désignation tient le commit pour inconnu (jamais deviné).
+        raise review_provenance.ProvenanceError(
+            "contradictory historical provenance for commit %s: %s"
+            % (str(sha)[:12], exc)) from exc
     fields = _fields(row)
     if not fields:
         return None
@@ -271,7 +271,13 @@ def authors(db, item: Mapping, milestone: Optional[Mapping],
         sha = str(raw or "").strip()
         if not sha:
             continue
-        receipt = _commit_receipt(provider, db, sha, strict=strict)
+        try:
+            receipt = _commit_receipt(provider, db, sha, strict=strict)
+        except review_provenance.ProvenanceError:
+            if strict:
+                raise
+            unknown.append(sha[:12])
+            continue
         if receipt is None:
             actor, stamp = commit_actor(repo, sha)
             if not actor:
