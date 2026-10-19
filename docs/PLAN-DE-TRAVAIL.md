@@ -191,8 +191,12 @@ all idempotent, which set the lot to `merged` with its `merged` milestone
    sweep report (`how`, `ref`, `target`), the journal receives once
    `contenu fusionné, fermeture retenue : <motif>`, the hold holder (or the
    agent who blocked the lot) is woken, and the lot stays open. An `unhold:`
-   note or a state change lifts the hold; the next sweep closes. The same
-   guard covers `sync-branches` and the units of `sync-packets`.
+   note or a state change lifts the hold; the next sweep closes. The check and
+   the closure share the lot's row lock — hold/lift notes and state changes
+   take it too — so a retention cannot slip between the journal read and the
+   close. A journal read error is an explicit `error` (the lot stays open,
+   never closes), not a silent hold. The same guard covers `sync-branches`
+   and the units of `sync-packets`.
 
    A package's units are closed by its manifest, without a card or
    `package_id`: on the target, `reviews/**paquet**.md` lists the composed

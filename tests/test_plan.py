@@ -1399,6 +1399,76 @@ class ContentMergeTest(_PlanDb):
         self.assertEqual(self.run_sync()[item["id"]]["result"], "merged")
         self.assertEqual(work.get(self.db, item["id"])["state"], "merged")
 
+    def test_2744_un_lot_bloque_pendant_le_releve_n_est_pas_ferme(self):
+        """B1 cx2 : qa → blocked pendant les sondes Git. La ligne du début de
+        balayage est périmée ; la garde relue sous le verrou du lot refuse."""
+        item = self._delivered("course-bloquee")
+        real = plan_git.probe
+        moved = []
+
+        def probe(repo, sha, target, *, lot=None):
+            if lot == item["id"] and not moved:
+                moved.append(True)
+                work.move(self.db, item["id"], "blocked", note="pendant le relevé",
+                          actor="dev-a")
+            return real(repo, sha, target, lot=lot)
+
+        with mock.patch.object(plan_git, "probe", side_effect=probe):
+            result = self.run_sync()[item["id"]]
+        self.assertEqual(result["result"], "withheld")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "blocked")
+        self.assertIn("état blocked", result["detail"])
+
+    def test_2744_un_journal_illisible_ne_ferme_pas(self):
+        """B2 cx2 : une lecture des retenues en erreur retient la fermeture ;
+        elle ne doit jamais laisser croire à l'absence de hold."""
+        item = self._delivered("journal-ko")
+        st = storage.of(self.db)
+        with mock.patch.object(type(st.progress), "lot_hold_events",
+                               side_effect=RuntimeError("panne journal")):
+            result = self.run_sync()[item["id"]]
+        self.assertEqual(result["result"], "error")
+        self.assertEqual(result["retention"]["what"], "unreadable")
+        self.assertIn("journal des retenues illisible", result["detail"])
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+
+    def test_2744_une_note_de_hold_prend_le_verrou_de_ligne(self):
+        """B1 cx2 (structure) : hold et fermeture partagent le verrou de ligne ;
+        une note `hold:` concurrente attend la fin de la transaction qui tient
+        le lot, elle ne se glisse pas entre la lecture et la fermeture."""
+        item = self.frozen("hold-verrou", "e" * 40)
+        writer = db_mod.connect(self.cfg)
+        done, errors = [], []
+
+        def hold():
+            try:
+                done.append(work.note(writer, item["id"],
+                                      "hold: pendant la fermeture", actor="dev-a"))
+            except Exception as exc:  # noqa: BLE001 - rapporté par le test
+                errors.append(repr(exc))
+
+        thread = threading.Thread(target=hold)
+        blocker = db_mod.connect(self.cfg)
+        try:
+            with blocker.transaction() as tx:
+                tx.query("SELECT id FROM work_items WHERE id = %s FOR UPDATE",
+                         (item["id"],))
+                thread.start()
+                # `pg_stat_activity.query` est tronqué à 1 Kio : le suffixe
+                # `FOR UPDATE` de la grande lecture tombe hors du texte lu.
+                self._wait_lock("work_migration_reservations")
+                self.assertEqual(done, [])
+            thread.join(10)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(done, [True])
+            self.assertTrue(any("hold: pendant la fermeture" in (e["note"] or "")
+                                for e in work.events(self.db, item["id"])))
+        finally:
+            thread.join(10)
+            blocker.close()
+            writer.close()
+
     def test_2744_un_lot_qa_sans_hold_ferme_comme_avant(self):
         item = self._delivered("sans-hold")
         result = self.run_sync()[item["id"]]

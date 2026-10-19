@@ -55,8 +55,11 @@ best-effort :
 
 #2744 : une fermeture par contenu est retenue tant que le lot est `blocked`
 ou qu'une note `hold:` n'est pas levée (le contenu fusionné est constaté, le
-journal le dit, le détenteur est réveillé, le lot reste ouvert) ; `sync-branches` et
-les unités de paquet (`sync-packets`) portent la même garde.
+journal le dit, le détenteur est réveillé, le lot reste ouvert) ; le contrôle
+et la fermeture partagent le verrou de ligne du lot avec les notes hold/lift
+(`work.close_merged(content_guard=…)`), et une lecture du journal en erreur
+retient aussi. `sync-branches` et les unités de paquet (`sync-packets`)
+portent la même garde.
 
 Un lot absorbé par un autre ou remplacé se clôt par
 `ameesh work close <id> --superseded-by <id>` ; jamais de réouverture d'un
@@ -649,8 +652,10 @@ def content_retention(st, row: dict) -> dict | None:
     Un lot `blocked`, ou sous une note `hold: …` non levée (#1664), n'est pas
     fermé par le contenu : sa livraison est constatée, sa fermeture attend la
     levée. `planned_waits.explicit_holds` est la seule lecture des hold : une
-    note `unhold:` ou un changement d'état lève la retenue. Rend
-    `{what, motif, by, since}`, ou None."""
+    note `unhold:` ou un changement d'état lève la retenue. Une lecture du
+    journal qui échoue rend une retenue `unreadable` : une erreur ne doit
+    jamais autoriser une fermeture. Rend `{what, motif, by, since}`, ou None.
+    """
     row = row or {}
     try:
         lot = int(row["id"])
@@ -659,8 +664,11 @@ def content_retention(st, row: dict) -> dict | None:
         return None
     try:
         events = st.progress.lot_hold_events([lot], planned_waits.HOLD_NOTE_PATTERNS)
-    except Exception:  # noqa: BLE001 — un journal illisible ne bloque pas le relevé
-        events = []
+    except Exception as exc:  # noqa: BLE001 — l'erreur retient, elle n'ouvre pas
+        return {"what": "unreadable",
+                "motif": "journal des retenues illisible (%s: %s)"
+                         % (type(exc).__name__, " ".join(str(exc).split())[:120]),
+                "by": str(row.get("assignee") or ""), "since": None}
     held = planned_waits.explicit_holds(events).get(lot)
     if held:
         by = str(held.get("by") or "")
@@ -687,38 +695,54 @@ def content_retention(st, row: dict) -> dict | None:
     return None
 
 
-def withhold_content_closure(db, st, row: dict, entry: dict, *, target: str,
-                             actor: str = "", dry_run: bool = False) -> dict | None:
-    """#2744 : retenir la fermeture d'un lot bloqué ou sous hold non levé.
-
-    Appelé quand une preuve de contenu dit la fusion. Hors `dry_run`, écrit
-    une fois le journal « contenu fusionné, fermeture retenue : <motif> » et
-    réveille le détenteur du hold ou le signaleur ; le lot n'est pas fermé.
-    Le jalon `merged` reste celui de la transition (`close_merged`) : un lot
-    retenu n'est pas fusionné, la frise et les estimations le compteraient
-    livré. Le fait est dans le compte rendu (`how`, `ref`, `target`). Rend
-    l'entrée (`withheld`/`would-withhold`), ou None sans retenue."""
-    retention = content_retention(st, row)
-    if retention is None:
-        return None
+def _retention_text(retention: dict, entry: dict, target: str) -> str:
+    """La ligne de journal d'une fermeture retenue (#2744)."""
     ref = str(entry.get("ref") or entry.get("sha") or "")
-    text = ("contenu fusionné, fermeture retenue : %s — %s (%s %s)"
+    return ("contenu fusionné, fermeture retenue : %s — %s (%s %s)"
             % (retention["motif"], target, entry.get("how") or "?",
                ref[:12] or "?"))
+
+
+def mark_withheld(entry: dict, retention: dict, *, target: str,
+                  dry_run: bool = False) -> str:
+    """#2744 : l'entrée de compte rendu d'une fermeture retenue."""
+    text = _retention_text(retention, entry, target)
     entry["retention"] = retention
     entry["result"] = "would-withhold" if dry_run else "withheld"
     entry["detail"] = "%s — %s" % (entry.get("detail") or "", text)
-    if dry_run:
-        return entry
+    return text
+
+
+def mark_retained(entry: dict, retention: dict, *, target: str,
+                  dry_run: bool = False) -> None:
+    """#2744 : compte rendu d'une retenue, ou d'une lecture de journal en
+    erreur — cette dernière est une **erreur** explicite, jamais un simple
+    hold : le lot reste ouvert et l'appelant la voit (`result: error`)."""
+    if retention.get("what") == "unreadable":
+        entry["retention"] = retention
+        entry["result"] = "error"
+        entry["detail"] = "%s — %s" % (entry.get("detail") or "",
+                                       retention.get("motif") or "journal illisible")
+        return
+    mark_withheld(entry, retention, target=target, dry_run=dry_run)
+
+
+def record_content_withheld(db, st, row: dict, entry: dict, retention: dict, *,
+                            target: str, actor: str = "") -> None:
+    """#2744 : journalise et réveille une fermeture retenue, une fois.
+
+    Appelé après le refus atomique de `work.close_merged` : la note et le
+    courrier ne sont pas dans la transaction de fermeture, mais la fermeture,
+    elle, a déjà été refusée sous le verrou du lot."""
+    text = _retention_text(retention, entry, target)
     lot = int(row["id"])
     if not _first_observation(st, lot, text):
-        return entry
+        return
     try:
         work_mod.note(db, lot, text, actor=actor)
     except work_mod.WorkError:
-        return entry                    # le lot a changé : rien à journaliser
+        return                    # le lot a changé : rien à journaliser
     _wake_retention(db, row, retention, entry=entry, target=target)
-    return entry
 
 
 def _first_observation(st, lot: int, text: str) -> bool:
@@ -889,22 +913,29 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
         entry.update(target=found_target, off_target=off_default, how=found_proof["how"],
                      ref=found_proof["ref"], sha=sha, result="open",
                      detail=found_proof["detail"])
-        if withhold_content_closure(
-                db, st, row, entry, target=found_target,
-                actor="git:%s" % found_target, dry_run=dry_run) is not None:
-            results.append(entry)
-            continue
         if dry_run:
+            retention = content_retention(st, row)
+            if retention is not None:
+                mark_retained(entry, retention, target=found_target, dry_run=True)
+                results.append(entry)
+                continue
             entry["result"] = "would-merge"
         else:
             done = work_mod.close_merged(
                 db, lot, sha=entry["ref"] or "", actor="git:%s" % found_target,
                 source="content (%s)" % entry["how"], frozen_id=frozen_id,
                 unfrozen=frozen_id is None,   # #2444 : un gel apparu entre-temps refuse
-                repo=repo_dir)          # L539 : dépôt du relevé, indice de classe
+                repo=repo_dir,          # L539 : dépôt du relevé, indice de classe
+                content_guard=content_retention)   # #2744 : verrou commun avec le hold
             entry["result"] = done["result"]
-            detail = "%s — %s" % (entry["detail"], done["detail"])
-            entry["detail"] = detail
+            if done["result"] in ("withheld", "error"):
+                mark_retained(entry, done["retention"], target=found_target)
+                if done["result"] == "withheld":
+                    record_content_withheld(
+                        db, st, row, entry, done["retention"], target=found_target,
+                        actor="git:%s" % found_target)
+            else:
+                entry["detail"] = "%s — %s" % (entry["detail"], done["detail"])
         results.append(entry)
     return {"git_dir": repo_dir, "target": target if target is not None else (default or ""),
             "auto": target is None, "off_target": default if target is None else None,
@@ -2561,12 +2592,12 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                 st.work.set_branch_head(lot, branch, found["tip"])
             results.append(entry)
             continue
-        if withhold_content_closure(
-                db, st, row, entry, target=target,
-                actor=actor or "git:%s" % target, dry_run=dry_run) is not None:
-            results.append(entry)
-            continue
         if dry_run:
+            retention = content_retention(st, row)
+            if retention is not None:
+                mark_retained(entry, retention, target=target, dry_run=True)
+                results.append(entry)
+                continue
             entry["result"] = "would-merge"
             results.append(entry)
             continue
@@ -2583,8 +2614,17 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
         done = work_mod.close_merged(
             db, lot, sha=found["ref"] or "", actor=actor or "git:%s" % target,
             source=source, frozen_id=found.get("frozen_id"),
-            repo=repo)                          # L539 : dépôt du relevé, indice de classe
-        entry.update(result=done["result"], detail="%s — %s" % (entry["detail"], done["detail"]))
+            repo=repo,                          # L539 : dépôt du relevé, indice de classe
+            content_guard=content_retention)    # #2744 : verrou commun avec le hold
+        entry["result"] = done["result"]
+        if done["result"] in ("withheld", "error"):
+            mark_retained(entry, done["retention"], target=target)
+            if done["result"] == "withheld":
+                record_content_withheld(
+                    db, st, row, entry, done["retention"], target=target,
+                    actor=actor or "git:%s" % target)
+        else:
+            entry["detail"] = "%s — %s" % (entry["detail"], done["detail"])
         if done["result"] == "merged":
             if found.get("kind") == "content":
                 delivered = "its last freeze %s is an ancestor of %s" % (

@@ -610,6 +610,16 @@ class WorkItems(interface.WorkItems):
                     str(mark_note).replace("{lot}", str(item["id"])), actor)
             return item
 
+    def lock(self, item_id) -> dict | None:
+        """#2744 : verrouille la ligne du lot `FOR UPDATE` pour la transaction
+        courante (None s'il n'existe pas). Verrou commun avec les notes de
+        retenue (`work.note` le prend avant `note`) : la lecture des hold et la
+        fermeture par contenu ne peuvent plus s'entrelacer."""
+        rows = self.db.query(
+            "SELECT %s FROM work_items WHERE id = %%s FOR UPDATE" % item_columns(self.db),
+            (int(item_id),))
+        return rows[0] if rows else None
+
     def get(self, item_id) -> dict | None:
         # #1922/B5 : `workflow_ref` (0452) est porté par la lecture, comme
         # `reviewer` (#705) l'est par `item_columns` — `to_jsonb` rend '' sur
