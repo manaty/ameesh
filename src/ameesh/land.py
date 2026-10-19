@@ -674,13 +674,15 @@ class _Landing:
         from . import review_lot
         try:
             item = work.get(self.db, self.lot)
+            repo = self.clone or self.project.repo
             klass = review_lot.class_at_merge(
-                self.db, self.lot, item=item,
-                repo=self.clone or self.project.repo,
+                self.db, self.lot, item=item, repo=repo,
                 target=self.row.get("target") or "", sha=merged_sha)
+            # #2585 : le dépôt sert aussi de preuve que le gel relu est entré
+            # dans le commit fusionné.
             return review_lot.open_after_merge(
                 self.db, lot=self.lot, klass=klass, item=item, merged_sha=merged_sha,
-                pr=pr, target=self.row.get("target") or "")
+                pr=pr, target=self.row.get("target") or "", repo=repo)
         except Exception as exc:  # noqa: BLE001 - la fusion est un fait, jamais défait
             return {"lot": self.lot, "id": None, "created": False, "class": "",
                     "why": "lot de relecture non ouvert : %s: %s"
