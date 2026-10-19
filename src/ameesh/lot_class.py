@@ -21,6 +21,7 @@ la tête gelée, les portes et le bail.
 """
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 from . import canon as canon_mod
@@ -109,6 +110,61 @@ def default_base(cfg, item: dict, repo: str) -> Optional[str]:
         return plan_git.default_target(repo)
     except Exception:  # noqa: BLE001 - dépôt illisible : l'appelant doutera
         return None
+
+
+def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=()) -> str:
+    """Le dépôt local qui contient le commit gelé `frozen`, ou "" (#2559).
+
+    L'hôte qui lit un lot (alerte SLO, vue) n'est pas forcément celui de son
+    auteur : `radar` ne connaît pas toujours le dépôt du projet. On essaie donc,
+    dans l'ordre, le dossier de travail de l'assigné (registre), le dépôt du
+    projet (`repository`), tout dossier de travail local du registre, les
+    chemins `extra_paths` de l'appelant, puis le dossier courant. Le premier
+    dont le dépôt résout `frozen` en commit gagne ; aucun : "" — l'appelant ne
+    conclut pas (jamais de classe rassurante par défaut). Lecture seule."""
+    from . import registry
+
+    frozen = str(frozen or "").strip()
+    if not frozen:
+        return ""
+    candidates = []
+    assignee = str((item or {}).get("assignee") or "").strip()
+    try:
+        if assignee:
+            candidates.append((registry.get(db, assignee) or {}).get("cwd") or "")
+    except Exception:  # noqa: BLE001 - registre illisible : les autres pistes
+        pass
+    try:
+        candidates.append(repository(cfg, item) or "")
+    except Exception:  # noqa: BLE001 - pas de réglage radar : les autres pistes
+        pass
+    try:
+        candidates.extend(str(row.get("cwd") or "") for row in registry.overview(db))
+    except Exception:  # noqa: BLE001 - registre illisible : les autres pistes
+        pass
+    candidates.extend(extra_paths or ())
+    try:
+        candidates.append(os.getcwd())
+    except OSError:
+        pass
+    seen = set()
+    for path in candidates:
+        path = os.path.expanduser(str(path or "").strip())
+        if not path or not os.path.isdir(path):
+            continue
+        try:
+            root = canon_mod.git_toplevel(path)
+        except Exception:  # noqa: BLE001 - pas un dépôt : piste suivante
+            root = None
+        if not root or root in seen:
+            continue
+        seen.add(root)
+        try:
+            if plan_git._commit(root, frozen):
+                return root
+        except Exception:  # noqa: BLE001 - commit illisible : piste suivante
+            continue
+    return ""
 
 
 def _doubtful_files(paths) -> list:
@@ -235,12 +291,16 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     out["frozen_sha"] = head
     # La cible résolue à l'atterrissage (celle du projet, ou `origin/HEAD`) peut
     # être `release/*` sans que la ligne du lot le dise : l'axe release se lit
-    # sur elle aussi, normalisée (revue #544 r1).
-    landing = default_base(cfg, row, repo)
+    # sur elle aussi, normalisée (revue #544 r1). Mais quand l'appelant nomme
+    # déjà la base (commit de cible frais, cible du paquet), elle seule fait
+    # foi : relire `origin/HEAD` d'un clone pour la surclasser rendait
+    # « release » un lot visant `main` (#2464, clone radar figé sur une release
+    # périmée).
+    landing = None if base else default_base(cfg, row, repo)
     if not base:
         base = landing
     out["target"] = base or ""
-    reason = release_reason(row, landing, base)
+    reason = release_reason(row, base)
     if reason:
         out.update({"class": RELEASE, "why": reason, "doubt": False})
         return out

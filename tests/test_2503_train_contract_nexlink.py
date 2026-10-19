@@ -568,6 +568,17 @@ class DynamicGitHubTest(unittest.TestCase):
         self.assertEqual([item["workflow"] for item in result["workflows"]],
                          [self.due.path])
 
+    def test_a_failed_plumbing_job_with_green_tests_names_no_lot(self):
+        """#2550 : un publieur de statut en échec n'est pas un test rouge."""
+        self.runs[0].update(conclusion="failure")
+        self.jobs = [
+            dict(id=19, name="backend", status="completed", conclusion="success"),
+            dict(id=20, name="lot-status / Lot status (%s)" % self.due.context,
+                 status="completed", conclusion="failure"),
+        ]
+        with self.assertRaisesRegex(train.TrainError, "does not prove"):
+            self.ci().read(self.plan)
+
     def test_remote_source_check_runs_once_per_head_and_base(self):
         """N1 de la relecture #2503 : la preuve dépend aussi de la base."""
         ci = self.ci()

@@ -81,7 +81,7 @@ import tempfile
 import time
 
 from . import plan_git
-from .canon import GIT_TIMEOUT, GitError, _git, _git_env
+from .canon import GIT_TIMEOUT, GitError, _git, _git_env, git_toplevel
 from .platform import PROC
 
 #: plafond d'exécution du sélecteur : un sélecteur bloqué ne retient pas la
@@ -179,7 +179,12 @@ def extract(repo: str, commit: str, dest: str) -> None:
     """L'arbre de `commit`, extrait dans `dest` depuis les objets Git
     (`git archive`), sans toucher au dépôt ni à un checkout. Seuls les
     fichiers, répertoires et liens symboliques internes entrent ; une entrée
-    d'un autre type, ou un lien qui sort de l'arbre, refuse."""
+    d'un autre type, ou un lien qui sort de l'arbre, refuse. Un sous-répertoire
+    est ramené à la racine de son arbre de travail : `git archive` est relatif
+    au cwd (#2567), un dépôt nu reste lu tel quel."""
+    top = git_toplevel(repo)
+    if top and os.path.realpath(repo) != top:
+        repo = top
     if not os.path.isdir(dest):
         os.makedirs(dest)
     argv = ["git", "--no-pager", "--no-replace-objects", "--literal-pathspecs",

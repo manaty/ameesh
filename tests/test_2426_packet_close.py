@@ -11,8 +11,10 @@ from __future__ import annotations
 import json
 import os
 import unittest
+from unittest import mock
 
 from ameesh import packet_close, work
+from ameesh.storage.postgres.work import WorkItems
 
 from .test_canon import git, write
 from .test_plan import _PlanDb
@@ -124,6 +126,31 @@ class PacketCloseTest(_PlanDb):
             self.assertIn("packet manifest", journal)
         # idempotent : les lots sont déjà fusionnés, plus rien à examiner
         self.assertEqual(self.sync()["results"], [])
+
+    def test_un_lot_absent_d_une_liste_d_items_tronquee_est_ferme(self):
+        """#2508 : la fermeture lit les lots du manifeste par leur id, pas la
+        liste globale `items(limit=1000)` ; une unité absente d'une liste
+        tronquée est tout de même examinée et fermée."""
+        first, second = self.item("première unité"), self.item("seconde unité")
+        units = self.package([first, second])
+        for item, unit in zip((first, second), units):
+            self.freeze(item, unit["source"])
+        original = WorkItems.items
+        called = []
+
+        def truncated(store, **kwargs):
+            called.append(True)
+            rows = original(store, **kwargs)
+            return [row for row in rows if int(row["id"]) != second["id"]]
+
+        with mock.patch.object(WorkItems, "items", new=truncated):
+            report = self.sync()
+        results = self.by_lot(report)
+        self.assertEqual(results[first["id"]]["result"], "merged", report)
+        self.assertEqual(results[second["id"]]["result"], "merged", report)
+        self.assertEqual(work.get(self.db, second["id"])["state"], "merged")
+        self.assertEqual(called, [],
+                         "#2508 : le balayage global `items()` ne doit plus être lu")
 
     def test_un_lot_regelé_apres_la_composition_reste_ouvert(self):
         first = self.item("unité")

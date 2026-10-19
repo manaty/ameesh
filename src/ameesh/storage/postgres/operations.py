@@ -67,6 +67,8 @@ class Operations(interface.Operations):
     def read_peek(self, name, human):
         # An unavailable snapshot is explicit; metadata still describes the
         # authorised agent. Old host/lease observations are never reused.
+        # An empty declared responsible never authorises an empty reader:
+        # the two empty strings must not match (N4, #1398).
         rows = self.db.query("""
             SELECT r.host, r.status, r.status_text,
                    w.id AS lot_id, w.title AS lot_title, w.state AS lot_state,
@@ -80,7 +82,7 @@ class Operations(interface.Operations):
                 ORDER BY (id::text = r.session_work_item) DESC NULLS LAST,
                          (state = 'build') DESC, updated_at DESC, id DESC LIMIT 1
             ) w ON true
-            WHERE r.name = %s AND r.responsible = %s
+            WHERE r.name = %s AND r.responsible <> '' AND r.responsible = %s
             """, (name, human))
         return rows[0] if rows else None
 

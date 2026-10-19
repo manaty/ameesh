@@ -20,10 +20,14 @@ Escalade (§9), à chaque dépassement :
    réassigne ;
 3. au triple — ou si le pilote est lui-même en retard — le bureau ou
    l'auditeur réassigne directement à un agent libre ;
-4. pour un P1, ou si rien n'est possible sans l'owner, notification à l'owner.
+4. pour un P1, le bureau traite, avec l'auditeur en copie. **Aucun
+   dépassement de délai n'est notifié à l'owner** (décision de l'owner du
+   18/10/2026 vers 08:00 : « rien sur les SLO ») : le niveau 4 vise le bureau
+   et l'auditeur, jamais l'owner.
 
 Un lot P1 (priorité 1, « high ») porte le délai court de la colonne
-« P1 / bloquant » et notifie l'owner dès le premier dépassement.
+« P1 / bloquant » et vise le bureau et l'auditeur dès le premier dépassement ;
+aucun dépassement n'est notifié à l'owner.
 """
 from __future__ import annotations
 
@@ -95,9 +99,9 @@ LEVEL_TARGETS = {
     2: ("pilot",),
     3: ("bureau", "auditeur"),
 }
-#: Le niveau 4 n'a pas de seuil propre : un P1 le déclenche, sinon « rien n'est
-#: possible sans l'owner » se constate au niveau 3.
-OWNER = "owner"
+#: #2395 : le niveau 4 n'a pas de seuil propre — un P1 le déclenche. Il vise le
+#: bureau et l'auditeur, jamais l'owner (canon §9, décision owner 18/10).
+CRITICAL_TARGETS = ("bureau", "auditeur")
 
 
 def step_of(key: str) -> Step:
@@ -126,10 +130,13 @@ def level(elapsed_s: float, target: float) -> int:
 
 
 def targets(level_: int, *, critical: bool = False) -> tuple:
-    """Les destinataires du niveau atteint ; un P1 y ajoute l'owner (§9.4)."""
+    """Les destinataires du niveau atteint ; un P1 y ajoute le bureau et
+    l'auditeur (niveau 4, canon §9) — jamais l'owner."""
     out = list(LEVEL_TARGETS.get(int(level_), ()))
-    if critical and OWNER not in out:
-        out.append(OWNER)
+    if critical:
+        for role in CRITICAL_TARGETS:
+            if role not in out:
+                out.append(role)
     return tuple(out)
 
 
@@ -212,6 +219,36 @@ def handover_ts(item: dict, events: Iterable[dict]) -> float | None:
     return last
 
 
+def intake_ready_ts(assigned: float | None, requested: float | None,
+                    dependencies: Iterable[dict] = (), *,
+                    started: float | None = None) -> float | None:
+    """L'instant où le lot est prêt pour `intake_started` (#2551).
+
+    Une dépendance bloquante ouverte retient le lot : son porteur ne peut rien
+    faire avant sa levée, donc le lot n'est pas « prêt, pas démarré » et aucun
+    délai ne court (`None`). Toutes les dépendances satisfaites, le départ est
+    le plus tardif de l'attribution (ou de la demande) et de la levée du
+    dernier bloqueur — les jalons `merged` ou `closed` du bloqueur, portés par
+    `satisfied_ts`. Le délai mesure alors l'attente d'un preneur, pas le temps
+    où le travail dépendait d'un autre lot.
+
+    Un lot déjà démarré (`started`) garde sa mesure : seules les levées
+    antérieures au début comptent, et une dépendance ajoutée après le début ne
+    réécrit pas le passé.
+    """
+    base = assigned if assigned is not None else requested
+    if base is None:
+        return None
+    edges = list(dependencies or ())
+    if started is None and any(edge.get("blocking") for edge in edges):
+        return None
+    stamps = [float(edge["satisfied_ts"]) for edge in edges
+              if edge.get("satisfied_ts") is not None]
+    if started is not None:
+        stamps = [stamp for stamp in stamps if stamp <= float(started)]
+    return max([float(base)] + stamps)
+
+
 def last_event_ts(item: dict, events: Iterable[dict]) -> float | None:
     """Dernière activité écrite (ligne du lot ou événement)."""
     stamps = [item.get("updated_ts"), item.get("created_ts")]
@@ -247,7 +284,8 @@ def _row(step: Step, start, *, now: float, critical: bool, done_ts=None, **extra
 
 
 def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
-              now: float | None = None, packet_slot: float | None = None) -> list:
+              now: float | None = None, packet_slot: float | None = None,
+              dependencies: Iterable[dict] = ()) -> list:
     """Les étapes mesurables d'un lot, une ligne par étape applicable.
 
     `jalons` vient de `progress._work_item_milestones` — le SEUL lecteur des
@@ -272,6 +310,12 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     ligne porte `handover_grace_s` (secondes restantes). La mesure reste
     visible (`elapsed_s`, `target_s`) ; après la grâce, l'escalade reprend au
     niveau que le retard justifie.
+
+    #2551 : `dependencies` sont les arêtes de prérequis du lot
+    (`work_dependencies.grouped`, enrichies de `satisfied_ts` — fusion ou
+    clôture du bloqueur — par l'appelant). Une dépendance bloquante ouverte ne
+    produit pas de ligne `intake_started` ; toutes satisfaites, le départ est
+    la levée du dernier bloqueur (`intake_ready_ts`).
     """
     events = list(events)
     now = time.time() if now is None else float(now)
@@ -293,13 +337,18 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     started = _first_event(events, "build")
     if requested is not None and state not in ("merged", "promoted", "closed"):
         step = step_of("intake_started")
-        ready = assigned if assigned is not None else requested
+        ready = intake_ready_ts(assigned, requested, dependencies, started=started)
         # #2562 : un report planifié ne constitue pas un retard intake.
         from .plan import day_start_ts
         planned = day_start_ts(item.get("planned_start"))
-        if planned is not None:
+        if ready is not None and planned is not None:
             ready = max(float(ready), planned)
-        if started is not None:
+        if ready is None:
+            # #2551 : dépendance bloquante ouverte — le lot n'est pas prêt,
+            # aucun délai ne court : son porteur ne peut rien faire avant la
+            # levée du prérequis. La mesure repart de cette levée.
+            pass
+        elif started is not None:
             out.append(_row(step, ready, now=now, critical=critical,
                             done_ts=round(started, 3),
                             elapsed_s=int(max(0.0, started - float(ready)))))

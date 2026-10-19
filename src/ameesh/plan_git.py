@@ -1135,9 +1135,31 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
                                "reverts its content"
                                % (branch, tip[:12], target, stopped["ref"][:12]))
         if not _on_first_parent(repo, tip, head):
-            return dict(out, merged=True, how="ancestor", ref=tip,
-                        detail="%s (%s) entered %s through a merge commit"
-                               % (branch, tip[:12], target))
+            # #2543 : une pointe entrée par un commit de fusion n'est pas une
+            # preuve en soi — une branche créée sur un commit de paquet déjà
+            # fusionné a exactement cette forme, sans travail propre. La voie
+            # « ancestor » n'est retenue que si cette pointe a déjà été vue en
+            # avance pour le lot (`branch_head`), ou qu'une fusion de la cible
+            # cite la branche ; sinon le lot ne bouge pas.
+            if seen_head and _commit(repo, seen_head) == tip:
+                return dict(out, merged=True, how="ancestor", ref=tip,
+                            detail="%s (%s) entered %s through a merge commit; "
+                                   "its tip was seen ahead for this lot"
+                                   % (branch, tip[:12], target))
+            found = seen()
+            if found:
+                return found
+            cited = mention(
+                "%s has no work of its own: its tip %s is an ancestor of %s through "
+                "a merge commit, but it was never seen ahead for this lot"
+                % (branch, tip[:12], target))
+            if cited["merged"]:
+                # la fusion cite la branche : la pointe est bien entrée par
+                # elle, l'ancêtre est la preuve (comme avant #2543)
+                return dict(cited, how="ancestor", ref=tip,
+                            detail="%s (%s) entered %s through a merge commit "
+                                   "that cites it" % (branch, tip[:12], target))
+            return cited
         return seen() or mention("%s has no work of its own: its tip %s is on the "
                                  "line of %s" % (branch, tip[:12], target))
     out["ahead"] = True

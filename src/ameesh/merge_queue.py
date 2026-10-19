@@ -61,6 +61,14 @@ class QueueError(RuntimeError):
     """A lot that cannot enter the queue: actionable message."""
 
 
+class RegistryReadError(QueueError):
+    """#2521 : le registre des agents n'a pas pu être lu.
+
+    Ce n'est pas une famille inconnue (agent absent, harnais non reconnu) :
+    conclure `verdicts-missing` sur une lecture impossible ferait écarter un
+    lot prêt du paquet. Le diagnostic doit nommer l'échec de lecture."""
+
+
 # --------------------------------------------------------------------------
 # entering and leaving
 # --------------------------------------------------------------------------
@@ -120,6 +128,9 @@ CRITICAL_SCOPE = (
                # la porte de fusion hors API, la classe du lot et son classement
                # (#2249 ; ligne perdue dans une composition, restaurée #2374)
                r"(^|/)(merge_pr|lot_class|review)\.py$|"
+               # ce qui entre dans un paquet : la liste calculée des lots
+               # prêts et ses remises (#2496)
+               r"^src/ameesh/packet_candidates\.py$|^scripts/paquet-candidats\.py$|"
                # le report des verdicts acquis sur une tête réalignée (#2442)
                r"^src/ameesh/verdict_carry\.py$|"
                # preuve de famille indépendante des avis (#2265)
@@ -212,15 +223,20 @@ def _same_sha(a, b, repo: str | None = None) -> bool:
 def actor_family(db, name) -> str:
     """La famille de modèle d'un agent (`claude`, `codex`, `deepseek`), "" si
     elle n'est pas connue : un humain, un agent absent du registre, un harnais
-    non reconnu. L'indépendance d'un avis ne se suppose jamais (#1374)."""
+    non reconnu. L'indépendance d'un avis ne se suppose jamais (#1374).
+
+    Une lecture du registre impossible lève `RegistryReadError` (#2521) : la
+    famille n'est pas « inconnue », elle n'a pas pu être lue ; les appelants
+    qui ne peuvent rien en faire d'autre l'attrapent explicitement."""
     from . import registry, review_lot
     name = str(name or "").strip()
     if not name or name.startswith(work.HUMAN_PREFIX) or ":" in name:
         return ""
     try:
         row = registry.get(db, name) or {}
-    except Exception:  # noqa: BLE001 - registre illisible : famille inconnue
-        return ""
+    except Exception as exc:  # noqa: BLE001 - #2521 : lecture impossible, pas inconnue
+        raise RegistryReadError(
+            "cannot read the agent registry for %s: %s" % (name, exc)) from exc
     return review_lot.family_of(registry.live_harness(row))
 
 
@@ -335,8 +351,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     # une copie antérieure au gel.
     waived, waived_by, row = _waiver(db, item)
     author = str(row.get("assignee") or "").strip()
-    out = {"ok": False, "why": "", "class": cls, "required": 0, "accepted": [],
-           "blocked": [], "waived": waived, "waived_by": waived_by,
+    out = {"ok": False, "why": "", "error": "", "class": cls, "required": 0,
+           "accepted": [], "blocked": [], "waived": waived, "waived_by": waived_by,
            "author": author, "author_family": "", "on_freeze": 0}
     if not frozen:
         out["why"] = "no freeze to review: the fire names the exact frozen head"
@@ -367,7 +383,18 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     if required == 0:
         out["ok"] = True
         return out
-    author_family = actor_family(db, author)
+    try:
+        author_family = actor_family(db, author)
+    except RegistryReadError as exc:
+        # #2521 : le registre est illisible, ce n'est pas « famille inconnue ».
+        # La porte refuse toujours (l'indépendance ne se suppose pas) mais le
+        # diagnostic doit dire la lecture impossible, pas un verdict manquant.
+        out["error"] = str(exc)
+        out["why"] = ("no review verdict ok on the freeze %s (class: %s): the agent "
+                      "registry cannot be read (%s), so no verdict can be proven "
+                      "independent (canon §2: independence is never assumed)"
+                      % (frozen[:12], cls, exc))
+        return out
     out["author_family"] = author_family
     # L'indépendance ne se suppose jamais (canon §2, décision 18855a) : une
     # classe sensible — y compris un doute de classe, qui peut cacher SQL, la
@@ -390,7 +417,15 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         actor = str(mark.get("actor") or "").strip()
         if author and actor and actor.lower() == author.lower():
             continue                      # on ne relit pas son propre travail
-        family = actor_family(db, actor)
+        try:
+            family = actor_family(db, actor)
+        except RegistryReadError as exc:
+            out["error"] = str(exc)
+            out["why"] = ("no review verdict ok on the freeze %s (class: %s): the agent "
+                          "registry cannot be read (%s), so the reviewer %s cannot be "
+                          "proven independent (canon §2: independence is never assumed)"
+                          % (frozen[:12], cls, exc, actor or "(none)"))
+            return out
         if strict:
             if not family:
                 continue                  # famille du relecteur inconnue : non prouvée
@@ -422,6 +457,47 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                   "verdict(s) required, %s; got %s"
                   % (frozen[:12], cls, required, need, got))
     return out
+
+
+def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None) -> dict | None:
+    """La porte des avis du dernier gel d'un lot, lue comme la composition du
+    paquet (`packet_candidates`) : dépôt retrouvé par le commit gelé (#2559,
+    l'hôte qui lit le lot n'est pas toujours celui de son auteur), classe du
+    diff gelé, puis `review_gate`.
+
+    Rend None quand la lecture n'est pas concluante (pas de gel, dépôt
+    introuvable, classe en doute sans chemin lisible) : l'appelant ne doit
+    jamais lire None comme une porte ouverte. Lecture seule."""
+    from . import lot_class
+
+    freeze = plan_git.latest_freeze(marks or ())
+    frozen = str((freeze or {}).get("sha") or "").strip()
+    repo = lot_class.repo_for_freeze(db, cfg, item, frozen) if frozen else ""
+    try:
+        # Comme la file : origin/<cible> avant la branche locale, qui peut
+        # encore contenir dans le diff des changements déjà fusionnés (#2207).
+        target = lot_class.default_base(cfg, item, repo) if repo else None
+        base = _class_base(repo, target) if target else None
+        base_sha = plan_git._commit(repo, base) if base else None
+        klass = klass or lot_class.of_lot(
+            db, int((item or {}).get("id") or 0), cfg=cfg, item=item,
+            repo=repo or None, head=frozen or None, milestones=marks or None,
+            base=base, base_sha=base_sha)
+    except Exception:  # noqa: BLE001 - une lecture ratée ne conclut pas
+        return None
+    if not klass:
+        return None
+    if klass.get("doubt") and not klass.get("files"):
+        return None
+    frozen = str(klass.get("frozen_sha") or frozen or "").strip()
+    if not frozen:
+        return None
+    try:
+        return review_gate(db, marks or [], frozen,
+                           repo=klass.get("repo") or repo or None,
+                           klass=klass, item=item)
+    except Exception:  # noqa: BLE001 - une porte illisible ne conclut pas
+        return None
 
 
 def _remote_branch(name: str) -> str:

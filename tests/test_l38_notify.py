@@ -16,7 +16,7 @@ import tempfile
 import threading
 import unittest
 
-from ameesh import fil, mail, notify, registry, storage, work
+from ameesh import alert_ack, fil, mail, notify, registry, storage, work
 
 from .support import FAKEBIN, PgTestCase
 from .test_canon import _TmpMixin, write
@@ -485,6 +485,63 @@ class FiabiliteTest(_Base):
         self.assertEqual([(r["event"], r["type"]) for r in records],
                          [("raised", "stopped_with_mail")])
 
+    def test_une_seule_notification_par_alerte_et_par_humain(self):
+        # #2395 : le registre `notified` retient l'alerte (même `since`) et son
+        # humain, même résolue puis revenue, et après redémarrage.
+        path = os.path.join(self.tmp, "notify", "state.json")
+        ncfg = self.ncfg(default_human="human:proprio")
+        alerte = _alert()
+        notifier = self.notifier(ncfg)
+        self.assertEqual(len(self.passe(notifier, [alerte])), 1)
+        self.assertEqual(len(_desktop_log(self.desk)), 1)
+        records = self.passe(notifier, [])
+        self.assertEqual([r["event"] for r in records], ["resolved"])
+        sent = len(_desktop_log(self.desk))
+        records = self.passe(notifier, [alerte])
+        self.assertEqual([r for r in records if r["event"] == "raised"], [])
+        self.assertEqual(len(_desktop_log(self.desk)), sent)
+        self.assertTrue(any("already notified" in line for line in self.logs))
+        notify.save_state(path, notifier.state)
+        notifier = self.notifier(ncfg, notify.load_state(path))
+        self.assertEqual(self.passe(notifier, [alerte]), [])
+        self.assertEqual(len(_desktop_log(self.desk)), sent)
+        # un humain différent est une autre notification (le registre est par
+        # humain) ; l'entrée active de l'ancien humain est écartée pour isoler
+        # ce que le registre retient.
+        notifier.state["active"] = {}
+        autre = dict(alerte, responsible="human:autre")
+        records = self.passe(notifier, [autre])
+        self.assertEqual([(r["event"], r["human"]) for r in records],
+                         [("raised", "human:autre")])
+
+    def test_nouvel_episode_sans_since_dans_la_cle_renotifie(self):
+        # #2395 (relecture b861fba4) : la clé de `ci_runner_stuck` n'a pas de
+        # `since` (une alerte par cause et par dépôt, #845). Un nouvel épisode,
+        # après résolution, est une nouvelle alerte : le registre ne la tait pas.
+        ncfg = self.ncfg(default_human="human:proprio")
+        notifier = self.notifier(ncfg)
+        episode = _alert("ci_runner_stuck", agent=None, since=1000.0,
+                         reason="manaty/ameesh", repo="manaty/ameesh")
+        self.assertEqual(len(self.passe(notifier, [episode])), 1)
+        self.assertEqual([r["event"] for r in self.passe(notifier, [])], ["resolved"])
+        retour = dict(episode, since=9000.0)
+        self.assertEqual(notify.key_of(retour), notify.key_of(episode))
+        records = self.passe(notifier, [retour])
+        self.assertEqual([r["event"] for r in records], ["raised"])
+        # le même épisode qui revient (même `since`) reste dédoublonné
+        self.passe(notifier, [])
+        self.assertEqual([r for r in self.passe(notifier, [retour])
+                          if r["event"] == "raised"], [])
+        # sans `since`, l'épisode n'a pas d'identité : la résolution libère
+        # le registre, le retour repart comme avant #2395
+        self.passe(notifier, [])
+        sans_date = _alert("orphan_lot", agent="coord", since=None, lot=8)
+        self.assertEqual([r["event"] for r in self.passe(notifier, [sans_date])],
+                         ["raised"])
+        self.assertEqual([r["event"] for r in self.passe(notifier, [])], ["resolved"])
+        self.assertEqual([r["event"] for r in self.passe(notifier, [sans_date])],
+                         ["raised"])
+
     def test_etat_illisible_mis_de_cote(self):
         path = os.path.join(self.tmp, "notify", "state.json")
         os.makedirs(os.path.dirname(path))
@@ -528,6 +585,204 @@ class FiabiliteTest(_Base):
         self.assertEqual([r["event"] for r in records], ["summary"])
         self.assertIn("1 stopped_with_mail", records[0]["text"])
         self.assertIn("resolved: 2", records[0]["text"])
+        self.assertEqual(notifier.state["summary"], {})
+
+    def test_resume_de_debit_marque_les_membres_et_bloque_le_renvoi(self):
+        # #2395 B2 : une alerte livrée par un résumé de débit entre dans le
+        # registre `notified` (identités/sévérités/humains des membres), après
+        # le succès du résumé et avant tout redémarrage ; la même alerte
+        # revenue après la fenêtre ne repart pas en envoi direct.
+        path = os.path.join(self.tmp, "notify", "state.json")
+        ncfg = self.ncfg(default_human="human:proprio", rate_per_minute=1)
+        a, b = _alert(agent="a"), _alert(agent="b")
+        notifier = self.notifier(ncfg)
+        records = self.passe(notifier, [a, b])
+        self.assertEqual([(r["event"], r["delivery"]) for r in records],
+                         [("raised", "envoyee"), ("raised", "resumee"),
+                          ("summary", "envoyee")])
+        self.assertEqual(len(_desktop_log(self.desk)), 2)
+        entree_b = {"key": notify.key_of(b), "severity": alert_ack.severity(b), "alert": b}
+        identite_b = notify.Notifier._notified_id(entree_b, "human:proprio")
+        self.assertIn(identite_b, notifier.state["notified"])
+        notify.save_state(path, notifier.state)
+        # reprise : le registre relu suffit à ne pas renvoyer B
+        notifier = self.notifier(ncfg, notify.load_state(path))
+        self.now += 61
+        self.assertEqual([r["event"] for r in self.passe(notifier, [a])], ["summary"])
+        envoyes = len(_desktop_log(self.desk))
+        records = self.passe(notifier, [a, b])
+        self.assertEqual([r for r in records if r["event"] == "raised"], [])
+        self.assertEqual(len(_desktop_log(self.desk)), envoyes)
+
+    def test_resume_de_debit_en_echec_ne_marque_pas_avant_le_succes(self):
+        # #2395 B2 : le registre n'est marqué qu'après un envoi réussi ; un
+        # résumé en échec reste en attente et ne fait pas taire l'alerte.
+        ncfg = self.ncfg(default_human="human:proprio", rate_per_minute=1)
+        a, b = _alert(agent="a"), _alert(agent="b")
+        reel = notify.Sender(env=_sender_env(self.desk))
+        appels = []
+
+        class EchecPuisSucces:
+            def send(self, channel, message):
+                appels.append(channel.name)
+                if len(appels) == 2:
+                    raise notify.ChannelError("panne simulee")
+                return reel.send(channel, message)
+
+        notifier = self.notifier(ncfg, sender=EchecPuisSucces())
+        self.passe(notifier, [a, b])
+        entree_b = {"key": notify.key_of(b), "severity": alert_ack.severity(b), "alert": b}
+        identite_b = notify.Notifier._notified_id(entree_b, "human:proprio")
+        self.assertNotIn(identite_b, notifier.state["notified"])
+        self.assertIn("human:proprio", notifier.state["summary"])
+        # le résumé est retenté au passage suivant et marque alors son membre
+        self.passe(notifier, [a, b])
+        self.assertIn(identite_b, notifier.state["notified"])
+        self.assertEqual(notifier.state["summary"], {})
+
+    def test_resume_de_debit_ne_redouble_pas_un_envoi_direct(self):
+        # #2395 B2 (relecture e828508e1) : un bucket de résumé resté en échec
+        # pendant que l'alerte se résout puis revient ne doit pas réémettre un
+        # `raised` déjà livré en direct dans la même passe.
+        ncfg = self.ncfg(default_human="human:proprio", rate_per_minute=1)
+        alerte = _alert(agent="B", since=900.0, responsible="human:proprio")
+        reel = notify.Sender(env=_sender_env(self.desk))
+
+        class Pannable:
+            panne = True
+
+            def send(self, channel, message):
+                if self.panne:
+                    raise notify.ChannelError("panne simulee")
+                return reel.send(channel, message)
+
+        sender = Pannable()
+        state = notify.empty_state()
+        state["rate"]["human:proprio"] = [4000.0]
+        notifier = self.notifier(ncfg, state, sender=sender)
+        self.now = 4000.0
+        self.passe(notifier, [alerte])
+        self.assertTrue(notifier.state["summary"])
+        self.now = 4001.0
+        self.passe(notifier, [])
+        self.now = 4061.0
+        sender.panne = False
+        records = self.passe(notifier, [alerte])
+        self.assertEqual([(r["event"], r["delivery"]) for r in records],
+                         [("raised", "envoyee")])
+        self.assertEqual(len(_desktop_log(self.desk)), 1)
+        self.assertEqual(notifier.state["summary"], {})
+
+    def test_resume_de_debit_ancien_membre_raccorde_a_l_entree_active(self):
+        # #2395 B2 (relecture e828508e1) : un membre synthétique de l'ancien
+        # format est raccordé à l'entrée active persistée quand elle est
+        # identifiable ; le résumé marque alors sa vraie identité, et le retour
+        # de l'alerte ne repart ni en direct ni en résumé.
+        ncfg = self.ncfg(default_human="human:proprio")
+        alerte = _alert(agent="B", since=900.0, responsible="human:proprio")
+        state = notify.empty_state()
+        key = notify.key_of(alerte)
+        # état antérieur au lot : l'entrée active n'avait pas encore de
+        # `severity` persistée ; le raccord doit retrouver l'identité réelle.
+        state["active"][key] = {
+            "alert": alerte, "key": key,
+            "human": "human:proprio", "source": "alerte", "status": "resumee",
+            "raised_ts": 900.0, "channels": {}}
+        state["summary"]["human:proprio"] = {
+            "raised": {"stopped_with_mail": 1}, "resolved": 0, "attempts": 0}
+        notifier = self.notifier(ncfg, state)
+        self.now = 3000.0
+        self.passe(notifier, [alerte])
+        identite = notify.Notifier._notified_id(
+            {"key": key, "severity": alert_ack.severity(alerte), "alert": alerte},
+            "human:proprio")
+        self.assertIn(identite, notifier.state["notified"])
+        self.assertEqual(len(_desktop_log(self.desk)), 1)
+        self.now = 3001.0
+        self.passe(notifier, [])
+        self.now = 3061.0
+        records = self.passe(notifier, [alerte])
+        self.assertEqual([r for r in records if r["event"] in ("raised", "summary")], [])
+        self.assertEqual(len(_desktop_log(self.desk)), 1)
+
+    def test_resume_de_debit_legacy_resolu_des_la_premiere_passe(self):
+        # #2395 B2 (relecture 13a963504) : la première passe constate la
+        # résolution ; l'entrée quitte `active` avant `_resolved`, mais le
+        # compte legacy est raccordé à son identité réelle avant le résumé.
+        ncfg = self.ncfg(default_human="human:proprio")
+        alerte = _alert(agent="B", since=900.0, responsible="human:proprio")
+        state = notify.empty_state()
+        key = notify.key_of(alerte)
+        state["active"][key] = {
+            "alert": alerte, "key": key, "human": "human:proprio",
+            "source": "alerte", "status": "resumee", "raised_ts": 900.0,
+            "channels": {}}
+        state["summary"]["human:proprio"] = {
+            "raised": {"stopped_with_mail": 1}, "resolved": 0, "attempts": 0}
+        reel = notify.Sender(env=_sender_env(self.desk))
+
+        class Panne:
+            def send(self, channel, message):
+                raise notify.ChannelError("panne simulee")
+
+        notifier = self.notifier(ncfg, state, sender=Panne())
+        self.now = 3000.0
+        self.passe(notifier, [])
+        identite = notify.Notifier._notified_id(
+            {"key": key, "severity": alert_ack.severity(alerte), "alert": alerte},
+            "human:proprio")
+        bucket = notifier.state["summary"]["human:proprio"]
+        self.assertIn(identite, bucket["raised"])
+        self.assertIn(identite, bucket["resolved"])
+        # résumé retenté canal rétabli, puis le retour de A ne repart pas
+        notifier.sender = reel
+        self.now = 3001.0
+        self.passe(notifier, [])
+        self.assertIn(identite, notifier.state["notified"])
+        self.assertEqual(len(_desktop_log(self.desk)), 1)
+        self.now = 3061.0
+        records = self.passe(notifier, [alerte])
+        self.assertEqual([r for r in records if r["event"] in ("raised", "summary")], [])
+        self.assertEqual(len(_desktop_log(self.desk)), 1)
+
+    def test_ancien_membre_sans_severity_marque_la_vraie_identite(self):
+        # #2395 B2 (relecture e828508e1) : une entrée active antérieure au lot
+        # n'avait pas de `severity` persistée ; le raccord la recalcule pour
+        # marquer la vraie identité, même sans passer par un relevé.
+        ncfg = self.ncfg(default_human="human:proprio")
+        alerte = _alert(agent="B", since=900.0, responsible="human:proprio")
+        state = notify.empty_state()
+        key = notify.key_of(alerte)
+        state["active"][key] = {
+            "alert": alerte, "key": key, "human": "human:proprio",
+            "source": "alerte", "status": "resumee", "raised_ts": 900.0,
+            "channels": {}}
+        state["summary"]["human:proprio"] = {
+            "raised": {"stopped_with_mail": 1}, "resolved": 0, "attempts": 0}
+        notifier = self.notifier(ncfg, state)
+        notifier._records = []
+        notifier._summaries(3000.0)
+        identite = notify.Notifier._notified_id(
+            {"key": key, "severity": alert_ack.severity(alerte), "alert": alerte},
+            "human:proprio")
+        self.assertIn(identite, notifier.state["notified"])
+        self.assertEqual(len(_desktop_log(self.desk)), 1)
+
+    def test_ancien_resume_de_debit_est_rendu_une_fois(self):
+        # état persisté avant #2395 : le compte par type reste rendu par le
+        # résumé, puis le registre n'a plus de membre à retenir. Bucket d'un
+        # humain qui n'est pas l'owner : le compte de résolutions sans type
+        # reste attribuable.
+        ncfg = self.ncfg(default_human="human:owner")
+        state = notify.empty_state()
+        state["summary"]["human:proprio"] = {
+            "raised": {"stopped_with_mail": 2}, "resolved": 1, "attempts": 0}
+        notifier = self.notifier(ncfg, state)
+        records = self.passe(notifier, [])
+        resumes = [r for r in records if r["event"] == "summary"]
+        self.assertEqual(len(resumes), 1)
+        self.assertIn("2 stopped_with_mail", resumes[0]["text"])
+        self.assertIn("resolved: 1", resumes[0]["text"])
         self.assertEqual(notifier.state["summary"], {})
 
     def test_canal_en_echec_isole_et_retente(self):
