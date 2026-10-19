@@ -418,10 +418,16 @@ class ActivationTest(_ActivationFixture, PgTestCase):
 
     def test_a_stale_light_freeze_does_not_clear_the_new_freeze(self):
         # Same guard on the light/no-path branch, which also writes the column.
+        # #2786: a freeze already in the target is refused, so the empty diff
+        # is an empty commit on top of the base, not the base itself.
         lot_head = self.frozen
-        self.frozen = self.base
+        branch = self.repo.git("rev-parse", "--abbrev-ref", "HEAD")
+        self.repo.git("checkout", "-q", self.base)
+        self.repo.git("commit", "-q", "--allow-empty", "-m", "gel vide")
+        self.frozen = self.repo.git("rev-parse", "HEAD")
         first, light = self.freeze()
         self.assertEqual(light["state"], rd.NONE, light)
+        self.repo.git("checkout", "-q", branch)
         self.frozen = lot_head
         self.repo.write("src/ameesh/work.py", "new head\n")
         self.frozen = self.repo.commit("new head")

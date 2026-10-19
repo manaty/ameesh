@@ -3096,6 +3096,10 @@ _REVIEWED_HEAD = re.compile(r"[0-9a-f]{%d,64}" % REVIEWED_HEAD_MIN)
 #: dans SON clone, et le balayage d'un hôte a passé un lot en `merged` sur le
 #: `HEAD` d'un autre arbre que celui gelé (#2712).
 FROZEN_HEAD_MIN = REVIEWED_HEAD_MIN
+#: #2786 (5) : la ligne machine de la note d'un gel qui dit dans quelles
+#: branches d'intégration il n'était pas encore (le balayage y croit la
+#: livraison par le contenu, même après une avance rapide).
+FREEZE_ABSENT_MARK = "ameesh-freeze-absent:"
 
 #: les jalons affichés, du plus récent au plus ancien : (nom, colonne d'instant,
 #: colonne de durée) — l'ordre est celui de la frise lue à l'envers. `delivered`
@@ -3243,6 +3247,90 @@ def reviewed_head(db: Db, item: dict, sha: str, *, repo: str | None = None) -> s
         "does not name the current frozen head" % text, repo=repo)
 
 
+def _freeze_refusal_target(repo: str, item: dict) -> str:
+    """La cible du lot lue dans `repo` (`branch_target`, puis le dépôt), ou ''."""
+    from . import plan_git
+    target = str((item or {}).get("branch_target") or "").strip()
+    if not target:
+        try:
+            target = str(plan_git.declared_target(repo) or "").strip()
+        except Exception:  # noqa: BLE001 - réglage illisible : cible inconnue
+            target = ""
+    if not target:
+        try:
+            target = str(plan_git.default_target(repo) or "").strip()
+        except Exception:  # noqa: BLE001 - cible par défaut illisible
+            target = ""
+    if not target:
+        return ""
+    try:
+        # la ref publiée (origin/<branche>) est plus fraîche que la locale
+        return str(plan_git.published_target(repo, target) or target)
+    except Exception:  # noqa: BLE001 - pas de remote : la cible reste lisible
+        return target
+
+
+def _refuse_freeze_already_in_target(repo: str, item: dict, full: str) -> None:
+    """#2786 (4) : refuser un gel qui n'a aucun commit propre.
+
+    Un gel déjà ancêtre de la cible au moment où il est posé ne prouvera
+    jamais une livraison (cas #2784 : un ancien commit d'un autre lot, déjà
+    dans `main`, gelé sans branche ni commit propre). La cible illisible ne
+    conclut pas : le balayage la traitera en doute."""
+    from . import plan_git
+    target = _freeze_refusal_target(repo, item)
+    if not target:
+        return
+    try:
+        if plan_git._commit(repo, target) is None:
+            return
+        if plan_git._is_ancestor(repo, full, target):
+            raise WorkError(
+                "freeze refused (already-in-target): %s is already an ancestor of %s "
+                "in %s — the freeze names no own commit; push the lot's commit and "
+                "freeze its head (#2784)" % (full[:12], target, repo))
+    except WorkError:
+        raise
+    except Exception:  # noqa: BLE001 - cible illisible : le balayage tranchera
+        return
+
+
+def _freeze_absent_marker(db: Db, item: dict, full: str, repo: str | None) -> str:
+    """La ligne machine des branches où `full` n'était pas au gel (#2786 (5)).
+
+    Le balayage y lira une preuve de livraison même après une avance rapide ;
+    sans elle (gel antérieur), il retombe sur l'instant du jalon. N'est écrite
+    que quand un dépôt de l'auteur porte le commit et que la liste est
+    lisible ; sinon rien (le balayage doutera, jamais ne devinera)."""
+    from . import freeze_checks, plan_git
+    where = ""
+    for candidate in ([repo] if repo else []) + _head_repos(db, item):
+        if candidate and freeze_checks.commit_in(candidate, full):
+            where = candidate
+            break
+    if not where:
+        return ""
+    names: dict = {}
+    try:
+        for prefix in ("refs/remotes/origin/", "refs/heads/"):
+            out = plan_git._out(where, "for-each-ref",
+                                "--format=%(refname) %(objectname)", prefix)
+            for line in (out or "").splitlines():
+                parts = line.split()
+                if len(parts) != 2:
+                    continue
+                name = parts[0][len(prefix):]
+                if name in ("develop", "main", "master") or name.startswith("release/"):
+                    names.setdefault(name, parts[1])
+        absent = sorted(name for name, tip in names.items()
+                        if not plan_git._is_ancestor(where, full, tip))
+    except Exception:  # noqa: BLE001 - refs illisibles : pas de marque
+        return ""
+    if not absent:
+        return ""
+    return "ameesh-freeze-absent: " + " ".join(absent[:8])
+
+
 def freeze_head(db: Db, item: dict, sha: str, *, repo: str | None = None) -> str:
     """La tête d'un gel, écrite en commit complet (#2786).
 
@@ -3254,41 +3342,60 @@ def freeze_head(db: Db, item: dict, sha: str, *, repo: str | None = None) -> str
     complète pour être écrite. Tout le reste est refusé : une ref symbolique
     (`HEAD`, une branche) n'est jamais résolue, parce que chaque lecteur la
     résoudrait dans SON clone et que le balayage d'un autre arbre passerait
-    le lot en `merged` sur un commit que personne n'a relu (#2712). Le
-    `sha` rendu est donc toujours le commit complet à stocker."""
+    le lot en `merged` sur un commit que personne n'a relu (#2712).
+
+    (4) : quand le dépôt de l'auteur est lisible, un commit déjà ancêtre de
+    la cible est refusé — il n'a aucun commit propre et ne prouverait aucune
+    livraison (#2784). Le `sha` rendu est donc toujours le commit complet à
+    stocker."""
     text = str(sha or "").strip().lower()
+    from . import freeze_checks
     if _FULL_HEAD.fullmatch(text):
-        return text
-    if not text:
+        full = text
+    elif not text:
         raise WorkError(
             "freeze refused (head-missing): a freeze must name the frozen commit — "
             "the full 40-hex commit id, or an abbreviation of at least %d hex "
             "characters resolved in the author's repository (`--sha`)"
             % FROZEN_HEAD_MIN)
-    if not _REVIEWED_HEAD.fullmatch(text):
+    elif not _REVIEWED_HEAD.fullmatch(text):
         raise WorkError(
             "freeze refused (head-missing): --sha %r is not a commit id — a symbolic "
             "ref (HEAD, a branch) is never resolved for a freeze: resolve it first "
             "(`git rev-parse <ref>`) and pass the full commit id, or an abbreviation "
             "of at least %d hex characters (`--sha`)" % (sha, FROZEN_HEAD_MIN))
-    from . import freeze_checks
-    if repo:
-        full = freeze_checks.commit_in(repo, text)
-        if full and full.lower().startswith(text):
-            return full.lower()
-        raise WorkError(
-            "freeze refused (head-unresolved): %s does not name a commit of %s; "
-            "freeze from the lot's worktree or pass --repo <the repository holding "
-            "the commit>" % (text, repo))
-    for where in _head_repos(db, item):
-        full = freeze_checks.commit_in(where, text)
-        if full and full.lower().startswith(text):
-            return full.lower()
-    raise WorkError(
-        "freeze refused (head-unresolved): %s does not resolve to a commit in the "
-        "author's repository (current directory, project repository, assignee's "
-        "worktree); freeze from the lot's worktree or pass --repo <the repository "
-        "holding the commit>" % text)
+    else:
+        full = ""
+        if repo:
+            resolved = freeze_checks.commit_in(repo, text)
+            if resolved and resolved.lower().startswith(text):
+                full = resolved.lower()
+            else:
+                raise WorkError(
+                    "freeze refused (head-unresolved): %s does not name a commit of %s; "
+                    "freeze from the lot's worktree or pass --repo <the repository "
+                    "holding the commit>" % (text, repo))
+        else:
+            for where in _head_repos(db, item):
+                resolved = freeze_checks.commit_in(where, text)
+                if resolved and resolved.lower().startswith(text):
+                    full = resolved.lower()
+                    _refuse_freeze_already_in_target(where, item, full)
+                    return full
+            if not full:
+                raise WorkError(
+                    "freeze refused (head-unresolved): %s does not resolve to a commit "
+                    "in the author's repository (current directory, project repository, "
+                    "assignee's worktree); freeze from the lot's worktree or pass --repo "
+                    "<the repository holding the commit>" % text)
+        _refuse_freeze_already_in_target(repo, item, full)
+        return full
+    # commit complet : on cherche un dépôt qui le contient pour la garde (4)
+    for where in ([repo] if repo else []) + _head_repos(db, item):
+        if where and freeze_checks.commit_in(where, full):
+            _refuse_freeze_already_in_target(where, item, full)
+            break
+    return full
 
 
 def milestone(
@@ -3377,6 +3484,12 @@ def milestone(
         # #2786 : écrire une tête immuable, jamais une ref que chaque lecteur
         # résoudrait dans son clone.
         sha = freeze_head(db, item, sha, repo=repo)
+        # (5) : la marque des branches où le gel était absent, pour que le
+        # balayage ne confonde pas une livraison (avance rapide) avec un gel
+        # déjà dans la cible. Une marque apportée par l'appelant est conservée.
+        marker = _freeze_absent_marker(db, item, sha, repo)
+        if marker and FREEZE_ABSENT_MARK not in note:
+            note = (note + "\n" if note else "") + marker
     drain: list | None = None
     if kind == "frozen" and on_frozen is None:
         from . import review_designation_activation as activation

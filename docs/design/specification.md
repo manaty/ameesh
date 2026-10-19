@@ -325,7 +325,10 @@ projet ou de l'assigné) et alors **écrite complète** ; une ref symbolique
 (`HEAD`, une branche) est refusée. Le balayage des fusions et la désignation
 automatique n'acceptent qu'un commit complet et ne résolvent jamais une ref
 dans leur propre clone : un gel « HEAD » vaut doute, jamais une livraison, et
-`ameesh work show` le signale (« jalon non rattaché à un commit »).
+`ameesh work show` le signale (« jalon non rattaché à un commit »). Un gel
+dont le commit est **déjà ancêtre de la cible** au moment du gel (aucun
+commit propre, cas #2784) est refusé à l'écriture ; et le balayage ne compte
+pas comme livraison un gel qui était déjà dans la cible quand il a été posé.
 Les durées `demande → gel`, `gel → revue`, `gel → fusion` et le nombre de
 verdicts bloqués se lisent dans `ameesh work list` (colonne DÉLAI), `ameesh work
 show` (frise complète) et le pied de `ameesh list` ; la forme complète est

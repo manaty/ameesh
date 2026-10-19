@@ -207,12 +207,21 @@ def _fetch_missing(repo: str, sha: str, target: str) -> str | None:
     return remote
 
 
-def probe(repo: str, sha: str, target: str, *, lot: int | None = None) -> dict:
+def probe(repo: str, sha: str, target: str, *, lot: int | None = None,
+          frozen_at: float | None = None, frozen_absent=()) -> dict:
     """Le commit `sha` est-il entré dans `target` ? Rend `{merged, how, ref, detail}`.
 
     `how` : ancestor | patch-id | squash | reverted ; `ref` : le commit de la
     cible qui porte le contenu (le gel lui-même s'il est ancêtre). `lot` :
     l'id du lot examiné, pour rattacher un revert à son porteur (#1825).
+
+    `frozen_at` (#2786) : l'instant du jalon `frozen` examiné. Si le commit
+    était déjà ancêtre de la cible **à cet instant**, il n'a jamais eu de
+    commit propre : ce n'est pas une livraison (cas #2784). `frozen_absent`
+    (la marque du gel) dispense de cette lecture d'instant pour la branche
+    cible : le gel y était absent quand il a été posé, une avance rapide
+    ultérieure est donc bien une livraison. Absent (une tête de branche, un
+    avis), la preuve par l'ancêtre reste celle d'avant.
 
     #1825 : une preuve par le contenu est annulée par un revert postérieur
     (`reverted_content`) — une tête ancêtre de la cible dont la fusion a été
@@ -239,6 +248,15 @@ def probe(repo: str, sha: str, target: str, *, lot: int | None = None) -> dict:
                 detail += " (explicit fetch from %s brought nothing)" % remote
             return {"merged": False, "how": None, "ref": None, "detail": detail}
     if _git(repo, "merge-base", "--is-ancestor", frozen, head).returncode == 0:
+        # #2786 (4)/(5) : un gel déjà ancêtre de la cible au moment où il a
+        # été posé ne prouve aucune livraison — c'est le cas #2784 (un ancien
+        # commit d'un autre lot, déjà dans main, gelé sans commit propre). La
+        # marque `frozen_absent` (branche cible absente au gel) lève le doute.
+        if frozen_at and _target_branch(target) not in set(frozen_absent) \
+                and _was_ancestor_at(repo, frozen, target, frozen_at):
+            return {"merged": False, "how": None, "ref": None,
+                    "detail": "%s was already an ancestor of %s when frozen: no own "
+                              "commit, not a delivery" % (frozen[:12], target)}
         stopped = reverted_content(repo, frozen, target, lot=lot)
         if stopped:
             return {"merged": False, "how": "reverted", "ref": None,
@@ -434,6 +452,33 @@ def same_commit(a, b) -> bool:
     """Deux identifiants qui nomment le même commit (préfixe admis, #1756)."""
     a, b = commit_id(a), commit_id(b)
     return bool(a and b) and (a == b or a.startswith(b) or b.startswith(a))
+
+
+#: #2786 (5) : les branches d'intégration où le gel n'était PAS quand il a été
+#: posé, écrites dans la note du jalon par `work.milestone` (une ligne
+#: machine) : la preuve de livraison y reste valable, même après une avance
+#: rapide. Les gels antérieurs n'ont pas la marque : repli sur l'instant.
+_FREEZE_ABSENT_RE = re.compile(r"(?m)^ameesh-freeze-absent:\s*(.*)$")
+
+
+def freeze_absent(note) -> frozenset[str]:
+    """Les branches d'intégration absentes au gel, lues dans la note (#2786)."""
+    match = _FREEZE_ABSENT_RE.search(str(note or ""))
+    if not match:
+        return frozenset()
+    return frozenset(word for word in match.group(1).split() if word)
+
+
+def _target_branch(target) -> str:
+    """Le nom de branche d'une cible (`origin/develop`, `develop`, …), ou ''."""
+    text = str(target or "").strip()
+    for prefix in ("refs/remotes/origin/", "refs/heads/", "origin/"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    if not text or _SHA_RE.match(text):
+        return ""
+    return text
 
 
 def rebase_identity(repo: str, reviewed: str, frozen: str, target: str) -> dict:
@@ -914,7 +959,12 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
         error = None
         for ref, off, closes in refs:
             try:
-                proof = probe(repo_dir, sha, ref, lot=lot)
+                proof = probe(
+                    repo_dir, sha, ref, lot=lot,
+                    frozen_at=(freeze or {}).get("at_ts")
+                    if freeze_origin == "frozen" else None,
+                    frozen_absent=freeze_absent((freeze or {}).get("note"))
+                    if freeze_origin == "frozen" else ())
             except (MergeProbeError, GitError) as exc:
                 if off:
                     residue = residue or "%s is unreadable (%s)" % (ref, exc)
@@ -1841,7 +1891,32 @@ def _is_ancestor(repo: str, sha: str, ref: str) -> bool:
     return _git(repo, "merge-base", "--is-ancestor", sha, ref).returncode == 0
 
 
-def _content_ancestor(repo: str, sha: str, target: str) -> bool:
+def _target_tip_at(repo: str, target: str, when) -> str | None:
+    """Le commit de la cible au plus tard à `when` (horodatage epoch), ou None.
+
+    #2786 (5) : la chaîne première-parente de la cible, lue à l'instant du
+    gel, dit si le gel y était déjà. `CLOCK_SLACK_S` est ajouté à l'instant du
+    jalon (horloge de la base) pour couvrir l'écart avec la date de committer
+    du poste qui a poussé : mieux vaut garder un lot ouvert (doute) que
+    fermer sur une fusion qui a suivi le gel."""
+    try:
+        stamp = float(when)
+    except (TypeError, ValueError):
+        return None
+    if stamp <= 0:
+        return None
+    return _out(repo, "rev-list", "-1", "--first-parent",
+                "--before=@%d" % int(stamp + CLOCK_SLACK_S), target)
+
+
+def _was_ancestor_at(repo: str, sha: str, target: str, when) -> bool:
+    """Le commit `sha` était-il déjà ancêtre de `target` à l'instant `when` ?"""
+    tip = _target_tip_at(repo, target, when)
+    return bool(tip) and _is_ancestor(repo, sha, tip)
+
+
+def _content_ancestor(repo: str, sha: str, target: str, *,
+                      at_ts: float | None = None, absent=()) -> bool:
     """#1005 : le commit gelé est-il ancêtre de la cible ? C'est la preuve par
     contenu la moins chère (une commande git), celle d'une fusion `--no-ff`
     (ou d'une avance rapide) poussée sur la branche d'intégration sans citer
@@ -1851,14 +1926,22 @@ def _content_ancestor(repo: str, sha: str, target: str) -> bool:
     #2786 : seul un commit complet est résolu ; une ref symbolique (`HEAD`, une
     branche) n'est jamais passée à `rev-parse`, dont le résultat dépendrait du
     clone du balayage — le cas #2712, qui a fermé un lot sur le `HEAD` d'un
-    autre arbre."""
+    autre arbre. Et un gel déjà ancêtre de la cible **quand il a été posé**
+    (`at_ts`) n'a aucun commit propre : ce n'est pas une livraison (#2784),
+    sauf si la marque `absent` dit que la branche cible ne le portait pas au
+    gel (une avance rapide ultérieure est alors une vraie livraison)."""
     frozen = full_commit_id(sha)
     if not frozen:
         return False
     head = _commit(repo, target)
     if head is None:
         return False
-    return _is_ancestor(repo, frozen, head)
+    if not _is_ancestor(repo, frozen, head):
+        return False
+    if at_ts and _target_branch(target) not in set(absent) \
+            and _was_ancestor_at(repo, frozen, target, at_ts):
+        return False
+    return True
 
 
 def _content_carrier(repo: str, sha: str, target: str) -> tuple[dict | None, bool]:
@@ -2095,7 +2178,9 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
     content = None
     reverted = None
     if freeze_sha and cited is None and not held and not (found and found["merged"]) \
-            and _content_ancestor(repo, freeze_sha, target):
+            and _content_ancestor(
+                repo, freeze_sha, target, at_ts=(freeze or {}).get("at_ts"),
+                absent=freeze_absent((freeze or {}).get("note"))):
         # #1825 : la tête gelée reste ancêtre de la cible quand sa fusion a
         # été annulée par un revert — le contenu n'y est plus, rien n'est livré
         reverted = reverted_content(repo, freeze_sha, target, lot=lot, branch=branch,

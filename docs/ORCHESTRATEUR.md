@@ -479,7 +479,9 @@ La tête du gel est un commit **complet** (une abréviation de 12+ hexadécimaux
 est résolue dans le dépôt de l'auteur et écrite complète) ; `HEAD` et un nom
 de branche sont refusés : chaque lecteur les résoudrait dans son clone, et le
 balayage d'un autre arbre a déjà fermé un lot sur ce `HEAD` (#2786, #2712).
-Un gel non conforme resté en base vaut doute, jamais une livraison.
+Un gel non conforme resté en base vaut doute, jamais une livraison. Un gel
+dont le commit est déjà ancêtre de la cible au moment du gel (aucun commit
+propre) est refusé : c'est un ancien commit, pas la branche du lot (#2784).
 
 ameesh range la file à chaque passage du radar : priorité, puis les lots
 sans conflit, puis ceux dont les conflits sont préparés (`ameesh work

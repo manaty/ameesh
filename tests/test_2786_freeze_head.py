@@ -94,7 +94,14 @@ class FreezeHeadWriteTest(PgTestCase):
     def test_une_abreviation_est_resolue_dans_le_depot_de_l_auteur(self):
         repo = tempfile.mkdtemp(prefix="ameesh-2786-")
         self.addCleanup(shutil.rmtree, repo, True)
-        head = repo_with_commit(repo)
+        repo_with_commit(repo)
+        # un commit propre à la branche du lot, pas la tête de la cible
+        git(repo, "checkout", "-q", "-b", "lot/2786-test")
+        with open(os.path.join(repo, "own"), "w", encoding="utf-8") as fh:
+            fh.write("own\n")
+        git(repo, "add", "own")
+        git(repo, "commit", "-qm", "propre")
+        head = git(repo, "rev-parse", "HEAD")
         row = self.freeze(head[:12], repo=repo)
         self.assertEqual(row["sha"], head)
 
@@ -104,6 +111,32 @@ class FreezeHeadWriteTest(PgTestCase):
         self.assertIn("head-unresolved", str(caught.exception))
         self.assertIn("deadbeefdead", str(caught.exception))
         self.assertEqual(self.freezes(), [])
+
+    def test_un_gel_deja_dans_la_cible_est_refuse(self):
+        # #2784 : le gel est la tête de la cible elle-même (aucun commit
+        # propre) ; la branche du lot n'a rien poussé.
+        repo = tempfile.mkdtemp(prefix="ameesh-2786-")
+        self.addCleanup(shutil.rmtree, repo, True)
+        head = repo_with_commit(repo)
+        work.set_branch(self.db, self.lot, "lot/2786-test", "main", actor="auteur")
+        with self.assertRaises(work.WorkError) as caught:
+            self.freeze(head, repo=repo)
+        self.assertIn("already-in-target", str(caught.exception))
+        self.assertEqual(self.freezes(), [])
+
+    def test_un_commit_propre_reste_gelable(self):
+        repo = tempfile.mkdtemp(prefix="ameesh-2786-")
+        self.addCleanup(shutil.rmtree, repo, True)
+        repo_with_commit(repo)
+        work.set_branch(self.db, self.lot, "lot/2786-test", "main", actor="auteur")
+        git(repo, "checkout", "-q", "-b", "lot/2786-test")
+        with open(os.path.join(repo, "own"), "w", encoding="utf-8") as fh:
+            fh.write("own\n")
+        git(repo, "add", "own")
+        git(repo, "commit", "-qm", "propre")
+        sha = git(repo, "rev-parse", "HEAD")
+        row = self.freeze(sha, repo=repo)
+        self.assertEqual(row["sha"], sha)
 
     def test_la_cli_refuse_head_avant_les_controles_statiques(self):
         proc = self.mesh("work", "milestone", str(self.lot), "frozen",
@@ -190,13 +223,61 @@ class SweepDoubtTest(_SweepBase):
         self.assertEqual(entry["result"], "doubt")
         self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
 
-    def test_un_gel_complet_reste_une_preuve_de_livraison(self):
-        # Contrôle : la même scène, gelée sur le SHA complet, ferme le lot.
+    def test_un_gel_deja_dans_la_cible_ne_ferme_pas(self):
+        # #2784 : le gel est un ancien commit déjà dans la cible au moment du
+        # gel (aucun commit propre) ; il ne prouve aucune livraison.
         lot = self.lot(self.frozen)
+        report = plan_git.sync_branches(self.db, host=self.cfg.host)
+        entry = self.entry(report, lot)
+        self.assertNotEqual(entry["result"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_un_gel_deja_dans_la_cible_ne_ferme_pas_par_le_contenu(self):
+        lot = self.lot(self.frozen)
+        report = plan_git.sync_merges(self.db, self.repo, target="origin/develop")
+        entry = self.entry(report, lot)
+        self.assertNotEqual(entry["result"], "merged")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_un_gel_pose_avant_la_fusion_reste_une_preuve(self):
+        # Contrôle : le gel a été posé AVANT la fusion (la cible d'alors ne le
+        # portait pas) ; le balayage le constate et ferme le lot.
+        git(self.repo, "checkout", "-q", "-b", "agent/own", "develop")
+        sha = self.commit("own")
+        lot = self.lot(sha)
+        self.db.execute(
+            "UPDATE work_item_milestones SET at = now() - interval '1 hour'"
+            " WHERE work_item_id = %s AND kind = 'frozen'", (lot["id"],))
+        git(self.repo, "checkout", "-q", "develop")
+        git(self.repo, "merge", "-q", "--no-ff", "-m",
+            "Merge branch 'agent/own' into develop", "agent/own")
+        git(self.repo, "update-ref", "refs/remotes/origin/develop",
+            git(self.repo, "rev-parse", "develop"))
         report = plan_git.sync_branches(self.db, host=self.cfg.host)
         entry = self.entry(report, lot)
         self.assertEqual(entry["result"], "merged")
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    def test_un_gel_marque_ferme_meme_en_avance_rapide(self):
+        # #2786 (5) : le gel réel écrit la marque des branches où il était
+        # absent ; une avance rapide postérieure reste une livraison, même si
+        # la date du commit précède le gel (le cas qui trompait l'instant).
+        git(self.repo, "checkout", "-q", "-b", "agent/ff", "develop")
+        sha = self.commit("ff")
+        item = work.add(self.db, title="lot avec marque", assignee="claude1",
+                        actor="orch")
+        for state in ("build", "qa"):
+            work.move(self.db, item["id"], state, actor="orch")
+        row = work.milestone(self.db, item["id"], "frozen", sha=sha, actor="auteur")
+        self.assertIn("ameesh-freeze-absent: develop", row["note"])
+        git(self.repo, "checkout", "-q", "develop")
+        git(self.repo, "merge", "-q", "--ff-only", "agent/ff")
+        git(self.repo, "update-ref", "refs/remotes/origin/develop",
+            git(self.repo, "rev-parse", "develop"))
+        report = plan_git.sync_branches(self.db, host=self.cfg.host)
+        entry = self.entry(report, item)
+        self.assertEqual(entry["result"], "merged")
+        self.assertEqual(work.get(self.db, item["id"])["state"], "merged")
 
 
 class _Port:

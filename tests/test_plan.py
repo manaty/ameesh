@@ -1149,7 +1149,11 @@ class ContentMergeTest(_PlanDb):
         item = work.add(self.db, title=title, **kwargs)
         for state in ("build", "qa"):
             work.move(self.db, item["id"], state)
-        work.milestone(self.db, item["id"], "frozen", sha=sha, actor="ouvrier")
+        # #2786 (5) : les tests fusionnent dans `main` AVANT de geler. La
+        # marque dit ce que le gel réel aurait écrit : `main` ne portait pas
+        # encore le commit, donc la livraison constatée reste prouvable.
+        work.milestone(self.db, item["id"], "frozen", sha=sha, actor="ouvrier",
+                       note="ameesh-freeze-absent: main")
         return item
 
     def run_sync(self, **kwargs) -> dict:
@@ -1406,12 +1410,13 @@ class ContentMergeTest(_PlanDb):
         real = plan_git.probe
         moved = []
 
-        def probe(repo, sha, target, *, lot=None):
+        def probe(repo, sha, target, *, lot=None, frozen_at=None, frozen_absent=()):
             if lot == item["id"] and not moved:
                 moved.append(True)
                 work.move(self.db, item["id"], "blocked", note="pendant le relevé",
                           actor="dev-a")
-            return real(repo, sha, target, lot=lot)
+            return real(repo, sha, target, lot=lot, frozen_at=frozen_at,
+                        frozen_absent=frozen_absent)
 
         with mock.patch.object(plan_git, "probe", side_effect=probe):
             result = self.run_sync()[item["id"]]
@@ -1521,7 +1526,8 @@ class ContentMergeTest(_PlanDb):
         git(self.repo, "merge", "-q", "--ff-only", "lot/x")
         git(self.repo, "checkout", "-q", "lot/x")
         latest = self.commit("src/x.py", "x=2\n", "nouveau travail gelé")
-        work.milestone(self.db, item["id"], "frozen", sha=latest, actor="ouvrier")
+        work.milestone(self.db, item["id"], "frozen", sha=latest, actor="ouvrier",
+                       note="ameesh-freeze-absent: main")
         result = self.run_sync()[item["id"]]
         self.assertEqual(result["result"], "open", result)
         self.assertEqual(result["sha"], latest)
