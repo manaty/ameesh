@@ -107,7 +107,7 @@ class DeclareTargetTest(unittest.TestCase):
         self._unset()
         with mock.patch.object(resolutions.Replayer, "declare_target",
                                side_effect=resolutions.GitError(
-                                   "git config: permission denied")):
+                                   "git config: error: could not lock config file .git/config: Permission denied")):
             with self.assertRaises(resolutions.GitError):
                 self.replayer.fetch()
 

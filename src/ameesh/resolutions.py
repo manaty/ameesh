@@ -1123,7 +1123,9 @@ class Replayer:
             # `git config` (`.git/config.lock`) à la première écriture. Le
             # fetch lui-même est fait ; la cible sera déclarée à la passe
             # suivante, jamais au prix d'une erreur pour cet échec transitoire.
-            if "could not lock config file" not in str(exc):
+            message = str(exc)
+            if ("could not lock config file" not in message
+                    or not message.endswith(": File exists")):
                 raise
 
     def _empty_cache(self) -> None:
