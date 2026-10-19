@@ -10,8 +10,10 @@ the inventory and the historical admission readers are used read-only.
 The comparison is the proof the pilot asks for: lots the composer included but
 the train omitted (with the named reason the train had), lots the train would
 have included and the composer did not, and the packet stamp/base that matched.
-A missing shadow plan for a packet is not an explained difference; it is
-recorded as such.
+A lot already composed in a packet that was still in flight at the cutoff is
+not a disagreement: it is named with its carrier ("porté par ... en vol")
+instead of being reported as an extra. A missing shadow plan for a packet is
+not an explained difference; it is recorded as such.
 """
 from __future__ import annotations
 
@@ -20,8 +22,10 @@ import os
 import re
 from datetime import datetime
 
-from . import (merge_queue, resolutions, train, train_admissions,
-               train_candidates, train_git, train_history, train_policy)
+from . import (land, merge_queue, plan_git, radar, resolutions, train,
+               train_admissions, train_candidates, train_git, train_history,
+               train_policy)
+from .canon import FETCH_TIMEOUT
 
 SCHEMA = "ameesh-train-shadow/1"
 #: kept plans and comparisons: enough for the two real packets of the proof
@@ -30,10 +34,40 @@ MAX_PLANS = 24
 MAX_COMPARISONS = 48
 _MANUAL = re.compile(r"integration/paquet-h-(\d{8}-\d{4})")
 _LOT = re.compile(r"#(\d+)")
+#: open packet branches are read in a private namespace of the shadow clone;
+#: the shadow never checks them out nor publishes anything.
+_PACKET_HEADS = "refs/heads/integration/paquet-h-"
+_INFLIGHT = "refs/ameesh/shadow-inflight/"
 
 
 def _atom(tag):
     return re.sub(r"[^A-Za-z0-9_.-]", "_", tag)
+
+
+class NoTrainFacts:
+    """#2682: a shadow passage lands nothing, so it has no train facts.
+
+    ``Runner.incident_once`` asks every passage for its packet facts when a
+    terminal integration run is red. The shadow mode keeps no persisted
+    landing intent: the honest answer is "no train facts", the direct reader
+    given as ``fallback`` stays authoritative, and this path never raises.
+    """
+
+    def __init__(self, project, *, fallback=None):
+        if fallback is not None and not callable(fallback):
+            raise train.TrainError("explicit incident fallback reader required")
+        self.repo = radar.github_slug(project)
+        self.target = merge_queue._remote_branch(project.target)
+        self.fallback = fallback
+
+    def lands(self, repo, head):
+        return self.fallback(repo, head) if self.fallback is not None else []
+
+    def diagnoses(self, repo, head):
+        return None
+
+    def links_for(self, repo, head):
+        return None
 
 
 class Store:
@@ -154,6 +188,15 @@ class Passage:
             self.notify("shadow comparison failed (%s: %s)" % (type(exc).__name__, exc))
         return result, deadline
 
+    def incident_facts(self, db, *, fallback=None):
+        """#2682: « aucun fait de train » pour l'ombre, et jamais une levée.
+
+        The incident consumer (#1681) queries every train passage. The shadow
+        passage has no packet landing to show; the direct landing reader must
+        stay in charge instead of an AttributeError silencing it.
+        """
+        return NoTrainFacts(self.project, fallback=fallback)
+
     # -- the read-only plan --------------------------------------------------
 
     def plan(self, db, rules, slot, now):
@@ -254,15 +297,22 @@ class Passage:
         repository = train_git.Repository(
             self.project, resolutions.Replayer(self.repository_source, self.clone_path))
         base = repository.target(self.project.target)
-        comparisons = []
         # Packets merged before the first shadow plan, or named for an hour
         # before it, are history, not an omission of the shadow mode.
         first = min(plan["cutoff"] for plan in plans)
         first_stamp = min(plan["local_stamp"] for plan in plans)
-        for packet in self.manual_packets(repository.clone.path, base):
-            if packet["sha"] in known or packet["created_ts"] < first \
-                    or packet["stamp"] < first_stamp:
-                continue
+        history = self.manual_packets(repository.clone.path, base)
+        packets = [packet for packet in history
+                   if packet["sha"] not in known and packet["created_ts"] >= first
+                   and packet["stamp"] >= first_stamp]
+        if not packets:
+            return []
+        # #2682: a packet still in flight at the cutoff carries its lots; the
+        # composer of the compared packet cannot have put them on the target
+        # yet, so they are not a disagreement of the shadow.
+        open_packets = self.open_packets(repository.clone.path, base)
+        comparisons = []
+        for packet in packets:
             plan = _match(plans, packet)
             if plan is None:
                 comparisons.append(dict(
@@ -273,7 +323,10 @@ class Passage:
             manual = set(packet["lots"])
             shadow = {int(row["work_item_id"]) for row in plan["members"]}
             missing = sorted(manual - shadow)
-            extra = sorted(shadow - manual)
+            extras = sorted(shadow - manual)
+            in_flight = _in_flight(plan, history, open_packets, packet)
+            carried = {lot: in_flight[lot] for lot in extras if lot in in_flight}
+            extra = [lot for lot in extras if lot not in carried]
             reasons = {str(row["work_item_id"]): row["reason"]
                        for row in plan.get("deferred", [])}
             explanations = {}
@@ -282,11 +335,15 @@ class Passage:
                     str(lot), "not a candidate of the train at this cutoff")
             for lot in extra:
                 explanations[str(lot)] = "train would include it; composer did not"
+            for lot, carrier in sorted(carried.items()):
+                explanations[str(lot)] = "porté par %s en vol" % carrier
             comparisons.append(dict(
                 packet=packet, plan=dict(cutoff=plan["cutoff"],
                                          local_stamp=plan["local_stamp"],
                                          matched=plan.get("matched")),
-                missing=missing, extra=extra, explanations=explanations))
+                missing=missing, extra=extra,
+                carried={str(lot): carrier for lot, carrier in sorted(carried.items())},
+                explanations=explanations))
         return comparisons
 
     @staticmethod
@@ -305,21 +362,7 @@ class Passage:
             match = _MANUAL.search(subject)
             if not match:
                 continue
-            tree = resolutions._run(clone, "ls-tree", "-r", "--name-only", sha,
-                                    "reviews/")
-            if tree.returncode:
-                raise train.TrainError("cannot read the manual packet manifest tree")
-            names = [name for name in resolutions._text(tree).splitlines()
-                     if name.startswith("reviews/integration-paquet-h-")
-                     and name.endswith(".md")]
-            name = next((name for name in names if match.group(1) in name),
-                        names[-1] if names else None)
-            if name is None:
-                continue
-            manifest = resolutions._run(clone, "show", "%s:%s" % (sha, name))
-            if manifest.returncode:
-                raise train.TrainError("cannot read the manual packet manifest")
-            lots = parse_manifest(resolutions._text(manifest))
+            name, lots = _manifest_lots(clone, sha, match.group(1))
             if not lots:
                 continue
             packets.append(dict(sha=sha, stamp=match.group(1),
@@ -327,6 +370,110 @@ class Passage:
                                 manifest=name, lots=sorted(set(lots))))
         packets.reverse()  # oldest first, like the plans
         return packets
+
+    def open_packets(self, clone, base):
+        """The composer's packet branches still open on the target (#2682).
+
+        Read-only: the ``integration/paquet-h-*`` heads are fetched into a
+        private namespace of the shadow clone, never checked out nor pushed.
+        A branch whose tip is already an ancestor of the target has landed;
+        its merge time is what dates its flight (``_carried``). Only branches
+        that are still not on the target are read here, with their manifest.
+        """
+        url = land._origin(self.project) or merge_queue.source_of(self.project.repo)
+        stale = resolutions._run(clone, "for-each-ref", "--format=%(refname)", _INFLIGHT)
+        if stale.returncode:
+            raise train.TrainError("cannot read the shadow in-flight refs")
+        refs = resolutions._text(stale).splitlines()
+        if refs:
+            deleted = resolutions._run(
+                clone, "update-ref", "--stdin",
+                stdin=("".join("delete %s\n" % ref for ref in refs)).encode())
+            if deleted.returncode:
+                raise train.TrainError("cannot refresh the shadow in-flight refs")
+        fetched = resolutions._run(
+            clone, "fetch", "--quiet", "--no-tags", url,
+            "+%s*:%s*" % (_PACKET_HEADS, _INFLIGHT), timeout=FETCH_TIMEOUT)
+        if fetched.returncode:
+            raise train.TrainError("cannot fetch the open packet branches: %s"
+                                   % resolutions._err(fetched)[-300:])
+        listed = resolutions._run(clone, "for-each-ref", "--format=%(refname)", _INFLIGHT)
+        if listed.returncode:
+            raise train.TrainError("cannot read the shadow in-flight refs")
+        open_packets = []
+        for ref in resolutions._text(listed).splitlines():
+            branch = "integration/paquet-h-" + ref[len(_INFLIGHT):]
+            match = _MANUAL.search(branch)
+            if match is None:
+                continue
+            head = plan_git._commit(clone, ref)
+            if head is None:
+                raise train.TrainError("open packet ref unreadable")
+            ancestor = resolutions._run(clone, "merge-base", "--is-ancestor", head, base)
+            if ancestor.returncode == 0:
+                continue
+            if ancestor.returncode != 1:
+                raise train.TrainError("cannot compare an open packet with the target")
+            name, lots = _manifest_lots(clone, head, match.group(1))
+            if not lots:
+                continue
+            open_packets.append(dict(sha=head, stamp=match.group(1), branch=branch,
+                                     manifest=name, lots=sorted(set(lots))))
+        return open_packets
+
+
+def _in_flight(plan, packets, open_packets, compared):
+    """{lot: carrier} already carried by a packet in flight at the plan cutoff.
+
+    A packet was in flight at the cutoff when its composition had started
+    before it and its merge was not on the target yet: either it merged after
+    the cutoff (first-parent history, ``created_ts``) or its
+    ``integration/**`` branch is still open. A packet named after the plan
+    belongs to a later slot and is not a carrier; the compared packet itself
+    is never its own carrier.
+    """
+    carried = {}
+    stamp = plan["local_stamp"]
+    for packet in packets:
+        if packet["sha"] == compared["sha"] or packet["stamp"] > stamp:
+            continue
+        if packet["created_ts"] <= plan["cutoff"]:
+            continue  # already merged at the cutoff: the shadow saw it on target
+        carrier = _carrier_name(packet)
+        for lot in packet["lots"]:
+            carried.setdefault(lot, carrier)
+    for packet in open_packets:
+        if packet["stamp"] > stamp:
+            continue
+        for lot in packet["lots"]:
+            carried.setdefault(lot, packet["branch"])
+    return carried
+
+
+def _carrier_name(packet):
+    """The branch name of one composer packet, suffix included."""
+    name = os.path.basename(packet.get("manifest") or "")
+    if name.startswith("integration-") and name.endswith(".md"):
+        return "integration/" + name[len("integration-"):-3]
+    return "integration/paquet-h-%s" % packet["stamp"]
+
+
+def _manifest_lots(clone, sha, stamp):
+    """The lot list of a packet commit's manifest, or ``(None, [])``."""
+    tree = resolutions._run(clone, "ls-tree", "-r", "--name-only", sha, "reviews/")
+    if tree.returncode:
+        raise train.TrainError("cannot read the packet manifest tree")
+    names = [name for name in resolutions._text(tree).splitlines()
+             if name.startswith("reviews/integration-paquet-h-")
+             and name.endswith(".md")]
+    name = next((name for name in names if stamp in name),
+                names[-1] if names else None)
+    if name is None:
+        return None, []
+    manifest = resolutions._run(clone, "show", "%s:%s" % (sha, name))
+    if manifest.returncode:
+        raise train.TrainError("cannot read the packet manifest")
+    return name, parse_manifest(resolutions._text(manifest))
 
 
 def _member(row, *, origin, proof):

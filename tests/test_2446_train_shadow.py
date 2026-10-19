@@ -20,7 +20,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from ameesh import (mechanics, merge_queue, plan_git, radar, storage,
-                    train_initial, train_shadow, work)
+                    train_incidents, train_initial, train_shadow, work)
 from .support import PgTestCase
 from .test_1467_train_review import author
 from .test_2446_train_assembly import MECHANICS, _Repo
@@ -189,6 +189,143 @@ class ShadowPassageTest(PgTestCase):
                               "integration/paquet-h-" + stamp)
         self.project_repo.git("push", "-q", "origin", "main",
                               "integration/paquet-h-" + stamp)
+
+    def open_packet(self, lots, stamp="20261018-1000"):
+        """A packet branch pushed but not merged: the composer is still on it."""
+        self.project_repo.git("checkout", "-qb",
+                              "integration/paquet-h-" + stamp, "main")
+        self.project_repo.write("reviews/integration-paquet-h-%s.md" % stamp,
+                                "# Paquet %s\n\n## Admissions\n\n%s\n\n"
+                                % (stamp, "\n".join("- #%d" % lot for lot in lots)))
+        self.project_repo.commit("composition %s" % stamp)
+        self.project_repo.git("push", "-q", "origin",
+                              "integration/paquet-h-" + stamp)
+        self.project_repo.git("checkout", "-q", "main")
+
+    def state_with_members(self, *lots, stamp="20261018-1100"):
+        self.shadow.scheduled_step(self.db, self.now)
+        state = self.shadow.store.load()
+        plan = dict(state["plans"][-1])
+        plan.update(local_stamp=stamp, cutoff=self.now,
+                    members=[dict(work_item_id=lot) for lot in lots],
+                    deferred=[])
+        return dict(state, plans=[plan])
+
+    @staticmethod
+    def fake_packet(lots, stamp, created_ts, sha):
+        return dict(sha=sha, stamp=stamp, manifest="reviews/paquet.md",
+                    created_ts=created_ts, lots=list(lots))
+
+    def test_shadow_incident_facts_are_empty_and_never_raise(self):
+        """#2682 : le consommateur d'incidents interroge l'ombre sans lever."""
+        calls = []
+
+        class Consumer:
+            INTEGRATION = {"o/r": "main"}
+
+            def consume(self, db, *, lands, diagnoses, links_for):
+                calls.append(db)
+                return []
+
+        fallback = lambda repo, head: [{"sha": head}]  # noqa: E731
+        reader = self.shadow.incident_facts(self.db, fallback=fallback)
+        self.assertIsInstance(reader, train_shadow.NoTrainFacts)
+        self.assertEqual((reader.repo, reader.target), ("o/r", "main"))
+        self.assertEqual(reader.lands("o/r", "a" * 40), [{"sha": "a" * 40}])
+        self.assertIsNone(reader.diagnoses("o/r", "a" * 40))
+        self.assertIsNone(reader.links_for("o/r", "a" * 40))
+        self.assertEqual(train_incidents.consume(
+            self.db, (self.shadow,), consumer=Consumer()), [])
+        self.assertEqual(calls, [self.db])
+
+    def test_extra_merged_after_the_cutoff_is_a_carrier_not_a_disagreement(self):
+        carrier_sha = "c" * 40
+        state = self.state_with_members(11, 22)
+        state["comparisons"] = [dict(packet=dict(sha=carrier_sha))]
+        packet = self.fake_packet([11], "20261018-1100", self.now + 60, "b" * 40)
+        carrier = self.fake_packet([22], "20261018-1000", self.now + 30, carrier_sha)
+        with mock.patch.object(self.shadow, "manual_packets",
+                               return_value=[carrier, packet]), \
+                mock.patch.object(self.shadow, "open_packets", return_value=[]):
+            comparisons = self.shadow.compare(state, None)
+        self.assertEqual(len(comparisons), 1)
+        comparison = comparisons[0]
+        self.assertEqual(comparison["extra"], [])
+        self.assertEqual(comparison["carried"],
+                         {"22": "integration/paquet-h-20261018-1000"})
+        self.assertEqual(comparison["explanations"]["22"],
+                         "porté par integration/paquet-h-20261018-1000 en vol")
+
+    def test_extra_composed_in_an_open_packet_is_a_carrier_not_a_disagreement(self):
+        state = self.state_with_members(11, 22)
+        packet = self.fake_packet([11], "20261018-1100", self.now + 60, "b" * 40)
+        carrier = dict(self.fake_packet([22], "20261018-1000", 0, "d" * 40),
+                       branch="integration/paquet-h-20261018-1000")
+        with mock.patch.object(self.shadow, "manual_packets", return_value=[packet]), \
+                mock.patch.object(self.shadow, "open_packets", return_value=[carrier]):
+            comparisons = self.shadow.compare(state, None)
+        comparison = comparisons[0]
+        self.assertEqual(comparison["extra"], [])
+        self.assertEqual(comparison["carried"],
+                         {"22": "integration/paquet-h-20261018-1000"})
+        self.assertEqual(comparison["explanations"]["22"],
+                         "porté par integration/paquet-h-20261018-1000 en vol")
+
+    def test_a_later_open_packet_does_not_hide_a_real_extra(self):
+        state = self.state_with_members(11, 22)
+        packet = self.fake_packet([11], "20261018-1100", self.now + 60, "b" * 40)
+        later = dict(self.fake_packet([22], "20261018-1200", 0, "d" * 40),
+                     branch="integration/paquet-h-20261018-1200")
+        with mock.patch.object(self.shadow, "manual_packets", return_value=[packet]), \
+                mock.patch.object(self.shadow, "open_packets", return_value=[later]):
+            comparisons = self.shadow.compare(state, None)
+        comparison = comparisons[0]
+        self.assertEqual(comparison["extra"], [22])
+        self.assertEqual(comparison["carried"], {})
+        self.assertEqual(comparison["explanations"]["22"],
+                         "train would include it; composer did not")
+
+    def test_a_packet_merged_before_the_cutoff_is_not_a_carrier(self):
+        state = self.state_with_members(11, 22)
+        packet = self.fake_packet([11], "20261018-1100", self.now + 60, "b" * 40)
+        old = self.fake_packet([22], "20261018-1000", self.now - 60, "c" * 40)
+        with mock.patch.object(self.shadow, "manual_packets",
+                               return_value=[old, packet]), \
+                mock.patch.object(self.shadow, "open_packets", return_value=[]):
+            comparisons = self.shadow.compare(state, None)
+        comparison = comparisons[0]
+        self.assertEqual(comparison["extra"], [22])
+        self.assertEqual(comparison["carried"], {})
+
+    def test_open_packets_reads_the_branch_manifest_until_it_lands(self):
+        self.shadow.scheduled_step(self.db, self.now)
+        self.open_packet([999], stamp="20261018-1000")
+        base = self.project_repo.git("rev-parse", "main")
+        opened = self.shadow.open_packets(self.shadow.clone_path, base)
+        self.assertEqual([(row["branch"], row["lots"]) for row in opened],
+                         [("integration/paquet-h-20261018-1000", [999])])
+        self.project_repo.git("merge", "--no-ff", "-m",
+                              "Merge pull request #1 from manaty/integration/"
+                              "paquet-h-20261018-1000",
+                              "integration/paquet-h-20261018-1000")
+        self.project_repo.git("push", "-q", "origin", "main")
+        base = self.project_repo.git("rev-parse", "main")
+        self.assertEqual(self.shadow.open_packets(self.shadow.clone_path, base), [])
+
+    def test_comparison_excludes_a_lot_composed_in_an_open_packet(self):
+        state = self.state_with_members(11, 22)
+        self.open_packet([22], stamp="20261018-1000")
+        self.manual_packet([11], stamp="20261018-1100")
+        comparisons = self.shadow.compare(state, None)
+        self.assertEqual(len(comparisons), 1)
+        comparison = comparisons[0]
+        self.assertEqual(comparison["packet"]["stamp"], "20261018-1100")
+        self.assertEqual(comparison["missing"], [])
+        self.assertEqual(comparison["extra"], [])
+        self.assertEqual(comparison["carried"],
+                         {"22": "integration/paquet-h-20261018-1000"})
+        self.assertEqual(comparison["explanations"]["22"],
+                         "porté par integration/paquet-h-20261018-1000 en vol")
 
     def test_shadow_plan_is_read_only_and_compares_equal_to_the_composer(self):
         result, deadline = self.shadow.scheduled_step(self.db, self.now)

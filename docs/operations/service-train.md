@@ -75,7 +75,11 @@ service :
    `$AMEESH_STATE/trains/shadow/<projet>-<cible>-<empreinte>.json` ;
 4. compare ce plan au manifeste du composeur humain quand le paquet de la même
    heure a atterri : lots manquants (avec le motif que le train avait), lots en
-   trop, paquet et base qui ont servi.
+   trop, paquet et base qui ont servi. Un lot déjà composé dans un paquet
+   `integration/**` encore en vol au créneau (paquet fusionné après la coupure,
+   ou branche encore ouverte, lue en lecture seule) n'est pas un désaccord : il
+   est exclu des « en trop » et nommé « porté par <paquet> en vol » dans
+   `carried` et `explanations`.
 
 L'inventaire de l'ombre applique la **même décision d'inscription** que le mode
 actif (`Enrollment.decide` : préparation, avis, puis frontière initiale et
@@ -90,7 +94,7 @@ Lecture :
 
 ```sh
 jq '.plans[-2:]' "$AMEESH_STATE"/trains/shadow/*.json
-jq '.comparisons[] | {packet: .packet.stamp, missing, extra, explanations}' \
+jq '.comparisons[] | {packet: .packet.stamp, missing, extra, carried, explanations}' \
   "$AMEESH_STATE"/trains/shadow/*.json
 ```
 
