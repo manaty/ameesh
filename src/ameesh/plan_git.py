@@ -1053,7 +1053,7 @@ def _remote_head(repo: str, branch: str) -> tuple[str, str | None]:
     return "sha", words[0]
 
 
-def _remote_moved(repo: str, branch: str, target: str, head: str, out: dict,
+def _remote_moved(repo: str, branch: str, target: str, out: dict,
                   found: dict) -> dict:
     """#2654 : `found` conclut à la livraison de `branch` sur une pointe du
     clone ou une tête vue (`branch_head`) ; elle ne tient que si la tête
@@ -1069,8 +1069,7 @@ def _remote_moved(repo: str, branch: str, target: str, head: str, out: dict,
                     detail="%s; but the head of %s on origin is unreadable (%s): no "
                            "conclusion" % (found.get("detail"), branch, value))
     present = _commit(repo, value)
-    if present and (present == found.get("tip") or _git(
-            repo, "merge-base", "--is-ancestor", present, head).returncode == 0
+    if present and (present == found.get("tip")
             or probe(repo, present, target, lot=branch_lot(branch))["merged"]):
         # la tête publiée est celle de la preuve, ou elle est entrée elle
         # aussi (ancêtre, contenu identique : squash)
@@ -1165,7 +1164,7 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
                           since_ts=since_ts)
     if found["merged"] and found["how"] != "message":
         # la citation par une fusion de la cible ne dépend pas de la pointe
-        return _remote_moved(repo, branch, target, head, out, found)
+        return _remote_moved(repo, branch, target, out, found)
     return found
 
 
