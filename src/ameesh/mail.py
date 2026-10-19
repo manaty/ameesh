@@ -319,6 +319,7 @@ def _assemble(kind: str, blocks: Sequence[str], remaining: int) -> str:
         parts.append(adapters.MAIL_REMAINING % remaining)
     parts.append(footer)
     parts.append(adapters.TMP_NOTE)  # L162 : $TMPDIR, jamais /tmp en dur
+    parts.append(adapters.VENV_NOTE)  # #2763 : jamais pip dans le venv partagé
     # L159b: with a lending VM, heavy suites go there; otherwise L131, heavy
     # suites capped per host by `ameesh heavy`
     parts.append(adapters.offload_note() or adapters.HEAVY_NOTE)
