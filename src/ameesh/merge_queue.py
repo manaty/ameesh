@@ -175,8 +175,12 @@ def critical_scope(klass) -> bool:
 
 def required_verdicts(klass) -> int:
     """Le nombre d'avis indépendants : deux pour un chemin critique, même si
-    le canon l'a omis ou classé léger ; sinon 0 pour léger, 1 pour normal et
-    1 pour sensible hors SQL, sécurité et prod.
+    le canon l'a omis ou classé léger ; sinon le plancher déclaré pour un lot
+    léger (`light_reviews`, §2 : un avis, #2642), 1 pour normal et 1 pour
+    sensible hors SQL, sécurité et prod.
+    Un lot léger **sans chemin changé** n'a rien à relire : 0. Le plancher est
+    lu par le lecteur de classe (`lot_class`), donc le même que la désignation
+    au gel et `paquet-candidats` ; il ne reclasse jamais la classe.
     Un doute de classe (politique ou diff illisible, `files` vide) est
     sensible : un avis d'une autre famille (canon §2, owner 15/10 : deux
     familles seulement pour droits SQL, secrets, paiement, prod réelle ;
@@ -196,7 +200,9 @@ def required_verdicts(klass) -> int:
     if klass.get("files") and critical_scope(klass):
         return CRITICAL_REVIEWS
     if cls == lot_class.LIGHT:
-        return 0
+        if not klass.get("files"):
+            return 0
+        return int(klass.get("light_reviews") or 0)
     if cls in (lot_class.NORMAL, lot_class.RELEASE):
         return 1
     return SENSITIVE_REVIEWS
@@ -318,14 +324,15 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     blocage, celui d'un autre relecteur ne le masque pas. Un blocage encore en
     vigueur refuse la porte, quelle que soit la classe.
 
-    Le nombre d'avis dépend de la classe (`required_verdicts`) : 1 pour un lot
-    normal et pour un lot sensible hors SQL/sécurité/prod — un doute de classe
-    reste sensible —, 2 pour un lot sensible qui touche ces domaines. Les avis
-    comptés sont **indépendants** : jamais le travail de l'auteur ; pour une
-    classe sensible, une famille de modèle connue et autre que celle de
-    l'auteur ; pour deux avis, deux familles distinctes. L'indépendance ne se
-    suppose jamais : une famille d'auteur inconnue refuse la porte (canon §2,
-    décision 18855a).
+    Le nombre d'avis dépend de la classe (`required_verdicts`) : le plancher
+    déclaré pour un lot léger (#2642), 1 pour un lot normal et pour un lot
+    sensible hors SQL/sécurité/prod — un doute de classe reste sensible —,
+    2 pour un lot sensible qui touche ces domaines. Les avis comptés sont
+    **indépendants** : jamais le travail de l'auteur ; pour un lot léger à
+    plancher déclaré et pour une classe sensible, une famille de modèle connue
+    et autre que celle de l'auteur ; pour deux avis, deux familles distinctes.
+    L'indépendance ne se suppose jamais : une famille d'auteur inconnue refuse
+    la porte (canon §2, décision 18855a).
 
     #1979 : le pilote peut marquer « verdict non requis » (`work.reviewer
     --no-verdict`, colonne `reviewer = -none`, geste d'autorité journalisé) ;
@@ -398,12 +405,14 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     out["author_family"] = author_family
     # L'indépendance ne se suppose jamais (canon §2, décision 18855a) : une
     # classe sensible — y compris un doute de classe, qui peut cacher SQL, la
-    # sécurité ou la prod — n'accepte que des familles connues et autres que
-    # celle de l'auteur. Famille d'auteur inconnue (agent absent du registre,
-    # harnais non reconnu) : aucun avis ne peut être prouvé indépendant, la
-    # porte refuse et le dit. Un auteur humain n'a pas de famille de modèle :
-    # il n'y a rien à comparer, seules les familles des relecteurs comptent.
-    strict = required >= 2 or cls == lot_class.SENSITIVE
+    # sécurité ou la prod — et un lot léger à plancher déclaré (#2642 : le §2
+    # demande « un avis d'une autre famille ») n'acceptent que des familles
+    # connues et autres que celle de l'auteur. Famille d'auteur inconnue
+    # (agent absent du registre, harnais non reconnu) : aucun avis ne peut être
+    # prouvé indépendant, la porte refuse et le dit. Un auteur humain n'a pas
+    # de famille de modèle : il n'y a rien à comparer, seules les familles des
+    # relecteurs comptent.
+    strict = required >= 2 or cls in (lot_class.LIGHT, lot_class.SENSITIVE)
     author_human = bool(author) and author.lower().startswith(work.HUMAN_PREFIX)
     if strict and not author_family and not author_human:
         out["why"] = ("no review verdict ok on the freeze %s (class: %s): the author %s has "

@@ -80,6 +80,7 @@ SCHEMA_KEYS = (
     "reviews.families",
     "reviews.exclude_author_family",
     "reviews.distinct_families",
+    "reviews.light_reviews",
     "merge.named_fire",
     "merge.repeat_freeze",
     "merge.on_green_packet",
@@ -124,6 +125,7 @@ BINDINGS = {
     "exclude_author_family": "reviews.exclude_author_family",
     "distinct_families": "reviews.distinct_families",
     "families": "reviews.families",
+    "light_reviews": "reviews.light_reviews",
     "cutoffs": "cutoffs",
     "timezone": "timezone",
     "classes": "prevalidation.classes",
@@ -165,6 +167,7 @@ DICT_BINDINGS = {
     "exclude_author_family": "reviews.exclude_author_family",
     "distinct_families": "reviews.distinct_families",
     "families": "reviews.families",
+    "light_reviews": "reviews.light_reviews",
     "cutoffs": "cutoffs",
     "timezone": "timezone",
     "schema": "schema",
@@ -352,6 +355,17 @@ EXEMPTIONS = (
                "compilée ; le passage raccordé passe la valeur du canon "
                "(retrait : #2451)",
     ),
+    Exemption(
+        path="src/ameesh/review_lot.py",
+        parameter="reviews.light_reviews",
+        literal="1",
+        name="lot #2642 (mty-amh-impl-08), 19/10",
+        date="2026-10-19",
+        reason="relecture après fusion : plancher historique d'un avis pour un "
+               "lot léger, repli d'une classe qui ne porte pas encore le "
+               "paramètre ; la valeur du canon (`light_reviews`) fait foi dès "
+               "qu'elle est déclarée (retrait : PR home)",
+    ),
 )
 
 
@@ -476,6 +490,9 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
     if key == "reviews.families":
         return (isinstance(value, tuple) and bool(value)
                 and bool(set(value) & FAMILY_NAMES))
+    if key == "reviews.light_reviews":
+        # §2 (#2642) : 0 n'est admis que le temps de la PR home, 1 au canon.
+        return type(value) is int and value in (0, 1)
     if key in ("cutoffs", "packets.cutoffs"):
         return _is_cutoff_literal(value)
     if key == "timezone":

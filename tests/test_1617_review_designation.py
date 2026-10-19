@@ -154,6 +154,15 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual(rd.required_count(rules, ["src/ameesh/db.py",
                                                    "src/ameesh/work.py"]), 2)
 
+    def test_the_declared_light_floor_raises_the_count(self):
+        # #2642 : le plancher léger est lu par le lecteur de politique
+        # (mechanics.reviews_for), jamais deviné ici ; il ne rabaisse aucune règle.
+        rules = rd.rules_of(RULES)
+        self.assertEqual(rd.required_count(rules, ["docs/guide.md"], light=1), 1)
+        self.assertEqual(rd.required_count(rules, ["src/ameesh/work.py"], light=1), 1)
+        self.assertEqual(rd.required_count(rules, ["src/ameesh/db.py"], light=1), 2)
+        self.assertEqual(rd.required_count(rules, [], light=1), 1)
+
     def test_glob_semantics_do_not_leak_between_paths(self):
         rules = rd.rules_of({"rules": [{"paths": ["docs/**"], "reviews": 1}]})
         self.assertEqual(rd.required_count(rules, ["docs"]), 0)
@@ -561,6 +570,22 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(out["state"], rd.NONE)
         self.assertEqual(self.port.commits, [])
         self.assertEqual(self.port.messages, [])
+
+    def test_the_policy_reader_light_floor_designates_one_reviewer(self):
+        # #2642 : le plancher déclaré au canon (light_reviews: 1) vient du
+        # lecteur de politique, qui le passe à `apply` ; une règle absente ne
+        # doit plus rendre un lot léger sans avis.
+        out = self.apply(paths=["docs/guide.md"], risk="light", required=1)
+        self.assertEqual(out["state"], rd.DESIGNATED)
+        self.assertEqual(out["required"], 1)
+        self.assertEqual(len(out["messages"]), 1)
+        self.assertNotEqual(out["messages"][0]["family"], "deepseek")
+        self.assertEqual(len(self.port.commits), 1)
+
+    def test_an_empty_diff_never_asks_for_the_light_floor(self):
+        out = self.apply(paths=[], risk="light", required=1)
+        self.assertEqual(out["state"], rd.NONE)
+        self.assertEqual(out["required"], 0)
 
     def test_non_light_without_a_rule_is_refused(self):
         with self.assertRaises(rd.DesignationError):
