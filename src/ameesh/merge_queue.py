@@ -335,6 +335,35 @@ def _waiver(db, item) -> tuple:
     return waived, waived_by, row
 
 
+def _corrections_on_freeze(db, marks, frozen, *, repo, klass, item, families=None):
+    """Les correcteurs d'un petit correctif de relecteur sur cette tête (#2739).
+
+    Lecture des commits exacts de la plage gelée et de leur provenance, la même
+    que la désignation (#2638) : la famille du correcteur reste éligible, mais
+    l'agent lui-même ne relit pas son propre correctif. Rend `None` quand aucune
+    lecture n'est possible (pas de base, pas de dépôt, pas de ligne de lot) :
+    la porte garde alors son comportement historique. Lève quand une lecture
+    était possible et a échoué : une porte qui ne peut pas prouver l'absence de
+    correcteur ne compte pas son avis (l'indépendance ne se suppose pas).
+    """
+    base = str((klass or {}).get("base_sha")
+               or (klass or {}).get("target") or "").strip()
+    if db is None or not repo or not base or not item:
+        return None
+    from . import review_designation_activation as act
+    freeze = plan_git.latest_freeze(marks or ())
+    milestone = None
+    if freeze is not None and _same_sha(freeze.get("sha"), frozen, repo):
+        milestone = {"id": int(freeze.get("id") or 0),
+                     "sha": str(freeze.get("sha") or ""),
+                     "actor": freeze.get("actor") or "",
+                     "at_ts": freeze.get("at_ts")}
+    rows = act.corrections_of_head(db, item, milestone, repo, base, frozen,
+                                   families=families or ())
+    return {str((row or {}).get("name") or "").strip().lower()
+            for row in rows or () if str((row or {}).get("name") or "").strip()}
+
+
 def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 item=None, families=None) -> dict:
     """Les avis requis sur la tête gelée `frozen`, et eux seuls (#1374).
@@ -355,6 +384,13 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     L'indépendance ne se suppose jamais : une famille d'auteur inconnue refuse
     la porte (canon §2, décision 18855a).
 
+    #2739 : l'auteur d'un petit correctif de relecteur tenu hors des auteurs
+    (#2638) ne relit pas son propre correctif. La porte lit les commits exacts
+    de la plage gelée (`corrections_of_head`) et écarte son avis **par son
+    nom**, sans exclure sa famille : un autre agent de la même famille reste
+    éligible. Quand la plage ne peut pas être lue, la porte échoue fermé si la
+    lecture était possible (dépôt, base et ligne de lot connus).
+
     #2664 : les familles viennent du canon compilé (`families`, sinon lues par
     `review_lot.compiled_families` au dernier commit audité). Un canon
     illisible refuse la porte **fermée** avec le canon nommé — une seule
@@ -369,7 +405,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     n'est jamais levé par la dispense : la correction reste due.
 
     Rend `{ok, why, class, required, accepted, blocked, waived, author,
-    author_family, on_freeze}` ; ne lève jamais.
+    author_family, corrections, on_freeze}` ; ne lève jamais.
     """
     from . import lot_class
     klass = klass or {}
@@ -386,7 +422,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     author = str(row.get("assignee") or "").strip()
     out = {"ok": False, "why": "", "error": "", "class": cls, "required": 0,
            "accepted": [], "blocked": [], "waived": waived, "waived_by": waived_by,
-           "author": author, "author_family": "", "on_freeze": 0}
+           "author": author, "author_family": "", "corrections": [],
+           "on_freeze": 0}
     if not frozen:
         out["why"] = "no freeze to review: the fire names the exact frozen head"
         return out
@@ -459,12 +496,27 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                       "(canon §2: independence is never assumed)"
                       % (frozen[:12], cls, author or "(none)"))
         return out
+    try:
+        corrections = _corrections_on_freeze(db, marks, frozen, repo=repo,
+                                             klass=klass, item=item,
+                                             families=families)
+    except Exception as exc:  # noqa: BLE001 - une plage illisible ne conclut pas
+        out["error"] = str(exc)
+        out["why"] = ("no review verdict ok on the freeze %s (class: %s): the frozen "
+                      "range cannot be read (%s), so a reviewer's own correction "
+                      "cannot be excluded (canon §2: independence is never assumed)"
+                      % (frozen[:12], cls, exc))
+        return out
+    corrections = corrections or set()
+    out["corrections"] = sorted(corrections)
     accepted = []
     for mark in sorted((m for m in latest.values() if (m.get("verdict") or "") == "ok"),
                        key=_mark_order):
         actor = str(mark.get("actor") or "").strip()
         if author and actor and actor.lower() == author.lower():
             continue                      # on ne relit pas son propre travail
+        if actor and actor.lower() in corrections:
+            continue                      # l'auteur d'un correctif ne le relit pas (#2739)
         try:
             family = _actor_family(db, actor, families)
         except RegistryReadError as exc:
