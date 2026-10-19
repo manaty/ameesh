@@ -432,12 +432,13 @@ def audited_commit(db: Db, cfg, canon: Canon, source) -> str:
     politique auditée, et l'on ne retombe jamais sur la référence. Sans état
     du tout (banc, premier démarrage), le commit exact de la source est le
     seul connu ; `mechanics.load` refuse encore une référence non commit.
+
+    Une **lecture impossible** de l'état n'est pas une absence d'état : elle
+    remonte à l'appelant, qui refuse la politique ou les familles sans jamais
+    lire la référence configurée, non auditée.
     """
     key = state_key(db, canon, getattr(cfg, "host", ""))
-    try:
-        state = storage.of(db).canon.state(getattr(cfg, "host", ""), key)
-    except Exception:  # noqa: BLE001 - état illisible : aucun commit audité connu
-        state = None
+    state = storage.of(db).canon.state(getattr(cfg, "host", ""), key)
     if state is not None:
         commit = str(state.get("last_good_commit") or "").strip().lower()
         root = str(state.get("root") or "")

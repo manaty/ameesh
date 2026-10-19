@@ -16,7 +16,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import canon, merge_queue, review_lot, review_provenance, storage
+from ameesh import (canon, merge_queue, review_designation_activation, review_lot,
+                    review_provenance, storage)
 
 from .test_l1616_mechanics import MECHANICS, _Repo
 
@@ -68,6 +69,22 @@ class FamiliesTest(unittest.TestCase):
 
     def test_without_a_recorded_state_the_exact_source_commit_is_read(self):
         self.assertEqual(self.families(None), ("claude", "codex"))
+
+    def test_an_unreadable_state_is_not_an_absent_state(self):
+        # #2664/cx1 : une erreur de lecture de `canon_state` ne prouve pas
+        # l'absence d'état ; elle ne doit jamais ouvrir la référence non auditée.
+        store = _Store(None)
+        store.canon.state = mock.Mock(side_effect=OSError("state unavailable"))
+        with mock.patch.object(storage, "of", return_value=store), \
+                mock.patch.object(review_lot, "_families_at",
+                                  side_effect=AssertionError("fallback to the ref")):
+            with self.assertRaises(review_lot.FamiliesError) as caught:
+                review_lot.compiled_families(None, self.cfg)
+            policy = review_designation_activation._policy(
+                self.cfg, None, "ameesh", ["src/ameesh/review_lot.py"])
+        self.assertIn("state unavailable", str(caught.exception))
+        self.assertIsInstance(policy, review_designation_activation.Unavailable)
+        self.assertIn("state unavailable", policy.why)
 
     def test_an_audited_state_without_commit_fails_closed_with_the_canon(self):
         state = {"root": self.repo.root, "last_good_commit": ""}

@@ -202,7 +202,12 @@ def _policy(cfg, db, project: str, paths: Sequence[str]) -> Policy | Unavailable
                 errors.append("%s: canon under a sub-directory, mechanics are read"
                               " at the Git root only" % (source.repo,))
                 continue
-            commit = _audited_commit(db, cfg, canon, source)
+            try:
+                commit = _audited_commit(db, cfg, canon, source)
+            except Exception as exc:  # noqa: BLE001 - état illisible : refus, jamais de repli
+                errors.append("%s: cannot read the audited state: %s"
+                              % (source.repo, str(exc)[:240]))
+                continue
             if not commit:
                 errors.append("%s: no exact audited commit" % (source.repo,))
                 continue
