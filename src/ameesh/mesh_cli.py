@@ -3568,6 +3568,12 @@ def cmd_accounts(cfg: Config, args) -> int:
                 print("no account declared for %s (key `accounts` of the host "
                       "configuration)" % args.harness, file=sys.stderr)
                 return 1
+            # #2572 (#313 N2) : un compte refusé par la politique de partage
+            # (`account_sharing: strict`, `accounts_shared: refuse`) est refusé
+            # ici, avec sa raison, au lieu d'être forcé puis rendu sans
+            # placement au tour suivant.
+            from . import account_claims
+            items = account_claims.mark_refused(cfg, items, db=db)
             accounts_mod.force(db, cfg.host, args.harness, items, args.account, by=qui)
             texte = ("Account %s forced for %s on %s by %s: no automatic choice "
                      "until \"ameesh accounts auto\"." % (args.account, args.harness,
