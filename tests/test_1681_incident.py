@@ -23,7 +23,7 @@ from unittest import mock
 
 import ameesh
 
-from ameesh import incident, runner
+from ameesh import incident, radar, runner, train, train_shadow
 
 
 def commit(sha: str, lot, files, author: str = "deepseek4", summary: str = "travail"):
@@ -892,6 +892,24 @@ class TestRaccordTrain(unittest.TestCase):
         messages = [call.args[0] for call in log.call_args_list]
         self.assertEqual(sum("train facts unreadable" in m for m in messages), 1)
         self.assertTrue(any("lot #9200 ouvert" in m for m in messages))
+
+    def test_un_passage_d_ombre_ne_rend_pas_les_faits_du_train_illisibles(self):
+        """#2682 : l'ombre n'a aucun fait de train ; le relevé direct fait foi."""
+        db = object()
+        project = radar.Project(name="ameesh", repo="/nonexistent", target="main",
+                                github="manaty/ameesh")
+        shadow = types.SimpleNamespace(
+            policy=train.Policy(enabled=True),
+            incident_facts=lambda db, fallback=None: train_shadow.NoTrainFacts(
+                project, fallback=fallback))
+        with mock.patch.object(incident, "consume", return_value=[]) as direct, \
+                mock.patch.object(runner, "log_async") as log:
+            runner.Runner.incident_once(
+                types.SimpleNamespace(train_passages=(shadow,)), db)
+        direct.assert_called_once()
+        self.assertIs(direct.call_args.args[0], db)
+        self.assertFalse(any("train facts unreadable" in call.args[0]
+                             for call in log.call_args_list))
 
 
 if __name__ == "__main__":
