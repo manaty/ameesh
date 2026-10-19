@@ -569,6 +569,38 @@ def _range(repo: str, base: str, head: str) -> tuple[str, list, list]:
 # the authors: one reading shared with the train and the merge gate (#2681)
 # --------------------------------------------------------------------------
 
+def _journal_reviewers(db, lot: int, *, until=None) -> list:
+    """The reviewer names designated by hand in the lot journal (#2739).
+
+    `work_items.reviewers` is the live column; `work reviewer --remove` retires
+    a manual seat and the column no longer carries the name. The journal keeps
+    the designation (`reviewer X designated`), so a manual reviewer who pushed
+    a first-round correction stays recognizable after their seat is retired,
+    exactly like the automatic names of the marks (#2638). With `until` (the
+    freeze instant), a reviewer named after the freeze is ignored: they did not
+    review that head.
+    """
+    names: list[str] = []
+    try:
+        events = storage.of(db).work.events(int(lot), 500) or []
+    except Exception:  # noqa: BLE001 - unreadable journal: no manual name
+        return names
+    for event in events:
+        note = str((event or {}).get("note") or "").strip()
+        if not note.startswith("reviewer ") or not note.endswith(" designated"):
+            continue
+        if until is not None:
+            try:
+                if float((event or {}).get("created_ts") or 0.0) > float(until):
+                    continue
+            except (TypeError, ValueError):
+                continue
+        name = note[len("reviewer "):-len(" designated")].strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
 def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
                           author: str) -> set[str]:
     """The names designated as reviewers of the lot, automatic or manual.
@@ -576,7 +608,9 @@ def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
     The current column holds the previous freeze's automatic names and the
     manual exception; the journal marks keep the names a later freeze retired.
     A reviewer who pushed a first-round correction must stay recognizable after
-    the freeze that retired them (#2638). The lot author is never a reviewer.
+    the freeze that retired them (#2638) — including a **manual** reviewer
+    whose seat was retired from the column (#2739), read from the journal. The
+    lot author is never a reviewer.
     """
     names: list[str] = []
     lot = int((item or {}).get("id") or 0)
@@ -584,6 +618,11 @@ def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
     try:
         names.extend(_previous_reviewers(db, lot, freeze_id))
     except Exception:  # noqa: BLE001 - unreadable journal: no automatic name
+        pass
+    try:
+        names.extend(_journal_reviewers(db, lot,
+                                        until=(milestone or {}).get("at_ts")))
+    except Exception:  # noqa: BLE001 - unreadable journal: no manual name
         pass
     try:
         from .work_reviewers import designated

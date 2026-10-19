@@ -168,3 +168,21 @@ class GateCorrectorTest(PgTestCase):
         out = self.gate()
         self.assertFalse(out["ok"], out)
         self.assertIn(self.frozen[:12], out["error"])
+
+    def test_a_manual_corrector_removed_from_the_column_still_does_not_count(self):
+        # #2739: the pilot retired the manual seat after the correction
+        # (#2076). The journal keeps the designation, so the corrector stays
+        # recognizable and the gate still refuses its verdict.
+        self.db.execute(
+            "UPDATE work_items SET reviewers = ARRAY[]::text[], reviewer = ''"
+            " WHERE id = %s", (self.lot,))
+        self.db.execute(
+            "INSERT INTO work_item_events (work_item_id, state, note, actor,"
+            " created_at) VALUES (%s, 'qa', 'reviewer cx2 designated',"
+            " 'mesh-design', now() - interval '10 minutes')", (self.lot,))
+        out = self.gate()
+        self.assertFalse(out.get("error"), out)
+        self.assertEqual(out["corrections"], ["cx2"])
+        self.assertTrue(out["ok"], out["why"])
+        self.assertEqual([entry["actor"] for entry in out["accepted"]],
+                         ["cx3", "dev1"])
