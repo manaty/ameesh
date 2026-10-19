@@ -90,6 +90,12 @@ $human ──frappes──► lanceur ──pty maître──► harnais interac
   injectée n'a pas d'autorité : elle demande de **présenter**, jamais de
   répondre ;
 * perte du TUI si le harnais n'accepte pas l'écriture dans son entrée ;
+* **dialogue de permission** : si la ligne est servie pendant que le harnais
+  attend une permission, le `\r` qui la soumet peut confirmer l'option par
+  défaut du dialogue. Garde proposée : n'écrire que si le dernier événement du
+  harnais est un `Stop` (marqueur d'état écrit par le hook `agent-mail`), sinon
+  attendre ; sans garde, le risque est propre au TUI interactif et disparaît
+  avec L77 (agent exécuté, permissions refusées). À trancher avant relecture ;
 * pas de service quand la session est fermée (le propriétaire reste seul juge
   de ce qu'il garde ouvert) ;
 * le lanceur porte du code de terminal (pty, redimensionnement, nettoyage) :
