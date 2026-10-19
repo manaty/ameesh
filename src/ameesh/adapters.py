@@ -75,6 +75,12 @@ PRIORITY_FOOTER = ("Handle it first, then resume your work without waiting "
 TMP_NOTE = ("Temporary files: in $TMPDIR (your own directory, on disk), never hard-coded "
             "in /tmp; nothing over 500 MB in /tmp (in memory, shared by all agents "
             "on the host).")
+#: #2763 : jamais d'installation dans le venv partagé de l'hôte (le
+#: 2026-10-19, un `uv pip install -e` lancé d'un worktree de relecture a
+#: remplacé l'ameesh de pc-smichea et mis six agents critiques en pause)
+VENV_NOTE = ("Never pip/uv install into the host's shared ameesh venv: test a branch "
+             "with `PYTHONPATH=src python -m unittest …`, or a venv of your own "
+             "under $TMPDIR.")
 #: L131: heavy suites go through `ameesh heavy` (on 2026-10-10, 11 agents
 #: started jest, SQL suites and builds together: load 43 for 12 CPUs)
 HEAVY_NOTE = ("Heavy suites (full test suite, jest, SQL suites, build): run them "

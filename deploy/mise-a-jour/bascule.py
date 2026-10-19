@@ -166,6 +166,36 @@ def _pip_install(directory, src):
     _run([pip, "install", "-q", src])
 
 
+def _sceller(directory):
+    """#2763 : un venv versionné préparé ne s'installe plus.
+
+    Son `pip` refuse (comme celui du venv stable), et `lib/` et `bin/` passent
+    en lecture seule : `uv pip install --python <venv-sha7>/bin/python` (ou un
+    `VIRTUAL_ENV` hérité) ne peut ni créer, ni retirer, ni remplacer un
+    fichier du venv vivant (incident du 19/10/2026 à 20:03, installation
+    éditable d'un worktree d'agent). `_supprimer` rend l'écriture avant de
+    retirer un venv."""
+    bin_dir = os.path.join(directory, "bin")
+    for nom in os.listdir(bin_dir):
+        if re.fullmatch(r"pip[0-9.]*", nom):
+            _write(os.path.join(bin_dir, nom), _PIP_REFUS)
+    for racine in (os.path.join(directory, "lib"), bin_dir):
+        for dossier, _sous, fichiers in os.walk(racine, topdown=False):
+            for nom in fichiers:
+                chemin = os.path.join(dossier, nom)
+                if not os.path.islink(chemin):
+                    os.chmod(chemin, os.lstat(chemin).st_mode & ~0o222)
+            os.chmod(dossier, os.stat(dossier).st_mode & ~0o222)
+
+
+def _supprimer(directory):
+    """Retire un venv versionné, scellé ou non (`_sceller`)."""
+    for dossier, _sous, _fichiers in os.walk(directory):
+        if not os.path.islink(dossier):
+            os.chmod(dossier, os.stat(dossier).st_mode | 0o700)
+    shutil.rmtree(directory)
+
+
 def _verifier_shebang(ameesh, python):
     """Refuse un préambule qui ne désigne pas l'interpréteur de CE venv.
 
@@ -237,14 +267,18 @@ def preparer(args):
         if etat.get("versions", {}).get(version) == "complete":
             print("bascule: venv-%s déjà préparé" % version)
             return 0
-        shutil.rmtree(cible)
+        _supprimer(cible)
     print("bascule: préparation de venv-%s depuis %s" % (version, src))
     try:
         _creer_venv(cible, args.python)
         _pip_install(cible, src)
         _controles(cible)
+        _sceller(cible)
     except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
-        shutil.rmtree(cible, ignore_errors=True)   # rien de partiel ne reste
+        try:
+            _supprimer(cible)   # rien de partiel ne reste
+        except OSError:
+            pass
         print("bascule: préparation de venv-%s ÉCHOUÉE, version active intacte : %s"
               % (version, exc), file=sys.stderr)
         return 1
