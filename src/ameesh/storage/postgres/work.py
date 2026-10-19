@@ -164,6 +164,8 @@ def item_columns(db, ref: str | None = None) -> str:
             " AS migrations")
     else:
         migrations = "'[]'::jsonb AS migrations"
+    wake = ("extract(epoch from (to_jsonb(%s)->>'wake_at')::timestamptz)::float8"
+            " as wake_ts" % (ref or "work_items"))
     return (_COLUMNS_TEMPLATE
             .replace("__REVIEWER__", reviewer + ", " + reviewers)
             .replace("__WAKE__", wake)
