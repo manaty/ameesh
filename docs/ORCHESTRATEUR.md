@@ -485,8 +485,9 @@ paquet.
 Un créneau manqué ne reste pas muet (#2601) : sur l'hôte opérateur, chaque
 `ameesh release tick` (minuteur de 5 min) relit la cadence compilée
 (`packets.cutoffs`) ; passé la grâce (15 min par défaut), si aucun porteur
-`integration/paquet*` n'est ouvert ni tout juste fusionné pour le projet et que
-la liste calculée rend au moins un lot prêt, une alerte urgente part, une fois
+`integration/paquet*` n'est ouvert ni tout juste fusionné pour le projet,
+qu'aucun paquet n'a déjà fusionné pendant le créneau et que la liste calculée
+rend au moins un lot prêt, une alerte urgente part, une fois
 par créneau, aux destinataires de `packet_watch.projects.<projet>.notify` (le
 composeur et le pilote). `ameesh release packet-watch --dry-run` montre ce qui
 partirait.

@@ -13,7 +13,8 @@ canon), une fois le délai de grâce passé et jusqu'au créneau suivant :
 
 * la cible est-elle libre ? — aucun porteur `integration/paquet*` ouvert pour
   le projet (un paquet en composition ou en CI occupe la cible, §12), et aucun
-  porteur fusionné depuis moins que la grâce (le composeur enchaîne) ;
+  porteur fusionné depuis moins que la grâce (le composeur enchaîne), ni
+  paquet déjà fusionné pendant le créneau surveillé ;
 * la liste calculée (`packet_candidates.inventory`, la même que
   `scripts/paquet-candidats.py`) rend-elle au moins un lot prêt ?
 
@@ -147,28 +148,36 @@ def _carrier(row, app: str) -> bool:
             and (row.get("app") or "") == app)
 
 
-def carriers(db, app: str, now: float, grace_s: float) -> dict:
-    """`{open: [ids], recent: [ids]}` : porteurs ouverts, et fusionnés depuis
-    moins que la grâce (le paquet suivant se compose sur la cible bougée)."""
+def carriers(db, app: str, now: float, grace_s: float, *, slot_at: float) -> dict:
+    """Porteurs ouverts, fusions récentes et créneau déjà servi.
+
+    Une fusion dans [slot_at, now] sert le créneau jusqu'au suivant, même
+    après la grâce et après un redémarrage du watcher. Seul le jalon effectif
+    de fusion fait foi ; modifier un ancien porteur ne sert pas un créneau.
+    """
     from . import storage
     st = storage.of(db).work
     opened = []
     for state in OPEN_STATES:
         opened += [int(row["id"]) for row in st.items(state=state, assignee=None, limit=None)
                    if _carrier(row, app)]
-    recent = []
-    for row in st.items(state="merged", assignee=None, limit=RECENT_MERGED):
-        if not _carrier(row, app):
-            continue
-        updated = row.get("updated_ts")
-        if updated is None and isinstance(row.get("updated_at"), _dt.datetime):
-            updated = row["updated_at"].timestamp()
+    merged_ids = [int(row["id"])
+                  for row in st.items(state="merged", assignee=None, limit=RECENT_MERGED)
+                  if _carrier(row, app)]
+    recent, served = [], []
+    for row in st.delays(RECENT_MERGED, ids=merged_ids) if merged_ids else ():
         try:
-            if updated is not None and now - float(updated) < float(grace_s):
-                recent.append(int(row["id"]))
-        except (TypeError, ValueError):
+            merged = float(row["merged_ts"])
+        except (KeyError, TypeError, ValueError):
             continue
-    return {"open": sorted(opened), "recent": sorted(recent)}
+        if not merged <= now:
+            continue
+        ident = int(row["work_item_id"])
+        if now - merged < float(grace_s):
+            recent.append(ident)
+        if slot_at <= merged:
+            served.append(ident)
+    return {"open": sorted(opened), "recent": sorted(recent), "served": sorted(served)}
 
 
 # --------------------------------------------------------------------------
@@ -269,7 +278,7 @@ def check(cfg, db, watch: ProjectWatch, rules, *, now: float, state: dict,
     """Un passage pour un projet ; rend `{result, …}` et met `state` à jour.
 
     `result` : `no-cadence`, `grace`, `already-alerted`, `busy` (porteur
-    ouvert ou tout juste fusionné), `nothing-ready`, `alerted`, `would-alert`.
+    ouvert ou tout juste fusionné), `served`, `nothing-ready`, `alerted`, `would-alert`.
     """
     app = watch.app or watch.name
     at = slot(rules, now, watch.grace_s)
@@ -280,7 +289,9 @@ def check(cfg, db, watch: ProjectWatch, rules, *, now: float, state: dict,
     mine = state.setdefault("projects", {}).setdefault(watch.name, {})
     if float(mine.get("last_alert_slot") or 0) >= at["at"]:
         return dict(out, result="already-alerted")
-    held = carriers(db, app, now, watch.grace_s)
+    held = carriers(db, app, now, watch.grace_s, slot_at=at["at"])
+    if held["served"]:
+        return dict(out, result="served", carriers=held)
     if held["open"] or held["recent"]:
         return dict(out, result="busy", carriers=held)
     payload = (inventory or (lambda: _inventory(cfg, db, watch, app)))()
