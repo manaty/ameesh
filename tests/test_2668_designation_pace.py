@@ -100,6 +100,35 @@ class FamilyAdvanceTest(unittest.TestCase):
         # Claude has no general reading: neutral 0, ahead of Codex's +16
         self.assertEqual([r["name"] for r in picked["reviewers"]], ["claude-opus"])
 
+    def test_a_stale_model_scope_is_neutral_not_the_account_general(self):
+        # cx3 B/P1: the expired @fable reading makes the Fable candidate
+        # neutral; the account's general -0.30 must not be re-injected.
+        expired = gauge("claude", "secondaire", 0.95, 1.01, key="seven_day@fable")
+        rows = [gauge("claude", "secondaire", 0.30, 0.60), expired,
+                gauge("codex", "secondaire", 0.20, 0.30)]
+        advances = review_pace.family_advances(rows, now=NOW)
+        self.assertAlmostEqual(advances["claude"][""], -0.30, places=6)
+        self.assertIsNone(advances["claude"]["fable"])
+        self.assertAlmostEqual(advances["codex"][""], -0.10, places=6)
+        fable = rd.select(
+            required=1,
+            authors=[{"name": "author", "family": "deepseek"}],
+            candidates=candidates(row("claude-fable", harness="claude", session="claude",
+                                      model="fable"),
+                                  row("codex-one", harness="codex", session="codex")),
+            advances=advances)
+        # the Fable candidate is neutral (0), Codex is behind (-10): Codex
+        self.assertEqual([r["name"] for r in fable["reviewers"]], ["codex-one"])
+        opus = rd.select(
+            required=1,
+            authors=[{"name": "author", "family": "deepseek"}],
+            candidates=candidates(row("claude-opus", harness="claude", session="claude",
+                                      model="claude-opus-5-5"),
+                                  row("codex-one", harness="codex", session="codex")),
+            advances=advances)
+        # the Opus candidate does not match the stale scope: general -30 wins
+        self.assertEqual([r["name"] for r in opus["reviewers"]], ["claude-opus"])
+
     def test_the_reserve_of_the_critical_agents_is_deducted(self):
         # #2648: a non-critical reviewer stops 10 points below the pace. At
         # 19 % elapsed the allowed pace is 19 % (the margin is 10, the
@@ -163,6 +192,22 @@ class SelectionPaceTest(unittest.TestCase):
         self.assertEqual(picked["state"], rd.DESIGNATED)
         self.assertEqual([r["name"] for r in picked["reviewers"]], ["claude-one"])
         self.assertIn("plan pace", picked["why"])
+
+    def test_the_family_reduction_compares_the_applicable_pace_before_load(self):
+        # cx3 B/P1: Opus (load 2, 0 pt) is the Claude representative, not the
+        # less-loaded Fable agent (35 pt ahead); without the fix the Fable
+        # agent wins the family then loses to Codex, designating Codex.
+        picked = rd.select(
+            required=1, authors=self.authors,
+            advances={"claude": {"": 0.0, "fable": 0.35},
+                      "codex": {"": 0.16}},
+            candidates=candidates(
+                row("claude-opus", harness="claude", session="claude",
+                    model="claude-opus-5-5"),
+                row("claude-fable", harness="claude", session="claude", model="fable"),
+                row("codex-one", harness="codex", session="codex"),
+                loads={"claude-opus": 2, "claude-fable": 0, "codex-one": 0}))
+        self.assertEqual([r["name"] for r in picked["reviewers"]], ["claude-opus"])
 
     def test_two_reviews_take_claude_and_codex_whatever_the_pace(self):
         # a sensitive lot (the merge gate, the review itself): two distinct

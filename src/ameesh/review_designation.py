@@ -359,7 +359,10 @@ def _normalise_advances(advances) -> dict:
 
     A flat value is the family's general advance; a nested mapping carries the
     general `""` key and one key per model scope (`fable`), so a candidate's
-    model can pick the gauges that apply to it (#2668, cx3 B/P1).
+    model can pick the gauges that apply to it (#2668, cx3 B/P1). A nested
+    `None` means the family carries that scope but no account has a current
+    applicable reading: the model is neutral, never rescued by the general
+    reading of an account whose scoped window is stale.
     """
     out: dict = {}
     for family, value in (advances or {}).items():
@@ -369,9 +372,13 @@ def _normalise_advances(advances) -> dict:
         if isinstance(value, Mapping):
             nested = {}
             for scope, number in value.items():
+                scope = str(scope or "").strip().lower()
+                if number is None:
+                    nested[scope] = None
+                    continue
                 number = _finite(number)
                 if number is not None:
-                    nested[str(scope or "").strip().lower()] = number
+                    nested[scope] = number
             if nested:
                 out[family] = nested
         else:
@@ -385,8 +392,10 @@ def _advance_of(candidate, pace: Mapping) -> float:
     """The advance applicable to one candidate, model-scoped gauges included.
 
     A scope counts when its name is part of the candidate's model, the rule of
-    `accounts.model_scoped`; an unknown model gets the general `""` reading
-    only. A family absent from `pace` is neutral (0, at its pace).
+    `accounts.model_scoped`; the general `""` reading is used only when no
+    scope matches. A matching scope with no current reading (`None`) makes the
+    candidate neutral (0) — it does not fall back to the general reading of a
+    stale account (cx3 B/P1). A family absent from `pace` is neutral too.
     """
     entry = pace.get((candidate.family or "").strip().lower())
     if entry is None:
@@ -394,10 +403,13 @@ def _advance_of(candidate, pace: Mapping) -> float:
     if not isinstance(entry, Mapping):
         return entry
     model = str(getattr(candidate, "model", "") or "").strip().lower()
-    values = [entry[""]] if "" in entry else []
-    values.extend(value for scope, value in entry.items()
-                  if scope and scope in model)
-    return max(values) if values else 0.0
+    matching = [value for scope, value in entry.items()
+                if scope and scope in model]
+    if matching:
+        values = [value for value in matching if value is not None]
+        return max(values) if values else 0.0
+    general = entry.get("")
+    return general if general is not None else 0.0
 
 
 def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
@@ -424,7 +436,8 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
       criteria decide (#2668, #1561). Never a reason to discard an eligible
       family: two opinions still take two distinct families;
     - the load of the agent only breaks a pace tie (least loaded first), then
-      the name: the selection is deterministic;
+      the name: the same order chooses the family's representative and orders
+      the families; the selection is deterministic;
     - `already` names the manual reviewers already designated (#2627). The ones
       that prove an independent family cover a seat; only the **missing** seats
       are designated, never a manual reviewer removed or overridden.
@@ -467,12 +480,18 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     # pace, so the load and the name decide. A model-scoped value is selected
     # by the candidate's own model.
     pace = _normalise_advances(advances)
-    # a single candidate per family: the least loaded, then the name
+    # a single candidate per family: the applicable pace first (cx3 B/P1: a
+    # Fable bucket must not make a less-loaded Fable agent hide a further
+    # behind Opus agent of the same family), then the least loaded, then the
+    # name.
     best: dict[str, Candidate] = {}
     for candidate in eligible:
         family = candidate.family.strip().lower()
         current = best.get(family)
-        if current is None or (candidate.load, candidate.name) < (current.load, current.name):
+        if current is None or ((_advance_of(candidate, pace), candidate.load,
+                                candidate.name)
+                               < (_advance_of(current, pace), current.load,
+                                  current.name)):
             best[family] = candidate
     ordered = [best[family] for family in sorted(best)]
     # pace first, then load, then name; a family absent from `pace` is neutral

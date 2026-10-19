@@ -77,12 +77,18 @@ scope: it counts only for a candidate whose model contains that scope
 (`fable` in `fable` or `claude-fable`, the rule of `accounts.model_scoped`),
 added to the general windows; a reviewer of another model, or of an unknown
 model, sees the general windows only. A family with only scoped readings is
-neutral for them, never contaminated by a bucket that applies to one model
-(cx3 B/P1). A stale reading (#1561: a dated window reset while another is
-open, or a reading older than its shortest window) is **neutral**, as is an
-absent reading: the family is absent from the mapping, and the load decides.
-The pace never makes a family ineligible: two required opinions still take two
-distinct families, whatever their pace.
+neutral for them, never contaminated by a bucket that applies to one model.
+The family's own representative is chosen by the **applicable pace before the
+load**: a less-loaded Fable agent cannot hide a further-behind Opus agent of
+the same family (cx3 B/P1, first case). A scope carried by the family but
+with no current applicable reading is stored as `None`: that model is neutral
+(0), never rescued by the general reading of an account whose scoped window is
+stale (second case). Validity is per model and per account. A stale reading
+(#1561: a dated window reset while another is open, or a reading older than
+its shortest window) is **neutral**, as is an absent reading: the family is
+absent from the mapping, and the load decides. The pace never makes a family
+ineligible: two required opinions still take two distinct families, whatever
+their pace.
 
 Witnesses: a DeepSeek author, one opinion, Codex 16 points ahead and Claude at
 its pace designates Claude even when Codex's agent is less loaded — including
@@ -319,13 +325,16 @@ session directory, and a sibling of another project is refused; a policy that
 arrives later is retried on the same freeze (the runner call included); the CLI
 freeze (light explanation included) and the recovery command.
 
-`tests/test_2668_designation_pace.py` — 16 targeted tests, without a database:
+`tests/test_2668_designation_pace.py` — 18 targeted tests, without a database:
 the raw plan advance with the critical reserve (Codex 16 points ahead when
 19 % of the week is elapsed, multiplier 1 and default ceiling), a stale
 reading neutral (#1561), the family's most constrained account, the anonymous
 readings dropped when named accounts exist, a model-scoped `seven_day@fable`
 bucket that counts for a Fable candidate and not for an Opus one (a
-scoped-only family is neutral for another model, cx3 B/P1), one opinion
+scoped-only family is neutral for another model), the family reduction by
+applicable pace before load (a less-loaded Fable agent does not hide a
+further-behind Opus one), a stale scope kept as `None` (neutral, not rescued
+by the account's general reading) — the two cx3 B/P1 cases — one opinion
 preferring the family behind even when its agent is more loaded, two opinions
 keeping two distinct families, and the load rule when no reading is current.
 One integration test in the activation file adds a current Claude/Codex gauge

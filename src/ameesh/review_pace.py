@@ -145,12 +145,18 @@ def family_advances(rows, *, now: float) -> dict:
     (`scope in model`, `accounts.model_scoped`): a `seven_day@fable` bucket
     raises the advance of a Fable reviewer, never that of an Opus one or of an
     unknown model, which sees the general windows only.
+
+    A scope that the family carries but for which **no account has a current
+    applicable reading** is recorded as `None`, not omitted: the selection
+    then reads that model as neutral (0) instead of falling back to the
+    account's general reading, which the stale scoped window invalidated
+    (cx3 B/P1, second case). Validity stays per model and per account: a
+    general-only sibling remains a valid reading for every model.
     """
     rows = list(rows or ())
     named = {str((row or {}).get("harness") or "").strip().lower()
              for row in rows if (row or {}).get("account")}
     grouped: dict = {}
-    scopes: set = set()
     for row in rows:
         row = dict(row or {})
         harness = str(row.get("harness") or "").strip().lower()
@@ -160,20 +166,25 @@ def family_advances(rows, *, now: float) -> dict:
         gauge = gauge_of(row)
         if gauge is None:
             continue
-        if gauge.scope:
-            scopes.add(gauge.scope)
         grouped.setdefault((harness, account), []).append(gauge)
-    out: dict = {}
+    accounts_of: dict = {}
     for (harness, _account), gauges in grouped.items():
-        entry = out.setdefault(harness, {})
-        general = account_advance(gauges, now=now)
-        if general is not None:
-            entry[""] = max(entry.get("", float("-inf")), general)
-        for scope in scopes:
-            if not any(gauge.scope == scope for gauge in gauges):
-                continue
-            advance = account_advance(gauges, now=now, model=scope)
-            if advance is None:
-                continue
-            entry[scope] = max(entry.get(scope, float("-inf")), advance)
-    return {harness: entry for harness, entry in out.items() if entry}
+        accounts_of.setdefault(harness, []).append(gauges)
+    out: dict = {}
+    for harness, accounts in accounts_of.items():
+        entry: dict = {}
+        general = [value for value in
+                   (account_advance(gauges, now=now) for gauges in accounts)
+                   if value is not None]
+        if general:
+            entry[""] = max(general)
+        scopes = {gauge.scope for gauges in accounts for gauge in gauges if gauge.scope}
+        for scope in sorted(scopes):
+            values = [value for value in
+                      (account_advance(gauges, now=now, model=scope)
+                       for gauges in accounts)
+                      if value is not None]
+            entry[scope] = max(values) if values else None
+        if entry:
+            out[harness] = entry
+    return out
