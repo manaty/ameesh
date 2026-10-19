@@ -35,6 +35,7 @@ _COLUMNS_TEMPLATE = """
     superseded_by, delegated_by,
     expected_value, value_score, priority, team, required_capabilities,
     branch, branch_target, branch_head, migration, migration_repo,
+    __MIGRATIONS__,
     migration_landed, migration_landed_repo,
     extract(epoch from branch_head_at)::float8 as branch_head_ts,
     partial_merge, extract(epoch from partial_seen_at)::float8 as partial_seen_ts,
@@ -77,6 +78,26 @@ def has_reviewer(db) -> bool:
     return flag
 
 
+def has_migration_slots(db) -> bool:
+    """#2481 : la table des créneaux de migration (#711, 0419) existe-t-elle ?
+
+    Seule la réponse POSITIVE est mise en cache, comme `has_reviewer` : une
+    base migrée pendant la vie du démon voit ses créneaux sans redémarrage.
+    Sur une base d'avant 0419, la liste se replie sur le champ scalaire."""
+    if getattr(db, "_has_migration_slots", False):
+        return True
+    found = bool(db.query(
+        "SELECT 1 AS ok FROM information_schema.tables"
+        " WHERE table_schema = current_schema()"
+        "   AND table_name = 'work_migration_reservations'"))
+    if found:
+        try:
+            db._has_migration_slots = True
+        except Exception:
+            pass
+    return found
+
+
 def item_columns(db, ref: str | None = None) -> str:
     """Les colonnes d'un lot ; `reviewer` quand 0421 est appliquée, `''` sinon
     (les lectures d'avant la migration ne cassent pas, #705).
@@ -84,7 +105,16 @@ def item_columns(db, ref: str | None = None) -> str:
     `ref` (le nom de la table dans la requête, « work_items ») lit `reviewer`
     par `to_jsonb`, sans sonde de colonne : les commandes à budget
     d'allers-retours (L61 : `work list`, `progress`) n'en paient pas un de
-    plus. `to_jsonb` rend NULL sur une base d'avant 0421, d'où le coalesce."""
+    plus. `to_jsonb` rend NULL sur une base d'avant 0421, d'où le coalesce.
+
+    #2481 : `migrations` est la liste des créneaux réservés du lot (JSONB),
+    lue dans `work_migration_reservations` par une sous-requête corrélée —
+    une seule requête, pas d'aller-retour par lot. La liste n'est lue que sur
+    la ligne complète (sans `ref`) : le chemin `ref` est celui des lectures à
+    budget L61, et la sonde de table y coûterait justement l'aller-retour
+    qu'il économise. Ces vues rendent `[]` et se replient sur le scalaire
+    (`work.migration_line`), jamais sur une erreur : sur une base d'avant
+    0419, la liste est de toute façon vide."""
     if ref:
         reviewer = "coalesce(to_jsonb(%s)->>'reviewer', '') AS reviewer" % ref
     elif has_reviewer(db):
@@ -94,7 +124,21 @@ def item_columns(db, ref: str | None = None) -> str:
     # to_jsonb keeps reads compatible with schemas predating 0456, without
     # another catalogue round trip (including bounded progress/list reads).
     reviewers = "to_jsonb(%s)->'reviewers' AS reviewers" % (ref or "work_items")
-    return _COLUMNS_TEMPLATE.replace("__REVIEWER__", reviewer + ", " + reviewers)
+    if ref:
+        migrations = "'[]'::jsonb AS migrations"
+    elif has_migration_slots(db):
+        migrations = (
+            "coalesce((SELECT jsonb_agg(jsonb_build_object("
+            "'number', r.number, 'repo', r.target_repo, 'slot', r.slot)"
+            " ORDER BY r.number, r.slot)"
+            " FROM work_migration_reservations r"
+            " WHERE r.work_item_id = work_items.id AND r.status = 'reserved'), '[]'::jsonb)"
+            " AS migrations")
+    else:
+        migrations = "'[]'::jsonb AS migrations"
+    return (_COLUMNS_TEMPLATE
+            .replace("__REVIEWER__", reviewer + ", " + reviewers)
+            .replace("__MIGRATIONS__", migrations))
 
 
 def has_reviewers(db) -> bool:
@@ -182,6 +226,9 @@ _RESERVE_WAIT_BASE_S = 0.005
 _RESERVE_WAIT_MAX_S = 0.5
 #: l'index unique (dépôt, numéro) de L122 : lui seul fait une contention
 MIGRATION_INDEX = "work_items_migration_repo_idx"
+#: #711/#2481 : l'index partiel des créneaux réservés (dépôt, cible, numéro) ;
+#: un second numéro du même lot y est inséré comme créneau supplémentaire
+MIGRATION_SLOTS_INDEX = "work_migration_reservations_active_idx"
 #: l'index unique (dépôt, numéro atterri) de #1567 : deux lots d'un même dépôt
 #: ne nomment jamais le même numéro atterri
 MIGRATION_LANDED_INDEX = "work_items_migration_landed_idx"
@@ -1655,58 +1702,138 @@ class WorkItems(interface.WorkItems):
 
     # -- numéro de migration réservé (L122) ----------------------------------
     def _release_migration(self, tx, item_id, row, *, why, actor) -> None:
-        """#956 : libère la réservation du lot qui entre dans un état terminal
-        (`merged`, `promoted`, `closed`), dans la transaction même de la
-        transition : une réservation tenue par un lot fusionné bloquait le
+        """#956, #2481 : libère les réservations du lot qui entre dans un état
+        terminal (`merged`, `promoted`, `closed`), dans la transaction même de
+        la transition : une réservation tenue par un lot fusionné bloquait le
         numéro pour toujours. Le numéro reste protégé tant qu'un fichier le
         porte sur la cible (réservation à numéro exact, `target_numbers`) ou
-        sur une branche (allocation du prochain libre, `repo_numbers`)."""
-        if row.get("migration") is None:
+        sur une branche (allocation du prochain libre, `repo_numbers`). Tous
+        les créneaux réservés du lot sont rendus, pas seulement le scalaire."""
+        numbers = sorted({int(item["number"]) for item in (row.get("migrations") or ())
+                          if item.get("number") is not None})
+        if row.get("migration") is not None and int(row["migration"]) not in numbers:
+            numbers.append(int(row["migration"]))
+            numbers.sort()
+        if not numbers:
             return
-        number = row["migration"]
+        if has_migration_slots(tx):
+            tx.execute(
+                "UPDATE work_migration_reservations SET status = 'released',"
+                "       updated_at = now()"
+                " WHERE work_item_id = %s AND status = 'reserved'", (int(item_id),))
         tx.execute(
             "UPDATE work_items SET migration = NULL, migration_repo = NULL,"
             "       updated_at = now() WHERE id = %s", (int(item_id),))
         # le lot rendu à l'appelant reflète l'état validé, pas la valeur d'avant
         row["migration"] = None
         row["migration_repo"] = None
+        row["migrations"] = []
+        what = ("migration %s" % numbers[0] if len(numbers) == 1
+                else "migrations %s" % ", ".join(str(n) for n in numbers))
         WorkItems(tx)._event(
             int(item_id), row["state"],
-            "migration %s released (%s, #956)" % (number, why), actor)
+            "%s released (%s, #956)" % (what, why), actor)
+
+    def _migration_row(self, tx, item_id):
+        rows = tx.query("SELECT %s FROM work_items WHERE id = %%s" % item_columns(tx),
+                        (int(item_id),))
+        return rows[0] if rows else None
+
+    def _release_migration_rows(self, tx, item_id, *, slots, scalar, number, note, actor,
+                                state, repo=None) -> dict | None:
+        """Libère le numéro `number` (None : tous) du lot, et rend sa ligne.
+
+        Le scalaire est la réservation principale ; s'il est libéré alors que
+        d'autres créneaux restent, le plus petit d'entre eux est promu et son
+        créneau libéré AVANT l'UPDATE du scalaire : le déclencheur
+        `work_items_migration_slot_sync` réécrit alors le créneau `default`
+        sans rencontrer le doublon du créneau promu."""
+        numbers = sorted({int(row["number"]) for row in slots})
+        if scalar is not None and int(scalar) not in numbers:
+            numbers.append(int(scalar))
+            numbers.sort()
+        if not numbers:
+            return self._migration_row(tx, item_id)
+        target = None if number is None else int(number)
+        if target is not None and target not in numbers:
+            return None
+        table = has_migration_slots(tx)
+        if target is None:
+            if table:
+                tx.execute(
+                    "UPDATE work_migration_reservations SET status = 'released',"
+                    "       updated_at = now()"
+                    " WHERE work_item_id = %s AND status = 'reserved'", (int(item_id),))
+            tx.execute(
+                "UPDATE work_items SET migration = NULL, migration_repo = NULL,"
+                "       updated_at = now() WHERE id = %s", (int(item_id),))
+        elif scalar is not None and target == int(scalar):
+            remaining = [row for row in slots if int(row["number"]) != target]
+            promoted = remaining[0] if remaining else None
+            if table:
+                for row in slots:
+                    if int(row["number"]) == target or (
+                            promoted is not None and row["slot"] == promoted["slot"]):
+                        tx.execute(
+                            "UPDATE work_migration_reservations SET status = 'released',"
+                            "       updated_at = now()"
+                            " WHERE work_item_id = %s AND slot = %s"
+                            "   AND status = 'reserved'", (int(item_id), row["slot"]))
+            if promoted is None:
+                tx.execute(
+                    "UPDATE work_items SET migration = NULL, migration_repo = NULL,"
+                    "       updated_at = now() WHERE id = %s", (int(item_id),))
+            else:
+                promoted_repo = repo or str(promoted.get("target_repo") or "")
+                if promoted_repo.startswith("github.com/"):
+                    promoted_repo = promoted_repo[len("github.com/"):]
+                tx.query(
+                    "UPDATE work_items SET migration = %%s, migration_repo = %%s,"
+                    "       updated_at = now() WHERE id = %%s"
+                    " RETURNING %s" % item_columns(tx),
+                    (int(promoted["number"]), promoted_repo, int(item_id)))
+        elif table:
+            for row in slots:
+                if int(row["number"]) == target:
+                    tx.execute(
+                        "UPDATE work_migration_reservations SET status = 'released',"
+                        "       updated_at = now()"
+                        " WHERE work_item_id = %s AND slot = %s"
+                        "   AND status = 'reserved'", (int(item_id), row["slot"]))
+        if target is not None:
+            note = note % {"number": target}
+        elif "%(number)" in note:
+            # #2481 N2 : une libération totale n'a pas UN numéro ; le
+            # gabarit nomme l'ensemble au lieu du sentinelle 0.
+            note = note.replace("%(number)04d", "%s").replace("%(number)s", "%s")
+            note = note % ", ".join(str(value) for value in numbers)
+        WorkItems(tx)._event(int(item_id), state, note, actor)
+        return self._migration_row(tx, item_id)
 
     def reserve_migration(self, item_id, repo, number, floor, *, note, actor,
-                          issue_ref, release=False) -> dict | None:
-        """Réserve (ou libère, `release`) le numéro de migration d'un lot
+                          issue_ref, release=False, release_number=None) -> dict | None:
+        """Réserve (ou libère, `release`) un numéro de migration d'un lot
         ouvert dans le dépôt `repo`, avec une ligne de journal. Sans
-        `number` : le prochain libre de ce dépôt, au moins `floor`, calculé
-        dans l'UPDATE même ; l'index unique `work_items_migration_repo_idx`
-        tranche entre deux réservations simultanées : la perdante attend un
-        délai plein jitter croissant, borné au budget restant, et recalcule
-        (nouvelle transaction) ; épuisé, `ReservationContention` — jamais la
-        DbError de l'index (#478). Seule la violation d'unicité de cet index
-        réessaie : une autre erreur qui le nomme remonte telle quelle
+        `number` : le prochain libre de ce dépôt, au moins `floor` ; l'index
+        unique `work_items_migration_repo_idx` et le garde de
+        `work_migration_reservations` tranchent entre deux réservations
+        simultanées : la perdante attend un délai plein jitter croissant,
+        borné au budget restant, et recalcule (nouvelle transaction) ;
+        épuisé, `ReservationContention` — jamais la DbError de l'index
+        (#478). Une autre erreur qui nomme l'index remonte telle quelle
         (codex #478 r1). Un `number` explicite déjà pris lève la DbError de
         l'index, sans réessai. #1830 : `issue_ref` (lue par l'appelant) est une
         condition du CAS, NULL et chaîne vide confondus — une correction
         concurrente de la référence pendant le scan du dépôt ne peut plus
         laisser `issue_ref` d'un dépôt avec `migration_repo` d'un autre ;
-        `release` l'ignore."""
+        `release` l'ignore.
+
+        #2481 : quand le lot a déjà une réservation, `number` (ou le prochain
+        libre) est AJOUTÉ comme créneau `legacy-<numéro>` de
+        `work_migration_reservations`, et le scalaire reste la réservation
+        principale. `release` libère tout, ou seulement `release_number`."""
         if release:
-            value, params = "NULL", ()
-        elif number is None:
-            value = ("greatest(%s, (SELECT coalesce(max(migration), 0) + 1 FROM work_items"
-                     "               WHERE migration_repo = %s"
-                     "                 AND state NOT IN ('merged', 'promoted', 'closed')),"
-                     " (SELECT coalesce(max(number), 0) + 1 FROM work_migration_reservations"
-                     " WHERE target_repo = %s AND status = 'reserved'))")
-            params = (int(floor), repo, "github.com/" + repo)
-        else:
-            value, params = "%s", (int(number),)
-        # `release` libère aussi un lot déjà terminal (#956) ; les autres
-        # chemins ne visent qu'un lot ouvert.
-        guard = "" if release else " AND state NOT IN ('merged', 'promoted', 'closed')"
-        issue_guard = "" if release else " AND coalesce(issue_ref, '') = coalesce(%%s, '')"
-        issue_params = () if release else (issue_ref,)
+            repo = repo or None
         deadline = time.monotonic() + _RESERVE_BUDGET_S
         wait = _RESERVE_WAIT_BASE_S
         while True:
@@ -1714,47 +1841,179 @@ class WorkItems(interface.WorkItems):
                 with self.db.transaction() as tx:
                     if not _lock_migration_writer(tx, item_id, None if release else repo):
                         return None
-                    if not release:
-                        # #956 : une réservation héritée d'un lot terminal
-                        # (prise avant ce correctif) ne tient plus le numéro :
-                        # elle est libérée dans la transaction de la
-                        # réservation, avec sa ligne de journal. Les lignes
-                        # sont lues AVANT l'UPDATE : `RETURNING` rendrait la
-                        # valeur déjà effacée. `ORDER BY id` : ordre de
-                        # verrouillage canonique (#967) — deux transactions qui
-                        # reprennent les réservations héritées du même dépôt
-                        # verrouillent ainsi les mêmes lignes dans le même
-                        # ordre, jamais en sens inverse (interblocage).
-                        for old in tx.query(
-                                "SELECT id, migration, state FROM work_items"
-                                " WHERE migration_repo = %s"
-                                "   AND state IN ('merged', 'promoted', 'closed')"
-                                " ORDER BY id FOR UPDATE", (repo,)):
+                    current = tx.query(
+                        "SELECT id, migration, migration_repo, app, branch_target, state,"
+                        "       coalesce(issue_ref, '') AS issue_ref"
+                        "  FROM work_items WHERE id = %s", (int(item_id),))
+                    if not current:
+                        return None
+                    current = current[0]
+                    scalar = (None if current["migration"] is None
+                              else int(current["migration"]))
+                    slots = []
+                    if has_migration_slots(tx):
+                        slots = tx.query(
+                            "SELECT slot, number, target_repo"
+                            "  FROM work_migration_reservations"
+                            " WHERE work_item_id = %s AND status = 'reserved'"
+                            " ORDER BY number, slot", (int(item_id),))
+                    if release:
+                        return self._release_migration_rows(
+                            tx, item_id, slots=slots, scalar=scalar,
+                            number=release_number, note=note, actor=actor,
+                            state=current["state"], repo=repo)
+                    if current["state"] in ("merged", "promoted", "closed"):
+                        return None
+                    if (current["issue_ref"] or "") != (issue_ref or ""):
+                        return None
+                    # #956 : une réservation héritée d'un lot terminal
+                    # (prise avant ce correctif) ne tient plus le numéro :
+                    # elle est libérée dans la transaction de la
+                    # réservation, avec sa ligne de journal. Les lignes
+                    # sont lues AVANT l'UPDATE : `RETURNING` rendrait la
+                    # valeur déjà effacée. `ORDER BY id` : ordre de
+                    # verrouillage canonique (#967) — deux transactions qui
+                    # reprennent les réservations héritées du même dépôt
+                    # verrouillent ainsi les mêmes lignes dans le même
+                    # ordre, jamais en sens inverse (interblocage).
+                    for old in tx.query(
+                            "SELECT id, migration, state FROM work_items"
+                            " WHERE migration_repo = %s"
+                            "   AND state IN ('merged', 'promoted', 'closed')"
+                            " ORDER BY id FOR UPDATE", (repo,)):
+                        if has_migration_slots(tx):
                             tx.execute(
-                                "UPDATE work_items SET migration = NULL,"
-                                "       migration_repo = NULL, updated_at = now()"
-                                " WHERE id = %s", (int(old["id"]),))
-                            WorkItems(tx)._event(
-                                int(old["id"]), old["state"],
-                                "migration %s released (lot %s %s, #956)" % (
-                                    old["migration"], old["id"], old["state"]), actor)
-                    sql = ("UPDATE work_items SET migration = %s, migration_repo = %%s,"
-                           "       updated_at = now()"
-                           " WHERE id = %%s" + guard + issue_guard +
-                           " RETURNING %s") % (value, item_columns(self.db))
-                    rows = tx.query(sql,
-                                    params + (None if release else repo, int(item_id))
-                                    + issue_params)
+                                "UPDATE work_migration_reservations SET status = 'released',"
+                                "       updated_at = now()"
+                                " WHERE work_item_id = %s AND status = 'reserved'",
+                                (int(old["id"]),))
+                        tx.execute(
+                            "UPDATE work_items SET migration = NULL,"
+                            "       migration_repo = NULL, updated_at = now()"
+                            " WHERE id = %s", (int(old["id"]),))
+                        WorkItems(tx)._event(
+                            int(old["id"]), old["state"],
+                            "migration %s released (lot %s %s, #956)" % (
+                                old["migration"], old["id"], old["state"]), actor)
+                    if scalar is None and slots:
+                        # état incohérent (scalaire effacé hors API) : le plus
+                        # petit créneau redevient la réservation principale
+                        first = slots[0]
+                        tx.execute(
+                            "UPDATE work_migration_reservations SET status = 'released',"
+                            "       updated_at = now()"
+                            " WHERE work_item_id = %s AND slot = %s"
+                            "   AND status = 'reserved'", (int(item_id), first["slot"]))
+                        tx.query(
+                            "UPDATE work_items SET migration = %%s, migration_repo = %%s,"
+                            "       updated_at = now() WHERE id = %%s"
+                            " RETURNING %s" % item_columns(tx),
+                            (int(first["number"]), repo, int(item_id)))
+                        scalar = int(first["number"])
+                    if scalar is not None and (current["migration_repo"] or "") != (repo or ""):
+                        # déplacement de la réservation principale vers un
+                        # autre dépôt (appel storage direct, #711) : les
+                        # créneaux de l'ancien dépôt sont rendus, puis le
+                        # scalaire est réécrit ; le déclencheur 0419 recrée
+                        # le créneau `default` dans le nouveau dépôt.
+                        if has_migration_slots(tx):
+                            tx.execute(
+                                "UPDATE work_migration_reservations SET status = 'released',"
+                                "       updated_at = now()"
+                                " WHERE work_item_id = %s AND status = 'reserved'",
+                                (int(item_id),))
+                        if number is None:
+                            value, params = (
+                                "greatest(%s, (SELECT coalesce(max(migration), 0) + 1"
+                                " FROM work_items WHERE migration_repo = %s"
+                                "   AND state NOT IN ('merged', 'promoted', 'closed')),"
+                                " (SELECT coalesce(max(number), 0) + 1"
+                                "  FROM work_migration_reservations"
+                                "  WHERE target_repo = %s AND status = 'reserved'))",
+                                (int(floor), repo, "github.com/" + repo))
+                        else:
+                            value, params = "%s", (int(number),)
+                        rows = tx.query(
+                            "UPDATE work_items SET migration = %s, migration_repo = %%s,"
+                            "       updated_at = now() WHERE id = %%s"
+                            "   AND state NOT IN ('merged', 'promoted', 'closed')"
+                            "   AND coalesce(issue_ref, '') = coalesce(%%s, '')"
+                            " RETURNING %s" % (value, item_columns(tx)),
+                            params + (repo, int(item_id), issue_ref))
+                        if not rows:
+                            return None
+                        WorkItems(tx)._event(
+                            int(item_id), rows[0]["state"],
+                            note % {"number": int(rows[0]["migration"] or 0)}, actor)
+                        return rows[0]
+                    if scalar is not None:
+                        # la réservation principale est conservée : le
+                        # nouveau numéro devient un créneau supplémentaire
+                        if number is not None:
+                            value = int(number)
+                            if value == scalar or any(
+                                    int(row["number"]) == value for row in slots):
+                                return self._migration_row(tx, item_id)
+                        else:
+                            row = tx.query(
+                                "SELECT greatest(%s,"
+                                " (SELECT coalesce(max(migration), 0) + 1 FROM work_items"
+                                "  WHERE migration_repo = %s"
+                                "    AND state NOT IN ('merged', 'promoted', 'closed')),"
+                                " (SELECT coalesce(max(number), 0) + 1"
+                                "  FROM work_migration_reservations"
+                                "  WHERE target_repo = %s AND status = 'reserved')) AS n",
+                                (int(floor), repo, "github.com/" + repo))[0]
+                            value = int(row["n"])
+                        slot = "legacy-%d" % value
+                        tx.execute(
+                            "INSERT INTO work_migration_reservations"
+                            " (work_item_id, slot, number, project, target_repo,"
+                            "  target_branch, status)"
+                            " VALUES (%s, %s, %s, %s, %s, NULL, 'reserved')"
+                            " ON CONFLICT (work_item_id, slot) DO UPDATE SET"
+                            "   number = excluded.number, project = excluded.project,"
+                            "   target_repo = excluded.target_repo,"
+                            "   target_branch = excluded.target_branch,"
+                            "   status = 'reserved', updated_at = now()",
+                            (int(item_id), slot, value, current["app"] or "",
+                             "github.com/" + repo))
+                        WorkItems(tx)._event(
+                            int(item_id), current["state"],
+                            note % {"number": value}, actor)
+                        return self._migration_row(tx, item_id)
+                    # aucune réservation : le scalaire reste la principale,
+                    # le déclencheur 0419 crée son créneau `default`
+                    if number is None:
+                        value, params = (
+                            "greatest(%s, (SELECT coalesce(max(migration), 0) + 1"
+                            " FROM work_items WHERE migration_repo = %s"
+                            "   AND state NOT IN ('merged', 'promoted', 'closed')),"
+                            " (SELECT coalesce(max(number), 0) + 1"
+                            "  FROM work_migration_reservations"
+                            "  WHERE target_repo = %s AND status = 'reserved'))",
+                            (int(floor), repo, "github.com/" + repo))
+                    else:
+                        value, params = "%s", (int(number),)
+                    rows = tx.query(
+                        "UPDATE work_items SET migration = %s, migration_repo = %%s,"
+                        "       updated_at = now()"
+                        " WHERE id = %%s"
+                        "   AND state NOT IN ('merged', 'promoted', 'closed')"
+                        "   AND coalesce(issue_ref, '') = coalesce(%%s, '')"
+                        " RETURNING %s" % (value, item_columns(tx)),
+                        params + (repo, int(item_id), issue_ref))
                     if not rows:
                         return None
-                    WorkItems(tx)._event(int(item_id), rows[0]["state"],
-                                         note % {"number": int(rows[0]["migration"] or 0)},
-                                         actor)
+                    WorkItems(tx)._event(
+                        int(item_id), rows[0]["state"],
+                        note % {"number": int(rows[0]["migration"] or 0)}, actor)
                     return rows[0]
             except DbError as exc:
                 if (number is not None or release
                         or not (is_unique_violation(exc, MIGRATION_INDEX)
-                                or is_unique_violation(exc, "work_migration_reservations_active_idx"))):
+                                or is_unique_violation(
+                                    exc, "work_migration_reservations_active_idx"))):
                     raise
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -1772,11 +2031,24 @@ class WorkItems(interface.WorkItems):
 
     def migration_holder(self, number, repo) -> dict | None:
         """Le lot OUVERT qui tient ce numéro (#956 : un lot terminal ne le
-        tient plus)."""
-        rows = self.db.query(
-            "SELECT id, title, state FROM work_items WHERE migration = %s"
-            " AND migration_repo = %s"
-            " AND state NOT IN ('merged', 'promoted', 'closed')", (int(number), repo))
+        tient plus). #2481 : les créneaux supplémentaires comptent aussi (un
+        lot peut réserver plusieurs numéros)."""
+        if has_migration_slots(self.db):
+            rows = self.db.query(
+                "SELECT w.id, w.title, w.state FROM work_items w"
+                " WHERE w.state NOT IN ('merged', 'promoted', 'closed')"
+                "   AND ((w.migration = %s AND w.migration_repo = %s)"
+                "        OR EXISTS (SELECT 1 FROM work_migration_reservations r"
+                "                    WHERE r.work_item_id = w.id"
+                "                      AND r.status = 'reserved' AND r.number = %s"
+                "                      AND (r.target_repo = %s OR r.target_repo = %s)))"
+                " ORDER BY w.id LIMIT 1",
+                (int(number), repo, int(number), repo, "github.com/" + repo))
+        else:
+            rows = self.db.query(
+                "SELECT id, title, state FROM work_items WHERE migration = %s"
+                " AND migration_repo = %s"
+                " AND state NOT IN ('merged', 'promoted', 'closed')", (int(number), repo))
         return rows[0] if rows else None
 
     def record_landed_migration(self, item_id, number, repo, *, note, actor) -> dict | None:
@@ -2456,6 +2728,65 @@ class WorkItems(interface.WorkItems):
                  package_id, package_parent, app or ""))
             item = rows[0]
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
+            return item
+
+    def backlog_basket_add(self, *, key, title, expected_value, line, value_score, priority,
+                           team, required_capabilities, package_id, package_parent, note,
+                           actor, app="") -> dict:
+        caps = _catalog._text_array(required_capabilities) if required_capabilities else None
+        with self.db.transaction() as tx:
+            # #2584 : un seul écrivain par clé de panier — deux ajouts
+            # simultanés n'ouvrent jamais deux paniers du même chantier.
+            tx.query("SELECT pg_advisory_xact_lock(hashtextextended("
+                     "current_schema() || ':backlog-basket:' || %s, 0))", (key,))
+            # Une prise concurrente (`assign_capped`) attend le verrou de
+            # ligne ; gagnée avant nous, la ligne ne vérifie plus le filtre :
+            # le panier pris reste fermé aux lignes. La clé seule fait le
+            # panier : l'équipe d'une ligne n'en ouvre pas un second.
+            rows = tx.query(
+                "SELECT id FROM work_items"
+                " WHERE type = 'improvement' AND source = %s AND state = 'intake'"
+                "   AND assignee IS NULL"
+                " ORDER BY id LIMIT 1 FOR NO KEY UPDATE", (key,))
+            opened = not rows
+            if opened:
+                rows = tx.query(
+                    "INSERT INTO work_items"
+                    "    (type, source, title, body, state, expected_value, value_score,"
+                    "     priority, team, required_capabilities, package_id, package_parent,"
+                    "     app)"
+                    " VALUES ('improvement', %s, %s, %s, 'intake', %s, %s, %s, %s,"
+                    "         %s::text[], %s, %s, %s)"
+                    " RETURNING id",
+                    (key, title, line, expected_value, int(value_score), int(priority),
+                     team, caps, package_id, package_parent, app or ""))
+            else:
+                tx.query(
+                    "UPDATE work_items"
+                    "   SET body = CASE WHEN btrim(coalesce(body, '')) = '' THEN %s"
+                    "                   ELSE body || %s END,"
+                    "       value_score = greatest(coalesce(value_score, 0), %s),"
+                    "       priority = least(coalesce(priority, %s), %s),"
+                    "       required_capabilities = (SELECT array_agg(DISTINCT c ORDER BY c)"
+                    "            FROM unnest(coalesce(required_capabilities, '{}'::text[])"
+                    "                        || coalesce(%s::text[], '{}'::text[])) AS c),"
+                    "       team = coalesce(team, %s),"
+                    "       updated_at = now()"
+                    " WHERE id = %s RETURNING id",
+                    (line, "\n" + line, int(value_score), int(priority), int(priority),
+                     caps, team, int(rows[0]["id"])))
+            item_id = int(rows[0]["id"])
+            WorkItems(tx)._event(item_id, "intake", note, actor)
+            rows = tx.query(
+                "SELECT " + item_columns(self.db) + ","
+                "       (SELECT count(*) FROM work_item_events e"
+                "         WHERE e.work_item_id = work_items.id"
+                "           AND starts_with(e.note, %s))::bigint AS basket_lines"
+                "  FROM work_items WHERE id = %s",
+                (interface.BASKET_LINE_NOTE, item_id))
+            item = dict(rows[0])
+            item["basket_lines"] = int(item.get("basket_lines") or 0)
+            item["basket_opened"] = opened
             return item
 
     def backlog(self, *, open_only, limit, ready_only=False) -> list[dict]:

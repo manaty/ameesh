@@ -645,14 +645,23 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
     verdict reste exigé. Une cible `release/*` (classe release) n'est jamais
     une auto-fusion : c'est la procédure de release du pilote.
 
+    #2505 : la cible de la classe est celle que la file va fusionner, donc
+    `origin/<cible>` quand elle existe (#2207, `merge_queue._class_base`) ;
+    la cible **locale** du checkout ne sert qu'à défaut. Un `main` local en
+    retard y ajouterait des commits déjà fusionnés, dont des chemins
+    sensibles, et surclasserait le lot au-dessus de ses vrais avis.
+
     Cette porte s'évalue **avant** toute PR, toute entrée en file et toute CI :
     un feu peut être enregistré au gel, mais rien ne part avant les avis."""
     lot = int(row["id"])
     freeze = freeze_of(marks)
     frozen = _norm((freeze or {}).get("sha"))
     head = merge_queue.pinned(repo, frozen) if repo else None
+    base = target or None
+    if repo and target:
+        base = merge_queue._class_base(repo, target) or target
     klass = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=repo or None,
-                             base=target or None, head=head)
+                             base=base, head=head)
     if str(klass.get("class") or "") == lot_class.RELEASE:
         return False, ("class: release (%s) — the release procedure belongs to the pilot: "
                        "a fire never arms an automatic merge on a release"
@@ -1506,7 +1515,17 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
     if not branch:
         out.update(result="no-branch", detail="lot without branch: no PR to arm")
         return out
-    work_repo = _checkout(repo) if repo else _repo_of(db, row)
+    work_repo = _repo_of(db, row) if repo is None else _checkout(repo)
+    # #2535 : un `--repo` explicite qui n'est pas un checkout est un refus,
+    # jamais un repli silencieux sur le clone que le projet déclare
+    # (`radar.projects.<p>.repo`). Le pilote qui se trompe de dépôt verrait
+    # sinon le feu lire une autre copie que celle demandée et rendre un
+    # verdict de préparation trompeur.
+    if repo is not None and work_repo is None:
+        out.update(result="no-repository", detail=(
+            "--repo %s is not a git checkout: pass a path inside the lot's repository "
+            "(#2535: refusing to read the project's declared clone instead)" % repo))
+        return out
     slug = _slug(cfg, row, work_repo)
     if not slug:
         out.update(result="no-repository", detail="no GitHub repository known for this lot")

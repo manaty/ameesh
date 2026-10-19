@@ -77,7 +77,7 @@ class ReservationImportTest(PgTestCase):
     def test_mapping_is_explicit_complete_and_repository_scoped(self):
         self.assertEqual([r["action"] for r in self.run_import({})], ["unmapped", "unmapped"])
         other = self.lot("Other", 3, "acme/other")
-        for mapping in ({}, {"323": self.a}, {"323": self.a, "324": self.a},
+        for mapping in ({}, {"323": self.a},
                         {"323": self.a, "324": other}, {"323": self.a, "325": self.b},
                         {"323": True, "324": self.b}, {"323": 1.5, "324": self.b},
                         {"323": self.a, "0323": self.b, "324": other}):
@@ -105,9 +105,20 @@ class ReservationImportTest(PgTestCase):
         storage.of(self.db).work.reserve_migration(
             self.a, self.slug, 327, 0, actor="orch", note="reserved %(number)s",
             issue_ref=work.get(self.db, self.a)["issue_ref"])
-        with self.assertRaisesRegex(work.WorkError, "different reservation"):
+        # #2481 : le numéro 327 du lot n'est plus un refus en soi ; le
+        # conflit vient du 324 tenu par un autre lot, et l'import entier
+        # reste annulé (aucun 323 ajouté en silence).
+        with self.assertRaisesRegex(work.WorkError, "already held"):
             self.run_import(apply=True)
         self.assertEqual(work.get(self.db, self.a)["migration"], 327)
+        storage.of(self.db).work.reserve_migration(
+            other, self.slug, None, 0, actor="orch", release=True,
+            note="released %(number)s", issue_ref=work.get(self.db, other)["issue_ref"])
+        self.assertEqual([row["action"] for row in self.run_import(apply=True)],
+                         ["reserved", "reserved"])
+        item = work.get(self.db, self.a)
+        self.assertEqual((item["migration"], [row["number"] for row in item["migrations"]]),
+                         (327, [323, 327]))
 
     def test_stale_collision_rolls_back_the_entire_import(self):
         # Inject a stale holder observation: the repository lock serializes
