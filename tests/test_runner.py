@@ -216,6 +216,10 @@ class RunnerTest(PgTestCase):
         comme la boucle de service. Le battement doit donc être constaté vivant
         *avant* la préparation (déterministe, sans horloge), et le veilleur
         arrêté dès la fin du tour : son échéance ne juge plus rien ensuite.
+        Le veilleur tuait en fait *dans* `run_turn` (« harness not yet
+        published », `proc` déjà effacé) : le battement s'arrêtait à la sortie
+        du harnais, avant la compta d'après tour. Il court désormais jusqu'à la
+        sortie de `_run_turn` ; la compta est ralentie ici pour le prouver.
         """
         cwd = self._cwd("lent")
         self.register("lent", "claude", cwd=cwd, prompt="tour préparé lentement")
@@ -238,9 +242,16 @@ class RunnerTest(PgTestCase):
                             "le battement s'est arrêté pendant la préparation")
             return ouverture(self_)
 
+        fin_de_tour = registry.end_turn
+
+        def fin_lente(*args, **kwargs):
+            time.sleep(5.0)  # compta d'après harnais plus longue que le bail
+            return fin_de_tour(*args, **kwargs)
+
         with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN,
                                           "AMEESH_TEST_LOG": self.turns_log}), \
-                mock.patch.object(AgentWorker, "_ouverture", lente):
+                mock.patch.object(AgentWorker, "_ouverture", lente), \
+                mock.patch.object(registry, "end_turn", fin_lente):
             ok = worker.run_turn({"kind": "prompt", "prompt": "consigne", "ids": []})
         # Le tour est fini : ce témoin ne rend pas le bail comme la boucle de
         # service, donc le veilleur ne doit plus juger l'échéance ensuite.
