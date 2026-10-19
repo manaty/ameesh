@@ -239,6 +239,39 @@ class TestRules(MechanicsTest):
         self.assertEqual(rules.reviews_for(["src/ameesh/conversation.py"]),
                          mechanics.ReviewNeed("sensitive", 1))
 
+    def test_light_reviews_is_the_floor_without_reclassifying(self):
+        # #2642 : le plancher d'avis d'un lot léger vient du canon, pas d'une
+        # règle fourre-tout `**` qui reclasserait tout chemin en sensible.
+        text = MECHANICS.replace("  distinct_families: true",
+                                 "  distinct_families: true\n  light_reviews: 1")
+        repo = self.repo(mechanics_text=text)
+        rules = mechanics.load(repo.root, repo.git("rev-parse", "HEAD"), "ameesh")
+        self.assertEqual(rules.light_reviews, 1)
+        self.assertEqual(rules.reviews_for(["README.md"]),
+                         mechanics.ReviewNeed("light", 1))
+        # Une règle de chemin reste prioritaire et reclassifie : le plancher
+        # n'est pas un motif fourre-tout.
+        self.assertEqual(rules.reviews_for(["src/ameesh/conversation.py"]),
+                         mechanics.ReviewNeed("sensitive", 1))
+        self.assertEqual(rules.reviews_for(["src/ameesh/migrations/0001.sql"]),
+                         mechanics.ReviewNeed("sensitive", 2))
+        # Le plancher léger ne couvre jamais un chemin sensible sans règle.
+        repo = self.repo(
+            mechanics_text=text,
+            federation_text=_without_train_path("src/ameesh/mechanics.py"))
+        rules = mechanics.load(repo.root, repo.git("rev-parse", "HEAD"), "ameesh")
+        with self.assertRaises(mechanics.MechanicsError):
+            rules.reviews_for(["src/ameesh/mechanics.py"])
+
+    def test_light_reviews_is_declared_zero_or_one(self):
+        for value in ('"1"', "true", "2", "-1", "1.0", "null"):
+            with self.subTest(value=value):
+                text = MECHANICS.replace(
+                    "  distinct_families: true",
+                    "  distinct_families: true\n  light_reviews: %s" % value)
+                with self.assertRaises(mechanics.MechanicsError):
+                    mechanics.compile_document(text)
+
     def test_non_light_path_without_rule_is_refused(self):
         # mechanics.py est classé sensible mais aucune règle d'avis ne le couvre.
         repo = self.repo(federation_text=_without_train_path("src/ameesh/mechanics.py"))
