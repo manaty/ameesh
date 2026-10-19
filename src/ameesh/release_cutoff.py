@@ -1072,6 +1072,10 @@ def tree_green(repo: str, project: "ProjectRelease", sha: str, reference: str | 
             return {"head": head, "tree": tree, "reference": cursor,
                     "reference_run": _run_evidence(proof["reference_run"]),
                     "runs": [_run_evidence(run) for run in proof["runs"]]}
+        # A failed match on a tested commit is final: an older, smaller
+        # suite cannot certify the current target's required jobs.
+        if not _release_commit(repo, cursor):
+            break
         parent = _out(repo, "rev-parse", "--verify", "%s^1" % cursor)
         if not parent:
             break

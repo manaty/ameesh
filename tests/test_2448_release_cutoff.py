@@ -743,6 +743,24 @@ class PacketTreeGreenTest(ReleaseFixtureMixin, unittest.TestCase):
         self.assertIsNone(plan.tree_green)
         self.assertEqual(plan.base, base)
 
+    def test_a_smaller_ancestor_suite_cannot_replace_the_last_green_suite(self):
+        base, _second, head, merge = self.second_packet()
+        older = self.git(self.seed, "rev-parse", base + "^1")
+
+        def suites(project, sha):
+            if sha == head:
+                return {"head": sha, "runs": self.packet_runs(missing="psql 1/16")}
+            run = self.reference_run()
+            if sha == older:
+                run["jobs"] = [job for job in run["jobs"]
+                               if job["name"] != "psql 1/16"]
+            return {"head": sha, "runs": [run]}
+
+        plan = self.plan(self.ci(green=(base, head), pending=(merge,)), suites)
+        self.assertFalse(plan.green)
+        self.assertIsNone(plan.tree_green)
+        self.assertEqual(plan.base, base)
+
     def test_a_failed_required_job_never_inherits(self):
         """A green run cannot hide a required job that actually failed."""
         base, _second, head, merge = self.second_packet()
