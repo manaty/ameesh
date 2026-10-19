@@ -605,14 +605,58 @@ def _method(project, info: dict) -> str:
     return allowed[0] if allowed else "merge"
 
 
-def _merge_pr(slug: str, status: dict, sha: str, method: str, *, gh) -> tuple:
+def _stacked_base_guard(slug: str, status: dict, target: str, default: str, *,
+                        gh) -> str:
+    """#2603 : refuse une fusion sur une base de travail déjà fusionnée dans la
+    cible par défaut (home#112/#113 après canon/2452) : le contenu atterrirait
+    sur une branche morte. La comparaison GitHub `base...default` rend `ahead`
+    ou `identical` quand la base est un ancêtre de la cible par défaut. Une
+    lecture impossible refuse : le doute ne fusionne pas sur une base morte."""
+    base = merge_queue._remote_branch(status.get("base") or "")
+    target = merge_queue._remote_branch(target or "")
+    default = merge_queue._remote_branch(default or "")
+    if not base or not target or base != target:
+        return ""
+    if not default:
+        return ("PR #%s targets %s, and the repository's default target is unknown: "
+                "nothing merged — read the default branch by hand"
+                % (status.get("number"), base))
+    if base == default:
+        return ""
+    proc = gh(["api", "repos/%s/compare/%s...%s" % (
+        slug, quote(base, safe=""), quote(default, safe=""))])
+    if proc.returncode != 0:
+        return ("PR #%s targets %s, not the default target %s, and the comparison cannot be "
+                "read (%s): nothing merged on a possibly dead base — check the PR by hand"
+                % (status.get("number"), base, default,
+                   (proc.stderr or proc.stdout or "").strip()[:200]))
+    try:
+        compared = land._json(proc, "gh api compare %s...%s" % (base, default), dict)
+    except land.LandError as exc:
+        return ("PR #%s targets %s, not the default target %s, and the comparison is "
+                "unreadable (%s): nothing merged on a possibly dead base"
+                % (status.get("number"), base, default, exc))
+    if str(compared.get("status") or "") in ("ahead", "identical"):
+        return ("PR #%s targets %s, already merged into %s: merging it there would land its "
+                "content on a dead branch — retarget it (`gh pr edit --base %s %s`), then "
+                "freeze and re-review" % (status.get("number"), base, default, default,
+                                          status.get("number")))
+    return ""
+
+
+def _merge_pr(slug: str, status: dict, sha: str, method: str, *, gh,
+              target: str = "", default: str = "") -> tuple:
     """Fusionne la PR **maintenant**, sur la tête exacte `sha` (#1374, P1-4).
 
     C'est ce geste, et lui seul, qui est lié au feu : `--match-head-commit`
     est vérifié par GitHub au moment de la fusion, pas à l'armement. Laisser
     une auto-fusion armée entre deux passages ferait fusionner une tête
     poussée après le feu (GitHub ne la désarme pas pour un push d'un compte
-    avec droit d'écriture). Rend `(ok, detail)`."""
+    avec droit d'écriture). Rend `(ok, detail)`. #2603 : une base de travail
+    déjà fusionnée dans la cible par défaut refuse avant l'appel."""
+    refusal = _stacked_base_guard(slug, status, target, default, gh=gh)
+    if refusal:
+        return False, refusal
     proc = gh(["pr", "merge", str(status["number"]), "--repo", slug, "--%s" % method,
                "--match-head-commit", sha], timeout=120.0)
     if proc.returncode == 0:
@@ -1770,7 +1814,9 @@ def _merge_direct(cfg, db, row: dict, marks: list, fire: dict, status: dict, *, 
     try:
         if not _renew(handle) or not _renew(cible, land.LOCK_TTL_S):
             return {"lot": lot, "result": "busy"}
-        ok, error = _merge_pr(slug, status, head, _method(project, info), gh=gh)
+        ok, error = _merge_pr(slug, status, head, _method(project, info), gh=gh,
+                              target=target,
+                              default=str(info.get("default_branch") or ""))
         if ok:
             out.update(result="merged", detail=error, sha=head)
             try:

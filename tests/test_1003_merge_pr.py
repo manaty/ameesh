@@ -327,6 +327,38 @@ class GuardTest(_Base):
         self.assertIn("head moved", str(caught.exception))
         self.assertEqual(self.tip(), self.base)
 
+    def test_a_base_already_merged_into_the_default_is_refused(self):
+        """#2603 : canon/2452 est déjà un ancêtre de main ; fusionner une PR
+        qui la vise poserait son contenu sur une branche morte (home#112/#113
+        après la fusion de canon/2452)."""
+        _git(self.origin, "branch", "canon/2452", self.base)
+        before = self.tip()
+        with self.assertRaises(merge_pr.MergePrError) as caught:
+            self.merge(self.gh(baseRefName="canon/2452"), target="canon/2452")
+        message = str(caught.exception)
+        self.assertIn("already merged into main", message)
+        self.assertIn("gh pr edit --base main", message)
+        self.assertEqual(self.tip(), before)
+        self.assertEqual(self.tip("canon/2452"), self.base)
+
+    def test_a_work_branch_not_yet_merged_is_not_refused(self):
+        """#2603 : la garde ne vise que la base morte ; une branche de travail
+        absente de la cible par défaut reste une base de fusion légitime."""
+        first = self.head
+        _write(self.repo, ".github/workflows/ci.yml",
+               "on: push\njobs:\n  t:\n    steps: []\n# stack\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "stack")
+        self.head = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "push", "-q", "origin", "lot/7-work")
+        _git(self.origin, "update-ref", "refs/pull/7/head", self.head)
+        _git(self.origin, "branch", "canon/2453", first)
+        self.ready_marks(self.head)
+        self.lot_target = "canon/2453"
+        out = self.merge(self.gh(baseRefName="canon/2453"), target="canon/2453",
+                         dry_run=True)
+        self.assertEqual(out["state"], "dry-run", out)
+
     def test_a_pr_without_workflow_is_refused(self):
         # une tête qui ne touche pas .github/workflows/** : une branche montée
         # depuis main, déclarée comme branche du lot (gelée et relue)
