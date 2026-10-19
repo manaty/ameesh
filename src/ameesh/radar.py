@@ -2132,6 +2132,14 @@ def _key_lots(key: str) -> list[int] | None:
     return None
 
 
+def _lot_inputs(fingerprint):
+    """A `conflicts_of` fingerprint without the target's head (`lot:tip@head`
+    becomes `lot:tip`); JSON fingerprints carry no target head (#2602)."""
+    if not fingerprint or fingerprint.startswith("["):
+        return fingerprint
+    return re.sub(r"@[^|]*", "", fingerprint)
+
+
 def send_mail(cfg, db, project: Project, report: dict, *, ci="github") -> list[dict]:
     """Le courrier d'un passage : un message par lot concerné et par conflit
     nouveau (passif), puis un réveil quand un conflit avec la cible bloque
@@ -2154,9 +2162,12 @@ def send_mail(cfg, db, project: Project, report: dict, *, ci="github") -> list[d
     for key, conflict in sorted(current.items()):
         done = dict(before.get(key) or {})
         fingerprint = conflict.get("fingerprint")
-        done.pop("dormant", False)
-        if done.get("fp") != fingerprint:
-            # #2602: changed heads are new inputs, even without an absent pass.
+        dormant = done.pop("dormant", False)
+        if (dormant and done.get("fp") != fingerprint) or \
+                _lot_inputs(done.get("fp")) != _lot_inputs(fingerprint):
+            # #2238: back on other inputs than the notice already sent.
+            # #2602: changed lot heads are new inputs, even without an absent
+            # pass; the target's head alone is not (it moves every packet).
             done = {}
         for lot in conflict["lots"]:
             one = branches.get(lot) or {}

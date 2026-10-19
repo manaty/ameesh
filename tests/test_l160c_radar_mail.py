@@ -181,6 +181,15 @@ class SendMailTest(unittest.TestCase):
                          ["a1", "a2"])
         self.assertEqual(self._pass(moved), [])
 
+    def test_continuous_conflict_on_moved_target_is_not_resent(self):
+        import copy
+        report = radar.scan(self.repo, ASSIGNED, migrations=MIG)
+        self._pass(report)
+        moved = copy.deepcopy(report)
+        for branch in moved["branches"]:
+            branch["target_head"] = "e" * 40
+        self.assertEqual([s for s in self._pass(moved) if s["key"] == "pair:1-2"], [])
+
     def test_flapping_migration_notice_keeps_same_delivery(self):
         import copy
         report = radar.scan(self.repo, ASSIGNED, migrations=MIG)
