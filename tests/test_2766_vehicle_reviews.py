@@ -104,6 +104,18 @@ class CompositionMembersTest(_Base):
                                          [self.m1, self.m2])
         self.assertEqual(own["paths"], [])
 
+    def test_a_clean_merge_with_an_extra_change_is_the_delta(self):
+        self.compose()
+        # la fusion est propre, mais son auteur y ajoute un contenu que le
+        # membre n'apporte pas : c'est un delta propre, pas du bruit.
+        _write(self.repo, "README.md", "post-composition\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "--amend", "--no-edit")
+        head = _git(self.repo, "rev-parse", "HEAD")
+        own = packet_reviews.own_changes(self.repo, self.base, head,
+                                         [self.m1, self.m2])
+        self.assertEqual(own["paths"], ["README.md"])
+
 
 class ResolutionDeltaTest(_Base):
     def setUp(self):
@@ -131,6 +143,19 @@ class ResolutionDeltaTest(_Base):
                                          [self.m1, self.m2])
         self.assertEqual(own["paths"], ["README.md"])
         self.assertEqual(own["commits"], [self.resolution])
+
+    def test_a_resolution_that_copies_a_parent_is_still_a_judgment(self):
+        # reproduction B de cx1 (#2766) : recopier intégralement ours ou theirs
+        # est un choix, pas une déduction ; le chemin reste à relire.
+        for parent in (self.m1, self.m2):
+            with self.subTest(parent=parent):
+                _git(self.repo, "checkout", parent, "--", "README.md")
+                _git(self.repo, "commit", "-q", "--amend", "--no-edit")
+                head = _git(self.repo, "rev-parse", "HEAD")
+                own = packet_reviews.own_changes(
+                    self.repo, self.base, head, [self.m1, self.m2])
+                self.assertEqual(own["paths"], ["README.md"])
+                self.assertEqual(own["commits"], [head])
 
 
 class DesignationTest(_Base):

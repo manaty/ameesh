@@ -172,14 +172,50 @@ def _is_review_free(path: str) -> bool:
     return bool(_TEST.search(path)) or bool(packet_close.MANIFEST.match(path))
 
 
+def _merge_own_paths(repo: str, parents: list, sha: str) -> list[str]:
+    """Le delta propre d'un commit de fusion, vide s'il est mécanique.
+
+    Une fusion **propre** n'ajoute que ce que la fusion automatique ne donne
+    pas : les chemins du premier parent que le second n'explique pas. Une
+    fusion **en conflit** ajoute les chemins en conflit même quand la
+    résolution recopie un parent à l'identique : choisir un camp est un
+    jugement, la ligne choisie n'a pas été relue. Une union pure des deux camps
+    reste mécanique (#2496) et n'exige aucun avis ; au-delà de deux parents,
+    seule une ligne qui diffère de **tous** est retenue (lecture prudente).
+    """
+    from . import packet_candidates
+
+    if len(parents) == 2:
+        merged = packet_candidates.merge_tree(repo, parents[0], parents[1])
+        if merged["state"] == "error":
+            raise VehicleError("cannot read the automatic merge of %s: %s"
+                               % (sha[:12], merged.get("detail") or "no tree"))
+        conflicts = set(merged.get("files") or ())
+        if conflicts:
+            try:
+                mechanical = packet_candidates.mechanical_union(
+                    repo, parents[0], parents[1], sha) == ""
+            except Exception:  # noqa: BLE001 - preuve indisponible : jugement
+                mechanical = False
+            if mechanical:
+                return []
+        # Un chemin en conflit est propre quel que soit le parent recopié ;
+        # les autres ne le sont que s'ils dépassent le second parent.
+        return sorted(conflicts | {
+            path for path in _changed(repo, parents[0], sha)
+            if _blob(repo, sha, path) != _blob(repo, parents[1], path)})
+    return sorted(path for path in _changed(repo, parents[0], sha)
+                  if all(_blob(repo, sha, path) != _blob(repo, parent, path)
+                         for parent in parents[1:]))
+
+
 def own_changes(repo: str, base: str, head: str, sources) -> dict:
     """Le delta que le véhicule ajoute au-delà de ses membres.
 
     `sources` sont les têtes gelées des membres. Les commits du véhicule sont
     ceux de `base..head` qui ne sont pas déjà dans un membre. Un commit de
-    fusion n'est propre que pour ses chemins dont le blob diffère **des deux
-    parents** : une ligne apportée par le second parent vient du membre, une
-    ligne qui diffère des deux est une résolution. Un commit simple (manifeste,
+    fusion est lu par `_merge_own_paths` (conflits et écarts à la fusion
+    automatique, choix d'un parent compris) ; un commit simple (manifeste,
     adaptation) est propre pour tout son diff. Rend `{paths, commits}` ; les
     chemins de test et de manifeste sont retirés, et un commit n'est retenu
     que s'il contribue au moins un chemin propre.
@@ -199,25 +235,8 @@ def own_changes(repo: str, base: str, head: str, sources) -> dict:
                    or "").split()[1:]
         if not parents:
             continue
-        if len(parents) >= 2:
-            # une ligne qui existe déjà chez un parent vient de lui ; seule
-            # celle qui diffère de **tous** les parents est une résolution
-            changed = [path for path in _changed(repo, parents[0], sha)
-                       if all(_blob(repo, sha, path) != _blob(repo, parent, path)
-                              for parent in parents[1:])]
-            if changed and len(parents) == 2:
-                # une résolution **mécanique** (fusion propre, ou union de deux
-                # ajouts purs) n'est pas un jugement : aucun avis (§2/#2496).
-                try:
-                    from . import packet_candidates
-                    mechanical = packet_candidates.mechanical_union(
-                        repo, parents[0], parents[1], sha) == ""
-                except Exception:  # noqa: BLE001 - preuve indisponible : jugement
-                    mechanical = False
-                if mechanical:
-                    changed = []
-        else:
-            changed = _changed(repo, parents[0], sha)
+        changed = (_merge_own_paths(repo, parents, sha) if len(parents) >= 2
+                   else _changed(repo, parents[0], sha))
         changed = sorted({path for path in changed if not _is_review_free(path)})
         if not changed:
             continue
