@@ -1030,8 +1030,8 @@ def merged_base(replayer, project, branch: str) -> str:
     (home#112/#113 après la fusion de canon/2452). La cible par défaut est lue
     dans le dépôt du projet ; une cible configurée introuvable refuse
     (`LandError`) plutôt que de laisser fusionner à l'aveugle. Un `fetch`
-    impossible rend "" : l'atterrissage relit de toute façon la cible
-    (`fresh_target`) et échouerait avant d'écrire."""
+    impossible refuse : relire la seule cible du lot ne prouve pas que la
+    branche par défaut est lisible."""
     from . import resolutions
 
     base = _branch_of(branch or "")
@@ -1054,11 +1054,14 @@ def merged_base(replayer, project, branch: str) -> str:
                             "+refs/heads/%s:%s" % (default, refs[1]),
                             timeout=FETCH_TIMEOUT)
     if proc.returncode != 0:
-        return ""
-    if resolutions._run(replayer.path, "merge-base", "--is-ancestor",
-                        refs[0], refs[1]).returncode == 0:
-        return default
-    return ""
+        raise LandError("cannot compare stacked base %s with %s: %s"
+                        % (base, default, resolutions._err(proc)[:200]))
+    compared = resolutions._run(replayer.path, "merge-base", "--is-ancestor",
+                                refs[0], refs[1])
+    if compared.returncode not in (0, 1):
+        raise LandError("cannot compare stacked base %s with %s: %s"
+                        % (base, default, resolutions._err(compared)[:200]))
+    return default if compared.returncode == 0 else ""
 
 
 def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:

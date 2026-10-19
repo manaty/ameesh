@@ -1196,6 +1196,17 @@ class StackedBaseMergeTest(unittest.TestCase):
         self.assertTrue(ok, detail)
         self.assertEqual([c[0] for c in calls], ["api", "pr"])
 
+    def test_a_comparison_without_a_known_status_refuses(self):
+        for payload in ('{}', '{"status": "unknown"}'):
+            with self.subTest(payload=payload):
+                gh = mock.Mock(return_value=subprocess.CompletedProcess(
+                    ["gh"], 0, payload, ""))
+                ok, detail = fire._merge_pr("acme/home", self._status(), A, "merge",
+                    gh=gh, target="canon/2452", default="main")
+                self.assertFalse(ok)
+                self.assertIn("unreadable", detail)
+                self.assertEqual(gh.call_count, 1)
+
     def test_the_default_base_needs_no_comparison(self):
         calls = []
 

@@ -273,8 +273,11 @@ def _stacked_base_guard(owner: str, fetch_url: str, repo: str, view: dict,
             "that %s is not already merged into %s by hand"
             % (pr, base, default, _redact(resolutions._err(proc)[-200:]), default, pr,
                base, default))
-    if _run(owner, "merge-base", "--is-ancestor", refs["base"],
-            refs["default"]).returncode == 0:
+    compared = _run(owner, "merge-base", "--is-ancestor", refs["base"], refs["default"])
+    if compared.returncode not in (0, 1):
+        raise MergePrError("PR #%d: comparison of %s with %s unreadable: nothing written"
+                           % (pr, base, default))
+    if compared.returncode == 0:
         raise MergePrError(
             "PR #%d targets %s, already merged into %s: merging it there would land its "
             "content on a dead branch and lose it — retarget it (`gh pr edit --base %s %d`), "

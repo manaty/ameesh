@@ -1305,6 +1305,21 @@ class MergedBaseTest(unittest.TestCase):
         _git(self.clone, "push", "-q", "origin", "canon/2453")
         self.assertEqual(land.merged_base(self.replayer, self.project, "canon/2453"), "")
 
+    def test_unreadable_stacked_base_comparison_refuses(self):
+        for code in (1, 128):
+            with self.subTest(code=code), mock.patch.object(
+                    resolutions, "_run", return_value=subprocess.CompletedProcess(
+                        ["git"], code, b"", b"unreadable default")):
+                with self.assertRaises(land.LandError):
+                    land.merged_base(self.replayer, self.project, "canon/2452")
+
+    def test_failed_ancestry_probe_refuses(self):
+        with mock.patch.object(resolutions, "_run", side_effect=[
+                subprocess.CompletedProcess(["git"], 0, "", ""),
+                subprocess.CompletedProcess(["git"], 128, b"", b"bad object")]):
+            with self.assertRaises(land.LandError):
+                land.merged_base(self.replayer, self.project, "canon/2452")
+
     def test_a_missing_configured_default_refuses(self):
         _git(self.repo, "config", "ameesh.target", "origin/absent")
         with self.assertRaises(land.LandError):

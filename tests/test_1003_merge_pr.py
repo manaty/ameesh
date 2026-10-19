@@ -341,6 +341,16 @@ class GuardTest(_Base):
         self.assertEqual(self.tip(), before)
         self.assertEqual(self.tip("canon/2452"), self.base)
 
+    def test_an_unreadable_ancestry_comparison_is_refused(self):
+        from ameesh import plan_git
+        with mock.patch.object(plan_git, "default_target", return_value="main"), \
+                mock.patch.object(merge_pr, "_run", side_effect=[
+                    subprocess.CompletedProcess(["git"], 0, "", ""),
+                    subprocess.CompletedProcess(["git"], 128, "", "bad object")]):
+            with self.assertRaisesRegex(merge_pr.MergePrError, "comparison.*unreadable"):
+                merge_pr._stacked_base_guard(self.repo, "unused", self.repo,
+                    {"number": 7, "baseRefName": "canon/2452"}, "canon/2452")
+
     def test_a_work_branch_not_yet_merged_is_not_refused(self):
         """#2603 : la garde ne vise que la base morte ; une branche de travail
         absente de la cible par défaut reste une base de fusion légitime."""

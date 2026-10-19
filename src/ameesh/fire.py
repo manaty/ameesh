@@ -636,7 +636,11 @@ def _stacked_base_guard(slug: str, status: dict, target: str, default: str, *,
         return ("PR #%s targets %s, not the default target %s, and the comparison is "
                 "unreadable (%s): nothing merged on a possibly dead base"
                 % (status.get("number"), base, default, exc))
-    if str(compared.get("status") or "") in ("ahead", "identical"):
+    comparison = str(compared.get("status") or "")
+    if comparison not in ("ahead", "identical", "behind", "diverged"):
+        return ("PR #%s: comparison of %s with %s unreadable: nothing merged"
+                % (status.get("number"), base, default))
+    if comparison in ("ahead", "identical"):
         return ("PR #%s targets %s, already merged into %s: merging it there would land its "
                 "content on a dead branch — retarget it (`gh pr edit --base %s %s`), then "
                 "freeze and re-review" % (status.get("number"), base, default, default,
