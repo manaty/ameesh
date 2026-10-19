@@ -137,6 +137,13 @@ class HistoryFixture:
         frozen = self.freeze(head)
         return dict(self.entry, frozen_id=frozen["id"], frozen_sha=head)
 
+    def reviewer_fix_head(self, text, path="content"):
+        """A new head whose only commit is a designated reviewer's correction."""
+        head = self.commit(text, actor="r1", path=path)
+        self.turn("r1", "claude")
+        frozen = self.freeze(head)
+        return dict(self.entry, frozen_id=frozen["id"], frozen_sha=head)
+
 
 class RecordedHistoryTest(HistoryFixture, PgTestCase):
     def test_every_commit_is_read_on_the_frozen_head_with_the_gate(self):
@@ -214,6 +221,24 @@ class RecordedHistoryTest(HistoryFixture, PgTestCase):
         with self.assertRaisesRegex(train.TrainError,
                                     "two independent verdicts"):
             self.qualify(entry=entry, required=2)
+
+    def test_a_reviewer_correction_over_the_threshold_cannot_admit_itself(self):
+        # §2 : au-delà de ~50 lignes, le relecteur devient auteur de sa
+        # correction ; son propre `ok` ne compte pas.
+        entry = self.reviewer_fix_head(
+            "r1\n" + "".join("line %02d\n" % index for index in range(60)))
+        self.verdict(entry["frozen_sha"], "r1", "claude")
+        with self.assertRaisesRegex(train.TrainError,
+                                    "one verdict from another family"):
+            self.qualify(entry=entry, required=1)
+
+    def test_a_reviewer_design_correction_cannot_admit_itself(self):
+        # §2 : une correction de conception n'est jamais un petit correctif.
+        entry = self.reviewer_fix_head("study\n", path="docs/design/x.md")
+        self.verdict(entry["frozen_sha"], "r1", "claude")
+        with self.assertRaisesRegex(train.TrainError,
+                                    "one verdict from another family"):
+            self.qualify(entry=entry, required=1)
 
     def test_pilot_waiver_covers_the_frozen_head_in_the_train_too(self):
         # #2681 cas (3) : la dispense `-none` est lue par la même porte que le
