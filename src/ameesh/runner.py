@@ -351,6 +351,25 @@ TURN_LABELS_EN = {"consigne": "instruction", "messages": "mail", "événements":
                   "prioritaire": "priority", "reprise": "resume", "suite": "continuation"}
 
 
+def turn_status_text(shown: str, duration: float, *, ok: bool = True,
+                     cloture: str = "") -> str:
+    """`status_text` du dernier tour — une durée passée, jamais une échéance.
+
+    #2689 : « resume in 295s » était lu comme « le prochain tour reprend dans
+    295 s » alors que 295 s est la **durée** du tour de reprise qui vient de
+    finir. Une valeur qui ne bouge plus passait alors pour un compte à rebours
+    figé. Le libellé dit maintenant explicitement qu'il s'agit du tour passé,
+    et la durée reste celle du tour (pas le délai du prochain réveil, qui se
+    lit dans l'état du bail et les alertes).
+    """
+    texte = "last turn: %s, %ds" % (shown, int(duration))
+    if not ok:
+        texte += " (failed)"
+    if ok and cloture:
+        texte += " (closed: %s)" % cloture.split(":")[0]
+    return texte
+
+
 class Reprise:
     """Attente exponentielle bornée pendant une panne de base (L72).
 
@@ -6553,9 +6572,9 @@ class AgentWorker(threading.Thread):
                 # remis la série à zéro (clé d'alerte stable, #1268 B1)
                 self.failure_since = time.time()
             self.failure_streak += 1
-        texte_fin = ("%s in %ds%s" % (shown, int(duration), "" if ok else " (failed)")
-                     + (" (closed: %s)" % cloture.split(":")[0]
-                        if ok and clos and cloture else ""))
+        texte_fin = turn_status_text(
+            shown, duration, ok=ok,
+            cloture=cloture if ok and clos and cloture else "")
         if not ok and self.rate_limit:
             # #1270 : l'épisode de débit est écrit dans le statut — visible
             # dans `ameesh list`/`show`, relu après un redémarrage, et lu par

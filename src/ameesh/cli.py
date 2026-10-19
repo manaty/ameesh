@@ -632,8 +632,13 @@ def cmd_list(bk) -> int:
             extra.append("lease:%s" % row["lease_owner"])
         if row.get("status_text"):
             extra.append(row["status_text"])
-        print("%-20s %-9s seen %5ss ago  unread:%-3d %s%s" % (
+        # #2689 : distinguer le courrier qui ouvrira un tour (L125) de celui
+        # qu'un tour lira plus tard — un « unread:6 » de copies/radars ne doit
+        # plus faire passer un agent au repos pour bloqué.
+        passive = int(row.get("passive_unread") or 0)
+        print("%-20s %-9s seen %5ss ago  unread:%-3d%s %s%s" % (
             row["name"], row.get("tool", "?"), age, row.get("unread", 0),
+            "  passive:%-3d" % passive if passive else "",
             row.get("cwd") or "", ("  " + " ".join(extra)) if extra else "",
         ))
     return 0
