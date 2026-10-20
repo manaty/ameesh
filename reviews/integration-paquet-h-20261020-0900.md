@@ -17,7 +17,8 @@ sur chaque ticket miroir ouvert au déploiement).
 
 - 07:58Z sur `cfa8b2f43` : **3 prêts** (#2843, #2851, #2808), 8 en attente,
   **1 lecture impossible** (#1515 : provenance d'auteur inconnue pour
-  `ab4f52ee1c05`, commit de #2808) ; `rc 1`, `--ready-out` retiré (#2404).
+  `ab4f52ee1c05`, commit de la branche `d4b1a43da94b`) ; `rc 1`,
+  `--ready-out` retiré (#2404).
 - 08:03Z sur la tête composée `ad83db765` (après #2808) : **0 erreur** ;
   #1515 et #2786 deviennent prêts — la provenance `ab4f52ee1c05` sort de la
   plage de gel, et le conflit `src/ameesh/plan_git.py` de #2786 ne subsiste
@@ -80,8 +81,11 @@ marqueur de conflit). Le seul contenu hors fusions est ce manifeste.
 - Composition : **6 unités, 6 lots** ; 51 fichiers, +3209/−167 hors manifeste ;
   aucun conflit, aucune résolution ; `git diff --check` ne relève rien.
 - `scripts/paquet-inclusion.py` (manifeste, tête, attendus et prêts) :
-  **aucun défaut** — 6 compositions, 0 exclusion, contenus à la tête :
-  6 présents, 0 partiel.
+  **aucune omission** (`omissions`, `ready_omissions`, `removed` vides ;
+  `errors` vide) — 6 compositions ; contenus à la tête : 5 présents,
+  **1 partiel attendu** (#2808 : 3 lignes de `merge_queue.py` et 3 de
+  `test_2808` adaptées par #1515, qui contient déjà #2808 ; `--strict` non
+  demandé) ; 0 exclusion.
 - `scripts/garde-mecanique.py --json` : **0 constat**, 0 exemption inutilisée.
 - `scripts/doc-links.py` : 172 fichiers, **0 lien cassé**.
 - `scripts/freeze-checks.py` : **6 contrôles verts**.
