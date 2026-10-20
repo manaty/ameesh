@@ -433,6 +433,150 @@ class PendingSpendExactTest(PgTestCase):
         finally:
             db.close()
 
+    def test_index_reutilise_reservation_etrangere_settled(self):
+        """B1 : une réservation settled d'un index réutilisé n'est pas celle
+        du marqueur ; seule, elle rend la clé indémontrable (suspension)."""
+        db = self._db(0)
+        try:
+            name = "foreign-settled"
+            marker = self._legacy_marker_row(db, name, turn_id="B", age="1 minute")
+            foreign = "%s:0:%.6f" % (name, float(marker["created_ts"]) - 86400.0)
+            db.execute(
+                "INSERT INTO turn_costs (agent, harness, turn, model, usd, spend_key,"
+                " turn_id, started_at, recorded_at)"
+                " VALUES (%s, 'deepseek', 'tour', 'm', 1.5, %s, 'A',"
+                " now() - interval '1 day', now())", (name, foreign))
+            db.execute(
+                "INSERT INTO account_reservations (billing_account, agent, usd,"
+                " period, state, spend_key, created_at)"
+                " VALUES ('deepseek-manaty', %s, 2.0, current_date, 'settled', %s,"
+                " now() - interval '1 day')", (name, foreign))
+
+            relu = registry.pending_spend_get(db, name)
+            self.assertTrue(relu["ledger_ambiguous"])
+            self.assertIsNone(relu["ledger_key"],
+                              "la réservation d'un index réutilisé a été retenue")
+            worker = self._worker(db, name)
+            self.assertFalse(worker._compta_ecrit(relu))
+            self.assertIsNotNone(registry.pending_spend_get(db, name))
+            self.assertEqual(
+                db.query("SELECT count(*) AS n FROM turn_costs WHERE agent = %s",
+                         (name,))[0]["n"], 1,
+                "la réparation a écrit une ligne pour la mauvaise réservation")
+        finally:
+            db.close()
+
+    def test_index_reutilise_reservation_etrangere_open(self):
+        """B1 : une réservation ouverte au même index mais à un autre instant
+        n'est pas attribuable au marqueur ; la comptabilité suspend."""
+        db = self._db(3)
+        try:
+            name = "foreign-open"
+            marker = self._legacy_marker_row(db, name, age="1 minute")
+            foreign = "%s:0:%.6f" % (name, float(marker["created_ts"]) - 86400.0)
+            db.execute(
+                "INSERT INTO account_reservations (billing_account, agent, usd,"
+                " period, state, spend_key, created_at)"
+                " VALUES ('deepseek-manaty', %s, 2.0, current_date, 'open', %s,"
+                " now() - interval '1 day')", (name, foreign))
+
+            relu = registry.pending_spend_get(db, name)
+            self.assertTrue(relu["ledger_ambiguous"])
+            self.assertIsNone(relu["ledger_key"])
+            worker = self._worker(db, name)
+            self.assertFalse(worker._compta_ecrit(relu))
+            self.assertIsNotNone(registry.pending_spend_get(db, name))
+            reservation = db.query(
+                "SELECT state FROM account_reservations WHERE spend_key = %s",
+                (foreign,))[0]
+            self.assertEqual(reservation["state"], "open")
+        finally:
+            db.close()
+
+    def test_index_reutilise_ligne_repli_etrangere(self):
+        """B1 : au repli sans turn_id ni started_at, l'époque de la clé doit
+        être celle du marqueur ; une ligne étrangère unique suspend."""
+        db = self._db(3)
+        try:
+            name = "foreign-row"
+            marker = self._legacy_marker_row(db, name, age="1 minute")
+            foreign = "%s:0:%.6f" % (name, float(marker["created_ts"]) - 86400.0)
+            db.execute(
+                "INSERT INTO turn_costs (agent, harness, turn, model, usd, spend_key,"
+                " recorded_at) VALUES (%s, 'deepseek', 'tour', 'm', 1.5, %s, now())",
+                (name, foreign))
+
+            relu = registry.pending_spend_get(db, name)
+            self.assertTrue(relu["ledger_ambiguous"])
+            self.assertIsNone(relu["ledger_key"],
+                              "la ligne d'un index réutilisé a été retenue")
+            worker = self._worker(db, name)
+            self.assertFalse(worker._compta_ecrit(relu))
+            self.assertIsNotNone(registry.pending_spend_get(db, name))
+            self.assertEqual(
+                db.query("SELECT count(*) AS n FROM turn_costs WHERE agent = %s",
+                         (name,))[0]["n"], 1)
+        finally:
+            db.close()
+
+    def test_reservation_historique_unique_est_retrouvee(self):
+        """Une réservation du tour, même settled, se retrouve par l'époque de
+        sa clé (précision variable) et non par le seul index."""
+        db = self._db(0)
+        try:
+            name = "genuine-settled"
+            marker = self._legacy_marker_row(db, name, turn_id="B", age="1 minute")
+            genuine = "%s:0:%.6f" % (name, float(marker["created_ts"]))
+            db.execute(
+                "INSERT INTO account_reservations (billing_account, agent, usd,"
+                " period, state, spend_key, created_at)"
+                " VALUES ('deepseek-manaty', %s, 2.0, current_date, 'settled', %s,"
+                " now())", (name, genuine))
+
+            relu = registry.pending_spend_get(db, name)
+            self.assertFalse(relu["ledger_ambiguous"])
+            self.assertEqual(relu["ledger_key"], genuine)
+            worker = self._worker(db, name)
+            self.assertTrue(worker._compta_ecrit(relu))
+            self.assertIsNone(registry.pending_spend_get(db, name))
+            self.assertEqual(
+                db.query("SELECT spend_key FROM turn_costs WHERE agent = %s",
+                         (name,))[0]["spend_key"], genuine)
+        finally:
+            db.close()
+
+    def test_reservation_etrangere_settled_ignoree_si_ligne_genuine(self):
+        """Une ligne du tour identifiée par `turn_id` prime : une vieille
+        réservation settled au même index ne bloque pas sa réparation."""
+        db = self._db(0)
+        try:
+            name = "genuine-row"
+            marker = self._legacy_marker_row(db, name, turn_id="B", age="1 minute")
+            genuine = "%s:0:%.6f" % (name, float(marker["created_ts"]))
+            db.execute(
+                "INSERT INTO turn_costs (agent, harness, turn, model, usd, spend_key,"
+                " turn_id, started_at, recorded_at)"
+                " VALUES (%s, 'deepseek', 'tour', 'm', 1.5, %s, 'B',"
+                " now() - interval '1 minute', now())", (name, genuine))
+            foreign = "%s:0:%.6f" % (name, float(marker["created_ts"]) - 86400.0)
+            db.execute(
+                "INSERT INTO account_reservations (billing_account, agent, usd,"
+                " period, state, spend_key, created_at)"
+                " VALUES ('deepseek-manaty', %s, 2.0, current_date, 'settled', %s,"
+                " now() - interval '1 day')", (name, foreign))
+
+            relu = registry.pending_spend_get(db, name)
+            self.assertFalse(relu["ledger_ambiguous"])
+            self.assertEqual(relu["ledger_key"], genuine)
+            worker = self._worker(db, name)
+            self.assertTrue(worker._compta_ecrit(relu))
+            self.assertIsNone(registry.pending_spend_get(db, name))
+            self.assertEqual(
+                db.query("SELECT count(*) AS n FROM turn_costs WHERE agent = %s",
+                         (name,))[0]["n"], 1)
+        finally:
+            db.close()
+
     def test_get_ne_melange_pas_un_marqueur_remplace_a_sa_cle(self):
         """B1 : un remplaçant qui écrit entre les deux lectures.
 

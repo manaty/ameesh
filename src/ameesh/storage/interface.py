@@ -585,8 +585,10 @@ class PendingSpend(Domain):
         (#2166) ; `spend_key` est la clé du marqueur (NULL avant 0471) ;
         `ledger_key` est la clé déjà écrite par ce tour — celle du marqueur,
         ou celle retrouvée dans sa ligne `turn_costs`/sa réservation #1469 par
-        l'identité du tour, jamais par ordre temporel ; `ledger_ambiguous`
-        vrai interdit de deviner et suspend la comptabilité (B1) ;
+        l'identité du tour (`turn_id`, instant de pose, époque de la clé),
+        jamais par le seul index de début ni par ordre temporel ;
+        `ledger_ambiguous` vrai interdit de deviner et suspend la comptabilité
+        (B1, notamment une réservation étrangère au même index) ;
         `created_ts` reste l'epoch float8 pour le début du tour
         (`turn_costs.started_at`)."""
 
