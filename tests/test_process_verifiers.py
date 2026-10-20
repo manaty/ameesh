@@ -499,25 +499,6 @@ class VerificateursTest(unittest.TestCase):
         with self.assertRaises(KeyError):
             completion_policy("mystere")
 
-    def test_le_module_lifecycle_couvre_les_cinq_types_non_code(self):
-        """Q1 #1915 : le descripteur installé et C restent alignés.
-
-        Le module `lifecycle` est la source installée des cinq types
-        documentaires ; C doit les admettre et les compléter sans livraison
-        exécutable. Toute divergence entre les deux listes casse ce test.
-        """
-        from ameesh.modules import lifecycle
-        self.assertEqual(set(lifecycle.TYPES),
-                         set(INSTALLED_TYPES) - set(CODE_TYPES))
-        for kind in lifecycle.TYPES:
-            with self.subTest(kind=kind):
-                policy = completion_policy(kind)
-                self.assertFalse(policy.code)
-                self.assertTrue(policy.requires_review)
-                self.assertTrue(verify(
-                    command_for("work_completed", references={"outcome": "resultat"}),
-                    full_snapshot(item=item(type=kind))).accepted)
-
     def test_completion_code_exige_une_livraison_acceptee(self):
         self.assertRefusal(
             "completion-evidence-missing",

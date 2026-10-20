@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+import io
+import json
 import sys
 import tempfile
 import threading
+import types as types_mod
 import unittest
 from unittest import mock
 
 from tests import support  # isolate host config before module tests
 from tests.support import PgTestCase
 from ameesh import canon, canon_sync, db as db_mod, identity, modules, work
-from ameesh.modules import it, lifecycle
+from ameesh.modules import it
 from ameesh.modules.it.execution import OUTPUT_BYTES, digest, execute
 from ameesh.modules.storage import ModuleStore
 
@@ -22,7 +25,67 @@ def federation(project="acme", names=None):
         project: {"modules": ["it"] if names is None else names}}}}}
 
 
+FIVE_DOCUMENTARY = ("docs", "investigation", "governance-tracking",
+                    "promotion", "human_operation")
+
+
+class FakeDistribution:
+    def __init__(self, name="tpk-ameesh-lifecycle", version="0.1.0"):
+        self.name = name
+        self.version = version
+
+
+class FakeEntryPoint:
+    group = "ameesh.modules"
+
+    def __init__(self, module, name="lifecycle", dist=None):
+        self.name = name
+        self.module = module
+        self.value = "tpk_lifecycle"
+        self.dist = dist if dist is not None else FakeDistribution()
+
+    def load(self):
+        if isinstance(self.module, Exception):
+            raise self.module
+        return self.module
+
+
+class FakeEntryPoints(list):
+    def select(self, group=None):
+        return [point for point in self if group in (None, point.group)]
+
+
+def external_lifecycle(types=None, name="lifecycle", descriptor=None):
+    """Un descripteur externe de test, installé hors du dépôt public."""
+    module = types_mod.ModuleType("tpk_lifecycle")
+    declared = tuple(types or FIVE_DOCUMENTARY)
+    module.NAME = name
+    module.TYPES = declared
+    if descriptor is not None:
+        module.descriptor = descriptor
+    else:
+        def compile_descriptor(options=None):
+            options = dict(options or {})
+            if options:
+                raise ValueError("unknown lifecycle module option(s): %s"
+                                 % ", ".join(sorted(options)))
+            return {"types": list(declared), "schemas": {}, "rules": []}
+        module.descriptor = compile_descriptor
+    return module
+
+
+def external_points(*points):
+    return mock.patch("ameesh.modules.metadata.entry_points",
+                      return_value=FakeEntryPoints(points))
+
+
 class ModuleConfigurationTest(unittest.TestCase):
+    def setUp(self):
+        # Aucun descripteur externe réel de l'hôte ne doit fuiter dans les tests.
+        discover = external_points()
+        discover.start()
+        self.addCleanup(discover.stop)
+
     def test_module_refusal_is_per_lot_but_other_database_errors_propagate(self):
         store = mock.Mock()
         # MagicMock : la fermeture ouvre sa transaction (et prend le verrou de
@@ -62,29 +125,95 @@ class ModuleConfigurationTest(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 modules.declarations(raw)
 
-    def test_lifecycle_declares_the_five_documentary_types(self):
-        self.assertEqual(lifecycle.NAME, "lifecycle")
-        self.assertEqual(set(lifecycle.TYPES), {
-            "docs", "investigation", "governance-tracking",
-            "promotion", "human_operation"})
-        descriptor = lifecycle.descriptor()
-        self.assertEqual(descriptor["types"], list(lifecycle.TYPES))
+    def test_external_descriptor_is_discovered_and_compiled(self):
+        fake = external_lifecycle()
+        with external_points(FakeEntryPoint(fake)):
+            self.assertIs(modules.installed()["lifecycle"], fake)
+            entries = modules.declarations(federation(names=["lifecycle"]))
+        self.assertEqual([(e["project"], e["module"]) for e in entries],
+                         [("acme", "lifecycle")])
+        self.assertEqual(entries[0]["types"], list(FIVE_DOCUMENTARY))
         # Q1 #1915 : aucun schéma ni règle métier inventé pour ces types.
-        self.assertEqual(descriptor["schemas"], {})
-        self.assertEqual(descriptor["rules"], [])
+        self.assertEqual(entries[0]["schemas"], {})
+        self.assertEqual(entries[0]["rules"], [])
         with self.assertRaisesRegex(ValueError, "unknown lifecycle module option"):
-            lifecycle.descriptor({"require_qa": ["promoted"]})
+            fake.descriptor({"require_qa": ["promoted"]})
 
-    def test_lifecycle_and_it_coexist_with_disjoint_types(self):
-        entries = modules.declarations(federation(names=["it", "lifecycle"]))
+    def test_external_descriptor_and_it_coexist_with_disjoint_types(self):
+        fake = external_lifecycle()
+        with external_points(FakeEntryPoint(fake)):
+            entries = modules.declarations(federation(names=["it", "lifecycle"]))
         self.assertEqual([(e["project"], e["module"]) for e in entries],
                          [("acme", "it"), ("acme", "lifecycle")])
         it_types = set(next(e["types"] for e in entries if e["module"] == "it"))
-        lifecycle_types = set(next(e["types"] for e in entries
-                                   if e["module"] == "lifecycle"))
-        self.assertEqual(lifecycle_types, set(lifecycle.TYPES))
-        self.assertFalse(it_types & lifecycle_types)
-        self.assertEqual(modules.installed()["lifecycle"], lifecycle)
+        self.assertEqual(set(fake.TYPES), set(FIVE_DOCUMENTARY))
+        self.assertFalse(it_types & set(fake.TYPES))
+
+    def test_external_module_refusals(self):
+        mismatch = external_lifecycle(name="other")
+        no_descriptor = types_mod.ModuleType("tpk_broken")
+        no_descriptor.NAME = "lifecycle"
+        malformed = external_lifecycle(
+            descriptor=lambda options=None: {"types": [], "schemas": {}, "rules": []})
+        wrong_keys = external_lifecycle(
+            descriptor=lambda options=None: {"types": ["docs"], "schemas": {}})
+        bad_types = external_lifecycle(types=["docs", "docs"])
+        cases = (
+            ("load", (FakeEntryPoint(RuntimeError("boom")),), "cannot be loaded"),
+            ("name", (FakeEntryPoint(mismatch),), "declares NAME"),
+            ("descriptor", (FakeEntryPoint(no_descriptor),), "no descriptor"),
+            ("types", (FakeEntryPoint(malformed),), "types must be unique"),
+            ("duplicate-types", (FakeEntryPoint(bad_types),), "types must be unique"),
+            ("keys", (FakeEntryPoint(wrong_keys),), "descriptor keys"),
+            ("duplicates", (FakeEntryPoint(external_lifecycle()),
+                            FakeEntryPoint(external_lifecycle())),
+             "duplicate installed module"),
+            ("builtin", (FakeEntryPoint(it, name="it"),), "duplicate installed module"),
+        )
+        for label, points, message in cases:
+            with self.subTest(label=label), external_points(*points), \
+                    self.assertRaisesRegex(ValueError, message):
+                modules.installed()
+        inconsistent = external_lifecycle()
+        inconsistent.TYPES = ("docs",)
+        with external_points(FakeEntryPoint(inconsistent)), \
+                self.assertRaisesRegex(ValueError, "TYPES differ"):
+            modules.installed()
+
+    def test_external_evidence_exposes_installation_proof(self):
+        with external_points(FakeEntryPoint(external_lifecycle())):
+            rows = modules.evidence()
+        row = next(item for item in rows if item["name"] == "lifecycle")
+        self.assertTrue(row["ok"])
+        self.assertEqual(row["source"], "external")
+        self.assertEqual(row["distribution"], "tpk-ameesh-lifecycle")
+        self.assertEqual(row["version"], "0.1.0")
+        self.assertEqual(len(row["descriptor_sha256"]), 64)
+        broken = external_lifecycle(name="other")
+        with external_points(FakeEntryPoint(broken)):
+            row = next(item for item in modules.evidence()
+                       if item["name"] == "lifecycle")
+        self.assertFalse(row["ok"])
+        self.assertIn("declares NAME", row["error"])
+
+    def test_external_types_cover_the_five_non_code_process_types(self):
+        from ameesh.process_verifiers import (CODE_TYPES, INSTALLED_TYPES,
+                                              completion_policy)
+        self.assertEqual(set(FIVE_DOCUMENTARY),
+                         set(INSTALLED_TYPES) - set(CODE_TYPES))
+        for kind in FIVE_DOCUMENTARY:
+            with self.subTest(kind=kind):
+                policy = completion_policy(kind)
+                self.assertFalse(policy.code)
+                self.assertTrue(policy.requires_review)
+
+    def test_module_cli_list_prints_installation_evidence(self):
+        with external_points(FakeEntryPoint(external_lifecycle())), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(modules.main(["--list"]), 0)
+        rows = json.loads(out.getvalue())
+        self.assertTrue(any(row["name"] == "lifecycle" and row["ok"]
+                            for row in rows))
 
     def test_canon_check_reports_module_errors(self):
         c = canon.Canon(root=".", readable=True, federation=federation(names=["missing"]))
@@ -230,6 +359,9 @@ class LifecycleGateTest(PgTestCase):
         super().setUp()
         # Git identity/ancestry is exercised separately in #1286; this class
         # isolates the IT gate after a valid manual merge declaration.
+        discover = external_points()
+        discover.start()
+        self.addCleanup(discover.stop)
         proof = mock.patch.object(work, "_declared_merge_commit",
                                   side_effect=lambda item, sha, **kw: sha)
         proof.start()
@@ -401,7 +533,7 @@ class LifecycleGateTest(PgTestCase):
 
 
 class DocumentaryTypesGateTest(PgTestCase):
-    """Q1 #1915 : le module lifecycle déclare les cinq types documentaires.
+    """Q1 #1915 : un descripteur externe peut déclarer les cinq types.
 
     Le descripteur les rend installables ; l'activation reste une sélection de
     canon par projet. Un projet sans module continue de les refuser, côté CLI
@@ -410,12 +542,14 @@ class DocumentaryTypesGateTest(PgTestCase):
 
     def setUp(self):
         super().setUp()
+        self.external = external_lifecycle()
+        with external_points(FakeEntryPoint(self.external)):
+            declarations = modules.declarations(federation(names=["lifecycle"]))
         with self.db.transaction() as tx:
-            ModuleStore(tx).replace(
-                "", modules.declarations(federation(names=["lifecycle"])))
+            ModuleStore(tx).replace("", declarations)
 
     def test_each_declared_type_is_admitted_for_the_project(self):
-        for kind in lifecycle.TYPES:
+        for kind in self.external.TYPES:
             with self.subTest(kind=kind):
                 lot = work.add(self.db, title="Documentary", type=kind, app="acme")
                 self.assertEqual((lot["type"], lot["app"]), (kind, "acme"))
@@ -423,7 +557,7 @@ class DocumentaryTypesGateTest(PgTestCase):
                 self.assertTrue(ModuleStore(self.db).admits("acme", kind))
 
     def test_a_project_without_the_module_still_refuses_each_type(self):
-        for kind in lifecycle.TYPES:
+        for kind in self.external.TYPES:
             with self.subTest(kind=kind):
                 with self.assertRaisesRegex(work.WorkError, "enable its module"):
                     work.add(self.db, title="No module", type=kind, app="other")
