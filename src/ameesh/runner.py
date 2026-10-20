@@ -4120,25 +4120,45 @@ class AgentWorker(threading.Thread):
         expired = [row for row in rows if mail.request_expired(row)]
         if not expired:
             return rows
+        # #2825 N5: a settlement failure leaves the message queued, so the
+        # next poll sees it again. The sender is told ONCE per message; the
+        # settlement is retried without repeating the notice.
+        notified = getattr(self, "_expired_notified", None)
+        if not isinstance(notified, set):
+            notified = self._expired_notified = set()
         for row in expired:
-            self._notify_expired_request(row)
+            mid = row.get("id")
+            key = int(mid) if mid is not None else None
+            if key is not None and key in notified:
+                continue
+            if self._notify_expired_request(row) and key is not None:
+                notified.add(key)
         try:
             mail.drop_expired(self.db, expired)
         except db_mod.DbError as exc:
-            log("[%s] expired request(s) not settled (%s)" % (self.name, exc))
+            log("[%s] expired request(s) not settled (%s); retried without a "
+                "new notice" % (self.name, exc))
         else:
+            for row in expired:
+                mid = row.get("id")
+                if mid is not None:
+                    notified.discard(int(mid))
             log_async("[%s] %d request(s) expired before a turn: not started"
                       % (self.name, len(expired)))
         return [row for row in rows if not mail.request_expired(row)]
 
-    def _notify_expired_request(self, row: dict) -> None:
+    def _notify_expired_request(self, row: dict) -> bool:
         """#2814 : dit à l'expéditeur qu'une requête à échéance explicite n'a
         pas été livrée, avant de la solder. Un message de service `ameesh`
-        (événement) laisse une trace dans le fil ; jamais pour soi-même."""
+        (événement) laisse une trace dans le fil ; jamais pour soi-même.
+
+        Rend True quand l'avis est réglé (envoyé, ou inutile: expéditeur
+        absent/soi-même), False quand l'envoi a échoué : l'appelant le
+        retentera sans dupliquer un avis déjà parti (#2825 N5)."""
         sender = str(row.get("sender") or "")
         mid = row.get("id")
         if not sender or sender in ("ameesh", self.name):
-            return
+            return True
         deadline = mail.request_deadline(row)
         when = time.strftime("%Y-%m-%d %H:%M:%S",
                              time.localtime(deadline)) if deadline else "?"
@@ -4152,6 +4172,8 @@ class AgentWorker(threading.Thread):
         except Exception as exc:  # a notice never blocks the settlement
             log("[%s] expired request #%s notice not sent (%s)"
                 % (self.name, mid, type(exc).__name__))
+            return False
+        return True
 
     def _queue_since(self, waiting: bool) -> float:
         """#2814 : âge (s) du premier tour retenu, 0 sans travail en attente.
@@ -9518,7 +9540,12 @@ class Runner:
                   if c is not None and hasattr(c, "host") and hasattr(c, "hosts")]
         if not canons:
             return  # objet factice des tests de `canon_sync_once`
-        mine = resources_mod.host_limits(canons, self.host)
+        # #2825 N4 : le défaut de CET hôte vient de sa propre détection (ou de
+        # sa fiche) ; les autres hôtes gardent le défaut `host`, jamais celui
+        # du processus qui lit leurs limites.
+        local_scope = resources_mod.pressure_scope(None)
+        mine = resources_mod.host_limits(canons, self.host,
+                                         default_scope=local_scope)
         limits = mine["limits"]
         # L112 : bail court d'un hôte volatil (fiche Host), sinon la config
         from .mediated_executor import host_gate
@@ -9534,7 +9561,9 @@ class Runner:
         for one in canons:
             for h in one.hosts:
                 if h.title not in par_hote:
-                    effective = resources_mod.host_limits(canons, h.title)
+                    effective = resources_mod.host_limits(
+                        canons, h.title,
+                        default_scope=local_scope if h.title == self.host else None)
                     par_hote[h.title] = effective["limits"]
                     if not hasattr(self, "_handoff_limits"):
                         self._handoff_limits = {}

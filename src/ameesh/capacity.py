@@ -14,8 +14,10 @@ secret, ni identifiant de modèle, ni budget détaillé. Deux formes fournies :
 * `cmd:<argv…>` : une commande est lancée (sans shell) avec l'événement sur
   son entrée standard ; sa dernière ligne de sortie est le JSON de décision.
   C'est le contrat d'un scaler externe : « capacité nécessaire / libérée » ;
-* `module:classe` : une classe Python est importée et instanciée ; elle doit
-  exposer `need(event)` et `release(event)` et rendre un mapping.
+* `<module>:<classe>` : une classe Python est importée et instanciée ; elle doit
+  exposer `need(event)` et `release(event)` et rendre un mapping. Ses appels
+  sont bornés par le même délai que `cmd:` (#2825) : un module qui pend ne
+  retient pas le worker.
 
 Une décision `granted` ne lance AUCUN tour : le fournisseur peut ajouter de
 la capacité (pod, nœud, quota), et c'est la pression qui retombe qui ouvre le
@@ -30,7 +32,10 @@ bornes restent celles de l'exécuteur :
   (`AgentWorker.budget_ok`) — un dépassement de budget ferme la porte, pas le
   fournisseur ;
 * une erreur, un délai dépassé ou une sortie illisible laisse la pression
-  telle quelle (fail closed : rien n'est accordé).
+  telle quelle (fail closed : rien n'est accordé) ;
+* un `refused`, `error` ou `none` ne garde pas le slot `requested` (#2825) :
+  la fenêtre suivante peut redemander ; un `release` n'est émis qu'avec un
+  `capacity_id` réellement accordé.
 
 L'observabilité : chaque décision est journalisée (`log_async`) et le dernier
 état est repris dans le texte de statut de l'agent (`resources.queue_text`),
@@ -94,6 +99,51 @@ def _log(log, text: str) -> None:
         log(text)
     except Exception:  # a logging failure never changes the decision
         pass
+
+
+def capacity_id(value) -> str | int | float | None:
+    """L'identifiant d'une capacité RÉELLEMENT accordée, sinon None (#2825).
+
+    Un fournisseur qui répond `granted` sans `capacity_id` n'a rien accordé
+    d'identifiable : on ne peut ni le libérer ni le représenter à l'identique.
+    Un identifiant vide, booléen ou d'un autre type ne compte pas."""
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    if isinstance(value, str):
+        return value if value.strip() else None
+    if value != value:  # NaN
+        return None
+    return value
+
+
+def _call_bounded(log, label: str, timeout: float, fn, *args) -> dict:
+    """Appelle `fn(*args)` avec un délai, comme le fournisseur `cmd:` (#2825).
+
+    Un fournisseur de module tourne DANS l'exécuteur : un appel qui ne rend
+    jamais la main retiendrait le worker (et laisserait `releasing` à vie).
+    Le thread est un démon : même bloqué, il ne retarde pas l'arrêt du
+    processus ; la décision rendue est `error` (fail closed)."""
+    if not timeout or timeout <= 0:
+        return fn(*args)
+    box: dict = {}
+
+    def run() -> None:
+        try:
+            box["reply"] = fn(*args)
+        except BaseException as exc:  # the caller decides; never kill the worker
+            box["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True,
+                              name="capacity-%s" % label)
+    thread.start()
+    thread.join(float(timeout))
+    if thread.is_alive():
+        _log(log, "capacity: %s provider did not answer in %gs"
+             % (label, float(timeout)))
+        return {"action": "error", "error": "timeout"}
+    if "error" in box:
+        raise box["error"]
+    return box.get("reply")
 
 
 def event(kind: str, **fields) -> dict:
@@ -178,11 +228,36 @@ class CommandProvider(Provider):
         return self._run(dict(event, event="release"))
 
 
+class ModuleProvider(Provider):
+    """Un fournisseur `<module>:<classe>`, borné comme le fournisseur `cmd:`.
+
+    La classe importée n'est pas un sous-processus : ses méthodes rendent la
+    main ou bloquent l'exécuteur. Chaque appel est donc attendu au plus
+    `AMEESH_CAPACITY_PROVIDER_TIMEOUT` (5 s par défaut) ; au-delà, `error`
+    (rien n'est accordé, une libération repasse en `release_failed`)."""
+
+    def __init__(self, provider, *, timeout: float = DEFAULT_TIMEOUT_S, log=None) -> None:
+        self.provider = provider
+        self.timeout = _number(timeout, DEFAULT_TIMEOUT_S, minimum=0.1)
+        self.log = log
+        self.is_noop = bool(getattr(provider, "is_noop", False))
+
+    def _call(self, method: str, event: dict) -> dict:
+        return _call_bounded(self.log, method, self.timeout,
+                             getattr(self.provider, method), dict(event))
+
+    def need(self, event: dict) -> dict:
+        return self._call("need", event)
+
+    def release(self, event: dict) -> dict:
+        return self._call("release", event)
+
+
 def load_provider(spec: str | None = None, *, log=None) -> Provider:
     """Le fournisseur configuré (`AMEESH_CAPACITY_PROVIDER`), ou le no-op.
 
     `cmd:<argv…>` : `CommandProvider` (`shlex`, variables d'environnement
-    développées) ; `module:classe` : une classe importée ; tout le reste
+    développées) ; `<module>:<classe>` : une classe importée ; tout le reste
     retombe sur le no-op avec une ligne de journal (une faute de frappe ne
     doit pas arrêter l'exécuteur ni accorder une capacité)."""
     spec = (spec if spec is not None else os.environ.get(PROVIDER_ENV) or "").strip()
@@ -204,7 +279,9 @@ def load_provider(spec: str | None = None, *, log=None) -> Provider:
             provider = factory() if callable(factory) else factory
             if not callable(getattr(provider, "need", None)):
                 raise TypeError("need(event) missing")
-            return provider
+            if not callable(getattr(provider, "release", None)):
+                raise TypeError("release(event) missing")
+            return ModuleProvider(provider, timeout=timeout, log=log)
         except Exception as exc:
             _log(log, "capacity: provider %r unusable (%s); no provider"
                  % (spec, type(exc).__name__))
@@ -302,13 +379,27 @@ class Manager:
         action = reply.get("action")
         if action not in ACTIONS:
             action = "error"
+        granted = capacity_id(reply.get("capacity_id"))
+        detail = reply.get("detail") or reply.get("error")
+        if action == "granted" and granted is None:
+            # #2825 N1: a grant without an identifier cannot be released nor
+            # represented with the same id later; it is not a usable capacity
+            action = "error"
+            detail = detail or "granted without capacity_id"
         state = {"state": "requested", "action": action, "since": now,
                  "agent": agent, "host": host,
-                 "capacity_id": reply.get("capacity_id"),
-                 "detail": reply.get("detail") or reply.get("error")}
+                 "capacity_id": granted,
+                 "detail": detail}
         with self._lock:
             if self._outstanding is placeholder:
-                self._outstanding = state
+                if action in ("granted", "wait"):
+                    self._outstanding = state
+                else:
+                    # #2825 N1: refused/error/none granted nothing. Drop the
+                    # slot so a later window can ask again (min_interval and
+                    # needs_per_hour still bound the attempts); never hold a
+                    # `requested` slot that no capacity will ever fill.
+                    self._outstanding = None
             self._idle_since = None
         _log(self.log, "capacity: need for %s on %s (%s) -> %s%s"
              % (agent, host, (verdict or {}).get("scope") or "?",
@@ -358,12 +449,28 @@ class Manager:
                     return None
             else:
                 return None
-            state = dict(state)
-            state["state"] = "releasing"
-            state["release_attempts"] = int(state.get("release_attempts") or 0) + 1
-            state["release_last_at"] = now
-            state["next_retry"] = None
-            self._outstanding = state
+            if capacity_id(state.get("capacity_id")) is None:
+                # #2825 N1: a `wait` reply (or a malformed grant) never gave
+                # an identifiable capacity; releasing one would announce a
+                # capacity we do not hold. Drop the slot without a provider
+                # call so a later need can ask again.
+                self._outstanding = None
+                self._idle_since = None
+                skipped = dict(state)
+                skipped["state"] = "idle"
+                state = None
+            else:
+                state = dict(state)
+                state["state"] = "releasing"
+                state["release_attempts"] = int(state.get("release_attempts") or 0) + 1
+                state["release_last_at"] = now
+                state["next_retry"] = None
+                self._outstanding = state
+        if state is None:
+            _log(self.log, "capacity: release skipped for %s on %s "
+                 "(no capacity_id: nothing was granted)"
+                 % (skipped.get("agent"), skipped.get("host")))
+            return skipped
         payload = event("release", host=state.get("host"), agent=state.get("agent"),
                         ts=now, capacity_id=state.get("capacity_id"),
                         release_attempt=state["release_attempts"],

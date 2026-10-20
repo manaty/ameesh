@@ -1334,7 +1334,10 @@ def host_verdicts(db, canons) -> dict:
     verdicts = {}
     for reading in storage.of(db).hosts.current(None):
         try:
-            limits = resources_mod.host_limits(canons, reading["host"])["limits"]
+            # #2825 N4 : le défaut de CET hôte vient de son relevé, pas du
+            # processus qui interroge la flotte.
+            limits = resources_mod.host_limits(
+                canons, reading["host"], reading=reading)["limits"]
         except Exception:
             limits = None
         verdicts[reading["host"]] = (reading, resources_mod.pressure(reading, limits=limits))

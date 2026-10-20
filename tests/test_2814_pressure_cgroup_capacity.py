@@ -22,10 +22,12 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
-from ameesh import capacity, canon, mail, mesh_cli, platform, registry, resources, storage
+from ameesh import (capacity, canon, db as db_mod, mail, mesh_cli, platform,
+                    registry, resources, runner, storage)
 
 from . import test_canon
 from .support import PgTestCase
@@ -169,11 +171,63 @@ class ScopeThresholdsTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"AMEESH_PRESSURE_SCOPE": "own_cgroup"}):
             self.assertEqual(resources.thresholds(None)["pressure_scope"], "own_cgroup")
 
-    def test_default_is_own_cgroup_only_in_a_container(self):
-        with mock.patch.dict(os.environ, {"AMEESH_CONTAINER": "1"}):
-            self.assertEqual(resources.thresholds(None)["pressure_scope"], "own_cgroup")
+    def test_default_is_own_cgroup_only_in_a_bounded_container(self):
+        # #2825 N2 : un conteneur sans cgroup v2 lisible garde les gardes de
+        # l'hôte au lieu de perdre CPU/mémoire en silence.
+        with tempfile.TemporaryDirectory() as root:
+            write_cgroup(root, maximum=1024 ** 3)
+            with mock.patch.dict(os.environ, {"AMEESH_CONTAINER": "1",
+                                              "AMEESH_CGROUP_DIR": root}):
+                self.assertEqual(resources.thresholds(None)["pressure_scope"],
+                                 "own_cgroup")
+        with tempfile.TemporaryDirectory() as root:  # no cpu.max/memory.max
+            with mock.patch.dict(os.environ, {"AMEESH_CONTAINER": "1",
+                                              "AMEESH_CGROUP_DIR": root}):
+                self.assertEqual(resources.thresholds(None)["pressure_scope"], "host")
         with mock.patch.dict(os.environ, {"AMEESH_CONTAINER": "0"}):
             self.assertEqual(resources.thresholds(None)["pressure_scope"], "host")
+
+    def test_host_limits_never_read_the_callers_container(self):
+        # #2825 N4 : `ameesh hosts` sur un autre hôte ne déduit pas son
+        # périmètre du processus qui interroge.
+        with tempfile.TemporaryDirectory() as root:
+            write_cgroup(root, maximum=1024 ** 3)
+            with mock.patch.dict(os.environ, {"AMEESH_CONTAINER": "1",
+                                              "AMEESH_CGROUP_DIR": root}):
+                got = resources.host_limits([], "ailleurs")
+        self.assertEqual(got["limits"]["pressure_scope"], "host")
+
+    def test_a_reading_sets_the_default_scope_of_its_host(self):
+        # #2825 N4 : le défaut vient de la lecture de l'hôte nommé, et une
+        # lecture ancienne (sans les clés) reste prudente.
+        own = {"cgroup": {"container": True, "bounded": True, "mem_used": 0.2}}
+        self.assertEqual(resources.host_limits([], "atelier", reading=own)
+                         ["limits"]["pressure_scope"], "own_cgroup")
+        blind = {"cgroup": {"container": True, "bounded": False}}
+        self.assertEqual(resources.host_limits([], "atelier", reading=blind)
+                         ["limits"]["pressure_scope"], "host")
+        old = {"cgroup": {"mem_used": 0.5}}
+        self.assertEqual(resources.host_limits([], "atelier", reading=old)
+                         ["limits"]["pressure_scope"], "host")
+
+    def test_an_own_cgroup_fiche_without_measure_falls_back_with_a_note(self):
+        # #2825 N2 : même demandé par une fiche, `own_cgroup` sans aucune
+        # mesure cgroup revient à `host` et le dit, au lieu de perdre les
+        # gardes en silence.
+        class Fiche:
+            policy = type("P", (), {"resources": {"pressure_scope": "own_cgroup"},
+                                    "max_agents": None})()
+
+        class Canon:
+            id = "a"
+
+            def host(self, name):
+                return Fiche()
+
+        got = resources.host_limits([Canon()], "atelier",
+                                    reading={"cgroup": {}})
+        self.assertEqual(got["limits"]["pressure_scope"], "host")
+        self.assertIn("no cgroup v2 measure", got["scope_fallback"])
 
     def test_cgroup_ceilings_have_prudent_defaults(self):
         self.assertEqual(limits()["max_cgroup_memory_used"],
@@ -250,17 +304,25 @@ class BreachesScopeTest(unittest.TestCase):
             limits=limits(pressure_scope="host"))
         self.assertFalse(verdict["blocked"])
 
-    def test_no_cgroup_measure_is_no_breach(self):
+    def test_own_cgroup_without_any_cgroup_measure_falls_back_to_host(self):
+        # #2825 N2 : sans aucune mesure cgroup, la charge du nœud n'est plus
+        # écartée en silence : le périmètre `host` garde ses seuils, et le
+        # repli est dit dans le verdict.
         verdict = resources.pressure(
             {"load1": 100.0},
             limits=limits(pressure_scope="own_cgroup", max_load=1))
-        self.assertFalse(verdict["blocked"])
+        self.assertTrue(verdict["blocked"])
+        self.assertEqual(verdict["scope"], "host")
+        self.assertIn("no cgroup v2 measure", verdict["scope_fallback"])
+        self.assertEqual([b["key"] for b in verdict["breaches"]], ["max_load"])
 
     def test_a_host_swap_stock_does_not_block_an_own_cgroup_host(self):
         # the container's /proc/meminfo shows the NODE's swap; without the
         # node's PSI it must not apply the 0028 fallback (a stock is not a
-        # pressure) — the cgroup's memory.max is the real guard
-        reading = {"swap_used_bytes": 20 * GIB, "load1": 50.0}
+        # pressure) — the cgroup's memory.max is the real guard. The cgroup
+        # must be measured, otherwise #2825 N2 keeps the host guards.
+        reading = {"swap_used_bytes": 20 * GIB, "load1": 50.0,
+                   "cgroup_mem_used": 0.2}
         self.assertEqual(resources.breaches(
             reading, limits(pressure_scope="own_cgroup")), [])
         # a declared swap ceiling still counts, corroborated by the cgroup's
@@ -518,6 +580,145 @@ class CapacityProviderTest(unittest.TestCase):
         self.assertEqual([e["event"] for e in provider.events],
                          ["need", "release", "release", "need"])
 
+    def test_a_refused_or_failed_need_never_holds_the_slot(self):
+        # #2825 N1 : un refus ou une erreur n'accorde rien ; le slot
+        # `requested` est rendu (une fenêtre ultérieure peut redemander) et
+        # aucun `release` n'est envoyé.
+        provider = _Provider()
+        provider.replies = [{"action": "refused", "detail": "no quota"},
+                            {"action": "error", "error": "boom"},
+                            {"action": "granted", "capacity_id": "c9"}]
+        clock = [100.0]
+        manager = capacity.Manager(provider, now=lambda: clock[0],
+                                   min_interval_s=15, needs_per_hour=5,
+                                   release_after_s=0)
+        refused = manager.need(host="h", agent="a")
+        self.assertEqual(refused["action"], "refused")
+        self.assertEqual(refused["capacity_id"], None)
+        self.assertIsNone(manager.snapshot())
+        # the min interval still bounds the next attempt
+        self.assertIsNone(manager.need(host="h", agent="a"))
+        self.assertEqual(len(provider.events), 1)
+        clock[0] = 116.0
+        failed = manager.need(host="h", agent="a")
+        self.assertEqual(failed["action"], "error")
+        self.assertIsNone(manager.snapshot())
+        # nothing was granted: a calm pressure releases nothing
+        self.assertIsNone(manager.observe(False))
+        self.assertEqual([e["event"] for e in provider.events], ["need", "need"])
+        clock[0] = 132.0
+        granted = manager.need(host="h", agent="a")
+        self.assertEqual(granted["capacity_id"], "c9")
+        self.assertEqual(manager.snapshot()["state"], "requested")
+
+    def test_a_granted_without_capacity_id_is_not_a_releasable_slot(self):
+        # #2825 N1 : un `granted` sans identifiant n'est pas une capacité
+        # utilisable ; on ne libère jamais `capacity_id: None`.
+        provider = _Provider()
+        provider.replies = [{"action": "granted"}]
+        clock = [100.0]
+        manager = capacity.Manager(provider, now=lambda: clock[0],
+                                   min_interval_s=0, needs_per_hour=5,
+                                   release_after_s=0)
+        state = manager.need(host="h", agent="a")
+        self.assertEqual(state["action"], "error")
+        self.assertIn("capacity_id", state["detail"])
+        self.assertIsNone(manager.snapshot())
+        self.assertIsNone(manager.observe(False))
+        self.assertEqual([e["event"] for e in provider.events], ["need"])
+
+    def test_a_wait_without_capacity_id_is_dropped_without_a_release(self):
+        # #2825 N1 : `wait` n'accorde encore rien. Au calme, le slot est rendu
+        # sans appeler le fournisseur (aucun identifiant à libérer).
+        provider = _Provider()
+        provider.replies = [{"action": "wait"}]
+        clock = [100.0]
+        manager = capacity.Manager(provider, now=lambda: clock[0],
+                                   min_interval_s=0, needs_per_hour=5,
+                                   release_after_s=0)
+        state = manager.need(host="h", agent="a")
+        self.assertEqual(state["action"], "wait")
+        self.assertEqual(manager.snapshot()["state"], "requested")
+        clock[0] = 101.0
+        self.assertIsNone(manager.observe(False))  # the calm starts
+        clock[0] = 102.0
+        skipped = manager.observe(False)
+        self.assertEqual(skipped["state"], "idle")
+        self.assertEqual([e["event"] for e in provider.events], ["need"])
+        self.assertIsNone(manager.snapshot())
+        # the slot is free: the next window may ask again
+        clock[0] = 110.0
+        self.assertEqual(manager.need(host="h", agent="b")["action"], "granted")
+
+    def test_a_slow_module_need_is_bounded(self):
+        # #2825 N3 : un fournisseur `module:` qui pend ne retient pas le
+        # worker ; son appel est borné comme celui de `cmd:`.
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "slow_capacity_need.py")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "import time\n"
+                    "class SlowNeed:\n"
+                    "    is_noop = False\n"
+                    "    def need(self, event):\n"
+                    "        time.sleep(3.0)\n"
+                    "        return {'action': 'granted', 'capacity_id': 'late'}\n"
+                    "    def release(self, event):\n"
+                    "        return {'action': 'none'}\n")
+            sys.path.insert(0, root)
+            try:
+                with mock.patch.dict(os.environ,
+                                     {"AMEESH_CAPACITY_PROVIDER_TIMEOUT": "0.2"}):
+                    provider = capacity.load_provider(
+                        "slow_capacity_need:SlowNeed")
+                    self.assertIsInstance(provider, capacity.ModuleProvider)
+                    manager = capacity.Manager(provider, min_interval_s=0,
+                                               needs_per_hour=5)
+                    started = time.monotonic()
+                    state = manager.need(host="h", agent="a")
+                self.assertLess(time.monotonic() - started, 1.5)
+                self.assertEqual(state["action"], "error")
+                self.assertEqual(state["detail"], "timeout")
+            finally:
+                sys.path.remove(root)
+                sys.modules.pop("slow_capacity_need", None)
+
+    def test_a_slow_module_release_is_bounded_and_not_left_releasing(self):
+        # #2825 N3 : un release qui pend ne laisse pas l'état `releasing` à
+        # vie ; il repasse en `release_failed` (retenté avec le même id).
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "slow_capacity_release.py")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "import time\n"
+                    "class SlowRelease:\n"
+                    "    is_noop = False\n"
+                    "    def need(self, event):\n"
+                    "        return {'action': 'granted', 'capacity_id': 'c1'}\n"
+                    "    def release(self, event):\n"
+                    "        time.sleep(3.0)\n"
+                    "        return {'action': 'none'}\n")
+            sys.path.insert(0, root)
+            try:
+                with mock.patch.dict(os.environ,
+                                     {"AMEESH_CAPACITY_PROVIDER_TIMEOUT": "0.2"}):
+                    provider = capacity.load_provider(
+                        "slow_capacity_release:SlowRelease")
+                    manager = capacity.Manager(provider, min_interval_s=0,
+                                               needs_per_hour=5,
+                                               release_after_s=0)
+                    manager.need(host="h", agent="a")
+                    manager.observe(False)  # the calm starts
+                    started = time.monotonic()
+                    failed = manager.observe(False)
+                self.assertLess(time.monotonic() - started, 1.5)
+                self.assertEqual(failed["state"], "release_failed")
+                self.assertEqual(failed["capacity_id"], "c1")
+                self.assertEqual(failed["detail"], "timeout")
+            finally:
+                sys.path.remove(root)
+                sys.modules.pop("slow_capacity_release", None)
+
 
 class MailExpiryTest(unittest.TestCase):
     def test_a_signature_ttl_is_not_a_request_deadline(self):
@@ -762,3 +963,28 @@ class RunnerExpiredRequestDbTest(test_canon._CanonDbCase):
         self.assertEqual(notices[0]["sender"], "ameesh")
         self.assertIn("expired", notices[0]["body"])
         self.assertEqual(mail.message_payload(notices[0]).get("request_expired"), sent)
+
+    def test_a_failed_settlement_does_not_repeat_the_notice(self):
+        # #2825 N5 : quand le soldage échoue, le message revient au sondage
+        # suivant ; l'avis `request_expired` n'est envoyé qu'une fois et le
+        # soldage est retenté.
+        self.sync()
+        sent = mail.send(self.db, "relecteur", "orchestre", "requête à échéance",
+                         host="atelier", kind="request",
+                         payload={"request_expires_ts": int(time.time() - 60)})
+        expired = [row for row in mail.unread_active(self.db, "orchestre")
+                   if mail.request_expired(row)]
+        self.assertEqual([row["id"] for row in expired], [sent])
+        worker = types.SimpleNamespace(name="orchestre", db=self.db)
+        worker._notify_expired_request = types.MethodType(
+            runner.AgentWorker._notify_expired_request, worker)
+        with mock.patch.object(mail, "drop_expired",
+                               side_effect=db_mod.DbError("boom")):
+            runner.AgentWorker._live_mail(worker, expired)
+            runner.AgentWorker._live_mail(worker, expired)
+        notices = mail.unread(self.db, "relecteur")
+        self.assertEqual(len(notices), 1, notices)
+        # the settlement succeeds on the next poll, without a second notice
+        runner.AgentWorker._live_mail(worker, expired)
+        self.assertEqual(mail.unread(self.db, "orchestre"), [])
+        self.assertEqual(len(mail.unread(self.db, "relecteur")), 1)
