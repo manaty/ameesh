@@ -153,6 +153,12 @@ FERMEES = {
     "work_packet_members": {"package_id", "work_item_id", "package_branch",
                             "base_sha", "head_sha", "unit_sha", "source_sha",
                             "frozen_sha", "recorded_by", "recorded_at"},
+    # #2845 (0470) : curseur, reçus et progression de la veille des tickets
+    # GitHub. État interne de l'agent de veille, pas un état de supervision ;
+    # fermé aux deux rôles superviseur, aucun GRANT modifié.
+    "github_watch_cursors": {"project", "repo", "scanned_through"},
+    "github_watch_events": {"project", "repo", "kind", "object_id", "digest"},
+    "github_watch_scans": {"project", "repo", "progress"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).

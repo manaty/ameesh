@@ -7,13 +7,18 @@ Faux `ssh` (aucune VM : lectures de migrations, unité) et faux CLI
 `ameesh` du poste (registre, pause, reprise) sur PATH. Les règles du drain
 (posé/levé/non levé, trap de sortie) sont couvertes en mode agents par
 `tests/test_503_agent_host.py` ; ce banc prouve le câblage du mode serveur,
-où la pause passe par le CLI du poste.
+où la pause passe par le CLI du poste. Il couvre aussi l'appel direct de
+`appel_drain` (#2578) : le script appelant meurt du signal reçu au lieu de
+poursuivre après le Ctrl-C.
 """
 from __future__ import annotations
 
 import os
+import shlex
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -300,6 +305,78 @@ class RedemarrageServeurDrainTest(unittest.TestCase):
         self.assertNotIn('systemctl stop ameesh-runner@dev9', journal_ssh)
         self.assertNotIn('systemctl start ameesh-runner@dev9', journal_ssh)
         self.assertNotIn('pause dev9', self.poste())
+
+
+class AppelDrainSignalTest(unittest.TestCase):
+    """#2578 : un appel direct à `appel_drain` (hors $(…) ou pipeline) meurt du
+    signal reçu. Sinon son code de sortie 128+sig est une sortie ordinaire :
+    le script de déploiement poursuit après le Ctrl-C. Le trap EXIT du
+    script (levée des drains) doit toujours passer."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='ameesh-2578-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        texte = SCRIPT.read_text()
+        debut = texte.index('appel_drain() {')
+        fin = texte.index('\n}\n', debut) + len('\n}\n')
+        self.fonction = texte[debut:fin]
+        self.enfant = self.root / 'enfant-demarre'
+        self.poursuite = self.root / 'poursuite'
+        self.nettoyage = self.root / 'nettoyage'
+        self.script = self.root / 'appel-direct.sh'
+        self.script.write_text(
+            '#!/bin/bash\n'
+            'trap \'echo nettoyage > {nettoyage}\' EXIT\n'
+            '{fonction}\n'
+            'appel_drain 30 bash -c \'echo demarre > {enfant}; exec sleep 30\'\n'
+            'echo poursuite > {poursuite}\n'.format(
+                nettoyage=shlex.quote(str(self.nettoyage)),
+                fonction=self.fonction,
+                enfant=shlex.quote(str(self.enfant)),
+                poursuite=shlex.quote(str(self.poursuite))))
+        self.script.chmod(0o755)
+
+    def test_direct_call_dies_from_the_signal_and_stops_the_caller(self):
+        proc = subprocess.Popen(['bash', str(self.script)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, start_new_session=True)
+
+        def nettoyer():
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.communicate()
+
+        self.addCleanup(nettoyer)
+        try:
+            limite = time.monotonic() + 10
+            while not self.enfant.exists() and time.monotonic() < limite:
+                time.sleep(0.05)
+            self.assertTrue(self.enfant.exists(),
+                            "enfant de l'appel non démarré")
+            # `appel_drain` lance son enfant avant d'installer ses
+            # gestionnaires : laisser passer cette fenêtre de quelques
+            # instructions, puis simuler le Ctrl-C du terminal, qui frappe
+            # tout le groupe (bash appelant et client Python).
+            time.sleep(0.2)
+            os.killpg(proc.pid, signal.SIGINT)
+            _, err = proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate()
+            self.fail("l'appel direct n'a pas été interrompu")
+        self.assertEqual(proc.returncode, -signal.SIGINT,
+                         'le script appelant doit mourir du SIGINT (rc %r)'
+                         % proc.returncode)
+        self.assertIn('appel de drain interrompu (signal %d transmis)'
+                      % signal.SIGINT, err)
+        self.assertFalse(self.poursuite.exists(),
+                         'le script a poursuivi après le Ctrl-C')
+        self.assertTrue(self.nettoyage.exists(),
+                        'le trap EXIT (levée des drains) doit passer')
 
 
 if __name__ == '__main__':

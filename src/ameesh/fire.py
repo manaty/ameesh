@@ -489,7 +489,8 @@ def _pr_status(slug: str, branch: str, *, gh) -> dict | None:
     if row is None:
         return None
     from . import radar
-    rollup = radar.latest_rollup(row.get("statusCheckRollup"))
+    rollup = radar.merge_rollup(row.get("statusCheckRollup"), slug=slug,
+                                head=_norm(row.get("headRefOid")), branch=branch, gh=gh)
     pending = any((c.get("status") or "COMPLETED") != "COMPLETED"
                   or (c.get("state") or "") == "PENDING" for c in rollup)
     ci = "green" if radar.ci_green(rollup) else "pending" if pending or not rollup else "red"

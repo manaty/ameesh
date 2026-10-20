@@ -59,7 +59,7 @@ class FakePort:
         return found
 
     def commit(self, lot, *, freeze, required, state, reviewers, missing, why, authors,
-               policy_ref="", notify="", messages=()):
+               policy_ref="", notify="", messages=(), unknown_authors=()):
         latest = self.latest_freeze(lot)
         if not latest or int(latest["id"]) != int(freeze["id"]):
             self.stale_refusals += 1
@@ -67,6 +67,7 @@ class FakePort:
         out = {"state": state, "required": required,
                "reviewers": [dict(r) for r in reviewers], "missing": missing, "why": why,
                "freeze": dict(freeze), "authors": [dict(a) for a in authors],
+               "unknown_authors": [str(value) for value in unknown_authors],
                "policy_ref": policy_ref, "notify": notify,
                "messages": [dict(m) for m in messages]}
         self.records[(int(lot), int(freeze["id"]))] = out

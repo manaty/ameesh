@@ -29,6 +29,7 @@ from .grants import Grants
 from .host_lifecycle import HostLifecycle
 from .handoffs import Handoffs
 from .hosts import Hosts, TurnResources, Visibility
+from .github_watch import GithubWatch
 from .mailbox import Mailbox
 from .menage import Housekeeping
 from .operations import Operations
@@ -70,6 +71,7 @@ class PostgresStorage(interface.Storage):
         self.events = Events(db)
         self.catalog = Catalog(db)
         self.mailbox = Mailbox(db)
+        self.github_watch = GithubWatch(db)
         self.wakeups = Wakeups(db)
         self.keys = Keys(db)
         self.approvals = Approvals(db)
