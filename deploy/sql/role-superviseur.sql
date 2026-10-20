@@ -397,7 +397,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L159f (0069): host gate state, seq and the guard's short reason
         'gate_state', 'gate_seq', 'gate_reason',
         -- #2022 (0455): process and zombie counts, the publishing runner
-        'procs_total', 'procs_zombie', 'runner_id', 'runner_procs', 'runner_zombies'
+        'procs_total', 'procs_zombie', 'runner_id', 'runner_procs', 'runner_zombies',
+        -- #2814 (0469) : mesures du cgroup v2 du processus (PSI, quota,
+        -- compteurs, chemin d'état) — des nombres et un chemin, pas un secret
+        'cgroup'
     ]),
     ('turn_resources', ARRAY[
         'id', 'turn_id', 'agent', 'host', 'pgid', 'label', 'containers',

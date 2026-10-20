@@ -4227,6 +4227,35 @@ class PrevalidationReports(Domain):
 # le stockage d'une connexion
 # --------------------------------------------------------------------------
 
+class GithubWatch(Domain):
+    """#2845: transactional GitHub intake; notifier host only."""
+
+    @abc.abstractmethod
+    def cursor(self, project: str, repo: str) -> float | None:
+        """Last completed scan, absent before bootstrap."""
+
+    @abc.abstractmethod
+    def lock(self, project: str, repo: str, initial: float) -> float:
+        """Create and lock the cursor until commit; return its timestamp."""
+
+    @abc.abstractmethod
+    def remember(self, project: str, repo: str, kind: str, object_id: int,
+                 digest: str) -> bool:
+        """True only for a new object version. Caller holds the cursor lock."""
+
+    @abc.abstractmethod
+    def advance(self, project: str, repo: str, until: float) -> None:
+        """Advance after every mailbox deposit succeeded, never backwards."""
+
+    @abc.abstractmethod
+    def scan(self, project: str, repo: str) -> dict | None:
+        """Incomplete scan window and next page, absent when the scan is complete."""
+
+    @abc.abstractmethod
+    def checkpoint(self, project: str, repo: str, progress: dict | None) -> None:
+        """Persist or clear partial progress atomically with mailbox delivery."""
+
+
 class Storage(abc.ABC):
     """Les domaines du stockage, liés à une connexion ou une transaction."""
 
@@ -4249,6 +4278,7 @@ class Storage(abc.ABC):
     watches: Watches
     events: Events
     mailbox: Mailbox
+    github_watch: GithubWatch
     wakeups: Wakeups
     keys: Keys
     approvals: Approvals

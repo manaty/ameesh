@@ -8,10 +8,13 @@ et nouvelle valeur.
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import os
+import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -310,16 +313,28 @@ class BudgetBaseTest(PgTestCase):
 
 class PsqlReadyProbeTest(unittest.TestCase):
     """#681 : le pilote psql n'annonce l'abonnement qu'une fois les LISTEN
-    actifs. Un faux psql lent répond à la sonde d'activation après un délai ;
-    sans base, seul le processus est simulé. Sans l'attente, l'abonnement
-    rendrait la main aussitôt et un NOTIFY émis juste après serait perdu."""
+    actifs. Un faux psql répond à la sonde d'activation, sans base : sans
+    l'attente, l'abonnement rendrait la main aussitôt et un NOTIFY émis juste
+    après serait perdu.
+
+    #2869 : le faux psql ne répond plus après un délai subi (0,5 s face aux
+    10 s de `READY_TIMEOUT`) mais quand le test ouvre une barrière, une fois
+    la sonde lue. Le verdict ne dépend donc plus de l'ordonnancement du
+    runner ; la trace du faux psql part dans le journal à l'échec, au lieu de
+    disparaître avec le dossier temporaire."""
 
     CHANNELS = ("ameesh_budget", "ameesh_wake")
+    #: garde-fou de la jointure, après la barrière : le délai de la sonde,
+    #: lui, est décidé par la barrière et borné par le READY_TIMEOUT du
+    #: constructeur (patché à 120 s), jamais par l'ordonnancement du runner.
+    JOIN_TIMEOUT = 60.0
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.trace = os.path.join(self.tmp.name, "trace")
+        self.gate = os.path.join(self.tmp.name, "gate")
+        self.probe_seen = os.path.join(self.tmp.name, "probe-seen")
         self.stub = os.path.join(self.tmp.name, "psql")
         with open(self.stub, "w", encoding="utf-8") as fh:
             fh.write(
@@ -330,7 +345,12 @@ class PsqlReadyProbeTest(unittest.TestCase):
                 '  case "$line" in\n'
                 "    '\\q') exit 0 ;;\n"
                 '    *__ameesh_listener_ready__*)\n'
-                '      sleep "$FAKE_PSQL_DELAY"\n'
+                '      if [ -n "$FAKE_PSQL_GATE" ]; then\n'
+                '        : > "$FAKE_PSQL_PROBE_SEEN"\n'
+                '        while [ ! -e "$FAKE_PSQL_GATE" ] && kill -0 "$PPID" 2>/dev/null; do\n'
+                '          sleep 0.01\n'
+                '        done\n'
+                '      fi\n'
                 '      if [ -n "$FAKE_PSQL_READY" ]; then\n'
                 '        printf "%s\\n" "$FAKE_PSQL_READY"\n'
                 '      fi ;;\n'
@@ -338,45 +358,104 @@ class PsqlReadyProbeTest(unittest.TestCase):
                 'done\n')
         os.chmod(self.stub, 0o755)
 
-    def _driver(self, ready, delay="0"):
-        env = dict(os.environ, FAKE_PSQL_TRACE=self.trace, FAKE_PSQL_DELAY=delay,
-                   FAKE_PSQL_READY=ready)
+    @contextlib.contextmanager
+    def _trace_on_failure(self):
+        """À l'échec, la trace du faux psql part dans le journal : le dossier
+        temporaire qui la porte est supprimé par le nettoyage, et le finding
+        du run 39401666851 n'avait gardé que « SELECT 1; »."""
+        try:
+            yield
+        except BaseException:
+            try:
+                with open(self.trace, encoding="utf-8") as fh:
+                    trace = fh.read()
+            except OSError as exc:
+                trace = "(trace illisible : %s)\n" % exc
+            sys.stderr.write("\n--- trace du faux psql (%s) ---\n%s--- fin ---\n"
+                             % (self.id(), trace or "(vide)\n"))
+            sys.stderr.flush()
+            raise
+
+    def _driver(self, ready, gate="", probe_seen=""):
+        env = dict(os.environ, FAKE_PSQL_TRACE=self.trace, FAKE_PSQL_READY=ready,
+                   FAKE_PSQL_GATE=gate, FAKE_PSQL_PROBE_SEEN=probe_seen)
         return types.SimpleNamespace(_interactive_args=[self.stub], env=env, _bootstrap="")
 
     def _ready_line(self, channels):
         return (db_mod._PsqlListener.READY_PREFIX
                 + db_mod._PsqlListener.READY_SEP.join(channels))
 
-    def test_sonde_attendue_avant_de_rendre_la_main(self):
-        start = time.monotonic()
-        listener = db_mod._PsqlListener(
-            self._driver(self._ready_line(self.CHANNELS), delay="0.5"),
-            list(self.CHANNELS))
-        elapsed = time.monotonic() - start
+    def _wait_probe(self, opener):
+        """Attend que le faux psql ait lu la sonde (ou que l'abonnement ait
+        rendu la main) ; pas d'horloge ici : le constructeur est lui-même
+        borné par READY_TIMEOUT, et la barrière décide de la réponse."""
+        while opener.is_alive() and not os.path.exists(self.probe_seen):
+            time.sleep(0.01)
+        return os.path.exists(self.probe_seen)
+
+    def _open(self, result, driver):
         try:
-            self.assertGreaterEqual(elapsed, 0.35,
-                                    "l'abonnement a rendu la main avant la sonde")
+            result["listener"] = db_mod._PsqlListener(driver, list(self.CHANNELS))
+        except BaseException as exc:      # remonté dans le fil du test
+            result["error"] = exc
+
+    def test_sonde_attendue_avant_de_rendre_la_main(self):
+        # 120 s de marge : le délai de production (10 s) ne doit jamais
+        # décider du verdict ; les deux tests suivants le vérifient.
+        with self._trace_on_failure(), \
+                mock.patch.object(db_mod._PsqlListener, "READY_TIMEOUT", 120.0):
+            driver = self._driver(self._ready_line(self.CHANNELS),
+                                  gate=self.gate, probe_seen=self.probe_seen)
+            result = {}
+            opener = threading.Thread(target=self._open, args=(result, driver),
+                                      daemon=True)
+            opener.start()
+            try:
+                self.assertTrue(self._wait_probe(opener),
+                                "la sonde n'a pas atteint le faux psql%s"
+                                % (" : %r" % result["error"] if "error" in result else ""))
+                self.assertTrue(opener.is_alive(),
+                                "l'abonnement a rendu la main avant la réponse à la sonde")
+                self.assertNotIn("listener", result)
+                with open(self.gate, "w", encoding="utf-8"):
+                    pass
+                opener.join(self.JOIN_TIMEOUT)
+                self.assertFalse(opener.is_alive(),
+                                 "l'abonnement n'a pas rendu la main après la sonde")
+                if "error" in result:
+                    raise result["error"]
+                listener = result["listener"]
+            finally:
+                if opener.is_alive() and "listener" not in result:
+                    # libère la barrière pour ne pas laisser le faux psql
+                    with open(self.gate, "w", encoding="utf-8"):
+                        pass
+                    opener.join(10)
+                if "listener" in result:
+                    result["listener"].close()
             self.assertTrue(listener._ready.is_set())
             self.assertEqual(tuple(listener._ready_channels), self.CHANNELS)
-        finally:
-            listener.close()
-        with open(self.trace, encoding="utf-8") as fh:
-            lines = fh.read().splitlines()
-        probe = next(i for i, line in enumerate(lines) if "__ameesh_listener_ready__" in line)
-        for channel in self.CHANNELS:
-            listens = [i for i, line in enumerate(lines)
-                       if line.startswith("LISTEN") and channel in line]
-            self.assertTrue(listens and listens[0] < probe,
-                            "LISTEN %s n'a pas précédé la sonde" % channel)
+            with open(self.trace, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+            probes = [i for i, line in enumerate(lines)
+                      if "__ameesh_listener_ready__" in line]
+            self.assertTrue(probes, "la sonde n'a pas atteint le faux psql : %r" % lines)
+            for channel in self.CHANNELS:
+                listens = [i for i, line in enumerate(lines)
+                           if line.startswith("LISTEN") and channel in line]
+                self.assertTrue(listens and listens[0] < probes[0],
+                                "LISTEN %s n'a pas précédé la sonde" % channel)
 
     def test_sonde_partielle_rend_unavailable(self):
-        with mock.patch.object(db_mod._PsqlListener, "READY_TIMEOUT", 0.5):
+        with self._trace_on_failure(), \
+                mock.patch.object(db_mod._PsqlListener, "READY_TIMEOUT", 0.5):
             with self.assertRaises(db_mod.Unavailable):
                 db_mod._PsqlListener(self._driver(self._ready_line(self.CHANNELS[:1])),
                                      list(self.CHANNELS))
 
     def test_sonde_muette_rend_unavailable(self):
-        with mock.patch.object(db_mod._PsqlListener, "READY_TIMEOUT", 0.5):
+        with self._trace_on_failure(), \
+                mock.patch.object(db_mod._PsqlListener, "READY_TIMEOUT", 0.5):
             with self.assertRaises(db_mod.Unavailable):
                 db_mod._PsqlListener(self._driver(""), list(self.CHANNELS))
 

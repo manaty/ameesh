@@ -585,10 +585,15 @@ def _designation_authority(db, actor: str) -> bool:
     """May `actor` have written a `reviewer X designated` journal line (#2739)?
 
     The line is only a text: any agent can copy it in a free note, so the text
-    alone proves nothing. The write path (`work.designate_reviewer`) already
-    admits only the system, a human, or an orchestrator/design agent; the
-    journal read applies the same authority, so an ordinary agent's note cannot
-    make itself a designated reviewer (and excuse its own commit as a fix).
+    alone proves nothing. The write path (`work.designate_reviewer`, and the
+    designation `work move qa --reviewer` makes in the same gesture) admits the
+    system, a human, or an orchestrator/design agent **including the recent
+    assigner history `corrector` uses**. The journal read applies the same
+    authority, so an ordinary agent's note cannot make itself a designated
+    reviewer (and excuse its own commit as a fix), while a designation the
+    write path accepted is read back (#2776: with `history=False`, a
+    `work move qa --reviewer` made by an ordinary agent was written and then
+    ignored, and its retired seat was treated as an author).
     """
     actor = str(actor or "").strip()
     if not actor:
@@ -599,7 +604,7 @@ def _designation_authority(db, actor: str) -> bool:
         from . import assignments
         return assignments.is_orchestrator(
             getattr(db, "cfg", None), db, actor,
-            roles=work.CORRECTOR_ROLES, history=False)
+            roles=work.CORRECTOR_ROLES, history=True)
     except Exception:  # noqa: BLE001 - unreadable authority: no name counted
         return False
 
@@ -613,13 +618,16 @@ def _journal_reviewers(db, lot: int, *, until=None) -> list:
     a first-round correction stays recognizable after their seat is retired,
     exactly like the automatic names of the marks (#2638). Only a line written
     by a designation authority counts (`_designation_authority`): a free note
-    carrying the same words is not a designation. With `until` (the freeze
-    instant), a reviewer named after the freeze is ignored: they did not
-    review that head.
+    carrying the same words is not a designation. The read is bounded by the
+    note prefix and the lot, never by the last 500 events: a designation older
+    than a talkative lot's recent journal stays read (#2776, same reason as
+    #1448 N2). With `until` (the freeze instant), a reviewer named after the
+    freeze is ignored: they did not review that head.
     """
     names: list[str] = []
     try:
-        events = storage.of(db).work.events(int(lot), 500) or []
+        events = storage.of(db).work.events_noted(
+            "reviewer ", 0.0, ids=[int(lot)]) or []
     except Exception:  # noqa: BLE001 - unreadable journal: no manual name
         return names
     for event in events:
@@ -1181,6 +1189,61 @@ def _latest_freeze(db, lot: int) -> Optional[dict]:
             "at_ts": row.get("at_ts"), "actor": row.get("actor") or ""}
 
 
+def frozen_authors(db, item: Mapping) -> Optional[list]:
+    """Les auteurs de la tête gelée, tels que la désignation de son gel les a lus.
+
+    #2864 : la proposition de relecture (#1677) doit écarter les familles de
+    **tous** les auteurs de la plage gelée, comme la désignation au gel
+    (#1617) et la porte (#2726), et pas seulement celle de l'assigné au gel.
+    La marque `review-designation` du dernier gel garde la lecture exacte de
+    `review_authors.reading` (noms, familles, preuves) : c'est cette lecture
+    qui fait foi ici, sans relire la plage ni deviner une famille.
+
+    La lecture n'est complète que si la marque nomme aussi les commits qu'elle
+    n'a pas pu attribuer (`unknown_authors`, #2864) : des auteurs connus ne
+    prouvent pas qu'aucun autre commit ne l'est pas. Une marque sans cette
+    liste (antérieure au champ), ou qui la porte non vide, ne prouve donc rien.
+
+    Rend la liste `{name, family}`, ou None quand aucune lecture **complète**
+    n'est disponible : pas de gel, pas de marque pour ce gel, journal
+    illisible, marque antérieure à #2721 (sans `authors`), liste
+    `unknown_authors` absente ou non vide, ou liste d'auteurs vide. L'appelant
+    échoue alors fermé — aucune proposition de relecture.
+    """
+    lot = int((item or {}).get("id") or 0)
+    if not lot:
+        return None
+    freeze = _latest_freeze(db, lot)
+    if freeze is None:
+        return None
+    try:
+        marks = _marks(db, lot, freeze_id=int(freeze["id"]),
+                       since_ts=float(freeze.get("at_ts") or 0.0))
+    except Exception:  # noqa: BLE001 - journal illisible : lecture inconnue
+        return None
+    for _row_id, kind, noted, _ts in reversed(marks or ()):
+        if kind != "designation":
+            continue
+        rows = noted.get("authors")
+        unknown = noted.get("unknown_authors")
+        # #2864 : la complétude de la provenance se prouve ; une marque d'avant
+        # le champ ne la prouve pas, et un inconnu explicite l'interdit.
+        if not isinstance(rows, list) or not isinstance(unknown, list):
+            return None
+        if [value for value in unknown if str(value).strip()]:
+            return None
+        authors = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            name = str(row.get("name") or "").strip()
+            if name:
+                authors.append({"name": name,
+                                "family": str(row.get("family") or "").strip().lower()})
+        return authors or None
+    return None
+
+
 def _lock_current_freeze(db, lot: int, freeze: Mapping) -> bool:
     """Locks the lot row and says whether `freeze` is still the latest one.
 
@@ -1447,29 +1510,66 @@ def _carried_in_transaction(tx, item: Mapping, freeze: Mapping,
 
 
 def _manual_outcome(db, item: Mapping, freeze: Mapping, manual: Sequence[str], *,
-                    waiver: bool = False) -> dict:
+                    waiver: bool = False, unknown: str = "",
+                    note: bool = True) -> dict:
     """The explicit manual no-op: keep the manual reviewers, add nobody (#2627).
 
     The note says why no automatic reviewer was added. The column is synced
     with an empty selection so a previous freeze's automatic names are retired
     while the manual names survive (`_sync_reviewers` never removes a name that
     no mark carries) and a `-none` waiver is never overridden.
+
+    `unknown` (#2637): the selection could not compute the coverage (prepare
+    failed, or the policy is unavailable). The note no longer claims the manual
+    reviewers cover the required reviews; it keeps them and says the coverage
+    is unknown, with the reason. `note=False` lets the caller write the single
+    unavailable note and its alert instead of duplicating it.
     """
     lot = int((item or {}).get("id") or 0)
     if waiver:
         text = ("automatic reviewer designation skipped at freeze %s: manual"
                 " waiver (-none) is not overridden" % _freeze_label(freeze))
         why = "manual waiver (-none)"
+    elif unknown:
+        text = ("automatic reviewer designation skipped at freeze %s: manual"
+                " reviewer(s) kept (%s); their coverage of the required"
+                " review(s) is unknown because %s"
+                % (_freeze_label(freeze), ", ".join(manual), unknown))
+        why = "manual reviewer designation (coverage unknown)"
     else:
         text = ("automatic reviewer designation skipped at freeze %s: manual"
                 " reviewer(s) already cover the required review(s) (%s); the"
                 " manual designation remains the journaled exception"
                 % (_freeze_label(freeze), ", ".join(manual)))
         why = "manual reviewer designation"
-    storage.of(db).work.note(lot, str((item or {}).get("state") or ""), text, SENDER)
+    if note:
+        storage.of(db).work.note(lot, str((item or {}).get("state") or ""), text, SENDER)
     _sync_reviewers(db, item, freeze, [])
     return {"state": "manual", "reviewers": [], "freeze": dict(freeze or {}),
             "why": why}
+
+
+def _manual_unavailable(cfg, tx, item: Mapping, freeze: Mapping,
+                        manual: Sequence[str], threads: list, why: str, *,
+                        silent: bool = False) -> dict:
+    """Keep the manual reviewers when the selection cannot compute coverage.
+
+    #2637: with manual seats present, an unavailable policy or a `prepare`
+    failure used to take `_manual_outcome`, which claimed the required reviews
+    were covered and skipped `_note_unavailable` and its pilot alert. The manual
+    seats are still kept and no automatic reviewer is added, but the waiting
+    state and the alert are now explicit. A silent source (no canon configured)
+    stays mail-free, and its manual note carries the unknown coverage reason.
+    """
+    if silent:
+        return _manual_outcome(tx, item, freeze, manual, unknown=why)
+    out = _manual_outcome(tx, item, freeze, manual, unknown=why, note=False)
+    coverage = ("manual reviewer(s) kept (%s); their coverage of the required"
+                " review(s) is unknown: %s" % (", ".join(manual), why))
+    notify = _notify(cfg, tx, str((item or {}).get("app") or ""),
+                     registry.overview(tx))
+    _note_unavailable(tx, item, freeze, coverage, threads, notify)
+    return out
 
 
 def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
@@ -1513,11 +1613,15 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
         inputs = prepare(cfg, tx, int(lot), freeze=freeze, fetch=False)
     except Exception as exc:  # noqa: BLE001 - recorded below, never guessed
         if manual:
-            return _manual_outcome(tx, item, freeze, manual)
+            return _manual_unavailable(
+                cfg, tx, item, freeze, manual, threads,
+                "internal designation error: %s: %s"
+                % (type(exc).__name__, str(exc)[:240]))
         return _internal_failure(cfg, tx, item, freeze, threads, exc)
     if isinstance(inputs, Unavailable):
         if manual:
-            return _manual_outcome(tx, item, freeze, manual)
+            return _manual_unavailable(cfg, tx, item, freeze, manual, threads,
+                                       inputs.why, silent=inputs.silent)
         if not inputs.silent:
             notify = _notify(cfg, tx, str(item.get("app") or ""),
                              registry.overview(tx))
@@ -1821,9 +1925,14 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         inputs = prepare(cfg, db, int(lot), freeze=freeze)
         if isinstance(inputs, Unavailable):
             if manual:
-                return {"state": "manual", "reviewers": [], "freeze": freeze,
-                        "why": "manual reviewer(s) designated: %s"
-                               % ", ".join(manual)}
+                with db.transaction() as tx:
+                    if not _lock_current_freeze(tx, int(lot), freeze):
+                        return _stale(freeze)
+                    out = _manual_unavailable(cfg, tx, item, freeze, manual,
+                                              threads, inputs.why,
+                                              silent=inputs.silent)
+                _drain(db, threads)
+                return out
             if not inputs.silent:
                 notify = _notify(cfg, db, str(item.get("app") or ""),
                                  registry.overview(db))
