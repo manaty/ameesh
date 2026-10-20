@@ -1471,14 +1471,55 @@ def latest_rollup(rollup) -> list:
     return latest
 
 
+def _replaced_packet_checks(rollup) -> list:
+    """#2876 : un portier annulé peut être remplacé par la suite de la PR.
+
+    Le rollup est celui d'une seule tête. Ne retirer que les checks connus du
+    portier, tous terminés, avec une annulation visible et un agrégat `tests`
+    réellement réussi après leur fin. Une date ambiguë conserve le blocage.
+    Les autres workflows et les statuts requis restent intégralement lus.
+    """
+    from datetime import datetime
+
+    def finished(check):
+        if check.get("status") != "COMPLETED":
+            return None
+        try:
+            stamp = datetime.fromisoformat(check["completedAt"].replace("Z", "+00:00"))
+            return stamp.timestamp() if stamp.tzinfo is not None else None
+        except (KeyError, AttributeError, TypeError, ValueError, OverflowError):
+            return None
+
+    packet = [c for c in rollup if c.get("__typename") == "CheckRun"
+              and c.get("workflowName") == "paquet"
+              and (c.get("name") == "couverture (PR ouverte sur cette tête)"
+                   or (c.get("name") or "").startswith("suite complète du paquet / "))]
+    if not packet or not any(c.get("conclusion") == "CANCELLED" for c in packet):
+        return rollup
+    ends = [finished(c) for c in packet]
+    if any(end is None for end in ends):
+        return rollup
+    aggregate = [c for c in rollup if c.get("__typename") == "CheckRun"
+                 and c.get("workflowName") == "tests" and c.get("name") == "tests"]
+    # Ex aequo / dates illisibles de latest_rollup : aucun agrégat ambigu
+    # n'autorise à effacer les résultats de l'autre workflow.
+    if len(aggregate) != 1 or aggregate[0].get("conclusion") != "SUCCESS":
+        return rollup
+    end = finished(aggregate[0])
+    if end is None or end <= max(ends):
+        return rollup
+    return [c for c in rollup if c not in packet]
+
+
 def ci_green(rollup, required=()) -> bool:
     """`statusCheckRollup` d'une PR : vert si au moins un check, et tous
-    terminés sans échec, après sélection des derniers checks (#2524).
+    terminés sans échec, après sélection des derniers checks (#2524) et
+    remplacement d'un portier annulé par la suite de PR réussie (#2876).
     #1748 (a) : chaque préfixe de `required`
     (`required_statuses`) doit en outre être porté par un statut de commit
     (`StatusContext`, jamais un check run, dont le nom est libre) en
     `success` — des checks `skipped` ou `success` seuls ne suffisent plus."""
-    rollup = latest_rollup(rollup)
+    rollup = _replaced_packet_checks(latest_rollup(rollup))
     if not rollup:
         return False
     statuses = [(c.get("context"), c.get("state")) for c in rollup
