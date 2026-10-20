@@ -151,3 +151,30 @@ class StageCommentsTest(unittest.TestCase):
         self.assertEqual(result["counts"]["unchanged"], 1)
         self.assertEqual(result["comments"][0]["event"], "event-7")
         self.assertTrue(all("PATCH" not in a for a in self.gh.writes()))
+
+    def test_external_issue_ref_comments_created_and_rediscovered_mirror(self):
+        self.item["issue_ref"] = "external/requests#42"
+        self.gh.repo(REPO)["issues"] = []
+        self.st.hosts = SimpleNamespace(current=lambda *_: [])
+        self.st.work.issue_feed = lambda *_: [self.item]
+        self.marks = [dict(id=3, kind="frozen", at_ts=3)]
+        with mock.patch.object(pg.storage, "of", return_value=self.st):
+            result = pg.project_lots(self.db, self.gh, "app", REPO)
+            self.assertEqual(result["errors"], [])
+            self.assertEqual([r["event"] for r in result["comments"]],
+                             ["accepted", "milestone-3"])
+            mirror = result["issues"][0]["number"]
+            self.assertTrue(all(r["number"] == mirror for r in result["comments"]))
+            self.assertEqual(self.item["issue_ref"], "external/requests#42")
+            self.events = [dict(id=7, state="blocked", created_ts=4,
+                                note="Public status: Please confirm the contract."), *self.events]
+            result = pg.project_lots(self.db, self.gh, "app", REPO)
+            self.assertEqual(result["errors"], [])
+            self.assertEqual(result["counts"]["unchanged"], 1)
+            self.assertEqual([(r["number"], r["event"]) for r in result["comments"]],
+                             [(mirror, "event-7")])
+            self.assertEqual(self.item["issue_ref"], "external/requests#42")
+            self.gh.reset_calls()
+            self.assertEqual(pg.project_lots(self.db, self.gh, "app", REPO)["comments"], [])
+            self.assertEqual(self.gh.writes(), [])
+        self.assertEqual(set(self.gh.state["repos"]), {REPO})

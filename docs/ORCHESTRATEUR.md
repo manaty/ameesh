@@ -652,6 +652,8 @@ transitions, même si plusieurs étapes ont eu lieu entre deux passages ; elle
 relit les commentaires GitHub pour éviter un second envoi après une panne.
 Les commentaires portent `<!-- ameesh:work-stage:v1 … -->`, que la veille
 GitHub ignore. Ne pas retirer ce marqueur.
+Ils suivent le ticket miroir sélectionné dans le dépôt du projet, même si
+`issue_ref` conserve la référence d'origine dans un autre dépôt ou outil.
 
 Pour préciser ce qui est attendu du demandeur, écrire dans la **note de la
 transition** bloquée/en attente une ligne `Public status: …` limitée aux

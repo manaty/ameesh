@@ -119,9 +119,8 @@ def project(db, st, gh_repo, report, mine, *, guard, refused, project, closings)
         if (not number or lot in refused or entry.get("error")
                 or entry.get("action") in ("refused", "deferred")):
             continue
-        ref = plan_github._ref_parts(item.get("issue_ref"))
-        if ref and (ref[0].casefold(), ref[1]) != (gh_repo.repo.casefold(), number):
-            continue
+        # project_lots selected this mirror. An external issue_ref is kept as
+        # the request's origin; it need not point at the projected issue.
         try:
             candidates = list(stages(item, st.work.milestones(lot, None),
                                      st.work.events(lot, None), receipts=receipts.get(lot, ()),
