@@ -1761,21 +1761,28 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     # seulement l'assigné courant.
     gate_authors = {}
     if required_verdicts(klass) > 0:
-        # La marque de dispense est relue par la porte après les jalons
-        # (#2281) : on lit donc les auteurs même si la copie courante porte
-        # une dispense, pour qu'une marque périmée ne laisse pas la porte sur
-        # le seul assigné (#1515).
-        try:
-            authors, families = _complete_authors(
-                db, row, tip, where, target, target_repo=repo,
-                queue=(where != repo), klass=klass, marks=marks)
-        except _ProvenanceError as exc:
-            raise QueueError(
-                "lot #%d: the complete authors of the lot cannot be established "
-                "(%s), so no verdict can be proven independent (canon §2)"
-                % (lot, exc)) from exc
-        gate_authors = {"authors": authors, "families": families,
-                        "authors_complete": True}
+        # #2803/#2766 (B cx1) : sur un véhicule de paquet, la porte borne
+        # elle-même la lecture au delta propre relu (`packet_reviews.need`).
+        # Pré-lire toute la plage du paquet agrège les familles des membres
+        # déjà relus et peut lever « famille ambiguë » avant que le périmètre
+        # ne soit déterminé : la lecture est reportée à la porte, qui la borne.
+        from . import packet_reviews
+        if not packet_reviews.is_vehicle(row):
+            # La marque de dispense est relue par la porte après les jalons
+            # (#2281) : on lit donc les auteurs même si la copie courante porte
+            # une dispense, pour qu'une marque périmée ne laisse pas la porte sur
+            # le seul assigné (#1515).
+            try:
+                authors, families = _complete_authors(
+                    db, row, tip, where, target, target_repo=repo,
+                    queue=(where != repo), klass=klass, marks=marks)
+            except _ProvenanceError as exc:
+                raise QueueError(
+                    "lot #%d: the complete authors of the lot cannot be established "
+                    "(%s), so no verdict can be proven independent (canon §2)"
+                    % (lot, exc)) from exc
+            gate_authors = {"authors": authors, "families": families,
+                            "authors_complete": True}
     gate = review_gate(db, marks, tip, repo=where, klass=klass, item=row,
                        cfg=cfg, target=fresh_target, **gate_authors)
     if not gate["ok"]:

@@ -539,10 +539,16 @@ class ReadyTest(unittest.TestCase):
                   authors=None):
         # #1515 : les auteurs complets sont lus par la porte du feu ; ici on
         # simule cette lecture, la provenance réelle est éprouvée à part.
+        # La liste est **complète** (`authors_complete=True`, #1515/cx2) : elle
+        # doit nommer la référence, sinon la porte conclut à juste titre qu'elle
+        # n'a rien écrit. Par défaut : l'assigné, comme en production.
+        if authors is None:
+            authors = [{"name": self.ROW["assignee"],
+                        "family": FAM.get(self.ROW["assignee"], "")}]
         with mock.patch.object(fire.lot_class, "of_lot", return_value=klass), \
                 mock.patch.object(merge_queue, "actor_family", side_effect=_family), \
                 mock.patch.object(merge_queue, "_complete_authors",
-                                  return_value=(list(authors or []), ())):
+                                  return_value=(list(authors), ())):
             return fire.ready_verdicts(None, object(), self.ROW, marks, repo=repo,
                                        project=project, target=target)
 
@@ -561,6 +567,28 @@ class ReadyTest(unittest.TestCase):
         good = _marks(_mark("frozen", A), _verdict("rev1"))
         ok, why, _ = self._verdicts(good, klass)
         self.assertTrue(ok, why)
+
+    def test_a_vehicle_does_not_pre_read_the_whole_packet_range(self):
+        # B cx1 (#2803/#2766) : sur un véhicule, la lecture préalable de toute
+        # la plage du paquet agrège les familles des membres déjà relus et peut
+        # lever « ambiguïté » avant que la porte ne borne au delta propre. La
+        # prélecture est donc réservée aux lots simples ; la porte lit le
+        # véhicule elle-même.
+        klass = {"class": "sensitive", "doubt": False, "files": [
+            {"path": "docs/x.md", "class": "sensitive", "rule": ["docs/**"]}]}
+        with mock.patch.object(fire.lot_class, "of_lot", return_value=klass), \
+                mock.patch.object(merge_queue, "actor_family", side_effect=_family), \
+                mock.patch("ameesh.packet_reviews.is_vehicle", return_value=True), \
+                mock.patch("ameesh.review_lot.compiled_families",
+                           return_value=("claude", "codex", "deepseek")), \
+                mock.patch.object(merge_queue, "_complete_authors",
+                                  side_effect=AssertionError(
+                                      "the packet range must not be pre-read")):
+            ok, why, _ = fire.ready_verdicts(None, object(), self.ROW,
+                                            _marks(_mark("frozen", A)),
+                                            repo=None, project=None, target="main")
+        self.assertFalse(ok)
+        self.assertIn("independent review", why)
 
     def test_a_corrector_author_does_not_review_his_own_work(self):
         # #1515 N1 : les auteurs du delta sont lus avant la porte ; le

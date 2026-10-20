@@ -136,8 +136,15 @@ class _Base(unittest.TestCase):
                 # (test_1374_fire, test_2739_review_correction).
                 # #2808 : None = plage non lue ; (None, []) serait une lecture
                 # vide, qui ne prouve plus le titulaire auteur.
+                # #1515/cx2 : la liste rendue est **complète**
+                # (`authors_complete=True`) : elle nomme l'assigné, sinon la
+                # porte conclut qu'il n'a rien écrit et refuse faute de famille.
                 mock.patch.object(merge_queue, "_complete_authors",
-                                  return_value=([], ())),
+                                  side_effect=lambda db, item, *a, **kw: (
+                                      [{"name": item.get("assignee"),
+                                        "family": self.FAMILIES.get(
+                                            str(item.get("assignee") or ""), "")}],
+                                      ())),
                 mock.patch.object(merge_queue, "_attribution_on_freeze",
                                   return_value=None)):
             patch.start()
