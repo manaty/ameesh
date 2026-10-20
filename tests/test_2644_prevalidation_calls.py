@@ -60,6 +60,7 @@ class Repo:
         self.write("README", "base\n")
         self.base = self.commit("base")
         self.write("scripts/test-plan.py", script if script is not None else PLAN_SCRIPT)
+        self.write("scripts/test-parts.py", "# lanceur factice (#2794)\n")
         self.write("data.txt", "head\n")
         self.head = self.commit("head")
 
@@ -272,6 +273,69 @@ class RunTest(unittest.TestCase):
             got = self.call(lambda **kw: report(), database=fake_db)
         # `run` ne lève pas : le run réel reste la preuve.
         self.assertTrue(got["ok"])
+
+
+class ToolingTest(unittest.TestCase):
+    """#2794 : un dépôt sans le plan ni le lanceur d'ameesh (nexlink) est
+    refusé nommément avant tout arbre, carte ou hôte."""
+
+    def setUp(self):
+        self.repo = Repo()
+        self.addCleanup(self.repo.cleanup)
+
+    def parameters(self):
+        return calls.Parameters(params=params(), repo="/canon", commit="c" * 40,
+                                project="nexlink")
+
+    def test_an_ameesh_tree_is_tooled(self):
+        calls.tooling(self.repo.root, self.repo.head, self.parameters())
+
+    def test_a_tree_without_the_plan_script_is_tooling_missing(self):
+        git(self.repo.root, "rm", "-q", "scripts/test-plan.py", "scripts/test-parts.py")
+        head = self.repo.commit("nexlink-like")
+        with self.assertRaises(pv.PrevalidationError) as caught:
+            calls.tooling(self.repo.root, head, self.parameters())
+        self.assertEqual(caught.exception.cause, "tooling-missing")
+        self.assertIn("tooling-missing", pv.CAUSES)
+        self.assertIn("scripts/test-plan.py", caught.exception.why)
+        self.assertIn("scripts/test-parts.py", caught.exception.why)
+        self.assertIn("nexlink", caught.exception.why)
+
+    def test_the_declared_launcher_is_the_one_checked(self):
+        block = replace(params(), parts_script="tools/parts.py")
+        with self.assertRaises(pv.PrevalidationError) as caught:
+            calls.tooling(self.repo.root, self.repo.head, calls.Parameters(
+                params=block, repo="/canon", commit="c" * 40, project="x"))
+        self.assertIn("tools/parts.py", caught.exception.why)
+        self.assertNotIn("test-plan.py", caught.exception.why)
+
+    def test_an_unknown_head_is_left_to_prepare(self):
+        calls.tooling(self.repo.root, "f" * 40, self.parameters())
+        calls.tooling("/nonexistent-2794", "f" * 40, self.parameters())
+
+    def test_run_refuses_before_any_map_or_tree(self):
+        git(self.repo.root, "rm", "-q", "scripts/test-plan.py")
+        head = self.repo.commit("sans plan")
+        with mock.patch.object(calls, "parameters", return_value=self.parameters()), \
+                mock.patch.object(calls, "map_for") as map_for, \
+                mock.patch.object(calls, "prepare") as prepare:
+            with self.assertRaises(pv.PrevalidationError) as caught:
+                calls.run(None, None, 2794, repo=self.repo.root, head=head,
+                          base=self.repo.base, project="nexlink")
+        self.assertEqual(caught.exception.cause, "tooling-missing")
+        map_for.assert_not_called()
+        prepare.assert_not_called()
+
+    def test_the_train_says_tooling_missing_unavailable(self):
+        git(self.repo.root, "rm", "-q", "scripts/test-plan.py")
+        head = self.repo.commit("sans plan")
+        with mock.patch.object(calls, "parameters", return_value=self.parameters()), \
+                mock.patch.object(calls, "map_for") as map_for:
+            got = calls.gate_train(None, repo=self.repo.root, head=head,
+                                   base=self.repo.base, project="nexlink")
+        self.assertEqual(got["state"], "unavailable")
+        self.assertEqual(got["cause"], "tooling-missing")
+        map_for.assert_not_called()
 
 
 class FreezeTest(unittest.TestCase):
