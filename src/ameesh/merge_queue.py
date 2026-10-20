@@ -427,8 +427,8 @@ def _corrections_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
 
 def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 item=None, families=None, required=None, family_of=None,
-                authors=None, cfg=None, project=None, target=None,
-                vehicle=None, exclude_author_family=None,
+                authors=None, authors_complete=False, cfg=None, project=None,
+                target=None, vehicle=None, exclude_author_family=None,
                 distinct_families=None) -> dict:
     """Les avis requis sur la tête gelée `frozen`, et eux seuls (#1374).
 
@@ -461,6 +461,15 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     reste celle de la trace du gel (`family_of`) : le reçu d'un autre commit du
     même nom ne la remplace pas. Sans `authors`, la porte garde son
     comportement historique : seul l'assigné est connu.
+
+    #2808 : l'assigné **titulaire** n'est auteur que s'il a écrit un commit de
+    la plage gelée. Quand la porte lit la plage, son nom absent des auteurs
+    lus le laisse hors des auteurs ; `authors_complete=True` dit la même chose
+    d'une liste lue par l'appelant (le train lit la plage exacte et refuse un
+    auteur inconnu). Sans cette preuve, la porte garde la référence — une
+    liste partielle ne prouve pas l'absence d'écriture, et l'indépendance ne se
+    suppose jamais. Un titulaire sans commit ne ferme donc plus sa famille ;
+    s'il a écrit, sa famille reste exclue avec la famille de son gel.
 
     `family_of` (#2681) est la source historique de famille du train : le même
     code de porte, mais les familles des reçus/tours à la date des faits au
@@ -680,6 +689,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     # #2803 : la lecture a établi les auteurs du seul delta relu. Sans elle
     # (pas de dépôt ou de ligne), la porte garde la référence historique.
     exact = vehicle_delta and attribution is not None
+    range_authors: list = []
     if attribution is not None:
         range_authors, range_correctors = attribution
         if authors is None or exact:
@@ -688,13 +698,29 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                        for row in range_correctors or ()
                        if str((row or {}).get("name") or "").strip()}
     out["corrections"] = sorted(corrections)
-    # #2681 : les auteurs **reconnus** de la tête, quand l'appelant les a lus
-    # (`review_authors.authors`). L'assigné historique passé dans `item` en
-    # fait toujours partie ; un tiers avec reçu exact ou un correcteur au-delà
-    # du seuil du §2 s'y ajoute. Un petit correctif de relecteur n'y est pas
-    # (#2638) : sa famille reste éligible.
+
+    def _author_names(rows) -> set:
+        return {str((row or {}).get("name") or "").strip().lower()
+                if isinstance(row, Mapping) else str(row or "").strip().lower()
+                for row in rows or ()}
+
+    # #2808 : le titulaire n'est auteur que s'il a écrit un commit de la plage.
+    # La lecture de la plage (ou une liste que l'appelant déclare complète et
+    # exacte, le train) dit s'il a écrit ; sans aucune preuve, il reste la
+    # référence (direction stricte : l'indépendance ne se suppose jamais).
+    if attribution is not None:
+        reference_is_author = bool(author) and author.lower() in _author_names(
+            range_authors)
+    elif authors is not None and authors_complete:
+        reference_is_author = bool(author) and author.lower() in _author_names(authors)
+    else:
+        reference_is_author = True
+    # #2681/#2808 : les auteurs **reconnus** de la tête, quand l'appelant les a
+    # lus (`review_authors.authors`). Un tiers avec reçu exact ou un correcteur
+    # au-delà du seuil du §2 s'y ajoute. Un petit correctif de relecteur n'y est
+    # pas (#2638) : sa famille reste éligible.
     recognized: dict = {}
-    if author and not exact:
+    if author and not exact and reference_is_author:
         recognized[author.lower()] = {"name": author, "family": author_family}
     for entry in authors or ():
         if isinstance(entry, Mapping):
@@ -706,11 +732,13 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             continue
         key = name.lower()
         if author and key == author.lower() and not exact:
-            # La référence (l'assigné historique) est déjà reconnue, avec la
-            # famille de la trace du gel (`family_of`) : le reçu d'un autre
-            # commit du même nom ne prouve pas sa famille au gel. Sur un
-            # véhicule dont le delta est lu (#2803), l'assigné n'est pas une
-            # référence : seul un reçu de commit le nomme auteur.
+            # La référence est déjà reconnue, avec la famille de la trace du
+            # gel (`family_of`) : le reçu d'un autre commit du même nom ne
+            # prouve pas sa famille au gel. Quand la lecture a établi qu'elle
+            # n'a rien écrit (#2808), elle ne se réintroduit pas par une liste
+            # d'appelant. Sur un véhicule dont le delta est lu (#2803),
+            # l'assigné n'est pas une référence : seul un reçu de commit le
+            # nomme auteur.
             continue
         if not family:
             try:
