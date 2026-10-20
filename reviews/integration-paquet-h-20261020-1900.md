@@ -2,7 +2,8 @@
 
 Base : `main` **`74db4b425c728`** (fusion du paquet h-1700, PR #2204, 20/10
 19:10 Paris). Branche `integration/paquet-h-20261020-1900`, cible `main`, lot
-porteur #2887. Une seule suite complète est demandée sur la tête finale.
+porteur #2887, PR #2207. Une seule suite complète est demandée sur la tête
+finale.
 
 Composeur : mty-amh-impl-01 (bureau 17:24Z ; pilote mesh-design informé).
 
