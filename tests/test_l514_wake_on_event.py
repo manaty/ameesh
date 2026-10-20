@@ -328,7 +328,7 @@ class DoctorHooksTest(unittest.TestCase):
         self.assertFalse(out["ok"])
         texte = "\n".join(out["lines"])
         self.assertIn(missing, texte)
-        self.assertIn("127", texte)
+        self.assertIn("exits 127", texte)
 
     def test_hook_binaire_sous_home_variable_est_trouve(self):
         """Incident staging b9a2 (16/10) : un hook écrit `$HOME/.local/bin/
@@ -343,7 +343,11 @@ class DoctorHooksTest(unittest.TestCase):
                                                   "Stop": command}))
                 out = self._lines(home, environ={"HOME": home})
                 self.assertTrue(out["ok"], out["lines"])
-                self.assertNotIn("127", "\n".join(out["lines"]))
+                # Le chemin du fichier de hooks (suffixe temporaire aléatoire)
+                # peut lui-même contenir « 127 » : le témoin porte sur le
+                # message du doctor, pas sur un nombre libre dans la sortie
+                # (#2891, CI paquet 39490886347).
+                self.assertNotIn("exits 127", "\n".join(out["lines"]))
 
     def test_hook_binaire_sous_home_variable_absent_reste_ko(self):
         """La variable développée vers un chemin absent reste un KO : la
@@ -353,7 +357,7 @@ class DoctorHooksTest(unittest.TestCase):
             {"PostToolUse": "$HOME/.local/bin/missing-agent-mail hook deepseek"}))
         out = self._lines(home, environ={"HOME": home})
         self.assertFalse(out["ok"])
-        self.assertIn("127", "\n".join(out["lines"]))
+        self.assertIn("exits 127", "\n".join(out["lines"]))
 
     def test_dollar_litteral_absent_ne_devient_pas_un_hook_present(self):
         home = self._home(binary=True, rel=".local/bin/agent-mail")
@@ -366,7 +370,7 @@ class DoctorHooksTest(unittest.TestCase):
                 self._write(home, self._document({"PostToolUse": word + " hook deepseek"}))
                 out = self._lines(home, environ={"HOME": home})
                 self.assertFalse(out["ok"], out["lines"])
-                self.assertIn("127", "\n".join(out["lines"]))
+                self.assertIn("exits 127", "\n".join(out["lines"]))
 
     def test_variable_dont_le_nom_commence_par_un_chiffre(self):
         """#1981/N2 : `$1abc` vaut `$1` puis `abc` (le shell), pas la variable
@@ -438,7 +442,7 @@ class DoctorHooksTest(unittest.TestCase):
         self.assertFalse(out["ok"])
         texte = "\n".join(out["lines"])
         self.assertIn("systemd manager PATH", texte)
-        self.assertIn("127", texte)
+        self.assertIn("exits 127", texte)
 
     def test_binary_visible_seulement_sous_le_gestionnaire_est_ko(self):
         """#1395 (avis bloquant cx2) : la présence sous le gestionnaire ne
@@ -452,7 +456,7 @@ class DoctorHooksTest(unittest.TestCase):
         self.assertFalse(out["ok"], out["lines"])
         texte = "\n".join(out["lines"])
         self.assertIn("this session's PATH", texte)
-        self.assertIn("127", texte)
+        self.assertIn("exits 127", texte)
 
     def test_binary_visible_dans_les_deux_contextes_est_ok(self):
         home = self._home(binary=True)
