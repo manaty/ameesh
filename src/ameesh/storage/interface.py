@@ -3563,6 +3563,13 @@ class HostResources(Domain):
         oldest first (the pilot report)."""
 
     @abc.abstractmethod
+    def disk_history(self, host: str, since_s: float) -> list[dict]:
+        """#2851: the disk fields of the host's readings over the last
+        `since_s` seconds, oldest first (`id`, `sampled_ts`, `volumes`,
+        `disk_path`, `disk_free_bytes` only) — the disk trend does not pay for
+        the ~50 columns of `since` on thousands of readings."""
+
+    @abc.abstractmethod
     def record_harness_version(self, host: str, harness: str, *, path: str | None,
                                version: str | None, raw: str | None) -> None:
         """L120: the last version read of `harness` on `host` (one row per
@@ -3727,10 +3734,21 @@ class Housekeeping(Domain):
         dans les bilans), les plus récentes d'abord ; instant en `at_ts`."""
 
     @abc.abstractmethod
-    def latest_by_path(self, host: str | None, kind: str) -> list[dict]:
+    def latest_by_path(self, host: str | None, kind: str,
+                       *, since_s: float | None = None) -> list[dict]:
         """#222: the last line of each (host, path) of this `kind` (of the host
-        if given), with no time window nor limit: only the retention of the
-        log bounds it."""
+        if given). Without `since_s`, no time window nor limit: only the
+        retention of the log bounds it; with it (#2851), the lines older than
+        `since_s` seconds are left out — a caller that ignores them anyway
+        does not sort the whole journal."""
+
+    @abc.abstractmethod
+    def action_lines(self, host: str | None, kind: str,
+                     actions: Sequence[str]) -> list[dict]:
+        """#2851: the lines of `kind` whose `action` is one of `actions` (of
+        the host if given), newest first. The caller keeps the latest per path
+        itself: these actions are rare (a few lines), so filtering them in SQL
+        avoids sorting the whole journal just to discard it."""
 
     @abc.abstractmethod
     def summary(self, host: str | None, since_s: float) -> list[dict]:

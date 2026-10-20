@@ -72,15 +72,35 @@ class Housekeeping(interface.Housekeeping):
             " ORDER BY at DESC, id DESC LIMIT %s", tuple(params))
         return [_data(dict(r)) for r in rows]
 
-    def latest_by_path(self, host, kind) -> list[dict]:
+    def latest_by_path(self, host, kind, *, since_s=None) -> list[dict]:
         where, params = "", [kind]
         if host:
             where = " AND host = %s"
             params.append(host)
+        if since_s is not None:
+            # #2851 : une alerte qui ignore de toute façon les lignes plus
+            # vieilles ne doit pas trier tout le journal de rétention.
+            where += " AND at >= now() - make_interval(secs => %s)"
+            params.append(float(since_s))
         rows = self.db.query(
             "SELECT DISTINCT ON (host, path) " + LOG_COLUMNS + " FROM housekeeping_log"
             " WHERE kind = %s" + where +
             " ORDER BY host, path, at DESC, id DESC", tuple(params))
+        return [_data(dict(r)) for r in rows]
+
+    def action_lines(self, host, kind, actions) -> list[dict]:
+        actions = [str(action) for action in actions or ()]
+        if not actions:
+            return []
+        where, params = "", [kind, *actions]
+        if host:
+            where = " AND host = %s"
+            params.append(host)
+        marks = ", ".join(["%s"] * len(actions))
+        rows = self.db.query(
+            "SELECT " + LOG_COLUMNS + " FROM housekeeping_log"
+            " WHERE kind = %s AND action IN (" + marks + ")" + where +
+            " ORDER BY at DESC, id DESC", tuple(params))
         return [_data(dict(r)) for r in rows]
 
     def summary(self, host, since_s) -> list[dict]:

@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 
 from . import planned_waits
 from . import storage
@@ -136,6 +137,60 @@ def _commit(repo: str, rev: str, *, timeout: float | None = None) -> str | None:
     bound = {} if timeout is None else {"timeout": timeout}
     proc = _git(repo, "rev-parse", "--verify", "--quiet", rev + "^{commit}",
                 env_extra=NO_LAZY_FETCH, **bound)
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.decode("utf-8", "replace").strip()
+
+
+#: #2851 : une sonde de présence de commit reste locale. Dans un clone partiel,
+#: `rev-parse <absent>^{commit}` lance un fetch paresseux du promisor — mesuré
+#: ~10 s vers GitHub, et `GIT_NO_LAZY_FETCH` ne l'empêche pas avec git 2.43.
+#: La borne couvre une lecture d'objets locaux ; un dépassement rend None.
+PROBE_TIMEOUT_S = 2.0
+
+
+def local_commit(repo: str, rev: str, *,
+                 timeout: float | None = PROBE_TIMEOUT_S) -> str | None:
+    """`rev` résolu en commit complet **depuis les objets locaux** de `repo`.
+
+    Sert aux sondes de présence qui balaient des clones d'autres projets
+    (#2851 : le dépôt d'un gel, `lot_class.repo_for_freeze`) : elles ne
+    doivent jamais réveiller le réseau. La résolution se fait dans un dépôt
+    git vide, sans remote ni promisor, dont le magasin d'objets est celui de
+    `repo` (`GIT_OBJECT_DIRECTORY`) : un commit absent — le cas d'un clone
+    partiel qui n'a pas la branche — échoue en quelques millisecondes au lieu
+    de lancer un fetch. Le commit présent se résout comme d'habitude, y
+    compris à travers `objects/info/alternates`.
+
+    Une ref non-SHA (`HEAD`, une branche) n'a pas de sens dans un magasin sans
+    refs : on retombe sur `_commit`, borné. Lecture seule, jamais de fetch."""
+    rev = str(rev or "").strip()
+    if not rev or rev.startswith("-"):
+        return None
+    if not commit_id(rev):
+        return _commit(repo, rev, timeout=timeout)
+    try:
+        objects = _out(repo, "rev-parse", "--git-path", "objects")
+    except Exception:  # noqa: BLE001 - dépôt illisible : la piste est écartée
+        return None
+    if not objects:
+        return None
+    objects = os.path.realpath(os.path.join(repo, objects))
+    bound = {} if timeout is None else {"timeout": timeout}
+    try:
+        with tempfile.TemporaryDirectory(prefix="ameesh-objets-") as gitdir:
+            # sans GIT_DIR, `git init --bare` prend le dossier courant
+            init = _git(gitdir, "init", "--quiet", "--bare")
+            if init.returncode != 0:
+                return None
+            proc = _git(gitdir, "rev-parse", "--verify", "--quiet",
+                        rev + "^{commit}", env_extra={
+                            "GIT_DIR": gitdir,
+                            "GIT_OBJECT_DIRECTORY": objects,
+                            "GIT_ALTERNATE_OBJECT_DIRECTORIES": objects,
+                            **NO_LAZY_FETCH}, **bound)
+    except (GitError, OSError):
+        return None
     if proc.returncode != 0:
         return None
     return proc.stdout.decode("utf-8", "replace").strip()
