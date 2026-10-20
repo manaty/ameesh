@@ -20,7 +20,10 @@ The reading is the **raw** pace (canon §7, #1606 point 6):
 
 The value passed to the selection is the **advance** in points,
 `used_at − held_cap`: positive means the family has consumed more than its
-pace allows (ahead), negative means it is behind. Within an account the
+pace allows (ahead), negative means it is behind. The plan is read on the
+**plan horizon**, the longest applicable window (the weekly `seven_day` in
+practice): a short `five_hour` burst is a capacity signal, not the weekly
+plan, and must not outweigh the weekly gap (#2675). Within that horizon the
 binding window is the one with the largest advance; across the accounts of a
 family the reading is the **most constrained current account** (the largest
 advance): a fresh sibling does not hide the plan that is ahead. An account is
@@ -115,17 +118,22 @@ def account_advance(gauges: Sequence[cost.Gauge], *, now: float,
                     model: str = "") -> Optional[float]:
     """The raw advance of one account for `model`, or None when it is stale.
 
-    It is `used_at − held_cap` on the **binding window** (the largest advance)
-    of the applicable gauges (`_applicable`), with the nominal multiplier and
-    the default ceiling; the reserve of the critical agents
+    It is `used_at − held_cap` on the **plan horizon** — the longest
+    applicable window, so a `five_hour` burst never becomes the weekly plan
+    (#2675) — and within that horizon on the **binding window** (the largest
+    advance). Staleness still reads all the applicable windows: a reset short
+    window keeps the reading neutral (#1561). The nominal multiplier and the
+    default ceiling apply; the reserve of the critical agents
     (`accounts.RESERVE`) is the only deduction. The same scale applies to
     every family, whatever its declared profile says.
     """
     gauges = _applicable(gauges, model)
     if not gauges or cost.stale_reading(gauges, now):
         return None
+    horizon = max(gauge.window_s for gauge in gauges)
+    plan = [gauge for gauge in gauges if gauge.window_s == horizon]
     advances = [gauge.used_at(now) - gauge.held_cap(now, accounts.RESERVE)
-                for gauge in gauges]
+                for gauge in plan]
     return max(advances) if advances else None
 
 
@@ -135,7 +143,9 @@ def family_advances(rows, *, now: float) -> dict:
     `rows` are the gauge-history rows (`operations.latest_gauges`). A harness
     that has named account readings drops its anonymous ones, like
     `sous_utilisation.latest_account_gauges`: they are the default account,
-    already counted. For each scope a family carries, its value is the
+    already counted. Each account's advance is read on its plan horizon (the
+    longest window, #2675), so a short burst does not lift a family. For each
+    scope a family carries, its value is the
     **largest** current advance over its accounts (the most constrained one):
     `""` for the general windows, `<scope>` for a model-scoped bucket added to
     the general ones. An account with a stale reading is ignored; a family
