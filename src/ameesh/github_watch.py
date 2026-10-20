@@ -245,7 +245,7 @@ def deliver(db, sub, events, until, feed, host, *, partial=False, scan_before=No
         if not partial or scan_after is None:
             st.github_watch.advance(sub.project, sub.repo, until)
     for record in after_commit:
-        record()
+        record(db.cfg, db)
     return count
 
 

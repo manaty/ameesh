@@ -11,7 +11,7 @@ from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 from ameesh import db as db_mod
-from ameesh import github_watch as watch, mail, notify, plan_github, registry, storage
+from ameesh import github_watch as watch, fil, mail, notify, plan_github, registry, storage
 from .support import PgTestCase
 
 SUB = watch.Subscription("app", "acme/app", "watcher", 900)
@@ -326,6 +326,20 @@ class DeliveryTest(PgTestCase):
         self.assertEqual(len(self.messages()), 3)
         self.assertEqual(self.messages()[-1]["payload"]["github_watch"]["issue_ref"], "acme/app#1")
         self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW + 1802)
+
+    def test_committed_mail_is_written_and_indexed_in_the_thread(self):
+        self.watcher(Api([issue()], [comment()])).tick(self.db, NOW)
+        messages = self.messages()
+        self.assertEqual(len(messages), 2)
+        transport = fil.transport_for(self.db.cfg)
+        entries = [entry for thread in transport.threads()
+                   for entry in transport.read(thread)
+                   if "GitHub watch" in entry.text]
+        self.assertEqual(len(entries), 2)
+        self.assertEqual({mid for entry in entries for mid in entry.meta["ids"]},
+                         {int(message["id"]) for message in messages})
+        indexed = storage.of(self.db).threads.indexed()
+        self.assertTrue(indexed)
 
     def test_delivery_failure_rolls_back_cursor_events_and_all_messages(self):
         api = Api([issue()], [comment()])
