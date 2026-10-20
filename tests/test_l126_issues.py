@@ -423,21 +423,22 @@ class LotIssuesTest(_Base):
         merged = self.issue(PUBLIC, "Fusionné")
         self.assertEqual((merged["state"], merged["state_reason"]), ("closed", "completed"))
         self.assertIn("ameesh:merged", merged["labels"])
-        self.assertEqual(self.comments(PUBLIC, merged["number"]),
-                         ["Work item %d merged by PR #9: issue closed by ameesh." % a["id"]])
+        self.assertIn("Accepted.", self.comments(PUBLIC, merged["number"])[0])
+        self.assertIn("Merged;", self.comments(PUBLIC, merged["number"])[1])
+        self.assertNotIn("Delivered in release", "\n".join(self.comments(PUBLIC, merged["number"])))
         replaced = self.issue(PUBLIC, "Remplacé")
         self.assertEqual((replaced["state"], replaced["state_reason"]), ("closed", "not_planned"))
-        self.assertEqual(self.comments(PUBLIC, replaced["number"]),
-                         ["Work item %d superseded by work item %d (#%d): issue closed by ameesh."
-                          % (b["id"], a["id"], merged["number"])])
+        self.assertIn("Work item %d superseded by work item %d (#%d): issue closed by ameesh."
+                      % (b["id"], a["id"], merged["number"]),
+                      self.comments(PUBLIC, replaced["number"])[-1])
         promoted = self.issue(PUBLIC, "Promu")
         self.assertEqual(promoted["state_reason"], "completed")
-        self.assertIn("delivered", self.comments(PUBLIC, promoted["number"])[0])
+        self.assertIn("Completed;", self.comments(PUBLIC, promoted["number"])[-1])
         # une seule fois
         self.gh.reset_calls()
         self.project()
         self.assertEqual(self.gh.writes(), [])
-        self.assertEqual(len(self.comments(PUBLIC, merged["number"])), 1)
+        self.assertEqual(len(self.comments(PUBLIC, merged["number"])), 2)
 
     def test_titre_refuse_rien_n_est_publie(self):
         a = work.add(self.db, title="Purger /home/bob/cache", app="web")
@@ -559,8 +560,8 @@ class SyncGithubCloseTest(_Base):
         # puis la projection ferme l'issue, avec la PR dans son commentaire
         self.project()
         self.assertEqual(self.issue(PUBLIC, "Export")["state"], "closed")
-        self.assertEqual(self.comments(PUBLIC, number),
-                         ["Work item %d merged by PR #5: issue closed by ameesh." % lot["id"]])
+        self.assertIn("Merged;", self.comments(PUBLIC, number)[-1])
+        self.assertEqual(len(self.comments(PUBLIC, number)), 2)
 
 
 # ==========================================================================

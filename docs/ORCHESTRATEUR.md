@@ -646,6 +646,28 @@ ferme l'issue avec un commentaire qui dit pourquoi. L'issue d'un lot est son
   c'est le lot qu'on change. Garder le marqueur `<!-- ameesh:work=… -->` du
   corps de l'issue, qui la relie au lot.
 
+Les étapes sont aussi commentées sur le ticket : accepté (priorité, cible),
+gelé, fusionné, bloqué ou en attente. La projection relit les jalons et les
+transitions, même si plusieurs étapes ont eu lieu entre deux passages ; elle
+relit les commentaires GitHub pour éviter un second envoi après une panne.
+Les commentaires portent `<!-- ameesh:work-stage:v1 … -->`, que la veille
+GitHub ignore. Ne pas retirer ce marqueur.
+
+Pour préciser ce qui est attendu du demandeur, écrire dans la **note de la
+transition** bloquée/en attente une ligne `Public status: …` limitée aux
+références et au contrat à confirmer. Les autres lignes restent internes.
+Cette ligne passe le contrôle public (secrets, chemins, hôtes, adresses,
+termes exclus), même pour un dépôt privé ; un refus est journalisé sans son
+texte. Sans ligne publiable, le commentaire annonce l'attente et indique que
+l'équipe précisera sur le ticket la décision ou l'information attendue.
+
+« Livré dans la release X, le … » exige le rapport durable de release sous
+`<état>/release/reports/` : tag, lot inclus, succès de staging et attestation
+d'activation du même commit. Un lot fusionné, promu ou clos avec un jalon
+`delivered` ne prouve pas à lui seul une livraison. Sans cette preuve locale,
+la projection n'annonce aucune release livrée. Application de
+`processus/demandes-github.md` du canon (owner, 20/10/2026, #2844).
+
 ## Le courrier qui réveille (L125)
 
 Chaque message qui réveille un agent lui coûte un tour, et chaque tour relit
