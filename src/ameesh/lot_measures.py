@@ -292,7 +292,8 @@ def diff_range(repo: str, sha: str, target: str | None = None) -> tuple[str, str
     return (parents[0] if parents else empty), sha
 
 
-def lot_diff_range(repo: str, sha: str, target: str | None = None) -> tuple[str, str] | None:
+def lot_diff_range(repo: str, sha: str, target: str | None = None,
+                   frozen: str | None = None) -> tuple[str, str] | None:
     """The (base, head) of the **lot's own** change brought by `sha` (#2374).
 
     `diff_range` reads what the merge made enter the target: a merge whose tree
@@ -304,14 +305,32 @@ def lot_diff_range(repo: str, sha: str, target: str | None = None) -> tuple[str,
     The lot's delta is `merge-base(first parent, lot head)..lot head`: the
     commit the merge brought in (its second parent), or `sha` itself when the
     merge record is the branch tip. None without a merge commit to anchor it —
-    never a guess."""
+    never a guess.
+
+    `frozen` (#2702) : le gel du lot, quand il est connu. Une fusion de paquet
+    porte plusieurs lots : son deuxième parent est la pointe du paquet, pas
+    celle du lot, et le diff du merge couvre tout le paquet. Le gel donne la
+    tête du lot (`merge-base(premier parent, gel)..gel`), soit la même lecture
+    que le gel d'avant fusion ; sans gel porté par la fusion, le deuxième
+    parent reste la tête lue (#2374).
+
+    Une cible locale périmée (#2702) ne porte pas `sha` : le repli
+    `merge-base(cible, sha)..sha` emporterait tout l'historique entre les deux.
+    La cible par défaut du dépôt (`origin/HEAD`) est donc essayée quand elle
+    porte `sha`."""
     if not has_commit(repo, sha):
         return None
     merge = ""
-    if len(_parents(repo, sha)) >= 2:
+    # A frozen lot may itself merge main for realignment. Its second parent
+    # is then main, not the lot: find the later integration merge instead.
+    if sha != (frozen or "").strip() and len(_parents(repo, sha)) >= 2:
         merge = sha
     else:
         tgt = _target(repo, target)
+        if tgt and not _is_ancestor(repo, sha, tgt):
+            alt = _target(repo, None)
+            if alt and alt != tgt and _is_ancestor(repo, sha, alt):
+                tgt = alt
         if tgt and _is_ancestor(repo, sha, tgt):
             merges = (_git(repo, "rev-list", "--ancestry-path", "--merges", "--reverse",
                            "%s..%s" % (sha, tgt), env_extra=NO_LAZY_FETCH) or "").split()
@@ -323,6 +342,14 @@ def lot_diff_range(repo: str, sha: str, target: str | None = None) -> tuple[str,
     parents = _parents(repo, merge) if merge else []
     if len(parents) < 2:
         return None
+    head = (frozen or "").strip()
+    if head and (head == merge or not _is_ancestor(repo, head, merge)):
+        head = ""
+    if head:
+        base = (_git(repo, "merge-base", parents[0], head,
+                     env_extra=NO_LAZY_FETCH) or "").strip()
+        if base and base != head:
+            return base, head
     base = (_git(repo, "merge-base", parents[0], parents[1],
                  env_extra=NO_LAZY_FETCH) or "").strip()
     return (base or parents[0], parents[1])
