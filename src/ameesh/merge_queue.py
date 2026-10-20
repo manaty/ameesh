@@ -374,7 +374,8 @@ def _waiver(db, item) -> tuple:
     return waived, waived_by, row
 
 
-def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=None):
+def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=None,
+                           commits=None):
     """Les auteurs et correcteurs de la tête gelée (#2681/#2739/#2726).
 
     Lecture des commits exacts de la plage gelée et de leur provenance, la même
@@ -385,10 +386,16 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
     la porte garde alors son comportement historique. Lève quand une lecture
     était possible et a échoué : une porte qui ne peut pas prouver qui a écrit
     la tête ne compte pas un avis non prouvé (l'indépendance ne se suppose pas).
+
+    #2803 : `commits` est la liste déjà calculée du delta propre d'un véhicule
+    (`packet_reviews.need`) ; la lecture porte alors sur ce seul contenu relu,
+    et `base` n'est plus nécessaire.
     """
     base = str((klass or {}).get("base_sha")
                or (klass or {}).get("target") or "").strip()
-    if db is None or not repo or not base or not item:
+    if db is None or not repo or not item:
+        return None
+    if commits is None and not base:
         return None
     from . import review_designation_activation as act
     freeze = plan_git.latest_freeze(marks or ())
@@ -399,7 +406,8 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
                      "actor": freeze.get("actor") or "",
                      "at_ts": freeze.get("at_ts")}
     authors, unknown, correctors = act.attribution_of_head(
-        db, item, milestone, repo, base, frozen, families=families or ())
+        db, item, milestone, repo, base, frozen, families=families or (),
+        commits=commits)
     if unknown:
         raise ValueError("author provenance unknown for frozen commit(s): %s"
                          % ", ".join(unknown))
@@ -466,6 +474,15 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     `exclude_author_family` et `distinct_families` viennent de l'appelant ou
     sinon de `klass` (drapeaux compilés du canon) : le premier rend la règle
     stricte même à un avis, le second décide de la double famille au compte 2.
+
+    #2803 : quand le véhicule a un delta propre, la porte lit les auteurs et
+    les correcteurs sur **les commits de ce delta** (`vehicle["commits"]`),
+    pas sur toute la plage gelée. Les familles des lots membres, déjà relues
+    sur leur propre tête, ne sont donc pas exclues une seconde fois, et le
+    composeur n'est pas une référence d'office : il ne compte que s'il a
+    écrit un commit de ce delta. Le commit de manifeste est hors delta
+    (`packet_reviews._is_review_free`) ; la lecture le filtre encore par
+    sûreté. Sans delta propre, aucun avis n'est dû (`required == 0`).
 
     #2739 : l'auteur d'un petit correctif de relecteur tenu hors des auteurs
     (#2638) ne relit pas son propre correctif. La porte lit les commits exacts
@@ -567,6 +584,12 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         if vehicle.get("ok") is True and vehicle_required == 0 and cls != lot_class.RELEASE:
             klass = {"class": lot_class.LIGHT, "files": []}
             cls = lot_class.LIGHT
+    # #2803 : le seul contenu que la porte du véhicule relit est son delta
+    # propre (`commits`) ; les membres ont leurs avis sur leur propre tête.
+    own_commits = [str(sha).strip() for sha in (vehicle or {}).get("commits") or ()
+                   if str(sha).strip()]
+    vehicle_delta = (vehicle is not None and vehicle.get("ok") is None
+                     and bool(own_commits))
     floor = required_verdicts(klass)
     if required is None:
         required = floor
@@ -645,7 +668,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     try:
         attribution = _attribution_on_freeze(db, marks, frozen, repo=repo,
                                              klass=klass, item=item,
-                                             families=families)
+                                             families=families,
+                                             commits=own_commits if vehicle_delta else None)
     except Exception as exc:  # noqa: BLE001 - une plage illisible ne conclut pas
         out["error"] = str(exc)
         out["why"] = ("no review verdict ok on the freeze %s (class: %s): the frozen "
@@ -653,9 +677,12 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                       "reviewer's own correction cannot be excluded (canon §2: "
                       "independence is never assumed)" % (frozen[:12], cls, exc))
         return out
+    # #2803 : la lecture a établi les auteurs du seul delta relu. Sans elle
+    # (pas de dépôt ou de ligne), la porte garde la référence historique.
+    exact = vehicle_delta and attribution is not None
     if attribution is not None:
         range_authors, range_correctors = attribution
-        if authors is None:
+        if authors is None or exact:
             authors = range_authors
         corrections = {str((row or {}).get("name") or "").strip().lower()
                        for row in range_correctors or ()
@@ -667,7 +694,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     # du seuil du §2 s'y ajoute. Un petit correctif de relecteur n'y est pas
     # (#2638) : sa famille reste éligible.
     recognized: dict = {}
-    if author:
+    if author and not exact:
         recognized[author.lower()] = {"name": author, "family": author_family}
     for entry in authors or ():
         if isinstance(entry, Mapping):
@@ -678,10 +705,12 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         if not name:
             continue
         key = name.lower()
-        if author and key == author.lower():
+        if author and key == author.lower() and not exact:
             # La référence (l'assigné historique) est déjà reconnue, avec la
             # famille de la trace du gel (`family_of`) : le reçu d'un autre
-            # commit du même nom ne prouve pas sa famille au gel.
+            # commit du même nom ne prouve pas sa famille au gel. Sur un
+            # véhicule dont le delta est lu (#2803), l'assigné n'est pas une
+            # référence : seul un reçu de commit le nomme auteur.
             continue
         if not family:
             try:
