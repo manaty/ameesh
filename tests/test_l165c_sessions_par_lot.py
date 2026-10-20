@@ -1257,18 +1257,27 @@ class ReveilTest(_Base):
                   wake_ts=time.time() - 1)
         spec = self.pick(worker)
         self.assertEqual(worker._wake_claim["lot"], lot)
-        # le lancement se prépare depuis plus que le bail : le battement passe
-        vieux = "now() - interval '%d seconds'" % (worker.WAKE_CLAIM_TTL + 30)
-        self.db.execute("UPDATE work_items SET wake_claim_at = " + vieux +
-                        " WHERE id = %s", (lot,))
-        worker._wake_claim_renewed = float("-inf")
-        worker._renew_wake_claim()
-        worker._scheduled_wake_checked = float("-inf")
-        self.assertIsNone(worker._scheduled_wake_spec(),
-                          "bail renouvelé : pas de second réveil")
-        worker._turn_launched = True
-        worker._consume_scheduled_wake(spec)
+
+        def preparation_longue(_spec):
+            # le lancement se prépare depuis plus que le bail : le battement
+            # du tour (armé par `run_turn`) renouvelle le claim
+            vieux = "now() - interval '%d seconds'" % (worker.WAKE_CLAIM_TTL + 30)
+            self.db.execute("UPDATE work_items SET wake_claim_at = " + vieux +
+                            " WHERE id = %s", (lot,))
+            worker._wake_claim_renewed = float("-inf")
+            worker._renew_wake_claim()
+            worker._scheduled_wake_checked = float("-inf")
+            self.assertIsNone(worker._scheduled_wake_spec(),
+                              "bail renouvelé : pas de second réveil")
+            worker._turn_launched = True
+            worker._consume_scheduled_wake(spec)
+            return True
+
+        with mock.patch.object(worker, "_run_turn_or_defer",
+                               side_effect=preparation_longue):
+            self.assertTrue(worker.run_turn(spec))
         self.assertIsNone(worker._wake_claim)
+        self.assertFalse(worker._wake_claim_armed)
         delivered = [e for e in work.events(self.db, lot)
                      if e["note"].startswith("wake: scheduled wake delivered")]
         self.assertEqual(len(delivered), 1, "un témoin, celui de la consommation")
@@ -1291,6 +1300,34 @@ class ReveilTest(_Base):
             worker._wake_claim_renewed = float("-inf")
             worker._renew_wake_claim()
         claim.assert_not_called()
+
+    def test_reveil_programme_claim_orphelin_n_est_pas_renouvele(self):
+        """#2614 (prélecture cx3) : un claim obtenu par `pick` dont le tour
+        ne part pas — spec écarté au second contrôle du dossier — n'est pas
+        renouvelé par le battement d'un tour ultérieur : il expire, le
+        réveil revient."""
+        worker = self._worker("r7f")
+        lot = work.add(self.db, title="séance owner", assignee="r7f",
+                       force=_FORCE)["id"]
+        work.note(self.db, lot, "hold: séance owner", actor="r7f",
+                  wake_ts=time.time() - 1)
+        with mock.patch.object(worker, "_lot_workdir_blocked",
+                               side_effect=[False, True]):
+            self.assertIsNone(self.pick(worker),
+                              "le second contrôle écarte le tour")
+        self.assertEqual(worker._wake_claim["lot"], lot,
+                         "le claim reste posé : aucun tour ne l'a porté")
+        self.assertFalse(worker._wake_claim_armed)
+        with mock.patch.object(storage.of(self.db).lot_sessions.__class__,
+                               "claim_wake") as claim:
+            worker._wake_claim_renewed = float("-inf")
+            worker._renew_wake_claim()
+        claim.assert_not_called()
+        self.db.execute("UPDATE work_items SET wake_claim_at ="
+                        " now() - interval '10 minutes' WHERE id = %s", (lot,))
+        worker._scheduled_wake_checked = float("-inf")
+        self.assertIsNotNone(worker._scheduled_wake_spec(),
+                             "claim orphelin expiré : le réveil revient")
 
     def test_reveil_programme_non_consomme_si_le_tour_n_est_pas_lance(self):
         """#2466 B1 (cx2, 2e tour) : tant que le harnais n'a pas démarré

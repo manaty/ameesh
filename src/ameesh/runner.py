@@ -568,6 +568,11 @@ class AgentWorker(threading.Thread):
         #: wake_ts}) — le battement du tour en renouvelle le bail
         self._wake_claim: dict | None = None
         self._wake_claim_renewed = float("-inf")
+        #: #2614 : vrai seulement pendant le tour qui porte ce claim — un
+        #: claim obtenu par `pick` mais dont le tour ne part pas n'est jamais
+        #: renouvelé (il expire, le réveil revient) ; un battement d'un tour
+        #: ultérieur ne peut pas le prolonger indéfiniment.
+        self._wake_claim_armed = False
         self.state_dir = self.cfg.agent_dir(self.name)
         self.renew_failures = 0
         #: #2600 : horloge du bail, injectable par les tests de course. Elle
@@ -4435,13 +4440,17 @@ class AgentWorker(threading.Thread):
         expirait et le réveil pouvait être délivré une seconde fois avant la
         consommation du premier. Le battement ne tourne que sous le bail de
         l'agent, donc seul le détenteur renouvelle (`claim_wake` avec
-        `claim_ttl_s=0`). Le claim est oublié à la consommation et en fin du
+        `claim_ttl_s=0`). Seul le tour qui porte le claim l'arme (`run_turn`) :
+        un claim obtenu par `pick` mais dont le tour ne part pas n'est pas
+        renouvelé et expire. Le claim est oublié à la consommation et en fin du
         tour qui le porte : un tour non lancé laisse le bail expirer et le
         réveil est délivré de nouveau (#2466 B1). Une base en panne laisse le
         claim tel quel ; le prochain battement réessaie."""
         claim = getattr(self, "_wake_claim", None)
-        if claim is None or (time.monotonic() - getattr(
-                self, "_wake_claim_renewed", float("-inf")) < self.WAKE_CLAIM_TTL / 4.0):
+        if (claim is None or not getattr(self, "_wake_claim_armed", False)
+                or (time.monotonic() - getattr(
+                    self, "_wake_claim_renewed", float("-inf"))
+                    < self.WAKE_CLAIM_TTL / 4.0)):
             return
         try:
             taken = storage.of(self.db).lot_sessions.claim_wake(
@@ -4469,8 +4478,9 @@ class AgentWorker(threading.Thread):
         reste armée jusqu'au lancement effectif du harnais, et un claim non
         consommé expire puis est délivré de nouveau — un drainage ou un arrêt
         entre le choix du tour et son lancement ne perd plus le rendez-vous
-        (#2466 B1). Le lot reçoit une ligne `wake:` au journal par délivrance,
-        témoin. Le réglage `lot_wake=off` ne l'éteint pas : c'est un geste
+        (#2466 B1). Le lot reçoit une ligne `wake:` au journal à la
+        consommation, une par réveil réellement délivré ; un claim non consommé
+        n'en écrit pas (#2614). Le réglage `lot_wake=off` ne l'éteint pas : c'est un geste
         posé, pas une relance d'inactivité. Les gardes de `_pick` (arrêt,
         budget, porte et pression d'hôte, authentification) sont déjà passées ;
         un lot sans dossier reste armé (#811). Sur un exécuteur médié, les
@@ -4877,13 +4887,18 @@ class AgentWorker(threading.Thread):
     def run_turn(self, spec: dict) -> bool | None:
         """Un tour (voir `_run_turn_or_defer`).
 
-        #2614 : le tour qui porte un réveil programmé oublie son claim en
-        sortant, lancé ou non : non consommé, le bail n'est plus renouvelé,
+        #2614 : seul le tour qui porte un réveil programmé arme son claim
+        pour le battement ; il l'oublie en sortant, lancé ou non. Un claim
+        obtenu par `pick` mais dont le tour ne part pas (spec écarté, base en
+        panne avant `run_turn`) reste donc inerte : il n'est pas renouvelé,
         expire, et le réveil est délivré de nouveau."""
         try:
+            if spec.get("scheduled_wake"):
+                self._wake_claim_armed = True
             return self._run_turn_or_defer(spec)
         finally:
             if spec.get("scheduled_wake"):
+                self._wake_claim_armed = False
                 self._wake_claim = None
 
     def _run_turn_or_defer(self, spec: dict) -> bool | None:
