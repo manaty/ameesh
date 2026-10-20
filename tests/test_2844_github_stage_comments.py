@@ -231,6 +231,22 @@ class StageCommentsTest(unittest.TestCase):
         saved = json.loads((Path(self.folder.name) / "github-stage-comments.json").read_text())
         self.assertIsInstance(saved["_since"], float)
 
+    def test_late_earlier_report_never_announces_a_second_delivery(self):
+        self.gh.repo(REPO)["issues"][0]["state"] = "closed"
+        checkpoint = Path(self.folder.name) / "github-stage-comments.json"
+        checkpoint.write_text('{"_since": 1000}')
+        newer = [("v1.17.0", "2026-10-22", 3000.0)]
+        with mock.patch.object(comments, "release_receipts", return_value={12: newer}):
+            self.assertEqual([r["event"] for r in self.project()["comments"]],
+                             ["delivered-v1.17.0"])
+        earlier = [("v1.16.0", "2026-10-21", 2000.0), *newer]
+        with mock.patch.object(comments, "release_receipts", return_value={12: earlier}):
+            self.assertEqual(self.project()["comments"], [])
+            # Lost local acknowledgement must reconcile any remote delivery.
+            checkpoint.write_text('{"_since": 1000}')
+            self.assertEqual(self.project()["comments"], [])
+        self.assertEqual(len(self.bodies()), 1)
+
     def test_dry_run_never_enrolls_or_consumes_receipts(self):
         self.project(dry_run=True)
         self.assertFalse((Path(self.folder.name) / "github-stage-comments.json").exists())

@@ -204,12 +204,21 @@ def project(db, st, gh_repo, report, mine, *, guard, refused, project, closings)
                 checkpoint[ticket] = saved
                 save()
             candidates = [(key, text) for key, text in candidates if key not in saved["seen"]]
+            if any(key.startswith("delivered-") for key in saved["seen"]):
+                candidates = [(key, text) for key, text in candidates
+                              if not key.startswith("delivered-")]
             if not candidates:
                 continue
             existing = "\n".join(row.get("body") or "" for row in gh_repo.comments(number))
             seen = set()
             for key, text in candidates:
                 marker = MARKER % (lot, key)
+                if key.startswith("delivered-") and (
+                        "<!-- ameesh:work-stage:v1 lot=%d event=delivered-" % lot) in existing:
+                    # A late/reconciled report can change the earliest receipt.
+                    # An existing delivery still closes this lot's timeline.
+                    saved["seen"].append(key)
+                    continue
                 if marker in existing:
                     if key not in saved["seen"]:
                         saved["seen"].append(key)
