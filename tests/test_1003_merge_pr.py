@@ -128,11 +128,14 @@ class _Base(unittest.TestCase):
                 mock.patch.object(merge_queue, "actor_family",
                                   side_effect=lambda db, n, **_: self.FAMILIES.get(
                                       str(n or "").strip(), "")),
-                # #2739 : `db` est un factice sans stockage, et ce dépôt de
-                # banc n'a pas de provenance d'agent : la lecture de plage de
-                # la porte échouerait en échec fermé. Ces témoins portent sur
-                # les gardes de `merge_pr`, pas sur les correcteurs ; l'échec
-                # fermé garde son témoin dédié (test_2739_review_correction).
+                # #1515/#2739 : `db` est un factice sans stockage, et ce dépôt
+                # de banc n'a pas de provenance d'agent : la lecture de plage
+                # de la porte échouerait en échec fermé. Ces témoins portent
+                # sur les gardes de `merge_pr`, pas sur les auteurs ; l'échec
+                # fermé garde ses témoins dédiés (test_1374_fire,
+                # test_2739_review_correction).
+                mock.patch.object(merge_queue, "_complete_authors",
+                                  return_value=([], ())),
                 mock.patch.object(merge_queue, "_corrections_on_freeze",
                                   return_value=set())):
             patch.start()
