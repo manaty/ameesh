@@ -196,6 +196,41 @@ class ModuleConfigurationTest(unittest.TestCase):
         self.assertFalse(row["ok"])
         self.assertIn("declares NAME", row["error"])
 
+    def test_external_evidence_reports_duplicates_as_unusable(self):
+        points = (FakeEntryPoint(external_lifecycle()),
+                  FakeEntryPoint(external_lifecycle()))
+        with external_points(*points):
+            rows = [row for row in modules.evidence() if row["name"] == "lifecycle"]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(not row["ok"] for row in rows))
+        self.assertTrue(all("duplicate installed module" in row["error"]
+                            for row in rows))
+        with external_points(*points), \
+                self.assertRaisesRegex(ValueError, "duplicate installed module"):
+            modules.installed()
+        with external_points(FakeEntryPoint(it, name="it")):
+            row = next(item for item in modules.evidence()
+                       if item["name"] == "it" and item["source"] == "external")
+        self.assertFalse(row["ok"])
+        self.assertIn("duplicate installed module", row["error"])
+
+    def test_external_types_are_rechecked_with_project_options(self):
+        def descriptor(options=None):
+            options = dict(options or {})
+            return {"types": ["promotion"] if options else ["docs"],
+                    "schemas": {}, "rules": []}
+
+        declared = external_lifecycle(types=["docs"], descriptor=descriptor)
+        with external_points(FakeEntryPoint(declared)), \
+                self.assertRaisesRegex(ValueError, "TYPES differ"):
+            modules.declarations(federation(names={"lifecycle": {"typed": True}}))
+        flexible = external_lifecycle(types=["docs"], descriptor=descriptor)
+        del flexible.TYPES
+        with external_points(FakeEntryPoint(flexible)):
+            entries = modules.declarations(
+                federation(names={"lifecycle": {"typed": True}}))
+        self.assertEqual(entries[0]["types"], ["promotion"])
+
     def test_external_types_cover_the_five_non_code_process_types(self):
         from ameesh.process_verifiers import (CODE_TYPES, INSTALLED_TYPES,
                                               completion_policy)

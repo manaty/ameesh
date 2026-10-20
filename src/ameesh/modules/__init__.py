@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import Counter
 from importlib import metadata
 
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -83,6 +84,17 @@ def _digest(descriptor):
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _check_types(name, module, descriptor):
+    """A static TYPES tuple, when present, must match every compiled policy.
+
+    A descriptor whose types legitimately vary with project options omits
+    TYPES: the SQL policy carries the compiled types per project either way."""
+    declared = getattr(module, "TYPES", None)
+    if declared is not None and list(declared) != descriptor["types"]:
+        raise ValueError("installed module %r: TYPES differ from descriptor(options) types"
+                         % name)
+
+
 def _external(entry):
     """Load and validate one external entry point; any failure is a refusal."""
     name = getattr(entry, "name", None)
@@ -104,10 +116,7 @@ def _external(entry):
         raise ValueError("installed module %r descriptor() failed: %s"
                          % (name, exc)) from exc
     _validate_descriptor(name, compiled)
-    declared_types = getattr(module, "TYPES", None)
-    if declared_types is not None and list(declared_types) != compiled["types"]:
-        raise ValueError("installed module %r: TYPES differ from descriptor().types"
-                         % name)
+    _check_types(name, module, compiled)
     return module, compiled
 
 
@@ -124,23 +133,29 @@ def installed():
 
 
 def evidence():
-    """Installation proof: source, distribution, entry point and descriptor digest."""
+    """Installation proof, with the same refusals as `installed()` per entry."""
     out = []
-    for name, module in sorted(_builtin().items()):
+    builtin = _builtin()
+    for name, module in sorted(builtin.items()):
         out.append({"name": name, "source": "builtin", "distribution": None,
                     "version": None, "entry_point": None, "ok": True,
                     "descriptor_sha256": _digest(module.descriptor({}))})
-    for entry in sorted(_entry_points(), key=lambda point: getattr(point, "name", "")):
+    entries = sorted(_entry_points(), key=lambda point: getattr(point, "name", ""))
+    counts = Counter(getattr(entry, "name", None) for entry in entries)
+    for entry in entries:
         name = getattr(entry, "name", None)
         dist, version = _distribution(entry)
         row = {"name": name, "source": "external", "distribution": dist,
                "version": version, "entry_point": getattr(entry, "value", None)}
-        try:
-            _, compiled = _external(entry)
-        except ValueError as exc:
-            row.update(ok=False, error=str(exc))
+        if name in builtin or counts[name] > 1:
+            row.update(ok=False, error="duplicate installed module: %r" % (name,))
         else:
-            row.update(ok=True, descriptor_sha256=_digest(compiled))
+            try:
+                _, compiled = _external(entry)
+            except ValueError as exc:
+                row.update(ok=False, error=str(exc))
+            else:
+                row.update(ok=True, descriptor_sha256=_digest(compiled))
         out.append(row)
     return out
 
@@ -193,6 +208,7 @@ def declarations(federation):
                 raise ValueError("unknown installed module: %s" % name)
             descriptor = registry[name].descriptor(module_options)
             _validate_descriptor(name, descriptor)
+            _check_types(name, registry[name], descriptor)
             if seen_types.intersection(descriptor["types"]):
                 raise ValueError("conflicting module types for project %s" % project)
             seen_types.update(descriptor["types"])
