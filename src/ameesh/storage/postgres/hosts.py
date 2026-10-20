@@ -268,13 +268,45 @@ class Hosts(interface.HostResources):
             " AND sampled_at >= now() - make_interval(secs => %s)"
             " ORDER BY sampled_at, id", (host, float(since_s)))]
 
-    def disk_history(self, host, since_s) -> list[dict]:
-        """#2851 : la tendance disque ne lit que ses quatre champs."""
+    def disk_history(self, host, since_s, step_s) -> list[dict]:
+        """#2879 : un point par tranche de `step_s`, champs de tendance seuls.
+
+        La fenêtre de 6 h compte ~4 800 relevés par hôte (un toutes les 4 s)
+        et ~3,3 Mo de `volumes` jsonb ; sur le lien dégradé de pc-smichea
+        (30 KiB/s), ce transfert prenait 53-63 s par hôte, pour une requête
+        serveur à ~0,1 s. Le sous-échantillonnage se fait donc en base — le
+        DERNIER relevé de chaque tranche, pour que le point le plus récent
+        reste frais — et chaque volume n'est rendu que par les champs de la
+        tendance (`path`, `paths`, `disk_free_bytes`) : quelques Ko par hôte.
+        """
         return [_reading(row) for row in self.db.query(
-            "SELECT id, extract(epoch from sampled_at)::float8 AS sampled_ts,"
-            " volumes, disk_path, disk_free_bytes FROM host_resources"
-            " WHERE host = %s AND sampled_at >= now() - make_interval(secs => %s)"
-            " ORDER BY sampled_at, id", (host, float(since_s)))]
+            """
+            WITH picked AS (
+                SELECT DISTINCT ON (bucket)
+                       id, sampled_at, volumes, disk_path, disk_free_bytes
+                  FROM (
+                      SELECT id, sampled_at, volumes, disk_path, disk_free_bytes,
+                             floor(extract(epoch FROM sampled_at)::float8
+                                   / %s::float8)::bigint AS bucket
+                        FROM host_resources
+                       WHERE host = %s
+                         AND sampled_at >= now() - make_interval(secs => %s)
+                  ) AS dense
+                 ORDER BY bucket, sampled_at DESC, id DESC
+            )
+            SELECT id,
+                   extract(epoch FROM sampled_at)::float8 AS sampled_ts,
+                   coalesce((SELECT jsonb_agg(jsonb_build_object(
+                                 'path', v->'path',
+                                 'paths', v->'paths',
+                                 'disk_free_bytes', v->'disk_free_bytes') ORDER BY ord)
+                               FROM jsonb_array_elements(picked.volumes)
+                                    WITH ORDINALITY AS t(v, ord)),
+                            '[]'::jsonb) AS volumes,
+                   disk_path, disk_free_bytes
+              FROM picked
+             ORDER BY sampled_at, id
+            """, (float(step_s), host, float(since_s)))]
 
     def record_harness_version(self, host, harness, *, path, version, raw) -> None:
         self.db.execute(

@@ -810,8 +810,9 @@ def _host_fleet(db, canons, args) -> int:
     for name in sorted(names):
         reading = readings.get(name, {"host": name})
         limits = res.host_limits(canons, reading["host"])["limits"]
-        history = (storage.of(db).hosts.since(reading["host"], res.DISK_TREND_WINDOW_S)
-                   if name in readings else [])
+        history = (storage.of(db).hosts.disk_history(
+            reading["host"], res.DISK_TREND_WINDOW_S, res.DISK_TREND_STEP_S)
+            if name in readings else [])
         lines.append(res.fleet_line(reading, limits, [h for h in history
                                                       if h.get("id") != reading.get("id")],
                                     now=now))
