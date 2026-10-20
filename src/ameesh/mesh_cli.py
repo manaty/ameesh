@@ -160,7 +160,17 @@ def _annotate_agents(cfg: Config, db, rows: list) -> list:
     # prod.
     for row in rows:
         row["paused_on_budget"] = progress.paused_on_budget(row)
+        # #2814 : l'état « queued » d'un tour différé, lisible par un client
+        # sans décoder le texte français (`ameesh-agents/1`,
+        # `GET /api/v1/agents`) ; None hors d'une attente de pression.
+        row["queue"] = _queue_of(row)
     return rows
+
+
+def _queue_of(row) -> dict | None:
+    """#2814 : le `queued` object d'une ligne d'agent (None sinon)."""
+    from . import resources as resources_mod
+    return resources_mod.parse_queue_status((row or {}).get("status_text"))
 
 
 def agent_rows(cfg: Config, db) -> list:
@@ -183,6 +193,8 @@ def agent_detail(db, name: str) -> dict | None:
     # #1070 : the budget pause reaches `show --json` too, as it does
     # `list --json` and `/api/v1/agents` (set in `_annotate_agents`)
     row["paused_on_budget"] = progress.paused_on_budget(row)
+    # #2814 : même objet `queued` que `ameesh list --json`
+    row["queue"] = _queue_of(row)
     row["key_ready"] = bool(info and info.get("public_key") and not info.get("key_revoked_ts"))
     row["public_key_fingerprint"] = (info or {}).get("public_key_fingerprint")
     row["key_updated_ts"] = (info or {}).get("key_updated_ts")
@@ -476,6 +488,8 @@ def _host_json(part: dict) -> dict:
         "host": part["name"],
         "responsible": host.responsible if host is not None else None,
         "limits": limits,
+        # #2814 : le périmètre d'admission, à côté des seuils qu'il gouverne
+        "pressure_scope": limits.get("pressure_scope"),
         "max_agents": physical["max_agents"],
         "limits_origin": physical["origin"],
         "fiches": [{"canon": canon.id, "default": canon.is_default,
@@ -603,6 +617,21 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
             print("  thresholds memory pressure ≤ %s%s"
                   % (res.fmt_value("max_mem_pressure", limits["max_mem_pressure"]),
                      tag("max_mem_pressure")))
+            # #2814 : le périmètre de pression (cgroup du processus ou hôte) ;
+            # en `own_cgroup`, la charge 1 min n'est plus un critère
+            print("  scope      pressure on %s%s%s" % (
+                res.scope_label(limits.get("pressure_scope")),
+                tag("pressure_scope") if fiches else "",
+                "; load advisory only" if limits.get("pressure_scope") == "own_cgroup"
+                else ""))
+            if limits.get("pressure_scope") == "own_cgroup":
+                print("  thresholds cgroup memory ≤ %s%s; cgroup throttled ≤ %s%s"
+                      % (res.fmt_value("max_cgroup_memory_used",
+                                       limits.get("max_cgroup_memory_used")),
+                         tag("max_cgroup_memory_used"),
+                         res.fmt_value("max_cgroup_throttled",
+                                       limits.get("max_cgroup_throttled")),
+                         tag("max_cgroup_throttled")))
             if limits.get("max_cpu_pressure") is not None:
                 print("  thresholds CPU pressure ≤ %s%s"
                       % (res.fmt_value("max_cpu_pressure", limits["max_cpu_pressure"]),
@@ -614,6 +643,29 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                      _fmt_bytes(latest.get("disk_free_bytes")),
                      latest.get("turns_in_progress")
                      if latest.get("turns_in_progress") is not None else "—"))
+            # #2814 : la mesure du cgroup de l'exécuteur (conteneur), publiée
+            # avec le relevé ; c'est elle que `own_cgroup` gouverne
+            cgroup = latest.get("cgroup") or {}
+            if cgroup:
+                parts = []
+                if cgroup.get("path"):
+                    parts.append("path %s" % cgroup["path"])
+                if cgroup.get("mem_used") is not None:
+                    parts.append("memory %s / %s (%s)" % (
+                        _fmt_bytes(cgroup.get("mem_current_bytes")),
+                        _fmt_bytes(cgroup.get("mem_max_bytes")),
+                        res.fmt_value("max_cgroup_memory_used", cgroup["mem_used"])))
+                if cgroup.get("cpu_quota"):
+                    parts.append("CPU quota %.2f" % cgroup["cpu_quota"])
+                if cgroup.get("throttled") is not None:
+                    parts.append("throttled %s" % res.fmt_value(
+                        "max_cgroup_throttled", cgroup["throttled"]))
+                if cgroup.get("cpu_some") is not None:
+                    parts.append("CPU PSI %.1f %%" % cgroup["cpu_some"])
+                if cgroup.get("mem_some") is not None:
+                    parts.append("memory PSI %.1f %%" % cgroup["mem_some"])
+                if parts:
+                    print("  cgroup     %s" % "; ".join(parts))
             manque = res.unmeasured(latest)
             if manque:
                 # L64: a measure the host cannot give, said rather than a "—"

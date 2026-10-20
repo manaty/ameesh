@@ -134,10 +134,6 @@ DISK_TREND_MIN_SPAN_S = 3600.0
 #: workstation, 11 000 on agents-1, #1749)
 ZOMBIE_KEYS = ("max_zombies",)
 DEFAULT_MAX_ZOMBIES = 200
-#: clés de seuil reconnues dans `policy.resources` (liste fermée)
-THRESHOLD_KEYS = ("min_mem_available", "max_swap_used", "max_load", "min_disk_free",
-                  "max_tmpfs_used", *POWER_KEYS, *PRESSURE_KEYS,
-                  *BTRFS_KEYS, *WARN_KEYS, *ZOMBIE_KEYS)
 #: L159c : plafonds mémoire des unités d'agent, dans `policy.resources` aussi.
 #: Ce ne sont pas des seuils de contre-pression : systemd les fait respecter
 #: (`MemoryMax`), `ameesh doctor` vérifie l'écart entre le canon et l'unité.
@@ -149,8 +145,32 @@ AGENT_MEMORY_KEYS = ("agent_memory_max", "agent_memory_max_by_agent")
 DEFAULT_AGENT_MEMORY_MAX = 6 * 1024 ** 3
 #: `MemoryHigh` (reprise de mémoire, ralentissement) à cette part du plafond dur
 AGENT_MEMORY_HIGH_RATIO = 0.9
+#: #2814: where the admission reads the pressure. `host` is the historical
+#: behaviour (`/proc/pressure`, `/proc/loadavg`, host memory); `own_cgroup`
+#: reads this process's cgroup v2 (PSI, `cpu.stat` throttling,
+#: `memory.current` vs `memory.max`) and DROPS the node-wide load. In a
+#: container the node load says nothing about the container's own capacity
+#: (TPK, 19/10: node load 19.6, ameesh container 377m CPU); the default is
+#: therefore `own_cgroup` when the process is in a container, `host` otherwise.
+PRESSURE_SCOPES = ("own_cgroup", "host")
+PRESSURE_SCOPE_KEY = "pressure_scope"
+#: environment override of the scope, for one executor without a canon edit
+PRESSURE_SCOPE_ENV = "AMEESH_PRESSURE_SCOPE"
+#: #2814: share of `memory.max` above which a cgroup closes new turns
+#: (critical halfway between the threshold and full, like the tmpfs ceiling)
+DEFAULT_MAX_CGROUP_MEMORY_USED = 0.9
+#: #2814: share of wall time during which the cgroup had throttled tasks
+#: (`cpu.stat` `throttled_usec` delta / wall time). A CPU quota that stalls
+#: tasks is real pressure even when the host load is low. Critical at
+#: halfway to 1.0.
+DEFAULT_MAX_CGROUP_THROTTLED = 0.5
+CGROUP_KEYS = ("max_cgroup_memory_used", "max_cgroup_throttled")
 #: seuils exprimés en PART (0 < x <= 1, ou texte « 80% ») et non en octets
-FRACTION_KEYS = ("max_tmpfs_used", "warn_disk_used")
+FRACTION_KEYS = ("max_tmpfs_used", "warn_disk_used", *CGROUP_KEYS)
+#: clés de seuil reconnues dans `policy.resources` (liste fermée)
+THRESHOLD_KEYS = ("min_mem_available", "max_swap_used", "max_load", "min_disk_free",
+                  "max_tmpfs_used", *POWER_KEYS, *PRESSURE_KEYS,
+                  *BTRFS_KEYS, *WARN_KEYS, *ZOMBIE_KEYS, *CGROUP_KEYS)
 #: dossier des sources d'alimentation (Linux) ; surchargé par les tests
 POWER_SUPPLY_ENV = "AMEESH_POWER_SUPPLY_DIR"
 POWER_SUPPLY_DIR = platform.host.POWER_SUPPLY_DIR
@@ -806,6 +826,83 @@ class CpuMeter:
 _CPU_METER = CpuMeter()
 
 
+#: shortest window that gives a throttle share (`cpu.stat` counters are µs)
+CGROUP_MIN_WINDOW_S = 1.0
+
+
+class CgroupMeter:
+    """#2814 : mesures du cgroup v2 de CE processus, pour l'admission.
+
+    Lit `cpu.pressure`/`memory.pressure` (PSI du cgroup, pas du nœud), le
+    quota (`cpu.max`), les compteurs de `cpu.stat` et `memory.current` /
+    `memory.max`. Les compteurs sont cumulés : la part de temps throttlé et
+    le CPU consommé demandent deux lectures, None à la première (aucune
+    supposition). `path` (ou `AMEESH_CGROUP_DIR`) : un arbre de test ; sans
+    lui, le cgroup du processus (`platform.host.cgroup_dir`)."""
+
+    def __init__(self, path: str | None = None, clock=None) -> None:
+        self._path = path
+        self._clock = clock or time.monotonic
+        self._prev: tuple | None = None
+        self._prev_path: str | None = None
+
+    def read(self, path: str | None = None, now: float | None = None) -> dict:
+        base = path or self._path or os.environ.get("AMEESH_CGROUP_DIR") \
+            or platform.host.cgroup_dir()
+        out = {
+            "path": base,
+            "cpu_some": None, "mem_some": None, "mem_full": None,
+            "cpu_quota": None,
+            "mem_current_bytes": None, "mem_max_bytes": None,
+            "mem_used": None, "throttled": None, "cpu_used": None,
+        }
+        if not base or not os.path.isdir(base):
+            self._prev, self._prev_path = None, None
+            return out
+        cpu = platform.cgroup_pressure("cpu", base)
+        mem = platform.cgroup_pressure("memory", base)
+        out["cpu_some"] = cpu.get("some", {}).get("avg60")
+        out["mem_some"] = mem.get("some", {}).get("avg60")
+        out["mem_full"] = mem.get("full", {}).get("avg60")
+        quota, period = platform.cgroup_cpu_max(base)
+        if quota is not None and period:
+            out["cpu_quota"] = round(quota / period, 4)
+        stat = platform.cgroup_cpu_stat(base)
+        current = platform.cgroup_memory_bytes(base)
+        ceiling = platform.cgroup_memory_max(base)
+        out["mem_current_bytes"] = current
+        out["mem_max_bytes"] = ceiling
+        if current is not None and ceiling:
+            out["mem_used"] = round(min(1.0, float(current) / float(ceiling)), 4)
+        now = self._clock() if now is None else float(now)
+        prev, prev_path = self._prev, self._prev_path
+        self._prev, self._prev_path = (now, dict(stat)), base
+        if prev is None or prev_path != base:
+            return out
+        if now <= prev[0]:
+            # a clock that went back: keep the earlier window's start
+            self._prev, self._prev_path = prev, prev_path
+            return out
+        window = now - prev[0]
+        if window < CGROUP_MIN_WINDOW_S:
+            # keep the previous instant: below a second the counters are noise
+            self._prev, self._prev_path = prev, prev_path
+            return out
+        before = prev[1]
+        if stat.get("throttled_usec") is not None \
+                and before.get("throttled_usec") is not None:
+            delta = max(0, stat["throttled_usec"] - before["throttled_usec"])
+            out["throttled"] = round(min(1.0, delta / (window * 1e6)), 4)
+        if stat.get("usage_usec") is not None and before.get("usage_usec") is not None:
+            delta = max(0, stat["usage_usec"] - before["usage_usec"])
+            out["cpu_used"] = round(delta / (window * 1e6), 4)
+        return out
+
+
+#: #2814: the reading's meter (a throttle share needs two samples)
+_CGROUP_METER = CgroupMeter()
+
+
 def guest_memory(cgroups: list[str] | None = None) -> int | None:
     """Memory charged to the guest's cgroups: 0 without a guest, None when
     a guest cgroup cannot be read (the application's memory is then
@@ -1022,6 +1119,9 @@ def sample(host: str, *, path: str | None = None, now: float | None = None,
     cgroups = guest_cgroups()
     out["guest_mem_bytes"] = guest_memory(cgroups)
     out.update(_CPU_METER.read(cgroups=cgroups))
+    # #2814 : la mesure du cgroup de CE processus, publiée avec le relevé ;
+    # elle sert l'admission (`own_cgroup`) et `ameesh hosts` sur un conteneur
+    out["cgroup"] = _CGROUP_METER.read()
     return out
 
 
@@ -1138,6 +1238,35 @@ GATE_KEYS = ("gate_state", "gate_seq", "gate_reason")
 # seuils (canon) et pression
 # --------------------------------------------------------------------------
 
+def pressure_scope(policy=None) -> str:
+    """#2814 : où l'admission lit la pression — `own_cgroup` ou `host`.
+
+    Ordre : la fiche `Host` (`policy.resources.pressure_scope`), puis
+    `AMEESH_PRESSURE_SCOPE` (dérogation d'un exécuteur, sans édition de
+    canon), puis le défaut : `own_cgroup` dès que le processus tourne dans un
+    conteneur (`platform.host.in_container`), `host` sinon. Un service systemd
+    borné n'est PAS un conteneur : pour le mesurer sur son propre cgroup, la
+    fiche le déclare (ou `AMEESH_PRESSURE_SCOPE=own_cgroup`)."""
+    raw = None
+    if policy is not None:
+        raw = getattr(policy, "resources", None)
+        if raw is None and isinstance(policy, dict):
+            raw = policy.get("resources")
+    if isinstance(raw, dict):
+        declared = raw.get(PRESSURE_SCOPE_KEY)
+        if isinstance(declared, str) and declared in PRESSURE_SCOPES:
+            return declared
+    override = os.environ.get(PRESSURE_SCOPE_ENV)
+    if override in PRESSURE_SCOPES:
+        return override
+    return "own_cgroup" if platform.host.in_container() else "host"
+
+
+def scope_label(scope: str | None) -> str:
+    """Le nom lisible du périmètre de pression (« own cgroup », « host »)."""
+    return "own cgroup" if scope == "own_cgroup" else "host"
+
+
 def thresholds(policy=None) -> dict:
     """Seuils effectifs d'un hôte : `policy.resources` de sa fiche `Host`,
     complétés par les valeurs par défaut prudentes.
@@ -1170,6 +1299,8 @@ def thresholds(policy=None) -> dict:
     stop = parse_percent(raw.get("stop_battery_percent"))
     cpu_pressure = parse_percent(raw.get("max_cpu_pressure"))
     mem_pressure = parse_percent(raw.get("max_mem_pressure"))
+    cg_mem_used = parse_fraction(raw.get("max_cgroup_memory_used"))
+    cg_throttled = parse_fraction(raw.get("max_cgroup_throttled"))
     unallocated = parse_bytes(raw.get("min_btrfs_unallocated"))
     headroom = parse_bytes(raw.get("min_btrfs_metadata_headroom"))
     zombies = parse_count(raw.get("max_zombies"))
@@ -1190,6 +1321,13 @@ def thresholds(policy=None) -> dict:
         # threshold takes the prudent default, it never removes the guard
         "max_mem_pressure": (DEFAULT_MAX_MEM_PRESSURE if mem_pressure is None
                              else mem_pressure),
+        # #2814: where the pressure is read; the cgroup ceilings only apply
+        # in own_cgroup mode unless the policy overrides them
+        "pressure_scope": pressure_scope(policy),
+        "max_cgroup_memory_used": (DEFAULT_MAX_CGROUP_MEMORY_USED
+                                   if cg_mem_used is None else cg_mem_used),
+        "max_cgroup_throttled": (DEFAULT_MAX_CGROUP_THROTTLED
+                                 if cg_throttled is None else cg_throttled),
         # L159d: the offer (`policy.lend`) caps the lendable capacity; None:
         # the host lends nothing
         "lend": lend_offer(policy),
@@ -1221,6 +1359,9 @@ def declared(policy) -> dict:
     if not isinstance(raw, dict):
         return {}
     out: dict = {}
+    scope = raw.get(PRESSURE_SCOPE_KEY)
+    if isinstance(scope, str) and scope in PRESSURE_SCOPES:
+        out[PRESSURE_SCOPE_KEY] = scope
     for key in THRESHOLD_KEYS:
         value = (finite_float(raw.get(key)) if key == "max_load"
                  else parse_count(raw.get(key)) if key in ZOMBIE_KEYS
@@ -1279,9 +1420,14 @@ def host_limits(canons, host: str) -> dict:
             fiches.append((getattr(canon, "id", "") or "?", fiche))
     limits = thresholds(None)
     origin = {key: DEFAULT_ORIGIN for key in THRESHOLD_KEYS}
+    origin[PRESSURE_SCOPE_KEY] = DEFAULT_ORIGIN
     best: dict = {}
+    scopes: list[tuple[str, str]] = []
     for label, fiche in fiches:
         for key, value in declared(getattr(fiche, "policy", None)).items():
+            if key == PRESSURE_SCOPE_KEY:
+                scopes.append((value, label))
+                continue
             current = best.get(key)
             if current is None or (value > current[0] if key in FLOOR_KEYS
                                    else value < current[0]):
@@ -1289,6 +1435,13 @@ def host_limits(canons, host: str) -> dict:
     for key, (value, label) in best.items():
         limits[key] = value
         origin[key] = label
+    # #2814 : le périmètre n'est pas un seuil ordinal. Une fiche qui déclare
+    # `own_cgroup` le fait pour une raison (conteneur) : elle l'emporte sur
+    # une fiche restée à `host` ; deux fiches d'accord gardent leur valeur.
+    if scopes:
+        value, label = next(((v, l) for v, l in scopes if v == "own_cgroup"), scopes[0])
+        limits[PRESSURE_SCOPE_KEY] = value
+        origin[PRESSURE_SCOPE_KEY] = label
     max_agents, max_origin = None, None
     for label, fiche in fiches:
         value = getattr(getattr(fiche, "policy", None), "max_agents", None)
@@ -1360,8 +1513,26 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
     elle-même (PSI `memory some` 60 s) est le critère d'admission qui suit la
     pression réelle. #2354 : sans PSI et sans plafond déclaré, le repli de
     0028 s'applique (le stock est le seul signal) et le libellé le dit.
+
+    #2814 : en périmètre `own_cgroup`, la charge 1 min (celle du NŒUD) ne
+    compte pas et les pressions CPU/mémoire sont celles du cgroup ; les
+    plafonds `max_cgroup_memory_used` et `max_cgroup_throttled` s'ajoutent.
+    En périmètre `host`, les mesures de cgroup sont ignorées : le relevé de
+    l'hôte reste la référence.
     """
     out: list[dict] = []
+    scope = limits.get("pressure_scope", "host")
+    own = scope == "own_cgroup"
+
+    def cg(key):
+        """The cgroup measure of the reading: the live flat key when the
+        executor merged one (even a None measure, which says "unknown"), else
+        the published `cgroup` mapping (#2814)."""
+        flat = "cgroup_" + key
+        if flat in reading:
+            return reading[flat]
+        stored = reading.get("cgroup")
+        return stored.get(key) if isinstance(stored, dict) else None
 
     def floor(key, label, value, limit, critical_factor):
         if value is None or limit is None:
@@ -1408,8 +1579,9 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
                 "swap used (no PSI: conservative default)" if fallback else "swap used",
                 reading.get("swap_used_bytes"), swap_ceiling(reading, limits),
                 CRITICAL_SWAP_FACTOR)
-    ceiling("max_load", "1-min load", reading.get("load1"),
-            limits["max_load"], CRITICAL_LOAD_FACTOR)
+    if not own:
+        ceiling("max_load", "1-min load", reading.get("load1"),
+                limits["max_load"], CRITICAL_LOAD_FACTOR)
     volume_floor("min_disk_free", "free disk", "disk_free_bytes",
                  limits["min_disk_free"], CRITICAL_DISK_FACTOR)
     # #246: btrfs allocation, which `disk_free` (statvfs) does not see; like
@@ -1429,20 +1601,42 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
                     "critical": part >= limit + (1.0 - limit) / 2.0})
     # #2296: memory pressure of the host (PSI some, 60 s): the admission
     # signal that follows the real pressure; critical halfway to 100 %, like
-    # the CPU pressure.
-    mem_pressure, limit = reading.get("psi_mem_some"), limits.get("max_mem_pressure")
+    # the CPU pressure. #2814: in own-cgroup mode this is the cgroup's own
+    # memory PSI, never the node's.
+    mem_pressure = cg("mem_some") if own else reading.get("psi_mem_some")
+    limit = limits.get("max_mem_pressure")
     if mem_pressure is not None and limit is not None and mem_pressure > limit:
         out.append({"key": "max_mem_pressure",
-                    "label": "memory pressure (PSI some 60 s)",
+                    "label": "memory pressure (PSI some 60 s%s)"
+                    % (", own cgroup" if own else ""),
                     "value": mem_pressure, "limit": limit,
                     "critical": mem_pressure >= limit + (100.0 - limit) / 2.0})
     # L159d: CPU pressure of the host; critical halfway between the ceiling
-    # and 100 %
-    cpu_pressure, limit = reading.get("psi_cpu_some"), limits.get("max_cpu_pressure")
+    # and 100 %. #2814: the cgroup's own CPU PSI in own-cgroup mode.
+    cpu_pressure = cg("cpu_some") if own else reading.get("psi_cpu_some")
+    limit = limits.get("max_cpu_pressure")
     if cpu_pressure is not None and limit is not None and cpu_pressure > limit:
-        out.append({"key": "max_cpu_pressure", "label": "CPU pressure (PSI some 60 s)",
+        out.append({"key": "max_cpu_pressure",
+                    "label": "CPU pressure (PSI some 60 s%s)"
+                    % (", own cgroup" if own else ""),
                     "value": cpu_pressure, "limit": limit,
                     "critical": cpu_pressure >= limit + (100.0 - limit) / 2.0})
+    # #2814: what the container itself is made of — memory charged against
+    # `memory.max`, and wall time with throttled tasks (`cpu.stat`). Only in
+    # own-cgroup mode: a host's own cgroup is not what the reading stores.
+    if own:
+        used, limit = cg("mem_used"), limits.get("max_cgroup_memory_used")
+        if used is not None and limit is not None and used > limit:
+            out.append({"key": "max_cgroup_memory_used",
+                        "label": "cgroup memory used (memory.current/memory.max)",
+                        "value": used, "limit": limit,
+                        "critical": used >= limit + (1.0 - limit) / 2.0})
+        throttled, limit = cg("throttled"), limits.get("max_cgroup_throttled")
+        if throttled is not None and limit is not None and throttled > limit:
+            out.append({"key": "max_cgroup_throttled",
+                        "label": "cgroup CPU throttled (share of wall time)",
+                        "value": throttled, "limit": limit,
+                        "critical": throttled >= limit + (1.0 - limit) / 2.0})
     etat = power_state(reading, limits)
     if etat["state"] in ("low", "stop"):
         # L106 : jamais `critical` — la pause des agents peu prioritaires ne
@@ -1606,12 +1800,88 @@ def pressure(reading: dict, policy=None, *, limits: dict | None = None) -> dict:
     if limits is None:
         limits = thresholds(policy)
     found = breaches(reading, limits)
+    scope = limits.get("pressure_scope", "host")
+    stored_cgroup = reading.get("cgroup") if isinstance(reading.get("cgroup"), dict) else {}
+
+    def cgroup_value(key):
+        flat = "cgroup_" + key
+        if flat in reading:
+            return reading[flat]
+        return stored_cgroup.get(key)
+
     return {
         "limits": limits,
+        "scope": scope,
         "breaches": found,
         "blocked": bool(found),
         "critical": any(b["critical"] for b in found),
         "power": power_state(reading, limits),
+        # #2814: the cgroup measure the verdict was made on (None keys when
+        # the executor is not measuring one)
+        "cgroup": {key: cgroup_value(key) for key in
+                   ("path", "cpu_some", "mem_some", "mem_full", "cpu_quota",
+                    "mem_current_bytes", "mem_max_bytes", "mem_used",
+                    "throttled", "cpu_used")},
+    }
+
+
+#: #2814 : the admission verdict is cached 10 s by the executor; a deferred
+#: turn says when it will look again, never a promise beyond that cache
+QUEUE_RETRY_S = 10
+
+
+def queue_text(host: str, verdict: dict, *, queued_s: float | None = None,
+               retry_s: int = QUEUE_RETRY_S, capacity: str | None = None) -> str:
+    """#2814 : the visible text of a turn held by pressure, parseable by
+    `parse_queue_status` — scope, breaches, age and next look.
+
+    `waiting: pressure on host X (own cgroup) — …; queued 42 s; retry in 10 s`
+    (`critical pressure …` for a critical verdict, prefixed by the caller)."""
+    text = "pressure on host %s (%s) — %s" % (
+        host, scope_label(verdict.get("scope")),
+        describe(verdict.get("breaches")) or "threshold")
+    if queued_s is not None:
+        text += "; queued %d s" % int(max(0.0, queued_s))
+    if capacity:
+        text += "; capacity %s" % capacity
+    return text + "; retry in %d s" % int(retry_s)
+
+
+_QUEUE_STATUS_RE = re.compile(
+    r"^(?P<state>waiting|paused): (?P<critical>critical )?pressure on host "
+    r"(?P<host>\S+) \((?P<scope>own cgroup|host)\) — (?P<detail>.*)$")
+_QUEUED_RE = re.compile(r"; queued (\d+) s")
+_RETRY_RE = re.compile(r"; retry in (\d+) s")
+_CAPACITY_RE = re.compile(r"; capacity ([^;]+)")
+
+
+def parse_queue_status(text: str | None) -> dict | None:
+    """#2814 : the `queued` object a client reads, from an agent's status text.
+
+    None for any other status. `state` is `queued` (a turn is waiting, not
+    running); `scope`, `critical`, `queued_s`, `retry_s`, `capacity` and the
+    human `detail` are the fields of `queue_text`. A turn never starts after
+    its request expired: ameesh mail has no expiry by default, and a signed
+    message's `signature_expires_at` is the deadline when it has one
+    (`mail.expired`)."""
+    match = _QUEUE_STATUS_RE.match((text or "").strip())
+    if match is None:
+        return None
+    detail = match.group("detail") or ""
+    queued = _QUEUED_RE.search(detail)
+    retry = _RETRY_RE.search(detail)
+    capacity = _CAPACITY_RE.search(detail)
+    return {
+        "state": "queued",
+        "reason": "pressure",
+        "host": match.group("host"),
+        "scope": "own_cgroup" if match.group("scope") == "own cgroup" else "host",
+        "critical": bool(match.group("critical")),
+        "detail": _CAPACITY_RE.sub("", _QUEUED_RE.sub("", _RETRY_RE.sub("", detail))
+                                   ).strip(" ;"),
+        "queued_s": int(queued.group(1)) if queued else None,
+        "retry_s": int(retry.group(1)) if retry else None,
+        "capacity": capacity.group(1) if capacity else None,
     }
 
 

@@ -494,6 +494,10 @@ class AgentWorker(threading.Thread):
     #: compte que les reports de verrou, pas les passations d'attach qui l'ont
     #: précédé.
     deferred_series_reason = ""
+    #: #2814 : début (horloge murale) du tour retenu par la pression, pour le
+    #: texte « queued N s » que lit le client ; défaut de classe comme les
+    #: reports, une construction partielle ne doit pas lever.
+    queue_since = 0.0
 
     #: L76 : le processus résident de l'agent entre ses tours, ou None.
     #: Défaut de classe : les constructions partielles (`__new__` sans
@@ -3977,16 +3981,26 @@ class AgentWorker(threading.Thread):
 
         Ne touche JAMAIS un tour en cours : `_pick` s'exécute entre deux tours.
         Seuls les agents de priorité la plus basse (0, le défaut) sont mis en
-        pause ; les autres attendent simplement que la pression redescende."""
+        pause ; les autres attendent simplement que la pression redescende.
+
+        #2814 : le texte dit la portée (`own cgroup`/`host`) et, pour un tour
+        différé, son âge et la prochaine lecture — un client peut alors
+        afficher « queued » au lieu de conclure à l'échec."""
         from . import resources as resources_mod
-        raisons = resources_mod.describe(pressure.get("breaches")) or "threshold"
         if (not pressure.get("critical")
                 or int(self.agent.get("priority") or 0) > 0):
-            self._host_pressure_hold(raisons)
+            self._host_pressure_hold(pressure)
             return
-        if self._work_waiting():
+        waiting = self._work_waiting()
+        queued_s = self._queue_since(waiting)
+        capacity = self._capacity_request(pressure, queued_s) if waiting else None
+        raisons = resources_mod.queue_text(
+            self.runner.host, pressure, queued_s=queued_s if waiting else None,
+            retry_s=pressure.get("retry_in_s", resources_mod.QUEUE_RETRY_S),
+            capacity=capacity)
+        if waiting:
             self.runner.pressure_delayed(self.name)
-        texte = "critical pressure on host %s: %s" % (self.runner.host, raisons)
+        texte = "critical " + raisons
         if getattr(self, "_pressure_reason", "") == texte:
             return
         # Pause fencée par le bail : un worker périmé (bail perdu, remplacé,
@@ -4012,11 +4026,77 @@ class AgentWorker(threading.Thread):
             return True
         try:
             # L125 : un courrier passif n'attend pas de tour
-            return bool(mail.unread_active(self.db, self.name, limit=1))
+            return bool(self._live_mail(mail.unread_active(self.db, self.name, limit=1)))
         except db_mod.DbError:
             return False
 
-    def _host_pressure_hold(self, raisons: str) -> None:
+    def _live_mail(self, rows) -> list[dict]:
+        """#2814 : les messages qui peuvent encore ouvrir un tour.
+
+        Une requête signée dont l'échéance (`signature_expires_at`) est
+        passée ne démarre JAMAIS : elle est soldée sans tour (la deadline
+        était explicite) et le journal dit combien. Un échec de base laisse
+        le message en place, mais il ne passe pas non plus : on ne démarre
+        pas après l'échéance, même si le solde a échoué."""
+        rows = list(rows or ())
+        expired = [row for row in rows if mail.is_expired(row)]
+        if not expired:
+            return rows
+        try:
+            mail.drop_expired(self.db, expired)
+        except db_mod.DbError as exc:
+            log("[%s] expired request(s) not settled (%s)" % (self.name, exc))
+        else:
+            log_async("[%s] %d request(s) expired before a turn: not started"
+                      % (self.name, len(expired)))
+        return [row for row in rows if not mail.is_expired(row)]
+
+    def _queue_since(self, waiting: bool) -> float:
+        """#2814 : âge (s) du premier tour retenu, 0 sans travail en attente.
+
+        L'âge se mesure à l'horloge murale et vit dans le worker : une
+        pression qui tombe puis revient repart à zéro, la ligne de statut
+        n'accumule pas les épisodes."""
+        if not waiting:
+            return 0.0
+        since = float(getattr(self, "queue_since", 0.0) or 0.0)
+        if not since:
+            since = time.time()
+            self.queue_since = since
+        return max(0.0, time.time() - since)
+
+    def _capacity_label(self, state: dict | None) -> str | None:
+        """#2814 : le mot du fournisseur dans le statut, jamais un secret."""
+        action = (state or {}).get("action")
+        return {"granted": "granted", "wait": "requested", "refused": "refused",
+                "error": "unavailable"}.get(action)
+
+    def _capacity_request(self, pressure: dict, queued_s: float) -> str | None:
+        """Demande une capacité au fournisseur si le budget le permet.
+
+        Sans budget disponible, rien n'est demandé (une extension ne doit pas
+        contourner le plafond) ; le fournisseur est no-op par défaut."""
+        capacity = getattr(self.runner, "capacity", None)
+        if capacity is None or not getattr(capacity, "enabled", False):
+            return None
+        try:
+            if not self.budget_ok():
+                return None
+        except Exception:
+            return None
+        try:
+            state = capacity.need(
+                host=self.runner.host, agent=self.name, verdict=pressure,
+                budget_usd_hour=getattr(self.runner, "budget_usd_per_hour", None),
+                max_agents=getattr(self.runner, "_host_max_agents", None),
+                queued_s=queued_s)
+        except Exception as exc:  # jamais fatal au tour suivant
+            log_async("[%s] capacity request failed (%s)"
+                      % (self.name, type(exc).__name__))
+            return None
+        return self._capacity_label(state)
+
+    def _host_pressure_hold(self, pressure: dict) -> None:
         """L31b : une attente de pression se VOIT (`ameesh show`, `ameesh list`).
 
         Sans elle, un agent retenu restait `queued`, erreur vide, sans raison
@@ -4025,13 +4105,23 @@ class AgentWorker(threading.Thread):
         jamais. Le journal, lui, ne dit l'attente qu'une fois par épisode de
         pression, pour tous les agents (`Runner._pressure_episode_update`).
         Not on a mediated executor: `leases.hold_note` is not in contract 1.1
-        (the wait stays silent there, as in 1.6.x)."""
+        (the wait stays silent there, as in 1.6.x).
+
+        #2814 : `waiting: pressure on host X (own cgroup) — …; queued 42 s;
+        capacity requested; retry in 10 s` — the `queued` object a client
+        reads (`resources.parse_queue_status`)."""
+        from . import resources as resources_mod
         if getattr(self.runner, "mediated", False):
             return
         if not self._work_waiting():
             return
         self.runner.pressure_delayed(self.name)
-        texte = "waiting: pressure on host %s — %s" % (self.runner.host, raisons)
+        queued_s = self._queue_since(True)
+        capacity = self._capacity_request(pressure, queued_s)
+        texte = "waiting: " + resources_mod.queue_text(
+            self.runner.host, pressure, queued_s=queued_s,
+            retry_s=pressure.get("retry_in_s", resources_mod.QUEUE_RETRY_S),
+            capacity=capacity)
         if getattr(self, "_pressure_text", "") == texte:
             return
         try:
@@ -4050,6 +4140,7 @@ class AgentWorker(threading.Thread):
         si son texte est toujours en place (personne ne l'a remplacé) ; le texte
         d'avant (« reprise : même session »…) revient."""
         self._pause_refused = ""
+        self.queue_since = 0.0
         texte = getattr(self, "_pressure_text", "")
         if not texte:
             return
@@ -4300,9 +4391,9 @@ class AgentWorker(threading.Thread):
         # doublures de test #1270) n'a pas de `cfg` : sans lui, la lecture du
         # courrier reste simple — aucun canon à charger, rien à retenir.
         cfg = getattr(self, "cfg", None)
-        urgents = lot_workdir.deliverable_unread(cfg, self.db, self.agent,
-                                                  besoin=50, mode="urgent",
-                                                  deferred=self._lot_deferred)
+        urgents = self._live_mail(lot_workdir.deliverable_unread(
+            cfg, self.db, self.agent, besoin=50, mode="urgent",
+            deferred=self._lot_deferred))
         autorises = [m for m in urgents if self.interrupt_allowed(m)]
         for refuse in (m for m in urgents if m not in autorises):
             mid = int(refuse.get("id") or 0)
@@ -4346,16 +4437,15 @@ class AgentWorker(threading.Thread):
         # #811 (B1/R3) : le courrier d'un lot retenu attend, les autres
         # messages du tour passent — et la lecture franchit un préfixe retenu
         # qui masquerait un message remisable plus récent.
-        messages = lot_workdir.deliverable_unread(cfg, self.db, self.agent,
-                                                   besoin=mail.UNREAD_LIMIT,
-                                                   deferred=self._lot_deferred)
+        messages = self._live_mail(lot_workdir.deliverable_unread(
+            cfg, self.db, self.agent, besoin=mail.UNREAD_LIMIT,
+            deferred=self._lot_deferred))
         if len(messages) >= mail.UNREAD_LIMIT and all(mail.passive_reason(m) for m in messages):
             # L125 : boîte pleine de courrier passif — les messages qui
             # réveillent, plus récents, ne doivent pas y rester invisibles
-            reveil = lot_workdir.deliverable_unread(cfg, self.db, self.agent,
-                                                     besoin=mail.UNREAD_LIMIT,
-                                                     mode="active",
-                                                     deferred=self._lot_deferred)
+            reveil = self._live_mail(lot_workdir.deliverable_unread(
+                cfg, self.db, self.agent, besoin=mail.UNREAD_LIMIT,
+                mode="active", deferred=self._lot_deferred))
             messages = reveil + messages
         if messages:
             spec = self._mail_spec(messages)
@@ -7203,6 +7293,14 @@ class Runner:
                                 "limits": self._host_limits}
         self._pressure_at = 0.0
         self._all_host_limits: dict = {}
+        #: #2814 : mesures du cgroup de CE processus (PSI, quota, throttling,
+        #: mémoire), lues à chaque verdict frais ; le compteur de throttling
+        #: a besoin de deux lectures (None à la première)
+        self._cgroup = resources_mod.CgroupMeter()
+        #: #2814 : fournisseur de capacité enfichable (no-op par défaut) ;
+        #: il ne lance aucun tour, il signale « capacité nécessaire/libérée »
+        from . import capacity as capacity_mod
+        self.capacity = capacity_mod.Manager(log=log_async)
         #: épisode de pression en cours (une ligne de journal à son début, une
         #: à sa fin : durée, tours retardés), ou None
         self._pressure_episode: dict | None = None
@@ -9381,22 +9479,51 @@ class Runner:
         # verdict (pas seulement au dernier relevé publié, ni seulement quand
         # la base répond)
         power = self.power_reading()
-        if reading is None and power.get("on_ac") is None \
-                and power.get("battery_percent") is None:
+        # #2814 : les mesures du cgroup de CE processus sont lues sur place,
+        # comme l'alimentation : le dernier relevé publié peut être celui du
+        # nœud (conteneur) et ne dit rien de la capacité du conteneur
+        meter = getattr(self, "_cgroup", None)
+        cgroup: dict = {}
+        if meter is not None:
+            try:
+                cgroup = meter.read()
+            except Exception as exc:  # une mesure ne doit jamais arrêter la boucle
+                log_async("cgroup pressure measure failed (%s)" % type(exc).__name__)
+        measured = any(value is not None for key, value in cgroup.items()
+                       if key != "path")
+        if reading is None and not measured \
+                and power.get("on_ac") is None and power.get("battery_percent") is None:
             verdict: dict = {"blocked": False, "critical": False, "breaches": [],
                              "limits": limits,
+                             "scope": limits.get("pressure_scope", "host"),
+                             "cgroup": {},
                              "power": resources_mod.power_state(None, limits)}
         else:
             merged = dict(reading or {}, **{k: v for k, v in power.items()
                                              if v is not None})
+            # `CgroupMeter` returns unprefixed keys (published as
+            # `host_resources.cgroup`); the pressure reader wants the flat
+            # `cgroup_*` form for the live reading.
+            merged.update({"cgroup_" + key: value for key, value in cgroup.items()})
             verdict = resources_mod.pressure(merged, limits=limits)
             if reading is not None:
                 verdict["since"] = reading.get("sampled_ts")
                 verdict["reading"] = reading
+        verdict["retry_in_s"] = resources_mod.QUEUE_RETRY_S
+        capacity = getattr(self, "capacity", None)
+        if capacity is not None:
+            verdict["capacity"] = capacity.snapshot()
         with self._pressure_lock:
             self._pressure = verdict
             self._pressure_at = now
             self._pressure_episode_update(verdict)
+        # #2814 : le fournisseur voit chaque verdict FRAIS (libération après
+        # le calme requis) ; jamais appelé sous le verrou de pression
+        if capacity is not None:
+            try:
+                capacity.observe(bool(verdict.get("blocked")))
+            except Exception as exc:  # un fournisseur ne casse pas l'exécuteur
+                log_async("capacity provider observe failed (%s)" % type(exc).__name__)
         return dict(verdict)
 
     # -- pression : orchestrateurs et épisodes ------------------------------
@@ -9540,8 +9667,9 @@ class Runner:
                     "auditor_turns": 0,
                     "tmpfs": False}
                 batterie = any(b.get("power") for b in verdict.get("breaches") or ())
-                log_async("pressure on host %s: start — %s; except auditors, no new turn%s"
-                          % (self.host, resources_mod.describe(verdict.get("breaches"))
+                log_async("pressure on host %s (%s): start — %s; except auditors, no new turn%s"
+                          % (self.host, resources_mod.scope_label(verdict.get("scope")),
+                             resources_mod.describe(verdict.get("breaches"))
                              or "threshold",
                              " (critical pressure)" if verdict.get("critical") else
                              " (low battery)" if batterie else

@@ -903,10 +903,12 @@ class HostPolicy:
     max_agents: int | None = None
     #: seuils de ressources de l'hôte (L31, 0028) : mapping
     #: `{min_mem_available, max_swap_used, max_load, min_disk_free}`, plus la
-    #: pression (L159d/#2296) `{max_cpu_pressure, max_mem_pressure}`,
-    #: l'alimentation (L106) `{min_battery_percent, stop_battery_percent}` et
-    #: btrfs (#246) `{min_btrfs_unallocated, min_btrfs_metadata_headroom}` ; None =
-    #: valeurs par défaut prudentes (`ameesh.resources`).
+    #: pression (L159d/#2296) `{max_cpu_pressure, max_mem_pressure}`, le
+    #: périmètre et les plafonds du cgroup (#2814) `{pressure_scope,
+    #: max_cgroup_memory_used, max_cgroup_throttled}`, l'alimentation (L106)
+    #: `{min_battery_percent, stop_battery_percent}` et btrfs (#246)
+    #: `{min_btrfs_unallocated, min_btrfs_metadata_headroom}` ; None = valeurs
+    #: par défaut prudentes (`ameesh.resources`).
     resources: dict | None = None
     #: racine de travail par projet (L31, 0029) : `work_roots[projet]` sinon
     #: `work_root/<projet>` ; remplace le `cwd` d'une admission. None = pas de
@@ -2906,6 +2908,16 @@ class _Loader:
                      "`policy.resources`: mapping expected", **where, **subject)
             return None
         parsed: dict = {}
+        # #2814: the pressure scope is a name, not a number; it is read first
+        # so that an unknown value is an error, never a silent fallback.
+        scope = raw.get(resources_mod.PRESSURE_SCOPE_KEY)
+        if scope is not None:
+            if not isinstance(scope, str) or scope not in resources_mod.PRESSURE_SCOPES:
+                self.add("host-policy-invalid", ERROR,
+                         "`policy.resources.pressure_scope`: one of %s expected"
+                         % ", ".join(resources_mod.PRESSURE_SCOPES), **where, **subject)
+            else:
+                parsed[resources_mod.PRESSURE_SCOPE_KEY] = scope
         for key in resources_mod.THRESHOLD_KEYS:
             value = raw.get(key)
             if value is None:
@@ -2978,7 +2990,8 @@ class _Loader:
                 continue
             parsed[key] = caps
         for unknown in sorted(set(raw) - set(resources_mod.THRESHOLD_KEYS)
-                              - set(resources_mod.AGENT_MEMORY_KEYS)):
+                              - set(resources_mod.AGENT_MEMORY_KEYS)
+                              - {resources_mod.PRESSURE_SCOPE_KEY}):
             self.add("host-resources-unknown", WARNING,
                      "`policy.resources.%s`: unknown key (ignored)" % unknown,
                      **where, **subject)

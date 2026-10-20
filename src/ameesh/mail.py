@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import unicodedata
 import uuid
 from typing import Any, Sequence
@@ -441,6 +442,39 @@ def is_event(row: Any) -> bool:
 def is_urgent(row: Any) -> bool:
     """Un événement `urgent` perce le regroupement (C9)."""
     return bool(message_payload(row).get("urgent"))
+
+
+def is_expired(row: Any, now: float | None = None) -> bool:
+    """#2814 : le message porte-t-il une échéance déjà passée ?
+
+    Seul un message signé en a une (`signature_expires_at`, posée par
+    `--sign --expires`) : c'est la deadline de la REQUÊTE. Un courrier
+    ordinaire n'en a pas — il ne peut donc pas expirer pendant qu'il attend
+    la pression, et un client qui veut une deadline en envoie une signée.
+    Une valeur illisible (0, None, négative) n'expire rien : on ne devine
+    pas une échéance."""
+    expires = row.get("signature_expires_ts")
+    if expires is None:
+        return False
+    try:
+        moment = float(expires)
+    except (TypeError, ValueError):
+        return False
+    if moment <= 0:
+        return False
+    return moment <= (time.time() if now is None else float(now))
+
+
+def drop_expired(db: Db, rows: Sequence[dict]) -> int:
+    """#2814 : solde des requêtes expirées SANS lancer de tour.
+
+    Rend le nombre de messages marqués remis. Le message n'est pas perdu de
+    la boîte : son échéance était explicite, et le tour ne doit pas démarrer
+    après elle. Une erreur de base est laissée à l'appelant (le tour est
+    simplement différé, rien n'est consommé)."""
+    ids = [int(row["id"]) for row in rows or ()
+           if row.get("id") is not None and is_expired(row)]
+    return mark_delivered(db, ids) if ids else 0
 
 
 # --------------------------------------------------------------------------
