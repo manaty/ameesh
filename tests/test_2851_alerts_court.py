@@ -208,12 +208,18 @@ class NarrowReadsTest(PgTestCase):
         return self.hosts.record(row)
 
     def test_disk_history_ne_rend_que_les_champs_de_la_tendance(self):
-        self.record(volumes=[{"path": "/", "disk_free_bytes": 40 * 1024 ** 3}])
-        rows = self.hosts.disk_history("pc", 6 * 3600.0)
+        self.record(volumes=[{"path": "/", "paths": ["/"], "fstype": "ext4",
+                              "disk_free_bytes": 40 * 1024 ** 3,
+                              "disk_total_bytes": 100 * 1024 ** 3}])
+        rows = self.hosts.disk_history("pc", 6 * 3600.0, 300.0)
         self.assertEqual(len(rows), 1)
         self.assertEqual(set(rows[0]),
                          {"id", "sampled_ts", "volumes", "disk_path", "disk_free_bytes"})
-        self.assertEqual(rows[0]["volumes"][0]["path"], "/")
+        # #2879 : les champs de tendance seuls suffisent, le reste (fstype,
+        # capacité) ne traverse plus le lien à chaque tranche.
+        self.assertEqual(rows[0]["volumes"][0],
+                         {"path": "/", "paths": ["/"],
+                          "disk_free_bytes": 40 * 1024 ** 3})
 
     def test_current_ne_rend_que_le_dernier_releve(self):
         self.record(mem_available_bytes=1024)

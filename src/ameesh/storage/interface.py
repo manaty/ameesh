@@ -3563,11 +3563,13 @@ class HostResources(Domain):
         oldest first (the pilot report)."""
 
     @abc.abstractmethod
-    def disk_history(self, host: str, since_s: float) -> list[dict]:
-        """#2851: the disk fields of the host's readings over the last
-        `since_s` seconds, oldest first (`id`, `sampled_ts`, `volumes`,
-        `disk_path`, `disk_free_bytes` only) — the disk trend does not pay for
-        the ~50 columns of `since` on thousands of readings."""
+    def disk_history(self, host: str, since_s: float, step_s: float) -> list[dict]:
+        """#2879: the disk fields of the host's readings over the last
+        `since_s` seconds, one reading per `step_s` bucket at most, oldest
+        first (`id`, `sampled_ts`, `volumes`, `disk_path`, `disk_free_bytes`
+        only) — the disk trend does not pay for the ~50 columns of `since`,
+        nor for every reading of a dense history. Each `volumes` entry is
+        reduced to its trend fields (`path`, `paths`, `disk_free_bytes`)."""
 
     @abc.abstractmethod
     def record_harness_version(self, host: str, harness: str, *, path: str | None,
