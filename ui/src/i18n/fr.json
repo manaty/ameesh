@@ -133,6 +133,8 @@
   "chat.unread": "{count} non lus",
   "chat.waiting": "En attente du prochain tour : l'agent lit votre message à son réveil.",
   "chat.asleep": "État de l'agent : {state}. Votre message attend dans sa boîte jusqu'à la reprise de l'agent.",
+  "chat.stopped": "État de l'agent : {state}. L'envoi est refusé immédiatement : rien n'est mis en attente ; reprenez d'abord l'agent avec `ameesh resume {agent}`.",
+  "chat.dead": "État de l'agent : {state}. Le bail de l'agent a expiré : votre message attend dans sa boîte jusqu'à ce que l'exécuteur le reprenne.",
   "chat.empty": "Aucun échange avec cet agent dans ses fils pour l'instant.",
   "chat.message": "Message à {agent}",
   "chat.send": "Envoyer",
