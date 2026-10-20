@@ -151,7 +151,20 @@ class _Base(unittest.TestCase):
                                      return_value=("claude", "codex", "deepseek")),
                    mock.patch.object(merge_queue, "actor_family",
                                      side_effect=lambda db, n, **_: self.FAMILIES.get(
-                                         str(n or "").strip(), ""))]
+                                         str(n or "").strip(), "")),
+                   # #1515/#2808 : ce dépôt de banc commite avec une identité
+                   # générique (`t`), sans provenance d'agent ; la porte lirait
+                   # une plage dont l'auteur n'a pas de famille et refuserait
+                   # au nom de `t`. Ce que le banc simule, c'est l'assigné
+                   # auteur du lot (`FAMILIES`) : la lecture complète rend
+                   # cette liste, comme `test_1003_merge_pr`.
+                   mock.patch.object(
+                       merge_queue, "_complete_authors",
+                       side_effect=lambda db, item, *a, **kw: (
+                           [{"name": str(item.get("assignee") or "").strip(),
+                             "family": self.FAMILIES.get(
+                                 str(item.get("assignee") or "").strip(), "")}]
+                           if str(item.get("assignee") or "").strip() else [], ()))]
         if getattr(self, "PACKET_GUARD", True):
             # #2333 : ces bancs sans base simulent la mécanique de file ; la
             # garde du paquet y est simulée (les témoins de la garde elle-même
@@ -1458,8 +1471,13 @@ class QueueWithoutRadarTest(PgTestCase):
         # en échec fermé. Ce témoin porte sur le clone jetable et la tête
         # fraîche, pas sur les auteurs/correcteurs : la lecture ne rend rien
         # (#2808 : None, plage non lue — pas (None, []), une lecture vide).
+        # #1515/#2808 : la lecture complète rend l'assigné simulé (a1), sans
+        # quoi la porte refuserait au nom de l'auteur Git générique `t`.
         with mock.patch.object(merge_queue, "_attribution_on_freeze",
                                return_value=None), \
+                mock.patch.object(merge_queue, "_complete_authors",
+                                  return_value=([{"name": "a1", "family": "deepseek"}],
+                                                ())), \
                 mock.patch.object(merge_queue, "radar_project", return_value=None), \
                 mock.patch.object(radar, "github_ci",
                                   return_value=lambda branch: dict(status)), \

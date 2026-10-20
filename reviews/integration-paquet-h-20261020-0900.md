@@ -101,6 +101,37 @@ marqueur de conflit). Le seul contenu hors fusions est ce manifeste.
   revue unitaire du paquet pour seul avis de la demande de CI (§12,
   `--full --avis 0`).
 
+## Correction de composition (CI rouge du 20/10, run 39391717331)
+
+La première suite complète sur `b8333531` a trouvé des bancs non adaptés aux
+comportements relus des unités (aucun défaut de production) :
+
+1. **Bancs de file/atterrissage/train** (`test_l160e2_land`, `test_2286`,
+   `test_l160e_merge_queue`, `test_1651_ci_parts`, `test_1467_train`,
+   `test_1467_train_transports`, `test_1467_train_candidates`,
+   `test_l160g_nexlink`, `test_2428_radar_clone_lock`) : ces dépôts de banc
+   committent avec l'identité générique `t`. Depuis #1515/#2808, la porte lit
+   la provenance complète de la plage et refuse une famille inconnue
+   (`no known model family`), donc `enter` refusait dès l'admission. Le banc
+   simule l'assigné auteur (`FAMILIES`) : `_Base` rend cette lecture
+   (`merge_queue._complete_authors`), comme `test_1003_merge_pr`, et
+   `QueueWithoutRadarTest` fait de même pour son dépôt réel.
+2. **Gel en SHA complet** (#2786) : `test_1465_provenance` (deux témoins) et
+   `test_l96_roadmap` déclaraient encore un gel symbolique ou sans tête. Ils
+   sont réécrits sur le contrat actuel : un vrai commit de branche de lot pour
+   la preuve ; une ref symbolique (`main`, `HEAD`, un tag) est refusée
+   `head-missing` sans écrire ni jalon ni preuve ; le témoin Gantt nomme un
+   commit complet.
+3. **Contrat de l'exécuteur médié** : `hosts.disk_history` (#2851) manquait à
+   la liste des opérations refusées ; ajoutée (`contract.json`) et compteurs
+   du document mis à jour (404 refusées, 474 opérations).
+
+Ce sont des adaptations de bancs et de liste de refus, sans changement de
+comportement de production : aucun avis supplémentaire n'est requis (§2,
+adaptation de test ; §11 bis). Les tests ciblés des modules touchés sont verts
+en local (les deux pilotes pour les bancs sans base, psql pour les autres) ;
+une nouvelle suite complète est demandée sur la tête corrigée.
+
 ## Notes d'activation
 
 - #2861 (P1) : le correctif doit être dans la release staging de 11:00 — au
