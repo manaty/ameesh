@@ -858,6 +858,58 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertEqual(designated(work.get(self.db, self.lot)), ["r1", "r2"])
         self.assertTrue([n for n in self.notes() if "manual reviewer(s)" in n])
 
+    def test_a_manual_reviewer_with_an_unavailable_policy_alerts_and_says_unknown(self):
+        # #2637 : prepare -> Unavailable avec un manuel ne doit plus faire croire
+        # que les avis requis sont couverts, ni taire l'alerte pilote.
+        bad = _Canon(os.path.join(self.tmp, "canon-sans-mecanique"), mechanics=None)
+        cfg = dataclasses.replace(self.cfg, canon=bad.root, canon_ref="HEAD")
+        work.move(self.db, self.lot, "qa")
+        work.designate_reviewer(self.cfg, self.db, self.lot, "r1",
+                                actor="human:smichea")
+        before = len(self.mailbox())
+        _, out = self.freeze(cfg=cfg)
+        self.assertEqual(out["state"], "manual", out)
+        self.assertIn("coverage unknown", out["why"])
+        self.assertEqual([m["recipient"] for m in self.mailbox()[before:]], ["pilot"])
+        notes = [n for n in self.notes() if "coverage of the required" in n]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("manual reviewer(s) kept (r1)", notes[0])
+        self.assertIn("policy unavailable", notes[0])
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1"])
+
+    def test_a_manual_reviewer_with_a_prepare_exception_alerts_and_says_unknown(self):
+        # #2637 : prepare lève, le manuel reste ; l'alerte interne et la
+        # couverture inconnue sont explicites, aucun relecteur n'est ajouté.
+        work.move(self.db, self.lot, "qa")
+        work.designate_reviewer(self.cfg, self.db, self.lot, "r1",
+                                actor="human:smichea")
+        before = len(self.mailbox())
+        with mock.patch.object(act, "prepare", side_effect=RuntimeError("injected")):
+            _, out = self.freeze()
+        self.assertEqual(out["state"], "manual", out)
+        self.assertIn("coverage unknown", out["why"])
+        self.assertEqual([m["recipient"] for m in self.mailbox()[before:]], ["pilot"])
+        notes = [n for n in self.notes() if "coverage of the required" in n]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("internal designation error: RuntimeError: injected", notes[0])
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1"])
+
+    def test_a_manual_reviewer_without_a_canon_notes_unknown_coverage_silently(self):
+        # #2637 : source silencieuse (aucun canon) : pas de courrier, mais la
+        # note ne prétend pas non plus que la couverture est acquise.
+        cfg = dataclasses.replace(self.cfg, canon="")
+        work.move(self.db, self.lot, "qa")
+        work.designate_reviewer(self.cfg, self.db, self.lot, "r1",
+                                actor="human:smichea")
+        before = len(self.mailbox())
+        _, out = self.freeze(cfg=cfg)
+        self.assertEqual(out["state"], "manual", out)
+        self.assertEqual(len(self.mailbox()), before)
+        notes = [n for n in self.notes() if "coverage of the required" in n]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("no canon configured", notes[0])
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1"])
+
     def test_an_insufficient_manual_designation_gets_the_missing_reviewer(self):
         # #2627 / constat #2551 : deux avis requis, un seul relecteur manuel
         # (claude). Le manque est désigné, le manuel reste en place.
