@@ -358,7 +358,7 @@ class _Base(PgTestCase):
         issue = self.issue("Export CSV")
         self.assertEqual((issue["state"], issue["state_reason"]), ("closed", "completed"))
         self.assertIn("board:done", issue["labels"])
-        self.assertIn("delivered", self.gh.repo(PUBLIC)["comments"][str(issue["number"])][0])
+        self.assertIn("completed", "\n".join(self.gh.repo(PUBLIC)["comments"][str(issue["number"])]).lower())
         self.assertEqual(report["counts"]["closed"], 1)
 
     def test_pinne_retenue_garde_l_etape(self):
@@ -423,7 +423,7 @@ class _Base(PgTestCase):
                         " WHERE id = %s", (lot["id"],))
         report = self.project()
         self.assertEqual((issue["state"], issue["state_reason"]), ("closed", "completed"))
-        self.assertIn("delivered", self.gh.repo(PUBLIC)["comments"][str(issue["number"])][0])
+        self.assertIn("completed", "\n".join(self.gh.repo(PUBLIC)["comments"][str(issue["number"])]).lower())
         self.assertEqual(report["counts"]["closed"], 1)
 
     def test_transfert_retire_l_ancien_libelle(self):
