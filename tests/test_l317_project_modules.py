@@ -249,6 +249,44 @@ class ModuleConfigurationTest(unittest.TestCase):
                     apply.assert_called_once_with(lock.db, c)
 
 
+class ExternalDiscoveryTest(unittest.TestCase):
+    """Un paquet réellement présent dans l'environnement est découvert."""
+
+    module_name = "tpk_lifecycle_2847"
+
+    def test_a_real_installed_distribution_is_discovered(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder, "%s.py" % self.module_name)
+            source.write_text(
+                "NAME = 'lifecycle'\n"
+                "TYPES = ('docs', 'investigation', 'governance-tracking',\n"
+                "         'promotion', 'human_operation')\n"
+                "def descriptor(options=None):\n"
+                "    options = dict(options or {})\n"
+                "    if options:\n"
+                "        raise ValueError('unknown option')\n"
+                "    return {'types': list(TYPES), 'schemas': {}, 'rules': []}\n")
+            info = Path(folder, "tpk_ameesh_lifecycle-0.1.0.dist-info")
+            info.mkdir()
+            (info / "METADATA").write_text(
+                "Metadata-Version: 2.1\nName: tpk-ameesh-lifecycle\nVersion: 0.1.0\n")
+            (info / "entry_points.txt").write_text(
+                "[ameesh.modules]\nlifecycle = %s\n" % self.module_name)
+            sys.path.insert(0, folder)
+            try:
+                registry = modules.installed()
+                rows = modules.evidence()
+            finally:
+                sys.path.remove(folder)
+                sys.modules.pop(self.module_name, None)
+        self.assertEqual(registry["lifecycle"].NAME, "lifecycle")
+        row = next(item for item in rows if item["name"] == "lifecycle")
+        self.assertTrue(row["ok"])
+        self.assertEqual(row["distribution"], "tpk-ameesh-lifecycle")
+        self.assertEqual(row["version"], "0.1.0")
+        self.assertEqual(len(row["descriptor_sha256"]), 64)
+
+
 class ExecutionTest(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
