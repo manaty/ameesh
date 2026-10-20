@@ -481,6 +481,10 @@ def _pending_spend_row(row: dict | None) -> dict | None:
         # #2166 : la clé exacte du grand livre et de la réservation #1469 ;
         # None sur un marqueur d'avant 0471 (clé historique dérivée du float8).
         "spend_key": row.get("spend_key"),
+        # #2166 : la clé déjà écrite par ce tour — celle du marqueur, ou la
+        # clé durable retrouvée dans sa ligne/réservation (marqueur d'avant
+        # 0471, quelle que soit la précision de la connexion de réparation).
+        "ledger_key": row.get("ledger_key") or row.get("spend_key"),
         # #796 : le lot du tour (None si inconnu, ou marqueur d'avant 0423)
         "work_item_id": row.get("work_item_id"),
         # #796 : l'identifiant du tour, pour relier la ligne à ses ressources
