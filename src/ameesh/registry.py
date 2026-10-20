@@ -520,6 +520,15 @@ def set_status(
     storage.of(db).agents.set_status(name, status, status_text, error, stop_reason)
 
 
+def set_status_text(db: Db, name: str, text: str) -> bool:
+    """#2789 : le texte libre d'un agent (`agent-mail status`), jamais son
+    statut — un tour en cours reste `running`. Faux si l'agent est inconnu,
+    retenu ou arrêté (son texte est alors un marqueur, gardé)."""
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.set_status_text")
+    return storage.of(db).agents.set_status_text(name, text)
+
+
 def set_mode(db: Db, name: str, mode: str) -> bool:
     """Change le mode d'un agent (`ameesh set <agent> mode=…`, L37)."""
     from .agent_names import resolve as resolve_agent_name
