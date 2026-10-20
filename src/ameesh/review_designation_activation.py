@@ -27,8 +27,12 @@ Inputs, all from machine sources (never a note, an assignment or a name):
   every commit of the frozen range through its exact provenance receipt
   (#1465), except a designated reviewer's first-round correction under the §2
   threshold (#2638: ≤ ~50 changed lines, no design). A commit without a
-  receipt makes the designation wait: an unknown family cannot prove
-  independence;
+  receipt is attributed by its agent committer's session family in the turn
+  journal (`review_authors`, #2681): the reference author stays the author, a
+  designated reviewer's small fix stays a correction; any other commit makes
+  the designation wait, because an unknown family cannot prove independence.
+  #2721 names that fallback in the mark (`proof: turn-journal`,
+  `fallback_commits`), never as an exact receipt;
 - **candidates**: the registry rows of the lot's project, real session family
   only (`registry.live_harness`), availability and open-lot load;
 - **pilot**: the project's `orchestrateur` in the canon, when registered; an
@@ -69,7 +73,7 @@ from . import canon as canon_mod
 from . import lot_class, mechanics, plan_git, projects, registry, review
 from . import review_designation as rd
 from . import review_designation_pg as pg
-from . import review_lot, review_provenance, storage, work
+from . import review_authors, storage, work
 
 #: the sender of the journal notes and automatic mails
 SENDER = pg.SENDER
@@ -86,12 +90,10 @@ LIGHT_WHY = ("light lot: no pre-merge reviewer is due (the other-family review"
 NO_PATH_WHY = "no changed path: no review due"
 #: a frozen range longer than this is not read in one selection (bounded work)
 MAX_COMMITS = 500
-#: canon §2: a reviewer's first-round correction is a small fix up to ~50
-#: changed lines; beyond that (or for a design change) its author becomes an
-#: author of the head (#2638)
-REVIEWER_FIX_LINES = 50
-#: canon §2 "ou de conception": a design document is never a small fix
-DESIGN_PREFIXES = ("docs/design/",)
+#: #2681 : le seuil et la lecture des auteurs sont celles de la porte et du
+#: train (`review_authors`), pas une seconde règle locale.
+REVIEWER_FIX_LINES = review_authors.REVIEWER_FIX_LINES
+DESIGN_PREFIXES = review_authors.DESIGN_PREFIXES
 
 #: a run of `retry_pending` reads at most this many unavailable notes
 RETRY_SCAN = 200
@@ -155,6 +157,9 @@ class Inputs:
     policy: Policy
     authors: list
     unknown_authors: list
+    #: designated reviewers' small first-round corrections (#2638): never
+    #: designated again, their family stays eligible (#2739)
+    correctors: list
     candidates: list
     notify: str
     manual: list = field(default_factory=list)
@@ -535,7 +540,7 @@ def _resolve_base(repo: str, base: str) -> str:
     return ""
 
 
-def _range(repo: str, base: str, head: str) -> tuple[str, list, list]:
+def _range(repo: str, base: str, head: str, *, bounded: bool = True) -> tuple[str, list, list]:
     """`(start, paths, commits)` of the lot's own frozen change."""
     base = _resolve_base(repo, base)
     if not base:
@@ -553,7 +558,7 @@ def _range(repo: str, base: str, head: str) -> tuple[str, list, list]:
                                  "%s..%s" % (start, head)) or "").split()
     except canon_mod.GitError as exc:
         raise ActivationError("cannot read the frozen diff: %s" % exc) from exc
-    if len(commits) > MAX_COMMITS:
+    if bounded and len(commits) > MAX_COMMITS:
         raise ActivationError("the frozen range carries %d commits (limit %d):"
                               " refusing an unbounded provenance read"
                               % (len(commits), MAX_COMMITS))
@@ -561,11 +566,66 @@ def _range(repo: str, base: str, head: str) -> tuple[str, list, list]:
 
 
 # --------------------------------------------------------------------------
-# the authors: the assignee at freeze and each commit's exact receipt
+# the authors: one reading shared with the train and the merge gate (#2681)
 # --------------------------------------------------------------------------
 
-def _family(harness, families) -> str:
-    return review_lot.family_of(str(harness or ""), families)
+def _designation_authority(db, actor: str) -> bool:
+    """May `actor` have written a `reviewer X designated` journal line (#2739)?
+
+    The line is only a text: any agent can copy it in a free note, so the text
+    alone proves nothing. The write path (`work.designate_reviewer`) already
+    admits only the system, a human, or an orchestrator/design agent; the
+    journal read applies the same authority, so an ordinary agent's note cannot
+    make itself a designated reviewer (and excuse its own commit as a fix).
+    """
+    actor = str(actor or "").strip()
+    if not actor:
+        return False
+    if actor == work.SYSTEM_SENDER or actor.startswith(work.HUMAN_PREFIX):
+        return True
+    try:
+        from . import assignments
+        return assignments.is_orchestrator(
+            getattr(db, "cfg", None), db, actor,
+            roles=work.CORRECTOR_ROLES, history=False)
+    except Exception:  # noqa: BLE001 - unreadable authority: no name counted
+        return False
+
+
+def _journal_reviewers(db, lot: int, *, until=None) -> list:
+    """The reviewer names designated by hand in the lot journal (#2739).
+
+    `work_items.reviewers` is the live column; `work reviewer --remove` retires
+    a manual seat and the column no longer carries the name. The journal keeps
+    the designation (`reviewer X designated`), so a manual reviewer who pushed
+    a first-round correction stays recognizable after their seat is retired,
+    exactly like the automatic names of the marks (#2638). Only a line written
+    by a designation authority counts (`_designation_authority`): a free note
+    carrying the same words is not a designation. With `until` (the freeze
+    instant), a reviewer named after the freeze is ignored: they did not
+    review that head.
+    """
+    names: list[str] = []
+    try:
+        events = storage.of(db).work.events(int(lot), 500) or []
+    except Exception:  # noqa: BLE001 - unreadable journal: no manual name
+        return names
+    for event in events:
+        note = str((event or {}).get("note") or "").strip()
+        if not note.startswith("reviewer ") or not note.endswith(" designated"):
+            continue
+        if not _designation_authority(db, (event or {}).get("actor")):
+            continue
+        if until is not None:
+            try:
+                if float((event or {}).get("created_ts") or 0.0) > float(until):
+                    continue
+            except (TypeError, ValueError):
+                continue
+        name = note[len("reviewer "):-len(" designated")].strip()
+        if name and name not in names:
+            names.append(name)
+    return names
 
 
 def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
@@ -575,7 +635,9 @@ def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
     The current column holds the previous freeze's automatic names and the
     manual exception; the journal marks keep the names a later freeze retired.
     A reviewer who pushed a first-round correction must stay recognizable after
-    the freeze that retired them (#2638). The lot author is never a reviewer.
+    the freeze that retired them (#2638) — including a **manual** reviewer
+    whose seat was retired from the column (#2739), read from the journal. The
+    lot author is never a reviewer.
     """
     names: list[str] = []
     lot = int((item or {}).get("id") or 0)
@@ -583,6 +645,11 @@ def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
     try:
         names.extend(_previous_reviewers(db, lot, freeze_id))
     except Exception:  # noqa: BLE001 - unreadable journal: no automatic name
+        pass
+    try:
+        names.extend(_journal_reviewers(db, lot,
+                                        until=(milestone or {}).get("at_ts")))
+    except Exception:  # noqa: BLE001 - unreadable journal: no manual name
         pass
     try:
         from .work_reviewers import designated
@@ -594,121 +661,40 @@ def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
             if str(value).strip() and str(value).strip() != author}
 
 
-def _change(repo: str, sha: str) -> Optional[tuple[int, bool]]:
-    """`(changed lines, touches a design path)` of one commit, or None.
+def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
+                        repo: str, base: str, head: str, *, families=()) -> tuple[list, list, list]:
+    """`(auteurs, inconnus, correcteurs)` de la plage gelée `base..head` (#2681/#2739).
 
-    `None` means the diff is unreadable: the caller must not guess a small fix.
-    A binary change is never a small fix, and neither is a design document
-    (canon §2: a correction "> ~50 lignes ou de conception" goes back to the
-    author, #2638)."""
-    if not repo:
-        return None
-    text = plan_git._out(repo, "show", "--numstat", "-z", "--format=", "--no-renames", sha)
-    if text is None:
-        return None
-    lines, design = 0, False
-    for row in str(text).split("\0"):
-        if not row:
-            continue
-        fields = row.split("\t", 2)
-        if len(fields) < 3:
-            return None
-        added, removed, path = fields
-        if added == "-" or removed == "-":
-            return REVIEWER_FIX_LINES + 1, design
-        try:
-            lines += int(added) + int(removed)
-        except ValueError:
-            return None
-        if path.startswith(DESIGN_PREFIXES):
-            design = True
-    return lines, design
-
-
-def _authors(db, item: Mapping, milestone: Optional[Mapping],
-             commits: Sequence[str], repo: str = "", families=()) -> tuple[list, list]:
-    """`(authors, unknown authors)` drawn from the freeze and exact receipts.
-
-    The reference author is the lot's author at freeze (the assignee, exactly
-    as `merge_queue.review_gate` reads it). Every other commit counts as an
-    author, with one exception: a **designated reviewer's** first-round
-    correction under the §2 threshold (`REVIEWER_FIX_LINES`, no design change)
-    does not make its author an author of the head — their family stays
-    eligible, and the same reviewer may be designated again on the new head.
-    A larger or design change makes them an author like any other (#2638).
-
-    `families` are the compiled canon's model families (#2664), read at the
-    same audited commit as the policy: no local list is assumed.
+    La même lecture partagée que la désignation (`review_authors.reading`),
+    offerte à la porte de fusion : quand l'appelant ne passe pas les auteurs,
+    elle les lit elle-même sur la plage exacte et exclut tous les auteurs
+    reconnus, pas seulement l'assigné (#2726). `milestone` est le gel du lot
+    quand la tête est celle-là ; il laisse `_designated_reviewers` reconnaître
+    un correcteur retiré par une désignation ultérieure. Ne lève pas sur un
+    inconnu : l'appelant décide (la porte refuse fermé, le train lève).
     """
-    lot = int((item or {}).get("id") or 0)
-    assignee = str((item or {}).get("assignee") or "").strip()
-    author = {}
-    try:
-        author = review_lot._author_at_freeze(db, lot, dict(item or {})) or {}
-    except Exception:  # noqa: BLE001 - unreadable trace: unknown family
-        author = {}
-    name = str(author.get("name") or assignee).strip()
-    family = _family(author.get("harness"), families)
-    if not family and milestone is not None:
-        try:
-            proof = review_provenance.receipt_for_milestone(db, int(milestone["id"]))
-        except (review_provenance.ProvenanceError, KeyError, TypeError, ValueError):
-            proof = None
-        if proof and str(proof.get("actor") or "").strip() == name:
-            family = _family(proof.get("harness"), families)
-    if not family and name and (milestone is None
-                                or str(milestone.get("actor") or "").strip()
-                                in ("", name)):
-        try:
-            row = registry.get(db, name) or {}
-            # the declared harness is not a session: only an opened session
-            # proves the family that really ran (L242b, #1037)
-            if row.get("session_id") or row.get("session_harness"):
-                family = _family(row.get("session_harness"), families)
-        except Exception:  # noqa: BLE001 - no session: the family stays unknown
-            family = ""
-    reviewers = _designated_reviewers(db, item, milestone, name)
-    by_name: dict[str, set] = {}
-    if name:
-        by_name.setdefault(name, set()).add(family)
-    unknown = []
-    review_commits: dict[str, list[tuple[str, str]]] = {}
-    for sha in commits or ():
-        try:
-            receipt = review_provenance.receipt_for_commit(db, sha)
-        except review_provenance.ProvenanceError:
-            receipt = None
-        if receipt is None:
-            unknown.append(str(sha)[:12])
-            continue
-        actor = str(receipt.get("actor") or "").strip()
-        if not actor:
-            continue
-        proven = _family(receipt.get("harness"), families)
-        if actor != name and actor in reviewers:
-            # held until the §2 threshold is known for their whole correction
-            review_commits.setdefault(actor, []).append((str(sha), proven))
-            continue
-        by_name.setdefault(actor, set()).add(proven)
-    for actor, entries in sorted(review_commits.items()):
-        total, design = 0, False
-        for sha, _proven in entries:
-            change = _change(repo, sha)
-            if change is None or change[1]:
-                design = True
-                break
-            total += change[0]
-        if design or total > REVIEWER_FIX_LINES:
-            # beyond the small first-round fix: they authored the head
-            by_name.setdefault(actor, set()).update(
-                proven for _sha, proven in entries if proven)
-    authors = []
-    for actor in sorted(by_name):
-        families = {f for f in by_name[actor] if f}
-        # one actor with two proven families is an ambiguity: never guess
-        family = next(iter(families)) if len(families) == 1 else ""
-        authors.append({"name": actor, "family": family})
-    return authors, unknown
+    _start, _paths, commits = _range(repo, base, head)
+    return review_authors.reading(db, item, milestone, commits, repo,
+                                  families=families)
+
+
+def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
+                        repo: str, base: str, head: str, *, families=()) -> list:
+    """The designated reviewers' small first-round corrections of `base..head`.
+
+    Read from the exact frozen commits and their provenance receipts, never
+    from a designation mark: a head re-integrated under a new SHA is read as it
+    stands (#2739). `milestone` is the lot's freeze when it is this head; it
+    lets `_designated_reviewers` recognise a corrector retired by a later
+    designation. The caller (the merge gate) handles an unreadable range as it
+    must; this reader invents no name.
+    """
+    _authors, unknown, correctors = attribution_of_head(
+        db, item, milestone, repo, base, head, families=families)
+    if unknown:
+        raise ActivationError("author provenance unknown for frozen commit(s): %s"
+                              % ", ".join(unknown))
+    return correctors
 
 
 # --------------------------------------------------------------------------
@@ -818,16 +804,20 @@ def _waiver(item: Mapping) -> bool:
 
 
 def _manual_seats(manual: Sequence[str], listing: Sequence[Mapping],
-                  authors: Sequence[Mapping], families) -> list:
+                  authors: Sequence[Mapping], families, *,
+                  correctors: Sequence[Mapping] = ()) -> list:
     """The manual reviewers that cover a required seat (#2627).
 
     A manual reviewer is always kept in the column; this only says which ones
     count: a known family of the compiled policy, distinct from every author's
     family and from the other manual reviewers. An unknown family, or the
     author's family, does not prove independence: the seat remains missing and
-    is designated automatically. The list is ordered like the column.
+    is designated automatically. A corrector cannot count its own seat either
+    (#2739): its family stays eligible, its name does not. The list is ordered
+    like the column.
     """
     forbidden_names, forbidden_families = rd.families_of(authors)
+    forbidden_names = forbidden_names | rd.names_of(correctors)
     rows = {str((row or {}).get("name") or ""): row for row in listing or ()}
     covered = set(forbidden_families)
     seats = []
@@ -893,10 +883,23 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     base = lot_class.default_base(cfg, item, repo)
     if not base:
         return Unavailable("no target branch known for lot #%d" % int(lot))
+    from . import packet_reviews
+
     try:
-        start, paths, commits = _range(repo, base, str(freeze.get("sha") or ""))
+        start, paths, commits = _range(repo, base, frozen_sha,
+                                       bounded=not packet_reviews.is_vehicle(item))
     except ActivationError as exc:
         return Unavailable(str(exc))
+    if packet_reviews.is_vehicle(item):
+        # #2766 : un véhicule ne désigne que pour son delta propre ; les
+        # membres portent leurs avis sur leur propre tête gelée.
+        try:
+            own = packet_reviews.designation_changes(db, int(lot), item, repo, start,
+                                                     frozen_sha)
+        except packet_reviews.VehicleError as exc:
+            return Unavailable("vehicle review unreadable: %s" % exc)
+        if own is not None:
+            paths, commits = own["paths"], own["commits"]
     project = str(item.get("app") or "").strip()
     if not project:
         return Unavailable("lot #%d declares no project: the review policy is unknown"
@@ -909,14 +912,14 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                       commits=commits,
                       policy=Policy(rules=(), families=(), risk="light", required=0,
                                     ref="", commit="", source=""),
-                      authors=[], unknown_authors=[], candidates=[], notify="",
-                      manual=manual, waiver=waiver)
+                      authors=[], unknown_authors=[], correctors=[], candidates=[],
+                      notify="", manual=manual, waiver=waiver)
     policy = _policy(cfg, db, project, paths)
     if isinstance(policy, Unavailable):
         return policy
     listing = registry.overview(db)
     notify = _notify(cfg, db, project, listing)
-    families = policy.families or rd.KNOWN_FAMILIES
+    families = policy.families
     candidates = rd.candidates_from_registry(
         listing, loads=_loads(db), project=project, families=families)
     if notify:
@@ -924,13 +927,15 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         # project's agents, so the two roles never collapse into one mail
         candidates = [candidate for candidate in candidates
                       if candidate.name != notify]
-    authors, unknown = _authors(db, item, freeze, commits, repo,
-                                families=policy.families)
+    authors, unknown, correctors = review_authors.reading(
+        db, item, freeze, commits, repo, families=policy.families, trace=True)
     return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=paths,
                   commits=commits, policy=policy, authors=authors,
-                  unknown_authors=unknown, candidates=candidates, notify=notify,
+                  unknown_authors=unknown, correctors=correctors,
+                  candidates=candidates, notify=notify,
                   manual=manual, waiver=waiver,
-                  manual_seats=_manual_seats(manual, listing, authors, families),
+                  manual_seats=_manual_seats(manual, listing, authors, families,
+                                             correctors=correctors),
                   advances=_advances(db))
 
 
@@ -1313,9 +1318,9 @@ def _selection(inputs: Inputs, port, *, force: bool = False) -> dict:
         authors=inputs.authors, candidates=inputs.candidates,
         risk=inputs.policy.risk, base=inputs.base, policy_ref=inputs.policy.ref,
         notify=inputs.notify, unknown_authors=inputs.unknown_authors,
-        families=inputs.policy.families or rd.KNOWN_FAMILIES,
-        already=inputs.manual_seats, required=inputs.policy.required,
-        advances=inputs.advances)
+        families=inputs.policy.families,
+        already=inputs.manual_seats, fixers=inputs.correctors,
+        required=inputs.policy.required, advances=inputs.advances)
 
 
 def carried_plan(cfg, db, lot: int, sha: str) -> Optional[dict]:
@@ -1438,8 +1443,9 @@ def _manual_outcome(db, item: Mapping, freeze: Mapping, manual: Sequence[str], *
             "why": why}
 
 
-def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
-                             threads: list, carried: Optional[Mapping] = None) -> dict:
+def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
+                              threads: list, carried: Optional[Mapping] = None,
+                              reading: Optional[dict] = None) -> dict:
     """The `on_frozen` body: all writes stay in the freeze's transaction.
 
     `carried` (#2487) : le plan du report quand il couvre la tête gelée ; la
@@ -1490,6 +1496,13 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
             _sync_reviewers(tx, item, freeze, [])
         return {"state": "unavailable", "reviewers": [], "freeze": freeze,
                 "why": inputs.why}
+    if reading is not None:
+        # #2812 : la même lecture que la désignation, réutilisée par la
+        # notification des blocages levés (aucune lecture git redoublée).
+        reading["excluded"] = {
+            str(row.get("name") or "").strip().lower()
+            for row in list(inputs.authors or ()) + list(inputs.correctors or ())
+            if str(row.get("name") or "").strip()}
     if _manual_covers(inputs):
         return _manual_outcome(tx, item, freeze, inputs.manual)
     checkpoint = len(threads)
@@ -1528,6 +1541,151 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
             raise exc
         del threads[checkpoint:]
         return _internal_failure(cfg, tx, item, freeze, threads, exc)
+
+
+#: journal prefix of the "your earlier block is superseded" notification
+SUPERSEDED_PREFIX = "review-block-superseded:"
+
+
+def _excluded_on_freeze(cfg, db, item: Mapping, freeze: Mapping) -> set[str]:
+    """Les noms que la porte écarte sur cette tête gelée (#2812).
+
+    Même lecture que la porte et la désignation (`review_authors.reading`) :
+    les auteurs de la plage gelée et les petits correctifs de premier tour des
+    relecteurs désignés. Le gel n'envoie donc pas l'invitation à un agent qui
+    ne peut pas rendre un avis indépendant. Une lecture impossible rend
+    l'ensemble vide : la notification garde son comportement historique et ne
+    perd jamais un gel.
+    """
+    sha = str((freeze or {}).get("sha") or "").strip().lower()
+    if cfg is None or db is None or not sha:
+        return set()
+    try:
+        item = dict(item or {})
+        repo = _repository(db, cfg, item, sha, fetch=False)
+        if not repo:
+            return set()
+        base = lot_class.default_base(cfg, item, repo)
+        if not base:
+            return set()
+        _start, _paths, commits = _range(repo, base, sha)
+        authors, _unknown, correctors = review_authors.reading(
+            db, item, dict(freeze or {}), commits, repo, families=())
+    except Exception:  # noqa: BLE001 - plage illisible : comportement historique
+        return set()
+    return {str(row.get("name") or "").strip().lower()
+            for row in list(authors or ()) + list(correctors or ())
+            if str(row.get("name") or "").strip()}
+
+
+def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mapping,
+                              threads: list, *, cfg=None,
+                              excluded: set[str] | None = None) -> None:
+    """Notifie le relecteur dont le blocage portait sur une tête antérieure.
+
+    #2681 : la porte ne lit que les verdicts de la tête gelée ; un blocage
+    posé sur une tête antérieure ne bloque plus, et un `ok` indépendant sur la
+    nouvelle tête suffit. Le relecteur qui a bloqué doit le savoir : un
+    `notify` par (lot, gel, relecteur), jamais un doublon, et pas de courrier
+    quand sa désignation du gel le prévient déjà. Une lecture impossible ne
+    perd jamais un gel : la notification est au mieux.
+
+    #2812 : on n'invite pas un agent que la porte écarte sur cette tête — un
+    auteur de la plage gelée ou un relecteur dont le petit correctif de premier
+    tour est lu par `review_authors.reading`. `excluded` est la lecture déjà
+    faite par la désignation ; à défaut (`None`), elle est refaite ici, et son
+    échec laisse le courrier historique."""
+    lot = int((item or {}).get("id") or 0)
+    freeze_id = int((freeze or {}).get("id") or 0)
+    sha = str((freeze or {}).get("sha") or "").strip().lower()
+    state = str((outcome or {}).get("state") or "")
+    if not lot or not freeze_id or not sha or state in ("unavailable", "stale"):
+        return
+    rows = storage.of(db).work.milestones(lot, None)
+    latest: dict = {}
+    for row in rows or ():
+        if row.get("kind") != "verdict":
+            continue
+        actor = str(row.get("actor") or "").strip()
+        if not actor:
+            continue
+        key = actor.lower()
+        order = (float(row.get("at_ts") or 0.0), int(row.get("id") or 0))
+        if key not in latest or order > latest[key][0]:
+            latest[key] = (order, row)
+    designated = {str(row.get("name") or "").strip().lower()
+                  for row in (outcome or {}).get("reviewers") or ()}
+    designated.update(str(name or "").strip().lower()
+                      for name in (outcome or {}).get("manual") or ())
+    author = str((item or {}).get("assignee") or "").strip().lower()
+    candidates = []
+    for key, (_order, row) in sorted(latest.items()):
+        if (row.get("verdict") or "") != "blocked" or key == author:
+            continue
+        mark_sha = str(row.get("sha") or "").strip().lower()
+        current = bool(mark_sha) and (mark_sha == sha
+                                      or (len(mark_sha) >= 7 and sha.startswith(mark_sha)))
+        if current or key in designated:
+            # un blocage sur la tête gelée reste en vigueur ; une désignation
+            # du gel envoie déjà son propre courrier au relecteur
+            continue
+        candidates.append((key, row, mark_sha))
+    if not candidates:
+        return
+    if excluded is None:
+        excluded = _excluded_on_freeze(cfg, db, item, freeze)
+    for key, row, mark_sha in candidates:
+        if key in excluded:
+            # #2812 : auteur de la tête ou auteur d'un petit correctif, son
+            # avis ne compterait pas sur cette tête ; ne pas l'inviter.
+            continue
+        prefix = "%s%d:%d:%s:" % (SUPERSEDED_PREFIX, lot, freeze_id, key)
+        if storage.of(db).work.events_noted(prefix, 0.0, ids=[lot]):
+            continue
+        actor = str(row.get("actor") or "").strip()
+        body = "\n".join([
+            "Blocage levé par une tête plus récente (canon §2, #2681).",
+            "",
+            "Lot: #%s" % lot,
+            "- Votre dernier verdict sur une tête antérieure (%s) était BLOQUANT." % mark_sha[:12],
+            "- La tête gelée courante est %s : la porte ne lit que les verdicts de" % sha[:12],
+            "  cette tête. Un `ok` indépendant sur elle suffit ; votre blocage antérieur",
+            "  ne la refuse pas.",
+            "",
+            "Si vous voulez re-relire cette tête :",
+            "  ameesh work milestone %d verdict ok|blocked --sha %s --actor %s"
+            % (lot, sha, actor),
+        ])
+        storage.of(db).work.note(
+            lot, str((item or {}).get("state") or ""), prefix + sha,
+            SENDER)
+        from . import mail
+        mail.send(db, SENDER, actor, body, work_item_id=str(lot),
+                  payload={"review_block_superseded": {
+                      "lot": lot, "freeze": freeze_id, "sha": sha,
+                      "blocked_sha": mark_sha}},
+                  after_commit=threads)
+
+
+def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
+                             threads: list, carried: Optional[Mapping] = None) -> dict:
+    """The `on_frozen` body, plus the superseded-block notification (#2681).
+
+    The notification is best-effort: it runs after the designation writes, and
+    an error there never loses the freeze or its designation. The gate rule
+    (only the frozen head's verdicts) is unchanged; this only tells a reviewer
+    whose earlier block no longer blocks the new head."""
+    reading: dict = {}
+    result = _designate_in_transaction(cfg, tx, lot, milestone=milestone,
+                                       threads=threads, carried=carried,
+                                       reading=reading)
+    try:
+        item = work.get(tx, int(lot)) or {"id": int(lot)}
+        _notify_superseded_blocks(tx, item, milestone or {}, result, threads,
+                                  cfg=cfg, excluded=reading.get("excluded"))
+    except Exception:  # noqa: BLE001 - une notification ne perd pas un gel
+        pass
+    return result
 
 
 def hook(cfg, outcome: Optional[dict] = None, *, carried: Optional[Mapping] = None):
@@ -1658,6 +1816,10 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
             names = ([r.get("name") for r in out.get("reviewers") or ()]
                      if out.get("state") == rd.DESIGNATED else [])
             _sync_reviewers(tx, item, freeze, names)
+            try:
+                _notify_superseded_blocks(tx, item, freeze, out, threads)
+            except Exception:  # noqa: BLE001 - une notification ne perd rien
+                pass
         _drain(db, threads)
         return out
     except rd.StaleFreeze as exc:

@@ -105,7 +105,7 @@ def _reviewer_missing(alert: dict) -> str:
             "with no designated reviewer, so the wait belongs to nobody. Expected action: "
             "designate the reviewer: ameesh work reviewer %d <agent>; or take the "
             "review yourself and give the verdict: ameesh work milestone %d verdict "
-            "ok|blocked --note \"…\"." % (
+            "ok|blocked --sha <frozen head> --note \"…\"." % (
                 lot, " \"%s\"" % title if title else "", alert.get("lot_state") or "?",
                 sous_utilisation._duration(alert.get("value") or 0), lot, lot))
 
@@ -116,9 +116,9 @@ def _verdict_due(alert: dict) -> str:
     title = alert.get("title")
     return ("Verdict expected: lot #%d%s (%s) has been waiting for its verdict for %s; you "
             "are its designated reviewer. Expected action: review it and give your verdict: "
-            "ameesh work milestone %d verdict ok|blocked --note \"…\"; if you cannot, say so "
-            "on the lot (ameesh work note %d \"hold: <reason>\") so the project's "
-            "orchestrator can hand the review over." % (
+            "ameesh work milestone %d verdict ok|blocked --sha <frozen head> --note \"…\"; "
+            "if you cannot, say so on the lot (ameesh work note %d \"hold: <reason>\") so "
+            "the project's orchestrator can hand the review over." % (
                 lot, " \"%s\"" % title if title else "", alert.get("lot_state") or "?",
                 sous_utilisation._duration(alert.get("value") or 0), lot, lot))
 
@@ -290,6 +290,9 @@ def _slo_breach(alert: dict) -> str:
     holder = " --if-holder %s" % who if who else ""
     waiting = alert.get("waiting") or {}
     what = waiting.get("what") if isinstance(waiting, dict) else None
+    # #2511 : le lot cible le dépôt canon (manaty/home) ; un paquet ameesh ne
+    # le porte pas, la fusion est celle du bureau.
+    canon = bool(isinstance(waiting, dict) and waiting.get("canon"))
     # #2378 : une demande ouverte et échue (sinon le lot serait en attente
     # prévue) ; les cibles sont passées au pilote à toute étape
     # (`exploitation._slo_targets`), le brief les suit. Sans demande,
@@ -302,7 +305,17 @@ def _slo_breach(alert: dict) -> str:
         # addressed to the pilot never reaches the assignee.
         what = None
     if what in ("merge", "merge-approval", "merge-outcome"):
-        if level >= 3:
+        if canon:
+            if level >= 3:
+                move = ("bureau: merge it directly — its `canon/…` branch targets the canon "
+                        "repository (manaty/home), which an ameesh package does not carry; "
+                        "auditor: see that the bureau does it, do not reassign or nudge the "
+                        "holder")
+            else:
+                move = ("bureau: merge it directly — its `canon/…` branch targets the canon "
+                        "repository (manaty/home), outside the ameesh package; the "
+                        "pilot/composer cannot carry it, do not wait for them")
+        elif level >= 3:
             move = ("bureau or auditor: the lot waits for its merge vehicle/package — "
                     "the composer/pilot carries it, and reassigning or nudging its holder "
                     "does not advance it; push the pilot/composer to include it in the next "
@@ -446,17 +459,18 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             for name in _of_teams(orchestras, by_name, teams):
                 out.setdefault(name, text)
         bureau = by_name.get("bureau") or {}
-        # #2602: the external desk cannot read automatic mail; home host
-        # operations are the exception, since they can require that desk.
+        # #2602/#2640: the external desk cannot read automatic mail; its copy
+        # goes to the readable lot thread (`notify`). There is no `home`
+        # project — canon lots are `app=ameesh`, branch `canon/…` (#2511) — so
+        # the old exception could never fire.
         # `registry.MODES`: a human-driven session is `externe` (0030).
-        if "bureau" in roles and bureau and (
-                bureau.get("mode") != "externe" or alert.get("project") == "home"):
+        if "bureau" in roles and bureau and bureau.get("mode") != "externe":
             out.setdefault("bureau", text)
         if "auditeur" in roles:
             for name in auditor_names or ():
                 if name in by_name:
                     out.setdefault(name, text)
-        if bureau.get("mode") == "externe" and alert.get("project") != "home":
+        if bureau.get("mode") == "externe":
             out.pop("bureau", None)  # also when listed as pilot or auditor
         return out
     else:

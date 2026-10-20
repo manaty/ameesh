@@ -235,6 +235,12 @@ refuse (`selection-full`, `selection-unsafe`) : `ci run` continue et journalise
 l'indisponibilité (seul un rouge arrête la demande) ; le gel et le train
 continuent et le disent.
 
+Le bloc global vaut pour tous les projets, mais `scripts/test-plan.py` et le
+lanceur de part sont des outils du dépôt ameesh (#2794) : avant tout arbre,
+carte ou hôte, leur présence est vérifiée au SHA candidat ; un dépôt qui ne
+les porte pas (nexlink) est indisponible, cause `tooling-missing`, au lieu
+d'un `can't open file` journalisé en `selection-unsafe`.
+
 ## Raccords
 
 - #1616 (lecteur) : extension additive, tête gelée non élargie ; ce delta est

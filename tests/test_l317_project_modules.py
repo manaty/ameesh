@@ -234,21 +234,25 @@ class LifecycleGateTest(PgTestCase):
             work.merged(self.db, self.lot, sha="abcdef1234")
         self.assertEqual(work.close_merged(self.db, self.lot, source="sync-github")["result"], "refused")
         with self.assertRaises(db_mod.DbError):
-            work.milestone(self.db, self.lot, "verdict", verdict="ok")
+            work.milestone(self.db, self.lot, "verdict", verdict="ok",
+                           sha="a" * 40)
         self.assertEqual(work.get(self.db, self.lot)["state"], "intake")
         self.assertFalse(any(m["kind"] == "merged" for m in work.milestones(self.db, self.lot)))
-        work.milestone(self.db, self.lot, "verdict", verdict="blocked")
+        work.milestone(self.db, self.lot, "verdict", verdict="blocked",
+                       sha="a" * 40)
 
     def test_delivery_without_proof_still_blocks_go(self):
         it.declare(self.db, self.lot, self.artifact, actor="tester")
         with self.assertRaisesRegex(db_mod.DbError, "proof"):
-            work.milestone(self.db, self.lot, "verdict", verdict="ok")
+            work.milestone(self.db, self.lot, "verdict", verdict="ok",
+                           sha="a" * 40)
 
     def test_matching_execution_allows_go_merge_and_promotion(self):
         proof = self.prove()
         self.assertEqual(proof["payload"]["exit_code"], 0)
-        work.milestone(self.db, self.lot, "verdict", verdict="ok", sha="abcdef1234")
-        self.assertEqual(work.merged(self.db, self.lot, sha="abcdef1234")["result"], "merged")
+        work.milestone(self.db, self.lot, "verdict", verdict="ok",
+                       sha="a" * 40)
+        self.assertEqual(work.merged(self.db, self.lot, sha="a" * 40)["result"], "merged")
         self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "promoted")
 
     def test_work_move_and_raw_storage_cannot_bypass_gate(self):

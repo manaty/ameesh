@@ -917,7 +917,7 @@ class BriefDeLotTest(_Base):
         self.assertIn("lot/b1", text)
         self.assertIn("travail.py", text)
         self.assertIn("1 file changed", text)
-        self.assertIn("## Lot thread — decisions and unread messages", text)
+        self.assertIn("## Lot thread — decisions, unread and delivered messages", text)
         self.assertIn("un message non lu sur le lot", text)
         # jamais le contenu d'un autre lot, ni l'ancienne session, ni la liste
         # des lots assignés du brief de reprise
@@ -925,6 +925,126 @@ class BriefDeLotTest(_Base):
         self.assertNotIn("un message pour un autre lot", text)
         self.assertNotIn("Previous session", text)
         self.assertNotIn("Work items assigned to you", text)
+
+    def test_bascule_reprend_un_verdict_livre_du_lot_suivant(self):
+        """#2539 : un message livré dans la session d'un autre lot ne disparaît
+        pas quand la session dédiée à son lot s'ouvre.
+
+        Vraie bascule : la session du lot A est active, le verdict du lot B a
+        été livré pendant celle-ci (et date de plus de 24 h), puis la session
+        de B s'ouvre. Le verdict doit figurer dans son brief, sinon le nouveau
+        tour ne sait pas qu'un blocked l'attend."""
+        from ameesh import reprise
+        runner, lease = self.bail("b4")
+        worker = AgentWorker(runner, registry.get(self.db, "b4"), lease)
+        try:
+            a = work.add(self.db, title="Le lot de la session neuve", assignee="b4",
+                         force=_FORCE)["id"]
+            b = work.add(self.db, title="Le lot du verdict", assignee="b4",
+                         force=_FORCE)["id"]
+            cwd = self._cwd("b4")
+            storage.of(self.db).operations.set_session_work_item(
+                "b4", runner.runner_id, worker.epoch, str(a))
+            registry.set_session(self.db, "b4", "sess-a", None, harness="claude", cwd=cwd)
+            worker.agent = registry.get(self.db, "b4")
+            mid = mail.send(self.db, "orch", "b4", "verdict B : blocked",
+                            work_item_id=str(b))
+            self.assertEqual(mail.mark_delivered(self.db, [mid]), 1)
+            self.db.execute(
+                "UPDATE agent_mailbox SET delivered_at = now() - interval '25 hours'"
+                " WHERE id = %s", (mid,))
+
+            self.assertTrue(worker._switch_lot(str(a), str(b)))
+            text = worker.resume_summary or ""
+            self.assertIn("verdict B : blocked", text)
+            self.assertIn("- delivered #%d" % mid, text)
+            self.assertNotIn("- unread #%d" % mid, text)
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_brief_ne_prend_que_les_courriers_du_lot_sous_le_bruit(self):
+        """#2539 B2 : le filtre par lot est dans la requête, pas après une
+        fenêtre de 200 messages : 201 courriers d'un autre lot ne masquent pas
+        le verdict de CE lot."""
+        from ameesh import reprise
+        self.bail("b5")
+        a = work.add(self.db, title="Le lot du verdict", assignee="b5")["id"]
+        autre = work.add(self.db, title="Le lot bruyant", assignee="b5")["id"]
+        mid = mail.send(self.db, "orch", "b5", "verdict utile", work_item_id=str(a))
+        self.assertEqual(mail.mark_delivered(self.db, [mid]), 1)
+        # 201 courriers plus récents d'un autre lot : un history(limit=200)
+        # les lirait tous avant de filtrer et perdrait le verdict ci-dessus.
+        self.db.execute(
+            "INSERT INTO agent_mailbox"
+            " (sender, recipient, body, work_item_id, status, delivered_at)"
+            " SELECT 'orch', %s, 'bruit ' || g, %s, 'delivered', now()"
+            "   FROM generate_series(1, 201) AS g",
+            ("b5", str(autre)))
+
+        text = reprise.lot_brief(self.cfg, self.db, registry.get(self.db, "b5"), a,
+                                 consigne="go")
+        self.assertIn("verdict utile", text)
+        self.assertNotIn("bruit 200", text)
+
+    def test_courriers_livres_du_lot_lus_sur_la_colonne_indexee(self):
+        """#2752 : le lot est filtré sur `work_item_id`, sans fonction, pour
+        que l'index partiel 0413 serve (comme #2563 pour les requests)."""
+        self.bail("b7")
+        a = work.add(self.db, title="Le lot indexé", assignee="b7")["id"]
+        mid = mail.send(self.db, "orch", "b7", "livré", work_item_id=str(a))
+        self.assertEqual(mail.mark_delivered(self.db, [mid]), 1)
+        seen = []
+
+        class Trace:
+            """La connexion réelle, avec le SQL de la lecture du lot noté."""
+            def __init__(self, db):
+                self.db = db
+
+            def query(self, sql, params=()):
+                seen.append(" ".join(sql.split()))
+                return self.db.query(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self.db, name)
+
+        found = mail.delivered_for_lot(Trace(self.db), "b7", a, 10)
+        self.assertEqual([r["id"] for r in found], [mid])
+        queries = [sql for sql in seen if "FROM agent_mailbox" in sql]
+        self.assertEqual(len(queries), 1)
+        predicate = queries[0].split("WHERE", 1)[1]
+        self.assertIn("work_item_id = %s", predicate)
+        self.assertNotIn("btrim", predicate)
+
+    def test_brief_borne_les_courriers_livres(self):
+        """#2539 : la lecture par lot est bornée ; le brief annonce le reste."""
+        from ameesh import reprise
+        self.bail("b6")
+        a = work.add(self.db, title="Le lot borné", assignee="b6")["id"]
+        ids = []
+        for i in range(reprise.LOT_MAIL_MAX + 2):
+            ids.append(mail.send(self.db, "orch", "b6", "livré %d" % i,
+                                 work_item_id=str(a)))
+        self.assertEqual(mail.mark_delivered(self.db, ids), reprise.LOT_MAIL_MAX + 2)
+
+        text = reprise.lot_brief(self.cfg, self.db, registry.get(self.db, "b6"), a,
+                                 consigne="go")
+        self.assertEqual(text.count("- delivered #"), reprise.LOT_MAIL_MAX)
+        self.assertIn("more delivered messages for this lot", text)
+
+    def test_brief_reste_lisible_si_la_lecture_mediate_refuse(self):
+        """#2539 : en mode médié, `mailbox.delivered_for_lot` est refusé au
+        contrat ; le brief garde les non-lus et n'échoue pas."""
+        from ameesh import reprise
+        from ameesh.mediated_executor.contract import NotSupportedRemotely
+        self.bail("b7")
+        a = work.add(self.db, title="Le lot médié", assignee="b7")["id"]
+        mail.send(self.db, "orch", "b7", "un message non lu", work_item_id=str(a))
+        with mock.patch.object(mail, "delivered_for_lot",
+                               side_effect=NotSupportedRemotely("refusé")):
+            text = reprise.lot_brief(self.cfg, self.db, registry.get(self.db, "b7"), a,
+                                     consigne="go")
+        self.assertIn("un message non lu", text)
+        self.assertNotIn("- delivered #", text)
 
     def test_brief_ne_dit_pas_put_aside_quand_rien_n_est_garde(self):
         """#2242 : `_switch_lot` peut ne rien garder (lot courant fini ou
@@ -1078,6 +1198,23 @@ class ReveilTest(_Base):
         consumed = [e for e in work.events(self.db, lot)
                     if e["note"].startswith("wake: scheduled wake delivered")]
         self.assertEqual(len(consumed), 1)
+
+    def test_reveil_programme_sur_executeur_medie(self):
+        """#2613 : le runner médié ne refuse plus le réveil programmé ; les
+        trois opérations de wake passent par le contrat (due_wakes,
+        claim_wake, consume_wake), pas seulement par un exécuteur local."""
+        worker = self._worker("r7m")
+        lot = work.add(self.db, title="séance owner", assignee="r7m",
+                       force=_FORCE)["id"]
+        work.note(self.db, lot, "hold: séance owner", actor="r7m",
+                  wake_ts=time.time() - 1)
+        with mock.patch.object(storage, "is_remote", return_value=True):
+            spec = self.pick(worker)
+        self.assertIsNotNone(spec, "un exécuteur médié délivre le réveil (#2613)")
+        self.assertEqual((spec["kind"], spec["lot"]), ("idle", str(lot)))
+        self.assertIn("Scheduled wake", spec["prompt"])
+        self.assertIsNotNone(work.get(self.db, lot)["wake_ts"],
+                             "la délivrance médiée ne consomme pas l'échéance")
 
     def test_reveil_programme_perdu_au_drainage_est_redelivre(self):
         """#2466 B1 (cx2) : si le drainage refuse le tour entre le choix et le

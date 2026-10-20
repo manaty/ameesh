@@ -1,7 +1,8 @@
 # @ameesh/ui
 
 Embeddable web components of an [ameesh](https://github.com/manaty/ameesh) mesh:
-projects, timeline, agent, alerts, hosts, budget and threads, as standard custom
+projects, timeline, agent, alerts, hosts, budget, threads, decisions and the
+conversation with an agent (`<ameesh-chat>`), as standard custom
 elements (Lit, Shadow DOM) — no framework is imposed on the host application.
 
 The same sources are served by `ameesh serve` as a standalone page (`/ui/`, the

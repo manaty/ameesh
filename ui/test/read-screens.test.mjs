@@ -138,9 +138,9 @@ test("an event during a request schedules a fresh snapshot after that request", 
   assert.equal(calls, 2);
 });
 
-test("the app assembles all eight screens and navigates project → lot thread internally", async () => {
+test("the app assembles all nine screens and navigates project → lot thread internally", async () => {
   const { client } = fixture(); const app = await mount("ameesh-app", client);
-  assert.equal(app.shadowRoot.querySelectorAll("nav button").length, 8);
+  assert.equal(app.shadowRoot.querySelectorAll("nav button").length, 9);
   let view = app.shadowRoot.querySelector("ameesh-projects"); await settle(view);
   view.shadowRoot.querySelector(".link").click(); await settle(app);
   view = app.shadowRoot.querySelector("ameesh-timeline"); await settle(view);

@@ -159,6 +159,9 @@ class InventoryTest(unittest.TestCase):
         # 9. contenu déjà dans la cible (tête ancêtre de main)
         rows.append(branch(9, "lot/9-merged", {"merged.py": "x\n"},
                            verdicts=("reviewer",)))
+        # 12. machinerie des paquets : train_reviews=2, un seul avis (#2696)
+        rows.append(branch(12, "lot/12-train", {"src/ameesh/resolutions.py": "x\n"},
+                           verdicts=("reviewer",)))
         # un lot d'un autre projet ne doit jamais apparaître
         rows.append(row(10, "lot/10-other", app="nexlink"))
 
@@ -183,11 +186,16 @@ class InventoryTest(unittest.TestCase):
                                progress=FakeProgress(self.marks))
         self.classes = {
             1: "normal", 2: "normal", 3: "sensitive", 4: "normal", 5: "light",
-            6: "light", 7: "normal", 8: "normal", 9: "light",
+            6: "light", 7: "normal", 8: "normal", 9: "light", 12: "sensitive",
         }
         self.files = {
             3: [{"path": "migrations/0009_x.sql", "class": "sensitive", "rule": None}],
+            12: [{"path": "src/ameesh/resolutions.py", "class": "sensitive",
+                  "rule": None}],
         }
+        # #2696 : le classement porte train_reviews ; la porte et la liste des
+        # prêts doivent lire le même nombre.
+        self.train_reviews = {12: 2}
         self.families = {"author": "deepseek", "reviewer": "claude"}
         self.class_calls = []
         self.head_classes: dict[str, tuple] = {}
@@ -202,16 +210,22 @@ class InventoryTest(unittest.TestCase):
             if rest.get("head") in self.head_classes:
                 cls, files = self.head_classes[rest["head"]]
                 return {"lot": lot, "class": cls, "doubt": False, "why": "test",
-                        "files": files, "light_reviews": 1}
+                        "files": files, "light_reviews": 1,
+                        "train_reviews": self.train_reviews.get(lot, 0)}
             return {"lot": lot, "class": self.classes[lot], "doubt": False,
                     "why": "test", "files": self.files.get(
                         lot, [{"path": "src/ameesh/x.py", "class": "light", "rule": None}]),
-                    "light_reviews": 1}
+                    "light_reviews": 1,
+                    "train_reviews": self.train_reviews.get(lot, 0)}
 
         def fake_family(db, name, **kw):
             return self.families.get(name, "")
 
         with mock.patch.object(storage, "of", return_value=self.store), \
+                mock.patch.object(work, "get",
+                                  side_effect=lambda db, lot: next(
+                                      (dict(row) for row in self.rows
+                                       if row["id"] == int(lot)), None)), \
                 mock.patch.object(lot_class, "of_lot", side_effect=fake_class), \
                 mock.patch.object(merge_queue, "actor_family",
                                   side_effect=family or fake_family):
@@ -245,11 +259,35 @@ class InventoryTest(unittest.TestCase):
         self.assertFalse(entry["ready"])
         self.assertIn("freeze-not-head", [cause["code"] for cause in entry["causes"]])
 
+    def test_pilot_waiver_covers_the_frozen_head_after_an_older_verdict(self):
+        """#2681 : le gel déclaré l'emporte sur un avis antérieur quand le
+        pilote a posé `-none` ; la porte honore la même dispense."""
+        self.marks[2].append({"id": 2000, "work_item_id": 2, "kind": "frozen",
+                              "sha": self.tips[2], "actor": "author",
+                              "verdict": None, "at_ts": 2000.0})
+        entry = self.by_id(self.inventory())[2]
+        self.assertIn("freeze-after-verdict",
+                      [cause["code"] for cause in entry["causes"]])
+        row = next(row for row in self.rows if row["id"] == 2)
+        row["reviewer"] = work.REVIEWER_NONE
+        entry = self.by_id(self.inventory())[2]
+        self.assertTrue(entry["ready"], entry["causes"])
+        self.assertEqual(entry["frozen_sha"], self.tips[2])
+        self.assertIn("verdict-not-required", entry["freeze"]["notes"])
+
     def test_missing_required_verdicts_is_named(self):
         entry = self.by_id(self.inventory())[3]
         self.assertFalse(entry["ready"])
         self.assertIn("verdicts-missing", [cause["code"] for cause in entry["causes"]])
         self.assertGreaterEqual(entry["gate"]["required"], 2)
+
+    def test_train_machinery_with_one_verdict_is_not_ready(self):
+        # #2696 : train_reviews=2 pour la machinerie des paquets ; un seul avis
+        # ne rend pas le lot prêt, même si sa classe est sensible.
+        entry = self.by_id(self.inventory())[12]
+        self.assertFalse(entry["ready"], entry["causes"])
+        self.assertIn("verdicts-missing", [cause["code"] for cause in entry["causes"]])
+        self.assertEqual(entry["gate"]["required"], 2)
 
     def test_unreadable_registry_is_an_error_not_a_verdicts_missing_wait(self):
         # #2521 : une lecture du registre impossible ne doit pas se lire
@@ -275,6 +313,25 @@ class InventoryTest(unittest.TestCase):
         self.assertFalse(entry["ready"])
         cause = next(cause for cause in entry["causes"] if cause["code"] == "conflict")
         self.assertEqual(cause["files"], ["shared.py"])
+
+    def test_missing_freeze_blob_is_refetched_before_the_conflict_read(self):
+        """#2738 : la tête du gel n'est qu'une ref sur des objets prêtés par le
+        checkout des agents ; quand un blob de sa fusion a disparu (source
+        élaguée), la fusion d'essai devient une erreur de lecture. Le fetch
+        doit rapatrier les objets du gel avant de conclure."""
+        tip = self.tips[4]
+        self.clone.ensure()          # clone partagé, objets prêtés
+        # l'objet que l'élagage de la source aurait retiré : le blob du gel
+        # n'est plus lisible nulle part, le commit et l'arbre le restent
+        blob = _git(self.repo, "rev-parse", tip + ":shared.py")
+        path = os.path.join(self.repo, ".git", "objects", blob[:2], blob[2:])
+        self.assertTrue(os.path.isfile(path), "le blob doit être loose pour ce témoin")
+        os.unlink(path)
+        payload = self.inventory()
+        entry = self.by_id(payload)[4]
+        self.assertEqual(entry["error"], "")
+        self.assertIn("conflict", [cause["code"] for cause in entry["causes"]])
+        self.assertEqual(payload["errors"], [])
 
     def test_light_lot_needs_the_declared_review(self):
         # #2642 : un lot léger n'entre plus au paquet sans l'avis d'une autre

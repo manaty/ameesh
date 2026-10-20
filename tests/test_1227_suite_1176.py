@@ -171,25 +171,21 @@ class UnderusedPaceSettingsTest(PgTestCase):
         return sous_utilisation.plan_underused(
             self.db, [], self.now, tail_s=0, used_pct=0, pace_gap_pct=gap, cfg=cfg)
 
-    def test_the_declared_ceiling_raises_the_allowed_pace(self):
-        # 85 % écoulés, 85 % utilisés : défaut 90 % (écart 5), compte 98 % (écart 10)
+    def test_the_declared_ceiling_does_not_invent_projected_loss(self):
+        # #2757 : 85 % consommés à 85 % écoulés, aucune perte prévue.
         self._record(0.85, 0.15 * WEEK, account="secondaire")
         profile = {"name": "secondaire", "path": "/x/compte", "check_credentials": False,
                    "pace_ceiling": 0.98}
         self.assertEqual(self._plan(self._cfg([]), gap=8.0), [])
-        [alerte] = self._plan(self._cfg([profile]), gap=8.0)
-        self.assertEqual((alerte["account"], alerte["reason"]), ("secondaire", "sous_rythme"))
-        self.assertAlmostEqual(alerte["pace_cap"], 0.95, places=4)
-        self.assertIn("allowed pace of 95 %", alerte["detail"])
+        self.assertEqual(self._plan(self._cfg([profile]), gap=8.0), [])
 
-    def test_the_declared_multiplier_raises_the_allowed_pace(self):
-        # 40 % écoulés : défaut 50 %, compte ×2 -> 90 %
+    def test_the_declared_multiplier_does_not_invent_projected_loss(self):
+        # 45 % consommés à 40 % écoulés : épuisement avant la remise.
         self._record(0.45, 0.6 * WEEK, account="secondaire")
         profile = {"name": "secondaire", "path": "/x/compte", "check_credentials": False,
                    "pace_multiplier": 2.0}
         self.assertEqual(self._plan(self._cfg([]), gap=8.0), [])
-        [alerte] = self._plan(self._cfg([profile]), gap=8.0)
-        self.assertAlmostEqual(alerte["pace_cap"], 0.90, places=4)
+        self.assertEqual(self._plan(self._cfg([profile]), gap=8.0), [])
 
     def test_a_reading_without_an_account_and_several_accounts_keeps_the_default(self):
         self._record(0.85, 0.15 * WEEK)

@@ -603,7 +603,8 @@ def _plan_for(cfg, db, lot: int, out: dict, declared: str, *, repo, clone, notes
         return out, [], [], ""
     out["tip"] = tip
     if merge_queue.pinned(where, declared) is None and row.get("branch"):
-        merge_queue.fetch_fresh(repo, [row["branch"]], clone)   # objets de la tête gelée
+        # objets de la tête gelée, bornés par la cible
+        merge_queue.fetch_fresh(repo, [row["branch"]], clone, base=out["target"])
     frozen = merge_queue.pinned(where, declared)
     if not frozen:
         out.update(result="error", detail="the freeze %s is not a commit of %s"

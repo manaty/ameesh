@@ -369,15 +369,15 @@ def rules(cfg, project: str) -> Rules | None:
 
 
 #: une source de relecture : « relecture #313 », « verdict dev7 #2525 »,
-#: « R2 #1300 », « review of #12 », « avis … #N »
+#: « R2 #1300 », « review of #12 », « en relisant #N », « avis … #N »
 REVIEW_WORDS = re.compile(
-    r"\b(?:relectures?|relire|relis|relit|relu|relue|relus|verdicts?|reviews?|reviewed|"
+    r"\b(?:relectures?|relire|relis|relit|relisant|relu|relue|relus|verdicts?|reviews?|reviewed|"
     r"avis|r[0-9])\b", re.I)
 #: une référence de lot `#N` (jamais `owner/repo#N`, une issue GitHub)
 LOT_REF = re.compile(r"(?<![\w/])#([0-9]+)\b")
 #: ce qui précède un `#N` qui n'est pas un lot : « PR #1943 », « pull request
-#: #1943 », « issue #12 »
-NOT_LOT_REF = re.compile(r"\b(?:prs?|pull(?:\s+requests?)?|issues?)\s*$", re.I)
+#: #1943 », « pull-request #1943 », « issue #12 »
+NOT_LOT_REF = re.compile(r"\b(?:prs?|pull(?:[\s-]+requests?)?|issues?)\s*$", re.I)
 
 
 def _lot_ref(text: str) -> int | None:
@@ -1029,7 +1029,8 @@ def _team_orchestrators(cfg, db, listing: list, team: str, orchestras=None) -> l
     return sorted([name for name in known if team in teams[name]] or known)
 
 
-def _assign_ready(st, item: dict, assignee: str, note: str, take) -> dict | None:
+def _assign_ready(st, item: dict, assignee: str, note: str, take,
+                  cap: int) -> dict | None:
     """La prise conditionnelle d'un élément prêt (`assign_capped`,
     `ready_only`), ou None s'il a été pris, bloqué, ou si l'agent a atteint
     le plafond §4 entre-temps.
@@ -1039,11 +1040,10 @@ def _assign_ready(st, item: dict, assignee: str, note: str, take) -> dict | None
     Le serveur annule alors la prise entière (rien d'écrit) : c'est une prise
     perdue entre-temps, comme une course perdue, et non une panne du passage.
     L'élément reste libre et le prochain passage le revérifie en entier ;
-    toute autre erreur remonte."""
-    from . import work
+    toute autre erreur remonte. `cap` : le plafond du canon (`work.build_limit`)."""
     try:
         return st.work.assign_capped(int(item["id"]), assignee, current=None, note=note,
-                                     actor=SENDER, max_build=work.BUILD_LIMIT,
+                                     actor=SENDER, max_build=cap,
                                      take=take, ready_only=True)
     except DbError as exc:
         if not is_deadlock(exc):
@@ -1193,7 +1193,7 @@ def _still_free(st, item_id) -> bool:
             and item.get("state") in ("intake", "build"))
 
 
-def _cap_reached(st, agent: str) -> bool:
+def _cap_reached(st, agent: str, cap: int) -> bool:
     """§4 : l'agent est-il au plafond d'en-cours ?
 
     Distingue, après un refus `None` de `assign_capped` sur un lot encore
@@ -1202,9 +1202,7 @@ def _cap_reached(st, agent: str) -> bool:
     Relecture hors du verrou de la prise : un agent redescendu entre-temps fait
     seulement retenter la prise, un agent remonté au plafond est refusé de
     nouveau par `assign_capped`."""
-    from . import work
-
-    return st.work.count_builds(agent) >= work.BUILD_LIMIT
+    return st.work.count_builds(agent) >= cap
 
 
 def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE_IDLE_S,
@@ -1242,6 +1240,15 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
 
     now = time.time() if now is None else float(now)
     st = storage.of(db)
+    caps: list = []
+
+    def cap() -> int:
+        """§4 : le plafond du canon compilé, lu à la première prise tentée ;
+        sans document lisible, `mechanics.MechanicsError` arrête le passage
+        (l'appelant l'isole) au lieu de supposer un plafond (#2451)."""
+        if not caps:
+            caps.append(work.build_limit(cfg))
+        return caps[0]
 
     # #804 : la place restante est relue avant **chaque** prise, pas une fois
     # par passe. Les compteurs sont en base et partagés par tous les
@@ -1373,10 +1380,10 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 break
             if not within_budget(row):
                 continue
-            # §4 canon : au plus 2 lots en build par agent — la prise
-            # automatique refuse le troisième (le témoin concurrent est dans
+            # §4 canon : plafond de lots en build par agent — la prise
+            # automatique refuse au-delà (le témoin concurrent est dans
             # le stockage : `assign_capped` recompte sous le verrou de l'agent)
-            if st.work.count_builds(row["name"]) >= work.BUILD_LIMIT:
+            if st.work.count_builds(row["name"]) >= cap():
                 continue
             agent = registry.get(db, row["name"])
             if agent is None:
@@ -1418,7 +1425,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                     # #1242 (L165) : la prise ne vise qu'un lot intake dont
                     # toutes les dépendances sont satisfaites.
                     done = _assign_ready(st, item, check["assignee"], note,
-                                         work.takes_rule(check))
+                                         work.takes_rule(check), cap())
                 except storage.PendingLot:
                     break                   # le lot reste à l'agent suivant
                 if done is None:
@@ -1429,7 +1436,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                     if not _still_free(st, item["id"]):
                         lots.remove(item)
                         continue        # pris entre-temps : lot suivant
-                    if _cap_reached(st, check["assignee"]):
+                    if _cap_reached(st, check["assignee"], cap()):
                         break           # agent au plafond : au suivant
                     continue            # refus sous verrou : lot suivant
                 lots.remove(item)
@@ -1483,7 +1490,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         if not within_budget(row):
             continue
         # §4 : le plafond de lots en build vaut aussi pour la file
-        if st.work.count_builds(row["name"]) >= work.BUILD_LIMIT:
+        if st.work.count_builds(row["name"]) >= cap():
             continue
         agent = registry.get(db, row["name"])
         if agent is None:
@@ -1517,7 +1524,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 item.get("expected_value") or "")
             try:
                 done = _assign_ready(st, item, check["assignee"], note,
-                                     work.takes_rule(check))
+                                     work.takes_rule(check), cap())
             except storage.PendingLot:
                 break                       # #540 : l'élément reste au suivant
             if done is None:
@@ -1526,7 +1533,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 if not _still_free(st, item["id"]):
                     queue.remove(item)
                     continue                # pris entre-temps : élément suivant
-                if _cap_reached(st, check["assignee"]):
+                if _cap_reached(st, check["assignee"], cap()):
                     break                   # agent au plafond : au suivant
                 continue                    # refus sous verrou : élément suivant
             queue.remove(item)

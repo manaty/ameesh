@@ -64,7 +64,9 @@ def main() -> int:
                     "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
                     # L73 : dossier temporaire et caches gérés
                     "TMPDIR", "TMP", "TEMP", "AMEESH_TMPDIR", "AMEESH_CACHE_DIR",
-                    "npm_config_cache", "npm_config_store_dir", "YARN_CACHE_FOLDER")},
+                    "npm_config_cache", "npm_config_store_dir", "YARN_CACHE_FOLDER",
+                    # #2772 : le PATH et le venv vus par le tour
+                    "PATH", "VIRTUAL_ENV")},
             }) + "\n")
     if os.environ.get("AMEESH_TEST_MAKE_TMP"):
         # L73 : un tour qui laisse des fichiers dans son TMPDIR et une entrée

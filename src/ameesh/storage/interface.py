@@ -1116,6 +1116,13 @@ class Mailbox(Domain):
         sortait de la fenêtre et une re-désignation renvoyait un doublon."""
 
     @abc.abstractmethod
+    def delivered_for_lot(self, recipient: str, lot: str, limit: int) -> list[dict]:
+        """Messages déjà remis d'un lot, du plus récent au plus ancien, bornés
+        par `limit`. Filtre destinataire ET lot dans la requête, sans fenêtre
+        de temps : un verdict ancien reste lisible dans le brief de son lot.
+        Non admis en mode médié (contrat fermé) : l'appelant garde les non-lus."""
+
+    @abc.abstractmethod
     def pending_recipients(self) -> list[str]:
         """Destinataires qui ont du courrier non remis."""
 
@@ -1700,6 +1707,15 @@ class WorkItems(Domain):
         survit à sa fermeture, sinon un second lot serait ouvert."""
 
     @abc.abstractmethod
+    def lock(self, item_id: int) -> dict | None:
+        """Le lot, verrouillé `FOR UPDATE` jusqu'à la fin de la transaction
+        courante ; None s'il n'existe pas. #2744 : c'est le verrou commun des
+        écritures de retenue (les notes `hold:`/`unhold:` le prennent avant
+        `note`, les transitions par leur UPDATE) et de la fermeture par
+        contenu — une retenue ne se glisse pas entre la lecture du journal et
+        la fermeture."""
+
+    @abc.abstractmethod
     def get(self, item_id: int) -> dict | None:
         """Un lot, ou None. #1922/B5 : le lot porte `workflow_ref` (la
         révision Process pinnée, '' quand il n'y en a pas — y compris sur une
@@ -2060,6 +2076,31 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def by_package(self, package_id: str) -> list[dict]:
         """Les lots rattachés à cette fiche, tous états confondus, par id."""
+
+    @abc.abstractmethod
+    def record_packet(self, package_id: int, *, branch: str, base_sha: str,
+                      head_sha: str, units: Sequence[dict], note: str,
+                      actor: str) -> list[dict]:
+        """#2443 : enregistre la composition d'un paquet (lot porteur
+        `package_id`, branche `branch`), en remplaçant l'ensemble de ses
+        unités, en UNE transaction.
+
+        `units` : des dicts `work_item_id`, `unit_sha`, `source_sha`,
+        `frozen_sha`. Un lot porteur ou une unité inconnue annule tout
+        (l'intégrité référentielle tranche) ; l'événement `note` est écrit au
+        journal du porteur dans la même transaction. Rend les lignes relues
+        par `packet_members` (ordre de `recorded_at` décroissant).
+        """
+
+    @abc.abstractmethod
+    def packet_members(self, *, item_ids: Sequence[int] | None = None,
+                       package_ids: Sequence[int] | None = None) -> list[dict]:
+        """#2443 : les appartenances de paquet, filtrées par unités
+        (`item_ids`) ou par porteur (`package_ids`), les plus récentes
+        d'abord. Chaque ligne porte `package_id`, `work_item_id`,
+        `package_branch`, `base_sha`, `head_sha`, `unit_sha`, `source_sha`,
+        `frozen_sha`, `recorded_by`, `recorded_ts`, l'état du porteur
+        (`package_state`) et son jalon de fusion (`package_merged_sha`)."""
 
     @abc.abstractmethod
     def close_merged(self, item_id: int, *, current: str, sha: str, actor: str, note: str,
@@ -3284,7 +3325,8 @@ class Operations(Domain):
         """Lots ouverts avec leur DERNIÈRE activité (`last_activity_ts`) :
         maximum de la ligne du lot, de ses transitions, jalons, actions et
         messages liés (`agent_mailbox.work_item_id`) ; plus id, title, state,
-        assignee, `package_id`, type et `priority` (le délai court du canon §9
+        assignee, `package_id`, type, `planned_start` (jour ISO ou None,
+        origine du délai intake #2562) et `priority` (le délai court du canon §9
         pour un P1, #789), app, workstream, reviewer (#705 : le projet du lot et
         son relecteur désigné), `lot_team` (équipe du lot : la sienne, sinon
         celle de son paquet ou du parent, sinon son `app`), `workflow_ref`

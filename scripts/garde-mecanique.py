@@ -258,84 +258,6 @@ class Exemption:
 #: inutilisée est signalée et le témoin refuse de la laisser traîner.
 EXEMPTIONS = (
     Exemption(
-        path="src/ameesh/work.py",
-        parameter="build.max_in_build",
-        literal="2",
-        name="lot #2449 (mty-amh-impl-08), inventaire du 18/10",
-        date="2026-10-18",
-        reason="constante §4 historique lue par work/wip/progress/backlog ; "
-               "conversion au canon suivie au backlog #2451",
-    ),
-    Exemption(
-        path="src/ameesh/train.py",
-        parameter="timezone",
-        literal="Europe/Paris",
-        name="lot #2449 (mty-amh-impl-08), inventaire du 18/10",
-        date="2026-10-18",
-        reason="moteur du train non installé : calendrier historique conservé "
-               "pour ses témoins ; le passage raccordé fournit `Policy.schedule` (retrait : #2451)",
-    ),
-    Exemption(
-        path="src/ameesh/train.py",
-        parameter="cutoffs",
-        literal="*",
-        name="lot #2449 (mty-amh-impl-08), inventaire du 18/10",
-        date="2026-10-18",
-        reason="moteur du train non installé : les coupures historiques "
-               "11:00/23:00 ne servent que sans `Policy.schedule`, jamais au "
-               "passage raccordé au canon (retrait : #2451)",
-    ),
-    Exemption(
-        path="src/ameesh/review_designation.py",
-        parameter="reviews.families",
-        literal="*",
-        name="lot #2449 (mty-amh-impl-08), inventaire du 18/10",
-        date="2026-10-18",
-        reason="désignation #1617 : repli documenté tant que le canon compilé "
-               "n'est pas câblé ; les appelants peuvent déjà passer `families` "
-               "(retrait : #2451)",
-    ),
-    Exemption(
-        path="src/ameesh/train_policy.py",
-        parameter="schema",
-        literal="ameesh-mechanics/1",
-        name="lot #2449 (mty-amh-impl-08), inventaire du 18/10",
-        date="2026-10-18",
-        reason="l'adaptateur du train n'accepte que le schéma /1 ; le bloc /2 "
-               "(prévalidation) sera porté à l'activation du train (#2446) ; "
-               "retrait : #2451",
-    ),
-    Exemption(
-        path="src/ameesh/train_review.py",
-        parameter="reviews.families",
-        literal="*",
-        name="lot #2449 (mty-amh-impl-08), inventaire du 18/10",
-        date="2026-10-18",
-        reason="bibliothèque du train non installé : défaut de la fonction "
-               "pure ; le passage raccordé (`train_history`) passe "
-               "`rules.families` et l'indépendance compilées (retrait : #2451)",
-    ),
-    Exemption(
-        path="src/ameesh/train_review.py",
-        parameter="reviews.exclude_author_family",
-        literal="True",
-        name="lot #2449 (mty-amh-impl-08), inventaire du 18/10",
-        date="2026-10-18",
-        reason="défaut de la fonction pure pour ses appelants sans règle "
-               "compilée ; le passage raccordé passe la valeur du canon "
-               "(retrait : #2451)",
-    ),
-    Exemption(
-        path="src/ameesh/train_review.py",
-        parameter="reviews.distinct_families",
-        literal="True",
-        name="lot #2449 (mty-amh-impl-08), inventaire du 18/10",
-        date="2026-10-18",
-        reason="défaut de la fonction pure pour ses appelants sans règle "
-               "compilée ; le passage raccordé passe la valeur du canon "
-               "(retrait : #2451)",
-    ),
-    Exemption(
         path="src/ameesh/review_lot.py",
         parameter="reviews.light_reviews",
         literal="1",
@@ -345,6 +267,43 @@ EXEMPTIONS = (
                "lot léger, repli d'une classe qui ne porte pas encore le "
                "paramètre ; la valeur du canon (`light_reviews`) fait foi dès "
                "qu'elle est déclarée (retrait : PR home)",
+    ),
+    Exemption(
+        path="src/ameesh/lot_class.py",
+        parameter="reviews.exclude_author_family",
+        literal="True",
+        name="lot #2726 (ameesh-dev3), 20/10",
+        date="2026-10-20",
+        reason="repli en doute quand le canon est illisible : la direction "
+               "stricte (True), jamais une valeur du canon, toujours lue par "
+               "`_review_flags` puis écrasée. Valeur exacte : une exemption "
+               "large couvrirait un False affaiblissant. Retrait quand "
+               "lot_class lira un repli nommé du lecteur.",
+    ),
+    Exemption(
+        path="src/ameesh/lot_class.py",
+        parameter="reviews.exclude_author_family",
+        literal="False",
+        name="lot #2726 (ameesh-dev3), 20/10",
+        date="2026-10-20",
+        reason="état initial d'`of_lot` avant la lecture du canon, toujours "
+               "écrasé par `class_of_paths` dès qu'un canon est lisible ; les "
+               "retours précoces qui le gardent sont des doutes `sensitive`, "
+               "où la porte applique déjà l'exclusion de famille. Valeur "
+               "exacte : aucune autre valeur n'est couverte.",
+    ),
+    Exemption(
+        path="src/ameesh/lot_class.py",
+        parameter="reviews.distinct_families",
+        literal="True",
+        name="lot #2726 (ameesh-dev3), 20/10",
+        date="2026-10-20",
+        reason="repli en doute quand le canon est illisible (True) et état "
+               "initial d'`of_lot` avant la lecture (True) : ces littéraux ne "
+               "fournissent jamais la valeur du canon, toujours lue par "
+               "`_review_flags` puis écrasée ; la direction est stricte (deux "
+               "familles). Valeur exacte : une exemption large couvrirait un "
+               "False affaiblissant.",
     ),
 )
 

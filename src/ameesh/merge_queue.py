@@ -42,6 +42,7 @@ import os
 import re
 import shutil
 import tempfile
+from collections.abc import Mapping
 from types import SimpleNamespace
 
 from . import packet_guard, plan_git, storage, work
@@ -105,36 +106,46 @@ def latest_verdict(rows: list[dict]) -> dict | None:
 #: La règle explique leur classe mais peut citer d'autres fichiers inchangés.
 #: `critical: true` au canon fait foi ; ces motifs restent un minimum lorsque
 #: le canon ne connaît pas encore un chemin critique ou omet sa déclaration.
+#: Les motifs propres à ameesh sont ancrés sous `src/ameesh/` et le repli ne
+#: s'applique qu'au projet ameesh (#2696) : le crate Nexlink `host-linux`, sous
+#: `desktop/`, ne devient plus un chemin de prod par le motif `host[-_]`.
 #: Un doute de classe (politique ou diff illisible, `files` vide) n'ajoute
 #: aucun de ces domaines : il reste sensible, un avis (canon §2, owner 15/10 :
 #: deux familles seulement pour droits SQL, secrets, paiement, prod réelle ;
 #: #2394).
 CRITICAL_SCOPE = (
-    # SQL, migrations, stockage
-    re.compile(r"(^|/)(migrations?|supabase|storage)(/|$)|(^|/)migrations\.py$|"
-               r"(^|/)db\.py$|\.sql$"),
+    # SQL, migrations, stockage — les noms ameesh sont ancrés sous src/ameesh/ ;
+    # `supabase/`, `*.sql` et `deploy/sql/` restent globaux (SQL dans tout projet).
+    re.compile(r"^src/ameesh/(?:[^/]+/)*(?:migrations?|storage)(?:/|$)|"
+               r"^src/ameesh/(?:[^/]+/)*(?:migrations|db)\.py$|"
+               r"(?:^|/)supabase/|\.sql$|^deploy/sql/"),
     # sécurité : droits, identité, clés, secrets, décisions ; garde cgroup
-    # DeepSeek (#2282 : le préchargement Node et son module Python)
-    re.compile(r"(^|/)(approve|auth|authority|identity|signing|cose|p256|jcs|decisions|"
-               r"visibility|auth_failure|dsn|assignments)(/|\.py$|$)|"
-               r"(^|/)deepseek_cgroup\.(?:cjs|py)$|"
-               r"(^|/)(keys?|secrets?)(/|$)|"
-               r"^src/ameesh/(approve_check|approve_client|config)\.py$"),
-    # prod, infra, déploiement, hôtes et relais — dont la porte de fusion
-    re.compile(r"(^|/)(deploy|infra|lab|bin)(/|$)|(^|/)\.github/|"
-               r"(^|/)scripts/(ci|deploy|compute|test)|(^|/)(Dockerfile|pyproject\.toml)$|"
-               r"(^|/)host[-_]|(^|/)(hostcheck|exploitation|relay|serve|progress_serve|"
-               r"relocation|placement|merge_queue|land|fire)\.py$|"
+    # DeepSeek (#2282 : le préchargement Node et son module Python). Noms
+    # ameesh ancrés sous src/ameesh/, à toute profondeur comme avant #2696
+    # (`mediated_executor/identity.py`, `mediated_executor/host_gate.py`).
+    re.compile(r"^src/ameesh/(?:[^/]+/)*(?:approve|auth|authority|identity|signing|cose|p256|jcs|"
+               r"decisions|visibility|auth_failure|dsn|assignments)(?:/|\.py$|$)|"
+               r"^src/ameesh/(?:[^/]+/)*deepseek_cgroup\.(?:cjs|py)$|"
+               r"^src/ameesh/(?:[^/]+/)*(?:keys?|secrets?)(?:/|$)|"
+               r"^src/ameesh/(?:approve_check|approve_client|config)\.py$"),
+    # prod, infra, déploiement, hôtes et relais — dont la porte de fusion.
+    # Les chemins ameesh sont ancrés sous src/ameesh/ ; les domaines génériques
+    # (deploy, infra, .github, scripts, Dockerfile, pyproject) restent globaux.
+    re.compile(r"(?:^|/)(?:deploy|infra|lab|bin)(?:/|$)|(?:^|/)\.github/|"
+               r"(?:^|/)scripts/(?:ci|deploy|compute|test)|"
+               r"(?:^|/)(?:Dockerfile|pyproject\.toml)$|"
+               r"^src/ameesh/(?:[^/]+/)*host[-_]|^src/ameesh/(?:[^/]+/)*(?:hostcheck|exploitation|relay|serve|"
+               r"progress_serve|relocation|placement|merge_queue|land|fire)\.py$|"
                # la porte de fusion hors API, la classe du lot et son classement
                # (#2249 ; ligne perdue dans une composition, restaurée #2374)
-               r"(^|/)(merge_pr|lot_class|review)\.py$|"
+               r"^src/ameesh/(?:[^/]+/)*(?:merge_pr|lot_class|review)\.py$|"
                # ce qui entre dans un paquet : la liste calculée des lots
                # prêts et ses remises (#2496)
                r"^src/ameesh/packet_candidates\.py$|^scripts/paquet-candidats\.py$|"
                # le report des verdicts acquis sur une tête réalignée (#2442)
                r"^src/ameesh/verdict_carry\.py$|"
                # preuve de famille indépendante des avis (#2265)
-               r"^src/ameesh/(review_lot|registry)\.py$"),
+               r"^src/ameesh/(?:review_lot|registry)\.py$"),
 )
 #: la documentation Markdown que le canon classe léger ou normal : les motifs
 #: de secours, larges, y verraient un domaine (`docs/design/decisions/`). Seul
@@ -150,8 +161,10 @@ def critical_scope(klass) -> bool:
     """Le diff gelé touche-t-il SQL, la sécurité ou la prod (deux avis) ?
 
     Le canon peut le déclarer explicitement sur chaque chemin classé. Les
-    motifs de secours s'appliquent aussi aux chemins classés légers, sauf à la
-    documentation Markdown classée légère ou normale.
+    motifs de secours ameesh sont ancrés sous `src/ameesh/` ; `required_verdicts`
+    ne les applique qu'au projet ameesh, la politique compilée des autres
+    projets faisant foi (#2696). Ils s'appliquent aussi aux chemins classés
+    légers, sauf à la documentation Markdown classée légère ou normale.
     Seuls les **chemins changés** prouvent un domaine critique : une liste
     `files` vide, ou une entrée sans chemin, n'en désigne aucun. Le doute de
     classe n'est pas critique pour autant : `required_verdicts` le garde
@@ -178,6 +191,14 @@ def required_verdicts(klass) -> int:
     le canon l'a omis ou classé léger ; sinon le plancher déclaré pour un lot
     léger (`light_reviews`, §2 : un avis, #2642), 1 pour normal et 1 pour
     sensible hors SQL, sécurité et prod.
+    Un lot peut aussi déclarer un nombre d'avis par chemin (`train_reviews`,
+    #2696) : le classement le lit et le porte (`train_reviews`), la porte
+    l'applique comme la désignation au gel ; un chemin léger déclaré à deux
+    avis les exige sans être reclassé, et le doute ne l'efface pas.
+    Les motifs de secours `CRITICAL_SCOPE` ne s'appliquent qu'au projet ameesh
+    (ou à un appel sans projet connu) : pour les autres projets, la politique
+    compilée fait foi (#2696, cas pilote Nexlink `desktop/host/**`) ; une
+    déclaration `critical: true` du canon garde deux avis pour tout projet.
     Un lot léger **sans chemin changé** n'a rien à relire : 0. Le plancher est
     lu par le lecteur de classe (`lot_class`), donc le même que la désignation
     au gel et `paquet-candidats` ; il ne reclasse jamais la classe.
@@ -193,19 +214,28 @@ def required_verdicts(klass) -> int:
     from . import lot_class
     klass = klass or {}
     cls = str(klass.get("class") or lot_class.SENSITIVE)
+    declared = int(klass.get("train_reviews") or 0)
+    project = str(klass.get("project") or "")
+    files = klass.get("files") or ()
     if klass.get("doubt"):
         # canon §8 : « en cas de doute, le lot est sensible » — jamais léger,
         # jamais critique par le seul doute (#2394).
         cls = lot_class.SENSITIVE
-    if klass.get("files") and critical_scope(klass):
-        return CRITICAL_REVIEWS
+    # #2696 : le canon compilé fait foi hors ameesh. Les motifs de secours
+    # décrivent les chemins d'ameesh ; sur un lot Nexlink, `host-linux` (un
+    # crate sous `desktop/`) ne devient pas un chemin de prod par `host[-_]`.
+    # Une déclaration `critical: true` du canon reste lue pour tous les projets.
+    explicit_critical = any(entry.get("critical") is True for entry in files)
+    fallback = critical_scope(klass) if project in ("", "ameesh") else False
+    if files and (explicit_critical or fallback):
+        return max(CRITICAL_REVIEWS, declared)
     if cls == lot_class.LIGHT:
         if not klass.get("files"):
             return 0
-        return int(klass.get("light_reviews") or 0)
+        return max(int(klass.get("light_reviews") or 0), declared)
     if cls in (lot_class.NORMAL, lot_class.RELEASE):
-        return 1
-    return SENSITIVE_REVIEWS
+        return max(1, declared)
+    return max(SENSITIVE_REVIEWS, declared)
 
 
 def _mark_order(mark: dict) -> tuple:
@@ -282,6 +312,17 @@ def blocked_verdicts(marks, frozen, *, repo: str | None = None) -> list[dict]:
                   key=_mark_order)
 
 
+def is_waived(item) -> bool:
+    """La dispense de re-verdict du pilote (`-none`, #1979) sur cette ligne.
+
+    Une seule lecture de la dispense (#2681) : la porte, le gel effectif
+    (`plan_git.freeze_candidate`), `paquet-candidats` et le train lisent la
+    même marque. Elle couvre la tête gelée, jamais une remise (#2496)."""
+    row = item or {}
+    return (str(row.get("reviewer") or "").strip() == work.REVIEWER_NONE
+            or work.REVIEWER_NONE in tuple(row.get("reviewers") or ()))
+
+
 def _waiver(db, item) -> tuple:
     """#2281/B1 : la dispense de re-verdict lue **à la porte**, après les jalons.
 
@@ -300,8 +341,7 @@ def _waiver(db, item) -> tuple:
     """
     row = item or {}
     lot = row.get("id")
-    waived = (str(row.get("reviewer") or "").strip() == work.REVIEWER_NONE
-              or work.REVIEWER_NONE in tuple(row.get("reviewers") or ()))
+    waived = is_waived(row)
     if waived and lot is not None:
         # Seule une ligne qui *réclame* la dispense peut périmer dans le
         # mauvais sens : relire la base après les jalons ferme la course. Une
@@ -314,8 +354,7 @@ def _waiver(db, item) -> tuple:
             row = dict(row, reviewer="", reviewers=[])
         else:
             row = fresh
-        waived = (str(row.get("reviewer") or "").strip() == work.REVIEWER_NONE
-                  or work.REVIEWER_NONE in tuple(row.get("reviewers") or ()))
+        waived = is_waived(row)
     waived_by = ""
     if waived and lot is not None:
         try:
@@ -335,25 +374,105 @@ def _waiver(db, item) -> tuple:
     return waived, waived_by, row
 
 
+def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=None):
+    """Les auteurs et correcteurs de la tête gelée (#2681/#2739/#2726).
+
+    Lecture des commits exacts de la plage gelée et de leur provenance, la même
+    que la désignation : l'auteur de référence et les coauteurs sont des
+    auteurs, un correctif de premier tour de relecteur sous le seuil (#2638)
+    est un correcteur. Rend `(auteurs, correcteurs)`, ou `None` quand aucune
+    lecture n'est possible (pas de base, pas de dépôt, pas de ligne de lot) :
+    la porte garde alors son comportement historique. Lève quand une lecture
+    était possible et a échoué : une porte qui ne peut pas prouver qui a écrit
+    la tête ne compte pas un avis non prouvé (l'indépendance ne se suppose pas).
+    """
+    base = str((klass or {}).get("base_sha")
+               or (klass or {}).get("target") or "").strip()
+    if db is None or not repo or not base or not item:
+        return None
+    from . import review_designation_activation as act
+    freeze = plan_git.latest_freeze(marks or ())
+    milestone = None
+    if freeze is not None and _same_sha(freeze.get("sha"), frozen, repo):
+        milestone = {"id": int(freeze.get("id") or 0),
+                     "sha": str(freeze.get("sha") or ""),
+                     "actor": freeze.get("actor") or "",
+                     "at_ts": freeze.get("at_ts")}
+    authors, unknown, correctors = act.attribution_of_head(
+        db, item, milestone, repo, base, frozen, families=families or ())
+    if unknown:
+        raise ValueError("author provenance unknown for frozen commit(s): %s"
+                         % ", ".join(unknown))
+    return authors, correctors
+
+
+def _corrections_on_freeze(db, marks, frozen, *, repo, klass, item, families=None):
+    """Les seuls correcteurs de la tête (#2739), pour les lecteurs historiques."""
+    attribution = _attribution_on_freeze(db, marks, frozen, repo=repo, klass=klass,
+                                         item=item, families=families)
+    if attribution is None:
+        return None
+    _authors, correctors = attribution
+    return {str((row or {}).get("name") or "").strip().lower()
+            for row in correctors or () if str((row or {}).get("name") or "").strip()}
+
+
 def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
-                item=None, families=None) -> dict:
+                item=None, families=None, required=None, family_of=None,
+                authors=None, cfg=None, project=None, target=None,
+                vehicle=None, exclude_author_family=None,
+                distinct_families=None) -> dict:
     """Les avis requis sur la tête gelée `frozen`, et eux seuls (#1374).
 
     Un verdict ne compte que s'il a été rendu **sur cette tête** (le `sha` du
     jalon est résolu, jamais une ref). Parmi ces verdicts, seul le **dernier de
     chaque relecteur** compte : un `ok` plus récent du même relecteur lève son
     blocage, celui d'un autre relecteur ne le masque pas. Un blocage encore en
-    vigueur refuse la porte, quelle que soit la classe.
+    vigueur refuse la porte, quelle que soit la classe. Un blocage posé sur une
+    **tête antérieure** ne compte pas : la nouvelle tête a ses propres avis
+    (canon §2, #2681 ; la règle de levée est celle de la porte).
 
     Le nombre d'avis dépend de la classe (`required_verdicts`) : le plancher
     déclaré pour un lot léger (#2642), 1 pour un lot normal et pour un lot
     sensible hors SQL/sécurité/prod — un doute de classe reste sensible —,
-    2 pour un lot sensible qui touche ces domaines. Les avis comptés sont
-    **indépendants** : jamais le travail de l'auteur ; pour un lot léger à
-    plancher déclaré et pour une classe sensible, une famille de modèle connue
-    et autre que celle de l'auteur ; pour deux avis, deux familles distinctes.
-    L'indépendance ne se suppose jamais : une famille d'auteur inconnue refuse
-    la porte (canon §2, décision 18855a).
+    2 pour un lot sensible qui touche ces domaines. `required` (#2681) permet
+    à un appelant qui lit une politique versionnée plus stricte (le train) de
+    passer son compte : la porte garde le **maximum** et ne s'affaiblit jamais.
+    Les avis comptés sont **indépendants** : jamais le travail d'un auteur ;
+    pour un lot léger à plancher déclaré et pour une classe sensible, une
+    famille de modèle connue et autre que celle de tout auteur ; pour deux
+    avis, deux familles distinctes. L'indépendance ne se suppose jamais : une
+    famille d'auteur inconnue refuse la porte (canon §2, décision 18855a).
+
+    `authors` (#2681) est l'ensemble des auteurs **reconnus** de la tête, tel
+    que l'appelant l'a lu (`review_authors.authors`) : `{name, family}`. La
+    porte ne compare plus seulement à l'assigné : un coauteur — tiers avec
+    reçu exact, correcteur de relecteur au-delà du seuil du §2 — ne relit ni
+    lui-même ni sa famille. Un petit correctif de relecteur n'est pas un auteur
+    (#2638) et sa famille reste éligible. La famille de l'assigné historique
+    reste celle de la trace du gel (`family_of`) : le reçu d'un autre commit du
+    même nom ne la remplace pas. Sans `authors`, la porte garde son
+    comportement historique : seul l'assigné est connu.
+
+    `family_of` (#2681) est la source historique de famille du train : le même
+    code de porte, mais les familles des reçus/tours à la date des faits au
+    lieu du registre courant. Un appelant qui le fournit ne lit ni le registre
+    ni le canon compilé.
+
+    #2726 : sans `authors`, la porte lit elle-même les auteurs reconnus de la
+    plage gelée quand le dépôt, la base et la ligne du lot sont connus
+    (`attribution_of_head`) — le feu, la file et le paquet excluent donc tous
+    les auteurs, pas seulement l'assigné ; une plage illisible échoue fermé.
+    `exclude_author_family` et `distinct_families` viennent de l'appelant ou
+    sinon de `klass` (drapeaux compilés du canon) : le premier rend la règle
+    stricte même à un avis, le second décide de la double famille au compte 2.
+
+    #2739 : l'auteur d'un petit correctif de relecteur tenu hors des auteurs
+    (#2638) ne relit pas son propre correctif. La porte lit les commits exacts
+    de la plage gelée (`corrections_of_head`) et écarte son avis **par son
+    nom**, sans exclure sa famille : un autre agent de la même famille reste
+    éligible. Quand la plage ne peut pas être lue, la porte échoue fermé si la
+    lecture était possible (dépôt, base et ligne de lot connus).
 
     #2664 : les familles viennent du canon compilé (`families`, sinon lues par
     `review_lot.compiled_families` au dernier commit audité). Un canon
@@ -368,8 +487,17 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     gel ne couvre jamais la nouvelle tête. Un verdict bloquant courant, lui,
     n'est jamais levé par la dispense : la correction reste due.
 
+    #2766 : pour un **véhicule de paquet** (`integration/**`), la porte ne
+    classe pas le diff gelé entier. `packet_reviews.need` lit les avis de
+    chaque membre sur SA tête gelée et ne retient que le delta propre du
+    véhicule (résolution non mécanique, adaptation) : sans delta, aucun avis
+    de véhicule n'est dû ; un membre sans avis refuse. `vehicle` permet à un
+    appelant qui a déjà fait cette lecture de la passer ; sinon elle est faite
+    ici quand `cfg` et `target` sont fournis. Un véhicule sans membre lisible
+    garde la lecture historique, jamais un passage à zéro avis.
+
     Rend `{ok, why, class, required, accepted, blocked, waived, author,
-    author_family, on_freeze}` ; ne lève jamais.
+    author_family, authors, corrections, on_freeze, vehicle}` ; ne lève jamais.
     """
     from . import lot_class
     klass = klass or {}
@@ -377,6 +505,14 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     frozen = str(frozen or "").strip().lower()
     if klass.get("doubt"):
         cls = lot_class.SENSITIVE
+    # #2726 : les drapeaux compilés du canon (`reviews`) sont portés par la
+    # classe lue (`lot_class`), ou passés explicitement par le train depuis son
+    # document. Absents (canon antérieur), on garde le comportement historique :
+    # pas d'exclusion de famille d'auteur, deux familles distinctes au compte 2.
+    if exclude_author_family is None:
+        exclude_author_family = bool(klass.get("exclude_author_family", False))
+    if distinct_families is None:
+        distinct_families = bool(klass.get("distinct_families", True))
     # #1979/#2281 : la dispense de re-verdict du pilote (`-none`) lève la
     # porte, comme elle lève l'attente dans `progress` ; elle ne survit pas à
     # un nouveau gel (stockage `_lapse_waiver`) et ne lève jamais un blocage.
@@ -386,12 +522,63 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     author = str(row.get("assignee") or "").strip()
     out = {"ok": False, "why": "", "error": "", "class": cls, "required": 0,
            "accepted": [], "blocked": [], "waived": waived, "waived_by": waived_by,
-           "author": author, "author_family": "", "on_freeze": 0}
+           "author": author, "author_family": "", "authors": [],
+           "corrections": [], "on_freeze": 0, "vehicle": None,
+           "exclude_author_family": exclude_author_family,
+           "distinct_families": distinct_families}
     if not frozen:
         out["why"] = "no freeze to review: the fire names the exact frozen head"
         return out
-    required = required_verdicts(klass)
+    if vehicle is None and cfg is not None and target and item is not None:
+        from . import packet_reviews
+        if packet_reviews.is_vehicle(item):
+            try:
+                vehicle = packet_reviews.need(db, int(item.get("id") or 0), item,
+                                              marks, repo or "", target, frozen,
+                                              cfg=cfg)
+            except Exception as exc:  # noqa: BLE001 - lecture impossible : refus
+                vehicle = {"ok": False, "required": None, "klass": None,
+                           "why": "vehicle review unreadable: %s" % exc,
+                           "members": [], "own_paths": []}
+    if vehicle is not None:
+        out["vehicle"] = vehicle
+        if vehicle.get("ok") is False:
+            out["why"] = (vehicle.get("why")
+                          or "no review verdict ok on the freeze %s (class: %s): "
+                             "the vehicle's constituents or proper delta are not "
+                             "proven" % (frozen[:12], cls))
+            return out
+        if vehicle.get("klass"):
+            # #2766 (B cx3) : la classe du delta propre vient de
+            # `class_of_paths` et ne porte ni `base_sha` ni `target`. La base
+            # de provenance reste celle de la plage gelée du lot : sans elle,
+            # `_corrections_on_freeze` rend None et le correcteur d'un petit
+            # correctif compterait sur son propre delta (#2739).
+            outer = klass or {}
+            provenance = {key: outer[key] for key in ("base_sha", "target")
+                          if outer.get(key)}
+            klass = dict(vehicle["klass"], **provenance)
+            cls = str(klass.get("class") or cls)
+            if klass.get("doubt"):
+                cls = lot_class.SENSITIVE
+    vehicle_required = 0
+    if vehicle is not None and vehicle.get("ok") is not False:
+        vehicle_required = int(vehicle.get("required") or 0)
+        if vehicle.get("ok") is True and vehicle_required == 0 and cls != lot_class.RELEASE:
+            klass = {"class": lot_class.LIGHT, "files": []}
+            cls = lot_class.LIGHT
+    floor = required_verdicts(klass)
+    if required is None:
+        required = floor
+    elif type(required) is not int or required not in (0, 1, 2):
+        out["error"] = "explicit review requirement expected"
+        out["why"] = ("no review verdict ok on the freeze %s (class: %s): an explicit"
+                      " review requirement of 0, 1 or 2 is required, not %r"
+                      % (frozen[:12], cls, required))
+        return out
+    required = max(required, floor, vehicle_required)
     out["required"] = required
+    out["class"] = cls
     on_freeze = [m for m in (marks or ()) if m.get("kind") == "verdict"
                  and _same_sha(m.get("sha"), frozen, repo)]
     out["on_freeze"] = len(on_freeze)
@@ -416,7 +603,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     if required == 0:
         out["ok"] = True
         return out
-    if families is None and db is not None:
+    if family_of is None and families is None and db is not None:
         from . import review_lot
         try:
             families = review_lot.compiled_families(db)
@@ -429,8 +616,15 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                           "independent (canon §2: independence is never assumed)"
                           % (frozen[:12], cls, exc))
             return out
+
+    def _family_of(name):
+        if family_of is not None:
+            value = family_of(name)
+            return "" if value is None else str(value)
+        return _actor_family(db, name, families)
+
     try:
-        author_family = _actor_family(db, author, families)
+        author_family = _family_of(author)
     except RegistryReadError as exc:
         # #2521 : le registre est illisible, ce n'est pas « famille inconnue ».
         # La porte refuse toujours (l'indépendance ne se suppose pas) mais le
@@ -442,31 +636,112 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                       % (frozen[:12], cls, exc))
         return out
     out["author_family"] = author_family
+    # #2726 : la porte lit elle-même la plage gelée quand l'appelant ne passe
+    # pas les auteurs — le feu, la file et le paquet, qui ne les lisaient pas.
+    # La même lecture rend les correcteurs (#2739) et échoue fermé quand la
+    # provenance manque : une porte qui ne peut pas prouver qui a écrit la tête
+    # ne compte pas un avis non prouvé (l'indépendance ne se suppose pas).
+    corrections: set = set()
+    try:
+        attribution = _attribution_on_freeze(db, marks, frozen, repo=repo,
+                                             klass=klass, item=item,
+                                             families=families)
+    except Exception as exc:  # noqa: BLE001 - une plage illisible ne conclut pas
+        out["error"] = str(exc)
+        out["why"] = ("no review verdict ok on the freeze %s (class: %s): the frozen "
+                      "range cannot be read (%s), so an author's own verdict and a "
+                      "reviewer's own correction cannot be excluded (canon §2: "
+                      "independence is never assumed)" % (frozen[:12], cls, exc))
+        return out
+    if attribution is not None:
+        range_authors, range_correctors = attribution
+        if authors is None:
+            authors = range_authors
+        corrections = {str((row or {}).get("name") or "").strip().lower()
+                       for row in range_correctors or ()
+                       if str((row or {}).get("name") or "").strip()}
+    out["corrections"] = sorted(corrections)
+    # #2681 : les auteurs **reconnus** de la tête, quand l'appelant les a lus
+    # (`review_authors.authors`). L'assigné historique passé dans `item` en
+    # fait toujours partie ; un tiers avec reçu exact ou un correcteur au-delà
+    # du seuil du §2 s'y ajoute. Un petit correctif de relecteur n'y est pas
+    # (#2638) : sa famille reste éligible.
+    recognized: dict = {}
+    if author:
+        recognized[author.lower()] = {"name": author, "family": author_family}
+    for entry in authors or ():
+        if isinstance(entry, Mapping):
+            name = str(entry.get("name") or "").strip()
+            family = str(entry.get("family") or "").strip()
+        else:
+            name, family = str(entry or "").strip(), ""
+        if not name:
+            continue
+        key = name.lower()
+        if author and key == author.lower():
+            # La référence (l'assigné historique) est déjà reconnue, avec la
+            # famille de la trace du gel (`family_of`) : le reçu d'un autre
+            # commit du même nom ne prouve pas sa famille au gel.
+            continue
+        if not family:
+            try:
+                family = _family_of(name)
+            except RegistryReadError as exc:
+                out["error"] = str(exc)
+                out["why"] = ("no review verdict ok on the freeze %s (class: %s): the agent "
+                              "registry cannot be read (%s), so the author %s cannot be "
+                              "proven independent (canon §2: independence is never assumed)"
+                              % (frozen[:12], cls, exc, name))
+                return out
+        known = recognized.get(key)
+        if known is None:
+            recognized[key] = {"name": name, "family": family}
+        elif family and not known["family"]:
+            known["family"] = family
+    out["authors"] = sorted(recognized.values(), key=lambda entry: entry["name"].lower())
     # L'indépendance ne se suppose jamais (canon §2, décision 18855a) : une
     # classe sensible — y compris un doute de classe, qui peut cacher SQL, la
     # sécurité ou la prod — et un lot léger à plancher déclaré (#2642 : le §2
     # demande « un avis d'une autre famille ») n'acceptent que des familles
-    # connues et autres que celle de l'auteur. Famille d'auteur inconnue
-    # (agent absent du registre, harnais non reconnu) : aucun avis ne peut être
-    # prouvé indépendant, la porte refuse et le dit. Un auteur humain n'a pas
-    # de famille de modèle : il n'y a rien à comparer, seules les familles des
-    # relecteurs comptent.
-    strict = required >= 2 or cls in (lot_class.LIGHT, lot_class.SENSITIVE)
-    author_human = bool(author) and author.lower().startswith(work.HUMAN_PREFIX)
-    if strict and not author_family and not author_human:
+    # connues et autres que celles de **tous** les auteurs. Famille d'auteur
+    # inconnue (agent absent du registre, harnais non reconnu) : aucun avis ne
+    # peut être prouvé indépendant, la porte refuse et le dit. Un auteur humain
+    # n'a pas de famille de modèle : il n'y a rien à comparer, seules les
+    # familles des relecteurs comptent.
+    # #2726 : `exclude_author_family` du canon rend la règle stricte même à un
+    # avis sur une classe normale ; `distinct_families` décide de la double
+    # famille au compte 2 (la porte garde le comportement historique sans
+    # drapeau lu).
+    strict = (required >= 2 or cls in (lot_class.LIGHT, lot_class.SENSITIVE)
+              or exclude_author_family)
+    if strict and not recognized:
+        # Aucun auteur connu (assigné absent, ni `authors`) : l'indépendance
+        # ne se suppose pas, comme avant #2681.
         out["why"] = ("no review verdict ok on the freeze %s (class: %s): the author %s has "
                       "no known model family, so no verdict can be proven independent "
                       "(canon §2: independence is never assumed)"
                       % (frozen[:12], cls, author or "(none)"))
         return out
+    if strict:
+        for entry in recognized.values():
+            if entry["family"] or entry["name"].lower().startswith(work.HUMAN_PREFIX):
+                continue
+            out["why"] = ("no review verdict ok on the freeze %s (class: %s): the author %s "
+                          "has no known model family, so no verdict can be proven "
+                          "independent (canon §2: independence is never assumed)"
+                          % (frozen[:12], cls, entry["name"]))
+            return out
+    author_families = {entry["family"] for entry in recognized.values() if entry["family"]}
     accepted = []
     for mark in sorted((m for m in latest.values() if (m.get("verdict") or "") == "ok"),
                        key=_mark_order):
         actor = str(mark.get("actor") or "").strip()
-        if author and actor and actor.lower() == author.lower():
+        if actor and actor.lower() in recognized:
             continue                      # on ne relit pas son propre travail
+        if actor and actor.lower() in corrections:
+            continue                      # l'auteur d'un correctif ne le relit pas (#2739)
         try:
-            family = _actor_family(db, actor, families)
+            family = _family_of(actor)
         except RegistryReadError as exc:
             out["error"] = str(exc)
             out["why"] = ("no review verdict ok on the freeze %s (class: %s): the agent "
@@ -477,11 +752,11 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         if strict:
             if not family:
                 continue                  # famille du relecteur inconnue : non prouvée
-            if family == author_family:
-                continue                  # la famille de l'auteur ne compte pas
+            if family in author_families:
+                continue                  # la famille d'un auteur ne compte pas
         accepted.append({"actor": actor, "family": family, "id": mark.get("id"),
                          "at_ts": mark.get("at_ts")})
-    if required >= 2:
+    if required >= 2 and distinct_families:
         chosen, seen = [], set()
         for entry in accepted:
             if entry["family"] in seen:
@@ -497,7 +772,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         return out
     got = ", ".join("%s (%s)" % (e["actor"] or "?", e["family"] or "famille inconnue")
                     for e in accepted) or "aucun"
-    need = ("two independent verdicts from different model families, neither the author's"
+    need = ("two independent verdicts from different model families, neither from an author's"
             if required >= 2 else
             "one verdict from another family than the author's" if strict
             else "one verdict from another agent")
@@ -507,11 +782,15 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     return out
 
 
-def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None) -> dict | None:
+def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
+                         overview=None) -> dict | None:
     """La porte des avis du dernier gel d'un lot, lue comme la composition du
     paquet (`packet_candidates`) : dépôt retrouvé par le commit gelé (#2559,
-    l'hôte qui lit le lot n'est pas toujours celui de son auteur), classe du
-    diff gelé, puis `review_gate`.
+    l'hôte qui lit le lot n'est pas toujours celui de son auteur), gel résolu
+    en commit complet puis classe du diff gelé, puis `review_gate`.
+
+    `overview` : les lignes de `registry.overview` déjà lues par l'appelant
+    (une passe SLO sur N lots = une lecture, #2564) ; `None` les relit.
 
     Rend None quand la lecture n'est pas concluante (pas de gel, dépôt
     introuvable, classe en doute sans chemin lisible) : l'appelant ne doit
@@ -520,7 +799,13 @@ def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None) -> dict | No
 
     freeze = plan_git.latest_freeze(marks or ())
     frozen = str((freeze or {}).get("sha") or "").strip()
-    repo = lot_class.repo_for_freeze(db, cfg, item, frozen) if frozen else ""
+    repo, resolved = (lot_class.repo_for_freeze(db, cfg, item, frozen,
+                                                overview=overview)
+                      if frozen else ("", ""))
+    if resolved:
+        # #2564 : la classe et la porte lisent le commit complet, jamais le
+        # préfixe saisi dans le jalon de gel.
+        frozen = resolved
     try:
         # Comme la file : origin/<cible> avant la branche locale, qui peut
         # encore contenir dans le diff des changements déjà fusionnés (#2207).
@@ -633,7 +918,221 @@ def source_of(repo: str) -> str:
     return normalize_source("%s%s/%s" % (host.lower(), ":%d" % int(port) if port else "", path))
 
 
-def fetch_fresh(repo: str, names, clone=None) -> tuple[dict, str]:
+def _unreadable_objects(where: str, revs, base: str | None = None) -> list[str] | None:
+    """Les objets que `where` ne peut pas lire pour `revs`.
+
+    `revs` : une tête, ou plusieurs dont on vérifie l'union. Le clone radar
+    est un `git clone --shared` : ses objets viennent par alternates du
+    checkout des agents, et un élagage de celui-ci (`gc`, ménage disque)
+    retire ceux que seul le clone partagé utilisait. Un
+    `rev-list --objects --missing=print` nomme les objets absents de la
+    fermeture **complète** des têtes : ceux de la cible et de la base de
+    fusion comptent aussi, puisque `merge-tree` lit les trois côtés.
+
+    Avec `base` (la cible), le parcours est borné à ce que lit réellement la
+    fusion d'essai : l'histoire propre des têtes (`--not base`), puis les
+    arbres des trois côtés — têtes, cible et commits de bord (`--boundary`,
+    dont les bases de fusion). La fermeture complète coûte 20 à 40 s sur
+    Nexlink à chaque fetch, la version bornée moins d'une seconde.
+
+    Une exception : plusieurs bases de fusion. `merge-tree` les fusionne
+    récursivement pour construire sa base virtuelle ; l'ancêtre propre de ces
+    bases n'apparaît alors ni dans l'histoire propre des têtes ni dans les
+    arbres de bord. Dès que `merge-base --all` nomme plus d'une base pour une
+    tête, le garde revient à la fermeture complète : mieux vaut un parcours
+    lent qu'une tête rendue que la fusion ne peut pas lire.
+
+    `None` quand le parcours lui-même échoue : l'appelant le traite comme un
+    manque à réparer, jamais comme une tête lisible."""
+    from . import resolutions
+    revs = [revs] if isinstance(revs, str) else list(revs)
+    revs = list(dict.fromkeys(revs))
+    if not revs:
+        return []
+    for rev in revs:
+        if plan_git._commit(where, rev) is None:
+            return [rev]      # une tête manquante arrête rev-list : on la nomme
+    if base and plan_git._commit(where, base) is None:
+        return [base]
+    if not base:
+        walks = [["rev-list", "--objects", "--missing=print", *revs]]
+    else:
+        proc = resolutions._run(where, "rev-list", "--boundary", *revs, "--not", base)
+        if proc.returncode:
+            return None
+        boundary = [line[1:] for line in resolutions._text(proc).splitlines()
+                    if line.startswith("-")]
+        for rev in revs:
+            if rev == base:
+                continue
+            proc = resolutions._run(where, "merge-base", "--all", rev, base)
+            if proc.returncode not in (0, 1):
+                return None
+            if len(resolutions._text(proc).split()) > 1:
+                # bases multiples : leur fusion récursive lit leur ancêtre
+                walks = [["rev-list", "--objects", "--missing=print",
+                          *sorted(set(revs) | {base})]]
+                break
+        else:
+            walks = [
+                ["rev-list", "--objects", "--missing=print", *revs, "--not", base],
+                ["rev-list", "--objects", "--missing=print", "--no-walk",
+                 *sorted(set(revs) | {base} | set(boundary))],
+            ]
+    missing = []
+    for args in walks:
+        proc = resolutions._run(where, *args)
+        if proc.returncode:
+            return None
+        for line in resolutions._text(proc).splitlines():
+            if not line.startswith("?"):
+                continue
+            fields = line[1:].split()
+            if fields and fields[0] not in missing:
+                missing.append(fields[0])
+    return missing
+
+
+def _refetch_tip_objects(where: str, url: str, branch: str) -> str:
+    """Refait le fetch de `branch` dans `where`, sans négociation.
+
+    Le clone lit ses objets par alternates : un fetch ordinaire peut répondre
+    « à jour » (la tête est lisible par les alternates) ou déposer un pack dont
+    `unpack-objects` saute les objets déjà fournis par eux — la tête reste
+    alors une ref sur des objets prêtés. `--refetch` force le transfert, et
+    `transfer.unpackLimit=1` garde le pack : `index-pack` l'écrit même quand
+    les alternates connaissent déjà ses objets, donc le clone les possède.
+    La ref de file est retirée d'abord, pour que le fetch ne soit pas un
+    simple « à jour ». Le pack couvre l'histoire de la branche (aucune
+    négociation) : cette réparation est rare et vaut mieux qu'un lot écarté
+    pour un objet absent. `--no-auto-gc` et `--no-auto-maintenance` évitent
+    qu'un repack détaché du clone ne coure pendant que la fusion d'essai lit
+    ses objets. Rend le message d'erreur de git, vide si le fetch a réussi."""
+    from . import resolutions
+    name = _remote_branch(branch)
+    ref = QUEUE_REF + name
+    resolutions._run(where, "update-ref", "-d", ref)
+    proc = resolutions._run(where, "-c", "transfer.unpackLimit=1",
+                            "fetch", "--quiet", "--no-tags", "--refetch",
+                            "--no-auto-gc", "--no-auto-maintenance", url,
+                            "+refs/heads/%s:%s" % (name, ref), timeout=FETCH_TIMEOUT)
+    return resolutions._err(proc)[:300] if proc.returncode else ""
+
+
+def _clone_base(where: str, base: str | None) -> str | None:
+    """Le commit de cible dont les objets sont vérifiés avec ceux des têtes.
+
+    `base` (la cible du même fetch) d'abord, puis la cible déclarée du clone,
+    puis sa branche par défaut. La cible et la base de fusion comptent : la
+    fusion d'essai lit leur côté de chaque conflit, et un blob d'ancêtre
+    commun absent fait échouer `merge-tree` même quand la tête est complète
+    (B1 de la relecture #2738). Aucun commit lisible : None, le garde ne
+    couvre alors que les têtes fournies."""
+    def first(candidates) -> str | None:
+        for candidate in candidates:
+            if not candidate:
+                continue
+            commit = plan_git._commit(where, candidate)
+            if commit:
+                return commit
+        return None
+    if base:
+        name = _remote_branch(base)
+        commit = first([QUEUE_REF + name, "origin/" + name, name, base])
+        if commit:
+            return commit
+    declared = plan_git.declared_target(where)
+    if declared:
+        commit = first([QUEUE_REF + _remote_branch(declared), declared])
+        if commit:
+            return commit
+    try:
+        default = plan_git.default_target(where)
+    except Exception:  # noqa: BLE001 - cible déclarée introuvable (#2680)
+        default = None
+    if default:
+        commit = first([default, QUEUE_REF + _remote_branch(default)])
+        if commit:
+            return commit
+    return first(plan_git.DEFAULT_TARGETS)
+
+
+def _guarantee_tip_objects(clone, url: str, names, tips: dict, base: str | None) -> dict:
+    """Ne rend que des têtes dont la fermeture est lisible dans le clone.
+
+    #2738 : une tête fraîche peut n'être qu'une ref sur des objets prêtés par
+    les alternates ; si la source les a élagués, la fusion d'essai et les
+    lectures de gel échouent (« blob absent du clone de calcul ») et
+    `paquet-candidats.py` écarte un lot prêt en erreur de lecture. Le garde
+    vérifie l'union des objets lus par la fusion d'essai — histoire propre des
+    têtes, arbres des têtes, de la cible et des bases de fusion, ou fermeture
+    complète si les bases sont multiples —, répare chaque branche
+    dont des objets manquent, puis re-vérifie. Une erreur Git du garde devient
+    une `QueueError` (B2), jamais une exception qui ferait planter l'appelant."""
+    label = ", ".join(names[:5]) + (" …" if len(names) > 5 else "")
+    try:
+        return _verified_tips(clone, url, names, tips, base)
+    except (GitError, OSError) as exc:
+        raise QueueError("cannot guarantee the objects of %s in the radar clone (%s): "
+                         "retry once the remote and the clone answer"
+                         % (label or "the fetched branches", str(exc)[:300])) from exc
+
+
+def _verified_tips(clone, url: str, names, tips: dict, base: str | None) -> dict:
+    """Le corps du garde de `_guarantee_tip_objects` (hors traduction d'erreurs)."""
+    base_branch = _remote_branch(base) if base else ""
+    base_commit = _clone_base(clone.path, base)
+
+    def wanted() -> list[str]:
+        revs = {tips[name] for name in names if tips.get(name)}
+        if base_commit:
+            revs.add(base_commit)
+        return sorted(revs)
+
+    revs = wanted()
+    missing = _unreadable_objects(clone.path, revs, base_commit) if revs else []
+    if missing == []:
+        return tips
+    # chemin rare : nommer la branche qui porte chaque objet manquant et la
+    # refaire. Une tête peut changer (la branche a bougé) ; les entrées de
+    # `tips` de la même branche suivent.
+    repaired: set = set()
+    for tip in revs:
+        branch = next((name for name in names if tips.get(name) == tip), "")
+        if not branch and tip == base_commit:
+            branch = base_branch
+        if not branch or _remote_branch(branch) in repaired:
+            continue
+        if _unreadable_objects(clone.path, tip) == []:
+            continue
+        repaired.add(_remote_branch(branch))
+        error = _refetch_tip_objects(clone.path, url, branch)
+        if error:
+            raise QueueError(
+                "cannot fetch %s from origin for the objects of its head %s (%s): "
+                "try again once the remote answers" % (branch, tip[:12], error))
+        fresh = plan_git._commit(clone.path, QUEUE_REF + _remote_branch(branch)) or tip
+        for name in names:
+            if _remote_branch(name) == _remote_branch(branch):
+                tips[name] = fresh
+        if _remote_branch(branch) == base_branch:
+            base_commit = fresh
+    revs = wanted()
+    missing = _unreadable_objects(clone.path, revs, base_commit) if revs else []
+    if missing == []:
+        return tips
+    detail = ("walk impossible" if missing is None
+              else "%d unreadable, first %s" % (len(missing), missing[0][:12]))
+    label = ", ".join(names[:5]) + (" …" if len(names) > 5 else "")
+    raise QueueError(
+        "cannot guarantee the objects of %s in the radar clone (%s, after an explicit "
+        "fetch from origin): the shared clone reads the agents' objects (git clone "
+        "--shared) and they were pruned; fetch the branch again in the source, or "
+        "recreate the clone" % (label or "the fetched branches", detail))
+
+
+def fetch_fresh(repo: str, names, clone=None,
+                base: str | None = None) -> tuple[dict, str]:
     """({name: commit, or None if there is no such branch}, repository holding
     them) of the branches `names` (lot branches or targets), read fresh. With
     an `origin`, they are listed on it, then fetched from it now into the
@@ -642,7 +1141,15 @@ def fetch_fresh(repo: str, names, clone=None) -> tuple[dict, str]:
     `origin/<branch>` counts, since another host may have pushed since. No
     clone, or a remote that does not answer, raises QueueError: no fetch, no
     tip. Without an `origin`, `repo` is the only copy and its local branches
-    are the tips."""
+    are the tips.
+
+    #2738 : les objets de chaque tête sont vérifiés dans le clone avant d'être
+    rendus, avec ceux de la cible (B1 : la fusion lit la base et l'ancêtre
+    commun) ; s'ils manquent (source élaguée, alternates), un `--refetch`
+    explicite de la branche les rapatrie, sinon QueueError. `base` nomme la
+    cible du même fetch, pour la vérifier et la réparer comme les têtes. Une
+    tête rendue est donc lisible par la fusion d'essai et les lectures de
+    gel, jamais une ref sur des objets absents."""
     from . import resolutions
     names = sorted({n for n in names if n})
     remote = {n: _remote_branch(n) for n in names}
@@ -679,8 +1186,9 @@ def fetch_fresh(repo: str, names, clone=None) -> tuple[dict, str]:
     if failed is not None:
         raise QueueError("cannot fetch %s from origin (%s): try again once the remote answers"
                          % (what, failed[:300]))
-    return {n: plan_git._commit(clone.path, QUEUE_REF + remote[n]) if remote[n] in present
-            else None for n in names}, clone.path
+    tips = {n: plan_git._commit(clone.path, QUEUE_REF + remote[n]) if remote[n] in present
+            else None for n in names}
+    return _guarantee_tip_objects(clone, url, names, tips, base), clone.path
 
 
 def branch_tip(repo: str, branch: str, clone=None) -> tuple[str | None, str]:
@@ -805,7 +1313,7 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     # lisaient sur une cible périmée (P2-1 de la R1).
     names = [row["branch"]] + ([target] if target else [])
     try:
-        tips, where = fetch_fresh(repo, names, clone)
+        tips, where = fetch_fresh(repo, names, clone, base=target)
     except QueueError as exc:
         raise QueueError("cannot fetch branch %s%s from origin: %s"
                          % (row["branch"], " and target %s" % target if target else "",
@@ -863,7 +1371,8 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     # (familles), et aucun blocage non levé ; un `ok` récent ne masque plus le
     # `blocked` d'un autre relecteur (P1-1). #2281 : la dispense de re-verdict
     # du pilote (#1979) lève l'exigence d'avis sur cette tête gelée.
-    gate = review_gate(db, marks, tip, repo=where, klass=klass, item=row)
+    gate = review_gate(db, marks, tip, repo=where, klass=klass, item=row,
+                       cfg=cfg, target=fresh_target)
     if not gate["ok"]:
         raise QueueError("lot #%d: %s" % (lot, gate["why"]))
     # L756 (#566): un lot de classe release ne se contente pas du check de sa
@@ -905,7 +1414,8 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
         _required_ci(project, tip, commit_ci, parts=parts, branch=row["branch"])
         proof = getattr(parts, "proof", None)
     return {"target": target, "frozen_sha": tip, "frozen_id": freeze["id"],
-            "pr": (status or {}).get("number"), "class": klass.get("class"),
+            "pr": (status or {}).get("number"),
+            "class": gate.get("class") or klass.get("class"),
             "class_why": klass.get("why") or "", "parts": proof,
             "waived": bool(gate.get("waived")),
             "waived_by": gate.get("waived_by") or ""}

@@ -116,7 +116,7 @@ class FakeGh:
         return 0, "", ""
 
 
-class ReleaseFixture(unittest.TestCase):
+class ReleaseFixtureMixin:
     maxDiff = None
 
     def setUp(self):
@@ -223,6 +223,8 @@ class ReleaseFixture(unittest.TestCase):
                                return_value=green or self.head):
             return release_cutoff.execute(self.cfg, None, self.project,
                                           now=now or _paris(11, 5), force=force)
+
+class ReleaseFixture(ReleaseFixtureMixin, unittest.TestCase):
 
     def test_release_tags_green_head_generates_notes_and_runs_staging(self):
         report = self.execute()
@@ -568,6 +570,259 @@ class ReleaseFixture(unittest.TestCase):
         self.assertEqual(plan.packets[0].package, "paquet-h-test")
 
 
+def _job(name, conclusion="success", status="completed"):
+    return {"name": name, "status": status, "conclusion": conclusion}
+
+
+def _run(run_id, jobs, *, event="push", workflow="tests", conclusion="success"):
+    return {"id": run_id,
+            "url": "https://github.com/manaty/ameesh/actions/runs/%d" % run_id,
+            "workflow": workflow, "event": event, "conclusion": conclusion,
+            "jobs": jobs}
+
+
+class PacketTreeGreenTest(ReleaseFixtureMixin, unittest.TestCase):
+    """#2692: a packet merge whose tree is the green packet head is green.
+
+    The target's CI is still in progress; the packet head's full suite was
+    validated before the merge, under the same jobs. These are the three
+    witnesses of the lot, plus the two guards (red target, red packet head)
+    and the evidence cited in the release notes.
+    """
+
+    def reference_run(self):
+        return _run(500, [
+            _job("plan"),
+            _job("psycopg 1/8"),
+            _job("psql 1/16"),
+            _job("plateforme macOS"),
+            _job("bilan des impactés"),
+            _job("tests"),
+            _job("version number", "skipped"),
+        ])
+
+    def packet_runs(self, *, missing=None):
+        """Two runs: the PR run (matrix) and the packet gate (flow checks)."""
+        jobs = [
+            _job("plan"),
+            _job("psycopg 1/8"),
+            _job("psql 1/16"),
+            _job("plateforme macOS"),
+            _job("bilan des impactés"),
+            _job("tests"),
+        ]
+        if missing:
+            jobs = [job for job in jobs if job["name"] != missing]
+        flows = [
+            _job("tests (flux) psql 1/16"),
+            _job("tests (flux) psycopg 1/8"),
+        ]
+        if missing:
+            flows = [job for job in flows if not job["name"].endswith(" " + missing)]
+        return [
+            _run(501, jobs, event="pull_request"),
+            _run(502, [
+                _job("couverture (PR ouverte sur cette tête)"),
+                _job("suite complète du paquet", "skipped"),
+                *flows,
+            ], workflow="paquet"),
+        ]
+
+    def second_packet(self, *, conflict=False, subject=(
+            "Merge pull request #101 from manaty/integration/paquet-h-2692")):
+        """A green main commit, then a packet head merged as a packet merge."""
+        self.write("main-2.txt", "main\n")
+        base = self.commit("main green base")
+        self.git(self.seed, "push", "-q", "origin", "main")
+        self.git(self.seed, "checkout", "-qb", "integration/paquet-h-2692")
+        self.write("packet-2.txt", "packet\n")
+        self.write("main-2.txt", "packet\n")
+        head = self.commit("packet head")
+        self.git(self.seed, "push", "-q", "origin", "integration/paquet-h-2692")
+        self.git(self.seed, "checkout", "-q", "main")
+        if not conflict:
+            self.git(self.seed, "merge", "--no-ff", "-q",
+                     "integration/paquet-h-2692", "-m", subject)
+            merge = self.git(self.seed, "rev-parse", "HEAD")
+            self.git(self.seed, "push", "-q", "origin", "main")
+            return base, base, head, merge
+        self.write("main-2.txt", "main edited\n")
+        second = self.commit("main green second")
+        proc = subprocess.run(["git", "-C", str(self.seed), "merge", "--no-ff",
+                               "integration/paquet-h-2692"],
+                              capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0, "a conflict is expected")
+        self.write("main-2.txt", "resolved\n")
+        self.commit(subject)
+        merge = self.git(self.seed, "rev-parse", "HEAD")
+        self.git(self.seed, "push", "-q", "origin", "main")
+        return base, second, head, merge
+
+    def ci(self, *, green=(), pending=(), failed=()):
+        def reading(project, sha):
+            if sha in failed:
+                return {"green": False, "pending": [], "failed": ["tests [main]"],
+                        "missing": []}
+            if sha in pending:
+                return {"green": False, "pending": ["tests [main]"], "failed": [],
+                        "missing": []}
+            return {"green": sha in green}
+        return reading
+
+    def suites(self, reference, head, *, missing=None):
+        def reading(project, sha):
+            if sha == head:
+                return {"head": sha, "runs": self.packet_runs(missing=missing)}
+            if sha == reference:
+                return {"head": sha, "runs": [self.reference_run()]}
+            return {"head": sha, "runs": []}
+        return reading
+
+    def plan(self, reading, suites):
+        with mock.patch.object(release_cutoff, "ci_reading", side_effect=reading), \
+             mock.patch.object(release_cutoff, "suite_reading", side_effect=suites):
+            return release_cutoff.build_plan(self.cfg, self.project,
+                                             now=_paris(11, 5))
+
+    def test_equal_tree_with_a_green_packet_and_running_target_is_green(self):
+        """Witness 1: arbre égal + paquet vert + main en cours → vert."""
+        base, _second, head, merge = self.second_packet()
+        plan = self.plan(self.ci(green=(base, head), pending=(merge,)),
+                         self.suites(base, head))
+        self.assertTrue(plan.ci.get("pending"), plan.ci)
+        self.assertFalse(plan.ci.get("green"))
+        self.assertTrue(plan.green)
+        self.assertEqual(plan.base, merge)
+        self.assertEqual(plan.last_green, merge)
+        self.assertEqual(plan.tree_green["head"], head)
+        self.assertEqual(plan.tree_green["reference"], base)
+        self.assertEqual(plan.tree_green["tree"],
+                         self.git(self.clone, "rev-parse", "%s^{tree}" % merge))
+        self.assertIn("tree of %s" % merge[:12], plan.notes)
+        self.assertIn(head[:12], plan.notes)
+        self.assertIn("actions/runs/501", plan.notes)
+        self.assertIn("reference run", plan.notes)
+        self.assertIn("#2000", plan.notes)
+
+    def test_equal_tree_with_a_red_target_never_inherits(self):
+        """Witness 2: arbre égal + main rouge → pas vert."""
+        base, _second, head, merge = self.second_packet()
+        plan = self.plan(self.ci(green=(base, head), failed=(merge,)),
+                         self.suites(base, head))
+        self.assertFalse(plan.green)
+        self.assertIsNone(plan.tree_green)
+        self.assertEqual(plan.base, base)
+        self.assertNotIn("tree of %s" % merge[:12], plan.notes)
+
+    def test_different_tree_never_inherits(self):
+        """Witness 3: arbre différent (résolution de conflit) → pas d'héritage."""
+        base, second, head, merge = self.second_packet(conflict=True)
+        self.assertFalse(release_cutoff.same_tree(
+            self.clone, merge, head))
+        plan = self.plan(self.ci(green=(base, second, head), pending=(merge,)),
+                         self.suites(second, head))
+        self.assertFalse(plan.green)
+        self.assertIsNone(plan.tree_green)
+        self.assertEqual(plan.base, second)
+
+    def test_a_red_packet_head_never_inherits(self):
+        """Guard: a red on main stays red only while the packet head is green."""
+        base, _second, head, merge = self.second_packet()
+        plan = self.plan(self.ci(green=(base,), pending=(merge,), failed=(head,)),
+                         self.suites(base, head))
+        self.assertFalse(plan.green)
+        self.assertIsNone(plan.tree_green)
+        self.assertEqual(plan.base, base)
+
+    def test_a_different_job_set_never_inherits(self):
+        """Same tree is not enough: the packet's jobs must be the target's."""
+        base, _second, head, merge = self.second_packet()
+        plan = self.plan(self.ci(green=(base, head), pending=(merge,)),
+                         self.suites(base, head, missing="psql 1/16"))
+        self.assertFalse(plan.green)
+        self.assertIsNone(plan.tree_green)
+        self.assertEqual(plan.base, base)
+
+    def test_a_smaller_ancestor_suite_cannot_replace_the_last_green_suite(self):
+        base, _second, head, merge = self.second_packet()
+        older = self.git(self.seed, "rev-parse", base + "^1")
+
+        def suites(project, sha):
+            if sha == head:
+                return {"head": sha, "runs": self.packet_runs(missing="psql 1/16")}
+            run = self.reference_run()
+            if sha == older:
+                run["jobs"] = [job for job in run["jobs"]
+                               if job["name"] != "psql 1/16"]
+            return {"head": sha, "runs": [run]}
+
+        plan = self.plan(self.ci(green=(base, head), pending=(merge,)), suites)
+        self.assertFalse(plan.green)
+        self.assertIsNone(plan.tree_green)
+        self.assertEqual(plan.base, base)
+
+    def test_a_failed_required_job_never_inherits(self):
+        """A green run cannot hide a required job that actually failed."""
+        base, _second, head, merge = self.second_packet()
+
+        def suites(project, sha):
+            runs = self.packet_runs()
+            if sha == head:
+                runs[0]["jobs"][1]["conclusion"] = "failure"
+                return {"head": sha, "runs": runs}
+            return {"head": sha, "runs": [self.reference_run()]}
+
+        plan = self.plan(self.ci(green=(base, head), pending=(merge,)), suites)
+        self.assertFalse(plan.green)
+        self.assertIsNone(plan.tree_green)
+        self.assertEqual(plan.base, base)
+
+    def test_a_similarly_named_job_never_stands_in_for_a_required_one(self):
+        """Only an exact job, a caller prefix or a flow run proves it."""
+        base, _second, head, merge = self.second_packet()
+
+        def suites(project, sha):
+            runs = self.packet_runs()
+            if sha == head:
+                runs[0]["jobs"] = [job for job in runs[0]["jobs"]
+                                   if job["name"] != "tests"]
+                runs[0]["jobs"].append(_job("sommaire des tests"))
+                return {"head": sha, "runs": runs}
+            return {"head": sha, "runs": [self.reference_run()]}
+
+        plan = self.plan(self.ci(green=(base, head), pending=(merge,)), suites)
+        self.assertFalse(plan.green)
+        self.assertIsNone(plan.tree_green)
+        self.assertEqual(plan.base, base)
+
+    def test_execute_releases_the_packet_tree_and_cites_the_runs(self):
+        """The release tags the packet merge's content, not the previous green."""
+        base, _second, head, merge = self.second_packet()
+        reading = self.ci(green=(base, head), pending=(merge,))
+        suites = self.suites(base, head)
+        with mock.patch.dict(os.environ,
+                             {"GIT_COMMITTER_DATE": "2026-10-18T11:04:00+0200"}), \
+             mock.patch.object(release_cutoff, "ci_reading", side_effect=reading), \
+             mock.patch.object(release_cutoff, "suite_reading", side_effect=suites):
+            report = release_cutoff.execute(self.cfg, None, self.project,
+                                            now=_paris(11, 5))
+        self.assertEqual(report["result"], "released", report)
+        self.assertEqual(report["version"], "1.11.8")
+        self.assertEqual(report["target_head"], merge)
+        self.assertEqual(report["release_sha"], report["landing_sha"])
+        self.assertEqual(self.git(self.clone, "rev-parse", "origin/main"),
+                         report["release_sha"])
+        self.assertEqual(self.git(self.clone, "rev-parse", "v1.11.8^{commit}"),
+                         report["release_sha"])
+        self.assertEqual(report["tree_green"]["head"], head)
+        notes = self.git(self.clone, "show", "origin/main:docs/versions/1.11.8.md")
+        self.assertIn("tree of %s" % merge[:12], notes)
+        self.assertIn(head[:12], notes)
+        self.assertIn("actions/runs/501", notes)
+        self.assertTrue(any("arbre identique" in text for text in report["deviations"]),
+                        report["deviations"])
+
+
 class StagingTimeoutTest(unittest.TestCase):
     def test_timeout_accepts_bytes_and_kills_the_process_group(self):
         """B2: partial bytes output must not break the report, children die."""
@@ -612,6 +867,15 @@ class StagingTimeoutTest(unittest.TestCase):
 
 
 class PureReleaseTest(unittest.TestCase):
+    def test_a_rerun_of_the_same_suite_is_not_ambiguous(self):
+        same = {"runs": [_run(2, [_job("plan"), _job("tests")]),
+                         _run(1, [_job("plan"), _job("tests")])]}
+        self.assertIsNotNone(release_cutoff._full_suite_run(same))
+        other = {"runs": [_run(2, [_job("plan")]), _run(1, [_job("tests")])]}
+        self.assertIsNone(release_cutoff._full_suite_run(other))
+        empty = {"runs": [_run(3, [])]}
+        self.assertIsNone(release_cutoff._full_suite_run(empty))
+
     def test_version_bumps(self):
         self.assertEqual(release_cutoff.next_version("1.11.7"), "1.11.8")
         self.assertEqual(release_cutoff.next_version("1.11.7", bump="level", floor="minor"),

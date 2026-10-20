@@ -127,7 +127,14 @@ class _Base(unittest.TestCase):
                 mock.patch.object(work, "events", side_effect=self._events),
                 mock.patch.object(merge_queue, "actor_family",
                                   side_effect=lambda db, n, **_: self.FAMILIES.get(
-                                      str(n or "").strip(), ""))):
+                                      str(n or "").strip(), "")),
+                # #2739/#2726 : `db` est un factice sans stockage, et ce dépôt
+                # de banc n'a pas de provenance d'agent : la lecture de plage
+                # de la porte échouerait en échec fermé. Ces témoins portent sur
+                # les gardes de `merge_pr`, pas sur les auteurs/correcteurs ;
+                # l'échec fermé garde son témoin dédié (test_2739_review_correction).
+                mock.patch.object(merge_queue, "_attribution_on_freeze",
+                                  return_value=(None, [])),):
             patch.start()
             self.addCleanup(patch.stop)
 

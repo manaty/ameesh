@@ -8,7 +8,7 @@ from unittest import mock
 
 from . import support  # isole la configuration et l'identité du poste
 from . import test_l234_auditor as l234
-from ameesh import auditor, canon as canon_mod
+from ameesh import auditor, canon as canon_mod, work
 from ameesh.config import CanonEntry
 
 
@@ -18,6 +18,11 @@ class CanonGuardTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
+        # #2451 : le plafond §4 passe par le canon compilé ; ces témoins
+        # n'ouvrent pas de dépôt et gardent la fixture de `AuditorTest.take`.
+        cap = mock.patch.object(work, "build_limit", return_value=support.FIXTURE_BUILD_CAP)
+        cap.start()
+        self.addCleanup(cap.stop)
         self.a = Path(temporary.name) / "A"
         self.b = Path(temporary.name) / "B"
         self.a.mkdir()

@@ -16,9 +16,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from typing import Protocol
-from zoneinfo import ZoneInfo
 
 from . import merge_queue
 
@@ -51,7 +49,6 @@ class MemberDeferred(TrainError):
 class Policy:
     enabled: bool = False
     # Build/beta uses the installed passage's compiled packet calendar.
-    # The uninstalled engine retains its historical fixture calendars.
     build_beta: bool = True
     interval_s: int = 3600
     threshold: int = 5
@@ -59,7 +56,7 @@ class Policy:
     ci_mode: str = "packet"
     max_failures: int = 8
     # The installed passage supplies the compiled canon calendar (#1616).
-    # None retains the standalone, uninstalled engine's legacy calendar.
+    # None has no calendar: a cutoff is refused, never a local default (#2451).
     schedule: object | None = None
 
     def __post_init__(self):
@@ -71,7 +68,9 @@ class Policy:
             raise ValueError("positive train limits expected")
 
     def cutoff(self, now):
-        at = self.schedule.last_packet(now) if self.schedule is not None else cutoff(now)
+        if self.schedule is None:
+            raise TrainError("compiled canon calendar required for a packet cutoff")
+        at = self.schedule.last_packet(now)
         if isinstance(at, bool) or not isinstance(at, (int, float)) \
                 or not math.isfinite(at) or at > now:
             raise TrainError("compiled canon must provide a packet cutoff at or before now")
@@ -115,18 +114,6 @@ def ordered(rows: list[dict], dependencies: list[dict]) -> list[dict]:
     return result
 
 
-def cutoff(now: float) -> float:
-    """Latest 11:00/23:00 Europe/Paris cutoff, including across DST."""
-    local = datetime.fromtimestamp(now, ZoneInfo("Europe/Paris"))
-    if local.hour >= 23:
-        slot = local.replace(hour=23, minute=0, second=0, microsecond=0)
-    elif local.hour >= 11:
-        slot = local.replace(hour=11, minute=0, second=0, microsecond=0)
-    else:
-        slot = (local - timedelta(days=1)).replace(hour=23, minute=0, second=0, microsecond=0)
-    return slot.timestamp()
-
-
 def due(rows: list[dict], now: float, policy: Policy, *, last_started: float = 0) -> bool:
     if not rows:
         return False
@@ -158,7 +145,9 @@ class Ports(Protocol):
     def entries(self) -> list[dict]: ...
     def dependencies(self, rows: list[dict]) -> list[dict]: ...
     def qualify(self, rows: list[dict], base: str, mode: str) -> dict: ...
-    def compose(self, base: str, rows: list[dict], nonce: str) -> dict: ...
+    def sync(self, base: str) -> dict | None: ...
+    def compose(self, base: str, rows: list[dict], nonce: str,
+                sync: dict | None = None) -> dict: ...
     def validate_transports(self, plan: dict) -> list[dict]: ...
     def publish(self, plan: dict, epoch: int) -> None: ...
     def start_ci(self, plan: dict) -> None: ...
@@ -189,7 +178,10 @@ class Engine:
         number = len(state["attempts"]) + 1
         nonce = digest([self.source, self.target, state["base"], state["started_ts"],
                         [identity(r) for r in members], proof, number])
-        merged = self.ports.compose(state["base"], members, nonce)
+        sync = self.ports.sync(state["base"])
+        merged = (self.ports.compose(state["base"], members, nonce, sync=sync)
+                  if sync is not None
+                  else self.ports.compose(state["base"], members, nonce))
         # The adapter refuses conflicts unless their exact merged delta is
         # reviewed. No implicit rerere approval and no inferred CI transfer.
         for field in ("head", "tree"):
@@ -205,6 +197,17 @@ class Engine:
                     nonce=nonce,
                     branch="integration/train-%s-%s" % (state["stamp"], token[:16]),
                     id=token, created_ts=now)
+        if sync is not None:
+            receipt = merged.get("sync")
+            if not isinstance(receipt, dict) or receipt.get("ref") != sync.get("ref") \
+                    or receipt.get("sha") != sync.get("sha") \
+                    or receipt.get("base") != state["base"]:
+                raise TrainError("compose returned no exact main sync receipt")
+            for field in ("head", "tree"):
+                value = receipt.get(field, "")
+                if not merge_queue._HEX.fullmatch(value) or len(value) not in (40, 64):
+                    raise TrainError("compose returned no full main sync %s" % field)
+            plan["sync"] = copy.deepcopy(receipt)
         if "transports" in merged:
             if not isinstance(merged["transports"], list) or not merged["transports"]:
                 raise TrainError("nonempty structured composition transports required")

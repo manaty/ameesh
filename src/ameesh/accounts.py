@@ -2219,6 +2219,11 @@ def report(cfg, db, book, *, now: float | None = None,
     Chaque jauge porte son plafond effectif (`pace_ceiling`, #1176) et sa
     raison (`ceiling_reason`, vide pour le plafond de base) : le relèvement de
     fin de fenêtre s'y lit, comme dans la raison du compte.
+
+    #2648 : l'évaluation applique la réserve des agents non critiques
+    (`reserve=True`, L242b), comme `choose` — l'état, les plafonds affichés et
+    le prochain choix sont ceux de la pause : un compte dans la bande de
+    réserve n'est ni « ok » ni proposé.
     """
     now = time.time() if now is None else now
     from . import account_claims
@@ -2240,7 +2245,14 @@ def report(cfg, db, book, *, now: float | None = None,
         evaluations = {}
         for profile in items:
             try:
-                result = (evaluate_fn or evaluate)(book, profile, items, now, record=record)
+                # #2648 : la lecture qui désigne le compte d'une nouvelle
+                # session applique l'éligible de la pause d'un non-critique
+                # (réserve des critiques comprise). Sinon `accounts list`
+                # proposait un compte que la garde mettait en pause sur une
+                # autre fenêtre, et l'alerte `plan_underused` promettait la
+                # même capacité.
+                result = (evaluate_fn or evaluate)(
+                    book, profile, items, now, record=record, reserve=True)
             except Exception as exc:  # noqa: BLE001 — #1600 : jauge illisible
                 # #1600 : une lecture en erreur ne fait pas tomber l'affichage
                 # (`ameesh accounts list`) : le compte reste listé, sans marge

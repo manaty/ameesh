@@ -250,6 +250,13 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         lots = work.delays(db, limit=500)
         open_by_agent: dict[str, int] = {}
         build_by_agent: dict[str, int] = {}
+        # §4 : le plafond du canon compilé (#2451) ; illisible, la vue montre
+        # l'en-cours sans juger le dépassement
+        from . import mechanics
+        try:
+            cap: int | None = work.build_limit(cfg)
+        except mechanics.MechanicsError:
+            cap = None
         for lot in lots:
             if lot.get("assignee") and lot.get("state") not in work.TERMINAL:
                 open_by_agent[lot["assignee"]] = open_by_agent.get(lot["assignee"], 0) + 1
@@ -296,7 +303,7 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
                 (row.get("host") or "")[:10],
                 status[:11], _lease(row), int(row.get("unread") or 0),
                 open_by_agent.get(row["name"], 0),
-                "%d!" % wip if wip > work.BUILD_LIMIT else str(wip), _budget(row),
+                "%d!" % wip if cap is not None and wip > cap else str(wip), _budget(row),
                 ("owner" if row.get("has_owner_key")
                  else "agent" if row.get("key_ready") else "—"),
                 _fmt_age(now - float(row.get("last_seen_ts") or 0)),
@@ -321,11 +328,14 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
             print("items    : %d (%s)%s" % (len(lots), detail, waiting))
         # §4 : qui dépasse le plafond d'en-cours (le balayage rend le surplus)
         over = sorted(name for name, count in build_by_agent.items()
-                      if count > work.BUILD_LIMIT)
+                      if cap is not None and count > cap)
         if over:
             print("wip      : %d agent(s) above the §4 cap (%d lots in build): %s — "
                   "ameesh work wip [--apply] returns the surplus to the team queue"
-                  % (len(over), work.BUILD_LIMIT, ", ".join(over)))
+                  % (len(over), cap, ", ".join(over)))
+        elif cap is None:
+            print("wip      : §4 cap unknown (build.max_in_build absent from the "
+                  "compiled canon): no overrun judged")
         return 0
     finally:
         db.close()
@@ -1458,7 +1468,7 @@ def work_rows(db, *, state: str | None = None, assignee: str | None = None,
     `target` (défaut : la cible du lot, sinon `origin/main`) permettent en plus
     de porter un avis sur un gel republié quand le delta du lot est
     mécaniquement constant (#1905) ; sans `repo`, le champ est inchangé."""
-    from . import plan, plan_git, stagnation
+    from . import merge_queue, plan, plan_git, stagnation
     if threshold is None:
         threshold = stagnation.DEFAULT_THRESHOLD_S
 
@@ -1482,7 +1492,8 @@ def work_rows(db, *, state: str | None = None, assignee: str | None = None,
             for row in rows:
                 row["freeze"] = plan_git.freeze_candidate(
                     marks.get(int(row["id"]), []), repo=repo,
-                    target=target or row.get("branch_target") or plan_git.DEFAULT_TARGET)
+                    target=target or row.get("branch_target") or plan_git.DEFAULT_TARGET,
+                    waived=merge_queue.is_waived(row))
         return rows
 
     # L61 : lectures regroupées — deux allers-retours en tout
@@ -1492,7 +1503,7 @@ def work_rows(db, *, state: str | None = None, assignee: str | None = None,
 def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
                 target: str | None = None) -> dict | None:
     """The object of `ameesh work show --json` (also `GET /api/v1/lots/{id}`)."""
-    from . import canon as canon_mod, plan, stagnation
+    from . import canon as canon_mod, merge_queue, plan, stagnation
 
     def lire(db):
         item = work.get(db, lot_id)
@@ -1503,7 +1514,8 @@ def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
         from . import plan_git
         item["freeze"] = plan_git.freeze_candidate(
             item["milestones"], repo=repo,
-            target=target or item.get("branch_target") or plan_git.DEFAULT_TARGET)
+            target=target or item.get("branch_target") or plan_git.DEFAULT_TARGET,
+            waived=merge_queue.is_waived(item))
         from .modules.storage import ModuleStore
         item["module_milestones"] = ModuleStore(db).milestones(lot_id)
         item["delays"] = work.timeline(db, lot_id)
@@ -1537,6 +1549,13 @@ def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
         item["resolutions"], error = resolutions.of_lot_or_error(db, lot_id)
         if error:  # e.g. a database without migration 0057
             item["resolutions_error"] = error
+        # #2443 : les paquets de composition enregistrés, lus en base — jamais
+        # le manifeste. Une base d'avant 0465 n'empêche pas la fiche de sortir.
+        from . import packet_link
+        try:
+            item["packets"] = packet_link.for_item(db, lot_id)
+        except Exception as exc:  # noqa: BLE001 - l'affichage ne casse pas le lot
+            item["packets"], item["packets_error"] = [], str(exc)
         # L160e : place du lot dans la file de fusion de sa cible
         try:
             item["queue"] = next((r for r in storage.of(db).work.queue()
@@ -1783,7 +1802,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     print("      %s" % " · ".join(notes))
             return 0
         if args.work_command == "show":
-            from . import estimates, lot_measures, resolutions
+            from . import estimates, lot_measures, packet_link, resolutions
             item = work_detail(cfg, db, args.id,
                                repo=getattr(args, "git_dir", None),
                                target=getattr(args, "freeze_target", None))
@@ -1813,6 +1832,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             if item.get("package_id") or item.get("epic"):
                 print("plan     : card %-12s epic: %s" % (
                     item.get("package_id") or "—", item.get("epic") or "—"))
+            for member in item.get("packets") or []:
+                print("package  : %s" % packet_link.describe(member))
+            if item.get("packets_error"):
+                print("package  : unavailable (%s)" % item["packets_error"])
             if any(item["planned"].get(k) for k in ("start", "end", "delivery")):
                 print("planned  : start %s · end %s · delivery %s%s" % (
                     item["planned"]["start"] or "—", item["planned"]["end"] or "—",
@@ -1905,6 +1928,16 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 _fmt_moment(item.get("closed_ts"))))
             if item["delays"]:
                 _print_delays(item["delays"])
+            # #2674 : les verdicts écrits avant la règle de la tête relue ne
+            # comptent pas à la porte ; le dire une fois, sans noyer la frise.
+            unattached = [m for m in item["milestones"]
+                          if m.get("kind") == "verdict"
+                          and not str(m.get("sha") or "").strip()]
+            if unattached:
+                print("verdicts : avis non rattaché à une tête%s (anciens verdicts sans "
+                      "sha : ils ne comptent pas à la porte de fusion ; redonner l'avis "
+                      "sur la tête gelée)"
+                      % (" ×%d" % len(unattached) if len(unattached) > 1 else ""))
             for event in item["events"]:
                 print("  %s  %-14s %-12s %s" % (
                     _fmt_moment(event.get("created_ts")), event["state"],
@@ -2144,13 +2177,14 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 note = freeze_checks.before_freeze(
                     cfg, db, args.id, args.sha or "", repo=args.repo,
                     skip=args.no_static_checks, note=note)
-            elif args.repo is not None or args.no_static_checks is not None \
-                    or args.prevalidation_map:
-                raise work.WorkError("--repo, --no-static-checks and --prevalidation-map "
+            elif args.no_static_checks is not None or args.prevalidation_map:
+                raise work.WorkError("--no-static-checks and --prevalidation-map "
                                      "only apply to a freeze")
+            # `--repo` vaut aussi pour un verdict (#2674) : il y résout
+            # l'abréviation du SHA relu, et fait alors autorité.
             row = work.milestone(
                 db, args.id, args.kind, sha=args.sha or "", actor=args.actor or "",
-                verdict=args.verdict, note=note, outcome=outcome)
+                verdict=args.verdict, note=note, outcome=outcome, repo=args.repo)
             print("milestone %s added to lot #%d%s" % (
                 row["kind"], args.id,
                 " (%s)" % row["verdict"] if row.get("verdict") else ""))
@@ -3080,7 +3114,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_mig.add_argument("--number", type=int, default=None,
                         help="reserve this exact number (refused if it already exists on the "
                              "lot's target branch or is reserved by another work item; branches "
-                             "not merged into the target do not count, #2620); added to the "
+                             "not merged into the target do not count, #2620; the target is the "
+                             "lot's, else its project's, else `ameesh.target` — never the clone's "
+                             "`origin/HEAD`, and none declared is a refusal, #2660); added to the "
                              "lot's other reservations (#2481)")
     pw_mig.add_argument("--release", action="store_true",
                         help="release all the lot's reservations, or only --number when given "
@@ -3189,10 +3225,10 @@ def build_parser() -> argparse.ArgumentParser:
                                 "to this agent")
     pw_assign.add_argument("--target", default=None, help="target branch (see work add)")
     pw_assign.add_argument("--wip-exception", default=None, metavar="REASON",
-                           help="explicit pilot exception to the §4 WIP limit (at most %d "
-                                "lots in build per agent): this lot may stay beyond the cap; "
-                                "reserved to humans and orchestrator/design agents"
-                                % work.BUILD_LIMIT)
+                           help="explicit pilot exception to the §4 WIP limit (lots in build "
+                                "per agent, capped by the compiled canon): this lot may stay "
+                                "beyond the cap; reserved to humans and orchestrator/design "
+                                "agents")
     pw_assign.add_argument("--actor", default="")
     pw_assign.set_defaults(func=cmd_work)
     pw_branch = work_sub.add_parser(
@@ -3289,17 +3325,22 @@ def build_parser() -> argparse.ArgumentParser:
     pw_ms.add_argument("kind", choices=["frozen", "verdict"],
                        help="frozen (branch frozen) or verdict (review delivered); "
                             "the pilot's fire is `ameesh work fire`")
-    pw_ms.add_argument("--sha", default="", help="the frozen or reviewed commit")
+    pw_ms.add_argument("--sha", default="",
+                       help="the frozen or reviewed commit (verdict: the full head, or "
+                            "an abbreviation of at least 12 hex characters resolved in "
+                            "a repository)")
     # le verdict est un positionnel (`work milestone 1 verdict ok`), comme la
     # frise se lit ; `frozen` n'en prend pas
     pw_ms.add_argument("verdict", nargs="?", choices=list(work.VERDICTS), default=None,
                        help="for the verdict milestone: ok or blocked")
     pw_ms.add_argument("--note", default="")
     pw_ms.add_argument("--actor", default="")
-    # #2542 : les contrôles statiques du projet passent avant le gel
+    # #2542 : les contrôles statiques du projet passent avant le gel ;
+    # #2674 : pour un verdict, le dépôt où résoudre l'abréviation du SHA relu
     pw_ms.add_argument("--repo", default=None,
-                       help="frozen: the repository holding --sha (default: the current "
-                            "directory, then the lot's project repository)")
+                       help="frozen|verdict: the repository holding --sha (freeze default: "
+                            "the current directory, then the lot's project repository; "
+                            "verdict: the abbreviation must resolve there)")
     pw_ms.add_argument("--prevalidation-map", default="",
                        help="#2644: measured map (carte.json.gz) for the freeze "
                             "prevalidation; default: the last carte artifact")

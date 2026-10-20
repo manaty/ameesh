@@ -43,8 +43,9 @@ class TrainRuntimeTest(PgTestCase):
         self.fires = train_fire.Fires(None, self.ledger)
         self.repository = mock.Mock(project=self.project, source="github.com/o/r")
         self.repository.target.side_effect = lambda target: self.memory.target()
-        self.repository.compose.side_effect = lambda target, base, rows, nonce: self.memory.compose(
-            base, rows, nonce)
+        self.repository.main_sync.return_value = None
+        self.repository.compose.side_effect = lambda target, base, rows, nonce, sync=None: \
+            self.memory.compose(base, rows, nonce, sync=sync)
         self.repository.publish.side_effect = lambda plan, **kw: self.memory.effects.append(
             ("publish", plan["head"]))
         self.repository.promote.side_effect = lambda plan, **kw: self.memory.promote(plan, {}, kw["epoch"])
@@ -154,8 +155,8 @@ class TrainRuntimeTest(PgTestCase):
         # number only after a confirmed promotion, then frees it.
         compose = self.memory.compose
         mapping = [dict(work_item_id=1, reserved=525, landed=517, files=[])]
-        self.memory.compose = lambda base, rows, nonce: dict(
-            compose(base, rows, nonce), migrations=mapping)
+        self.memory.compose = lambda base, rows, nonce, sync=None: dict(
+            compose(base, rows, nonce, sync=sync), migrations=mapping)
         allocator = mock.Mock()
         allocator.landed.return_value = []
         self.engine = self.engine_for(self.runtime_for(migrations=allocator))
@@ -172,8 +173,8 @@ class TrainRuntimeTest(PgTestCase):
     def test_migration_landing_record_failure_never_revokes_the_merge(self):
         compose = self.memory.compose
         mapping = [dict(work_item_id=1, reserved=525, landed=517, files=[])]
-        self.memory.compose = lambda base, rows, nonce: dict(
-            compose(base, rows, nonce), migrations=mapping)
+        self.memory.compose = lambda base, rows, nonce, sync=None: dict(
+            compose(base, rows, nonce, sync=sync), migrations=mapping)
         allocator = mock.Mock()
         allocator.landed.return_value = ["record unavailable"]
         self.engine = self.engine_for(self.runtime_for(migrations=allocator))

@@ -39,6 +39,13 @@ qui a un tel gel, la fusion est constatée, dans cet ordre :
 La fermeture est conditionnée en base au gel examiné : si un nouveau gel est
 déclaré entre l'examen et l'écriture, rien n'est fermé (`refrozen`).
 
+#2443 : une unité dont la composition de paquet est enregistrée
+(`work_packet_members`) est d'abord prouvée par son commit de composition,
+dans la cible (`ameesh-work`, revert #1825 compris) : un jalon `frozen` n'est
+pas nécessaire, ce qui couvre le cas #2366. La preuve est écartée si le gel
+effectif courant de l'unité n'est plus celui de la composition (re-gel), et le
+relevé retombe alors sur le gel déclaré.
+
 Lecture seule du dépôt (`git merge-base`, `rev-list`, `log -p`, `patch-id`) ;
 la cible est lue telle que le clone la connaît. Deux exceptions, bornées et
 best-effort :
@@ -53,6 +60,14 @@ best-effort :
   périmée. Un clone que personne ne fetch ne fermait jamais les lots livrés
   par un paquet ; si le fetch échoue, le relevé continue sur les refs lues.
 
+#2744 : une fermeture par contenu est retenue tant que le lot est `blocked`
+ou qu'une note `hold:` n'est pas levée (le contenu fusionné est constaté, le
+journal le dit, le détenteur est réveillé, le lot reste ouvert) ; le contrôle
+et la fermeture partagent le verrou de ligne du lot avec les notes hold/lift
+(`work.close_merged(content_guard=…)`), et une lecture du journal en erreur
+retient aussi. `sync-branches` et les unités de paquet (`sync-packets`)
+portent la même garde.
+
 Un lot absorbé par un autre ou remplacé se clôt par
 `ameesh work close <id> --superseded-by <id>` ; jamais de réouverture d'un
 lot fermé.
@@ -62,6 +77,7 @@ from __future__ import annotations
 import os
 import re
 
+from . import planned_waits
 from . import storage
 from . import work as work_mod
 from .canon import (FETCH_TIMEOUT, GitError, NO_LAZY_FETCH, _git, _norm_url,
@@ -469,7 +485,7 @@ def _freeze_mark(row: dict | None) -> dict | None:
 
 
 def freeze_candidate(rows: list[dict], repo: str | None = None,
-                     target: str | None = None) -> dict:
+                     target: str | None = None, *, waived: bool = False) -> dict:
     """Le gel effectif d'un lot (#1756) : le commit sur lequel un avis
     favorable existe, même sans jalon `frozen`, ou malgré un gel périmé.
 
@@ -500,6 +516,11 @@ def freeze_candidate(rows: list[dict], repo: str | None = None,
     * aucun avis : le gel déclaré reste candidat (note `no-verdict` — la
       classe légère n'exige pas d'avis) ; sans gel non plus, refus
       `no-verdict` ;
+    * `waived` (#2681, dispense `-none` du pilote, #1979) : le gel déclaré
+      est le candidat même quand le dernier avis porte sur une tête
+      antérieure — la dispense couvre la tête gelée, pas une remise (#2496) ;
+      note `verdict-not-required`. Un `blocked` sur la tête gelée refuse
+      toujours ;
     * un `blocked` applicable n'est jamais masqué par le `ok` d'un autre
       relecteur : refus `blocked-verdict`.
 
@@ -542,42 +563,49 @@ def freeze_candidate(rows: list[dict], repo: str | None = None,
     v_sha = commit_id((last or {}).get("sha"))
     v_at = float((last or {}).get("at_ts") or 0)
 
-    if last is None:
-        if f_sha:
-            out.update(sha=f_sha, origin="frozen")
-            out["notes"].append("no-verdict")
-            return out
-        out["causes"].append("no-verdict")
-        return out
-    if (last.get("verdict") or "ok") != "ok":
-        out["causes"].append("blocked-verdict")
-        return out
     carried_from = None
-    if f_sha and v_sha:
-        if same_commit(f_sha, v_sha):
-            out.update(sha=max(f_sha, v_sha, key=len), origin="frozen")
-        elif f_at > v_at:
-            carried = (rebase_identity(repo, v_sha, f_sha, target or DEFAULT_TARGET)
-                       if repo else {"mechanical": False})
-            if not carried["mechanical"]:
-                out["causes"].append("freeze-after-verdict")
-                return out
-            out.update(sha=f_sha, origin="frozen")
-            out["notes"].append("mechanical-rebase: %s" % carried["detail"])
-            carried_from = v_sha
-        else:
-            out.update(sha=v_sha, origin="verdict")
-            out["notes"].append("declared-freeze-stale")
-    elif v_sha:
-        out.update(sha=v_sha, origin="verdict")
-        if freeze is not None:
-            out["notes"].append("declared-freeze-stale")
-    elif f_sha and v_at >= f_at:
+    if waived and f_sha:
+        # La dispense du pilote couvre la tête déclarée (#2681) : un avis
+        # antérieur ne la déclasse pas. La porte garde son blocage courant,
+        # vérifié ci-dessous sur cette même tête.
         out.update(sha=f_sha, origin="frozen")
-        out["notes"].append("verdict-names-no-commit")
+        out["notes"].append("verdict-not-required")
     else:
-        out["causes"].append("verdict-names-no-commit")
-        return out
+        if last is None:
+            if f_sha:
+                out.update(sha=f_sha, origin="frozen")
+                out["notes"].append("no-verdict")
+                return out
+            out["causes"].append("no-verdict")
+            return out
+        if (last.get("verdict") or "ok") != "ok":
+            out["causes"].append("blocked-verdict")
+            return out
+        if f_sha and v_sha:
+            if same_commit(f_sha, v_sha):
+                out.update(sha=max(f_sha, v_sha, key=len), origin="frozen")
+            elif f_at > v_at:
+                carried = (rebase_identity(repo, v_sha, f_sha, target or DEFAULT_TARGET)
+                           if repo else {"mechanical": False})
+                if not carried["mechanical"]:
+                    out["causes"].append("freeze-after-verdict")
+                    return out
+                out.update(sha=f_sha, origin="frozen")
+                out["notes"].append("mechanical-rebase: %s" % carried["detail"])
+                carried_from = v_sha
+            else:
+                out.update(sha=v_sha, origin="verdict")
+                out["notes"].append("declared-freeze-stale")
+        elif v_sha:
+            out.update(sha=v_sha, origin="verdict")
+            if freeze is not None:
+                out["notes"].append("declared-freeze-stale")
+        elif f_sha and v_at >= f_at:
+            out.update(sha=f_sha, origin="frozen")
+            out["notes"].append("verdict-names-no-commit")
+        else:
+            out["causes"].append("verdict-names-no-commit")
+            return out
 
     # Blocage applicable : le dernier avis de chaque relecteur sur le commit
     # candidat (mêmes règles que la porte des avis, #1374).
@@ -632,6 +660,213 @@ def _content_refs(row: dict, target: str | None, *, declared_repo: str | None,
     return to_try
 
 
+def _packet_delivery(repo: str, lot: int, members: list[dict], refs: list[tuple],
+                     marks: list[dict], *, default: str | None) -> dict | None:
+    """#2443 : l'unité a-t-elle été livrée par un paquet composé ?
+
+    `members` sont les appartenances enregistrées (`work_packet_members`) ;
+    seule une ref qui ferme est examinée. Le commit de composition (`unit_sha`)
+    doit être entré dans cette ref (`probe`, revert #1825 compris). La preuve
+    n'est retenue que si le gel effectif courant de l'unité est encore celui de
+    la composition — le gel enregistré, ou la tête composée elle-même quand
+    aucun gel n'existait alors ; un nouveau gel rend la preuve périmée et le
+    lot retombe sur le relevé de son gel.
+
+    Rend `{ref, proof, member, target, off_target}` ou None.
+    """
+    if not members or not refs:
+        return None
+    target_ref = refs[0][0]
+    try:
+        candidate = freeze_candidate(marks, repo=repo, target=target_ref)
+    except (MergeProbeError, GitError):
+        return None                       # gel courant illisible : jamais de preuve
+    current = commit_id(candidate.get("sha"))
+    # Sans gel effectif, seule l'absence de tout gel/avis (`no-verdict`) laisse
+    # la composition conclure : un avis bloqué, un gel postérieur à l'avis ou
+    # un avis sans commit déclarent une tête que la composition ne couvre pas.
+    undecided = not current and bool(
+        set(candidate.get("causes") or ()) - {"no-verdict"})
+    for member in members:
+        unit = commit_id(member.get("unit_sha"))
+        if not unit:
+            continue
+        recorded = commit_id(member.get("frozen_sha"))
+        source = commit_id(member.get("source_sha"))
+        if current:
+            if not (same_commit(current, recorded) or same_commit(current, source)):
+                continue                 # un nouveau gel : la composition est périmée
+            # Le gel capturé par record peut avoir avancé APRÈS la composition.
+            # Son identité avec le gel courant ne prouve donc pas sa livraison :
+            # la source réellement composée doit aussi en porter le contenu.
+            if not same_commit(current, source):
+                if not source:
+                    continue
+                try:
+                    if not probe(repo, current, source, lot=lot)["merged"]:
+                        continue
+                except (MergeProbeError, GitError):
+                    continue
+        elif recorded:
+            continue                     # le gel enregistré a disparu : ne pas conclure
+        elif undecided:
+            continue                     # une déclaration existe, sans gel lisible
+        for ref, off, closes in refs:
+            if not closes:
+                continue
+            try:
+                proof = probe(repo, unit, ref, lot=lot)
+            except (MergeProbeError, GitError):
+                continue
+            if not proof["merged"]:
+                continue
+            return {"ref": ref, "proof": proof, "member": member, "target": ref,
+                    "off_target": default if off else None}
+    return None
+
+
+#: #2744 : états qui retiennent la fermeture par le contenu — le lot peut être
+#: livré sans être clos (une passe, une décision ou un déblocage restent dus).
+CONTENT_HELD_STATES = ("blocked",)
+
+
+def content_retention(st, row: dict) -> dict | None:
+    """#2744 : la retenue qui empêche de fermer un lot par son contenu.
+
+    Un lot `blocked`, ou sous une note `hold: …` non levée (#1664), n'est pas
+    fermé par le contenu : sa livraison est constatée, sa fermeture attend la
+    levée. `planned_waits.explicit_holds` est la seule lecture des hold : une
+    note `unhold:` ou un changement d'état lève la retenue. Une lecture du
+    journal qui échoue rend une retenue `unreadable` : une erreur ne doit
+    jamais autoriser une fermeture. Rend `{what, motif, by, since}`, ou None.
+    """
+    row = row or {}
+    try:
+        lot = int(row["id"])
+        state = str(row.get("state") or "")
+    except (KeyError, TypeError, ValueError):
+        return None
+    try:
+        events = st.progress.lot_hold_events([lot], planned_waits.HOLD_NOTE_PATTERNS)
+    except Exception as exc:  # noqa: BLE001 — l'erreur retient, elle n'ouvre pas
+        return {"what": "unreadable",
+                "motif": "journal des retenues illisible (%s: %s)"
+                         % (type(exc).__name__, " ".join(str(exc).split())[:120]),
+                "by": str(row.get("assignee") or ""), "since": None}
+    held = planned_waits.explicit_holds(events).get(lot)
+    if held:
+        by = str(held.get("by") or "")
+        reason = ""
+        for event in reversed(events):
+            text = str(event.get("note") or "").strip()
+            if planned_waits.is_hold_note(text):
+                reason = " ".join(text.split())
+                if reason[:5].lower() == "hold:":
+                    reason = reason[5:].strip()
+                reason = reason[:160]
+                break
+        motif = "hold" + (" de %s" % by if by else "")
+        if reason:
+            motif += " : %s" % reason
+        return {"what": "hold", "motif": motif, "by": by,
+                "since": held.get("since")}
+    if state in CONTENT_HELD_STATES:
+        transitions = [e for e in events if e.get("state") in CONTENT_HELD_STATES]
+        last = transitions[-1] if transitions else {}
+        by = str(last.get("actor") or row.get("assignee") or "")
+        return {"what": "blocked", "motif": "état %s" % state, "by": by,
+                "since": last.get("created_ts")}
+    return None
+
+
+def _retention_text(retention: dict, entry: dict, target: str) -> str:
+    """La ligne de journal d'une fermeture retenue (#2744)."""
+    ref = str(entry.get("ref") or entry.get("sha") or "")
+    return ("contenu fusionné, fermeture retenue : %s — %s (%s %s)"
+            % (retention["motif"], target, entry.get("how") or "?",
+               ref[:12] or "?"))
+
+
+def mark_withheld(entry: dict, retention: dict, *, target: str,
+                  dry_run: bool = False) -> str:
+    """#2744 : l'entrée de compte rendu d'une fermeture retenue."""
+    text = _retention_text(retention, entry, target)
+    entry["retention"] = retention
+    entry["result"] = "would-withhold" if dry_run else "withheld"
+    entry["detail"] = "%s — %s" % (entry.get("detail") or "", text)
+    return text
+
+
+def mark_retained(entry: dict, retention: dict, *, target: str,
+                  dry_run: bool = False) -> None:
+    """#2744 : compte rendu d'une retenue, ou d'une lecture de journal en
+    erreur — cette dernière est une **erreur** explicite, jamais un simple
+    hold : le lot reste ouvert et l'appelant la voit (`result: error`)."""
+    if retention.get("what") == "unreadable":
+        entry["retention"] = retention
+        entry["result"] = "error"
+        entry["detail"] = "%s — %s" % (entry.get("detail") or "",
+                                       retention.get("motif") or "journal illisible")
+        return
+    mark_withheld(entry, retention, target=target, dry_run=dry_run)
+
+
+def record_content_withheld(db, st, row: dict, entry: dict, retention: dict, *,
+                            target: str, actor: str = "") -> None:
+    """#2744 : journalise et réveille une fermeture retenue, une fois.
+
+    Appelé après le refus atomique de `work.close_merged` : la note et le
+    courrier ne sont pas dans la transaction de fermeture, mais la fermeture,
+    elle, a déjà été refusée sous le verrou du lot."""
+    text = _retention_text(retention, entry, target)
+    lot = int(row["id"])
+    if not _first_observation(st, lot, text):
+        return
+    try:
+        work_mod.note(db, lot, text, actor=actor)
+    except work_mod.WorkError:
+        return                    # le lot a changé : rien à journaliser
+    _wake_retention(db, row, retention, entry=entry, target=target)
+
+
+def _first_observation(st, lot: int, text: str) -> bool:
+    """#2744 : cette retenue n'est-elle pas déjà au journal ? (une note et un
+    réveil par observation, pas un par balayage)."""
+    try:
+        return not any((e.get("note") or "").strip() == text
+                       for e in st.work.events(lot, 40))
+    except Exception:  # noqa: BLE001 — une lecture impossible ne bloque pas la note
+        return True
+
+
+def _wake_retention(db, row: dict, retention: dict, *, entry: dict, target: str) -> None:
+    """#2744 : réveille le détenteur du hold, sinon le signaleur du blocage.
+
+    Best-effort : la note est déjà écrite ; un courrier non délivré ne doit pas
+    casser le relevé. Un humain n'est pas réveillé par la boîte aux lettres."""
+    from . import mail
+    recipient = str(retention.get("by") or row.get("assignee") or "").strip()
+    if not recipient or recipient.startswith(work_mod.HUMAN_PREFIX) \
+            or recipient == work_mod.SYSTEM_SENDER:
+        return
+    ref = str(entry.get("ref") or entry.get("sha") or "")
+    body = ("Lot #%d \"%s\": its frozen content is merged into %s (%s, %s), but the "
+            "closure is withheld: %s. The lot stays %s; lift the hold (a state change "
+            "or an `unhold:` note) and the next content sweep will close it."
+            % (int(row["id"]), row.get("title") or "", target,
+               entry.get("how") or "?", ref[:12] or "?", retention["motif"],
+               row.get("state") or "?"))
+    try:
+        mail.send(db, work_mod.SYSTEM_SENDER, recipient, body, kind="event",
+                  work_item_id=str(int(row["id"])),
+                  payload={"closure_withheld": {
+                      "lot": int(row["id"]), "reason": retention["what"],
+                      "target": target, "how": entry.get("how"),
+                      "ref": ref}})
+    except Exception:  # noqa: BLE001 — le journal porte déjà la retenue
+        pass
+
+
 def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool = False,
                 limit: int = 1000) -> dict:
     """Ferme les lots dont le contenu gelé est entré dans la cible.
@@ -668,6 +903,18 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
     declared: dict = {}
     for ms in st.progress.lot_milestones([int(r["id"]) for r in rows]):
         declared.setdefault(int(ms["work_item_id"]), []).append(ms)
+    # #2443 : l'appartenance enregistrée à la composition, lue une fois pour
+    # tous les lots examinés. Une base d'avant 0465 ne fait pas échouer le
+    # relevé : le repli par le gel reste inchangé, l'absence est dite.
+    packet_error = ""
+    packets: dict[int, list[dict]] = {}
+    try:
+        from .db import DbError
+        members = st.work.packet_members(item_ids=[int(r["id"]) for r in rows])
+    except DbError as exc:                     # table absente (schéma ancien)
+        members, packet_error = [], str(exc)
+    for member in members:
+        packets.setdefault(int(member["work_item_id"]), []).append(member)
     results: list[dict] = []
     for row in sorted(rows, key=lambda r: int(r["id"])):
         lot = int(row["id"])
@@ -682,8 +929,10 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
             # effectif (`freeze.origin=verdict`, #1756) ; sans jalon `frozen`,
             # c'est le contenu relu qui entre dans la cible. Un avis sur une
             # autre tête ne prouve rien : la branche a avancé depuis.
-            candidate = freeze_candidate(marks, repo_dir,
-                                         target or row.get("branch_target") or default)
+            from . import merge_queue
+            candidate = freeze_candidate(
+                marks, repo_dir, target or row.get("branch_target") or default,
+                waived=merge_queue.is_waived(row))
             # #2444 : la tête confrontée est la tête publiée (origin d'abord) ;
             # une branche disparue ne vaut pas un contrôle de la tête.
             reviewed = commit_id(candidate.get("sha"))
@@ -699,15 +948,72 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
                  "detail": unchecked or (
                      "last freeze has no commit (milestone frozen --sha)" if freeze
                      else "no freeze declared (milestone frozen --sha)")}
-        if not sha:
-            results.append(entry)
-            continue
+        # #2443 : ne pas sortir sur l'absence de gel déclaré avant d'avoir
+        # examiné une composition de paquet — c'est la voie du cas #2366.
+
         refs = _content_refs(row, target, declared_repo=declared_repo, default=default,
                              candidates=candidates)
         if not refs:
             entry.update(result="no-target",
                          detail="no target: `git config %s <branch>` in %s, or --target"
                                 % (TARGET_GIT_KEY, repo_dir))
+            results.append(entry)
+            continue
+        composition = _packet_delivery(repo_dir, lot, packets.get(lot, []), refs,
+                                       declared.get(lot, []), default=default)
+        if composition is not None:
+            member = composition["member"]
+            entry.update(target=composition["target"],
+                         off_target=composition["off_target"], how="composition",
+                         ref=composition["proof"]["ref"], sha=member["unit_sha"],
+                         packet=int(member["package_id"]), result="open",
+                         detail=("%s is the composition unit of package #%s (%s) in %s"
+                                 % ((member["unit_sha"] or "")[:12],
+                                    member["package_id"],
+                                    member.get("package_branch") or "?",
+                                    composition["target"])),
+                         composition={"package": int(member["package_id"]),
+                                      "branch": member.get("package_branch") or "",
+                                      "unit": member["unit_sha"]})
+            if dry_run:
+                # #2744 : la même retenue que la fermeture par le gel.
+                retention = content_retention(st, row)
+                if retention is not None:
+                    mark_retained(entry, retention, target=composition["target"],
+                                  dry_run=True)
+                    results.append(entry)
+                    continue
+                entry["result"] = "would-merge"
+            else:
+                done = work_mod.close_merged(
+                    db, lot, sha=entry["ref"] or "", actor="composition:%s"
+                    % member["package_id"],
+                    source="package composition #%s (%s)"
+                    % (member["package_id"], member.get("package_branch") or "?"),
+                    frozen_id=int(freeze["id"]) if freeze else None,
+                    # #2444 : aucun gel déclaré examiné (gel d'origine verdict) ;
+                    # un gel apparu entre-temps refuse la fermeture.
+                    unfrozen=freeze is None,
+                    repo=repo_dir,      # L539 : dépôt du relevé, indice de classe
+                    content_guard=content_retention)   # #2744 : verrou commun avec le hold
+                entry["result"] = done["result"]
+                if done["result"] in ("withheld", "error"):
+                    mark_retained(entry, done["retention"],
+                                  target=composition["target"])
+                    if done["result"] == "withheld":
+                        record_content_withheld(
+                            db, st, row, entry, done["retention"],
+                            target=composition["target"],
+                            actor="composition:%s" % member["package_id"])
+                else:
+                    entry["detail"] = "%s — %s" % (entry["detail"], done["detail"])
+            results.append(entry)
+            continue
+        if not sha:
+            if packets.get(lot):
+                entry["detail"] += ("; recorded packet composition #%s not delivered yet"
+                                    % ", #".join(str(m["package_id"])
+                                                 for m in packets[lot]))
             results.append(entry)
             continue
         found_target = None              # la ref qui a livré le gel
@@ -763,21 +1069,36 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
                      ref=found_proof["ref"], sha=sha, result="open",
                      detail=found_proof["detail"])
         if dry_run:
+            retention = content_retention(st, row)
+            if retention is not None:
+                mark_retained(entry, retention, target=found_target, dry_run=True)
+                results.append(entry)
+                continue
             entry["result"] = "would-merge"
         else:
             done = work_mod.close_merged(
                 db, lot, sha=entry["ref"] or "", actor="git:%s" % found_target,
                 source="content (%s)" % entry["how"], frozen_id=frozen_id,
                 unfrozen=frozen_id is None,   # #2444 : un gel apparu entre-temps refuse
-                repo=repo_dir)          # L539 : dépôt du relevé, indice de classe
+                repo=repo_dir,          # L539 : dépôt du relevé, indice de classe
+                content_guard=content_retention)   # #2744 : verrou commun avec le hold
             entry["result"] = done["result"]
-            detail = "%s — %s" % (entry["detail"], done["detail"])
-            entry["detail"] = detail
+            if done["result"] in ("withheld", "error"):
+                mark_retained(entry, done["retention"], target=found_target)
+                if done["result"] == "withheld":
+                    record_content_withheld(
+                        db, st, row, entry, done["retention"], target=found_target,
+                        actor="git:%s" % found_target)
+            else:
+                entry["detail"] = "%s — %s" % (entry["detail"], done["detail"])
         results.append(entry)
-    return {"git_dir": repo_dir, "target": target if target is not None else (default or ""),
-            "auto": target is None, "off_target": default if target is None else None,
-            "dry_run": bool(dry_run), "results": results,
-            "merged": sum(1 for r in results if r["result"] == "merged")}
+    report = {"git_dir": repo_dir, "target": target if target is not None else (default or ""),
+              "auto": target is None, "off_target": default if target is None else None,
+              "dry_run": bool(dry_run), "results": results,
+              "merged": sum(1 for r in results if r["result"] == "merged")}
+    if packet_error:
+        report["packet_error"] = packet_error
+    return report
 
 
 # --------------------------------------------------------------------------
@@ -2430,6 +2751,11 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             results.append(entry)
             continue
         if dry_run:
+            retention = content_retention(st, row)
+            if retention is not None:
+                mark_retained(entry, retention, target=target, dry_run=True)
+                results.append(entry)
+                continue
             entry["result"] = "would-merge"
             results.append(entry)
             continue
@@ -2446,8 +2772,17 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
         done = work_mod.close_merged(
             db, lot, sha=found["ref"] or "", actor=actor or "git:%s" % target,
             source=source, frozen_id=found.get("frozen_id"),
-            repo=repo)                          # L539 : dépôt du relevé, indice de classe
-        entry.update(result=done["result"], detail="%s — %s" % (entry["detail"], done["detail"]))
+            repo=repo,                          # L539 : dépôt du relevé, indice de classe
+            content_guard=content_retention)    # #2744 : verrou commun avec le hold
+        entry["result"] = done["result"]
+        if done["result"] in ("withheld", "error"):
+            mark_retained(entry, done["retention"], target=target)
+            if done["result"] == "withheld":
+                record_content_withheld(
+                    db, st, row, entry, done["retention"], target=target,
+                    actor=actor or "git:%s" % target)
+        else:
+            entry["detail"] = "%s — %s" % (entry["detail"], done["detail"])
         if done["result"] == "merged":
             if found.get("kind") == "content":
                 delivered = "its last freeze %s is an ancestor of %s" % (

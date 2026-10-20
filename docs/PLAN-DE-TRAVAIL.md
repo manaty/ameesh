@@ -67,7 +67,14 @@ ameesh work close <id> --abandoned                 lot that will not be done
 ameesh work close <id> --superseded-by <id2>       lot replaced or absorbed by another
 ameesh work close <id> --delivered --sha <head>    lot delivered outside the target (#988)
 ameesh work close <id> --done                      delivered without a merge (no branch)
+ameesh work packet record <carrier> [--repo R]     link its composition units (#2443)
+ameesh work packet show <lot|carrier> [--json]     recorded package composition
 ```
+
+`package` on `work add`/`work link` is the **plan card** (`work_packages`).
+The package-composition link of #2443 is separate: `work packet record` reads
+the carrier's `integration/**` composition commits (`ameesh-work:` trailers,
+never the manifest), and `work show` then prints `package : #<carrier> …`.
 
 `close` moves the lot to the terminal state `closed` and records a `closed` milestone:
 nothing stays open by oversight. A closed lot is **never reopened** by a
@@ -185,6 +192,18 @@ all idempotent, which set the lot to `merged` with its `merged` milestone
    wrongly. `sync-branches` and `sync-merges` carry the same guard. Closing is
    conditioned in the database on the examined freeze: a new
    freeze declared in the meantime prevents it (`refrozen`).
+
+   A closure by content is **withheld** (#2744) while the lot is `blocked` or
+   carries an unlifted `hold: …` note (#1664): the merge proof stays in the
+   sweep report (`how`, `ref`, `target`), the journal receives once
+   `contenu fusionné, fermeture retenue : <motif>`, the hold holder (or the
+   agent who blocked the lot) is woken, and the lot stays open. An `unhold:`
+   note or a state change lifts the hold; the next sweep closes. The check and
+   the closure share the lot's row lock — hold/lift notes and state changes
+   take it too — so a retention cannot slip between the journal read and the
+   close. A journal read error is an explicit `error` (the lot stays open,
+   never closes), not a silent hold. The same guard covers `sync-branches`
+   and the units of `sync-packets`.
 
    A package's units are closed by its manifest, without a card or
    `package_id`: on the target, `reviews/**paquet**.md` lists the composed
@@ -394,8 +413,12 @@ is assumed (§7), every item stays a lot as before.
 ### WIP limit: at most 2 lots in `build` per agent (§4)
 
 Owner 14/10/2026, canon §4: an agent holds at most
-`ameesh.work.BUILD_LIMIT` (2) lots in `build`, **all projects
-confused** (the cap is global, not per team). Two guards:
+`build.max_in_build` lots in `build` (2 today), **all projects
+confused** (the cap is global, not per team). Since #2451 the value is
+read from the compiled canon (`ameesh.work.build_limit`, global
+document of `processus/mecanique.yaml`); without a readable canon the
+sweep and the automatic pick-up refuse rather than assume a cap. Two
+guards:
 
 * **the automatic pick-up refuses the third lot**: the count and the
   assignment are written in one transaction under the agent's advisory

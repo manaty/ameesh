@@ -301,6 +301,8 @@ class PreemptResidentTest(unittest.TestCase):
         worker._preempt_row = None
         worker.preempting = threading.Event()
         worker._preempt_seq = 0
+        worker.preempt_gen = 0
+        worker._preempt_lock = threading.Lock()
         worker._steer_pending = []
         worker._steer_lock = threading.Lock()
         worker._turn_generation = 1

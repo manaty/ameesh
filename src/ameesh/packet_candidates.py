@@ -18,7 +18,8 @@ courrier :
   une tête locale n'est pas la forge) ;
 * verdicts requis acquis **sur cette tête**, par la même porte que la fusion
   (`merge_queue.review_gate`, #1374) : comptés par classe, indépendants, sans
-  blocage courant ;
+  blocage courant ; la dispense `-none` du pilote (#1979) couvre la tête
+  gelée, jamais une remise (#2496/#2681) ;
 * `git merge-tree` propre contre la cible (le commit de base du paquet) ;
   #2496 : sinon, une **remise** propre sur la cible
   (`refs/ameesh/resolutions/<lot>/<cible>-*` ou `union-<cible>-*`) rend le
@@ -486,7 +487,8 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     names = [target_branch]
     names += [str(row.get("branch") or "") for row in rows if row.get("branch")]
     try:
-        tips, where = merge_queue.fetch_fresh(repo, names, clone)
+        tips, where = merge_queue.fetch_fresh(repo, names, clone,
+                                              base=target_branch)
     except merge_queue.QueueError as exc:
         raise CandidateError(str(exc)) from exc
     fetched_target = tips.get(target_branch)
@@ -682,7 +684,9 @@ def _candidate(db, row: dict, *, target_branch: str, tips: dict, where: str,
         return entry
     entry["published_head"] = tip
     try:
-        freeze = plan_git.freeze_candidate(marks, repo=where, target=package_base)
+        freeze = plan_git.freeze_candidate(
+            marks, repo=where, target=package_base,
+            waived=merge_queue.is_waived(row))
     except Exception as exc:  # noqa: BLE001 - lecture du gel impossible
         entry["error"] = "cannot read the effective freeze: %s" % exc
         return entry

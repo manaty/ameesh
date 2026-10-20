@@ -113,8 +113,13 @@ none of them certifies that a test loads the file, so the full suite stays
 Any error while reading the map gives the fallback plan, never a failure.
 
 **Changed lines without a test**: an existing block whose fingerprint
-changed and that no test executes is listed in the plan, in the job summary,
-and as a GitHub annotation on the PR diff (`--annotations`).
+changed since the branch's base and that no test executes is listed in the
+plan, in the job summary, and as a GitHub annotation on the PR diff
+(`--annotations`). A block the target changed after the map, but that the
+branch leaves as it is, has the same fingerprint at the base and at HEAD and
+is not listed (#1909); the selection still judges it changed since the map,
+so its importers keep running. When the branch's own range cannot be read,
+the listing stays conservative.
 
 **Provisional green**: each part writes a `impacted` event to its stream
 once its P0 and P1 modules are done (`scripts/test-parts.py`); when every
@@ -869,7 +874,7 @@ class Impact:
     def __init__(self) -> None:
         self.p0: dict[str, str] = {}
         self.p1: dict[str, str] = {}
-        self.untested: list[dict] = []       # changed blocks no test executes
+        self.untested: list[dict] = []       # branch's changed blocks no test executes
         self.unknown_blocks: list[str] = []  # blocks the map has never seen
         self.unsure: list[str] = []          # why the map cannot judge everything
         self.textual: list[str] = []         # files left to the L161b heuristic
@@ -1032,6 +1037,38 @@ def _python(card: dict, impact: Impact, status: str, path: str, head: str,
     impact.unknown_blocks.extend(f"{path}::{b}" for b in sorted(added))
 
 
+def _changed_since_base(untested: list[dict], base: str, head: str,
+                        repo: pathlib.Path) -> list[dict]:
+    """#1909 : ne garder que les blocs dont l'empreinte diffère aussi de la
+    base de la branche.
+
+    `_python` compare les empreintes à la carte. La cible a pu changer un bloc
+    après la carte : son empreinte diffère alors de la carte, mais elle est la
+    même à la base de fusion et à HEAD, et le bloc n'est pas une ligne de la
+    branche. Une empreinte illisible d'un côté garde le bloc (doute).
+    """
+    blocks: dict[str, tuple[dict | None, dict | None] | None] = {}
+    kept = []
+    for item in untested:
+        path = item["file"]
+        if path not in blocks:
+            before, after = show(path, base, repo), show(path, head, repo)
+            try:
+                blocks[path] = (
+                    None if before is None else map_mod.blocks(before)[0],
+                    None if after is None else map_mod.blocks(after)[0])
+            except (SyntaxError, ValueError):
+                blocks[path] = None
+        pair = blocks[path]
+        if pair is not None and pair[0] is not None and pair[1] is not None:
+            at_base = pair[0].get(item["block"], {}).get("empreinte")
+            at_head = pair[1].get(item["block"], {}).get("empreinte")
+            if at_base == at_head:
+                continue
+        kept.append(item)
+    return kept
+
+
 def _dynamic(tree: ast.AST) -> bool:
     """Whether the module may reach a function by a computed name: `import *`,
     `globals()`, `vars()`, `locals()`, or `getattr` with a name that is not a
@@ -1134,6 +1171,11 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
     full suite (#1314, #1476). The version-only exemption of `pyproject.toml`
     (L157) is judged on that same own range, so a target change to the file no
     longer breaks it.
+
+    The `untested` report is the branch's own: a block whose fingerprint is
+    the same at `own_base` and at `head` changed on the target after the map,
+    not here, and is not listed (#1909). The selection keeps the map's doubt
+    for it (`_resolve_unmeasured`); only the report narrows.
     """
     impact = Impact()
     known_modules = set(card.get("modules", {}))
@@ -1192,6 +1234,13 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
     #: leur fichier (sélection élargie), la preuve étant la mesure ou un import
     #: exécuté au niveau module (relecture Codex, B2 résiduel).
     _resolve_unmeasured(card, impact, modules, head, repo)
+    #: #1909 : le rapport « lignes sans test » nomme les blocs que la branche
+    #: change, pas ceux que la cible a changés depuis la carte. La sélection
+    #: ci-dessus a déjà gardé le doute de la carte : un bloc hérité reste couvert
+    #: par ses importateurs, seule sa mention dans le rapport disparaît.
+    #: `own` inconnu (range illisible ou non fiable) : liste conservatrice.
+    if impact.untested and own is not None and own_base is not None:
+        impact.untested = _changed_since_base(impact.untested, own_base, head, repo)
     return impact
 
 
