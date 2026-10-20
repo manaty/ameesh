@@ -5,9 +5,11 @@
 // the server deposits it in the agent's mailbox, which wakes the agent at its
 // next turn, and writes its readable copy in the thread. The answer arrives
 // as mail, so through the thread: the screen shows the exchanges between the
-// human and the agent in the threads where they land (the lot's when one is
-// set; otherwise the agent's project and its current lot), the agent's state
-// and, while the last word is the human's, "waiting for the next turn".
+// human and the agent in the threads where they land (the selected lot's and
+// its project's; otherwise the agent's project and its current lot), the
+// agent's state and, while the last word is the human's, "waiting for the
+// next turn". A reply sent without `--lot` lands in the project thread, so a
+// selected lot must not hide it.
 // Tier 2 (live answer of a resident agent, `chat.delta`) follows L75–L83.
 import { css, html, nothing } from "lit";
 import { ApiError, type Client } from "../api/client";
@@ -56,7 +58,9 @@ export class AmeeshChat extends ReadView {
       .find((a) => a.name === this.agent);
     const agent = { ...object(object(detail).agent), ...current };
     const project = this.project || label(agent.project);
-    const lots = this.lot ? [this.lot] : [null, object(agent.lot).id ?? null];
+    // a reply sent without `--lot` lands in the project thread: keep reading
+    // it beside the selected lot's thread, never instead of it
+    const lots = this.lot ? [null, this.lot] : [null, object(agent.lot).id ?? null];
     const threads = project === "—" ? [] : await Promise.all(
       [...new Set(lots.map((lot) => lot === null ? null : String(lot)))].map((lot) => {
         const read = lot === null
