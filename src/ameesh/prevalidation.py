@@ -477,7 +477,8 @@ def head_state(root: str, head: str, *,
     return True, "", got
 
 
-def pinned_snapshot(root: str, head: str, plan_rel: str, plan: str) -> str:
+def pinned_snapshot(root: str, head: str, plan_rel: str, plan: str, *,
+                    deadline: Deadline | None = None) -> str:
     """L'identité exacte de ce qui part sur la VM : `head` + le plan relu.
 
     `offload.snapshot()` photographie l'arbre de travail — fichiers non suivis
@@ -489,9 +490,17 @@ def pinned_snapshot(root: str, head: str, plan_rel: str, plan: str) -> str:
     l'état local, et le rapport peut nommer l'identité envoyée.
 
     Un échec de construction est un refus `selection-unsafe` : `head-moved`
-    reste réservé à la tête qui a réellement bougé (`head_state`)."""
+    reste réservé à la tête qui a réellement bougé (`head_state`). Une
+    échéance épuisée est `run-incomplete` : c'est une indisponibilité, pas un
+    contenu faux (#2665)."""
     try:
-        return offload.snapshot_with(root, head, {plan_rel: plan})
+        # `offload` lit une échéance monotone absolute, pas l'objet Deadline
+        bound = None if deadline is None else time.monotonic() + deadline.remaining()
+        return offload.snapshot_with(root, head, {plan_rel: plan}, deadline=bound)
+    except offload.SnapshotTimeout as exc:
+        raise PrevalidationError(
+            "run-incomplete", "arbre du SHA non construit dans le budget: %s" % exc) \
+            from None
     except offload.OffloadError as exc:
         raise PrevalidationError("selection-unsafe",
                                  "arbre du SHA + plan non constructible: %s" % exc) from None
@@ -837,6 +846,31 @@ def published_head(ref: str, *, repo: str = ".", remote: str = "origin",
     raise PrevalidationError("head-moved", "référence publiée introuvable: %s" % ref)
 
 
+def _bounded_runner(runner, deadline: Deadline | None):
+    """Un runner git qui ne dépasse jamais l'échéance du passage (#2665).
+
+    Chaque appel reçoit le temps qui reste ; un dépassement est une
+    indisponibilité `run-incomplete`, jamais un refus de sélection.
+    """
+    if deadline is None:
+        return runner
+
+    def call(*args, **kwargs):
+        left = deadline.remaining()
+        if left <= 0:
+            raise PrevalidationError(
+                "run-incomplete", "budget de prévalidation épuisé avant git")
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = left
+        try:
+            return runner(*args, **kwargs)
+        except subprocess.TimeoutExpired:
+            raise PrevalidationError(
+                "run-incomplete", "budget de prévalidation épuisé pendant git") from None
+
+    return call
+
+
 def validate(*, lot: int, plan_path: str, head: str, host: str, params,
              base: str = "", repo: str = "", published_ref: str = "",
              profile: str = "", remote: str = "origin", local: str | None = None,
@@ -868,6 +902,9 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
     if deadline is not None and deadline.expired():
         raise PrevalidationError("run-incomplete",
                                  "budget de prévalidation épuisé avant le plan")
+    # chaque git local (contrats, tête avant/après, chemin du plan) reçoit le
+    # temps qui reste : un git bloqué ne dépasse plus le bail (#2665).
+    git_runner = _bounded_runner(git_runner, deadline)
     # Les contrats et le contenu exécuté viennent du même SHA, jamais du disque.
     # `--repo` désigne le dépôt ; sans lui, le cwd.
     root = os.path.abspath(cwd or repo or os.getcwd())
@@ -888,7 +925,10 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
         raise PrevalidationError("run-incomplete",
                                  "budget de prévalidation épuisé avant l'arbre du SHA")
     remote_plan = remote_plan_path(plan_path, root, head=head, runner=git_runner)
-    pinned = (snapshotter or pinned_snapshot)(root, head, remote_plan, text)
+    if snapshotter is not None:
+        pinned = snapshotter(root, head, remote_plan, text)
+    else:
+        pinned = pinned_snapshot(root, head, remote_plan, text, deadline=deadline)
     result = run_offload(name, remote_script(
         remote_plan, chosen.parts,
         parts_script=getattr(params, "parts_script", None) or ""),

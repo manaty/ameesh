@@ -359,6 +359,11 @@ class ClientWaitTest(unittest.TestCase):
                          deadline=time.monotonic() - 1)
         self.assertEqual(remote.calls, [])
 
+    def test_the_snapshot_construction_is_bounded_before_git(self):
+        # #2665/B1 cx2 : même la construction locale du snapshot est bornée.
+        with self.assertRaises(offload.SnapshotTimeout):
+            offload.snapshot("/repo", deadline=time.monotonic() - 1)
+
 
 class FallbackTest(OffloadBase):
     def test_a_protocol_look_alike_from_the_command_is_not_a_result(self):

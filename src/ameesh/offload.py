@@ -33,10 +33,11 @@ local`, the default). A timeout, a cancel or a connection lost during the
 job is never rerun: the suite may still be running on the VM.
 
 `--timeout` bounds the guest job from its slot; it does not bound the
-client's wait for a slot, the transport or the snapshot push. `--wait-timeout`
-bounds that whole local wait (snapshot push included): at the deadline the
-client asks the VM to cancel the job, closes the session and exits 124; the
-guest shell also cancels a job whose session is gone. No local rerun.
+client's wait for a slot, the transport or the snapshot. `--wait-timeout`
+bounds that whole local wait (snapshot construction and push included): at
+the deadline the client asks the VM to cancel the job, closes the session and
+exits 124; the guest shell also cancels a job whose session is gone. No local
+rerun.
 
 `AMEESH_OFFLOAD_SSH` replaces the `ssh` command (tests, or extra options).
 The VM side is `ameesh.platform.offload_shell` (forced command of the SSH key).
@@ -85,6 +86,10 @@ class ClientTimeout(OffloadError):
     """The client's own wait budget expired: the job is stopped, never rerun."""
 
 
+class SnapshotTimeout(OffloadError):
+    """The client's wait budget expired while building the snapshot (#2665)."""
+
+
 def _left(deadline: float | None) -> float | None:
     return None if deadline is None else max(0.0, deadline - time.monotonic())
 
@@ -104,18 +109,27 @@ def _note(text: str) -> None:
     sys.stderr.flush()
 
 
-def _git(repo: str, *args: str, env: dict | None = None, input: str | None = None) -> str:
-    res = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
-                         env=env, input=input)
+def _git(repo: str, *args: str, env: dict | None = None, input: str | None = None,
+         deadline: float | None = None) -> str:
+    """Un appel git local, borné par ``deadline`` quand elle est fournie."""
+    left = _left(deadline)
+    if left is not None and left <= 0:
+        raise SnapshotTimeout("snapshot budget exhausted before git %s" % args[0])
+    try:
+        res = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
+                             env=env, input=input, timeout=left)
+    except subprocess.TimeoutExpired:
+        raise SnapshotTimeout("snapshot budget exhausted during git %s"
+                              % args[0]) from None
     if res.returncode != 0:
         raise OffloadError("git %s: %s" % (args[0], res.stderr.strip()))
     return res.stdout.strip()
 
 
-def snapshot(top: str) -> str:
+def snapshot(top: str, *, deadline: float | None = None) -> str:
     """Commit id of the exact working tree. The agent's index is copied to a
     temporary one (its stat cache keeps `git add -A` fast), never written."""
-    git_dir = _git(top, "rev-parse", "--absolute-git-dir")
+    git_dir = _git(top, "rev-parse", "--absolute-git-dir", deadline=deadline)
     with tempfile.TemporaryDirectory(prefix="ameesh-offload-") as tmp:
         index = os.path.join(tmp, "index")
         env = dict(os.environ, GIT_INDEX_FILE=index, **SNAP_ENV)
@@ -128,24 +142,27 @@ def snapshot(top: str) -> str:
         # absent from disk) or an assume-unchanged one (contents not looked
         # at) of the copied index would otherwise travel as the index has it
         full = ("-c", "core.sparseCheckout=false", "-c", "index.sparse=false")
-        entries = _git(top, *full, "ls-files", "-v", "-z", env=env).split("\0")
+        entries = _git(top, *full, "ls-files", "-v", "-z", env=env,
+                       deadline=deadline).split("\0")
         # one flag per call: update-index applies only the last of the two
         for flag, flagged in (
                 ("--no-skip-worktree", [e[2:] for e in entries if e[:1] in ("S", "s")]),
                 ("--no-assume-unchanged", [e[2:] for e in entries if e[:1].islower()])):
             if flagged:
                 _git(top, *full, "update-index", flag, "-z", "--stdin", env=env,
-                     input="\0".join(flagged) + "\0")
-        _git(top, *full, "add", "-A", env=env)
-        tree = _git(top, *full, "write-tree", env=env)
+                     input="\0".join(flagged) + "\0", deadline=deadline)
+        _git(top, *full, "add", "-A", env=env, deadline=deadline)
+        tree = _git(top, *full, "write-tree", env=env, deadline=deadline)
     # no parent: the history (a secret deleted since, or now ignored) never
     # travels; fixed date: the same tree always gives the same snapshot
     env = dict(os.environ, GIT_AUTHOR_DATE="@0 +0000", GIT_COMMITTER_DATE="@0 +0000",
                **SNAP_ENV)
-    return _git(top, "commit-tree", tree, "-m", "ameesh offload snapshot", env=env)
+    return _git(top, "commit-tree", tree, "-m", "ameesh offload snapshot", env=env,
+                deadline=deadline)
 
 
-def snapshot_with(top: str, commit: str, files: dict[str, str]) -> str:
+def snapshot_with(top: str, commit: str, files: dict[str, str], *,
+                  deadline: float | None = None) -> str:
     """Commit id de l'arbre de `commit` plus `files` (chemin dépôt -> contenu).
 
     Même identité que `snapshot()` : aucun parent, mêmes auteur et dates figés,
@@ -154,28 +171,42 @@ def snapshot_with(top: str, commit: str, files: dict[str, str]) -> str:
     doit garantir ce qui part sur la VM (prévalidation du gel, #1770) calcule
     ici « SHA candidat + ses propres fichiers » puis le passe à
     `run --snapshot`. Rien de l'état local ne peut s'y glisser — ni fichier non
-    suivi, ni flag `assume-unchanged`/`skip-worktree` que `git status` masque."""
+    suivi, ni flag `assume-unchanged`/`skip-worktree` que `git status` masque.
+    Avec ``deadline``, chaque git local est borné par le temps qui reste (#2665).
+    """
     with tempfile.TemporaryDirectory(prefix="ameesh-offload-") as tmp:
         env = dict(os.environ, GIT_INDEX_FILE=os.path.join(tmp, "index"), **SNAP_ENV,
                    **NO_REPLACE_ENV)
-        _git(top, "read-tree", commit, env=env)
+        _git(top, "read-tree", commit, env=env, deadline=deadline)
         for rel, content in files.items():
-            blob = _git(top, "hash-object", "-w", "--stdin", env=env, input=content)
+            blob = _git(top, "hash-object", "-w", "--stdin", env=env, input=content,
+                        deadline=deadline)
             _git(top, "update-index", "--add", "--cacheinfo",
-                 "100644,%s,%s" % (blob, rel), env=env)
-        tree = _git(top, "write-tree", env=env)
+                 "100644,%s,%s" % (blob, rel), env=env, deadline=deadline)
+        tree = _git(top, "write-tree", env=env, deadline=deadline)
     env = dict(os.environ, GIT_AUTHOR_DATE="@0 +0000", GIT_COMMITTER_DATE="@0 +0000",
                **SNAP_ENV)
-    return _git(top, "commit-tree", tree, "-m", "ameesh offload snapshot", env=env)
+    return _git(top, "commit-tree", tree, "-m", "ameesh offload snapshot", env=env,
+                deadline=deadline)
 
 
-def known_locally(top: str, shas: list[str]) -> list[str]:
+def known_locally(top: str, shas: list[str], *,
+                  deadline: float | None = None) -> list[str]:
     """The commits of `shas` this repository has (earlier snapshots stay as
     loose objects until git prunes them)."""
     if not shas:
         return []
-    res = subprocess.run(["git", "-C", top, "cat-file", "--batch-check=%(objectname) %(objecttype)"],
-                         input="\n".join(shas) + "\n", capture_output=True, text=True)
+    left = _left(deadline)
+    if left is not None and left <= 0:
+        raise ClientTimeout("client wait budget exhausted before the snapshot pack")
+    try:
+        res = subprocess.run(["git", "-C", top, "cat-file",
+                              "--batch-check=%(objectname) %(objecttype)"],
+                             input="\n".join(shas) + "\n", capture_output=True,
+                             text=True, timeout=left)
+    except subprocess.TimeoutExpired:
+        raise ClientTimeout("client wait budget exhausted during the snapshot pack") \
+            from None
     return [line.split()[0] for line in res.stdout.splitlines()
             if line.endswith(" commit")]
 
@@ -236,7 +267,7 @@ def push(remote: Remote, top: str, repo: str, snap: str, *,
     present = res.stdout.decode().split()
     if snap in present:
         return
-    bases = known_locally(top, present)
+    bases = known_locally(top, present, deadline=deadline)
     revs = snap + "\n" + "".join("^%s\n" % sha for sha in bases)
     # --shallow: the bases share no history with the snapshot, so git must
     # treat every one of them as an edge to leave out the objects they hold
@@ -407,19 +438,19 @@ def cmd_run(opts: dict, argv: list[str]) -> int:
     deadline = (time.monotonic() + opts["wait_timeout"]
                 if opts["wait_timeout"] > 0 else None)
     try:
-        top = _git(os.getcwd(), "rev-parse", "--show-toplevel")
+        top = _git(os.getcwd(), "rev-parse", "--show-toplevel", deadline=deadline)
         rel = os.path.relpath(os.getcwd(), top)
         repo = opts["repo"] or repo_name(top)
         if opts.get("snapshot"):
             # contenu figé par l'appelant : il doit exister ici, et c'est lui
             # qui part — pas une photographie de l'arbre de travail
             snap = opts["snapshot"]
-            _git(top, "cat-file", "-e", "%s^{commit}" % snap)
+            _git(top, "cat-file", "-e", "%s^{commit}" % snap, deadline=deadline)
         else:
-            snap = snapshot(top)
+            snap = snapshot(top, deadline=deadline)
         remote = Remote(host)
         push(remote, top, repo, snap, deadline=deadline)
-    except ClientTimeout as exc:
+    except (ClientTimeout, SnapshotTimeout) as exc:
         _note("%s; no local rerun" % exc)
         return 124
     except OffloadError as exc:

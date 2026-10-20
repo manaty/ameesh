@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -239,6 +240,29 @@ class ValidateTest(unittest.TestCase):
         self.assertEqual(report["exit"], 124)
         self.assertGreater(seen["timeout"], 30.0)
         self.assertGreater(int(seen["wait_timeout"]), 0)
+
+    def test_une_echeance_borne_les_git_locaux_de_validate(self):
+        # #2665/B1 cx2 : un git local dormant (contrats, HEAD, chemin du
+        # plan, relecture après run) ne dépasse plus l'échéance ; le refus est
+        # une indisponibilité, pas une sélection fausse.
+        seen = {}
+
+        def git_runner(argv, **kwargs):
+            seen["timeout"] = kwargs.get("timeout")
+            subprocess.run(["sleep", "0.15"], timeout=kwargs.get("timeout"))
+            return _Proc(0, A + "\n")
+
+        began = time.monotonic()
+        with self.assertRaises(pv.PrevalidationError) as caught:
+            pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
+                        params=params(), repo=self.tmp.name,
+                        runner=runner_for(0, flux()),
+                        snapshotter=snapshot_for(), git_runner=git_runner,
+                        deadline=pv.Deadline(0.03))
+        self.assertEqual(caught.exception.cause, "run-incomplete")
+        self.assertLess(time.monotonic() - began, 0.2)
+        self.assertIsNotNone(seen.get("timeout"))
+        self.assertLessEqual(seen["timeout"], 0.03)
 
     def test_lanceur_de_part_du_bloc_dans_la_commande(self):
         """Le bloc nomme le lanceur de part : il part tel quel sur la VM."""

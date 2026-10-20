@@ -467,6 +467,15 @@ class RunTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 2.0)
         self.assertIsNotNone(result["seconds"])
 
+    def test_pinned_snapshot_budget_expired_is_run_incomplete(self):
+        # #2665/B1 cx2 : la construction du snapshot (git) est bornée ; une
+        # échéance épuisée est une indisponibilité, pas une sélection fausse.
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(pv.PrevalidationError) as caught:
+                pv.pinned_snapshot(root, A, "plan.json", "{}",
+                                   deadline=pv.Deadline(0.0))
+        self.assertEqual(caught.exception.cause, "run-incomplete")
+
 
 class SnapshotIdentityTest(unittest.TestCase):
     """Le contenu envoyé est **construit**, pas photographié (P1 cx1).
