@@ -1415,10 +1415,18 @@ def resume(cfg: Config, db, name: str, *, brief: str = "", fresh: bool = False,
     if live and row.get("status") == "stopped":
         raise RepriseError("%s is stopped but its lease is still live (the runner has not "
                            "returned it yet): try again in a few seconds" % name)
-    if not live and row.get("status") != "stopped":
-        # #293: a runner keeps the lease of every agent it serves that is not
-        # stopped; none here means no runner serves it (gone, or holding back
-        # on battery or max_agents), and the queued instruction waits
+    runner_seen = False
+    if not live and row.get("status") == "stopped":
+        # #2625: stopped agents normally have no lease. Only a recent pass
+        # for this agent on its current host proves that a runner serves it.
+        if (row.get("runner_seen_ts") is not None and row.get("runner_seen_owner")
+                and row.get("host") and row.get("runner_seen_host") == row["host"]):
+            now = db.query("SELECT extract(epoch from clock_timestamp())::float8 AS ts")[0]["ts"]
+            age = now - float(row["runner_seen_ts"])
+            runner_seen = 0 <= age <= 2 * max(60.0, cfg.poll, cfg.runner_liveness_interval)
+    if not live and not runner_seen:
+        # #293: without a lease (or #2625's stopped-agent proof), the queued
+        # instruction waits for a runner, including admission/capacity holds.
         warn("no runner holds %s's lease on %s: the instruction waits until a runner "
              "serves it again" % (name, row.get("host") or "?"))
     decision = plan(cfg, db, row, fresh=fresh)

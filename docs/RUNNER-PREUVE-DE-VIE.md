@@ -2,7 +2,7 @@
 
 Chaque runner écrit un signal indépendant du bail pour les personas `execute`
 placées sur son hôte, limitées à `--agents` si cette option est fournie.
-Les personas arrêtées ou externes sont exclues. Une porte fermée, un manque
+Les personas arrêtées sont incluses ; les externes sont exclues. Une porte fermée, un manque
 de capacité ou une persona inéligible n’empêchent pas le signal.
 
 `ameesh show <persona> --json` et `ameesh list --json` exposent :
@@ -32,3 +32,10 @@ En mode médié, `agents.runner_seen` utilise le jeton d’exécuteur sans bail 
 le serveur force l’hôte, limite les noms aux agents admis, et exige le préfixe
 `exec:<executor_id>:` du propriétaire. Le jeton de session ne peut pas l’appeler.
 La disponibilité de l’hôte ne bloque pas cette preuve de vie.
+
+`ameesh resume` avertit aussi pour une persona arrêtée sans bail, sauf si
+elle porte une preuve du même hôte, avec une identité de runner, datant
+d’au plus deux intervalles (`max(60 s, poll, runner_liveness_interval)`).
+L’âge est mesuré avec l’heure de la base. Cette preuve évite un avertissement
+quand le runner a rendu normalement le bail ; elle ne garantit pas un tour
+immédiat et ne change pas la valeur `runner_live`, réservée au bail.
