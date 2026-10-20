@@ -130,6 +130,10 @@ DEFAULT_TMP_QUOTA = 4 * GIB          # par agent
 DEFAULT_CACHE_QUOTA = 10 * GIB       # tous caches partagés de l'hôte
 DEFAULT_TMPFS_ALERT = 0.6            # alerte (la contre-pression est à 0,8)
 DEFAULT_ORPHAN_MIN_SIZE = 50 * MIB   # entrée de /tmp signalée au-delà
+DEFAULT_EVENTS_QUOTA = 64 * MIB      # #2820 : flux events.jsonl d'un agent, avant rotation
+#: #2820 : plus petit `events_quota` admis (la reprise du dernier tour en est
+#: le quart)
+MIN_EVENTS_QUOTA = 1 * MIB
 #: âge minimal d'un fichier évincé (secondes) : jamais un fichier en écriture
 EVICT_MIN_AGE_S = 3600.0
 #: #1665 : inactivité (secondes) d'un worktree orphelin (aucun lot nommé par
@@ -241,7 +245,8 @@ POLICY_KEYS = ("tmp_root", "cache_root", "tmp_quota", "cache_quota", "tmpfs_aler
                "redirect", "xdg_cache", "worktrees", "orphan_min_size",
                "orphan_cleanup", "orphan_idle", "deps", "deps_idle", "artifacts",
                "artifact_idle", "unreadable_ok", "docker_orphan_volumes_alert",
-               "docker_build_cache_alert", "docker_volumes", "docker_volume_idle")
+               "docker_build_cache_alert", "docker_volumes", "docker_volume_idle",
+               "events_quota")
 #: racines refusées : le ménage n'y supprimerait que ses sous-dossiers, mais
 #: un dossier partagé par tout le système n'est pas un dossier GÉRÉ
 FORBIDDEN_ROOTS = ("/", "~", "/tmp", "/var/tmp", "/dev/shm", "/home", "/root")
@@ -288,6 +293,9 @@ class Policy:
     #: artifacts of an idle worktree AND the holder check of an abandoned /tmp
     #: entry; empty by default, set per host in its Host card
     unreadable_ok: tuple = ()
+    #: #2820 : taille du flux `events.jsonl` d'un agent au-delà de laquelle il
+    #: tourne au début du tour suivant (`events_rotation`)
+    events_quota: int = DEFAULT_EVENTS_QUOTA
     #: #2180: discovery roots derived from Host work_root/work_roots, never
     #: deletion roots. Not a separate housekeeping setting.
     worktree_roots: tuple = ()
@@ -333,6 +341,12 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             problems.append("`%s`: size in bytes expected (e.g. 4GiB)" % key)
         else:
             parsed[key] = octets
+    if raw.get("events_quota") is not None:
+        octets = resources_mod.parse_bytes(raw["events_quota"])
+        if octets is None or octets < MIN_EVENTS_QUOTA:
+            problems.append("`events_quota`: size of at least 1MiB expected (e.g. 64MiB)")
+        else:
+            parsed["events_quota"] = octets
     if raw.get("docker_orphan_volumes_alert") is not None:
         count = raw["docker_orphan_volumes_alert"]
         if type(count) is not int or count <= 0:
@@ -424,7 +438,8 @@ def effective(canons, host: str) -> Policy:
             if key not in values:
                 values[key], origin[key] = value, label
             elif key in ("tmp_quota", "cache_quota", "orphan_min_size", "tmpfs_alert",
-                         "docker_orphan_volumes_alert", "docker_build_cache_alert") \
+                         "docker_orphan_volumes_alert", "docker_build_cache_alert",
+                         "events_quota") \
                     and value < values[key]:
                 values[key], origin[key] = value, label
             elif (key in ("orphan_idle", "deps_idle", "artifact_idle",

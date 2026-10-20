@@ -3723,6 +3723,34 @@ class AgentWorker(threading.Thread):
             self._resident_usage_pending.pop(0)
         return True
 
+    def _rotation_du_flux(self, events_path: str) -> None:
+        """#2820 : tourne `events.jsonl` au-delà de `events_quota`, au point sûr.
+
+        Appelé avant le marqueur de compte du tour : les index de ligne
+        (`spend_pending.start_index`) ne survivent pas à une rotation, donc
+        aucun marqueur comptable ne doit attendre en base, ni aucune mesure
+        résidente en mémoire. Base injoignable ou marqueur douteux : pas de
+        rotation, le flux tournera à un tour suivant. Jamais bloquant."""
+        from . import events_rotation
+        try:
+            quota = self.runner.housekeeping_policy().events_quota
+            if os.path.getsize(events_path) <= quota:
+                return
+            if self._resident_usage_pending or self._compta_en_attente() is not None:
+                return
+            fait = events_rotation.rotate(events_path, quota)
+        except FileNotFoundError:
+            return
+        except db_mod.Unavailable:
+            return
+        except Exception as exc:
+            log("[%s] events.jsonl not rotated (%s)" % (self.name, exc))
+            return
+        if fait is not None:
+            log("[%s] events.jsonl rotated: %.0f MiB, %d KiB carried over, previous in "
+                "events.jsonl%s" % (self.name, fait.size / 1024 ** 2, fait.carried // 1024,
+                                    events_rotation.PREVIOUS))
+
     def _compta_en_attente(self) -> dict | None:
         """Le marqueur comptable **en base** (L13 B5, arbitrage mesh-design).
 
@@ -5955,6 +5983,8 @@ class AgentWorker(threading.Thread):
         events_path = self._path("events.jsonl")
         stderr_path = self._path("stderr.log")
         started = time.time()
+        # #2820 : avant les marqueurs du tour, qui en ouvrent le flux neuf
+        self._rotation_du_flux(events_path)
         if compte is not None:
             # Marqueur de compte AVANT l'index de début : les relevés du tour (et
             # sa ligne de grand livre) sont attribués à ce compte (L30).
