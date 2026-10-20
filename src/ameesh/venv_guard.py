@@ -16,8 +16,11 @@ Ce module retire de l'environnement d'un tour :
 
 et rend au tour les deux seuls points d'entrée dont il a besoin, `ameesh` et
 `agent-mail`, par des shims qui exécutent le binaire du venv par chemin
-absolu. Les tests d'une branche passent par `PYTHONPATH=src` ou par un venv
-du worktree, jamais par le venv partagé.
+absolu. Un échec d'écriture des shims ne rouvre jamais le PATH de production
+(#2772) : les `bin/` cachés restent retirés, le tour peut perdre les deux
+points d'entrée s'ils ne viennent pas d'un autre dossier du PATH. Les tests
+d'une branche passent par `PYTHONPATH=src` ou par un venv du worktree, jamais
+par le venv partagé.
 
 `installation_problems` sert à `ameesh doctor` : une installation éditable
 (`__editable__*.pth`, `direct_url.json` éditable) ou un paquet `ameesh`
@@ -27,10 +30,13 @@ from __future__ import annotations
 
 import glob
 import json
+import logging
 import os
 import re
 import sys
 import tempfile
+
+LOG = logging.getLogger(__name__)
 
 #: points d'entrée rendus au tour (les hooks des harnais appellent agent-mail)
 SHIMMED = ("ameesh", "agent-mail")
@@ -116,7 +122,9 @@ def install_shims(directory: str) -> str:
 
 def scrub(env: dict, shim_dir: str | None = None) -> dict:
     """Retire le venv de production de `env` (sur place) ; avec `shim_dir`,
-    y installe les shims et les met en tête du PATH. Idempotent."""
+    y installe les shims et les met en tête du PATH. Un échec d'écriture des
+    shims retire quand même les `bin/` cachés : le PATH de production n'est
+    jamais rouvert (#2772). Idempotent."""
     caches = hidden_venvs(env)
     if not caches:
         return env
@@ -127,10 +135,13 @@ def scrub(env: dict, shim_dir: str | None = None) -> dict:
     if shim_dir:
         try:
             dossier = install_shims(shim_dir)
-        except OSError:
-            # sans shims, le tour perdrait `agent-mail` (hooks) : le PATH est
-            # gardé tel quel, seul VIRTUAL_ENV est retiré
-            return env
+        except OSError as exc:
+            # #2772 : sans shims, le tour perd `ameesh`/`agent-mail` s'ils ne
+            # viennent pas d'un autre dossier du PATH ; le venv de production,
+            # lui, ne doit jamais revenir dans le PATH sur cette erreur.
+            LOG.warning("venv guard: shims not written in %s (%s); "
+                        "production venv hidden without them", shim_dir, exc)
+            dossier = ""
     entrees = [e for e in (env.get("PATH") or "").split(os.pathsep) if e]
     bins = {os.path.join(v, "bin") for v in caches}
     gardees = [e for e in entrees if _real(e) not in bins]

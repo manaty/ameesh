@@ -17,7 +17,7 @@ import time
 import types
 from unittest import mock
 
-from ameesh import mail, registry, review_designation as rd
+from ameesh import mail, registry, review_authors, review_designation as rd
 from ameesh import review_designation_activation as act
 from ameesh import review_designation_pg as pg
 from ameesh import review_provenance as prov
@@ -775,6 +775,41 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertEqual(out["state"], rd.WAITING, out)
         self.assertNotIn("provenance unknown", out["why"])
         self.assertEqual(out["reviewers"], [])
+
+    def test_a_freeze_family_different_from_the_commit_turn_waits(self):
+        """#2755 / #2721 N : deux familles prouvées restent ambiguës."""
+        # Le commit précède le tour de gel : leurs familles sont deux preuves
+        # historiques distinctes, pas une divergence avec le registre courant.
+        self.repo.git("checkout", "-q", "-B", "rotation", self.base)
+        stamp = str(int(time.time()) - 120) + " +0000"
+        self.repo.dry.update(GIT_AUTHOR_DATE=stamp, GIT_COMMITTER_DATE=stamp)
+        self.repo.write("src/ameesh/work.py", "codex avant gel deepseek\n")
+        head = self.repo.commit("avant rotation", agent="author")
+        self.db.execute("DELETE FROM provenance_receipts")
+        self.db.execute("DELETE FROM turn_costs")
+        self.turn("author", "codex", head)
+        self.db.execute(
+            "INSERT INTO turn_costs (agent, harness, session, recorded_at)"
+            " VALUES ('author', 'deepseek', 's-freeze', now() + interval '1 minute')")
+        self.frozen = head
+        milestone, out = self.freeze()
+        item = work.get(self.db, self.lot)
+        self.assertEqual(review_authors.reference_author(
+            self.db, item, milestone, ("claude", "codex", "deepseek")),
+            {"name": "author", "family": "deepseek"})
+        self.assertEqual(review_authors.actor_family(
+            self.db, "author", float(self.repo.git("log", "-1", "--format=%ct", head)),
+            ("claude", "codex", "deepseek")), "codex")
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.assertIn("author family unknown: author", out["why"])
+        self.assertNotIn("provenance unknown", out["why"])
+        self.assertEqual(out["reviewers"], [])
+        mark = pg.designation_of(self.marks()[0])
+        self.assertEqual(mark["authors"], [{
+            "name": "author", "family": "", "proof": "turn-journal",
+            "fallback_commits": [head[:12]],
+        }])
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["pilot"])
 
     def test_an_unknown_author_family_waits(self):
         self.db.execute("DELETE FROM turn_costs")
