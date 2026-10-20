@@ -1453,12 +1453,12 @@ class QueueWithoutRadarTest(PgTestCase):
             return path
 
         args = mock.Mock(queue_command="add", id=lot, repo=agents, actor="pilot", json=False)
-        # #2739 : ce dépôt de banc commite avec une identité générique, sans
-        # provenance d'agent ; la lecture de plage de la porte échouerait en
-        # échec fermé. Ce témoin porte sur le clone jetable et la tête fraîche,
-        # pas sur les correcteurs : la lecture rend aucun correcteur.
-        with mock.patch.object(merge_queue, "_corrections_on_freeze",
-                               return_value=set()), \
+        # #2739/#2726 : ce dépôt de banc commite avec une identité générique,
+        # sans provenance d'agent ; la lecture de plage de la porte échouerait
+        # en échec fermé. Ce témoin porte sur le clone jetable et la tête
+        # fraîche, pas sur les auteurs/correcteurs : la lecture ne rend rien.
+        with mock.patch.object(merge_queue, "_attribution_on_freeze",
+                               return_value=(None, [])), \
                 mock.patch.object(merge_queue, "radar_project", return_value=None), \
                 mock.patch.object(radar, "github_ci",
                                   return_value=lambda branch: dict(status)), \

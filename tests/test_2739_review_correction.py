@@ -191,6 +191,32 @@ class GateCorrectorTest(PgTestCase):
         out = self.gate()
         self.assertEqual(out["corrections"], ["cx2"])
 
+    def test_the_gate_reads_the_coauthor_it_was_not_given(self):
+        # #2726 : la porte lit elle-même les auteurs de la plage gelée quand
+        # l'appelant ne les passe pas (le feu, la file, le paquet). Un tiers
+        # avec reçu exact est un auteur : ni son avis ni sa famille ne comptent.
+        self.repo.write("src/ameesh/work.py", "lot\ncx2 small fix\nthird work\n")
+        head = self.repo.commit("third: coauthor")
+        self.receipt("third", "claude", [head])
+        registry.upsert(self.db, "third", harness="claude", host=self.cfg.host,
+                        cwd=self.repo.root, status="idle")
+        work.milestone(self.db, self.lot, "frozen", sha=head, actor="author")
+        for actor in ("third", "cx3"):
+            work.milestone(self.db, self.lot, "verdict", sha=head,
+                           actor=actor, verdict="ok")
+        self.frozen = head
+        klass = {"class": "normal", "doubt": False,
+                 "repo": self.repo.root, "target": self.base,
+                 "base_sha": self.base}
+        out = merge_queue.review_gate(
+            self.db, work.milestones(self.db, self.lot), self.frozen,
+            repo=self.repo.root, klass=klass, item=work.get(self.db, self.lot),
+            required=1)
+        self.assertFalse(out.get("error"), out)
+        self.assertIn("third", {entry["name"] for entry in out["authors"]})
+        self.assertNotIn("third", [entry["actor"] for entry in out["accepted"]])
+        self.assertEqual([entry["actor"] for entry in out["accepted"]], ["cx3"])
+
     def test_unreadable_correction_provenance_refuses_the_gate(self):
         self.db.execute("DELETE FROM provenance_receipts WHERE subject = %s",
                         ("commit:" + self.frozen,))
