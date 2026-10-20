@@ -57,10 +57,11 @@ class StageReceiptsRecoveryTest(unittest.TestCase):
         self.checkpoint_path.write_text(json.dumps(legacy))
         self.marks = [dict(id=3, kind="frozen", at_ts=3)]
         report = self.project()
-        self.assertEqual([r["event"] for r in report["comments"]], ["milestone-3"])
+        self.assertEqual([r["event"] for r in report["comments"]], ["frozen"])
         data = self.checkpoint()
         self.assertEqual(data["schema"], comments.CHECKPOINT_SCHEMA)
-        self.assertEqual(data[TICKET], {"enrolled": True, "seen": ["accepted", "milestone-3"]})
+        self.assertEqual(data[TICKET], {"enrolled": True, "seen": ["accepted", "frozen"],
+                                        "baseline": False})
 
     def test_unknown_schema_is_reported_and_never_rewritten(self):
         raw = json.dumps({"schema": "ameesh/github-stage-comments/9",
@@ -93,22 +94,25 @@ class StageReceiptsRecoveryTest(unittest.TestCase):
         self.assertEqual(text.count(comments.MARKER % (12, "event-7")), 1)
 
     def test_deleted_remote_comment_is_repaired_after_clearing_seen(self):
+        # #2861: a mirror enrolled while already frozen starts from its current
+        # stage, so "accepted" is posted before the freeze.
+        self.project()
         self.marks = [dict(id=3, kind="frozen", at_ts=3)]
         self.project()
         self.assertEqual(len(self.bodies()), 2)
         # Gesture documented for an operator: drop the deleted stage key from
         # `seen`, keep the rest of the cache, then rerun the projection.
         data = self.checkpoint()
-        data[TICKET]["seen"].remove("milestone-3")
+        data[TICKET]["seen"].remove("frozen")
         self.checkpoint_path.write_text(json.dumps(data))
         self.gh.repo(REPO)["comments"]["7"] = [
             body for body in self.bodies()
-            if (comments.MARKER % (12, "milestone-3")) not in body]
+            if (comments.MARKER % (12, "frozen")) not in body]
         report = self.project()
-        self.assertEqual([r["event"] for r in report["comments"]], ["milestone-3"])
+        self.assertEqual([r["event"] for r in report["comments"]], ["frozen"])
         text = "\n".join(self.bodies())
         self.assertEqual(text.count(comments.MARKER % (12, "accepted")), 1)
-        self.assertEqual(text.count(comments.MARKER % (12, "milestone-3")), 1)
+        self.assertEqual(text.count(comments.MARKER % (12, "frozen")), 1)
         self.gh.reset_calls()
         self.assertEqual(self.project()["comments"], [])
         self.assertEqual(self.gh.writes(), [])
