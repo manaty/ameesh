@@ -573,10 +573,15 @@ def _designation_authority(db, actor: str) -> bool:
     """May `actor` have written a `reviewer X designated` journal line (#2739)?
 
     The line is only a text: any agent can copy it in a free note, so the text
-    alone proves nothing. The write path (`work.designate_reviewer`) already
-    admits only the system, a human, or an orchestrator/design agent; the
-    journal read applies the same authority, so an ordinary agent's note cannot
-    make itself a designated reviewer (and excuse its own commit as a fix).
+    alone proves nothing. The write path (`work.designate_reviewer`, and the
+    designation `work move qa --reviewer` makes in the same gesture) admits the
+    system, a human, or an orchestrator/design agent **including the recent
+    assigner history `corrector` uses**. The journal read applies the same
+    authority, so an ordinary agent's note cannot make itself a designated
+    reviewer (and excuse its own commit as a fix), while a designation the
+    write path accepted is read back (#2776: with `history=False`, a
+    `work move qa --reviewer` made by an ordinary agent was written and then
+    ignored, and its retired seat was treated as an author).
     """
     actor = str(actor or "").strip()
     if not actor:
@@ -587,7 +592,7 @@ def _designation_authority(db, actor: str) -> bool:
         from . import assignments
         return assignments.is_orchestrator(
             getattr(db, "cfg", None), db, actor,
-            roles=work.CORRECTOR_ROLES, history=False)
+            roles=work.CORRECTOR_ROLES, history=True)
     except Exception:  # noqa: BLE001 - unreadable authority: no name counted
         return False
 
@@ -601,13 +606,16 @@ def _journal_reviewers(db, lot: int, *, until=None) -> list:
     a first-round correction stays recognizable after their seat is retired,
     exactly like the automatic names of the marks (#2638). Only a line written
     by a designation authority counts (`_designation_authority`): a free note
-    carrying the same words is not a designation. With `until` (the freeze
-    instant), a reviewer named after the freeze is ignored: they did not
-    review that head.
+    carrying the same words is not a designation. The read is bounded by the
+    note prefix and the lot, never by the last 500 events: a designation older
+    than a talkative lot's recent journal stays read (#2776, same reason as
+    #1448 N2). With `until` (the freeze instant), a reviewer named after the
+    freeze is ignored: they did not review that head.
     """
     names: list[str] = []
     try:
-        events = storage.of(db).work.events(int(lot), 500) or []
+        events = storage.of(db).work.events_noted(
+            "reviewer ", 0.0, ids=[int(lot)]) or []
     except Exception:  # noqa: BLE001 - unreadable journal: no manual name
         return names
     for event in events:
