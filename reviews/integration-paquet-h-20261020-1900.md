@@ -27,6 +27,11 @@ et son SHA, et il porte un trailer `ameesh-work: 2810`.
 Aucune : la fusion est propre. La remise `86f04d9f5a6d` (#286 × #2810) reste
 hors véhicule : #286 n'est pas prêt (waiting_human).
 
+Adaptation de test : la doublure de `SelectedTurnRefusedTest` (test_l790)
+porte désormais `_servir`, appelé par `run_turn` depuis #2810, et vérifie
+que la fin du tour refusé efface les messages servis. Aucun changement du
+runner ; avis de l'unité conservé (canon §2, adaptation de test).
+
 ## Écartés (ce véhicule)
 
 | lot | motif |

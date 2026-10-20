@@ -188,6 +188,8 @@ class SelectedTurnRefusedTest(unittest.TestCase):
             runner=runner, db=object(), name="perime", epoch=1, fast_failure=True,
             _attach_pending=lambda: False, _session_lock=mock.Mock(),
             resident=object(), state_dir=state_dir.name,
+            # #2810 : l'enveloppe efface les messages servis à la fin du tour.
+            _servir=mock.Mock(),
             # #2096 : `run_turn` rend la mémoire du tour dans son `finally` ;
             # la doublure n'a pas d'allocateur, le rappel est inerte.
             _release_turn_memory=lambda *a, **k: None)
@@ -204,6 +206,7 @@ class SelectedTurnRefusedTest(unittest.TestCase):
         restore.assert_called_once_with(worker.db, "perime", "runner-1", 1)
         self.assertEqual(set_status.call_args[0][:3], (worker.db, "perime", "queued"))
         self.assertFalse(worker.fast_failure)
+        worker._servir.assert_called_once_with(())
 
 
 class RestartExitTest(unittest.TestCase):
