@@ -16,6 +16,13 @@ n'était consigné. Ce module ferme les deux trous, de façon réversible, et so
    répond à « qui a annulé ce run ? ». C'est une attribution, pas une
    contrainte : un appel du vrai `gh` par son chemin absolu, ou de l'API par
    `curl`, échappe au journal.
+   Depuis #2853, le `gh` généré **refuse** en plus `pr merge --auto` quand
+   GitHub ne peut pas attendre le vert : `allow_auto_merge` désactivé sur le
+   dépôt, ou branche sans protection portant des checks requis. Sans cela,
+   `gh pr merge --auto --match-head-commit` fusionne aussitôt (paquet 111,
+   PR manaty/nexlink#1849, 2026-10-20 : fusion 25 s après le dispatch de la
+   CI). Le refus nomme la file de fusion, qui attend la CI verte sur la tête
+   gelée. Les autres gestes `gh` ne sont pas filtrés.
 2. **Identité par rôle** (inerte sans configuration) : le fichier
    `<config>/github-identities.json` associe des agents à un rôle et un rôle
    à un fichier de jeton. Si le jeton du rôle est lisible, le tour porte ce
@@ -291,14 +298,213 @@ def _annotated(argv):
     return argv
 '''
 
+#: #2853 : garde déterministe de `gh pr merge --auto`, embarquée dans le `gh`
+#: généré. Sur un dépôt sans auto-merge GitHub (`allow_auto_merge=false`,
+#: manaty/nexlink et manaty/home), `--auto` ne fait pas attendre le vert : la
+#: PR est fusionnée aussitôt. Même chose si la branche n'a pas de protection
+#: portant des checks requis : l'auto-merge n'a alors rien à attendre. Le
+#: refus est fail-closed (dépôt, PR ou protection illisibles) et renvoie vers
+#: la file de fusion d'ameesh, qui atterrit sur la tête gelée dès le vert.
+GUARD = r'''
+#: options de `gh pr merge` qui prennent la valeur suivante
+_MERGE_VALEUR = {"--repo", "-R", "--body", "-b", "--body-file", "-F",
+                 "--subject", "-t", "--match-head-commit", "--author-email"}
+
+
+def _merge_argv(argv):
+    """(identifiant de PR ou "", dépôt de l'option --repo ou "") pour un
+    `gh pr merge`, sinon None. Les positionnels sont lus hors des options et
+    de leurs valeurs ; un `--` termine les options."""
+    mots, i = [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            mots.extend(argv[i + 1:])
+            break
+        if a.startswith("-") and a != "-":
+            i += 2 if a in _MERGE_VALEUR else 1
+            continue
+        mots.append(a)
+        i += 1
+    if len(mots) < 2 or mots[0] != "pr" or mots[1] != "merge":
+        return None
+    repo = ""
+    for i, a in enumerate(argv):
+        if a in ("--repo", "-R"):
+            repo = argv[i + 1] if i + 1 < len(argv) else ""
+            break
+        if a.startswith("--repo="):
+            repo = a.partition("=")[2]
+            break
+        if a.startswith("-R") and len(a) > 2:
+            repo = a[2:]
+            break
+    return (mots[2] if len(mots) > 2 else ""), repo
+
+
+def _real(real, args, timeout=30):
+    import subprocess
+    try:
+        return subprocess.run([real] + args, capture_output=True, text=True,
+                              timeout=timeout)
+    except Exception as exc:
+        return subprocess.CompletedProcess([real] + args, 1, "", str(exc))
+
+
+def _bool_opt(argv, name):
+    """Valeur booléenne d'une option (`--x`, `--x=true`, `--x=false`), ou
+    False. La **dernière** occurrence gagne, comme gh/pflag (`boolValue.Set`
+    réaffecte) : `--auto=false --auto` vaut vrai. Les valeurs des options à
+    valeur sont sautées : `--body --x` est un corps, pas l'option. Un `--`
+    termine les options. Une valeur non reconnue vaut True : le doute refuse."""
+    value = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            break
+        if a.startswith("-") and a != "-":
+            if a in _MERGE_VALEUR:
+                i += 2
+                continue
+            if a == name:
+                value = True
+            elif a.startswith(name + "="):
+                v = a.partition("=")[2].strip().lower()
+                value = v not in ("false", "0", "f", "no", "n")
+            i += 1
+            continue
+        i += 1
+    return value
+
+
+def _identity_of_url(url):
+    """(hôte, owner, repo) d'une URL de PR, ou None."""
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(str(url or ""))
+    except ValueError:
+        return None
+    if not parts.netloc:
+        return None
+    pieces = [p for p in parts.path.split("/") if p]
+    if len(pieces) < 4 or pieces[2] != "pull":
+        return None
+    return (parts.netloc.lower(), pieces[0], pieces[1])
+
+
+def _identity_of_repo(repo, host):
+    """(hôte, owner, repo) de l'option `--repo`, l'hôte par défaut étant celui
+    de la PR ; None si la valeur n'est pas `[HOST/]OWNER/REPO`."""
+    value = str(repo or "").strip().strip("/")
+    if not value or "://" in value:
+        return None
+    pieces = value.split("/")
+    if len(pieces) == 2:
+        return (host, pieces[0], pieces[1])
+    if len(pieces) == 3:
+        return (pieces[0].lower(), pieces[1], pieces[2])
+    return None
+
+
+def _same_identity(a, b):
+    return tuple(str(p).lower() for p in a) == tuple(str(p).lower() for p in b)
+
+
+def auto_refusal(real, argv):
+    """None si `gh pr merge --auto` peut attendre le vert, sinon le refus."""
+    auto = _bool_opt(argv, "--auto")
+    found = _merge_argv(argv)
+    if found is None or not auto:
+        return None
+    if _bool_opt(argv, "--admin"):
+        return ("--admin contourne la protection : l'auto-merge ne garantit "
+                "pas d'attendre le vert")
+    pr, repo = found
+    args = ["pr", "view"] + ([pr] if pr else []) + (
+        ["--repo", repo] if repo else []) + ["--json", "baseRefName,url"]
+    view = _real(real, args)
+    if view.returncode != 0:
+        return ("PR illisible (%s) : impossible de prouver que l'auto-merge "
+                "attendra la CI"
+                % ((view.stderr or view.stdout or "").strip()[:160] or "gh pr view"))
+    try:
+        row = json.loads(view.stdout or "{}")
+    except ValueError:
+        return "PR illisible (JSON)"
+    if not isinstance(row, dict):
+        return "PR illisible (JSON)"
+    identity = _identity_of_url(row.get("url"))
+    if identity is None:
+        return ("URL de la PR illisible : impossible de prouver le dépôt que "
+                "l'auto-merge attendra")
+    host, owner, name = identity
+    given = _identity_of_repo(repo, host)
+    if repo and (given is None or not _same_identity(given, identity)):
+        return ("l'option --repo %r ne désigne pas la PR résolue (%s/%s/%s) : "
+                "refus de contrôler un autre dépôt" % (repo, host, owner, name))
+    base = str(row.get("baseRefName") or "")
+    if not base:
+        return "branche de base illisible : impossible de prouver la protection"
+    slug = "%s/%s" % (owner, name)
+    info = _real(real, ["api", "--hostname", host, "repos/%s" % slug])
+    if info.returncode != 0:
+        return ("réglages du dépôt illisibles (%s)"
+                % ((info.stderr or info.stdout or "").strip()[:160] or "gh api"))
+    try:
+        data = json.loads(info.stdout or "{}")
+    except ValueError:
+        return "réglages du dépôt illisibles (JSON)"
+    if not isinstance(data, dict) or not data.get("allow_auto_merge"):
+        return ("auto-merge GitHub désactivé sur %s (allow_auto_merge=false) : "
+                "GitHub fusionne immédiatement au lieu d'attendre le vert" % slug)
+    from urllib.parse import quote
+    prot = _real(real, ["api", "--hostname", host,
+                        "repos/%s/branches/%s/protection"
+                        % (slug, quote(base, safe=""))])
+    if prot.returncode != 0:
+        return ("branche %s sans protection lisible (%s) : l'auto-merge ne "
+                "garantit pas d'attendre la CI"
+                % (base, (prot.stderr or prot.stdout or "").strip()[:160]
+                   or "gh api"))
+    try:
+        rules = json.loads(prot.stdout or "{}")
+    except ValueError:
+        return "protection de %s illisible (JSON)" % base
+    checks = (rules.get("required_status_checks") or {}) \
+        if isinstance(rules, dict) else {}
+    if not (isinstance(checks, dict) and (checks.get("checks") or checks.get("contexts"))):
+        return ("branche %s protégée sans check requis : l'auto-merge ne "
+                "garantit pas d'attendre la CI" % base)
+    return None
+
+
+def refuse_auto(real, argv):
+    """Refuse `pr merge --auto` sans attente possible du vert ; True si refus."""
+    message = auto_refusal(real, argv)
+    if message is None:
+        return False
+    sys.stderr.write(
+        "ameesh: refus de `gh pr merge --auto` : %s.\n"
+        "  Rien n'a été fusionné. Utiliser `ameesh work queue add <lot>` "
+        "(atterrissage sur la tête gelée dès la CI verte) ou, pour une PR "
+        "touchant .github/workflows/**, `ameesh work merge-pr --lot <lot>`.\n"
+        % message)
+    sys.stderr.flush()
+    return True
+'''
+
+
 #: le `gh` généré. Volontairement autonome (bibliothèque standard seule) : il
 #: tourne sous l'interpréteur de l'exécuteur, sans importer ameesh.
 SHIM = r'''#!{python}
-# ameesh #1645 : journal des gestes gh. Fichier généré par l'exécuteur, ne pas
-# éditer ; il est réécrit à chaque tour.
+# ameesh #1645 : journal des gestes gh ; #2848 : marqueur des commentaires ;
+# #2853 : garde `pr merge --auto`.
+# Fichier généré par l'exécuteur, ne pas éditer ; il est réécrit à chaque tour.
 import json, os, re, sys, time
 {sanitize}
 {marker}
+{guard}
 real = os.environ.get("{real}", "")
 if not real or not os.access(real, os.X_OK):
     sys.stderr.write("ameesh: vrai gh introuvable ({real}=%r)\n" % real)
@@ -332,6 +538,8 @@ try:
     argv = _annotated(sys.argv[1:])
 except Exception:  # le marqueur ne bloque jamais la commande
     argv = sys.argv[1:]
+if refuse_auto(real, argv):
+    sys.exit(1)
 os.execv(real, [real] + argv)
 '''
 
@@ -444,7 +652,8 @@ def write_shim(shim_dir: str, python: str | None = None) -> str:
     os.makedirs(shim_dir, mode=0o700, exist_ok=True)
     contenu = SHIM.format(python=python or sys.executable, real=ENV_REAL,
                           journal=ENV_JOURNAL, role=ENV_ROLE,
-                          sanitize=SANITIZE, marker=COMMENT_MARKER)
+                          sanitize=SANITIZE, marker=COMMENT_MARKER,
+                          guard=GUARD)
     cible = os.path.join(shim_dir, "gh")
     try:
         with open(cible, encoding="utf-8") as fh:
@@ -471,11 +680,11 @@ def _problem(info: dict, texte: str) -> None:
 
 def apply(env: dict, agent: str, config_dir: str, state_dir: str,
           lot: str | None = None) -> dict:
-    """Pose sur `env` (celui du tour) le shim `gh` (journal et marqueur #2848)
-    et, s'il est configuré, le jeton du rôle. Rend la résolution (sans jeton),
-    pour le journal de l'exécuteur. Jamais bloquant : chaque étape se prépare
-    sur une copie et n'est publiée qu'entière ; un échec laisse l'environnement
-    hérité."""
+    """Pose sur `env` (celui du tour) le shim `gh` (journal, marqueur #2848 et
+    garde #2853) et, s'il est configuré, le jeton du rôle. Rend la résolution
+    (sans jeton), pour le journal de l'exécuteur. Jamais bloquant : chaque
+    étape se prépare sur une copie et n'est publiée qu'entière ; un échec
+    laisse l'environnement hérité."""
     info, jeton = _resolve(config_dir, agent)
     nouveau = dict(env)
     if lot:
