@@ -1233,7 +1233,13 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         # absolue — la garde de budget désactivée ne le lève pas
         result.hard = bool(getattr(profile, "refused", ""))
         return result
-    result.gauges = gauges_of(book, profile, items, environ, model=model, now=now)
+    from .codex_gauges import AmbiguousCodexGauges
+    try:
+        result.gauges = gauges_of(book, profile, items, environ, model=model, now=now)
+    except AmbiguousCodexGauges as exc:
+        result.reason = str(exc)
+        result.hard = True
+        return result
     if result.gauges and record:
         # historique des jauges de L26, attribué au compte (migration 0028)
         book.record_gauges(result.gauges, account=profile.name)

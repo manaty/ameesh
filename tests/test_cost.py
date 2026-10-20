@@ -428,8 +428,11 @@ class CodexGaugeTest(Sandbox, unittest.TestCase):
                   {"type": "session_meta"},
                   {"type": "message", "text": "x" * 2_100_000},
                   {"payload": {"rate_limits": {
+                      "plan_type": "team",
                       "primary": {"used_percent": used, "window_minutes": 300,
-                                  "resets_at": self.now + 3600}}}})
+                                  "resets_at": self.now + 3600},
+                      "secondary": {"used_percent": used, "window_minutes": 10080,
+                                    "resets_at": self.now + 86400}}}})
             gauges = self.book().codex_gauges(sessions=root)
             self.assertAlmostEqual(gauges[0].used, used / 100)
 

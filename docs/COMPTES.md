@@ -246,6 +246,27 @@ sont tues tant que le relevé n'est pas rafraîchi (#1561). Chaque relevé porte
 son horodatage (`read_at` : marqueur de compte Claude, date du journal Codex),
 exposé par `accounts list --json` et l'instantané `progress`.
 
+Les journaux Codex récents sont réconciliés fenêtre par fenêtre (#2839) :
+un relevé hebdomadaire seul ne supprime plus une fenêtre courte encore
+ouverte. Leur horodatage d'événement prime sur la date de modification du
+fichier. À identité et forfait égaux, la dernière observation de chaque
+fenêtre gagne, y compris si sa remise à zéro varie ou a lieu plus tôt.
+Des relevés vivants qui portent des identités de créateur ou des
+forfaits incompatibles rendent le compte ambigu :
+il est refusé, même garde de rythme désactivée, et le choix cherche un autre
+compte. `creator_account_id` ne suffit pas à attribuer un relevé : une session
+reprise peut conserver son créateur alors que ses nouvelles jauges portent
+un autre forfait. Aucune valeur d'identifiant n'apparaît dans le diagnostic.
+Les fenêtres échues ne maintiennent pas ce refus.
+Sans compte déclaré, l'exécuteur met l'agent en pause avec la raison
+d'ambiguïté ; le rapport de coût affiche cette raison avec des jauges vides.
+La lecture porte sur les 32 journaux les plus récemment modifiés, avec
+256 Kio de fin de fichier et 64 Kio de métadonnées au maximum par journal,
+puis une seule réconciliation. Si une fenêtre attendue reste introuvable
+dans un échantillon tronqué, le compte est refusé comme relevé incomplet :
+une limite de lecture ne doit pas masquer une fenêtre saturée. Le forfait
+pro peut ne publier que la semaine.
+
 Depuis la tranche 3 de #1580 (15/10/2026), les jauges d'un compte Claude
 peuvent venir du fichier du widget omarchy (`~/.local/state/omarchy/agents/
 usage/claude*.json`, dossier réglable par l'hôte avec
