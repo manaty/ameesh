@@ -140,8 +140,12 @@ def reconcile(readings, now, *, truncated=False):
     # A long sequence of partial team readings must not evict a saturated
     # short window beyond our I/O budget. Pro legitimately has a week only.
     if truncated:
+        # Expiry clears quota usage, not the observed plan's window layout.
+        # Otherwise a week-only pro account would require a fresh short
+        # reading to resume after reset, which it cannot produce.
+        sample_plans = {r[1].get("plan_type") for r in readings if r[1].get("plan_type")}
         missing = []
-        if plans != {"pro"} and not any(
+        if sample_plans != {"pro"} and not any(
                 g.window_s <= 5 * 3600 for g, _limits in windows.values()):
             missing.append("short window")
         if not any(g.window_s > 5 * 3600 for g, _limits in windows.values()):

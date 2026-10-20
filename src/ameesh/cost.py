@@ -2525,8 +2525,8 @@ def _resident_codex_cumulative(book: "CostBook", agent: str, session: str | None
 
 def _read_tail(path: str, limit: int = TAIL_BYTES) -> str:
     try:
-        size = os.path.getsize(path)
         with open(path, "rb") as fh:
+            size = os.fstat(fh.fileno()).st_size
             if size > limit:
                 fh.seek(size - limit)
             return fh.read(limit).decode("utf-8", "ignore")

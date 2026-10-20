@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import builtins
 import os
 import time
 import unittest
@@ -227,6 +228,39 @@ class CodexReadingsTest(Sandbox, unittest.TestCase):
         for i in range(codex_gauges.MAX_FILES + 1):
             journal(self.codex, str(i), event(self.now, short=None, plan="pro"))
         self.assertEqual(len(self.book().codex_gauges()), 1)
+
+    def test_truncated_pro_weekly_reading_remains_usable_after_reset(self):
+        observed = self.now
+        for i in range(codex_gauges.MAX_FILES + 1):
+            journal(self.codex, str(i), event(observed, short=None, plan="pro"))
+        agent = self.agent("default-codex", "codex")
+        book = self.book()
+        for offset in (86400, 86401, 8 * 86400):
+            with self.subTest(offset=offset):
+                self.now = observed + offset
+                gauges = book.codex_gauges()
+                self.assertEqual(len(gauges), 1)
+                self.assertEqual(gauges[0].used_at(self.now), 0.0)
+                self.assertFalse(gauges.in_overage(self.now))
+                self.assertFalse(cost.stale_reading(gauges, self.now))
+                self.assertEqual(book.gauges("codex").errors, {})
+                self.assertEqual(book.over(agent, pace=False), "")
+                self.assertEqual(book.over(agent, pace=True), "")
+
+    def test_tail_uses_size_of_open_file_after_concurrent_growth(self):
+        path = os.path.join(self.codex, "growing.jsonl")
+        os.makedirs(self.codex, exist_ok=True)
+        with open(path, "wb") as stream:
+            stream.write(b"a" * 16)
+        original_open = builtins.open
+
+        def grow_then_open(filename, mode):
+            with original_open(filename, "ab") as stream:
+                stream.write(b"b" * 16)
+            return original_open(filename, mode)
+
+        with mock.patch("builtins.open", side_effect=grow_then_open):
+            self.assertEqual(cost._read_tail(path, 16), "b" * 16)
 
     def test_expired_other_plan_does_not_hold_account_forever(self):
         journal(self.codex, "old", event(self.now - 8 * 86400, plan="pro"))
