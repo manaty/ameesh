@@ -9,10 +9,10 @@ import unittest
 from datetime import datetime, timezone
 from unittest import mock
 
-from ameesh import accounts, account_turn, cost
+from ameesh import accounts, account_turn, codex_gauges, cost
 from ameesh.codex_gauges import AmbiguousCodexGauges
 
-from .test_cost import Sandbox, write
+from .test_cost import RACY_CTIME_NS, Sandbox, write
 from .test_l30_accounts import _Base
 
 
@@ -51,16 +51,46 @@ class CodexReadingsTest(Sandbox, unittest.TestCase):
                     mtime=self.now + i + 1)
         self.assertTrue(self.book().codex_gauges().in_overage(self.now))
 
+    @mock.patch.object(cost, "RACY_CTIME_NS", RACY_CTIME_NS)
     def test_cached_reading_invalidated_by_same_size_rewrite(self):
         path = journal(self.codex, "cached", event(self.now, short=100))
         before = os.stat(path)
-        self.assertTrue(self.book().codex_gauges().in_overage(self.now))
-        with open(path) as stream:
-            content = stream.read().replace('"used_percent": 100', '"used_percent": 1.0')
-        with open(path, "w") as stream:
-            stream.write(content)
-        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
-        self.assertFalse(self.book().codex_gauges().in_overage(self.now))
+        clock_ns = [before.st_ctime_ns + 5 * RACY_CTIME_NS]
+        # Hold the whole stat signature constant: deterministic coarse-ctime
+        # rewrite, including a previously settled cache hit becoming racy.
+        with mock.patch.object(codex_gauges.os, "stat", return_value=before), \
+                mock.patch.object(codex_gauges.time, "time_ns", side_effect=lambda: clock_ns[0]):
+            first = codex_gauges.session_reading(path, before.st_mtime)
+            self.assertEqual(first[0][0].used, 1.0)
+            self.assertIn(path, codex_gauges._READINGS)
+            with open(path) as stream:
+                content = stream.read().replace('"used_percent": 100', '"used_percent": 1.0')
+            with open(path, "w") as stream:
+                stream.write(content)
+            clock_ns[0] = before.st_ctime_ns + RACY_CTIME_NS // 2
+            fresh = codex_gauges.session_reading(path, before.st_mtime)
+            self.assertEqual(fresh[0][0].used, 0.01)
+            self.assertNotIn(path, codex_gauges._READINGS)
+            clock_ns[0] = before.st_ctime_ns + 5 * RACY_CTIME_NS
+            settled = codex_gauges.session_reading(path, before.st_mtime)
+            self.assertEqual(settled[0][0].used, 0.01)
+
+    @mock.patch.object(cost, "RACY_CTIME_NS", RACY_CTIME_NS)
+    def test_slow_read_cannot_age_racy_snapshot_into_cache(self):
+        path = journal(self.codex, "slow", event(self.now))
+        before = os.stat(path)
+        clock_ns = [before.st_ctime_ns + RACY_CTIME_NS // 2]
+        parse = codex_gauges._session_reading
+
+        def slow_read(*args):
+            readings = parse(*args)
+            clock_ns[0] = before.st_ctime_ns + 5 * RACY_CTIME_NS
+            return readings
+
+        with mock.patch.object(codex_gauges.time, "time_ns", side_effect=lambda: clock_ns[0]), \
+                mock.patch.object(codex_gauges, "_session_reading", side_effect=slow_read):
+            codex_gauges.session_reading(path, before.st_mtime)
+        self.assertNotIn(path, codex_gauges._READINGS)
 
     def test_retained_short_window_expires_at_its_own_reset(self):
         observed = self.now

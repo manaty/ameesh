@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
-from functools import lru_cache
+import time
+import threading
+from collections import OrderedDict
 from datetime import datetime
 
 
@@ -19,14 +21,36 @@ def _timestamp(event, fallback):
         return fallback
 
 
+_READINGS = OrderedDict()
+_CACHE_LOCK = threading.Lock()
+
+
 def session_reading(path, read_at):
+    from .cost import _journal_signature, _racy
+
     stat = os.stat(path)
-    signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
-    return _session_reading(path, read_at, signature)
+    seen = time.time_ns()
+    signature = _journal_signature(stat)
+    with _CACHE_LOCK:
+        cached = _READINGS.get(path)
+        if cached is not None and cached[0] == signature and not _racy(stat, seen):
+            _READINGS.move_to_end(path)
+            return cached[1]
+        # Evict even on an unchanged signature: after a clock step back, a
+        # formerly settled cache entry can become racy again.
+        _READINGS.pop(path, None)
+    readings = _session_reading(path, read_at)
+    after = os.stat(path)
+    # Age is measured BEFORE parsing; a slow read cannot settle its snapshot.
+    if signature == _journal_signature(after) and not _racy(stat, seen):
+        with _CACHE_LOCK:
+            _READINGS[path] = (signature, readings)
+            if len(_READINGS) > 4096:
+                _READINGS.popitem(last=False)
+    return readings
 
 
-@lru_cache(maxsize=4096)
-def _session_reading(path, read_at, signature):
+def _session_reading(path, read_at):
     # Local import avoids a cost -> codex_gauges -> cost import cycle.
     from .cost import Gauge, _epoch, _find_rate_limits, _fraction, _read_tail
 
