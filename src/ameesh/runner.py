@@ -8004,6 +8004,24 @@ class Runner:
                    and a.get("stop_reason") in work_mod.RELEASABLE_STOP_REASONS]
         if not stopped:
             return []
+        # #2877 : ce que ces agents tiennent encore, en UNE lecture sans verrou.
+        # `release_lots` verrouille la ligne du registre de l'agent le temps de
+        # ses allers-retours ; refaite à chaque passe par chaque exécuteur pour
+        # un agent qui n'a plus rien à rendre, elle formait un convoi (une
+        # trentaine de sessions en file sur la même ligne, 20/10). Un lot
+        # assigné après ce relevé est vu à la passe suivante ; la transaction
+        # revérifie toujours l'agent et chaque lot.
+        try:
+            held = work_mod.held_lots(self.db, [a["name"] for a in stopped])
+        except db_mod.DbError as exc:
+            message = "stopped agents not swept (%s)" % exc
+            if message != getattr(self, "_stopped_lots_error", None):
+                log_async(message)
+            self._stopped_lots_error = message
+            return []
+        stopped = [a for a in stopped if a["name"] in held]
+        if not stopped:
+            return []
         cache = getattr(self, "_measure_canons_cache", None)
         now = time.time()
         if cache is None or cache[0] <= now:
@@ -8020,6 +8038,9 @@ class Runner:
         # bail expiré — ne dessaisit pas : l'agent relancé retrouve ses lots.
         # Seul un arrêt délibéré (manuel) les rend.
         for agent in stopped:
+            if not held[agent["name"]]["open"] and (
+                    not measure_actor or measure_actor == agent["name"]):
+                continue  # #2877 : des lots promus seulement, et personne pour les mesurer
             try:
                 done = work_mod.release_lots(
                     self.db, agent["name"],
