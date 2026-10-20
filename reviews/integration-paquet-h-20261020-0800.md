@@ -89,6 +89,18 @@ il entre dans ce véhicule avec sa tête `e5f62e692ff4`.
   revue unitaire du paquet pour seul avis de la demande de CI (§12,
   `--full --avis 0`).
 
+## Correctif de composition (CI 39382671331)
+
+- `test_2022_fleet` (#2022) : le second appel `--json` du test de l'hôte canon
+  recevait une ligne datée du journal asynchrone de l'exécuteur
+  (`ameesh.runner.log_async`, fil `journal`) encore en file après
+  `test_1466_relecture_config` ; `json.loads` la lisait comme du JSON
+  (« Extra data: line 1 column 2 (char 1) »). Le captage du test n'accepte
+  désormais que les écritures de son propre fil (`_OwnThreadOutput`) et un
+  test de régression force une écriture du fil `journal` pendant le captage.
+  Vert localement sous les deux pilotes (`test_2022_fleet`, 11 tests). Suite
+  complète redemandée sur cette tête.
+
 ## Notes d'activation
 
 - #2839 (P1, SLO) : au staging, le geste opérateur réversible prévu avec cx1
