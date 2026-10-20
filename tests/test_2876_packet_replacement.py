@@ -51,7 +51,7 @@ def gh_for(rows, *, single=False, runs=None, pr_run=None, api_error=False):
         if argv[0] == "api":
             if api_error:
                 return types.SimpleNamespace(returncode=1, stderr="unavailable", stdout="")
-            if "/workflows/paquet.yml/runs?" in argv[1]:
+            if "/actions/runs?" in argv[1]:
                 from urllib.parse import parse_qs, urlsplit
                 page = int(parse_qs(urlsplit(argv[1]).query)["page"][0])
                 listed = [packet_run()] if runs is None else runs
@@ -173,6 +173,9 @@ class PacketReplacementTest(unittest.TestCase):
         self.assert_gate(rows, False, runs=[packet_run(status="in_progress", conclusion=None)])
         self.assert_gate(rows, False, runs=[packet_run(conclusion="failure")])
         self.assert_gate(rows, True, runs=[])
+        other = {**packet_run(status="in_progress", conclusion=None),
+                 "path": ".github/workflows/ui.yml"}
+        self.assert_gate(rows, True, runs=[other])
 
     def test_latest_cancelled_run_must_have_its_own_cancelled_check(self):
         self.assert_gate(witness(), False, runs=[packet_run(), packet_run(101)])

@@ -92,7 +92,7 @@ class Forge:
         path = args[-1] if args else ""
         # #2876 : une PR verte prouve aussi qu'aucun portier invisible ne
         # tourne encore sur cette tête. Ce banc ne crée aucun run paquet.
-        if args[:1] == ["api"] and "/actions/workflows/paquet.yml/runs?" in path:
+        if args[:1] == ["api"] and "/actions/runs?" in path:
             return 0, json.dumps({"total_count": 0, "workflow_runs": []}), ""
         if args[:1] == ["api"] and path.endswith("/actions/runs/200"):
             return 0, json.dumps({"id": 200, "head_sha": self.head, "head_branch": self.branch,

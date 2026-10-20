@@ -1522,22 +1522,14 @@ def merge_rollup(rollup, *, slug: str, head: str, branch: str, gh) -> list:
         except (KeyError, AttributeError, TypeError, ValueError, OverflowError):
             return None
 
-    replacement = aggregate[0]
-    end, replacement_id = finished(replacement), run_id(replacement)
-    if end is None or replacement_id is None or gh is None:
-        return blocked()
     try:
-        pr_run = read("repos/%s/actions/runs/%d" % (slug, replacement_id))
-        if (pr_run.get("id") != replacement_id or pr_run.get("head_sha") != head
-                or pr_run.get("head_branch") != branch or pr_run.get("event") != "pull_request"
-                or pr_run.get("path") != ".github/workflows/tests.yml"
-                or pr_run.get("status") != "completed" or pr_run.get("conclusion") != "success"):
-            return blocked()
         runs, page = [], 1
         while True:
             query = urlencode({"head_sha": head, "branch": branch, "event": "push",
                                "per_page": 100, "page": page})
-            data = read("repos/%s/actions/workflows/paquet.yml/runs?%s" % (slug, query))
+            # La liste générale fonctionne aussi dans un dépôt sans portier
+            # (pas de 404 ambigu sur un workflow absent).
+            data = read("repos/%s/actions/runs?%s" % (slug, query))
             batch = data["workflow_runs"]
             total = data["total_count"]
             if not isinstance(batch, list) or type(total) is not int or total < 0:
@@ -1550,22 +1542,33 @@ def merge_rollup(rollup, *, slug: str, head: str, branch: str, gh) -> list:
             if not batch:
                 return blocked()
             page += 1
-        if not runs:
-            # Aucun portier créé : la PR porte toute la validation.
-            return rows if not any(c.get("workflowName") == "paquet" for c in rows) else blocked()
         if any(type(r.get("id")) is not int or r["id"] <= 0
                or r.get("head_sha") != head or r.get("head_branch") != branch
-               or r.get("event") != "push" or r.get("path") != ".github/workflows/paquet.yml"
+               or r.get("event") != "push" or not isinstance(r.get("path"), str)
                for r in runs):
             return blocked()
         if len({r["id"] for r in runs}) != len(runs):
             return blocked()  # pagination déplacée pendant la lecture
+        runs = [r for r in runs if r.get("path") == ".github/workflows/paquet.yml"]
+        if not runs:
+            # Aucun portier créé : la PR porte toute la validation.
+            return rows if not any(c.get("workflowName") == "paquet" for c in rows) else blocked()
         if any(r.get("status") != "completed" for r in runs):
             return blocked()  # y compris une nouvelle tentative d'un ancien run
         latest = max(runs, key=lambda r: r["id"])
         if latest.get("conclusion") == "success":
             return rows  # aucun échec de portier n'est effacé sans annulation
         if latest.get("conclusion") != "cancelled":
+            return blocked()
+        replacement = aggregate[0]
+        end, replacement_id = finished(replacement), run_id(replacement)
+        if end is None or replacement_id is None or gh is None:
+            return blocked()
+        pr_run = read("repos/%s/actions/runs/%d" % (slug, replacement_id))
+        if (pr_run.get("id") != replacement_id or pr_run.get("head_sha") != head
+                or pr_run.get("head_branch") != branch or pr_run.get("event") != "pull_request"
+                or pr_run.get("path") != ".github/workflows/tests.yml"
+                or pr_run.get("status") != "completed" or pr_run.get("conclusion") != "success"):
             return blocked()
     except (ValueError, KeyError, TypeError, AttributeError, OSError, RuntimeError):
         return blocked()
