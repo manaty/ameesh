@@ -11,7 +11,7 @@ h-1300, bureau 17:26 ; impl-01, composeur désigné, prévenu).
 
 | lot | source | classe | avis | motif |
 |---|---|---|---|---|
-| #2848 | `d70d12d3cdc6` (tête gelée, gel 14765) | sensitive | auditeur (Claude) + cx1 (Codex) | panier de #2845 : réveil de l'auteur à l'intake, tests du veilleur sous psql ; auteur impl-07 |
+| #2848 | `d70d12d3cdc6` (tête gelée, gel 14765) | sensitive | auditeur (Claude) + cx1 (Codex) | panier du lot 2845 : réveil de l'auteur à l'intake, tests du veilleur sous psql ; auteur impl-07 |
 | #2863 | `5fe81731646f` (tête gelée, gel 14689) | sensitive | dev3 (DeepSeek) + orchestrateur (Claude) | gel : `--sha HEAD` symbolique refusé, abréviations développées ; auteur cx2 |
 | #2879 | `def90d019870` (tête gelée, gel 14718) | sensitive | auditeur (Claude) + cx3 (Codex) | alerts : tendance disque sous-échantillonnée en base ; auteur impl-04 |
 | #2675 | `352dacb2ddb1` (tête gelée, gel 14694) | sensitive | auditeur (Claude) + cx3 (Codex) | rythme des familles lu sur l'horizon du plan ; auteur impl-08 |
