@@ -79,6 +79,7 @@ CAUSES = (
     "run-incomplete",     # timeout, annulation, part sans fin : inexploitable (124/130/70)
     "transport-lost",     # connexion perdue, résultat non authentifié
     "block-missing",      # le canon ne porte pas le bloc `prevalidation` (#1770)
+    "tooling-missing",    # le dépôt candidat n'a pas le plan ni le lanceur (#2794)
 )
 
 

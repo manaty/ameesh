@@ -106,36 +106,46 @@ def latest_verdict(rows: list[dict]) -> dict | None:
 #: La règle explique leur classe mais peut citer d'autres fichiers inchangés.
 #: `critical: true` au canon fait foi ; ces motifs restent un minimum lorsque
 #: le canon ne connaît pas encore un chemin critique ou omet sa déclaration.
+#: Les motifs propres à ameesh sont ancrés sous `src/ameesh/` et le repli ne
+#: s'applique qu'au projet ameesh (#2696) : le crate Nexlink `host-linux`, sous
+#: `desktop/`, ne devient plus un chemin de prod par le motif `host[-_]`.
 #: Un doute de classe (politique ou diff illisible, `files` vide) n'ajoute
 #: aucun de ces domaines : il reste sensible, un avis (canon §2, owner 15/10 :
 #: deux familles seulement pour droits SQL, secrets, paiement, prod réelle ;
 #: #2394).
 CRITICAL_SCOPE = (
-    # SQL, migrations, stockage
-    re.compile(r"(^|/)(migrations?|supabase|storage)(/|$)|(^|/)migrations\.py$|"
-               r"(^|/)db\.py$|\.sql$"),
+    # SQL, migrations, stockage — les noms ameesh sont ancrés sous src/ameesh/ ;
+    # `supabase/`, `*.sql` et `deploy/sql/` restent globaux (SQL dans tout projet).
+    re.compile(r"^src/ameesh/(?:[^/]+/)*(?:migrations?|storage)(?:/|$)|"
+               r"^src/ameesh/(?:[^/]+/)*(?:migrations|db)\.py$|"
+               r"(?:^|/)supabase/|\.sql$|^deploy/sql/"),
     # sécurité : droits, identité, clés, secrets, décisions ; garde cgroup
-    # DeepSeek (#2282 : le préchargement Node et son module Python)
-    re.compile(r"(^|/)(approve|auth|authority|identity|signing|cose|p256|jcs|decisions|"
-               r"visibility|auth_failure|dsn|assignments)(/|\.py$|$)|"
-               r"(^|/)deepseek_cgroup\.(?:cjs|py)$|"
-               r"(^|/)(keys?|secrets?)(/|$)|"
-               r"^src/ameesh/(approve_check|approve_client|config)\.py$"),
-    # prod, infra, déploiement, hôtes et relais — dont la porte de fusion
-    re.compile(r"(^|/)(deploy|infra|lab|bin)(/|$)|(^|/)\.github/|"
-               r"(^|/)scripts/(ci|deploy|compute|test)|(^|/)(Dockerfile|pyproject\.toml)$|"
-               r"(^|/)host[-_]|(^|/)(hostcheck|exploitation|relay|serve|progress_serve|"
-               r"relocation|placement|merge_queue|land|fire)\.py$|"
+    # DeepSeek (#2282 : le préchargement Node et son module Python). Noms
+    # ameesh ancrés sous src/ameesh/, à toute profondeur comme avant #2696
+    # (`mediated_executor/identity.py`, `mediated_executor/host_gate.py`).
+    re.compile(r"^src/ameesh/(?:[^/]+/)*(?:approve|auth|authority|identity|signing|cose|p256|jcs|"
+               r"decisions|visibility|auth_failure|dsn|assignments)(?:/|\.py$|$)|"
+               r"^src/ameesh/(?:[^/]+/)*deepseek_cgroup\.(?:cjs|py)$|"
+               r"^src/ameesh/(?:[^/]+/)*(?:keys?|secrets?)(?:/|$)|"
+               r"^src/ameesh/(?:approve_check|approve_client|config)\.py$"),
+    # prod, infra, déploiement, hôtes et relais — dont la porte de fusion.
+    # Les chemins ameesh sont ancrés sous src/ameesh/ ; les domaines génériques
+    # (deploy, infra, .github, scripts, Dockerfile, pyproject) restent globaux.
+    re.compile(r"(?:^|/)(?:deploy|infra|lab|bin)(?:/|$)|(?:^|/)\.github/|"
+               r"(?:^|/)scripts/(?:ci|deploy|compute|test)|"
+               r"(?:^|/)(?:Dockerfile|pyproject\.toml)$|"
+               r"^src/ameesh/(?:[^/]+/)*host[-_]|^src/ameesh/(?:[^/]+/)*(?:hostcheck|exploitation|relay|serve|"
+               r"progress_serve|relocation|placement|merge_queue|land|fire)\.py$|"
                # la porte de fusion hors API, la classe du lot et son classement
                # (#2249 ; ligne perdue dans une composition, restaurée #2374)
-               r"(^|/)(merge_pr|lot_class|review)\.py$|"
+               r"^src/ameesh/(?:[^/]+/)*(?:merge_pr|lot_class|review)\.py$|"
                # ce qui entre dans un paquet : la liste calculée des lots
                # prêts et ses remises (#2496)
                r"^src/ameesh/packet_candidates\.py$|^scripts/paquet-candidats\.py$|"
                # le report des verdicts acquis sur une tête réalignée (#2442)
                r"^src/ameesh/verdict_carry\.py$|"
                # preuve de famille indépendante des avis (#2265)
-               r"^src/ameesh/(review_lot|registry)\.py$"),
+               r"^src/ameesh/(?:review_lot|registry)\.py$"),
 )
 #: la documentation Markdown que le canon classe léger ou normal : les motifs
 #: de secours, larges, y verraient un domaine (`docs/design/decisions/`). Seul
@@ -151,8 +161,10 @@ def critical_scope(klass) -> bool:
     """Le diff gelé touche-t-il SQL, la sécurité ou la prod (deux avis) ?
 
     Le canon peut le déclarer explicitement sur chaque chemin classé. Les
-    motifs de secours s'appliquent aussi aux chemins classés légers, sauf à la
-    documentation Markdown classée légère ou normale.
+    motifs de secours ameesh sont ancrés sous `src/ameesh/` ; `required_verdicts`
+    ne les applique qu'au projet ameesh, la politique compilée des autres
+    projets faisant foi (#2696). Ils s'appliquent aussi aux chemins classés
+    légers, sauf à la documentation Markdown classée légère ou normale.
     Seuls les **chemins changés** prouvent un domaine critique : une liste
     `files` vide, ou une entrée sans chemin, n'en désigne aucun. Le doute de
     classe n'est pas critique pour autant : `required_verdicts` le garde
@@ -179,6 +191,14 @@ def required_verdicts(klass) -> int:
     le canon l'a omis ou classé léger ; sinon le plancher déclaré pour un lot
     léger (`light_reviews`, §2 : un avis, #2642), 1 pour normal et 1 pour
     sensible hors SQL, sécurité et prod.
+    Un lot peut aussi déclarer un nombre d'avis par chemin (`train_reviews`,
+    #2696) : le classement le lit et le porte (`train_reviews`), la porte
+    l'applique comme la désignation au gel ; un chemin léger déclaré à deux
+    avis les exige sans être reclassé, et le doute ne l'efface pas.
+    Les motifs de secours `CRITICAL_SCOPE` ne s'appliquent qu'au projet ameesh
+    (ou à un appel sans projet connu) : pour les autres projets, la politique
+    compilée fait foi (#2696, cas pilote Nexlink `desktop/host/**`) ; une
+    déclaration `critical: true` du canon garde deux avis pour tout projet.
     Un lot léger **sans chemin changé** n'a rien à relire : 0. Le plancher est
     lu par le lecteur de classe (`lot_class`), donc le même que la désignation
     au gel et `paquet-candidats` ; il ne reclasse jamais la classe.
@@ -194,19 +214,28 @@ def required_verdicts(klass) -> int:
     from . import lot_class
     klass = klass or {}
     cls = str(klass.get("class") or lot_class.SENSITIVE)
+    declared = int(klass.get("train_reviews") or 0)
+    project = str(klass.get("project") or "")
+    files = klass.get("files") or ()
     if klass.get("doubt"):
         # canon §8 : « en cas de doute, le lot est sensible » — jamais léger,
         # jamais critique par le seul doute (#2394).
         cls = lot_class.SENSITIVE
-    if klass.get("files") and critical_scope(klass):
-        return CRITICAL_REVIEWS
+    # #2696 : le canon compilé fait foi hors ameesh. Les motifs de secours
+    # décrivent les chemins d'ameesh ; sur un lot Nexlink, `host-linux` (un
+    # crate sous `desktop/`) ne devient pas un chemin de prod par `host[-_]`.
+    # Une déclaration `critical: true` du canon reste lue pour tous les projets.
+    explicit_critical = any(entry.get("critical") is True for entry in files)
+    fallback = critical_scope(klass) if project in ("", "ameesh") else False
+    if files and (explicit_critical or fallback):
+        return max(CRITICAL_REVIEWS, declared)
     if cls == lot_class.LIGHT:
         if not klass.get("files"):
             return 0
-        return int(klass.get("light_reviews") or 0)
+        return max(int(klass.get("light_reviews") or 0), declared)
     if cls in (lot_class.NORMAL, lot_class.RELEASE):
-        return 1
-    return SENSITIVE_REVIEWS
+        return max(1, declared)
+    return max(SENSITIVE_REVIEWS, declared)
 
 
 def _mark_order(mark: dict) -> tuple:
@@ -345,6 +374,35 @@ def _waiver(db, item) -> tuple:
     return waived, waived_by, row
 
 
+def _corrections_on_freeze(db, marks, frozen, *, repo, klass, item, families=None):
+    """Les correcteurs d'un petit correctif de relecteur sur cette tête (#2739).
+
+    Lecture des commits exacts de la plage gelée et de leur provenance, la même
+    que la désignation (#2638) : la famille du correcteur reste éligible, mais
+    l'agent lui-même ne relit pas son propre correctif. Rend `None` quand aucune
+    lecture n'est possible (pas de base, pas de dépôt, pas de ligne de lot) :
+    la porte garde alors son comportement historique. Lève quand une lecture
+    était possible et a échoué : une porte qui ne peut pas prouver l'absence de
+    correcteur ne compte pas son avis (l'indépendance ne se suppose pas).
+    """
+    base = str((klass or {}).get("base_sha")
+               or (klass or {}).get("target") or "").strip()
+    if db is None or not repo or not base or not item:
+        return None
+    from . import review_designation_activation as act
+    freeze = plan_git.latest_freeze(marks or ())
+    milestone = None
+    if freeze is not None and _same_sha(freeze.get("sha"), frozen, repo):
+        milestone = {"id": int(freeze.get("id") or 0),
+                     "sha": str(freeze.get("sha") or ""),
+                     "actor": freeze.get("actor") or "",
+                     "at_ts": freeze.get("at_ts")}
+    rows = act.corrections_of_head(db, item, milestone, repo, base, frozen,
+                                   families=families or ())
+    return {str((row or {}).get("name") or "").strip().lower()
+            for row in rows or () if str((row or {}).get("name") or "").strip()}
+
+
 def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 item=None, families=None, required=None, family_of=None,
                 authors=None) -> dict:
@@ -385,6 +443,13 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     lieu du registre courant. Un appelant qui le fournit ne lit ni le registre
     ni le canon compilé.
 
+    #2739 : l'auteur d'un petit correctif de relecteur tenu hors des auteurs
+    (#2638) ne relit pas son propre correctif. La porte lit les commits exacts
+    de la plage gelée (`corrections_of_head`) et écarte son avis **par son
+    nom**, sans exclure sa famille : un autre agent de la même famille reste
+    éligible. Quand la plage ne peut pas être lue, la porte échoue fermé si la
+    lecture était possible (dépôt, base et ligne de lot connus).
+
     #2664 : les familles viennent du canon compilé (`families`, sinon lues par
     `review_lot.compiled_families` au dernier commit audité). Un canon
     illisible refuse la porte **fermée** avec le canon nommé — une seule
@@ -399,7 +464,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     n'est jamais levé par la dispense : la correction reste due.
 
     Rend `{ok, why, class, required, accepted, blocked, waived, author,
-    author_family, authors, on_freeze}` ; ne lève jamais.
+    author_family, authors, corrections, on_freeze}` ; ne lève jamais.
     """
     from . import lot_class
     klass = klass or {}
@@ -416,7 +481,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     author = str(row.get("assignee") or "").strip()
     out = {"ok": False, "why": "", "error": "", "class": cls, "required": 0,
            "accepted": [], "blocked": [], "waived": waived, "waived_by": waived_by,
-           "author": author, "author_family": "", "authors": [], "on_freeze": 0}
+           "author": author, "author_family": "", "authors": [],
+           "corrections": [], "on_freeze": 0}
     if not frozen:
         out["why"] = "no freeze to review: the fire names the exact frozen head"
         return out
@@ -554,12 +620,27 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                           % (frozen[:12], cls, entry["name"]))
             return out
     author_families = {entry["family"] for entry in recognized.values() if entry["family"]}
+    try:
+        corrections = _corrections_on_freeze(db, marks, frozen, repo=repo,
+                                             klass=klass, item=item,
+                                             families=families)
+    except Exception as exc:  # noqa: BLE001 - une plage illisible ne conclut pas
+        out["error"] = str(exc)
+        out["why"] = ("no review verdict ok on the freeze %s (class: %s): the frozen "
+                      "range cannot be read (%s), so a reviewer's own correction "
+                      "cannot be excluded (canon §2: independence is never assumed)"
+                      % (frozen[:12], cls, exc))
+        return out
+    corrections = corrections or set()
+    out["corrections"] = sorted(corrections)
     accepted = []
     for mark in sorted((m for m in latest.values() if (m.get("verdict") or "") == "ok"),
                        key=_mark_order):
         actor = str(mark.get("actor") or "").strip()
         if actor and actor.lower() in recognized:
             continue                      # on ne relit pas son propre travail
+        if actor and actor.lower() in corrections:
+            continue                      # l'auteur d'un correctif ne le relit pas (#2739)
         try:
             family = _family_of(actor)
         except RegistryReadError as exc:
@@ -738,7 +819,221 @@ def source_of(repo: str) -> str:
     return normalize_source("%s%s/%s" % (host.lower(), ":%d" % int(port) if port else "", path))
 
 
-def fetch_fresh(repo: str, names, clone=None) -> tuple[dict, str]:
+def _unreadable_objects(where: str, revs, base: str | None = None) -> list[str] | None:
+    """Les objets que `where` ne peut pas lire pour `revs`.
+
+    `revs` : une tête, ou plusieurs dont on vérifie l'union. Le clone radar
+    est un `git clone --shared` : ses objets viennent par alternates du
+    checkout des agents, et un élagage de celui-ci (`gc`, ménage disque)
+    retire ceux que seul le clone partagé utilisait. Un
+    `rev-list --objects --missing=print` nomme les objets absents de la
+    fermeture **complète** des têtes : ceux de la cible et de la base de
+    fusion comptent aussi, puisque `merge-tree` lit les trois côtés.
+
+    Avec `base` (la cible), le parcours est borné à ce que lit réellement la
+    fusion d'essai : l'histoire propre des têtes (`--not base`), puis les
+    arbres des trois côtés — têtes, cible et commits de bord (`--boundary`,
+    dont les bases de fusion). La fermeture complète coûte 20 à 40 s sur
+    Nexlink à chaque fetch, la version bornée moins d'une seconde.
+
+    Une exception : plusieurs bases de fusion. `merge-tree` les fusionne
+    récursivement pour construire sa base virtuelle ; l'ancêtre propre de ces
+    bases n'apparaît alors ni dans l'histoire propre des têtes ni dans les
+    arbres de bord. Dès que `merge-base --all` nomme plus d'une base pour une
+    tête, le garde revient à la fermeture complète : mieux vaut un parcours
+    lent qu'une tête rendue que la fusion ne peut pas lire.
+
+    `None` quand le parcours lui-même échoue : l'appelant le traite comme un
+    manque à réparer, jamais comme une tête lisible."""
+    from . import resolutions
+    revs = [revs] if isinstance(revs, str) else list(revs)
+    revs = list(dict.fromkeys(revs))
+    if not revs:
+        return []
+    for rev in revs:
+        if plan_git._commit(where, rev) is None:
+            return [rev]      # une tête manquante arrête rev-list : on la nomme
+    if base and plan_git._commit(where, base) is None:
+        return [base]
+    if not base:
+        walks = [["rev-list", "--objects", "--missing=print", *revs]]
+    else:
+        proc = resolutions._run(where, "rev-list", "--boundary", *revs, "--not", base)
+        if proc.returncode:
+            return None
+        boundary = [line[1:] for line in resolutions._text(proc).splitlines()
+                    if line.startswith("-")]
+        for rev in revs:
+            if rev == base:
+                continue
+            proc = resolutions._run(where, "merge-base", "--all", rev, base)
+            if proc.returncode not in (0, 1):
+                return None
+            if len(resolutions._text(proc).split()) > 1:
+                # bases multiples : leur fusion récursive lit leur ancêtre
+                walks = [["rev-list", "--objects", "--missing=print",
+                          *sorted(set(revs) | {base})]]
+                break
+        else:
+            walks = [
+                ["rev-list", "--objects", "--missing=print", *revs, "--not", base],
+                ["rev-list", "--objects", "--missing=print", "--no-walk",
+                 *sorted(set(revs) | {base} | set(boundary))],
+            ]
+    missing = []
+    for args in walks:
+        proc = resolutions._run(where, *args)
+        if proc.returncode:
+            return None
+        for line in resolutions._text(proc).splitlines():
+            if not line.startswith("?"):
+                continue
+            fields = line[1:].split()
+            if fields and fields[0] not in missing:
+                missing.append(fields[0])
+    return missing
+
+
+def _refetch_tip_objects(where: str, url: str, branch: str) -> str:
+    """Refait le fetch de `branch` dans `where`, sans négociation.
+
+    Le clone lit ses objets par alternates : un fetch ordinaire peut répondre
+    « à jour » (la tête est lisible par les alternates) ou déposer un pack dont
+    `unpack-objects` saute les objets déjà fournis par eux — la tête reste
+    alors une ref sur des objets prêtés. `--refetch` force le transfert, et
+    `transfer.unpackLimit=1` garde le pack : `index-pack` l'écrit même quand
+    les alternates connaissent déjà ses objets, donc le clone les possède.
+    La ref de file est retirée d'abord, pour que le fetch ne soit pas un
+    simple « à jour ». Le pack couvre l'histoire de la branche (aucune
+    négociation) : cette réparation est rare et vaut mieux qu'un lot écarté
+    pour un objet absent. `--no-auto-gc` et `--no-auto-maintenance` évitent
+    qu'un repack détaché du clone ne coure pendant que la fusion d'essai lit
+    ses objets. Rend le message d'erreur de git, vide si le fetch a réussi."""
+    from . import resolutions
+    name = _remote_branch(branch)
+    ref = QUEUE_REF + name
+    resolutions._run(where, "update-ref", "-d", ref)
+    proc = resolutions._run(where, "-c", "transfer.unpackLimit=1",
+                            "fetch", "--quiet", "--no-tags", "--refetch",
+                            "--no-auto-gc", "--no-auto-maintenance", url,
+                            "+refs/heads/%s:%s" % (name, ref), timeout=FETCH_TIMEOUT)
+    return resolutions._err(proc)[:300] if proc.returncode else ""
+
+
+def _clone_base(where: str, base: str | None) -> str | None:
+    """Le commit de cible dont les objets sont vérifiés avec ceux des têtes.
+
+    `base` (la cible du même fetch) d'abord, puis la cible déclarée du clone,
+    puis sa branche par défaut. La cible et la base de fusion comptent : la
+    fusion d'essai lit leur côté de chaque conflit, et un blob d'ancêtre
+    commun absent fait échouer `merge-tree` même quand la tête est complète
+    (B1 de la relecture #2738). Aucun commit lisible : None, le garde ne
+    couvre alors que les têtes fournies."""
+    def first(candidates) -> str | None:
+        for candidate in candidates:
+            if not candidate:
+                continue
+            commit = plan_git._commit(where, candidate)
+            if commit:
+                return commit
+        return None
+    if base:
+        name = _remote_branch(base)
+        commit = first([QUEUE_REF + name, "origin/" + name, name, base])
+        if commit:
+            return commit
+    declared = plan_git.declared_target(where)
+    if declared:
+        commit = first([QUEUE_REF + _remote_branch(declared), declared])
+        if commit:
+            return commit
+    try:
+        default = plan_git.default_target(where)
+    except Exception:  # noqa: BLE001 - cible déclarée introuvable (#2680)
+        default = None
+    if default:
+        commit = first([default, QUEUE_REF + _remote_branch(default)])
+        if commit:
+            return commit
+    return first(plan_git.DEFAULT_TARGETS)
+
+
+def _guarantee_tip_objects(clone, url: str, names, tips: dict, base: str | None) -> dict:
+    """Ne rend que des têtes dont la fermeture est lisible dans le clone.
+
+    #2738 : une tête fraîche peut n'être qu'une ref sur des objets prêtés par
+    les alternates ; si la source les a élagués, la fusion d'essai et les
+    lectures de gel échouent (« blob absent du clone de calcul ») et
+    `paquet-candidats.py` écarte un lot prêt en erreur de lecture. Le garde
+    vérifie l'union des objets lus par la fusion d'essai — histoire propre des
+    têtes, arbres des têtes, de la cible et des bases de fusion, ou fermeture
+    complète si les bases sont multiples —, répare chaque branche
+    dont des objets manquent, puis re-vérifie. Une erreur Git du garde devient
+    une `QueueError` (B2), jamais une exception qui ferait planter l'appelant."""
+    label = ", ".join(names[:5]) + (" …" if len(names) > 5 else "")
+    try:
+        return _verified_tips(clone, url, names, tips, base)
+    except (GitError, OSError) as exc:
+        raise QueueError("cannot guarantee the objects of %s in the radar clone (%s): "
+                         "retry once the remote and the clone answer"
+                         % (label or "the fetched branches", str(exc)[:300])) from exc
+
+
+def _verified_tips(clone, url: str, names, tips: dict, base: str | None) -> dict:
+    """Le corps du garde de `_guarantee_tip_objects` (hors traduction d'erreurs)."""
+    base_branch = _remote_branch(base) if base else ""
+    base_commit = _clone_base(clone.path, base)
+
+    def wanted() -> list[str]:
+        revs = {tips[name] for name in names if tips.get(name)}
+        if base_commit:
+            revs.add(base_commit)
+        return sorted(revs)
+
+    revs = wanted()
+    missing = _unreadable_objects(clone.path, revs, base_commit) if revs else []
+    if missing == []:
+        return tips
+    # chemin rare : nommer la branche qui porte chaque objet manquant et la
+    # refaire. Une tête peut changer (la branche a bougé) ; les entrées de
+    # `tips` de la même branche suivent.
+    repaired: set = set()
+    for tip in revs:
+        branch = next((name for name in names if tips.get(name) == tip), "")
+        if not branch and tip == base_commit:
+            branch = base_branch
+        if not branch or _remote_branch(branch) in repaired:
+            continue
+        if _unreadable_objects(clone.path, tip) == []:
+            continue
+        repaired.add(_remote_branch(branch))
+        error = _refetch_tip_objects(clone.path, url, branch)
+        if error:
+            raise QueueError(
+                "cannot fetch %s from origin for the objects of its head %s (%s): "
+                "try again once the remote answers" % (branch, tip[:12], error))
+        fresh = plan_git._commit(clone.path, QUEUE_REF + _remote_branch(branch)) or tip
+        for name in names:
+            if _remote_branch(name) == _remote_branch(branch):
+                tips[name] = fresh
+        if _remote_branch(branch) == base_branch:
+            base_commit = fresh
+    revs = wanted()
+    missing = _unreadable_objects(clone.path, revs, base_commit) if revs else []
+    if missing == []:
+        return tips
+    detail = ("walk impossible" if missing is None
+              else "%d unreadable, first %s" % (len(missing), missing[0][:12]))
+    label = ", ".join(names[:5]) + (" …" if len(names) > 5 else "")
+    raise QueueError(
+        "cannot guarantee the objects of %s in the radar clone (%s, after an explicit "
+        "fetch from origin): the shared clone reads the agents' objects (git clone "
+        "--shared) and they were pruned; fetch the branch again in the source, or "
+        "recreate the clone" % (label or "the fetched branches", detail))
+
+
+def fetch_fresh(repo: str, names, clone=None,
+                base: str | None = None) -> tuple[dict, str]:
     """({name: commit, or None if there is no such branch}, repository holding
     them) of the branches `names` (lot branches or targets), read fresh. With
     an `origin`, they are listed on it, then fetched from it now into the
@@ -747,7 +1042,15 @@ def fetch_fresh(repo: str, names, clone=None) -> tuple[dict, str]:
     `origin/<branch>` counts, since another host may have pushed since. No
     clone, or a remote that does not answer, raises QueueError: no fetch, no
     tip. Without an `origin`, `repo` is the only copy and its local branches
-    are the tips."""
+    are the tips.
+
+    #2738 : les objets de chaque tête sont vérifiés dans le clone avant d'être
+    rendus, avec ceux de la cible (B1 : la fusion lit la base et l'ancêtre
+    commun) ; s'ils manquent (source élaguée, alternates), un `--refetch`
+    explicite de la branche les rapatrie, sinon QueueError. `base` nomme la
+    cible du même fetch, pour la vérifier et la réparer comme les têtes. Une
+    tête rendue est donc lisible par la fusion d'essai et les lectures de
+    gel, jamais une ref sur des objets absents."""
     from . import resolutions
     names = sorted({n for n in names if n})
     remote = {n: _remote_branch(n) for n in names}
@@ -784,8 +1087,9 @@ def fetch_fresh(repo: str, names, clone=None) -> tuple[dict, str]:
     if failed is not None:
         raise QueueError("cannot fetch %s from origin (%s): try again once the remote answers"
                          % (what, failed[:300]))
-    return {n: plan_git._commit(clone.path, QUEUE_REF + remote[n]) if remote[n] in present
-            else None for n in names}, clone.path
+    tips = {n: plan_git._commit(clone.path, QUEUE_REF + remote[n]) if remote[n] in present
+            else None for n in names}
+    return _guarantee_tip_objects(clone, url, names, tips, base), clone.path
 
 
 def branch_tip(repo: str, branch: str, clone=None) -> tuple[str | None, str]:
@@ -910,7 +1214,7 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     # lisaient sur une cible périmée (P2-1 de la R1).
     names = [row["branch"]] + ([target] if target else [])
     try:
-        tips, where = fetch_fresh(repo, names, clone)
+        tips, where = fetch_fresh(repo, names, clone, base=target)
     except QueueError as exc:
         raise QueueError("cannot fetch branch %s%s from origin: %s"
                          % (row["branch"], " and target %s" % target if target else "",

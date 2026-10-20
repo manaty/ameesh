@@ -127,5 +127,16 @@
   "field.amount": "Montant",
   "field.proposedBy": "Proposée par",
   "field.requester": "Demandeur",
-  "field.due": "Échéance"
+  "field.due": "Échéance",
+  "view.chat": "Conversation",
+  "chat.agentState": "{agent} : {state}",
+  "chat.unread": "{count} non lus",
+  "chat.waiting": "En attente du prochain tour : l'agent lit votre message à son réveil.",
+  "chat.asleep": "État de l'agent : {state}. Votre message attend dans sa boîte jusqu'à la reprise de l'agent.",
+  "chat.empty": "Aucun échange avec cet agent dans ses fils pour l'instant.",
+  "chat.message": "Message à {agent}",
+  "chat.send": "Envoyer",
+  "chat.sending": "Envoi…",
+  "chat.hint": "Remis dans la boîte de l'agent et écrit dans le fil.",
+  "chat.failed": "Le message n'a pas été envoyé ({code})."
 }

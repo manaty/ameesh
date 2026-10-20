@@ -587,15 +587,31 @@ la lecture des attentes retrouve les unités par ces trailers `ameesh-work:`
 de la branche, au-dessus de la cible (#2599) ; un `#N` cité en prose ne
 supprime toujours pas son alerte.
 
-À la fusion du paquet, ses unités se ferment **sans geste manuel** : le relevé
-de l'exécuteur lit les manifestes `reviews/**paquet**.md` de la cible et, pour
-chaque lot de leur table de composition encore ouvert, examine son dernier gel
-par le contenu — ancêtre, patch-id, squash, revert (#1825) — puis le passe
-`merged` (`packet_close`, #2426). Une ligne de retrait ne ferme rien ; un lot
-re-gelé après la composition reste ouvert. `ameesh work sync-packets --git-dir
-D --target T [--dry-run]` fait le même constat à la main, sur les seules
-unités des manifestes : c'est le balayage ciblé qui manquait à `sync-merges`
-(tous les lots ouverts, plus de 120 s sur ameesh).
+Après la composition — et après chaque recomposition — le composeur écrit la
+liaison en base, depuis le worktree du paquet :
+
+```sh
+ameesh work packet record <porteur> --repo <worktree du paquet>
+```
+
+La commande relit les commits de composition (`ameesh-work:`, jamais le
+manifeste), capture le gel effectif de chaque unité et remplace l'ensemble des
+appartenances du porteur (#2443). `ameesh work show <unité>` affiche alors
+`package : #<porteur> <branche>` sans lire aucun manifeste ; `ameesh work
+sync-merges` ferme une unité quand son commit de composition est entré dans la
+cible — y compris sans jalon `frozen`, ce qui couvre le cas #2366 — et refuse
+cette preuve si l'unité a été re-gelée depuis la composition. Une composition
+non enregistrée reste ouverte : le repli par le gel déclaré est inchangé.
+
+À la fusion du paquet, ses unités se ferment aussi **sans geste manuel** : le
+relevé de l'exécuteur lit les manifestes `reviews/**paquet**.md` de la cible
+et, pour chaque lot de leur table de composition encore ouvert, examine son
+dernier gel par le contenu — ancêtre, patch-id, squash, revert (#1825) — puis
+le passe `merged` (`packet_close`, #2426). Une ligne de retrait ne ferme rien ;
+un lot re-gelé après la composition reste ouvert. `ameesh work sync-packets
+--git-dir D --target T [--dry-run]` fait le même constat à la main, sur les
+seules unités des manifestes : c'est le balayage ciblé qui manquait à
+`sync-merges` (tous les lots ouverts, plus de 120 s sur ameesh).
 
 ## Le lot en cours
 
@@ -838,8 +854,10 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    être le dépôt du lot sur l'hôte github.com exactement), et
    des numéros déjà réservés pour ce dépôt. `--number N` réserve un numéro
    précis : il est refusé s'il existe déjà **sur la branche cible du lot**
-   (#2620 : sa `branch_target`, sinon la cible du projet, sinon celle du
-   dépôt, `origin/` publiée d'abord ; l'arbre de travail, le paquet installé
+   (#2620 : sa `branch_target`, sinon la cible du projet, sinon la cible
+   déclarée du clone — `git config ameesh.target` —, jamais sa branche par
+   défaut `origin/HEAD` : sans cible déclarée, la commande refuse (#2660) ;
+   `origin/` publiée d'abord ; l'arbre de travail, le paquet installé
    et les branches non fusionnées ne comptent pas — un paquet renumérote une
    migration à sa fusion, #2400) ou s'il est réservé par un autre lot. Chaque
    dépôt a sa suite : la
@@ -853,8 +871,10 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    déclenche un réessai ; une autre erreur qui le nomme remonte. La commande est
    idempotente ; `--number N` réserve un numéro précis, refusé s'il existe
    déjà sur la branche cible du lot (`branch_target`, sinon la cible du
-   projet, sinon celle du dépôt, `origin/` publiée d'abord ; les branches non
-   fusionnées ne comptent pas, #2620) ou s'il est réservé ailleurs. Un lot qui
+   projet, sinon la cible déclarée `ameesh.target`, `origin/` publiée
+   d'abord ; sans cible déclarée, refus — jamais `origin/HEAD`, #2660 ; les
+   branches non fusionnées ne comptent pas, #2620) ou s'il est réservé
+   ailleurs. Un lot qui
    ajoute plusieurs migrations en réserve plusieurs (#2481) : chaque
    `--number` s'ajoute à sa liste `migrations`, le premier numéro restant la
    réservation principale lue par les clients d'avant #2481 ; `--release

@@ -477,7 +477,9 @@ class ResidentDriver:
         env.update(self.descriptor.env)
         env.update(self.adapter.env())
         env.update(self.extra_env)
-        return env
+        # #2763 : le VIRTUAL_ENV hérité du runner ne revient pas par os.environ
+        from . import venv_guard
+        return venv_guard.scrub(env)
 
     # -- public interface --------------------------------------------------
     @property

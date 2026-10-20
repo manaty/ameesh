@@ -1549,6 +1549,13 @@ def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
         item["resolutions"], error = resolutions.of_lot_or_error(db, lot_id)
         if error:  # e.g. a database without migration 0057
             item["resolutions_error"] = error
+        # #2443 : les paquets de composition enregistrés, lus en base — jamais
+        # le manifeste. Une base d'avant 0465 n'empêche pas la fiche de sortir.
+        from . import packet_link
+        try:
+            item["packets"] = packet_link.for_item(db, lot_id)
+        except Exception as exc:  # noqa: BLE001 - l'affichage ne casse pas le lot
+            item["packets"], item["packets_error"] = [], str(exc)
         # L160e : place du lot dans la file de fusion de sa cible
         try:
             item["queue"] = next((r for r in storage.of(db).work.queue()
@@ -1795,7 +1802,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     print("      %s" % " · ".join(notes))
             return 0
         if args.work_command == "show":
-            from . import estimates, lot_measures, resolutions
+            from . import estimates, lot_measures, packet_link, resolutions
             item = work_detail(cfg, db, args.id,
                                repo=getattr(args, "git_dir", None),
                                target=getattr(args, "freeze_target", None))
@@ -1825,6 +1832,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             if item.get("package_id") or item.get("epic"):
                 print("plan     : card %-12s epic: %s" % (
                     item.get("package_id") or "—", item.get("epic") or "—"))
+            for member in item.get("packets") or []:
+                print("package  : %s" % packet_link.describe(member))
+            if item.get("packets_error"):
+                print("package  : unavailable (%s)" % item["packets_error"])
             if any(item["planned"].get(k) for k in ("start", "end", "delivery")):
                 print("planned  : start %s · end %s · delivery %s%s" % (
                     item["planned"]["start"] or "—", item["planned"]["end"] or "—",
@@ -3123,7 +3134,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_mig.add_argument("--number", type=int, default=None,
                         help="reserve this exact number (refused if it already exists on the "
                              "lot's target branch or is reserved by another work item; branches "
-                             "not merged into the target do not count, #2620); added to the "
+                             "not merged into the target do not count, #2620; the target is the "
+                             "lot's, else its project's, else `ameesh.target` — never the clone's "
+                             "`origin/HEAD`, and none declared is a refusal, #2660); added to the "
                              "lot's other reservations (#2481)")
     pw_mig.add_argument("--release", action="store_true",
                         help="release all the lot's reservations, or only --number when given "

@@ -722,11 +722,13 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertNotIn("provenance unknown", out["why"])
         self.assertNotIn("r2", [r["name"] for r in out["reviewers"]])
 
-    def test_a_small_inter_agent_amend_keeps_the_reviewer_eligible(self):
-        """#2721 / §2 — un amend de relecteur sous le seuil reste un correctif.
+    def test_a_small_inter_agent_amend_keeps_its_family_but_not_a_seat(self):
+        """#2721 / §2 + #2739 — un amend de relecteur sous le seuil reste un correctif.
 
-        r2/codex garde alors sa famille éligible et couvre un siège manuel ;
-        la sélection désigne r1/claude pour l'autre."""
+        r2/codex garde sa famille éligible (codex n'est pas une famille
+        interdite) mais ne couvre aucun siège, même manuel : la sélection
+        attend un autre agent codex, elle ne désigne pas r2 sur sa propre
+        correction (#2739)."""
         self.repo.git("checkout", "-q", "-B", "small-amend", self.base)
         self.repo.write("src/ameesh/work.py", "A\n" * 5)
         self.repo.commit("A", agent="author")
@@ -748,10 +750,12 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         _, out = self.freeze()
         authors = {row["name"]: row for row in out["authors"]}
         self.assertNotIn("r2", authors)
-        self.assertEqual(out["state"], rd.DESIGNATED, out)
-        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1"])
-        self.assertEqual(set(designated(work.get(self.db, self.lot))),
-                         {"r1", "r2"})
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.assertEqual(out["reviewers"], [], out)
+        # le correcteur est écarté par son nom ; sa famille (codex) reste
+        # éligible et n'apparaît pas dans les familles interdites.
+        self.assertIn("r2", out["why"])
+        self.assertNotIn("codex", out["why"])
 
     def test_a_borrowed_harness_uses_the_commit_turn_family(self):
         """#2721 P1 cx2 — le harnais déclaré ne prouve pas la famille.

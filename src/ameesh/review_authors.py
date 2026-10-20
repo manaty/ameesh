@@ -240,11 +240,11 @@ def actor_family(db, actor: str, at_ts: float, families) -> str:
     return _family(harness, families)
 
 
-def authors(db, item: Mapping, milestone: Optional[Mapping],
+def reading(db, item: Mapping, milestone: Optional[Mapping],
             commits: Sequence[str], repo: str = "", families=(),
             *, reference: Optional[Mapping] = None, provider=None,
-            strict: bool = False, trace: bool = False) -> tuple[list, list]:
-    """`(auteurs, inconnus)` de la plage gelée, même lecture pour tous.
+            strict: bool = False, trace: bool = False) -> tuple[list, list, list]:
+    """`(auteurs, inconnus, correcteurs)` de la plage gelée, même lecture pour tous.
 
     `reference` est l'auteur de référence déjà lu (`reference_author`) : la
     désignation et le train la partagent. `provider` est le fournisseur exact
@@ -258,6 +258,11 @@ def authors(db, item: Mapping, milestone: Optional[Mapping],
     correctif de relecture ; un tiers non relecteur reste inconnu. Au-delà du
     seuil (ou pour une conception), le relecteur devient auteur de sa
     correction, avec sa famille de session.
+
+    Les **correcteurs** (#2739) sont les relecteurs désignés dont le correctif
+    de premier tour reste sous le seuil : ils ne sont pas auteurs de la tête
+    (#2638), mais l'agent lui-même ne relit pas son propre correctif — la
+    désignation l'écarte et la porte refuse son avis, sans exclure sa famille.
 
     #2721 : la famille d'un commit sans reçu vient du journal des tours **à
     l'instant du commit** (le harnais qui a réellement tourné, harnais emprunté
@@ -360,7 +365,26 @@ def authors(db, item: Mapping, milestone: Optional[Mapping],
             row["proof"] = "turn-journal"
             row["fallback_commits"] = sorted(proofs[actor])
         out.append(row)
-    return out, unknown
+    correctors = []
+    for actor in sorted(review_commits):
+        if actor in by_name:
+            continue
+        proven = {value for _sha, value in review_commits[actor] if value}
+        # une ambiguïté de familles ne change rien ici : seul le nom exclut
+        family = next(iter(proven)) if len(proven) == 1 else ""
+        correctors.append({"name": actor, "family": family})
+    return out, unknown, correctors
+
+
+def authors(db, item: Mapping, milestone: Optional[Mapping],
+            commits: Sequence[str], repo: str = "", families=(),
+            *, reference: Optional[Mapping] = None, provider=None,
+            strict: bool = False, trace: bool = False) -> tuple[list, list]:
+    """`(auteurs, inconnus)` — la lecture partagée, sans les correcteurs."""
+    authors_, unknown, _correctors = reading(
+        db, item, milestone, commits, repo, families, reference=reference,
+        provider=provider, strict=strict, trace=trace)
+    return authors_, unknown
 
 
 def verdict_families(db, marks, families, *, provider=None,

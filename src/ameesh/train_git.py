@@ -99,7 +99,7 @@ class Repository:
                            merge_queue._remote_branch(r["target"]) != branch for r in rows):
             raise TrainError("train members belong to another source or target")
         tips, _ = merge_queue.fetch_fresh(self.project.repo, [r["branch"] for r in rows],
-                                         self.clone)
+                                         self.clone, base=target)
         moved = ["#%s branch=%s frozen=%s published=%s" % (
                     r["work_item_id"], r["branch"], r["frozen_sha"],
                     tips.get(r["branch"]) or "missing")
