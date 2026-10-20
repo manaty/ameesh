@@ -1385,9 +1385,13 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             _marque_boite(cfg, name, attente)
             return 0
         #: L77/B11 : un tour résident (fichier de tour posé) ne remet pas les
-        #: messages humains par le hook ; la file du tour les possède.
-        remise = _Remise(cfg, bk, name, binding,
-                         resident=bool(tour and binding.bound_to_lease))
+        #: messages humains par le hook ; la file du tour les possède. Le seul
+        #: indice fiable est `AMEESH_TURN_ID_FILE` : `AMEESH_TURN_ID` existe
+        #: aussi pour un tour par événement, et un hook de test peut hériter
+        #: celui de son propre exécuteur.
+        resident_turn = bool(tour and binding.bound_to_lease
+                             and os.environ.get(resident_runner.TURN_FILE_ENV))
+        remise = _Remise(cfg, bk, name, binding, resident=resident_turn)
         #: #1628 : un drapeau local, pas `sys.exc_info()` — un `cmd_hook` appelé
         #: depuis un `except` verrait l'exception extérieure et ne marquerait
         #: jamais la boîte.
