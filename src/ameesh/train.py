@@ -441,9 +441,11 @@ class Engine:
         La composition est immuable : rester en `publishing` rejouerait le
         même rouge à chaque événement et tiendrait la réservation. `paused`
         est terminal — le `finally` rend l'époque — et le diagnostic porte les
-        tests en échec ; le prochain créneau repart d'un état neuf. Comme pour
-        un CI rouge en build/beta, aucun diagnostic automatique n'est lancé :
-        un échec multi-lots ne prouve pas un coupable.
+        tests en échec. Comme après un CI rouge en build/beta, le train reste
+        arrêté et attend le pilote : `step()` court-circuite `paused`, aucun
+        créneau ne repart tout seul (même comportement que `_red`). Aucun
+        diagnostic automatique n'est lancé : un échec multi-lots ne prouve pas
+        un coupable.
         """
         state["failures"] += 1
         state["diagnosis"] = {"stage": "prevalidation", "why": str(exc)}

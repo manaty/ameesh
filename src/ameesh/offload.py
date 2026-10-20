@@ -4,7 +4,8 @@ builds) on a lending VM instead of the workstation (lot L159b, mode b1 of the
 L159 study).
 
   ameesh offload run [--host H] [--profile P] [--repo NAME] [--timeout S]
-        [--snapshot SHA] [--env K=V]... [--fallback local|none] -- <command...>
+        [--wait-timeout S] [--snapshot SHA] [--env K=V]... [--fallback local|none]
+        -- <command...>
   ameesh offload status [--host H] [<job>]
   ameesh offload cancel [--host H] <job>
 
@@ -31,6 +32,13 @@ unreachable before the job starts, or when it refuses or stops the job
 local`, the default). A timeout, a cancel or a connection lost during the
 job is never rerun: the suite may still be running on the VM.
 
+`--timeout` bounds the guest job from its slot; it does not bound the
+client's wait for a slot, the transport or the snapshot. `--wait-timeout`
+bounds that whole local wait (snapshot construction and push included): at
+the deadline the client asks the VM to cancel the job, closes the session and
+exits 124; the guest shell also cancels a job whose session is gone. No local
+rerun.
+
 `AMEESH_OFFLOAD_SSH` replaces the `ssh` command (tests, or extra options).
 The VM side is `ameesh.platform.offload_shell` (forced command of the SSH key).
 """
@@ -46,6 +54,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 from .platform.offload_shell import NONCE_RE, PREFIX, result_mac
 
@@ -73,23 +82,54 @@ class OffloadError(Exception):
     """The offload could not happen (local git, or the VM is unreachable)."""
 
 
+class ClientTimeout(OffloadError):
+    """The client's own wait budget expired: the job is stopped, never rerun."""
+
+
+class SnapshotTimeout(OffloadError):
+    """The client's wait budget expired while building the snapshot (#2665)."""
+
+
+def _left(deadline: float | None) -> float | None:
+    return None if deadline is None else max(0.0, deadline - time.monotonic())
+
+
+def _bounded(cap: float, deadline: float | None) -> float:
+    """Le plafond d'un appel réseau, jamais au-delà de l'échéance locale."""
+    left = _left(deadline)
+    if left is None:
+        return cap
+    if left <= 0:
+        raise ClientTimeout("client wait budget exhausted before the snapshot push")
+    return min(float(cap), left)
+
+
 def _note(text: str) -> None:
     sys.stderr.write("ameesh offload: %s\n" % text)
     sys.stderr.flush()
 
 
-def _git(repo: str, *args: str, env: dict | None = None, input: str | None = None) -> str:
-    res = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
-                         env=env, input=input)
+def _git(repo: str, *args: str, env: dict | None = None, input: str | None = None,
+         deadline: float | None = None) -> str:
+    """Un appel git local, borné par ``deadline`` quand elle est fournie."""
+    left = _left(deadline)
+    if left is not None and left <= 0:
+        raise SnapshotTimeout("snapshot budget exhausted before git %s" % args[0])
+    try:
+        res = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
+                             env=env, input=input, timeout=left)
+    except subprocess.TimeoutExpired:
+        raise SnapshotTimeout("snapshot budget exhausted during git %s"
+                              % args[0]) from None
     if res.returncode != 0:
         raise OffloadError("git %s: %s" % (args[0], res.stderr.strip()))
     return res.stdout.strip()
 
 
-def snapshot(top: str) -> str:
+def snapshot(top: str, *, deadline: float | None = None) -> str:
     """Commit id of the exact working tree. The agent's index is copied to a
     temporary one (its stat cache keeps `git add -A` fast), never written."""
-    git_dir = _git(top, "rev-parse", "--absolute-git-dir")
+    git_dir = _git(top, "rev-parse", "--absolute-git-dir", deadline=deadline)
     with tempfile.TemporaryDirectory(prefix="ameesh-offload-") as tmp:
         index = os.path.join(tmp, "index")
         env = dict(os.environ, GIT_INDEX_FILE=index, **SNAP_ENV)
@@ -102,24 +142,27 @@ def snapshot(top: str) -> str:
         # absent from disk) or an assume-unchanged one (contents not looked
         # at) of the copied index would otherwise travel as the index has it
         full = ("-c", "core.sparseCheckout=false", "-c", "index.sparse=false")
-        entries = _git(top, *full, "ls-files", "-v", "-z", env=env).split("\0")
+        entries = _git(top, *full, "ls-files", "-v", "-z", env=env,
+                       deadline=deadline).split("\0")
         # one flag per call: update-index applies only the last of the two
         for flag, flagged in (
                 ("--no-skip-worktree", [e[2:] for e in entries if e[:1] in ("S", "s")]),
                 ("--no-assume-unchanged", [e[2:] for e in entries if e[:1].islower()])):
             if flagged:
                 _git(top, *full, "update-index", flag, "-z", "--stdin", env=env,
-                     input="\0".join(flagged) + "\0")
-        _git(top, *full, "add", "-A", env=env)
-        tree = _git(top, *full, "write-tree", env=env)
+                     input="\0".join(flagged) + "\0", deadline=deadline)
+        _git(top, *full, "add", "-A", env=env, deadline=deadline)
+        tree = _git(top, *full, "write-tree", env=env, deadline=deadline)
     # no parent: the history (a secret deleted since, or now ignored) never
     # travels; fixed date: the same tree always gives the same snapshot
     env = dict(os.environ, GIT_AUTHOR_DATE="@0 +0000", GIT_COMMITTER_DATE="@0 +0000",
                **SNAP_ENV)
-    return _git(top, "commit-tree", tree, "-m", "ameesh offload snapshot", env=env)
+    return _git(top, "commit-tree", tree, "-m", "ameesh offload snapshot", env=env,
+                deadline=deadline)
 
 
-def snapshot_with(top: str, commit: str, files: dict[str, str]) -> str:
+def snapshot_with(top: str, commit: str, files: dict[str, str], *,
+                  deadline: float | None = None) -> str:
     """Commit id de l'arbre de `commit` plus `files` (chemin dépôt -> contenu).
 
     Même identité que `snapshot()` : aucun parent, mêmes auteur et dates figés,
@@ -128,28 +171,42 @@ def snapshot_with(top: str, commit: str, files: dict[str, str]) -> str:
     doit garantir ce qui part sur la VM (prévalidation du gel, #1770) calcule
     ici « SHA candidat + ses propres fichiers » puis le passe à
     `run --snapshot`. Rien de l'état local ne peut s'y glisser — ni fichier non
-    suivi, ni flag `assume-unchanged`/`skip-worktree` que `git status` masque."""
+    suivi, ni flag `assume-unchanged`/`skip-worktree` que `git status` masque.
+    Avec ``deadline``, chaque git local est borné par le temps qui reste (#2665).
+    """
     with tempfile.TemporaryDirectory(prefix="ameesh-offload-") as tmp:
         env = dict(os.environ, GIT_INDEX_FILE=os.path.join(tmp, "index"), **SNAP_ENV,
                    **NO_REPLACE_ENV)
-        _git(top, "read-tree", commit, env=env)
+        _git(top, "read-tree", commit, env=env, deadline=deadline)
         for rel, content in files.items():
-            blob = _git(top, "hash-object", "-w", "--stdin", env=env, input=content)
+            blob = _git(top, "hash-object", "-w", "--stdin", env=env, input=content,
+                        deadline=deadline)
             _git(top, "update-index", "--add", "--cacheinfo",
-                 "100644,%s,%s" % (blob, rel), env=env)
-        tree = _git(top, "write-tree", env=env)
+                 "100644,%s,%s" % (blob, rel), env=env, deadline=deadline)
+        tree = _git(top, "write-tree", env=env, deadline=deadline)
     env = dict(os.environ, GIT_AUTHOR_DATE="@0 +0000", GIT_COMMITTER_DATE="@0 +0000",
                **SNAP_ENV)
-    return _git(top, "commit-tree", tree, "-m", "ameesh offload snapshot", env=env)
+    return _git(top, "commit-tree", tree, "-m", "ameesh offload snapshot", env=env,
+                deadline=deadline)
 
 
-def known_locally(top: str, shas: list[str]) -> list[str]:
+def known_locally(top: str, shas: list[str], *,
+                  deadline: float | None = None) -> list[str]:
     """The commits of `shas` this repository has (earlier snapshots stay as
     loose objects until git prunes them)."""
     if not shas:
         return []
-    res = subprocess.run(["git", "-C", top, "cat-file", "--batch-check=%(objectname) %(objecttype)"],
-                         input="\n".join(shas) + "\n", capture_output=True, text=True)
+    left = _left(deadline)
+    if left is not None and left <= 0:
+        raise ClientTimeout("client wait budget exhausted before the snapshot pack")
+    try:
+        res = subprocess.run(["git", "-C", top, "cat-file",
+                              "--batch-check=%(objectname) %(objecttype)"],
+                             input="\n".join(shas) + "\n", capture_output=True,
+                             text=True, timeout=left)
+    except subprocess.TimeoutExpired:
+        raise ClientTimeout("client wait budget exhausted during the snapshot pack") \
+            from None
     return [line.split()[0] for line in res.stdout.splitlines()
             if line.endswith(" commit")]
 
@@ -183,24 +240,34 @@ class Remote:
             raise OffloadError("%s: `%s` got no answer within %ds"
                                % (self.host, words[0], int(timeout))) from None
 
-    def cancel(self, job: str) -> None:
+    def cancel(self, job: str, *, timeout: float = CALL_TIMEOUT_S) -> None:
         """Asks the VM to cancel `job`, once; never raises."""
         try:
-            self.call("cancel", job)
+            self.call("cancel", job, timeout=timeout)
         except OffloadError as exc:
             _note(str(exc))
 
 
-def push(remote: Remote, top: str, repo: str, snap: str) -> None:
+def push(remote: Remote, top: str, repo: str, snap: str, *,
+         deadline: float | None = None) -> None:
     # the VM lists its recent snapshots: the pack leaves out what they hold
-    res = remote.call("put", repo, "--have", input=b"")
+    try:
+        res = remote.call("put", repo, "--have", input=b"",
+                          timeout=_bounded(CALL_TIMEOUT_S, deadline))
+    except ClientTimeout:
+        raise
+    except OffloadError as exc:
+        if deadline is not None and (_left(deadline) or 0.0) <= 0:
+            raise ClientTimeout("client wait budget exhausted during the "
+                                "snapshot push") from exc
+        raise
     if res.returncode != 0:
         raise OffloadError("VM unreachable or refused (put --have, exit %d): %s"
                            % (res.returncode, res.stderr.decode(errors="replace").strip()))
     present = res.stdout.decode().split()
     if snap in present:
         return
-    bases = known_locally(top, present)
+    bases = known_locally(top, present, deadline=deadline)
     revs = snap + "\n" + "".join("^%s\n" % sha for sha in bases)
     # --shallow: the bases share no history with the snapshot, so git must
     # treat every one of them as an edge to leave out the objects they hold
@@ -211,9 +278,16 @@ def push(remote: Remote, top: str, repo: str, snap: str) -> None:
                                               pack.stdin.close()))
     writer.start()
     try:
-        sent = remote.call("put", repo, snap, stdin=pack.stdout, timeout=PUT_TIMEOUT_S)
-    except OffloadError:
+        sent = remote.call("put", repo, snap, stdin=pack.stdout,
+                           timeout=_bounded(PUT_TIMEOUT_S, deadline))
+    except ClientTimeout:
         pack.kill()
+        raise
+    except OffloadError as exc:
+        pack.kill()
+        if deadline is not None and (_left(deadline) or 0.0) <= 0:
+            raise ClientTimeout("client wait budget exhausted during the "
+                                "snapshot upload") from exc
         raise
     pack.stdout.close()
     writer.join()
@@ -224,10 +298,18 @@ def push(remote: Remote, top: str, repo: str, snap: str) -> None:
                            % (sent.returncode, sent.stderr.decode(errors="replace").strip()))
 
 
-def run_remote(remote: Remote, words: list[str]) -> tuple[int, dict | None, str | None]:
+def run_remote(remote: Remote, words: list[str], *,
+               deadline: float | None = None,
+               wait_budget: float = 0.0) -> tuple[int, dict | None, str | None]:
     """Runs `run …` on the VM: stdout passes through, stderr too except the
     protocol lines. Returns (ssh exit code, result object or None, job id
-    or None)."""
+    or None).
+
+    `deadline` is the client's monotonic budget, started before the snapshot
+    push (slot, transport): at the deadline the job is cancelled on the VM,
+    the session is closed, and a `timeout` result is returned when none
+    arrived. `wait_budget` only labels that budget in the note.
+    """
     # the command's stderr shares the stream: only lines tagged with the
     # session's nonce are protocol, a look-alike printed by the command is
     # relayed as output and never taken for a result. The VM shell draws the
@@ -237,7 +319,7 @@ def run_remote(remote: Remote, words: list[str]) -> tuple[int, dict | None, str 
     # is no result either
     proc = subprocess.Popen(remote.argv(*words),
                             stdin=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    state: dict = {"job": None, "result": None}
+    state: dict = {"job": None, "result": None, "timed_out": False}
 
     def relay() -> None:
         tag = nonce = None
@@ -298,6 +380,16 @@ def run_remote(remote: Remote, words: list[str]) -> tuple[int, dict | None, str 
                     _note("the session to %s did not end after the result: closed"
                           % remote.host)
                     return finish(0)
+            if deadline is not None and time.monotonic() >= deadline:
+                state["timed_out"] = True
+                if state["job"]:
+                    _note("no result within %ds: cancelling job %s"
+                          % (int(wait_budget), state["job"]))
+                    # le nettoyage garde son propre budget, sous le nôtre
+                    remote.cancel(state["job"],
+                                  timeout=min(CALL_TIMEOUT_S, max(1.0, wait_budget)))
+                proc.send_signal(signal.SIGTERM)
+                return finish(RESULT_GRACE_S)
 
     try:
         rc = wait()
@@ -310,7 +402,14 @@ def run_remote(remote: Remote, words: list[str]) -> tuple[int, dict | None, str 
         reader.join(timeout=5)
         return rc, state["result"] or {"outcome": "cancelled", "job": state["job"]}, state["job"]
     reader.join(timeout=5)
-    return rc, state["result"], state["job"]
+    result = state["result"]
+    if state["timed_out"]:
+        # a result that arrives after our own wait deadline is the guest's
+        # reaction to the cancel we just sent: the client's bound expired, so
+        # it is a timeout, not a green run that outlived its budget.
+        result = {"outcome": "timeout", "job": state["job"],
+                  "reason": "no result within %ds; job cancelled" % int(wait_budget)}
+    return rc, result, state["job"]
 
 
 def run_local(argv: list[str]) -> int:
@@ -336,19 +435,24 @@ def cmd_run(opts: dict, argv: list[str]) -> int:
 
     if not host:
         return fall_back("no AMEESH_OFFLOAD_HOST")
+    deadline = (time.monotonic() + opts["wait_timeout"]
+                if opts["wait_timeout"] > 0 else None)
     try:
-        top = _git(os.getcwd(), "rev-parse", "--show-toplevel")
+        top = _git(os.getcwd(), "rev-parse", "--show-toplevel", deadline=deadline)
         rel = os.path.relpath(os.getcwd(), top)
         repo = opts["repo"] or repo_name(top)
         if opts.get("snapshot"):
             # contenu figé par l'appelant : il doit exister ici, et c'est lui
             # qui part — pas une photographie de l'arbre de travail
             snap = opts["snapshot"]
-            _git(top, "cat-file", "-e", "%s^{commit}" % snap)
+            _git(top, "cat-file", "-e", "%s^{commit}" % snap, deadline=deadline)
         else:
-            snap = snapshot(top)
+            snap = snapshot(top, deadline=deadline)
         remote = Remote(host)
-        push(remote, top, repo, snap)
+        push(remote, top, repo, snap, deadline=deadline)
+    except (ClientTimeout, SnapshotTimeout) as exc:
+        _note("%s; no local rerun" % exc)
+        return 124
     except OffloadError as exc:
         return fall_back(str(exc))
     words = ["run", repo, snap, "--profile", opts["profile"], "--cwd", rel]
@@ -356,7 +460,9 @@ def cmd_run(opts: dict, argv: list[str]) -> int:
         words += ["--timeout", str(opts["timeout"])]
     for item in opts["env"]:
         words += ["--env", item]
-    rc, result, job = run_remote(remote, words + ["--"] + argv)
+    rc, result, job = run_remote(remote, words + ["--"] + argv,
+                                 deadline=deadline,
+                                 wait_budget=opts["wait_timeout"])
     if result is None:
         # no result line: the connection broke (ssh 255) or the shell is not
         # ours. The suite may still run there: never rerun it here as well
@@ -404,7 +510,8 @@ def cmd_cancel(host: str, args: list[str]) -> int:
 
 def parse(args: list[str]) -> tuple[dict, list[str]]:
     opts = {"host": os.environ.get("AMEESH_OFFLOAD_HOST", ""), "profile": "default",
-            "repo": "", "timeout": 0, "env": [], "fallback": "local", "snapshot": ""}
+            "repo": "", "timeout": 0, "wait_timeout": 0, "env": [],
+            "fallback": "local", "snapshot": ""}
     rest: list[str] = []
     i = 0
     while i < len(args):
@@ -412,7 +519,8 @@ def parse(args: list[str]) -> tuple[dict, list[str]]:
         if arg == "--":
             return opts, rest + args[i + 1:]
         key = arg[2:] if arg.startswith("--") else None
-        if key in ("host", "profile", "repo", "timeout", "env", "fallback", "snapshot"):
+        if key in ("host", "profile", "repo", "timeout", "wait-timeout", "env",
+                   "fallback", "snapshot"):
             if i + 1 >= len(args):
                 raise ValueError("%s needs a value" % arg)
             val = args[i + 1]
@@ -420,6 +528,8 @@ def parse(args: list[str]) -> tuple[dict, list[str]]:
                 opts["env"].append(val)
             elif key == "timeout":
                 opts["timeout"] = int(val)
+            elif key == "wait-timeout":
+                opts["wait_timeout"] = max(0, int(val))
             elif key == "fallback" and val not in ("local", "none"):
                 raise ValueError("--fallback local|none")
             else:
