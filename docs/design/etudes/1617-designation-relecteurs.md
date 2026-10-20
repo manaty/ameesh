@@ -67,14 +67,17 @@ behind. The declared `pace_multiplier`/`pace_ceiling` are deliberately not
 read: with the real ×10 (Claude) and ×3 (Codex) profiles, Claude looked 20
 points behind and Codex 21.8, designating Codex — the inverse of the witness.
 The same raw scale applies to every family (B of mesh-design on 4123b99,
-19/10/2026).
+19/10/2026). The plan horizon is the longest applicable window (the weekly
+`seven_day` in practice): a short `five_hour` burst is a capacity signal, not
+the weekly plan, and does not enter the advance (#2675).
 
 When several families are eligible for one opinion, the selection prefers the
 family furthest behind; the agent load only breaks a tie. A family's value is
-its most constrained current account (a fresh sibling does not hide a plan
-that is ahead). A **model-scoped** bucket (`seven_day@fable`) is kept with its
-scope: it counts only for a candidate whose model contains that scope
-(`fable` in `fable` or `claude-fable`, the rule of `accounts.model_scoped`),
+its most constrained current account on that horizon (a fresh sibling does not
+hide a plan that is ahead). A **model-scoped** bucket (`seven_day@fable`) is
+kept with its scope: it counts only for a candidate whose model contains that
+scope (`fable` in `fable` or `claude-fable`, the rule of
+`accounts.model_scoped`),
 added to the general windows; a reviewer of another model, or of an unknown
 model, sees the general windows only. A family with only scoped readings is
 neutral for them, never contaminated by a bucket that applies to one model.
@@ -327,18 +330,20 @@ session directory, and a sibling of another project is refused; a policy that
 arrives later is retried on the same freeze (the runner call included); the CLI
 freeze (light explanation included) and the recovery command.
 
-`tests/test_2668_designation_pace.py` — 18 targeted tests, without a database:
+`tests/test_2668_designation_pace.py` — 19 targeted tests, without a database:
 the raw plan advance with the critical reserve (Codex 16 points ahead when
-19 % of the week is elapsed, multiplier 1 and default ceiling), a stale
-reading neutral (#1561), the family's most constrained account, the anonymous
-readings dropped when named accounts exist, a model-scoped `seven_day@fable`
-bucket that counts for a Fable candidate and not for an Opus one (a
-scoped-only family is neutral for another model), the family reduction by
-applicable pace before load (a less-loaded Fable agent does not hide a
-further-behind Opus one), a stale scope kept as `None` (neutral, not rescued
-by the account's general reading) — the two cx3 B/P1 cases — one opinion
-preferring the family behind even when its agent is more loaded, two opinions
-keeping two distinct families, and the load rule when no reading is current.
+19 % of the week is elapsed, multiplier 1 and default ceiling), a 5 h burst
+that does not override the weekly plan (#2675), a stale reading neutral
+(#1561), the family's most constrained account on the plan horizon, the
+anonymous readings dropped when named accounts exist, a model-scoped
+`seven_day@fable` bucket that counts for a Fable candidate and not for an
+Opus one (a scoped-only family is neutral for another model), the family
+reduction by applicable pace before load (a less-loaded Fable agent does not
+hide a further-behind Opus one), a stale scope kept as `None` (neutral, not
+rescued by the account's general reading) — the two cx3 B/P1 cases — one
+opinion preferring the family behind even when its agent is more loaded, two
+opinions keeping two distinct families, and the load rule when no reading is
+current.
 One integration test in the activation file adds a current Claude/Codex gauge
 pair, declared ×10/×3 profiles and a Fable-only bucket, checks that the raw
 pace still designates Claude on a real freeze, then removes the readings and

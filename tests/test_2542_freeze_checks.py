@@ -267,6 +267,49 @@ class CliTest(PgTestCase):
     def frozen(self) -> list:
         return [m for m in work.milestones(self.db, self.lot) if m["kind"] == "frozen"]
 
+    def test_symbolic_refs_refused_even_when_checks_skipped(self):
+        self.repo.commit(script=GREEN)
+        for ref in ("HEAD", "main", "HEAD~0", "refs/heads/main", ""):
+            with self.subTest(ref=ref):
+                proc = self.freeze(ref, "--no-static-checks", "incident")
+                self.assertEqual(proc.returncode, 1, proc.stdout)
+                self.assertIn("head-missing", proc.stderr)
+                self.assertEqual(self.frozen(), [])
+
+    def test_abbreviation_is_stored_as_full_commit(self):
+        sha = self.repo.commit(script=GREEN)
+        proc = self.freeze(sha[:12].upper())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual([m["sha"] for m in self.frozen()], [sha])
+
+    def test_short_and_unknown_abbreviations_refused(self):
+        sha = self.repo.commit(script=GREEN)
+        for ref, cause in ((sha[:7], "head-missing"),
+                           ("deadbeefdead", "head-unresolved")):
+            with self.subTest(ref=ref):
+                proc = self.freeze(ref)
+                self.assertEqual(proc.returncode, 1, proc.stdout)
+                self.assertIn(cause, proc.stderr)
+                self.assertEqual(self.frozen(), [])
+
+    def test_direct_api_refuses_symbolic_ref_before_hook(self):
+        self.repo.commit(script=GREEN)
+        hook = mock.Mock()
+        with self.assertRaisesRegex(work.WorkError, "head-missing"):
+            work.milestone(self.db, self.lot, "frozen", sha="HEAD",
+                           repo=self.repo.root, on_frozen=hook)
+        hook.assert_not_called()
+        self.assertEqual(self.frozen(), [])
+
+    def test_direct_api_expands_abbreviation_before_hook(self):
+        sha = self.repo.commit(script=GREEN)
+        seen = []
+        work.milestone(self.db, self.lot, "frozen", sha=sha[:12],
+                       repo=self.repo.root,
+                       on_frozen=lambda tx, milestone, threads: seen.append(milestone["sha"]))
+        self.assertEqual(seen, [sha])
+        self.assertEqual([m["sha"] for m in self.frozen()], [sha])
+
     def test_rouge_refuse_le_gel_sans_jalon(self):
         proc = self.freeze(self.repo.commit(script=RED))
         self.assertEqual(proc.returncode, 1, proc.stdout)

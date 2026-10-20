@@ -46,6 +46,8 @@ READING_COLUMNS = (
     "volumes, "
     # L159e6 (0361): the guard's last restart, decoded by `_reading`
     "guard_restart::text AS guard_restart, "
+    # #2814 (0469): the executor's own cgroup measure, decoded by `_reading`
+    "cgroup::text AS cgroup, "
     # L159f (0069): host gate the executor obeys
     "ameesh_host_gate_state(host, gate_state) AS gate_state, gate_seq, gate_reason, "
     # #2022 (0455): processes and zombies, of the host and of the runner
@@ -80,6 +82,17 @@ def _reading(row: dict) -> dict:
     # L159e6 (0361): `guard_restart` read as text (whatever the driver)
     if isinstance(row.get("guard_restart"), str):
         row["guard_restart"] = json.loads(row["guard_restart"])
+    # #2814 (0469): the cgroup measure as a mapping, {} before the migration.
+    # Une lecture étroite (#2851, disk_history) qui ne sélectionne pas la
+    # colonne ne doit pas gagner la clé : on ne normalise que si elle est là.
+    if "cgroup" in row:
+        cgroup = row.get("cgroup")
+        if isinstance(cgroup, str):
+            try:
+                cgroup = json.loads(cgroup)
+            except ValueError:
+                cgroup = None
+        row["cgroup"] = cgroup if isinstance(cgroup, dict) else {}
     return row
 
 
@@ -170,9 +183,10 @@ class Hosts(interface.HostResources):
                 (host, mem_available_bytes, swap_used_bytes, load1, cpu_count,
                  disk_free_bytes, disk_path, turns_in_progress,
                  tmp_path, tmp_fstype, tmp_size_bytes, tmp_used_bytes,
-                 on_ac, battery_percent, volumes, guard_restart, """ + ", ".join(MEASURE_COLUMNS) + """)
+                 on_ac, battery_percent, volumes, guard_restart, cgroup, """
+            + ", ".join(MEASURE_COLUMNS) + """)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb,
-                    %s::jsonb, """
+                    %s::jsonb, %s::jsonb, """
             + ", ".join(["%s"] * len(MEASURE_COLUMNS)) + """)
             RETURNING """ + READING_COLUMNS,
             (reading.get("host") or "", reading.get("mem_available_bytes"),
@@ -185,6 +199,7 @@ class Hosts(interface.HostResources):
              _volumes_param(reading.get("volumes")),
              None if reading.get("guard_restart") is None
              else json.dumps(reading["guard_restart"]),
+             json.dumps(reading.get("cgroup") or {}, ensure_ascii=False),
              *(reading.get(column) for column in MEASURE_COLUMNS)),
         )
         # Historique court : au-delà de sept jours, la ligne n'a plus d'usage
@@ -253,13 +268,45 @@ class Hosts(interface.HostResources):
             " AND sampled_at >= now() - make_interval(secs => %s)"
             " ORDER BY sampled_at, id", (host, float(since_s)))]
 
-    def disk_history(self, host, since_s) -> list[dict]:
-        """#2851 : la tendance disque ne lit que ses quatre champs."""
+    def disk_history(self, host, since_s, step_s) -> list[dict]:
+        """#2879 : un point par tranche de `step_s`, champs de tendance seuls.
+
+        La fenêtre de 6 h compte ~4 800 relevés par hôte (un toutes les 4 s)
+        et ~3,3 Mo de `volumes` jsonb ; sur le lien dégradé de pc-smichea
+        (30 KiB/s), ce transfert prenait 53-63 s par hôte, pour une requête
+        serveur à ~0,1 s. Le sous-échantillonnage se fait donc en base — le
+        DERNIER relevé de chaque tranche, pour que le point le plus récent
+        reste frais — et chaque volume n'est rendu que par les champs de la
+        tendance (`path`, `paths`, `disk_free_bytes`) : quelques Ko par hôte.
+        """
         return [_reading(row) for row in self.db.query(
-            "SELECT id, extract(epoch from sampled_at)::float8 AS sampled_ts,"
-            " volumes, disk_path, disk_free_bytes FROM host_resources"
-            " WHERE host = %s AND sampled_at >= now() - make_interval(secs => %s)"
-            " ORDER BY sampled_at, id", (host, float(since_s)))]
+            """
+            WITH picked AS (
+                SELECT DISTINCT ON (bucket)
+                       id, sampled_at, volumes, disk_path, disk_free_bytes
+                  FROM (
+                      SELECT id, sampled_at, volumes, disk_path, disk_free_bytes,
+                             floor(extract(epoch FROM sampled_at)::float8
+                                   / %s::float8)::bigint AS bucket
+                        FROM host_resources
+                       WHERE host = %s
+                         AND sampled_at >= now() - make_interval(secs => %s)
+                  ) AS dense
+                 ORDER BY bucket, sampled_at DESC, id DESC
+            )
+            SELECT id,
+                   extract(epoch FROM sampled_at)::float8 AS sampled_ts,
+                   coalesce((SELECT jsonb_agg(jsonb_build_object(
+                                 'path', v->'path',
+                                 'paths', v->'paths',
+                                 'disk_free_bytes', v->'disk_free_bytes') ORDER BY ord)
+                               FROM jsonb_array_elements(picked.volumes)
+                                    WITH ORDINALITY AS t(v, ord)),
+                            '[]'::jsonb) AS volumes,
+                   disk_path, disk_free_bytes
+              FROM picked
+             ORDER BY sampled_at, id
+            """, (float(step_s), host, float(since_s)))]
 
     def record_harness_version(self, host, harness, *, path, version, raw) -> None:
         self.db.execute(

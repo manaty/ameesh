@@ -1693,6 +1693,13 @@ class WorkItems(Domain):
         """L118 : les lots ouverts d'un assigné."""
 
     @abc.abstractmethod
+    def held_by(self, agents: Sequence[str]) -> dict[str, dict]:
+        """#2877 : ce que ces agents tiennent encore, en une lecture sans
+        verrou : par assigné, ``open`` (un lot ni fusionné, ni promu, ni fermé)
+        et ``promoted`` (un lot promu) ; un agent qui ne tient rien est absent.
+        Sert à ne verrouiller (``release_agent``) que s'il y a un lot à rendre."""
+
+    @abc.abstractmethod
     def release_agent(self, agent: str, *, reason: str, actor: str,
                       measure_actor: str = "", measure_reason: str = "",
                       dry_run: bool = False,
@@ -3563,11 +3570,13 @@ class HostResources(Domain):
         oldest first (the pilot report)."""
 
     @abc.abstractmethod
-    def disk_history(self, host: str, since_s: float) -> list[dict]:
-        """#2851: the disk fields of the host's readings over the last
-        `since_s` seconds, oldest first (`id`, `sampled_ts`, `volumes`,
-        `disk_path`, `disk_free_bytes` only) — the disk trend does not pay for
-        the ~50 columns of `since` on thousands of readings."""
+    def disk_history(self, host: str, since_s: float, step_s: float) -> list[dict]:
+        """#2879: the disk fields of the host's readings over the last
+        `since_s` seconds, one reading per `step_s` bucket at most, oldest
+        first (`id`, `sampled_ts`, `volumes`, `disk_path`, `disk_free_bytes`
+        only) — the disk trend does not pay for the ~50 columns of `since`,
+        nor for every reading of a dense history. Each `volumes` entry is
+        reduced to its trend fields (`path`, `paths`, `disk_free_bytes`)."""
 
     @abc.abstractmethod
     def record_harness_version(self, host: str, harness: str, *, path: str | None,
@@ -4220,6 +4229,35 @@ class PrevalidationReports(Domain):
 # le stockage d'une connexion
 # --------------------------------------------------------------------------
 
+class GithubWatch(Domain):
+    """#2845: transactional GitHub intake; notifier host only."""
+
+    @abc.abstractmethod
+    def cursor(self, project: str, repo: str) -> float | None:
+        """Last completed scan, absent before bootstrap."""
+
+    @abc.abstractmethod
+    def lock(self, project: str, repo: str, initial: float) -> float:
+        """Create and lock the cursor until commit; return its timestamp."""
+
+    @abc.abstractmethod
+    def remember(self, project: str, repo: str, kind: str, object_id: int,
+                 digest: str) -> bool:
+        """True only for a new object version. Caller holds the cursor lock."""
+
+    @abc.abstractmethod
+    def advance(self, project: str, repo: str, until: float) -> None:
+        """Advance after every mailbox deposit succeeded, never backwards."""
+
+    @abc.abstractmethod
+    def scan(self, project: str, repo: str) -> dict | None:
+        """Incomplete scan window and next page, absent when the scan is complete."""
+
+    @abc.abstractmethod
+    def checkpoint(self, project: str, repo: str, progress: dict | None) -> None:
+        """Persist or clear partial progress atomically with mailbox delivery."""
+
+
 class Storage(abc.ABC):
     """Les domaines du stockage, liés à une connexion ou une transaction."""
 
@@ -4242,6 +4280,7 @@ class Storage(abc.ABC):
     watches: Watches
     events: Events
     mailbox: Mailbox
+    github_watch: GithubWatch
     wakeups: Wakeups
     keys: Keys
     approvals: Approvals

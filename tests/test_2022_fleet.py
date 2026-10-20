@@ -84,14 +84,21 @@ class FleetCommandTest(unittest.TestCase):
     def run_fleet(self, readings, *, json_out=False, send=None, code=0, err=None, canons=()):
         store = mock.MagicMock()
         store.hosts.current.return_value = readings
-        store.hosts.since.return_value = []
+        # #2879 : la flotte ne lit que les champs de la tendance, et
+        # sous-échantillonnés en base ; une lecture large serait un retour.
+        store.hosts.disk_history.return_value = []
+        store.hosts.since.side_effect = AssertionError("lecture large de l'historique")
         args = argparse.Namespace(host=None, json=json_out, send=send)
         out = _OwnThreadOutput()
         with mock.patch.object(storage, "of", return_value=store), \
                 mock.patch.object(mesh_cli.time, "time", return_value=10_000.0), \
                 contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(err or io.StringIO()):
-            self.assertEqual(mesh_cli._host_fleet("db", canons, args), code)
+            # #2825 N4: the fleet resolves each host's scope from its own
+            # reading; the local config names the host whose own detection
+            # may fill in when it has no reading.
+            self.assertEqual(mesh_cli._host_fleet(config_mod.Config(), "db",
+                                                  canons, args), code)
         return out.getvalue()
 
     def test_canon_host_without_retained_reading_stays_visible(self):

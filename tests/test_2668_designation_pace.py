@@ -54,6 +54,20 @@ class FamilyAdvanceTest(unittest.TestCase):
         self.assertAlmostEqual(advances["codex"][""], 0.16, places=6)
         self.assertAlmostEqual(advances["claude"][""], 0.0, places=6)
 
+    def test_a_five_hour_burst_does_not_override_the_weekly_plan(self):
+        # #2675: the plan advance is read on the longest window; a 5 h burst
+        # is a capacity signal, not the weekly gap the designation balances.
+        # Codex's weekly plan is 20 points behind while its 5 h window is 85
+        # points ahead: the former max() read +0.85 and flipped the family.
+        advances = review_pace.family_advances(
+            [gauge("codex", "secondaire", 0.20, 0.40),
+             gauge("codex", "secondaire", 0.95, 0.10, key="five_hour",
+                   window=5 * 3600),
+             gauge("claude", "secondaire", 0.60, 0.60)],
+            now=NOW)
+        self.assertAlmostEqual(advances["codex"][""], -0.20, places=6)
+        self.assertAlmostEqual(advances["claude"][""], 0.0, places=6)
+
     def test_a_model_scoped_bucket_does_not_contaminate_another_model(self):
         # cx3 B/P1: seven_day@fable at 95 % is a Fable-only bucket; it must
         # not make Claude look ahead for a reviewer of another model. The
@@ -267,10 +281,11 @@ class _Port:
         return None
 
     def commit(self, lot, *, freeze, required, state, reviewers, missing, why,
-               authors, policy_ref="", notify="", messages=()):
+               authors, policy_ref="", notify="", messages=(), unknown_authors=()):
         out = {"state": state, "required": required,
                "reviewers": [dict(r) for r in reviewers], "missing": missing,
                "why": why, "freeze": dict(freeze), "authors": [dict(a) for a in authors],
+               "unknown_authors": [str(value) for value in unknown_authors],
                "messages": [dict(m) for m in messages]}
         self.commits.append(out)
         return out

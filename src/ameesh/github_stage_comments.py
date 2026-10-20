@@ -3,7 +3,14 @@
 
 Only explicitly public status lines are read from free-form notes.
 The remote marker is the receipt: a crash after POST is reconciled next pass.
-The designated GitHub projection host remains the single writer (L126).
+The designated GitHub projection host remains the single writer (L126), so
+the local checkpoint needs no lock: its atomic write never exposes a partial
+file, and a lost update replays from the remote markers. The checkpoint is a
+cache, never the authority (#2854): a receipt entry that is malformed, of an
+unknown format or manually cleared is reset and replayed from the thread. A
+comment deleted by hand is repaired by removing its key from ``seen`` (or the
+whole ticket entry on an open thread) and rerunning the projection; markers
+already present are re-read and only missing comments are posted.
 """
 from __future__ import annotations
 
@@ -11,10 +18,26 @@ import datetime as dt
 import json
 from pathlib import Path
 import re
+import time
 
 MARKER = "<!-- ameesh:work-stage:v1 lot=%d event=%s -->"
 PUBLIC_STATUS = re.compile(r"(?im)^Public status:[ \t]*(\S[^\r\n]*)$")
 WAIT_DETAIL = "The team will specify the required decision or information on this ticket."
+#: Root version of the local receipt cache (#2854). A file without it is the
+#: legacy v0 map and is upgraded on its next save; an unknown version is left
+#: untouched so an older binary never clobbers a newer format.
+CHECKPOINT_SCHEMA = "ameesh/github-stage-comments/1"
+SCHEMA_KEY = "schema"
+_MISSING = object()
+
+
+def _saved_entry(value):
+    """Return a usable receipt entry, or None when it must replay (#2854)."""
+    if (isinstance(value, dict) and isinstance(value.get("enrolled"), bool)
+            and isinstance(value.get("seen"), list)
+            and all(isinstance(key, str) for key in value["seen"])):
+        return value
+    return None
 
 
 def _waiting(state, detail=WAIT_DETAIL):
@@ -68,8 +91,21 @@ def release_receipts(cfg, project):
             # actif's --lot values are strings; cutoff's included values are ints.
             if ((isinstance(lot, int) and not isinstance(lot, bool) and lot > 0)
                     or (isinstance(lot, str) and re.fullmatch(r"[1-9][0-9]*", lot))):
-                receipts.setdefault(int(lot), []).append((version, day))
+                receipts.setdefault(int(lot), []).append(
+                    (version, day, float(report.get("completed_at"))))
     return receipts
+
+
+def _current_receipts(receipts, since):
+    """#2874: one delivery per lot, and only for releases cut after `since`.
+
+    Releases completed before the stage comments were switched on are history:
+    replaying them posted a "Delivered in release X" for every past release on
+    every mirror. A lot listed by several reports keeps its earliest release.
+    """
+    kept = [r for r in receipts if len(r) < 3 or r[2] >= since]
+    kept.sort(key=lambda r: r[2] if len(r) > 2 else 0.0)
+    return [tuple(kept[0][:2])] if kept else []
 
 
 def stages(item, milestones, events, *, receipts=(), closing=None):
@@ -121,7 +157,7 @@ def stages(item, milestones, events, *, receipts=(), closing=None):
 def project(db, st, gh_repo, report, mine, *, guard, refused, project, closings):
     from . import plan_github
 
-    receipts = release_receipts(getattr(db, "cfg", None), project)
+    raw_receipts = release_receipts(getattr(db, "cfg", None), project)
     # Single writer, as for the issue projection. Local receipts avoid re-reading
     # completed threads; remote markers still reconcile a POST with a lost ack.
     folder = getattr(getattr(db, "cfg", None), "state_dir", None)
@@ -130,15 +166,31 @@ def project(db, st, gh_repo, report, mine, *, guard, refused, project, closings)
         checkpoint = json.loads(path.read_text(encoding="utf-8")) if path and path.exists() else {}
         if not isinstance(checkpoint, dict):
             raise ValueError("invalid stage-comment checkpoint")
+        version = checkpoint.get(SCHEMA_KEY)
+        if version is not None and version != CHECKPOINT_SCHEMA:
+            # Never rewrite a format a newer binary may own (#2854).
+            raise ValueError("unsupported stage-comment checkpoint schema %r" % (version,))
     except (OSError, ValueError) as exc:
         report["errors"].append({"action": "stage-checkpoint", "detail": str(exc)})
         return
 
+    # #2874: the first real pass fixes the start of the public timeline.
+    since = checkpoint.get("_since")
+    if not isinstance(since, (int, float)):
+        since = time.time()
+
     def save():
         if path and not gh_repo.dry_run:
             path.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint[SCHEMA_KEY] = CHECKPOINT_SCHEMA
             plan_github._atomic_write(str(path), checkpoint)
 
+    if not gh_repo.dry_run and "_since" not in checkpoint:
+        checkpoint["_since"] = since
+        save()      # the cutoff must survive a pass that posts nothing
+
+    receipts = {lot: kept for lot, rows in raw_receipts.items()
+                if (kept := _current_receipts(rows, since))}
     entries = {row["work_item"]: row for row in report["issues"]}
     for item, issue in mine:
         lot = int(item["id"])
@@ -151,7 +203,24 @@ def project(db, st, gh_repo, report, mine, *, guard, refused, project, closings)
         # the request's origin; it need not point at the projected issue.
         try:
             ticket = "%s#%s/lot-%s" % (gh_repo.repo, number, lot)
-            saved = checkpoint.get(ticket, {"enrolled": False, "seen": []})
+            saved = checkpoint.get(ticket, _MISSING)
+            usable = _saved_entry(saved) if saved is not _MISSING else None
+            if saved is _MISSING:
+                saved = {"enrolled": False, "seen": []}
+            elif usable is not None:
+                saved = usable
+            else:
+                # The cache is not the authority: an unreadable entry replays
+                # from the remote markers below, so a deleted comment can be
+                # re-posted without duplicating the ones still present.
+                report["errors"].append({
+                    "work_item": lot, "number": number, "action": "stage-checkpoint",
+                    "detail": "invalid receipt entry reset; replaying from remote markers"})
+                saved = {"enrolled": False, "seen": []}
+                checkpoint[ticket] = saved
+                # Persist the reset even for a closed thread that will not
+                # replay, so the anomaly is reported once, not every pass.
+                save()
             # `issue` is the snapshot BEFORE project_lots applies a closure.
             # Enroll open/new mirrors, never backfill an already closed thread.
             if issue is None or (issue.get("state") or "").lower() == "open":
@@ -179,12 +248,21 @@ def project(db, st, gh_repo, report, mine, *, guard, refused, project, closings)
                 checkpoint[ticket] = saved
                 save()
             candidates = [(key, text) for key, text in candidates if key not in saved["seen"]]
+            if any(key.startswith("delivered-") for key in saved["seen"]):
+                candidates = [(key, text) for key, text in candidates
+                              if not key.startswith("delivered-")]
             if not candidates:
                 continue
             existing = "\n".join(row.get("body") or "" for row in gh_repo.comments(number))
             seen = set()
             for key, text in candidates:
                 marker = MARKER % (lot, key)
+                if key.startswith("delivered-") and (
+                        "<!-- ameesh:work-stage:v1 lot=%d event=delivered-" % lot) in existing:
+                    # A late/reconciled report can change the earliest receipt.
+                    # An existing delivery still closes this lot's timeline.
+                    saved["seen"].append(key)
+                    continue
                 if marker in existing:
                     if key not in saved["seen"]:
                         saved["seen"].append(key)

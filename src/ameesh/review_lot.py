@@ -1272,6 +1272,8 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
             # ne classe pas ses lots sur le diff du paquet, et une cible
             # locale périmée n'élargit pas le diff à l'historique entre les
             # deux ; l'intervalle de la fusion reste le repli (#2374).
+            # UnprovenLotDiff (#2823) interrompt aussi ce repli et l'essai
+            # du gel seul : le paquet ne prouve pas le delta du lot.
             rng = lot_measures.lot_diff_range(where, tip, target or None,
                                               frozen=frozen or None)
             if rng is None:
@@ -1362,6 +1364,10 @@ def open_for_merge(db, lot: int, *, merged_sha: str = "", pr=None,
         out["class"] = klass.get("class") or ""
         out["merged_class"] = out["class"]
         out["doubt"] = bool(klass.get("doubt"))
+        if out["doubt"]:
+            # #2823 : garder la cause, sans annoncer une classe confirmée.
+            out["why"] = klass.get("why") or "classe après fusion incertaine"
+            return out
         opened = open_after_merge(
             db, lot=lot, klass=klass, item=item, merged_sha=merged_sha, pr=pr,
             target=where_target, actor=actor, repo=repo)

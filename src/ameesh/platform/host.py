@@ -343,6 +343,14 @@ def pressure(resource: str, base: str | None = None) -> dict:
     return parse_pressure(_read(os.path.join(base or PSI_DIR, resource)) or "")
 
 
+def cgroup_pressure(resource: str, path: str | None = None) -> dict:
+    """PSI of a cgroup v2 (`<path>/<resource>.pressure`), parsed; {} when
+    unreadable. The files are named `cpu.pressure`, `memory.pressure` and
+    `io.pressure`, unlike /proc/pressure's `cpu`, `memory`, `io`."""
+    text = _read(os.path.join(path, resource + ".pressure")) if path else None
+    return parse_pressure(text or "")
+
+
 def cpu_busy_seconds(stat: str | None = None) -> float | None:
     """Busy CPU time of the host since boot (line `cpu` of /proc/stat), in
     seconds: everything but `idle` and `iowait`; `guest` and `guest_nice`
@@ -382,6 +390,51 @@ def cgroup_cpu_seconds(path: str) -> float | None:
 def cgroup_memory_bytes(path: str) -> int | None:
     """Memory charged to a cgroup (`memory.current`), in bytes."""
     number = _float(_read(os.path.join(path, "memory.current")))
+    return None if number is None else int(number)
+
+
+def cgroup_cpu_max(path: str | None) -> tuple[float | None, float | None]:
+    """`(quota_us, period_us)` from a cgroup's `cpu.max`; quota is None for
+    `max` (no limit) and both are None when unreadable. The quota is a
+    microsecond budget per period, not a number of CPUs."""
+    text = _read(os.path.join(path, "cpu.max")) if path else None
+    if not text:
+        return None, None
+    fields = text.split()
+    if len(fields) != 2:
+        return None, None
+    period = _float(fields[1])
+    if period is None or period <= 0:
+        return None, None
+    if fields[0] == "max":
+        return None, period
+    quota = _float(fields[0])
+    return (None, period) if quota is None else (quota, period)
+
+
+def cgroup_cpu_stat(path: str | None) -> dict:
+    """The integer counters of a cgroup's `cpu.stat` (`usage_usec`,
+    `nr_periods`, `nr_throttled`, `throttled_usec`, `burst_usec`…); {} when
+    unreadable. They are cumulative: a share needs two readings."""
+    out: dict = {}
+    text = _read(os.path.join(path, "cpu.stat")) if path else None
+    for line in (text or "").splitlines():
+        key, _, value = line.partition(" ")
+        if not key or not value:
+            continue
+        number = _float(value)
+        if number is not None:
+            out[key] = int(number)
+    return out
+
+
+def cgroup_memory_max(path: str | None) -> int | None:
+    """The memory ceiling of a cgroup (`memory.max`), None when unreadable or
+    `max` (no ceiling). `memory.current` is `cgroup_memory_bytes`."""
+    text = _read(os.path.join(path, "memory.max")) if path else None
+    if not text or text.strip() == "max":
+        return None
+    number = _float(text)
     return None if number is None else int(number)
 
 
@@ -644,16 +697,109 @@ BOOT_ID = os.path.join(PROC, "sys", "kernel", "random", "boot_id")
 #: included (CLOCK_BOOTTIME), first field
 UPTIME = os.path.join(PROC, "uptime")
 
+#: test/recovery override of the file that names this process's cgroup;
+#: empty means the real `/proc/self/cgroup`
+OWN_CGROUP_FILE_ENV = "AMEESH_OWN_CGROUP_FILE"
+#: test override of the cgroup v2 directory itself (highest priority)
+CGROUP_DIR_ENV = "AMEESH_CGROUP_DIR"
+#: the cgroup v2 hierarchy root (`AMEESH_CGROUP_ROOT` moves it for the tests
+#: and for a chrooted runner; the same name the resources layer uses)
+CGROUP_ROOT_ENV = "AMEESH_CGROUP_ROOT"
+
 
 def own_cgroup(path: str | None = None) -> str | None:
     """The cgroup v2 path of this process (`/system.slice/x.service`), None
-    when unknown. `path`: a file in the format of /proc/self/cgroup."""
+    when unknown. `path`: a file in the format of /proc/self/cgroup;
+    `AMEESH_OWN_CGROUP_FILE` does the same for a test or a chrooted runner."""
     if path is None and not is_linux():
-        return None
-    for line in (_read(path or os.path.join(PROC, "self", "cgroup")) or "").splitlines():
+        explicit = os.environ.get(OWN_CGROUP_FILE_ENV)
+        if not explicit:
+            return None
+        path = explicit
+    if path is None:
+        path = os.environ.get(OWN_CGROUP_FILE_ENV) or os.path.join(PROC, "self", "cgroup")
+    for line in (_read(path) or "").splitlines():
         if line.startswith("0::"):
             return line[3:] or "/"
     return None
+
+
+def cgroup_dir(path: str | None = None, root: str | None = None) -> str | None:
+    """The absolute cgroup v2 directory of this process, None when unknown.
+
+    `path` wins (`AMEESH_CGROUP_DIR` when not given): the tests point it at a
+    fake tree, and a supervised runner can name its own. Otherwise the
+    process's cgroup path is resolved under `root`
+    (`AMEESH_CGROUP_ROOT`, `/sys/fs/cgroup`). Inside a container with a
+    cgroup namespace the path reads `/`, so the root itself is the container
+    cgroup — the building block this lot needs."""
+    if path:
+        return path
+    explicit = os.environ.get(CGROUP_DIR_ENV)
+    if explicit:
+        return explicit
+    rel = own_cgroup()
+    if rel is None:
+        return None
+    base = root or os.environ.get(CGROUP_ROOT_ENV) or CGROUP_ROOT
+    return base if rel == "/" else os.path.join(base, rel.lstrip("/"))
+
+
+#: files a container runtime leaves behind (Docker, Podman)
+CONTAINER_MARKERS = ("/.dockerenv", "/run/.containerenv")
+#: environment variables a Kubernetes pod (or a container manager) sets
+CONTAINER_ENV = ("KUBERNETES_SERVICE_HOST", "CONTAINER", "container")
+#: fragments of the cgroup path that name a container runtime
+CONTAINER_CGROUP_MARKERS = ("docker", "kubepods", "containerd", "libpod", "lxc")
+
+
+def in_container(path: str | None = None, root: str | None = None) -> bool:
+    """Is this process running inside a container?
+
+    Signals, from the strongest: `AMEESH_CONTAINER` (`1`/`0`, an explicit
+    answer for an unusual runtime), Kubernetes' service variables, the
+    runtime's marker file, a cgroup path named after a runtime. In a cgroup
+    namespace (`/proc/self/cgroup` reads `0::/`), the root cgroup carrying a
+    finite `cpu.max` or `memory.max` is the runtime's cgroup: also a
+    container. None of these is guessed: no signal means `False` (a
+    workstation)."""
+    override = os.environ.get("AMEESH_CONTAINER")
+    if override is not None:
+        return override.strip().lower() in ("1", "true", "yes", "on")
+    if any(os.environ.get(key) for key in CONTAINER_ENV):
+        return True
+    if any(os.path.exists(marker) for marker in CONTAINER_MARKERS):
+        return True
+    rel = own_cgroup(path)
+    if rel is None:
+        return False
+    if rel != "/" and any(marker in rel for marker in CONTAINER_CGROUP_MARKERS):
+        return True
+    if rel == "/" or path is not None:
+        if path is not None:
+            base = root or os.environ.get(CGROUP_ROOT_ENV) or CGROUP_ROOT
+            directory = base if rel == "/" else os.path.join(base, rel.lstrip("/"))
+        else:
+            directory = cgroup_dir(root=root)
+        if not directory:
+            return False
+        quota, _period = cgroup_cpu_max(directory)
+        return quota is not None or cgroup_memory_max(directory) is not None
+    return False
+
+
+def own_cgroup_bounded(path: str | None = None, root: str | None = None) -> bool:
+    """Does the process's own cgroup impose a finite CPU or memory limit?
+
+    A systemd service with `CPUQuota=`/`MemoryMax=` counts, like a container:
+    measuring it says more about this process than the node-wide load. A
+    cgroup without either limit says nothing (own-cgroup pressure would then
+    be blind); callers fall back to the host scope."""
+    directory = path or cgroup_dir(root=root)
+    if not directory:
+        return False
+    quota, _period = cgroup_cpu_max(directory)
+    return quota is not None or cgroup_memory_max(directory) is not None
 
 
 def boot_id(path: str | None = None) -> str | None:

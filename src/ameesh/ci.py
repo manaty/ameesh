@@ -2155,6 +2155,28 @@ def _runs_of(api, repo: str, *, sha: str = "", branch: str = "",
     return list(data.get("workflow_runs") or ())
 
 
+def _packet_runs(api, repo: str, branch: str, sha: str) -> list[dict]:
+    """#2876 : portiers push vivants de cette branche et cette tête seulement.
+
+    La liste générale évite un 404 sur les dépôts sans paquet.yml. Paginer
+    garde les portiers visibles même après de nombreuses relances.
+    """
+    found, page = [], 1
+    while True:
+        data = api("repos/%s/actions/runs?per_page=100&page=%d&head_sha=%s&branch=%s&event=push"
+                   % (repo, page, _q(sha), _q(branch))) or {}
+        rows = list(data.get("workflow_runs") or ())
+        found.extend(row for row in rows
+                     if row.get("path") == ".github/workflows/paquet.yml"
+                     and row.get("event") == "push"
+                     and row.get("head_branch") == branch
+                     and row.get("head_sha") == sha
+                     and row.get("status") in OPEN_STATUSES)
+        if len(rows) < 100:
+            return found
+        page += 1
+
+
 def pr_run(row: dict) -> dict | None:
     """Une exécution de PR étiquetée #1343 : PR, mode, tête gelée, base.
 
@@ -3013,6 +3035,19 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
                    "run `ameesh ci run %d` again" % (base[:12], pr["base"][:12], item_id))
             note("released", why)
             return {"requested": False, "action": "refuse", "why": why}
+        # #2876 : le push peut avoir lancé le portier avant la création de
+        # la PR. Son workflow_call ne porte pas le check requis de cette PR.
+        # Le remplacer avant labeled, après toutes les gardes et sous verrou.
+        if mode == "full" and pr["head_ref"].startswith("integration/"):
+            for row in _packet_runs(api, decision["repo"], decision["branch"], sha):
+                messages = []
+                failed = _cancel_runs(gh, decision["repo"], [_short_run(row)],
+                                      say=messages.append)
+                text = "packet portier: " + "; ".join(messages)
+                work.note(tx, int(item_id), text)
+                if failed:
+                    note("released", text)
+                    return {"requested": False, "action": "refuse", "why": text}
         posed = _pose_request(gh, decision["repo"], pr, label, mode)
         if not posed["ok"]:
             note("released", posed["error"])

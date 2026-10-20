@@ -1066,7 +1066,11 @@ def _propose_reviews(db, st, listing, *, pool, room, dry_run=False, canons=(),
     famille, il n'en dispense pas —, `may_take` de l'auditeur, plafond de
     budget, agent réveillable (#1021), jamais un orchestrateur. L'auteur du
     lot est écarté (B3) et sa famille se lit au tour du gel
-    (`review_lot._author_at_freeze`, #1053/#1777).
+    (`review_lot._author_at_freeze`, #1053/#1777). Une relecture écarte en
+    outre **toutes** les familles d'auteur de la plage gelée (#2864), lues sur
+    la marque de désignation du dernier gel (`frozen_authors`) : la même
+    lecture que la désignation et la porte. Sans cette lecture (pas de marque,
+    famille d'auteur inconnue), aucune proposition n'est faite (échec fermé).
 
     Rend les propositions dans la forme des prises (`item`, `agent`,
     `message_id`, `kind` valant `review` ou `correction`, `notified`). Le lot
@@ -1075,7 +1079,8 @@ def _propose_reviews(db, st, listing, *, pool, room, dry_run=False, canons=(),
     la fenêtre et la note sont pris sous un verrou consultatif par lot
     (#1738 N5), et une relecture désigne son relecteur (#705, #1738 N7) — la
     double relecture est écartée et `stale_lot` sait à qui s'adresser."""
-    from . import mail, registry, review_lot
+    from . import mail, registry, review_designation as rd, review_lot
+    from . import review_designation_activation as activation
     if room <= 0 or not pool:
         return []
     # N6 : lire plus large que la pièce demandée — l'appariement (famille,
@@ -1089,6 +1094,9 @@ def _propose_reviews(db, st, listing, *, pool, room, dry_run=False, canons=(),
     # relectures d'abord, corrections ensuite (l'ordre du SQL est conservé)
     rows = sorted(rows, key=lambda r: 1 if (r.get("last_verdict") or "") == "blocked" else 0)
     by_name = {row.get("name"): row for row in listing}
+    # #2864 : la lecture des auteurs ne dépend que du lot — une fois par lot,
+    # pas une fois par couple (agent, lot). None (lecture absente) est mémorisé.
+    frozen_reading: dict = {}
     out: list = []
     used: set = set()
     for row in pool:
@@ -1145,14 +1153,39 @@ def _propose_reviews(db, st, listing, *, pool, room, dry_run=False, canons=(),
                     families = review_lot.compiled_families(db)
                 except review_lot.FamiliesError:
                     continue
-                want = review_lot.reviewer_family(author_info.get("harness"), families)
-                if want == review_lot.UNKNOWN_FAMILY:
-                    ok = bool(review_lot.family_of(mine, families))
-                else:
-                    ok = mine == want
-                if not ok:
+                # #2864 : écarter **toutes** les familles d'auteur de la plage
+                # gelée, avec la lecture de la désignation au gel (sa marque),
+                # pas seulement celle de l'assigné au gel. Provenance inconnue
+                # (pas de marque lisible, auteur sans famille) : aucune
+                # proposition, l'indépendance ne se suppose pas (échec fermé).
+                if lot not in frozen_reading:
+                    frozen_reading[lot] = activation.frozen_authors(db, item)
+                authors = frozen_reading[lot]
+                if authors is None:
                     continue
-                family = want
+                author_names, forbidden_families = rd.families_of(authors)
+                if rd.unknown_families(authors) or name in author_names:
+                    continue
+                eligible = [family for family in families
+                            if family not in forbidden_families]
+                mine_family = review_lot.family_of(mine, families)
+                if not mine_family or not eligible:
+                    continue
+                # la famille opposée à l'auteur de référence reste préférée ;
+                # si elle est elle-même auteur de la plage, une autre famille
+                # indépendante convient (même règle que la désignation).
+                reference = next((row.get("family") for row in authors
+                                  if row.get("name") == author_info.get("name")), "")
+                want = review_lot.reviewer_family(
+                    reference or author_info.get("harness"), families)
+                if want != review_lot.UNKNOWN_FAMILY and want in eligible:
+                    if mine_family != want:
+                        continue
+                    family = want
+                else:
+                    if mine_family not in eligible:
+                        continue
+                    family = mine_family
             kind = "correction" if correction else "review"
             payload = {"review_proposal": {"lot": lot, "agent": name, "kind": kind}}
             message_id = None
