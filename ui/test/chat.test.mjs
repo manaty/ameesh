@@ -203,3 +203,61 @@ test("after a failed send, changing its lot or agent takes a fresh idempotency k
   await el.send();
   assert.notEqual(keys[2], keys[3]);
 });
+
+test("the conversation is read in the agent's project, not in a differing selected project", async () => {
+  // Reproduced from the review: agent ada belongs to ameesh, the page selects
+  // nexlink. The server writes the message in ameesh; the screen must read it.
+  const { client, fetch } = fixture({
+    "/api/v1/threads/ameesh": [200, { entries: [
+      { id: "here", author: "human:ada", recipient: "agent:ada", text: "Delivered here", ts: stamp - 10 }] }],
+    "/api/v1/threads/nexlink": [200, { entries: [
+      { id: "there", author: "human:ada", recipient: "agent:ada", text: "Other project", ts: stamp - 5 }] }],
+  });
+  const el = await mount(client, { agent: "ada", project: "nexlink" });
+  assert.match(text(el), /Delivered here/);
+  assert.doesNotMatch(text(el), /Other project/);
+  assert.ok(fetch.calls.some((c) => c.path === "/api/v1/threads/ameesh"));
+  assert.ok(!fetch.calls.some((c) => c.path === "/api/v1/threads/nexlink"));
+});
+
+test("a selected lot of another project is read in the lot's own project", async () => {
+  const { client, fetch } = fixture({
+    "/api/v1/lots/9": [200, { schema: "ameesh-lot/1",
+      lot: { id: 9, app: "ameesh", title: "Elsewhere" } }],
+    "/api/v1/threads/ameesh/9": [200, { entries: [
+      { id: "lot9", author: "agent:ada", recipient: "human:ada", text: "Lot nine answer", ts: stamp - 3 }] }],
+    "/api/v1/threads/nexlink/9": [200, { entries: [
+      { id: "wrong", author: "agent:ada", recipient: "human:ada", text: "Wrong project", ts: stamp - 2 }] }],
+  });
+  const el = await mount(client, { agent: "ada", project: "nexlink", lot: "9" });
+  assert.match(text(el), /Lot nine answer/);
+  assert.doesNotMatch(text(el), /Wrong project/);
+  assert.ok(fetch.calls.some((c) => c.path === "/api/v1/lots/9"));
+  assert.ok(fetch.calls.some((c) => c.path === "/api/v1/threads/ameesh/9"));
+  assert.ok(!fetch.calls.some((c) => c.path === "/api/v1/threads/nexlink/9"));
+});
+
+test("a refused send's error is cleared when the agent or the lot changes", async () => {
+  const { client } = fixture();
+  const wrapped = { ...client, post: async () => {
+    throw new ui.ApiError(409, "refused", "agent stopped");
+  } };
+  const el = await mount(wrapped, { agent: "ada", lot: "7" });
+  el.draft = "Hello";
+  await el.send();
+  await settle(el);
+  assert.match(text(el), /not sent \(refused\)/);
+  el.lot = "8";
+  await settle(el);
+  assert.doesNotMatch(text(el), /not sent/);
+  assert.equal(el.draft, "Hello");
+});
+
+test("the unread count is singular in French for a single message", async () => {
+  const one = structuredClone(routes["/api/v1/projects"]);
+  one[1].projects[0].agents[0].unread = 1;
+  document.documentElement.lang = "fr";
+  const el = await mount(fixture({ "/api/v1/projects": one }).client, { agent: "ada" });
+  assert.match(text(el), /1 non lu\b/);
+  assert.doesNotMatch(text(el), /1 non lus/);
+});

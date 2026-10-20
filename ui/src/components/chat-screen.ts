@@ -5,9 +5,11 @@
 // the server deposits it in the agent's mailbox, which wakes the agent at its
 // next turn, and writes its readable copy in the thread. The answer arrives
 // as mail, so through the thread: the screen shows the exchanges between the
-// human and the agent in the threads where they land (the lot's when one is
-// set; otherwise the agent's project and its current lot), the agent's state
-// and, while the last word is the human's, "waiting for the next turn".
+// human and the agent in the threads where they land — the project thread a
+// reply sent without a lot is written in, and each lot's thread in the lot's
+// own project (the server's routing, never the selected project) — the
+// agent's state and, while the last word is the human's, "waiting for the
+// next turn".
 // Tier 2 (live answer of a resident agent, `chat.delta`) follows L75–L83.
 import { css, html, nothing } from "lit";
 import { ApiError, type Client } from "../api/client";
@@ -45,6 +47,44 @@ export class AmeeshChat extends ReadView {
   //: one key per message: a retry after an uncertain failure replays it, never
   //: sends it twice; a new text, or a delivered one, takes a fresh key
   #key: { text: string; agent: string; lot: number | null; client: Client; key: string } | null = null;
+  //: the project of a lot, read once: the server routes a message carrying a
+  //: lot to the lot's project, so the screen must read its thread there even
+  //: when the selected project differs
+  #lotProjects = new Map<string, string>();
+
+  override willUpdate(changed: Map<PropertyKey, unknown>): void {
+    super.willUpdate(changed);
+    // a refusal belongs to the target it was made for: changing the agent or
+    // the lot must not show it under the new one (the draft may stay)
+    if (changed.has("agent") || changed.has("lot")) this.failed = "";
+  }
+
+  /** Where the server writes a message without a lot: the agent's project. */
+  #agentProject(agent: Row): string {
+    const own = label(agent.project);
+    return own === "—" ? this.project : own;
+  }
+
+  /** The lot's project (the server's routing), read once; `fallback` if unreadable. */
+  async #lotProject(client: Client, lot: number, fallback: string,
+                    signal: AbortSignal): Promise<string> {
+    const key = String(lot);
+    const known = this.#lotProjects.get(key);
+    if (known !== undefined) return known;
+    try {
+      const read = object(await client.get("/api/v1/lots/{id}", { path: { id: lot }, signal }));
+      const project = label(object(read.lot).app);
+      if (project !== "—" && project !== "") {
+        this.#lotProjects.set(key, project);
+        return project;
+      }
+    } catch (error) {
+      if (signal.aborted) throw error;
+      // an unreadable lot keeps the caller's project: the screen shows what it
+      // can, and the send says the refusal
+    }
+    return fallback;
+  }
 
   protected async load(client: Client, signal: AbortSignal) {
     const [me, detail, overview] = await Promise.all([
@@ -55,19 +95,34 @@ export class AmeeshChat extends ReadView {
     const current = rows(object(overview).projects).flatMap((p) => rows(p.agents))
       .find((a) => a.name === this.agent);
     const agent = { ...object(object(detail).agent), ...current };
-    const project = this.project || label(agent.project);
-    const lots = this.lot ? [this.lot] : [null, object(agent.lot).id ?? null];
-    const threads = project === "—" ? [] : await Promise.all(
-      [...new Set(lots.map((lot) => lot === null ? null : String(lot)))].map((lot) => {
-        const read = lot === null
-          ? client.get("/api/v1/threads/{project}", { path: { project }, signal })
-          : client.get("/api/v1/threads/{project}/{lot}", { path: { project, lot }, signal });
-        // a thread not written yet is an empty conversation, not an error
-        return read.catch((error) => {
-          if (error instanceof ApiError && error.status === 404) return { entries: [] };
-          throw error;
-        });
-      }));
+    // the server writes a message without a lot in the agent's project: the
+    // `project` attribute is not the routing, it only covers an agent with none
+    const project = this.#agentProject(agent);
+    const explicit = /^[1-9][0-9]{0,8}$/.test(this.lot) ? Number(this.lot) : null;
+    const currentLot = Number(object(agent.lot).id);
+    const lots = explicit !== null ? [explicit]
+      : Number.isFinite(currentLot) && currentLot > 0 ? [currentLot] : [];
+    const fallback = project === "—" ? "" : project;
+    const lotProjects = await Promise.all(lots.map((lot) =>
+      this.#lotProject(client, lot, fallback, signal)));
+    // where messages land: the project thread (a reply sent without a lot) and
+    // each lot's thread in its own project; never the selected project alone
+    const reads = new Map<string, { project: string; lot: string | null }>();
+    if (fallback) reads.set(fallback + "|", { project: fallback, lot: null });
+    lots.forEach((lot, index) => {
+      const where = lotProjects[index] || fallback;
+      if (where) reads.set(where + "|" + lot, { project: where, lot: String(lot) });
+    });
+    const threads = await Promise.all([...reads.values()].map(({ project: where, lot }) => {
+      const read = lot === null
+        ? client.get("/api/v1/threads/{project}", { path: { project: where }, signal })
+        : client.get("/api/v1/threads/{project}/{lot}", { path: { project: where, lot }, signal });
+      // a thread not written yet is an empty conversation, not an error
+      return read.catch((error) => {
+        if (error instanceof ApiError && error.status === 404) return { entries: [] };
+        throw error;
+      });
+    }));
     return { me: label(object(me).human), agent, entries: threads.flatMap((t) => rows(object(t).entries)) };
   }
 
@@ -148,7 +203,8 @@ export class AmeeshChat extends ReadView {
           ? this.t("chat.asleep", { state: this.state(shown) })
           : this.t("chat.waiting");
     return html`<p role="status">${this.t("chat.agentState", { agent: this.agent, state: this.state(shown) })}
-      ${agent.unread ? html` · ${this.t("chat.unread", { count: label(agent.unread) })}` : nothing}</p>
+      ${agent.unread ? html` · ${this.t("chat.unread", { count: label(agent.unread),
+        n: number(agent.unread) ?? 0 })}` : nothing}</p>
       ${waiting || stopped ? html`<p class="muted">${notice}</p>` : nothing}`;
   }
 
