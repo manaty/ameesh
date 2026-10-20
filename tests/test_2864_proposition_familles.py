@@ -14,6 +14,7 @@ d'auteur inconnue), elle ne propose rien : l'indépendance ne se suppose pas.
 """
 from __future__ import annotations
 
+import json
 import time
 
 from ameesh import backlog, plan_git, registry
@@ -79,6 +80,21 @@ class _Stacked(_ActivationFixture):
             "DELETE FROM work_item_events WHERE work_item_id = %s"
             " AND starts_with(note, %s)", (self.lot, pg.MARK_PREFIX))
 
+    def marque_sans_inconnus(self, authors):
+        """Une marque d'avant #2864 : les auteurs connus, pas la liste des
+        commits non attribués. Sa complétude n'est pas prouvée."""
+        freeze = plan_git.latest_freeze(work.milestones(self.db, self.lot))
+        payload = {
+            "state": rd.WAITING, "required": 2, "reviewers": [], "missing": 2,
+            "why": "test : marque antérieure au champ unknown_authors",
+            "freeze": {"id": int(freeze["id"]),
+                       "sha": str(freeze.get("sha") or self.frozen)},
+            "authors": [dict(row) for row in authors], "policy_ref": "", "sent": [],
+        }
+        note = "%s%d:%d: %s" % (pg.MARK_PREFIX, self.lot, int(freeze["id"]),
+                                json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        storage.of(self.db).work.note(self.lot, "qa", note, "test")
+
 
 class PropositionFamillesTest(_Stacked, PgTestCase):
     def test_le_lot_empile_propose_la_famille_independante(self):
@@ -99,6 +115,33 @@ class PropositionFamillesTest(_Stacked, PgTestCase):
     def test_sans_marque_de_designation_aucune_proposition(self):
         self.freeze()
         self.retire_marques()
+        self.assertEqual(self.take(), [])
+        self.assertEqual(self.mails("cx1"), [])
+        self.assertEqual(self.mails("r1"), [])
+
+    def test_provenance_partiellement_inconnue_ne_propose_rien(self):
+        # B/P1 de la revue cx3 : des auteurs connus ne prouvent pas que tous
+        # les commits le sont. Un commit d'un agent hors registre, sans reçu,
+        # rend la désignation waiting (unknown) ; aucune proposition ne doit
+        # en sortir.
+        self.repo.write("src/ameesh/third.py", "third\n")
+        self.frozen = self.repo.commit("third party", agent="unregistered")
+        _row, outcome = self.freeze()
+        self.assertEqual(outcome["state"], rd.WAITING, outcome)
+        self.assertIn("author provenance unknown", outcome["why"])
+        mark = pg.designation_of(self.marks()[0])
+        self.assertEqual(mark["unknown_authors"], [self.frozen[:12]])
+        self.assertEqual(self.take(), [])
+        self.assertEqual(self.mails("cx1"), [])
+        self.assertEqual(self.mails("r1"), [])
+
+    def test_une_marque_sans_liste_inconnue_ne_prouve_rien(self):
+        self.freeze()
+        # La marque la plus récente ne porte pas la liste de complétude : la
+        # lecture ne prouve pas l'absence d'auteur inconnu, donc rien n'est
+        # proposé (échec fermé), même avec des familles connues.
+        self.marque_sans_inconnus([{"name": "author", "family": "deepseek"},
+                                   {"name": "cx2", "family": "codex"}])
         self.assertEqual(self.take(), [])
         self.assertEqual(self.mails("cx1"), [])
         self.assertEqual(self.mails("r1"), [])

@@ -1170,9 +1170,15 @@ def frozen_authors(db, item: Mapping) -> Optional[list]:
     `review_authors.reading` (noms, familles, preuves) : c'est cette lecture
     qui fait foi ici, sans relire la plage ni deviner une famille.
 
-    Rend la liste `{name, family}`, ou None quand aucune lecture durable n'est
-    disponible : pas de gel, pas de marque pour ce gel, journal illisible,
-    marque antérieure à #2721 (sans `authors`), ou liste vide. L'appelant
+    La lecture n'est complète que si la marque nomme aussi les commits qu'elle
+    n'a pas pu attribuer (`unknown_authors`, #2864) : des auteurs connus ne
+    prouvent pas qu'aucun autre commit ne l'est pas. Une marque sans cette
+    liste (antérieure au champ), ou qui la porte non vide, ne prouve donc rien.
+
+    Rend la liste `{name, family}`, ou None quand aucune lecture **complète**
+    n'est disponible : pas de gel, pas de marque pour ce gel, journal
+    illisible, marque antérieure à #2721 (sans `authors`), liste
+    `unknown_authors` absente ou non vide, ou liste d'auteurs vide. L'appelant
     échoue alors fermé — aucune proposition de relecture.
     """
     lot = int((item or {}).get("id") or 0)
@@ -1190,8 +1196,13 @@ def frozen_authors(db, item: Mapping) -> Optional[list]:
         if kind != "designation":
             continue
         rows = noted.get("authors")
-        if not isinstance(rows, list):
-            continue
+        unknown = noted.get("unknown_authors")
+        # #2864 : la complétude de la provenance se prouve ; une marque d'avant
+        # le champ ne la prouve pas, et un inconnu explicite l'interdit.
+        if not isinstance(rows, list) or not isinstance(unknown, list):
+            return None
+        if [value for value in unknown if str(value).strip()]:
+            return None
         authors = []
         for row in rows:
             if not isinstance(row, Mapping):
