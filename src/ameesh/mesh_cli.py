@@ -2172,6 +2172,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             outcome: dict = {}
             note = args.note or ""
             if args.kind == "frozen":
+                # #2863: validate before checks, including when checks are skipped.
+                item = work.get(db, args.id)
+                if item is None:
+                    raise work.WorkError("lot %s not found" % args.id)
+                args.sha = work.frozen_head(db, item, args.sha or "", repo=args.repo)
                 # #2542 : un contrôle statique rouge refuse le gel, avant le paquet
                 from . import freeze_checks
                 note = freeze_checks.before_freeze(
@@ -3326,9 +3331,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="frozen (branch frozen) or verdict (review delivered); "
                             "the pilot's fire is `ameesh work fire`")
     pw_ms.add_argument("--sha", default="",
-                       help="the frozen or reviewed commit (verdict: the full head, or "
-                            "an abbreviation of at least 12 hex characters resolved in "
-                            "a repository)")
+                       help="the full frozen or reviewed commit id, or 12+ hex characters "
+                            "resolved in a repository; symbolic refs such as HEAD are refused")
     # le verdict est un positionnel (`work milestone 1 verdict ok`), comme la
     # frise se lit ; `frozen` n'en prend pas
     pw_ms.add_argument("verdict", nargs="?", choices=list(work.VERDICTS), default=None,

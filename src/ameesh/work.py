@@ -3247,6 +3247,30 @@ def reviewed_head(db: Db, item: dict, sha: str, *, repo: str | None = None) -> s
         "does not name the current frozen head" % text, repo=repo)
 
 
+def frozen_head(db: Db, item: dict, sha: str, *, repo: str | None = None) -> str:
+    """Normalize a freeze to an immutable commit id (#2863).
+
+    Symbolic refs are refused: HEAD may name a different worktree's commit.
+    Full ids remain usable without a local checkout, as for verdicts.
+    Abbreviations (12+ hex) must resolve and are stored in full.
+    """
+    text = str(sha or "").strip().lower()
+    if not _REVIEWED_HEAD.fullmatch(text):
+        raise WorkError(
+            "freeze refused (head-invalid): --sha must be the full commit id or "
+            "at least 12 hex characters resolved in a repository; symbolic refs "
+            "such as HEAD are not accepted (use git rev-parse HEAD)")
+    from . import freeze_checks
+    for where in ([repo] if repo else _head_repos(db, item)):
+        commit = freeze_checks.commit_in(where, text)
+        if commit:
+            return commit
+    if _FULL_HEAD.fullmatch(text) and not repo:
+        return text
+    raise WorkError("freeze refused (head-unresolved): %s does not resolve to a commit%s"
+                    % (text, " in %s" % repo if repo else " here"))
+
+
 def milestone(
     db: Db,
     item_id: int,
@@ -3269,6 +3293,10 @@ def milestone(
     et `delivered` sont écrits automatiquement (transitions, fermeture et
     livraison hors cible : 0013, 0026, #988), les déclarer à la main serait un
     mensonge sur la frise.
+
+    `frozen` (#2863) refuse les références symboliques et les têtes vides.
+    Une abréviation de 12+ caractères hexadécimaux doit se résoudre et est
+    stockée en SHA complet avant la provenance et la désignation.
 
     `verdict` (#2674) exige une tête relue : le `sha` est vérifié par
     [`reviewed_head`] avant toute écriture — complet, ou abréviation de 12
@@ -3323,6 +3351,8 @@ def milestone(
     if kind == "verdict":
         # #2674 : refuser à l'écriture un avis qui ne nomme pas la tête relue.
         sha = reviewed_head(db, item, sha, repo=repo)
+    if kind == "frozen":
+        sha = frozen_head(db, item, sha, repo=repo)
     drain: list | None = None
     if kind == "frozen" and on_frozen is None:
         from . import review_designation_activation as activation
