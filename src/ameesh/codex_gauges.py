@@ -142,11 +142,24 @@ def reconcile(readings, now, *, truncated=False):
     if truncated:
         # Expiry clears quota usage, not the observed plan's window layout.
         # Otherwise a week-only pro account would require a fresh short
-        # reading to resume after reset, which it cannot produce.
-        sample_plans = {r[1].get("plan_type") for r in readings if r[1].get("plan_type")}
+        # reading to resume after reset, which it cannot produce. The *live*
+        # plan names the expected layout when one is observed: a plan change
+        # leaves expired team journals behind, and those must not demand a
+        # short window from a pro account.
+        live_plans = {r[1].get("plan_type") for r in live if r[1].get("plan_type")}
+        sample_plans = live_plans or {
+            r[1].get("plan_type") for r in readings if r[1].get("plan_type")}
         missing = []
+        # #2843: for a non-pro plan the short window must be seen *live*, not
+        # merely present. An expired short in the sample says nothing about a
+        # live saturated short hidden outside the 32-journal sample: its
+        # `used_at` is 0 and it would mask the overage. A team account whose
+        # sampled short observations have all expired is refused (a pause)
+        # until a live one appears — the same prudence as for a sample with no
+        # short window at all, accepting that bounded residual.
         if sample_plans != {"pro"} and not any(
-                g.window_s <= 5 * 3600 for g, _limits in windows.values()):
+                g.window_s <= 5 * 3600 and not g.reset_passed(now)
+                for g, _limits in windows.values()):
             missing.append("short window")
         if not any(g.window_s > 5 * 3600 for g, _limits in windows.values()):
             missing.append("weekly window")
