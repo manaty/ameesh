@@ -1426,29 +1426,66 @@ def _carried_in_transaction(tx, item: Mapping, freeze: Mapping,
 
 
 def _manual_outcome(db, item: Mapping, freeze: Mapping, manual: Sequence[str], *,
-                    waiver: bool = False) -> dict:
+                    waiver: bool = False, unknown: str = "",
+                    note: bool = True) -> dict:
     """The explicit manual no-op: keep the manual reviewers, add nobody (#2627).
 
     The note says why no automatic reviewer was added. The column is synced
     with an empty selection so a previous freeze's automatic names are retired
     while the manual names survive (`_sync_reviewers` never removes a name that
     no mark carries) and a `-none` waiver is never overridden.
+
+    `unknown` (#2637): the selection could not compute the coverage (prepare
+    failed, or the policy is unavailable). The note no longer claims the manual
+    reviewers cover the required reviews; it keeps them and says the coverage
+    is unknown, with the reason. `note=False` lets the caller write the single
+    unavailable note and its alert instead of duplicating it.
     """
     lot = int((item or {}).get("id") or 0)
     if waiver:
         text = ("automatic reviewer designation skipped at freeze %s: manual"
                 " waiver (-none) is not overridden" % _freeze_label(freeze))
         why = "manual waiver (-none)"
+    elif unknown:
+        text = ("automatic reviewer designation skipped at freeze %s: manual"
+                " reviewer(s) kept (%s); their coverage of the required"
+                " review(s) is unknown because %s"
+                % (_freeze_label(freeze), ", ".join(manual), unknown))
+        why = "manual reviewer designation (coverage unknown)"
     else:
         text = ("automatic reviewer designation skipped at freeze %s: manual"
                 " reviewer(s) already cover the required review(s) (%s); the"
                 " manual designation remains the journaled exception"
                 % (_freeze_label(freeze), ", ".join(manual)))
         why = "manual reviewer designation"
-    storage.of(db).work.note(lot, str((item or {}).get("state") or ""), text, SENDER)
+    if note:
+        storage.of(db).work.note(lot, str((item or {}).get("state") or ""), text, SENDER)
     _sync_reviewers(db, item, freeze, [])
     return {"state": "manual", "reviewers": [], "freeze": dict(freeze or {}),
             "why": why}
+
+
+def _manual_unavailable(cfg, tx, item: Mapping, freeze: Mapping,
+                        manual: Sequence[str], threads: list, why: str, *,
+                        silent: bool = False) -> dict:
+    """Keep the manual reviewers when the selection cannot compute coverage.
+
+    #2637: with manual seats present, an unavailable policy or a `prepare`
+    failure used to take `_manual_outcome`, which claimed the required reviews
+    were covered and skipped `_note_unavailable` and its pilot alert. The manual
+    seats are still kept and no automatic reviewer is added, but the waiting
+    state and the alert are now explicit. A silent source (no canon configured)
+    stays mail-free, and its manual note carries the unknown coverage reason.
+    """
+    if silent:
+        return _manual_outcome(tx, item, freeze, manual, unknown=why)
+    out = _manual_outcome(tx, item, freeze, manual, unknown=why, note=False)
+    coverage = ("manual reviewer(s) kept (%s); their coverage of the required"
+                " review(s) is unknown: %s" % (", ".join(manual), why))
+    notify = _notify(cfg, tx, str((item or {}).get("app") or ""),
+                     registry.overview(tx))
+    _note_unavailable(tx, item, freeze, coverage, threads, notify)
+    return out
 
 
 def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
@@ -1492,11 +1529,15 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
         inputs = prepare(cfg, tx, int(lot), freeze=freeze, fetch=False)
     except Exception as exc:  # noqa: BLE001 - recorded below, never guessed
         if manual:
-            return _manual_outcome(tx, item, freeze, manual)
+            return _manual_unavailable(
+                cfg, tx, item, freeze, manual, threads,
+                "internal designation error: %s: %s"
+                % (type(exc).__name__, str(exc)[:240]))
         return _internal_failure(cfg, tx, item, freeze, threads, exc)
     if isinstance(inputs, Unavailable):
         if manual:
-            return _manual_outcome(tx, item, freeze, manual)
+            return _manual_unavailable(cfg, tx, item, freeze, manual, threads,
+                                       inputs.why, silent=inputs.silent)
         if not inputs.silent:
             notify = _notify(cfg, tx, str(item.get("app") or ""),
                              registry.overview(tx))
@@ -1791,9 +1832,14 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         inputs = prepare(cfg, db, int(lot), freeze=freeze)
         if isinstance(inputs, Unavailable):
             if manual:
-                return {"state": "manual", "reviewers": [], "freeze": freeze,
-                        "why": "manual reviewer(s) designated: %s"
-                               % ", ".join(manual)}
+                with db.transaction() as tx:
+                    if not _lock_current_freeze(tx, int(lot), freeze):
+                        return _stale(freeze)
+                    out = _manual_unavailable(cfg, tx, item, freeze, manual,
+                                              threads, inputs.why,
+                                              silent=inputs.silent)
+                _drain(db, threads)
+                return out
             if not inputs.silent:
                 notify = _notify(cfg, db, str(item.get("app") or ""),
                                  registry.overview(db))
