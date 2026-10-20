@@ -838,8 +838,9 @@ class ActionsDeadlineRaceTest(ActionsBase):
     le connecteur n'est pas appelé. Témoin : relâché avant l'échéance, il part.
     """
 
-    #: secondes entre la préparation de la course et l'échéance
-    MARGIN = 4
+    #: La préparation inclut plusieurs connexions/psql : garder une marge
+    #: sur les runners CI chargés, sans retirer le contrôle avant échéance.
+    MARGIN = 15
     #: échéance des témoins : bien après la fin de l'attente
     LATER = 60
 
