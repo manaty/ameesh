@@ -209,9 +209,11 @@ authorization: do **not** filter `requests[]` on `delivered_ts`/`delivered_at`
 — the document is written before launch, so `delivered_ts` is normally null
 and delivery is settled just after launch. A request in the set whose payload
 has no `ameesh-sandbox-request/1` is `not-a-sandbox-request` and is skipped.
-After admission a cancel does **not** change the request's `request.state` (it
-stays `delivered`); it sets `sandbox.state = cancelled` and
-`cancel_requested_at`.
+After admission a cancel does **not** change the request's `request.state`: it
+does not become `withdrawn`, and presence in `requests[]` remains what
+authorizes the turn — the row's delivery bookkeeping (`pending`/`delivered`) is
+not the authorization and may still be `pending` in the admission window. A
+cancel sets `sandbox.state = cancelled` and `cancel_requested_at`.
 The `turn_id` is the one allocated before the first side effect of the turn
 (#2167), so `turn_resources`, `spend_pending`, `turn_costs` and
 `sandbox_turns` carry the same id. The `spend_key` is opaque: the adapter
