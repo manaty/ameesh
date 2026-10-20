@@ -49,10 +49,14 @@ class StageCommentsTest(unittest.TestCase):
                        dict(id=7, state="blocked", created_ts=2,
                             note="internal\nPublic status: Please confirm the CSV contract on this ticket."),
                        *self.events]
+        marks, events = self.marks, self.events
+        self.marks, self.events = [], self.events[-1:]
+        self.assertEqual([r["event"] for r in self.project()["comments"]], ["accepted"])
+        self.marks, self.events = marks, events
         self.item["state"] = "merged"
         report = self.project()
         self.assertEqual([r["event"] for r in report["comments"]],
-                         ["accepted", "event-7", "milestone-3", "milestone-4"])
+                         ["event-7", "frozen", "milestone-4"])
         text = "\n".join(self.bodies())
         for phrase in ("Priority: P1", "2026-10-22", "Please confirm the CSV contract", "Merged;"):
             self.assertIn(phrase, text)
@@ -60,6 +64,20 @@ class StageCommentsTest(unittest.TestCase):
         self.gh.reset_calls()
         self.assertEqual(self.project()["comments"], [])
         self.assertEqual(self.gh.writes(), [])
+
+    def test_preexisting_open_ticket_gets_current_stage_and_one_freeze(self):
+        # #2861: enrolling an open mirror that predates the feature posts no
+        # history, and re-freezes never repeat "Frozen for review."
+        self.marks = [dict(id=n, kind="frozen", at_ts=n) for n in (6, 5, 4, 3)]
+        self.events = [dict(id=7, state="blocked", created_ts=5,
+                            note="Public status: Please confirm."), *self.events]
+        self.assertEqual([r["event"] for r in self.project()["comments"]], ["frozen"])
+        self.assertEqual(len(self.bodies()), 1)
+        self.marks = [dict(id=8, kind="frozen", at_ts=8), *self.marks]
+        self.assertEqual(self.project()["comments"], [])
+        self.marks = [dict(id=9, kind="merged", at_ts=9), *self.marks]
+        self.item["state"] = "merged"
+        self.assertEqual([r["event"] for r in self.project()["comments"]], ["milestone-9"])
 
     def test_post_failure_and_lost_ack_reconciled_without_issue_update(self):
         self.project()
@@ -172,7 +190,8 @@ class StageCommentsTest(unittest.TestCase):
             self.assertEqual(self.gh.repo(REPO)["issues"][0]["state"], "closed")
             self.gh.fail = None
             result = pg.project_lots(self.db, self.gh, "app", REPO)
-            self.assertEqual([r["event"] for r in result["comments"]], ["accepted", "merged"])
+            # #2861: a mirror enrolled late gets its current stage only
+            self.assertEqual([r["event"] for r in result["comments"]], ["merged"])
             self.assertIn("Merged by PR #42;", self.bodies()[-1])
             self.gh.reset_calls()
             self.assertEqual(pg.project_lots(self.db, self.gh, "app", REPO)["comments"], [])
@@ -219,7 +238,7 @@ class StageCommentsTest(unittest.TestCase):
             result = pg.project_lots(self.db, self.gh, "app", REPO)
             self.assertEqual(result["errors"], [])
             self.assertEqual([r["event"] for r in result["comments"]],
-                             ["accepted", "milestone-3"])
+                             ["accepted", "frozen"])
             mirror = result["issues"][0]["number"]
             self.assertTrue(all(r["number"] == mirror for r in result["comments"]))
             self.assertEqual(self.item["issue_ref"], "external/requests#42")
