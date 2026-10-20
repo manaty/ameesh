@@ -133,8 +133,10 @@ class _Base(unittest.TestCase):
                 # de la porte échouerait en échec fermé. Ces témoins portent sur
                 # les gardes de `merge_pr`, pas sur les auteurs/correcteurs ;
                 # l'échec fermé garde son témoin dédié (test_2739_review_correction).
+                # #2808 : None = plage non lue ; (None, []) serait une lecture
+                # vide, qui ne prouve plus le titulaire auteur.
                 mock.patch.object(merge_queue, "_attribution_on_freeze",
-                                  return_value=(None, [])),):
+                                  return_value=None),):
             patch.start()
             self.addCleanup(patch.stop)
 
