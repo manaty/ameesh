@@ -140,9 +140,11 @@ def parameters(cfg, project: str, *, canon_repo: str = "",
     reprise, banc) ; sinon le premier canon configuré qui porte un bloc
     ``prevalidation`` pour ce projet est retenu. Aucun fallback : un canon
     sans bloc, illisible ou sans commit exact refuse ``block-missing``.
-    Avec ``deadline`` (#2665), la lecture du canon ne prend que le temps qui
-    reste au passage ; une échéance épuisée est ``run-incomplete``, pas un
-    ``block-missing`` trompeur.
+    Avec ``deadline`` (#2665), la découverte des canons configurés
+    (``canon.load_configured`` : résolution git, manifeste, fiches) et la
+    lecture des paramètres ne prennent que le temps qui reste au passage ;
+    une échéance épuisée est ``run-incomplete``, pas un ``block-missing``
+    trompeur.
     """
     if canon_repo and canon_commit:
         _, params = prevalidation.load_parameters(canon_repo, canon_commit, project,
@@ -153,7 +155,11 @@ def parameters(cfg, project: str, *, canon_repo: str = "",
         raise prevalidation.PrevalidationError(
             "block-missing", "aucun canon configuré : paramètres de prévalidation inconnus")
     try:
-        canons = canon_mod.load_configured(cfg)
+        canons = canon_mod.load_configured(cfg, deadline=deadline)
+    except canon_mod.GitDeadline:
+        raise prevalidation.PrevalidationError(
+            "run-incomplete",
+            "budget de prévalidation épuisé pendant la découverte des canons") from None
     except Exception as exc:  # noqa: BLE001 - un canon illisible ne prouve rien
         raise prevalidation.PrevalidationError(
             "block-missing", "canon configuré illisible: %s: %s"

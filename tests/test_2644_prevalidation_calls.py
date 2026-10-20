@@ -171,6 +171,35 @@ class ParametersTest(unittest.TestCase):
         self.assertEqual(caught.exception.cause, "run-incomplete")
         load.assert_not_called()
 
+    def test_the_configured_discovery_is_bounded_by_the_deadline(self):
+        # #2665/B1 cx1+cx2 : load_configured→from_config→load→git_toplevel
+        # gardait 60 s ; le faux git dormant 0,15 s doit être coupé à 0,03 s.
+        root = tempfile.mkdtemp(prefix="ameesh-2665-canon-")
+        self.addCleanup(shutil.rmtree, root, True)
+        cfg = SimpleNamespace(canon=root, canon_ref="", canon_untrusted=False)
+        now = [100.0]
+        deadline = calls.Deadline(0.03, clock=lambda: now[0])
+
+        def slow(cmd, **kwargs):
+            now[0] += 0.15
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+
+        with mock.patch.object(canon.subprocess, "run", side_effect=slow):
+            with self.assertRaises(pv.PrevalidationError) as caught:
+                calls.parameters(cfg, "ameesh", deadline=deadline)
+        self.assertEqual(caught.exception.cause, "run-incomplete")
+        self.assertIn("découverte des canons", caught.exception.why)
+
+    def test_an_expired_discovery_launches_no_git(self):
+        root = tempfile.mkdtemp(prefix="ameesh-2665-canon-")
+        self.addCleanup(shutil.rmtree, root, True)
+        cfg = SimpleNamespace(canon=root, canon_ref="", canon_untrusted=False)
+        with mock.patch.object(canon.subprocess, "run") as run:
+            with self.assertRaises(pv.PrevalidationError) as caught:
+                calls.parameters(cfg, "ameesh", deadline=calls.Deadline(0.0))
+        self.assertEqual(caught.exception.cause, "run-incomplete")
+        run.assert_not_called()
+
     def test_an_expired_canon_read_is_run_incomplete(self):
         now = [100.0]
         deadline = calls.Deadline(5.0, clock=lambda: now[0])
