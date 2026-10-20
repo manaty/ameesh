@@ -271,28 +271,39 @@ EXEMPTIONS = (
     Exemption(
         path="src/ameesh/lot_class.py",
         parameter="reviews.exclude_author_family",
-        literal="*",
+        literal="True",
         name="lot #2726 (ameesh-dev3), 20/10",
         date="2026-10-20",
-        reason="repli en doute quand le canon est illisible (True) et état "
-               "initial d'`of_lot` avant la lecture (False) : ces littéraux ne "
-               "fournissent jamais la valeur du canon, toujours lue par "
-               "`_review_flags` puis écrasée ; le repli va dans le sens strict "
-               "(doute). Retrait quand lot_class lira un repli nommé du "
-               "lecteur.",
+        reason="repli en doute quand le canon est illisible : la direction "
+               "stricte (True), jamais une valeur du canon, toujours lue par "
+               "`_review_flags` puis écrasée. Valeur exacte : une exemption "
+               "large couvrirait un False affaiblissant. Retrait quand "
+               "lot_class lira un repli nommé du lecteur.",
+    ),
+    Exemption(
+        path="src/ameesh/lot_class.py",
+        parameter="reviews.exclude_author_family",
+        literal="False",
+        name="lot #2726 (ameesh-dev3), 20/10",
+        date="2026-10-20",
+        reason="état initial d'`of_lot` avant la lecture du canon, toujours "
+               "écrasé par `class_of_paths` dès qu'un canon est lisible ; les "
+               "retours précoces qui le gardent sont des doutes `sensitive`, "
+               "où la porte applique déjà l'exclusion de famille. Valeur "
+               "exacte : aucune autre valeur n'est couverte.",
     ),
     Exemption(
         path="src/ameesh/lot_class.py",
         parameter="reviews.distinct_families",
-        literal="*",
+        literal="True",
         name="lot #2726 (ameesh-dev3), 20/10",
         date="2026-10-20",
         reason="repli en doute quand le canon est illisible (True) et état "
                "initial d'`of_lot` avant la lecture (True) : ces littéraux ne "
                "fournissent jamais la valeur du canon, toujours lue par "
-               "`_review_flags` puis écrasée ; le repli va dans le sens strict "
-               "(doute). Retrait quand lot_class lira un repli nommé du "
-               "lecteur.",
+               "`_review_flags` puis écrasée ; la direction est stricte (deux "
+               "familles). Valeur exacte : une exemption large couvrirait un "
+               "False affaiblissant.",
     ),
 )
 
