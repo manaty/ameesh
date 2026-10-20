@@ -269,7 +269,7 @@ python_agents() { commande_agents /home/ameesh/.local/share/ameesh/venv/bin/pyth
 # est tué avant de récolter le chef, descendants compris.
 # #2198/N1 : l'enfant est dans sa propre session (start_new_session), donc le
 # signal reçu par le client (SIGINT/SIGTERM) ne l'atteint pas tout seul : on le
-# transmet au groupe de l'enfant, puis on sort avec le code du signal.
+# transmet au groupe de l'enfant, puis on meurt du signal reçu (#2578).
 appel_drain() {  # $1 : délai local ; $2… : commande
   python3 - "$@" <<'PY'
 import os, signal, subprocess, sys
@@ -313,7 +313,12 @@ except Interrompu as e:
         p.wait()
     print("appel de drain interrompu (signal %d transmis)" % e.signum,
           file=sys.stderr)
-    sys.exit(128 + e.signum)
+    # #2578 : mourir du signal reçu, comme l'enfant. Un code de sortie
+    # 128+sig est une sortie ordinaire : appelé directement (hors $(…) ou
+    # pipeline), le script de déploiement continuerait après le Ctrl-C ;
+    # bash n'arrête la commande en cours que si elle est tuée par le signal.
+    signal.signal(e.signum, signal.SIG_DFL)
+    os.kill(os.getpid(), e.signum)
 except subprocess.TimeoutExpired:
     tuer_groupe(signal.SIGKILL)
     p.wait()
