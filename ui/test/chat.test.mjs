@@ -47,6 +47,32 @@ test("the conversation shows the exchanges with the agent from its project and l
   assert.deepEqual(await violations(), []);
 });
 
+test("a selected lot still reads the project thread, where a reply without --lot lands", async () => {
+  const { client, fetch } = fixture({
+    "/api/v1/threads/ameesh": [200, { entries: [
+      { id: "p1", author: "human:ada", recipient: "agent:ada", text: "Project question", ts: stamp - 10 },
+      { id: "p2", author: "agent:ada", recipient: "human:ada", text: "Project answer", ts: stamp + 10 },
+      // the same exchange recorded in both threads is shown once (id|ts)
+      { id: "p0", author: "human:ada", recipient: "agent:ada", text: "Repeated question", ts: stamp - 5 },
+    ] }],
+    "/api/v1/threads/ameesh/7": [200, { entries: [
+      { id: "l1", author: "human:ada", recipient: "agent:ada", text: "Lot question", ts: stamp },
+      { id: "p0", author: "human:ada", recipient: "agent:ada", text: "Repeated question", ts: stamp - 5 },
+    ] }],
+  });
+  const el = await mount(client, { agent: "ada", lot: "7" });
+  const body = text(el);
+  assert.match(body, /Project answer/);
+  assert.ok(body.indexOf("Project question") < body.indexOf("Lot question"));
+  assert.ok(body.indexOf("Lot question") < body.indexOf("Project answer"));
+  assert.equal(body.split("Repeated question").length - 1, 1);
+  // the agent answered last: nothing waits, even with the lot selected
+  assert.doesNotMatch(body, /Waiting for the next turn/);
+  assert.ok(fetch.calls.some((c) => c.path === "/api/v1/threads/ameesh"));
+  assert.ok(fetch.calls.some((c) => c.path === "/api/v1/threads/ameesh/7"));
+  assert.deepEqual(await violations(), []);
+});
+
 test("a message is sent once to the shared conversation, then waits for the next turn", async () => {
   const { client, fetch } = fixture();
   const keys = [];
@@ -114,6 +140,49 @@ test("a paused agent: the message waits in its mailbox until resumed", async () 
   document.documentElement.lang = "fr";
   const el = await mount(client, { agent: "ada" });
   assert.match(text(el), /État de l'agent : En pause\. Votre message attend/);
+});
+
+test("a stopped agent: the send is refused at once, the screen asks to resume it", async () => {
+  const stopped = structuredClone(routes["/api/v1/projects"]);
+  stopped[1].projects[0].agents[0].state = "stopped";
+  stopped[1].projects[0].agents[0].status = "stopped";
+  const { client, fetch } = fixture({
+    "/api/v1/projects": stopped,
+    "/api/v1/threads/ameesh": [200, { entries: [
+      { id: "q", author: "human:ada", recipient: "agent:ada", text: "Hello", ts: stamp + 100 }] }],
+  });
+  document.documentElement.lang = "fr";
+  const el = await mount(client, { agent: "ada" });
+  assert.match(text(el), /État de l'agent : Arrêté\./);
+  assert.match(text(el), /reprenez d'abord l'agent avec `ameesh resume ada`/);
+  assert.doesNotMatch(text(el), /attend dans sa boîte/);
+  // the API refuses a stopped recipient (409 refused): the form is disabled
+  assert.equal(el.shadowRoot.querySelector("textarea").disabled, true);
+  assert.equal(el.shadowRoot.querySelector("form button").disabled, true);
+  el.draft = "Hello"; await settle(el);
+  await el.send();
+  assert.ok(!fetch.calls.some((c) => c.path === CHAT));
+});
+
+test("a dead agent: the message waits in its mailbox until the executor takes it back", async () => {
+  const dead = structuredClone(routes["/api/v1/projects"]);
+  dead[1].projects[0].agents[0].state = "stopped";   // `progress` merges dead into stopped
+  dead[1].projects[0].agents[0].status = "dead";
+  const { client, fetch } = fixture({
+    "/api/v1/projects": dead,
+    "/api/v1/threads/ameesh": [200, { entries: [
+      { id: "q", author: "human:ada", recipient: "agent:ada", text: "Hello", ts: stamp + 100 }] }],
+  });
+  document.documentElement.lang = "fr";
+  const el = await mount(client, { agent: "ada" });
+  assert.match(text(el), /État de l'agent : Hors ligne\./);
+  assert.match(text(el), /Le bail de l'agent a expiré/);
+  assert.doesNotMatch(text(el), /reprenez d'abord/);
+  // a dead lease is still queued, not a manual stop: the form stays usable
+  assert.equal(el.shadowRoot.querySelector("textarea").disabled, false);
+  el.draft = "Hello"; await settle(el);
+  el.shadowRoot.querySelector("form button").click(); await settle(el);
+  assert.ok(fetch.calls.some((c) => c.path === CHAT));
 });
 
 test("without an agent, the screen asks for one and sends nothing", async () => {

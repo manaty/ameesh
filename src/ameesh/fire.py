@@ -715,7 +715,8 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
         return False, ("class: release (%s) — the release procedure belongs to the pilot: "
                        "a fire never arms an automatic merge on a release"
                        % (klass.get("why") or "release")), klass
-    gate = merge_queue.review_gate(db, marks, frozen, repo=repo, klass=klass, item=row)
+    gate = merge_queue.review_gate(db, marks, frozen, repo=repo, klass=klass,
+                                   item=row, cfg=cfg, target=base)
     if not gate["ok"]:
         return False, gate["why"], klass
     return True, "", klass

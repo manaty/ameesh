@@ -184,7 +184,7 @@ def write_runner_seen(db, host, owner, names, *, admission_sql=None, admission_p
     """
     if names is not None and not names:
         return
-    selected = "host = %s AND mode = 'execute' AND status <> 'stopped'"
+    selected = "host = %s AND mode = 'execute'"
     if names is not None:
         selected += " AND name IN (%s)" % name_list(names)
     sql = f"""UPDATE agent_registry r
@@ -193,7 +193,7 @@ def write_runner_seen(db, host, owner, names, *, admission_sql=None, admission_p
                FROM (SELECT name FROM agent_registry WHERE {selected}
                      ORDER BY name FOR UPDATE) s
               WHERE r.name = s.name AND r.host = %s
-                AND r.mode = 'execute' AND r.status <> 'stopped'"""
+                AND r.mode = 'execute'"""
     params = [host, owner, host, host]
     if admission_sql is not None:
         sql += " AND (" + admission_sql + ")"
