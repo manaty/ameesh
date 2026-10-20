@@ -515,6 +515,10 @@ class AgentWorker(threading.Thread):
     #: #2814 : instant du dernier texte de pression écrit, pour ne pas
     #: réécrire `status_text` à chaque sondage (l'âge change à chaque seconde)
     _pressure_text_at = 0.0
+    #: #2810 : ids des messages que le tour choisi/en cours sert déjà. Un
+    #: NOTIFY pour l'un d'eux ne doit pas arrêter ce tour (son propre message).
+    #: Défaut de classe : une construction partielle ne doit pas lever.
+    _turn_mail_ids: frozenset[int] = frozenset()
 
     #: L76 : le processus résident de l'agent entre ses tours, ou None.
     #: Défaut de classe : les constructions partielles (`__new__` sans
@@ -631,6 +635,10 @@ class AgentWorker(threading.Thread):
         #: préemption reçue pendant la préparation).
         self.preempt_gen = 0
         self._preempt_lock = threading.Lock()
+        #: #2810 : messages que le tour choisi/en cours sert déjà, publiés sous
+        #: `_preempt_lock` — `request_preempt` les voit dans la même section
+        #: critique (le NOTIFY d'un message déjà servi n'arrête pas son tour).
+        self._turn_mail_ids: frozenset[int] = frozenset()
         self._refus_vus: set[int] = set()
         #: arrêt demandé avant la publication du Popen (point de passage unique)
         self.stop_requested = threading.Event()
@@ -1465,7 +1473,34 @@ class AgentWorker(threading.Thread):
             return True
         return self.retry_due() or self.idle_due()
 
-    def request_preempt(self) -> None:
+    def _servir(self, ids) -> None:
+        """#2810 : publie les messages que le tour choisi/en cours sert déjà.
+
+        L'écriture et la lecture par `request_preempt` partagent
+        `_preempt_lock` : un NOTIFY ne peut pas se glisser entre « ce tour
+        sert ce message » et la décision de le préempter.
+        """
+        noyau = frozenset(int(i) for i in (ids or ()) if i is not None)
+        verrou = getattr(self, "_preempt_lock", None)
+        if verrou is None:  # construction partielle (`__new__` des tests)
+            self._turn_mail_ids = noyau
+            return
+        with verrou:
+            self._turn_mail_ids = noyau
+
+    def serves_mail(self, message_id: int) -> bool:
+        """#2810 : le tour choisi/en cours sert-il déjà ce message ?
+
+        Lecture sous le verrou de préemption : la réponse ne peut pas être
+        démentie par un `_servir` concurrent avant la décision de l'appelant.
+        """
+        verrou = getattr(self, "_preempt_lock", None)
+        if verrou is None:
+            return int(message_id) in getattr(self, "_turn_mail_ids", frozenset())
+        with verrou:
+            return int(message_id) in self._turn_mail_ids
+
+    def request_preempt(self, message_id: int | None = None) -> bool:
         """Un message prioritaire préempte le tour en cours (0018, R19).
 
         Le tour est arrêté (SIGTERM bref puis SIGKILL), sa consigne repart en
@@ -1475,11 +1510,20 @@ class AgentWorker(threading.Thread):
         #2729 : la génération et le drapeau sont posés sous le même verrou que
         la consommation du début de tour — une demande ne peut donc pas tomber
         entre le test de génération et le `clear()`.
+
+        #2810 : le NOTIFY d'un message que ce tour sert DÉJÀ (`message_id`
+        dans `_turn_mail_ids`, dispatch traité après `_pick` ou après la
+        remise mi-tour) n'est pas une demande : il n'arrête pas son propre
+        tour. Rend True si la demande a été posée, False si elle était déjà
+        servie.
         """
         with self._preempt_lock:
+            if message_id is not None and int(message_id) in self._turn_mail_ids:
+                return False
             self.preempt_gen += 1
             self.preempting.set()
         self.wake.set()
+        return True
 
     def _preempt_monitor(self, done: threading.Event) -> None:
         """Arrête le harnais dès qu'un message prioritaire arrive (0018).
@@ -4444,7 +4488,11 @@ class AgentWorker(threading.Thread):
 
         Le tour porte son lot (`lot`, L26) quand il est déductible."""
         if self._attach_pending():
+            self._servir(())  # #2810 : aucun tour ne part
             return None
+        # #2810 : entre deux tours, rien n'est servi — un NOTIFY pour le
+        # message du tour précédent reste réglé par la génération de #2729.
+        self._servir(())
         # #2729 : frontière d'un tour ordinaire, prise AVANT la sélection.
         # Une demande qui entre pendant `_pick` — après la lecture des
         # urgents, donc hors de ce que le tour choisi sert — ne doit pas être
@@ -4465,6 +4513,7 @@ class AgentWorker(threading.Thread):
                 if spec.get("kind") == "prompt":
                     registry.restore_prompt(self.db, self.name, self.runner.runner_id,
                                             self.epoch)
+                self._servir(())  # #2810 : ce tour ne partira pas
                 return None
             # transportée par le spec : `rotate_for_lot` et les copies de
             # `_run_guarded_turn` la gardent (dict(spec, …)).
@@ -4959,10 +5008,16 @@ class AgentWorker(threading.Thread):
         """
         prompt, retenus, reste = mail.prompt_for(self.db, messages, kind=kind,
                                                  budget=self._budget_courrier())
+        ids = [int(m["id"]) for m in retenus if m.get("id") is not None]
+        # #2810 : le tour choisi sert ces messages. Publié sous le verrou de
+        # préemption : le NOTIFY de l'un d'eux, traité après `_pick`, ne
+        # l'arrêtera pas ; une demande pour un AUTRE message, elle, reste un
+        # arrêt (frontière de #2729, relue après `_pick` pour un urgent).
+        self._servir(ids)
         return {
             "kind": kind,
             "prompt": prompt,
-            "ids": [int(m["id"]) for m in retenus if m.get("id") is not None],
+            "ids": ids,
             "rows": retenus,
             "candidats": list(messages),
             "remaining": reste,
@@ -5086,21 +5141,25 @@ class AgentWorker(threading.Thread):
         self.fast_failure = False
         if (registry.get(self.db, self.name) or {}).get("operator_paused"):
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            self._servir(())  # #2810 : aucun tour ne part
             return False
         from .platform import process, session_lock
         if self._attach_pending():
             self.deferred_reason = "attach requested"
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            self._servir(())  # #2810 : le tour est reporté
             return None
         if getattr(self, "_session_lock", None) is None:
             self._session_lock = session_lock.try_lock(self.state_dir, "session-use")
             if self._session_lock is None:
                 self.deferred_reason = "session lock held"
                 registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+                self._servir(())  # #2810 : le tour est reporté
                 return None
         if self._attach_pending():
             self.deferred_reason = "attach requested"
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            self._servir(())  # #2810 : le tour est reporté
             return None
         self._session_turn_depth = getattr(self, "_session_turn_depth", 0) + 1
         # #2096 : le RSS avant le tour, pour ne rendre les arènes au noyau que
@@ -5109,6 +5168,10 @@ class AgentWorker(threading.Thread):
         try:
             return self._run_guarded_turn(spec)
         finally:
+            # #2810 : le tour est fini ; plus aucun message n'est servi. Un
+            # NOTIFY tardif reste réglé par la génération de #2729 (une demande
+            # antérieure à la sélection suivante est un résidu consommé).
+            self._servir(())
             self._session_turn_depth -= 1
             if not self._session_turn_depth:
                 try:
@@ -5221,6 +5284,7 @@ class AgentWorker(threading.Thread):
                 % (self.name, exc))
             return False
         if not reserves:
+            self._servir(())  # #2810 : aucun tour ne sert ces messages
             log("[%s] turn mail already reserved or delivered elsewhere, or lease "
                 "lost: turn cancelled" % self.name)
             return False
@@ -5229,6 +5293,9 @@ class AgentWorker(threading.Thread):
         prompt, inclus, _ = mail.prompt_for(self.db, reserves, kind=kind, budget=budget,
                                             extra_remaining=reste)
         ids = [int(m["id"]) for m in inclus]
+        # #2810 : ce tour sert exactement ces messages (la réservation peut
+        # différer de la sélection).
+        self._servir(ids)
         hors = [int(m["id"]) for m in reserves if int(m["id"]) not in ids]
         if hors:  # par construction vide ; jamais réservé sans être montré
             mail.release(self.db, self.name, jeton, hors)
@@ -8415,6 +8482,7 @@ class Runner:
                 self.wake_all.set()
                 return
             prioritaire = False
+            row = None
             if worker is not None and payload.get("id"):
                 row = mail.get(self.db, int(payload["id"]))
                 if row and mail.is_urgent(row):
@@ -8423,8 +8491,21 @@ class Runner:
                         log_async("urgent from %s without interruption: sender not "
                                   "allowed to interrupt" % (row.get("sender") or "?"))
             if worker and prioritaire:
-                worker.request_preempt()  # le signal d'abord
-                log_async("priority message for %s: interrupting the turn" % target)
+                mid = int(row["id"])
+                if row.get("delivered_ts") is not None:
+                    # #2810 : le message est déjà remis (hook mi-tour, ou tour
+                    # précédent) — il n'y a plus de tour à interrompre pour lui.
+                    worker.wake.set()
+                    log_async("priority message for %s already delivered: no "
+                              "interruption" % target)
+                elif worker.request_preempt(mid):  # le signal d'abord
+                    log_async("priority message for %s: interrupting the turn" % target)
+                else:
+                    # #2810 : son propre NOTIFY, traité après `_pick` (ou après
+                    # la remise) : le tour sert déjà ce message, l'arrêter ne
+                    # ferait que le re-livrer au tour suivant.
+                    log_async("priority message for %s already served by the turn: "
+                              "no interruption" % target)
             elif worker:
                 worker.wake.set()
                 log_async("message for %s: waking the turn" % target)
