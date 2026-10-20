@@ -624,6 +624,9 @@ def freeze_candidate(rows: list[dict], repo: str | None = None,
       et écarté, note `late-verdict-on-older-commit` (#1767) ;
     * gel postérieur à l'avis sur un autre commit : refus
       `freeze-after-verdict`, un nouvel avis est dû sur la tête gelée (#1283) ;
+      si un avis favorable nomme déjà cette tête, retour au gel déclaré,
+      note `returned-to-reviewed-head` (#2884), sous réserve des blocages
+      applicables sur cette tête, lus par relecteur ci-dessous ;
       si `repo` est fourni et que le delta du lot est **mécaniquement
       constant** entre la tête relue et la tête gelée (`rebase_identity`,
       #1905), l'avis est porté sur la tête gelée, note `mechanical-rebase` ;
@@ -671,8 +674,23 @@ def freeze_candidate(rows: list[dict], repo: str | None = None,
                 and any(same_commit(sha, b) for b in before))
 
     last = newest([v for v in verdicts if not late(v)])
+    # #2884 : retour explicite à une source déjà relue après une tête
+    # intermédiaire. Les avis acquis sur ce SHA restent valables ; le dernier
+    # avis toutes têtes confondues ne suffit pas à choisir le candidat.
+    returned = None
+    if (f_sha and last is not None
+            and f_at > float(last.get("at_ts") or 0)
+            and commit_id(last.get("sha"))
+            and not same_commit(f_sha, commit_id(last.get("sha")))):
+        returned = newest([v for v in verdicts
+                           if (v.get("verdict") or "ok") == "ok"
+                           and same_commit(commit_id(v.get("sha")), f_sha)])
+        if returned is not None:
+            last = returned
     out = {"sha": "", "origin": "", "declared": _freeze_mark(freeze),
            "verdict": _freeze_mark(last), "causes": [], "notes": []}
+    if returned is not None:
+        out["notes"].append("returned-to-reviewed-head")
     if any(late(v) for v in verdicts):
         out["notes"].append("late-verdict-on-older-commit")
     if freeze is not None and not f_sha:
