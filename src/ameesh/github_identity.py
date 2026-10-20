@@ -278,9 +278,11 @@ def _real(real, args, timeout=30):
 
 def _bool_opt(argv, name):
     """Valeur booléenne d'une option (`--x`, `--x=true`, `--x=false`), ou
-    False. Les valeurs des options à valeur sont sautées : `--body --x` est
-    un corps, pas l'option. Un `--` termine les options. Une valeur non
-    reconnue vaut True : le doute refuse."""
+    False. La **dernière** occurrence gagne, comme gh/pflag (`boolValue.Set`
+    réaffecte) : `--auto=false --auto` vaut vrai. Les valeurs des options à
+    valeur sont sautées : `--body --x` est un corps, pas l'option. Un `--`
+    termine les options. Une valeur non reconnue vaut True : le doute refuse."""
+    value = False
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -291,14 +293,14 @@ def _bool_opt(argv, name):
                 i += 2
                 continue
             if a == name:
-                return True
-            if a.startswith(name + "="):
+                value = True
+            elif a.startswith(name + "="):
                 v = a.partition("=")[2].strip().lower()
-                return v not in ("false", "0", "f", "no", "n")
+                value = v not in ("false", "0", "f", "no", "n")
             i += 1
             continue
         i += 1
-    return False
+    return value
 
 
 def _identity_of_url(url):

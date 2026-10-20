@@ -169,6 +169,21 @@ class RefusTest(Base):
         self.assertIn("--admin", sortie.stderr)
         self.assertEqual(self.appels(), [])
 
+    def test_auto_derniere_occurrence_vraie_refuse(self):
+        # gh/pflag retient la dernière occurrence : --auto=false --auto = vrai.
+        sortie = self.lancer("pr", "merge", "12", "--auto=false", "--auto")
+        self.assertEqual(sortie.returncode, 1, sortie.stderr)
+        self.assertIn("allow_auto_merge=false", sortie.stderr)
+
+    def test_admin_derniere_occurrence_vraie_refuse(self):
+        sortie = self.lancer(
+            "pr", "merge", "12", "--auto", "--admin=false", "--admin=true",
+            **self.info_repo(FAKE_PROT=json.dumps(
+                {"required_status_checks": {"contexts": ["tests"]}})))
+        self.assertEqual(sortie.returncode, 1, sortie.stderr)
+        self.assertIn("--admin", sortie.stderr)
+        self.assertEqual(self.appels(), [])
+
     def test_url_pr_et_repo_different_refuse(self):
         url = "https://github.com/manaty/nexlink/pull/1849"
         sortie = self.lancer(
@@ -264,6 +279,22 @@ class AutorisationTest(Base):
         sortie = self.lancer("pr", "merge", "12", "--auto=false")
         self.assertEqual(sortie.returncode, 3, sortie.stderr)
         self.assertEqual(self.appels(), ["pr merge 12 --auto=false"])
+
+    def test_auto_derniere_occurrence_fausse_autorise(self):
+        # la dernière occurrence est --auto=false : gh ne demande pas l'auto.
+        sortie = self.lancer("pr", "merge", "12", "--auto", "--auto=false")
+        self.assertEqual(sortie.returncode, 3, sortie.stderr)
+        self.assertEqual(self.appels(), ["pr merge 12 --auto --auto=false"])
+
+    def test_admin_derniere_occurrence_fausse_autorise(self):
+        sortie = self.lancer(
+            "pr", "merge", "12", "--auto", "--admin=true", "--admin=false",
+            **self.info_repo(FAKE_PROT=json.dumps(
+                {"required_status_checks": {"contexts": ["tests"]}})))
+        self.assertEqual(sortie.returncode, 3, sortie.stderr)
+        self.assertEqual(
+            self.appels()[-1],
+            "pr merge 12 --auto --admin=true --admin=false")
 
     def test_url_pr_et_repo_identique_autorise(self):
         url = "https://github.com/acme/private/pull/12"
