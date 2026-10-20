@@ -1113,7 +1113,9 @@ class PendingSpend(interface.PendingSpend):
     #: l'ancienne connexion a pu produire (0 à 6 décimales, les deux voisins
     #: en cas d'égalité car PostgreSQL arrondit au pair). Un tour étranger
     #: à un autre instant n'en fait pas partie, même à 0,2 s ; une clé ISO
-    #: (repli exact) est lue comme son époque.
+    #: (repli exact) est lue comme son époque. La ligne ou la réservation doit
+    #: aussi suivre le marqueur : au même arrondi d'une seconde, celle d'un
+    #: tour antérieur reste étrangère.
     _HISTORICAL_ROUNDINGS = 6
 
     def _get_sql(self) -> str:
@@ -1122,16 +1124,17 @@ class PendingSpend(interface.PendingSpend):
         La clé se retrouve par l'identité du tour, jamais par ordre temporel :
         `turn_id` exact ; sinon `started_at` (instant de pose du marqueur) ;
         sinon, pour une ligne d'avant 0423, l'époque portée par sa clé, qui
-        doit être un arrondi historique exact de l'instant du marqueur. L'index
-        de début seul ne prouve rien : il est réutilisé après une rotation du
-        flux, donc une réservation (ou une ligne) au même index mais à un autre
-        instant est étrangère. Elle n'est jamais retenue ; une réservation
-        étrangère sans candidat, une réservation étrangère encore ouverte, ou
-        une ligne étrangère au repli rendent la clé indémontrable
-        (`ledger_ambiguous`), et l'appelant suspend au lieu de deviner. Un
-        ancien worker peut écrire sa ligne APRÈS le marqueur de son remplaçant
-        (#1469) : la première ligne après `created_at` n'est pas forcément
-        celle du marqueur.
+        doit être un arrondi historique exact de l'instant du marqueur. Une
+        ligne ou une réservation antérieure au marqueur est étrangère, même
+        quand son arrondi tombe dans la même seconde. L'index de début seul ne
+        prouve rien : il est réutilisé après une rotation du flux, donc une
+        réservation (ou une ligne) au même index mais à un autre instant est
+        étrangère. Elle n'est jamais retenue ; une réservation étrangère sans
+        candidat, une réservation étrangère encore ouverte, ou une ligne
+        étrangère au repli rendent la clé indémontrable (`ledger_ambiguous`), et
+        l'appelant suspend au lieu de deviner. Un ancien worker peut écrire sa
+        ligne APRÈS le marqueur de son remplaçant (#1469) : la première ligne
+        après `created_at` n'est pas forcément celle du marqueur.
         """
         return f"""
 WITH marqueur_brut AS (
@@ -1157,12 +1160,15 @@ WITH marqueur_brut AS (
                   ORDER BY v) AS epoques
       FROM marqueur_brut m
 ), lignes_lues AS (
-    SELECT tc.spend_key, tc.turn_id, tc.started_at,
+    SELECT tc.spend_key, tc.turn_id, tc.started_at, tc.recorded_at,
            m.turn_id AS marqueur_turn_id,
            m.epoques AS epoques,
            (left(tc.spend_key,
                  length(m.agent || ':' || m.start_index || ':'))
                 = m.agent || ':' || m.start_index || ':') AS meme_index,
+           -- une ligne du tour ne peut pas précéder son marqueur : celle d'un
+           -- index réutilisé, même au même arrondi, est étrangère.
+           (tc.recorded_at >= m.created_at::timestamptz) AS posterieure,
            substr(tc.spend_key,
                   length(m.agent || ':' || m.start_index || ':') + 1) AS suffixe
       FROM turn_costs tc
@@ -1189,9 +1195,9 @@ WITH marqueur_brut AS (
              WHEN marqueur_turn_id IS NOT NULL
                   AND turn_id = marqueur_turn_id THEN 1
              WHEN turn_id IS NULL AND started_at IS NOT NULL AND meme_index
-                  AND debut_historique THEN 2
+                  AND posterieure AND debut_historique THEN 2
              WHEN turn_id IS NULL AND started_at IS NULL AND meme_index
-                  AND epoque_historique THEN 3
+                  AND posterieure AND epoque_historique THEN 3
            END AS rang
       FROM lignes_identifiees
 ), meilleur AS (
@@ -1201,22 +1207,25 @@ WITH marqueur_brut AS (
      WHERE rang = (SELECT rang FROM meilleur)
 ), lignes_etrangeres AS (
     -- repli sans turn_id ni started_at : l'époque de la clé doit être un
-    -- arrondi historique exact du marqueur, sinon c'est la ligne d'un index
-    -- réutilisé.
+    -- arrondi historique exact du marqueur et la ligne le suivre, sinon c'est
+    -- la ligne d'un index réutilisé.
     SELECT 1 FROM lignes_identifiees
      WHERE turn_id IS NULL AND started_at IS NULL AND meme_index
-       AND NOT epoque_historique
+       AND (NOT posterieure OR NOT epoque_historique)
 ), lignes_contradictoires AS (
     -- l'instant de début et l'époque de la clé désignent deux arrondis
     -- différents : aucune identité démontrable, même si un seul candidat sort.
     SELECT 1 FROM lignes_identifiees
      WHERE turn_id IS NULL AND started_at IS NOT NULL AND meme_index
-       AND debut_historique <> epoque_historique
+       AND posterieure AND debut_historique <> epoque_historique
 ), reservations_lues AS (
-    SELECT ar.spend_key, ar.state,
+    SELECT ar.spend_key, ar.state, ar.created_at AS pose,
            (left(ar.spend_key,
                  length(m.agent || ':' || m.start_index || ':'))
                 = m.agent || ':' || m.start_index || ':') AS meme_index,
+           -- une réservation du tour est prise APRÈS son marqueur : celle
+           -- d'un tour antérieur, même au même arrondi, est étrangère.
+           (ar.created_at >= m.created_at::timestamptz) AS posterieure,
            substr(ar.spend_key,
                   length(m.agent || ':' || m.start_index || ':') + 1) AS suffixe,
            m.epoques AS epoques
@@ -1234,14 +1243,16 @@ WITH marqueur_brut AS (
       FROM reservations_lues
 ), reservations AS (
     -- la réservation du tour porte un arrondi historique de l'époque du
-    -- marqueur dans sa clé : au même index, une réservation d'un autre
-    -- instant est étrangère.
+    -- marqueur dans sa clé et le suit : au même index, une réservation d'un
+    -- autre instant est étrangère.
     SELECT DISTINCT spend_key FROM reservations_identifiees
-     WHERE meme_index AND coalesce(cle_epoch = ANY(epoques), false)
+     WHERE meme_index AND posterieure
+       AND coalesce(cle_epoch = ANY(epoques), false)
 ), reservations_etrangeres AS (
     SELECT DISTINCT state FROM reservations_identifiees
      WHERE meme_index
-       AND NOT coalesce(cle_epoch = ANY(epoques), false)
+       AND (NOT posterieure
+            OR NOT coalesce(cle_epoch = ANY(epoques), false))
 ), candidats AS (
     SELECT spend_key FROM retenues WHERE spend_key IS NOT NULL
     UNION
@@ -1356,11 +1367,12 @@ SELECT m.agent, m.start_index, m.turn, m.model, m.work_item_id, m.turn_id,
         par ordre temporel : un ancien worker peut écrire sa ligne après le
         marqueur de son remplaçant (#1469). L'époque d'une clé historique est
         un arrondi float8 de l'instant du marqueur : elle est comparée aux
-        arrondis exacts possibles (0 à 6 décimales), jamais à une fenêtre.
-        Aucun candidat : la clé exacte du marqueur. Candidats incohérents,
-        réservation étrangère sans candidat ou encore ouverte, ligne étrangère
-        au repli : `ledger_key` NULL et `ledger_ambiguous` vrai — l'appelant
-        suspend, il ne devine pas.
+        arrondis exacts possibles (0 à 6 décimales), jamais à une fenêtre ; la
+        ligne ou la réservation doit aussi suivre le marqueur, sinon elle est
+        étrangère même au même arrondi d'une seconde. Aucun candidat : la clé
+        exacte du marqueur. Candidats incohérents, réservation étrangère sans
+        candidat ou encore ouverte, ligne étrangère au repli : `ledger_key`
+        NULL et `ledger_ambiguous` vrai — l'appelant suspend, il ne devine pas.
 
         Une seule instruction : le marqueur lu et la clé résolue voient le
         même état, même si un remplaçant écrit entre-temps.

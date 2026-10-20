@@ -684,6 +684,63 @@ class PendingSpendExactTest(PgTestCase):
         finally:
             db.close()
 
+    def test_reservation_etrangere_meme_seconde_avant_le_marqueur(self):
+        """B1 : au même arrondi d'une seconde, une réservation antérieure au
+        marqueur ne peut pas être celle de ce tour (la réservation suit la
+        pose du marqueur) ; elle suspend au lieu d'être retenue."""
+        db = self._db(-5)
+        try:
+            name = "rounded-before-res"
+            marker = self._legacy_marker_at(db, name, offset="0.456789")
+            key = self._historical_key(name, marker)
+            db.execute(
+                "INSERT INTO account_reservations (billing_account, agent, usd,"
+                " period, state, spend_key, created_at)"
+                " VALUES ('deepseek-manaty', %s, 2.0, current_date, 'open',"
+                " %s, %s::timestamptz - interval '0.2 seconds')",
+                (name, key, marker["created_at"]))
+
+            relu = registry.pending_spend_get(db, name)
+            self.assertTrue(relu["ledger_ambiguous"])
+            self.assertIsNone(relu["ledger_key"],
+                              "une réservation antérieure au marqueur a été retenue")
+            worker = self._worker(db, name)
+            self.assertFalse(worker._compta_ecrit(relu))
+            self.assertIsNotNone(registry.pending_spend_get(db, name))
+            self.assertEqual(
+                db.query("SELECT count(*) AS n FROM turn_costs WHERE agent = %s",
+                         (name,))[0]["n"], 0)
+        finally:
+            db.close()
+
+    def test_ligne_etrangere_meme_arrondi_avant_le_marqueur(self):
+        """B1 : une ligne du même arrondi mais antérieure au marqueur est
+        étrangère ; la retenir attribuerait la clé d'un tour révolu."""
+        db = self._db(-5)
+        try:
+            name = "rounded-before-row"
+            marker = self._legacy_marker_at(db, name, offset="0.456789")
+            key = self._historical_key(name, marker)
+            db.execute(
+                "INSERT INTO turn_costs (agent, harness, turn, model, usd,"
+                " spend_key, recorded_at)"
+                " VALUES (%s, 'deepseek', 'tour', 'm', 1.5, %s,"
+                " %s::timestamptz - interval '0.2 seconds')",
+                (name, key, marker["created_at"]))
+
+            relu = registry.pending_spend_get(db, name)
+            self.assertTrue(relu["ledger_ambiguous"])
+            self.assertIsNone(relu["ledger_key"],
+                              "une ligne antérieure au marqueur a été retenue")
+            worker = self._worker(db, name)
+            self.assertFalse(worker._compta_ecrit(relu))
+            self.assertIsNotNone(registry.pending_spend_get(db, name))
+            self.assertEqual(
+                db.query("SELECT count(*) AS n FROM turn_costs WHERE agent = %s",
+                         (name,))[0]["n"], 1)
+        finally:
+            db.close()
+
     def test_ligne_avant_0423_arrondie_est_retrouvee(self):
         """B1 : `started_at` et clé arrondis à la seconde désignent le tour.
 
