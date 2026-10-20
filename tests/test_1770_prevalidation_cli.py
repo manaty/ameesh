@@ -217,6 +217,29 @@ class ValidateTest(unittest.TestCase):
         self.assertEqual(report["tree"],
                          {"head": A, "snapshot": C, "plan": "plan.json"})
 
+    def test_une_echeance_borne_le_geste_jusqu_a_l_offload(self):
+        # #2665/B1 cx2 : l'échéance traverse validate jusqu'au runner réel ;
+        # l'attente locale du client est tuée et le rapport est indisponible,
+        # jamais vert.
+        seen = {}
+
+        def runner(argv, **kwargs):
+            seen["timeout"] = kwargs.get("timeout")
+            seen["wait_timeout"] = argv[argv.index("--wait-timeout") + 1]
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+        report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
+                             params=params(), repo=self.tmp.name, runner=runner,
+                             snapshotter=snapshot_for(),
+                             git_runner=git_runner_for(),
+                             deadline=pv.Deadline(30.0))
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["outcome"], "run-incomplete")
+        self.assertIn("run-incomplete", report["causes"])
+        self.assertEqual(report["exit"], 124)
+        self.assertGreater(seen["timeout"], 30.0)
+        self.assertGreater(int(seen["wait_timeout"]), 0)
+
     def test_lanceur_de_part_du_bloc_dans_la_commande(self):
         """Le bloc nomme le lanceur de part : il part tel quel sur la VM."""
         seen: list = []

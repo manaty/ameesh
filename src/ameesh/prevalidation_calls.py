@@ -49,6 +49,7 @@ from dataclasses import dataclass, replace
 
 from . import canon as canon_mod
 from . import land, lot_class, mechanics, plan_git, prevalidation, registry, work
+from .deadline import Deadline
 
 #: le calculateur du plan L161f, lu dans l'arbre du candidat (convention ameesh)
 PLAN_SCRIPT = "scripts/test-plan.py"
@@ -76,32 +77,6 @@ TRAIN_RUN_TIMEOUT = 1200
 TRAIN_LOCK_MARGIN = 300.0
 #: borne du nettoyage d'un arbre préparé (retrait du worktree git)
 TRAIN_CLEANUP_TIMEOUT = 120
-
-
-class Deadline:
-    """Une échéance monotone partagée par les étapes d'un même passage.
-
-    Les plafonds par opération ne composent pas une borne : chaque étape lit
-    ici le temps qui lui reste, jamais son seul plafond. ``expired`` arrête
-    les étapes suivantes ; une échéance épuisée est une indisponibilité
-    (``run-incomplete``), jamais un rouge. ``clock`` est injectable pour que
-    la borne se teste sans dormir.
-    """
-
-    def __init__(self, budget: float, clock=time.monotonic):
-        self.clock = clock
-        self.started = clock()
-        self.at = self.started + max(0.0, float(budget))
-
-    def remaining(self) -> float:
-        return max(0.0, self.at - self.clock())
-
-    def timeout(self, cap: float) -> float:
-        """Le délai d'une commande : ``cap``, jamais au-delà de l'échéance."""
-        return min(float(cap), self.remaining())
-
-    def expired(self) -> bool:
-        return self.remaining() <= 0.0
 
 
 def train_deadline(clock=time.monotonic) -> Deadline:
@@ -581,7 +556,8 @@ def _run_hosts(prepared: Prepared, params: Parameters, *, lot: int, head: str,
             report = check(
                 lot=lot, plan_path=prepared.path, head=head, host=host,
                 params=attempt.params, base=base, repo=prepared.tree,
-                published_ref=branch, profile=profile, executable=executable)
+                published_ref=branch, profile=profile, executable=executable,
+                deadline=deadline)
         except prevalidation.PrevalidationError as exc:
             if exc.cause in RETRYABLE and index + 1 < len(hosts):
                 if deadline is not None and deadline.expired():

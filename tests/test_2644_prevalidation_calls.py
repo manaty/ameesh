@@ -634,6 +634,8 @@ class HostFallbackTest(unittest.TestCase):
         seen = []
 
         def check(**kwargs):
+            # l'échéance atteint le geste complet (validate → run_offload)
+            self.assertIs(kwargs.get("deadline"), deadline)
             seen.append(kwargs["params"].timeout_seconds)
             now[0] += 80.0
             return report(ok=False, causes=("no-vm",), outcome="no-vm")

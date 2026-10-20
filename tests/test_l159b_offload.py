@@ -309,6 +309,20 @@ class RunTest(OffloadBase):
         self.assertIn("timeout", res.stderr)
         self.assertFalse(os.path.exists(marker))
 
+    def test_wait_timeout_cancels_the_job_and_bounds_the_client(self):
+        # #2665/B1 cx2 : --timeout ne borne que le job à partir de son slot ;
+        # --wait-timeout borne l'attente locale (slot, transport, push) et
+        # annule le job côté VM avant de rendre la main.
+        began = time.time()
+        res = self.offload("run", "--wait-timeout", "2", "--", "sh", "-c", "sleep 30")
+        self.assertEqual(res.returncode, 124, res.stderr)
+        self.assertIn("no result within", res.stderr)
+        self.assertLess(time.time() - began, 20)
+        deadline = time.time() + 10
+        while time.time() < deadline and self.running_jobs():
+            time.sleep(0.2)
+        self.assertEqual(self.running_jobs(), [])
+
     def test_hooks_and_setup_are_supervised_by_the_job_deadline(self):
         after = os.path.join(self.tmp, "after.log")
         self.write_profile("slowdb", {"before": "sleep 30",
@@ -325,6 +339,25 @@ class RunTest(OffloadBase):
         cache = os.path.join(self.vm, "cache", "slowdeps")
         self.assertFalse(any(os.path.exists(os.path.join(cache, d, ".ready"))
                              for d in os.listdir(cache)))
+
+
+class ClientWaitTest(unittest.TestCase):
+    def test_the_snapshot_push_is_bounded_before_any_network_call(self):
+        # #2665/B1 cx2 : l'échéance du client couvre aussi le push du
+        # snapshot, pas seulement l'attente du résultat.
+        class Remote:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                raise AssertionError("aucun appel réseau attendu")
+
+        remote = Remote()
+        with self.assertRaises(offload.ClientTimeout):
+            offload.push(remote, "/repo", "acme-widget", "a" * 40,
+                         deadline=time.monotonic() - 1)
+        self.assertEqual(remote.calls, [])
 
 
 class FallbackTest(OffloadBase):

@@ -10,7 +10,9 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 import ameesh.prevalidation  # noqa: F401  (preuve du chargement du fichier, plan L161f #1339)
 from ameesh import offload, prevalidation as pv
@@ -416,6 +418,42 @@ class RunTest(unittest.TestCase):
         result = pv.run_offload("vm-agents-1", "echo coupe", runner=lambda *a, **k: Fake())
         self.assertEqual(result["outcome"], "gate-preempted")
         self.assertEqual(result["flow"]["fins"], ("succes",))
+
+    def test_run_offload_borne_l_attente_locale(self):
+        # #2665/B1 cx2 : l'échéance du passage atteint le runner réel, pas
+        # seulement le timeout du job distant ; le client reçoit un
+        # --wait-timeout pour annuler son job avant le garde-fou local.
+        seen = {}
+
+        def runner(argv, **kwargs):
+            seen["timeout"] = kwargs.get("timeout")
+            seen["wait_timeout"] = argv[argv.index("--wait-timeout") + 1]
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+        result = pv.run_offload("vm-agents-1", "echo", timeout=120,
+                                deadline=pv.Deadline(30.0), runner=runner)
+        self.assertEqual(result["outcome"], "run-incomplete")
+        self.assertEqual(result["exit"], 124)
+        self.assertGreater(seen["timeout"], 30.0)
+        self.assertLessEqual(seen["timeout"], 30.0 + pv.OFFLOAD_LOCAL_GRACE_S)
+        self.assertGreater(int(seen["wait_timeout"]), 0)
+
+    def test_run_offload_attente_locale_reellement_tuee(self):
+        # Le vrai subprocess.run est le juge : une commande qui dort plus que
+        # le budget local est tuée et rend un run-incomplete, pas un blocage.
+        started = time.monotonic()
+
+        def runner(argv, **kwargs):
+            return subprocess.run(["sleep", "5"], timeout=kwargs.get("timeout"),
+                                  capture_output=True, text=True)
+
+        with mock.patch.object(pv, "OFFLOAD_LOCAL_GRACE_S", 0.1):
+            result = pv.run_offload("vm-agents-1", "echo", deadline=pv.Deadline(0.05),
+                                    runner=runner)
+        self.assertEqual(result["outcome"], "run-incomplete")
+        self.assertEqual(result["exit"], 124)
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertIsNotNone(result["seconds"])
 
 
 class SnapshotIdentityTest(unittest.TestCase):
