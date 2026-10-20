@@ -1104,13 +1104,17 @@ class PendingSpend(interface.PendingSpend):
         " 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')")
 
     #: #2166/B1 : l'instant de pose du marqueur vit aussi dans `started_at`
-    #: et dans l'époque de la clé historique (`agent:index:epoch`). Cet
-    #: instant pouvait être imprimé par une connexion à `extra_float_digits`
-    #: réduit avant d'être formaté (0 → ~4 µs, -5 → ~123 ms) : 200 ms couvre
-    #: ces arrondis sans confondre deux tours réels. Un index de début
-    #: réutilisé vient d'un tour antérieur, séparé de secondes : sa clé, elle,
-    #: n'est pas celle du marqueur.
-    _TIME_TOLERANCE_S = 0.2
+    #: et dans l'époque de la clé historique (`agent:index:epoch`). Cette clé
+    #: a été écrite par une connexion dont `extra_float_digits` pouvait être
+    #: réduit : à -5, PostgreSQL n'imprime que 10 chiffres significatifs, soit
+    #: la seconde entière pour une époque actuelle (~1,8e9 s) — un arrondi
+    #: pouvant atteindre 0,5 s, pas 123 ms. On ne compare donc pas à une
+    #: fenêtre : l'époque de la clé doit être EXACTEMENT l'un des arrondis que
+    #: l'ancienne connexion a pu produire (0 à 6 décimales, les deux voisins
+    #: en cas d'égalité car PostgreSQL arrondit au pair). Un tour étranger
+    #: à un autre instant n'en fait pas partie, même à 0,2 s ; une clé ISO
+    #: (repli exact) est lue comme son époque.
+    _HISTORICAL_ROUNDINGS = 6
 
     def _get_sql(self) -> str:
         """`get` en UNE instruction : marqueur et clé durable du MÊME état.
@@ -1118,101 +1122,126 @@ class PendingSpend(interface.PendingSpend):
         La clé se retrouve par l'identité du tour, jamais par ordre temporel :
         `turn_id` exact ; sinon `started_at` (instant de pose du marqueur) ;
         sinon, pour une ligne d'avant 0423, l'époque portée par sa clé, qui
-        doit être celle du marqueur. L'index de début seul ne prouve rien : il
-        est réutilisé après une rotation du flux, donc une réservation (ou une
-        ligne) au même index mais à un autre instant est étrangère. Elle n'est
-        jamais retenue ; une réservation étrangère sans candidat, une
-        réservation étrangère encore ouverte, ou une ligne étrangère au
-        repli rendent la clé indémontrable (`ledger_ambiguous`), et l'appelant
-        suspend au lieu de deviner. Un ancien worker peut écrire sa ligne APRÈS
-        le marqueur de son remplaçant (#1469) : la première ligne après
-        `created_at` n'est pas forcément celle du marqueur.
+        doit être un arrondi historique exact de l'instant du marqueur. L'index
+        de début seul ne prouve rien : il est réutilisé après une rotation du
+        flux, donc une réservation (ou une ligne) au même index mais à un autre
+        instant est étrangère. Elle n'est jamais retenue ; une réservation
+        étrangère sans candidat, une réservation étrangère encore ouverte, ou
+        une ligne étrangère au repli rendent la clé indémontrable
+        (`ledger_ambiguous`), et l'appelant suspend au lieu de deviner. Un
+        ancien worker peut écrire sa ligne APRÈS le marqueur de son remplaçant
+        (#1469) : la première ligne après `created_at` n'est pas forcément
+        celle du marqueur.
         """
-        return """
-WITH marqueur AS (
+        return f"""
+WITH marqueur_brut AS (
     SELECT agent, start_index, turn, model, work_item_id, turn_id,
            resident_usage, spend_key,
-           """ + self._EXACT_CREATED_AT + """ AS created_at,
+           {self._EXACT_CREATED_AT} AS created_at,
            extract(epoch from created_at)::float8 AS created_ts,
-           extract(epoch from created_at)::numeric AS epoch,
-           %s::numeric AS tolerance
+           extract(epoch from created_at)::numeric AS epoch
       FROM spend_pending WHERE agent = %s
-), lignes AS (
+), marqueur AS (
+    SELECT m.*,
+           ARRAY(SELECT v
+                   FROM generate_series(0, {self._HISTORICAL_ROUNDINGS}) AS g(d)
+                   CROSS JOIN LATERAL (
+                       SELECT round(m.epoch, d) AS v
+                       UNION
+                       -- égalité exacte : PostgreSQL arrondit au pair, donc
+                       -- les deux voisins sont des sorties possibles
+                       SELECT floor(m.epoch * power(10::numeric, d))
+                              / power(10::numeric, d)
+                        WHERE mod(m.epoch * power(10::numeric, d), 1) = 0.5
+                   ) AS candidat
+                  ORDER BY v) AS epoques
+      FROM marqueur_brut m
+), lignes_lues AS (
     SELECT tc.spend_key, tc.turn_id, tc.started_at,
            m.turn_id AS marqueur_turn_id,
-           m.epoch AS marqueur_epoch,
-           m.tolerance AS tolerance,
+           m.epoques AS epoques,
            (left(tc.spend_key,
                  length(m.agent || ':' || m.start_index || ':'))
                 = m.agent || ':' || m.start_index || ':') AS meme_index,
-           CASE WHEN split_part(tc.spend_key, ':', 3)
-                     ~ '^[0-9]+([.][0-9]+)?$'
-                THEN split_part(tc.spend_key, ':', 3)::numeric
-           END AS cle_epoch
+           substr(tc.spend_key,
+                  length(m.agent || ':' || m.start_index || ':') + 1) AS suffixe
       FROM turn_costs tc
       JOIN marqueur m ON tc.agent = m.agent
      WHERE m.spend_key IS NULL
+), lignes AS (
+    SELECT *,
+           CASE WHEN suffixe ~ '^[0-9]+([.][0-9]+)?$'
+                THEN suffixe::numeric
+                WHEN suffixe ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T'
+                              '[0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}}[.][0-9]{{6}}Z$'
+                THEN extract(epoch from suffixe::timestamptz)::numeric
+           END AS cle_epoch
+      FROM lignes_lues
+), lignes_identifiees AS (
+    SELECT *,
+           coalesce(cle_epoch = ANY(epoques), false) AS epoque_historique,
+           coalesce(extract(epoch from started_at)::numeric = ANY(epoques),
+                    false) AS debut_historique
+      FROM lignes
 ), lignes_retenues AS (
     SELECT DISTINCT spend_key,
            CASE
              WHEN marqueur_turn_id IS NOT NULL
                   AND turn_id = marqueur_turn_id THEN 1
-             WHEN turn_id IS NULL AND started_at IS NOT NULL
-                  AND abs(extract(epoch from started_at) - marqueur_epoch)
-                      <= tolerance THEN 2
+             WHEN turn_id IS NULL AND started_at IS NOT NULL AND meme_index
+                  AND debut_historique THEN 2
              WHEN turn_id IS NULL AND started_at IS NULL AND meme_index
-                  AND cle_epoch IS NOT NULL
-                  AND abs(cle_epoch - marqueur_epoch) <= tolerance THEN 3
+                  AND epoque_historique THEN 3
            END AS rang
-      FROM lignes
+      FROM lignes_identifiees
 ), meilleur AS (
     SELECT min(rang) AS rang FROM lignes_retenues
 ), retenues AS (
     SELECT DISTINCT spend_key FROM lignes_retenues
      WHERE rang = (SELECT rang FROM meilleur)
 ), lignes_etrangeres AS (
-    -- repli sans turn_id ni started_at : l'époque de la clé doit être celle
-    -- du marqueur, sinon c'est la ligne d'un index réutilisé.
-    SELECT 1 FROM lignes
+    -- repli sans turn_id ni started_at : l'époque de la clé doit être un
+    -- arrondi historique exact du marqueur, sinon c'est la ligne d'un index
+    -- réutilisé.
+    SELECT 1 FROM lignes_identifiees
      WHERE turn_id IS NULL AND started_at IS NULL AND meme_index
-       AND (cle_epoch IS NULL
-            OR abs(cle_epoch - marqueur_epoch) > tolerance)
+       AND NOT epoque_historique
 ), lignes_contradictoires AS (
-    -- l'instant de début et l'époque de la clé se contredisent : aucune
-    -- identité démontrable, même si un seul candidat en sort.
-    SELECT 1 FROM lignes
-     WHERE turn_id IS NULL AND started_at IS NOT NULL
-       AND ((abs(extract(epoch from started_at) - marqueur_epoch) <= tolerance
-             AND (cle_epoch IS NULL
-                  OR abs(cle_epoch - marqueur_epoch) > tolerance))
-            OR (abs(extract(epoch from started_at) - marqueur_epoch) > tolerance
-                AND cle_epoch IS NOT NULL
-                AND abs(cle_epoch - marqueur_epoch) <= tolerance))
+    -- l'instant de début et l'époque de la clé désignent deux arrondis
+    -- différents : aucune identité démontrable, même si un seul candidat sort.
+    SELECT 1 FROM lignes_identifiees
+     WHERE turn_id IS NULL AND started_at IS NOT NULL AND meme_index
+       AND debut_historique <> epoque_historique
 ), reservations_lues AS (
     SELECT ar.spend_key, ar.state,
            (left(ar.spend_key,
                  length(m.agent || ':' || m.start_index || ':'))
                 = m.agent || ':' || m.start_index || ':') AS meme_index,
-           CASE WHEN split_part(ar.spend_key, ':', 3)
-                     ~ '^[0-9]+([.][0-9]+)?$'
-                THEN split_part(ar.spend_key, ':', 3)::numeric
-           END AS cle_epoch,
-           m.epoch AS marqueur_epoch,
-           m.tolerance AS tolerance
+           substr(ar.spend_key,
+                  length(m.agent || ':' || m.start_index || ':') + 1) AS suffixe,
+           m.epoques AS epoques
       FROM account_reservations ar
       JOIN marqueur m ON ar.agent = m.agent
      WHERE m.spend_key IS NULL
+), reservations_identifiees AS (
+    SELECT *,
+           CASE WHEN suffixe ~ '^[0-9]+([.][0-9]+)?$'
+                THEN suffixe::numeric
+                WHEN suffixe ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T'
+                              '[0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}}[.][0-9]{{6}}Z$'
+                THEN extract(epoch from suffixe::timestamptz)::numeric
+           END AS cle_epoch
+      FROM reservations_lues
 ), reservations AS (
-    -- la réservation du tour porte l'époque du marqueur dans sa clé : au
-    -- même index, une réservation d'un autre instant est étrangère.
-    SELECT DISTINCT spend_key FROM reservations_lues
-     WHERE meme_index AND cle_epoch IS NOT NULL
-       AND abs(cle_epoch - marqueur_epoch) <= tolerance
+    -- la réservation du tour porte un arrondi historique de l'époque du
+    -- marqueur dans sa clé : au même index, une réservation d'un autre
+    -- instant est étrangère.
+    SELECT DISTINCT spend_key FROM reservations_identifiees
+     WHERE meme_index AND coalesce(cle_epoch = ANY(epoques), false)
 ), reservations_etrangeres AS (
-    SELECT DISTINCT state FROM reservations_lues
+    SELECT DISTINCT state FROM reservations_identifiees
      WHERE meme_index
-       AND (cle_epoch IS NULL
-            OR abs(cle_epoch - marqueur_epoch) > tolerance)
+       AND NOT coalesce(cle_epoch = ANY(epoques), false)
 ), candidats AS (
     SELECT spend_key FROM retenues WHERE spend_key IS NOT NULL
     UNION
@@ -1325,17 +1354,20 @@ SELECT m.agent, m.start_index, m.turn, m.model, m.work_item_id, m.turn_id,
         retrouvée par son identité (`turn_id`, `started_at`, époque de la clé),
         jamais par le seul index de début (réutilisé après une rotation) ni
         par ordre temporel : un ancien worker peut écrire sa ligne après le
-        marqueur de son remplaçant (#1469). Aucun candidat : la clé exacte du
-        marqueur. Candidats incohérents, réservation étrangère sans candidat
-        ou encore ouverte, ligne étrangère au repli : `ledger_key` NULL et
-        `ledger_ambiguous` vrai — l'appelant suspend, il ne devine pas.
+        marqueur de son remplaçant (#1469). L'époque d'une clé historique est
+        un arrondi float8 de l'instant du marqueur : elle est comparée aux
+        arrondis exacts possibles (0 à 6 décimales), jamais à une fenêtre.
+        Aucun candidat : la clé exacte du marqueur. Candidats incohérents,
+        réservation étrangère sans candidat ou encore ouverte, ligne étrangère
+        au repli : `ledger_key` NULL et `ledger_ambiguous` vrai — l'appelant
+        suspend, il ne devine pas.
 
         Une seule instruction : le marqueur lu et la clé résolue voient le
         même état, même si un remplaçant écrit entre-temps.
         """
         rows = self.db.query(
             self._get_sql(),
-            (self._TIME_TOLERANCE_S, name),
+            (name,),
         )
         if not rows:
             return None

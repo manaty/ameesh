@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 from urllib.parse import quote
 
@@ -315,6 +316,28 @@ class PendingSpendExactTest(PgTestCase):
         self.assertIsNone(marker["spend_key"])
         return marker
 
+    @staticmethod
+    def _epoch(created_at: str) -> float:
+        return datetime.strptime(
+            created_at, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+                tzinfo=timezone.utc).timestamp()
+
+    def _legacy_marker_at(self, db, name: str, *, offset: str,
+                          turn_id: str | None = None) -> dict:
+        """Marqueur d'avant 0471 posé à `seconde tronquée + offset`."""
+        db.execute(
+            "INSERT INTO spend_pending (agent, start_index, turn, model, turn_id,"
+            " created_at) VALUES (%s, 0, 'tour', 'm', %s,"
+            " date_trunc('second', now()) - interval '5 minutes'"
+            " + %s::interval)", (name, turn_id, offset))
+        marker = registry.pending_spend_get(db, name)
+        self.assertIsNone(marker["spend_key"])
+        return marker
+
+    def _historical_key(self, name: str, marker: dict) -> str:
+        """La clé écrite par l'ancien exécuteur, à la précision de sa connexion."""
+        return "%s:0:%.6f" % (name, float(marker["created_ts"]))
+
     def test_reparation_avant_0471_ignore_une_ligne_ancienne_tardive(self):
         """B1 : la ligne d'un ancien worker écrite APRÈS le marqueur B n'est
         pas celle de B ; sa réservation ouverte, elle, identifie B.
@@ -574,6 +597,161 @@ class PendingSpendExactTest(PgTestCase):
             self.assertEqual(
                 db.query("SELECT count(*) AS n FROM turn_costs WHERE agent = %s",
                          (name,))[0]["n"], 1)
+        finally:
+            db.close()
+
+    def test_cle_historique_arrondie_a_la_seconde_est_retrouvee(self):
+        """B1 : `extra_float_digits=-5` arrondit l'époque à la seconde entière.
+
+        À 10 chiffres significatifs, une époque actuelle (~1,8e9 s) perd ses
+        décimales : la clé authentique vaut `…:S.000000`, à 0,5 s près du
+        marqueur, pas à 123 ms. Elle doit être retrouvée par l'arrondi exact
+        (vers le bas, vers le haut, aux bornes), pas par une fenêtre.
+        """
+        for offset in ("0.456789", "0.499999", "0.500000", "0.500001",
+                       "0.567890"):
+            with self.subTest(offset=offset):
+                db = self._db(-5)
+                try:
+                    name = "rounded" + offset.replace(".", "")
+                    marker = self._legacy_marker_at(db, name, offset=offset,
+                                                    turn_id="B")
+                    key = self._historical_key(name, marker)
+                    self.assertTrue(key.endswith(".000000"),
+                                    "la clé n'a pas été arrondie à la seconde")
+                    exact = self._epoch(marker["created_at"])
+                    key_epoch = float(key.rsplit(":", 1)[1])
+                    self.assertGreater(
+                        abs(key_epoch - exact), 0.2,
+                        "le cas ne dépasse pas l'ancienne tolérance")
+                    self.assertLess(abs(key_epoch - exact), 0.5 + 1e-6)
+                    db.execute(
+                        "INSERT INTO account_reservations (billing_account, agent,"
+                        " usd, period, state, spend_key, created_at)"
+                        " VALUES ('deepseek-manaty', %s, 2.0, current_date,"
+                        " 'open', %s, now())", (name, key))
+
+                    relu = registry.pending_spend_get(db, name)
+                    self.assertFalse(relu["ledger_ambiguous"],
+                                     "la clé authentique a été jugée étrangère")
+                    self.assertEqual(relu["ledger_key"], key)
+
+                    worker = self._worker(db, name)
+                    self.assertTrue(worker._compta_ecrit(relu))
+                    self.assertIsNone(registry.pending_spend_get(db, name))
+                    lignes = db.query(
+                        "SELECT spend_key FROM turn_costs WHERE agent = %s",
+                        (name,))
+                    self.assertEqual([ligne["spend_key"] for ligne in lignes], [key])
+                    reservation = db.query(
+                        "SELECT state FROM account_reservations WHERE spend_key = %s",
+                        (key,))[0]
+                    self.assertEqual(reservation["state"], "kept")
+                finally:
+                    db.close()
+
+    def test_cle_historique_ne_s_elargit_pas_a_une_fenetre(self):
+        """B1 : une clé étrangère à 0,1 s n'est pas un arrondi du marqueur.
+
+        L'ancienne fenêtre de 200 ms l'aurait retenue ; l'identité se prouve
+        par égalité avec un arrondi historique possible, jamais par proximité.
+        """
+        db = self._db(-5)
+        try:
+            name = "rounded-foreign"
+            marker = self._legacy_marker_at(db, name, offset="0.456789")
+            exact = self._epoch(marker["created_at"])
+            foreign_epoch = exact - 0.1
+            foreign = "%s:0:%.6f" % (name, foreign_epoch)
+            self.assertLess(abs(foreign_epoch - exact), 0.2,
+                            "le cas n'éprouve pas l'ancienne fenêtre")
+            db.execute(
+                "INSERT INTO account_reservations (billing_account, agent, usd,"
+                " period, state, spend_key, created_at)"
+                " VALUES ('deepseek-manaty', %s, 2.0, current_date, 'open', %s,"
+                " now())", (name, foreign))
+
+            relu = registry.pending_spend_get(db, name)
+            self.assertTrue(relu["ledger_ambiguous"])
+            self.assertIsNone(relu["ledger_key"],
+                              "une réservation étrangère à 0,1 s a été retenue")
+            worker = self._worker(db, name)
+            self.assertFalse(worker._compta_ecrit(relu))
+            self.assertIsNotNone(registry.pending_spend_get(db, name))
+            self.assertEqual(
+                db.query("SELECT count(*) AS n FROM turn_costs WHERE agent = %s",
+                         (name,))[0]["n"], 0)
+        finally:
+            db.close()
+
+    def test_ligne_avant_0423_arrondie_est_retrouvee(self):
+        """B1 : `started_at` et clé arrondis à la seconde désignent le tour.
+
+        Une réparation après 0423 écrit `started_at` depuis le float8 relu :
+        sous -5, les deux portent la seconde entière. Les écarter laisserait
+        la réparation écrire une seconde ligne sous la clé ISO de repli.
+        """
+        db = self._db(-5)
+        try:
+            name = "rounded-line"
+            marker = self._legacy_marker_at(db, name, offset="0.456789")
+            key = self._historical_key(name, marker)
+            debut = float(key.rsplit(":", 1)[1])
+            db.execute(
+                "INSERT INTO turn_costs (agent, harness, turn, model, usd,"
+                " spend_key, started_at, recorded_at)"
+                " VALUES (%s, 'deepseek', 'tour', 'm', 1.5, %s,"
+                " to_timestamp(%s), now())", (name, key, debut))
+
+            relu = registry.pending_spend_get(db, name)
+            self.assertFalse(relu["ledger_ambiguous"])
+            self.assertEqual(relu["ledger_key"], key,
+                             "la ligne du tour n'a pas été retrouvée")
+
+            worker = self._worker(db, name)
+            self.assertTrue(worker._compta_ecrit(relu))
+            self.assertIsNone(registry.pending_spend_get(db, name))
+            self.assertEqual(
+                db.query("SELECT count(*) AS n FROM turn_costs WHERE agent = %s",
+                         (name,))[0]["n"], 1,
+                "la réparation a écrit une seconde ligne")
+        finally:
+            db.close()
+
+    def test_repli_iso_rejoue_apres_echec_d_effacement(self):
+        """N1 : le repli ISO d'un marqueur d'avant 0471 doit être relu.
+
+        Écriture réussie puis effacement raté : au rejeu, la ligne porte la
+        clé ISO `agent:index:created_at`. `cle_epoch` doit la lire comme son
+        époque, sinon la ligne passe pour étrangère et la suspension devient
+        définitive.
+        """
+        db = self._db(3)
+        try:
+            name = "iso-replay"
+            marker = self._legacy_marker_row(db, name, age="1 minute")
+            relu = registry.pending_spend_get(db, name)
+            key = relu["ledger_key"]
+            self.assertTrue(key.startswith(name + ":0:"))
+            self.assertIn("T", key, "le repli attendu n'est pas ISO")
+
+            worker = self._worker(db, name)
+            with mock.patch.object(registry, "pending_spend_clear",
+                                   return_value=False):
+                self.assertTrue(worker._compta_ecrit(relu))
+            self.assertIsNotNone(registry.pending_spend_get(db, name),
+                                 "l'effacement n'a pas été simulé")
+
+            relu2 = registry.pending_spend_get(db, name)
+            self.assertFalse(relu2["ledger_ambiguous"],
+                             "la ligne ISO a été jugée étrangère au rejeu")
+            self.assertEqual(relu2["ledger_key"], key)
+            self.assertTrue(worker._compta_ecrit(relu2))
+            self.assertIsNone(registry.pending_spend_get(db, name))
+            self.assertEqual(
+                db.query("SELECT count(*) AS n FROM turn_costs WHERE agent = %s",
+                         (name,))[0]["n"], 1,
+                "le rejeu a doublé la ligne")
         finally:
             db.close()
 
