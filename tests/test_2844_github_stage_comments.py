@@ -127,6 +127,8 @@ class StageCommentsTest(unittest.TestCase):
         self.assertIn("required decision or information", self.bodies()[-1])
 
     def test_delivery_needs_release_and_matching_activation(self):
+        # releases from the epoch on count (#2874: the cutoff is tested below)
+        (Path(self.folder.name) / "github-stage-comments.json").write_text('{"_since": 0}')
         self.item["state"] = "promoted"
         self.marks = [dict(id=2, kind="delivered", at_ts=3)]
         self.project()
@@ -206,6 +208,44 @@ class StageCommentsTest(unittest.TestCase):
             self.gh.reset_calls()
             self.assertEqual(self.project()["comments"], [])
             self.assertEqual(self.gh.calls(), [])
+
+    def test_past_releases_are_not_replayed_and_one_delivery_per_lot(self):
+        # #2874: 1.13/1.14/1.15 were replayed as three "Delivered" comments on
+        # every mirror the first time stage comments ran.
+        self.gh.repo(REPO)["issues"][0]["state"] = "closed"
+        self.item["state"] = "promoted"
+        (Path(self.folder.name) / "github-stage-comments.json").write_text('{"_since": 1000}')
+        old = [("v1.13.0", "2026-10-18", 10.0), ("v1.14.0", "2026-10-19", 20.0)]
+        with mock.patch.object(comments, "release_receipts", return_value={12: old}):
+            self.assertEqual(self.project()["comments"], [])
+        new = old + [("v1.16.0", "2026-10-21", 2000.0), ("v1.17.0", "2026-10-22", 3000.0)]
+        with mock.patch.object(comments, "release_receipts", return_value={12: new}):
+            self.assertEqual([r["event"] for r in self.project()["comments"]],
+                             ["delivered-v1.16.0"])
+            self.assertEqual(self.project()["comments"], [])
+
+    def test_first_pass_records_the_cutoff_even_without_comments(self):
+        self.gh.repo(REPO)["issues"][0]["state"] = "closed"
+        with mock.patch.object(comments, "release_receipts", return_value={}):
+            self.project()
+        saved = json.loads((Path(self.folder.name) / "github-stage-comments.json").read_text())
+        self.assertIsInstance(saved["_since"], float)
+
+    def test_late_earlier_report_never_announces_a_second_delivery(self):
+        self.gh.repo(REPO)["issues"][0]["state"] = "closed"
+        checkpoint = Path(self.folder.name) / "github-stage-comments.json"
+        checkpoint.write_text('{"_since": 1000}')
+        newer = [("v1.17.0", "2026-10-22", 3000.0)]
+        with mock.patch.object(comments, "release_receipts", return_value={12: newer}):
+            self.assertEqual([r["event"] for r in self.project()["comments"]],
+                             ["delivered-v1.17.0"])
+        earlier = [("v1.16.0", "2026-10-21", 2000.0), *newer]
+        with mock.patch.object(comments, "release_receipts", return_value={12: earlier}):
+            self.assertEqual(self.project()["comments"], [])
+            # Lost local acknowledgement must reconcile any remote delivery.
+            checkpoint.write_text('{"_since": 1000}')
+            self.assertEqual(self.project()["comments"], [])
+        self.assertEqual(len(self.bodies()), 1)
 
     def test_dry_run_never_enrolls_or_consumes_receipts(self):
         self.project(dry_run=True)
