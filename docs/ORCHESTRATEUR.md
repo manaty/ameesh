@@ -573,8 +573,9 @@ Le corps du lot porteur nomme ses unités avec leur tête, `#<lot> <tête>`, la
 ligne qu'imprime `scripts/paquet-compose.py --units --base <cible>` (#2360) :
 un `#N` seul n'y déclare aucune unité (#2335). Quand ce corps omet la liste,
 la lecture des attentes retrouve les unités par ces trailers `ameesh-work:`
-de la branche, au-dessus de la cible (#2599) ; un `#N` cité en prose ne
-supprime toujours pas son alerte.
+de la branche, au-dessus de la cible (#2599) ; l'hôte qui lit retrouve un
+clone du registre s'il n'a pas les réglages radar du projet (#2837) ; un `#N`
+cité en prose ne supprime toujours pas son alerte.
 
 Après la composition — et après chaque recomposition — le composeur écrit la
 liaison en base, depuis le worktree du paquet :

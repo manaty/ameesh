@@ -285,19 +285,53 @@ def packet_trailers(repo, carrier, target=None):
     return found
 
 
-def packet_attachments(cfg, open_items, rows=()):
+def _carrier_repo(db, cfg, carrier, *, overview=None):
+    """Le dépôt local où lire la composition d'un porteur (#2599, #2837).
+
+    `radar.projects` d'abord : l'hôte opérateur connaît le dépôt du projet.
+    Un hôte d'agents ne l'a pas forcément ; on y retrouve alors un clone qui
+    résout la tête observée (`branch_head`), la ref publiée de la branche ou
+    la branche locale — la même découverte que `lot_class.repo_for_freeze`
+    (#2564), sans quoi un porteur composé sur cet hôte restait invisible et
+    ses unités levaient un faux retard `verdict_merge`. Sans dépôt, aucun
+    attachement : le doute ne tait aucune alerte."""
+    from . import lot_class
+
+    repo = lot_class.repository(cfg, carrier)
+    if repo:
+        return repo
+    if db is None:
+        return None
+    branch = str(carrier.get("branch") or "").strip()
+    refs = [str(carrier.get("branch_head") or "").strip()]
+    if branch:
+        refs += ["refs/remotes/origin/" + branch, branch]
+    for ref in refs:
+        if not ref:
+            continue
+        try:
+            repo, _commit = lot_class.repo_for_freeze(
+                db, cfg, carrier, ref, overview=overview)
+        except Exception:  # noqa: BLE001 - registre ou clone illisible : doute
+            continue
+        if repo:
+            return repo
+    return None
+
+
+def packet_attachments(cfg, open_items, rows=(), *, db=None):
     """#2599 : `{porteur: lots}` lus dans les trailers de sa branche.
 
     `cfg` est la configuration de l'hôte qui lit : le dépôt vient de
-    `radar.projects.<app>.repo` (`lot_class.repository`). Le census est
-    `open_items` plus `rows` (même univers que `packet_waits`). Sans dépôt,
-    sans cible ou sans branche lisible, le porteur n'a pas d'attachement — sa
-    liste de corps reste la seule preuve, et aucune alerte n'est tue par un
-    doute (le sens sûr)."""
+    `radar.projects.<app>.repo` (`lot_class.repository`). `db` (#2837) sert
+    de repli quand cet hôte n'a pas les réglages radar : un clone du registre
+    qui résout la tête du porteur suffit à lire ses commits de composition.
+    Le census est `open_items` plus `rows` (même univers que `packet_waits`).
+    Sans dépôt, sans cible ou sans branche lisible, le porteur n'a pas
+    d'attachement — sa liste de corps reste la seule preuve, et aucune alerte
+    n'est tue par un doute (le sens sûr)."""
     from . import lot_class, plan_git
 
-    if cfg is None:
-        return {}
     universe: dict[int, dict] = {}
     for row in open_items or ():
         universe[int(row["id"])] = row
@@ -306,10 +340,19 @@ def packet_attachments(cfg, open_items, rows=()):
     carriers = packet_carriers(universe.values())
     if not carriers:
         return {}
+    repos = {cid: lot_class.repository(cfg, carrier) if cfg is not None else None
+             for cid, carrier in carriers.items()}
+    overview = None
+    if db is not None and any(repo is None for repo in repos.values()):
+        try:
+            from . import registry
+            overview = registry.overview(db)
+        except Exception:  # noqa: BLE001 - registre illisible : pistes locales seules
+            overview = []
     out: dict[int, set[int]] = {}
     for cid, carrier in carriers.items():
         try:
-            repo = lot_class.repository(cfg, carrier)
+            repo = repos[cid] or _carrier_repo(db, cfg, carrier, overview=overview)
             if not repo:
                 continue
             target = lot_class.default_base(cfg, carrier, repo)
@@ -666,8 +709,9 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
     elif packets is True and not open_items:
         open_items = st.operations.open_lots_activity(None)
     want_packets = bool(packets) if packets is not None else (supplied or bool(open_items))
-    attached = packet_attachments(getattr(db, "cfg", None), open_items, rows) \
-        if want_packets and not _dry_pass(db) else {}
+    attached = (packet_attachments(getattr(db, "cfg", None), open_items, rows,
+                                   db=db)
+                if want_packets and not _dry_pass(db) else {})
     packet = packet_waits(rows, open_items, attachments=attached) if want_packets else {}
     landings = _with_heads(st, _admitted(
         st, rows, st.work_dependencies.landings_for([int(r["id"]) for r in rows])))

@@ -12,8 +12,8 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import (mesh_cli, plan, planned_waits as W, progress, roadmap,
-                    stagnation, storage, work, work_dependencies)
+from ameesh import (mesh_cli, plan, planned_waits as W, progress,
+                    registry, roadmap, stagnation, storage, work, work_dependencies)
 from ameesh import work_dependencies as D
 from ameesh.storage import interface as SI
 from ameesh.storage.postgres.progress import Progress
@@ -106,6 +106,28 @@ class PacketTrailersTest(unittest.TestCase):
                    "branch": "integration/paquet-test"}
         self.assertEqual(W.packet_attachments(None, [carrier]), {})
         self.assertEqual(W.packet_attachments(types.SimpleNamespace(radar={}), [carrier]), {})
+
+    def test_a_registry_clone_replaces_a_missing_project_repo(self):
+        # #2837 : l'hôte qui lit les alertes n'a pas forcément les réglages
+        # radar ; un clone d'agent qui porte la tête du porteur suffit à lire
+        # la composition, donc à taire le SLO des unités du paquet.
+        head = self.packet_branch()
+        carrier = {"id": 9001, "state": "qa", "app": "ameesh",
+                   "branch": "integration/paquet-test", "branch_head": head}
+        db = types.SimpleNamespace()
+        with mock.patch.object(registry, "overview",
+                               return_value=[{"cwd": self.repo}]):
+            self.assertEqual(W.packet_attachments(None, [carrier], db=db),
+                             {9001: {1234, 5678}})
+
+    def test_a_registry_clone_without_the_carrier_head_attaches_nothing(self):
+        self.packet_branch()
+        carrier = {"id": 9001, "state": "qa", "app": "ameesh",
+                   "branch": "integration/absente", "branch_head": "0" * 40}
+        with mock.patch.object(registry, "overview",
+                               return_value=[{"cwd": self.repo}]):
+            self.assertEqual(
+                W.packet_attachments(None, [carrier], db=types.SimpleNamespace()), {})
 
     def test_the_dry_pass_is_not_read(self):
         # la passe à blanc de db.batched ne fait aucune I/O (même règle que
