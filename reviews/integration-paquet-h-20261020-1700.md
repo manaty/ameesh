@@ -40,6 +40,12 @@ et son SHA, et il porte un trailer `ameesh-work: <lot>`.
 |---|---|---|---|
 | `4fc6db1a4` | #2825 × #2879 dans `mesh_cli._host_fleet` : #2825 change `limits` (périmètre lu dans le relevé), #2879 la ligne voisine `history` (`disk_history` sous-échantillonné) | hunks adjacents, chaque côté repris tel quel (limits de #2825, history de #2879), aucune ligne nouvelle | aucun (§2, conflit mécanique) ; auteurs prévenus |
 
+## Adaptations après CI (run 39450958359 sur `af2a23627667`)
+
+| commit | conflit | nature | avis |
+|---|---|---|---|
+| `84fb5aca8` | #2825 : `_host_alerts` passe `reading=` à `resources.host_limits` ; le faux `physical(_canons, host)` de `test_2341_host_unsampled` ne l'acceptait pas (TypeError, 8 tests × 2 parts) | adaptation de test seule (impl-01, `3af9f77a3`), aucun code de production | aucun (§11 bis) |
+
 ## Écartés (ce véhicule)
 
 | lot | motif |
