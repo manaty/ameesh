@@ -62,7 +62,7 @@ test("device: the local state is rendered without any mesh request", async () =>
   assert.deepEqual(await violations(), []);
 });
 
-test("device: a clean stop raises the event with the control socket", async () => {
+test("device: a clean stop raises identifiers without a control socket", async () => {
   const events = [];
   document.addEventListener("ameesh:stop", (event) => events.push(event.detail));
   const el = mount();
@@ -73,7 +73,7 @@ test("device: a clean stop raises the event with the control socket", async () =
   button.click();
   assert.deepEqual(events, [{
     agent: "agent-a", runner: "runner-a@pc-test", mesh: "manaty",
-    control_socket: "/run/user/1000/ameesh/control-a.sock", mode: "clean",
+    mode: "clean",
   }]);
 });
 
@@ -86,8 +86,16 @@ test("device: the immediate stop is a distinct, host-decided gesture", async () 
     .find((item) => item.textContent.trim() === "Stop immediately");
   assert.ok(button, "the immediate stop button exists");
   button.click();
+  assert.deepEqual(events, [], "the initial click must not stop the sandbox");
+  await settle(el);
+  assert.match(text(el), /Stop agent-a immediately.*unfinished work may be lost/);
+  assert.deepEqual(await violations(), []);
+  const confirm = [...el.shadowRoot.querySelectorAll("button")]
+    .find((item) => item.textContent.trim() === "Confirm immediate stop");
+  confirm.click();
   assert.equal(events[0].mode, "immediate");
-  assert.equal(events[0].control_socket, "/run/user/1000/ameesh/control-a.sock");
+  assert.equal(events[0].agent, "agent-a");
+  assert.equal("control_socket" in events[0], false);
 });
 
 test("device: a host provider feeds the screen, and a refused state is said", async () => {
@@ -119,7 +127,6 @@ test("device: connectHost routes the stop to the host's stopAgent", async () => 
   button.click();
   assert.deepEqual(calls, [["agent-a", {
     mode: "clean", runner: "runner-a@pc-test", mesh: "manaty",
-    control_socket: "/run/user/1000/ameesh/control-a.sock",
   }]]);
   unbind();
 });
@@ -137,4 +144,42 @@ test("device: without a host provider, the limit is stated instead of pretending
   assert.match(text(el), /only by the host application/);
   assert.match(text(el), /a web page cannot open it/);
   assert.deepEqual(await violations(), []);
+});
+
+
+test("device: cancelling the immediate stop does not emit a request", async () => {
+  const calls = [];
+  const unbind = ui.connectHost({
+    getToken: () => null, openApproval: () => {}, notify: () => {},
+    stopAgent: (...args) => calls.push(args),
+  });
+  try {
+    const el = mount();
+    await settle(el);
+    const click = (label) => [...el.shadowRoot.querySelectorAll("button")]
+      .find((item) => item.textContent.trim() === label).click();
+    click("Stop immediately");
+    await settle(el);
+    click("Cancel");
+    await settle(el);
+    assert.deepEqual(calls, []);
+    assert.equal(el.shadowRoot.querySelector('[role="group"]'), null);
+  } finally { unbind(); }
+});
+
+test("device: forged page socket paths never cross the host binding", () => {
+  const calls = [];
+  const unbind = ui.connectHost({
+    getToken: () => null, openApproval: () => {}, notify: () => {},
+    stopAgent: (...args) => calls.push(args),
+  });
+  try {
+    document.dispatchEvent(new CustomEvent("ameesh:stop", { detail: {
+      agent: "agent-a", mode: "clean", runner: "runner-a@pc-test", mesh: "manaty",
+      control_socket: "/attacker/chosen.sock",
+    } }));
+    assert.deepEqual(calls, [["agent-a", {
+      mode: "clean", runner: "runner-a@pc-test", mesh: "manaty",
+    }]]);
+  } finally { unbind(); }
 });
