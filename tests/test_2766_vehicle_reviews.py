@@ -252,6 +252,26 @@ class DesignationTest(_Base):
         self.assertEqual(own["paths"], [])
         self.assertEqual(own["commits"], [])
 
+    def test_an_unfrozen_landing_does_not_block_designation(self):
+        self.compose()
+        own = self.designation([{"work_item_id": 103}],
+                               {101: [{"kind": "frozen", "sha": self.m1}],
+                                102: [{"kind": "frozen", "sha": self.m2}],
+                                103: []}, self.head)
+        self.assertEqual(own, {"paths": [], "commits": []})
+
+    def test_an_unfrozen_landing_does_not_exempt_the_vehicle_code(self):
+        _write(self.repo, "src/app.py", "print(1)\n")
+        head = _commit_all(self.repo, "vehicle code")
+        own = self.designation([{"work_item_id": 103}], {103: []}, head)
+        self.assertEqual(own["paths"], ["src/app.py"])
+        self.assertEqual(own["commits"], [head])
+
+    def test_a_composed_member_without_a_freeze_refuses_designation(self):
+        self.compose()
+        with self.assertRaisesRegex(packet_reviews.VehicleError, "#101 has no frozen head"):
+            self.designation([], {101: [], 102: []}, self.head)
+
     def test_a_non_vehicle_is_left_to_the_historical_diff(self):
         self.assertIsNone(packet_reviews.designation_changes(
             self._NoLandings(), 1, {"id": 1, "branch": "lot/1-x"},
@@ -410,6 +430,29 @@ class NeedTest(_Base):
         out = self.need(rows, marks, self.head)
         self.assertTrue(out["ok"])
         self.assertEqual(out["required"], 0)
+
+    def test_an_unfrozen_landing_is_not_a_constituent(self):
+        self.compose()
+        rows = [{"work_item_id": 103}]
+        marks = {101: [{"kind": "frozen", "sha": self.m1}],
+                 102: [{"kind": "frozen", "sha": self.m2}], 103: []}
+        out = self.need(rows, marks, self.head)
+        self.assertTrue(out["ok"])
+        self.assertIn("2 constituent(s) reviewed", out["why"])
+
+    def test_an_unfrozen_landing_does_not_hide_the_vehicle_delta(self):
+        _write(self.repo, "src/app.py", "print(1)\n")
+        head = _commit_all(self.repo, "vehicle change without a member")
+        out = self.need([{"work_item_id": 103}], {101: [], 103: []}, head)
+        # Aucun membre effectif : None conserve la porte historique sur le
+        # diff entier, sans exemption de relecture pour le véhicule.
+        self.assertIsNone(out)
+
+    def test_a_composed_member_without_a_freeze_is_refused(self):
+        self.compose()
+        out = self.need([], {101: [], 102: []}, self.head)
+        self.assertFalse(out["ok"])
+        self.assertIn("#101 has no frozen head", out["why"])
 
     def test_a_composed_source_must_carry_the_frozen_head(self):
         self.compose()

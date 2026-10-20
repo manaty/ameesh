@@ -9,6 +9,7 @@ import argparse
 import contextlib
 import io
 import json
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -16,6 +17,26 @@ from unittest import mock
 from ameesh import config as config_mod, mesh_cli, resources, storage
 
 GIB = 1024 ** 3
+
+
+class _OwnThreadOutput(io.StringIO):
+    """Stdout capturé qui ignore les écritures des autres fils.
+
+    Le journal asynchrone de l'exécuteur (`ameesh.runner.log_async`) imprime
+    ses lignes `HH:MM:SS …` depuis son propre fil quand sa file se vide : un
+    message laissé par un test précédent peut donc atterrir entre deux
+    `print` de la commande capturée. Une ligne datée n'est pas du JSON
+    (« Extra data: line 1 column 2 » sur un `--json`) ; seule la sortie du fil
+    du test est gardée."""
+
+    def __init__(self):
+        super().__init__()
+        self._writer = threading.current_thread()
+
+    def write(self, text):
+        if threading.current_thread() is not self._writer:
+            return len(text)
+        return super().write(text)
 
 
 def reading(host, free, *, age=60.0, zombies=0, now=10_000.0):
@@ -65,7 +86,7 @@ class FleetCommandTest(unittest.TestCase):
         store.hosts.current.return_value = readings
         store.hosts.since.return_value = []
         args = argparse.Namespace(host=None, json=json_out, send=send)
-        out = io.StringIO()
+        out = _OwnThreadOutput()
         with mock.patch.object(storage, "of", return_value=store), \
                 mock.patch.object(mesh_cli.time, "time", return_value=10_000.0), \
                 contextlib.redirect_stdout(out), \
@@ -83,6 +104,23 @@ class FleetCommandTest(unittest.TestCase):
         self.assertIsNone(rows[0]["age_s"])
         self.assertTrue(rows[0]["stale"])
         self.assertFalse(rows[0]["ok"])
+
+    def test_json_ignores_the_asynchronous_journal(self):
+        """#2855 : une ligne datée du journal de l'exécuteur (fil `journal`)
+        peut se vider pendant le captage ; elle n'est pas du JSON."""
+        canon = SimpleNamespace(hosts=[SimpleNamespace(title="ci-unmeasured")])
+        vrai = resources.fleet_line
+
+        def avec_journal(*args, **kwargs):
+            fil = threading.Thread(target=lambda: print("06:00:00 config reloaded"))
+            fil.start()
+            fil.join()
+            return vrai(*args, **kwargs)
+
+        with mock.patch.object(resources, "fleet_line", side_effect=avec_journal):
+            text = self.run_fleet([], canons=[canon], json_out=True)
+        rows = [json.loads(l) for l in text.splitlines()]
+        self.assertEqual([row["host"] for row in rows], ["ci-unmeasured"])
 
     def test_send_mails_the_summary_as_printed(self):
         with mock.patch.object(mesh_cli.mail, "send") as send:

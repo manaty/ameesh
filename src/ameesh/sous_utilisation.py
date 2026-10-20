@@ -47,6 +47,7 @@ import time
 
 from . import accounts as accounts_mod
 from . import cost as cost_mod
+from . import db as db_mod
 from . import planned_waits
 from . import storage
 
@@ -233,6 +234,41 @@ def expiring(gauge, now: float) -> tuple | None:
     return float(gauge.resets_at), max(0.0, 1.0 - float(gauge.used or 0.0))
 
 
+def _gauge_history(db, *, since_s: float) -> list:
+    """Historique des jauges pour la projection au rythme récent (#2759).
+
+    Le try/except seul ne suffisait pas : une erreur SQL dans une transaction
+    ouverte l'avorte (psycopg la garde avortée jusqu'au ROLLBACK, le pilote
+    psql ferme sa session), et les lectures de dépense au token qui suivent
+    échouaient alors aussi. Ici, dans une transaction appelante, l'historique
+    est lu sur une connexion INDÉPENDANTE : son échec reste local et ne touche
+    pas la transaction. Hors transaction (le cas nominal d'`ameesh alerts`),
+    la lecture reste sur la connexion reçue. Un historique illisible rend `[]`,
+    le repli documenté sur la moyenne de fenêtre."""
+    def read(source):
+        return storage.of(source).operations.gauge_history(
+            since_s=since_s, harness=None)
+
+    if not db_mod.in_transaction(db):
+        try:
+            return read(db)
+        except Exception:
+            return []
+    try:
+        own = db_mod.connect(db.cfg)
+    except Exception:
+        return []
+    try:
+        return read(own)
+    except Exception:
+        return []
+    finally:
+        try:
+            own.close()
+        except Exception:
+            pass
+
+
 def latest_account_gauges(db, now: float) -> dict:
     """{(harnais, compte) : [Gauge]} : le dernier relevé de chaque jauge.
 
@@ -403,11 +439,7 @@ def plan_underused(db, listing: list, now: float, *,
             cap = gauge.held_cap(now, accounts_mod.RESERVE, multiplier, ceiling)
             used = float(gauge.used or 0.0)
             if history is None:
-                try:
-                    history = storage.of(db).operations.gauge_history(
-                        since_s=PLAN_RATE_WINDOW_S, harness=None)
-                except Exception:
-                    history = []  # historique indisponible : moyenne de fenêtre
+                history = _gauge_history(db, since_s=PLAN_RATE_WINDOW_S)
             lost_at_pace, rate_source, rate_span = _projected_plan_loss(
                 gauge, account, now, history, multiplier=multiplier,
                 ceiling=ceiling, reserve=accounts_mod.RESERVE)

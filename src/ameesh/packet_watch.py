@@ -325,9 +325,14 @@ def check(cfg, db, watch: ProjectWatch, rules, *, now: float, state: dict,
 
 
 def tick(cfg, db, *, now: float, rules_of, dry_run: bool = False,
-         only: str | None = None) -> list[dict]:
+         only: str | None = None, gh=None) -> list[dict]:
     """Tous les projets surveillés de l'hôte ; `rules_of(name)` rend la
-    mécanique compilée (`release_cutoff.compiled_rules`, sans repli)."""
+    mécanique compilée (`release_cutoff.compiled_rules`, sans repli).
+
+    #2813 : le même passage fusionne au vert un porteur publié, ou le désarme
+    si sa tête ou sa cible a changé depuis la publication
+    (`packet_automerge.watch`) ; seuls une fusion, un désarmement et une
+    erreur sont rendus, un porteur en attente ne dit rien."""
     declared = projects(cfg)
     if only:
         if only not in declared:
@@ -344,6 +349,25 @@ def tick(cfg, db, *, now: float, rules_of, dry_run: bool = False,
         except Exception as exc:  # noqa: BLE001 - un projet ne fait pas tomber l'autre
             results.append({"project": name, "result": "error",
                             "error": "%s: %s" % (type(exc).__name__, exc)})
+        results += _auto_merge(cfg, db, name, watch.app or name, gh=gh, dry_run=dry_run)
     if not dry_run:
         save_state(cfg, state)
     return results
+
+
+def _auto_merge(cfg, db, name: str, app: str, *, gh, dry_run: bool) -> list[dict]:
+    """#2813 : les fusions, désarmements et erreurs des porteurs publiés de `app`."""
+    from . import packet_automerge
+    try:
+        rows = packet_automerge.watch(cfg, db, app, gh=gh, dry_run=dry_run)
+    except Exception as exc:  # noqa: BLE001 - l'alerte de créneau reste rendue
+        return [{"project": name, "result": "error",
+                 "error": "auto-merge: %s: %s" % (type(exc).__name__, exc)}]
+    out = []
+    for row in rows:
+        if row["result"] == "error":
+            out.append({"project": name, "result": "error", "lot": row["lot"],
+                        "error": "auto-merge of #%d: %s" % (row["lot"], row.get("error"))})
+        elif row["result"] in ("disarmed", "would-disarm", "merged", "would-merge"):
+            out.append(dict(row, project=name, result="auto-merge-" + row["result"]))
+    return out

@@ -688,16 +688,11 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
                             owner=owner)
         if project is None:
             project = _project_of(cfg, repo)
-        # #1656: the direct merge replays the whole proof here; an armed
-        # auto-merge would merge the head without it — GitHub checks its
-        # --match-head-commit only when it is armed, never after a head
-        # rewrite. Disarm before any guard: ameesh is the only merge actor.
-        if view.get("autoMergeRequest"):
-            error = land.pr_disable_auto(slug, pr, gh=gh)
-            if error is not None:
-                raise MergePrError(
-                    "PR #%d: auto-merge armed and not disarmed (%s): nothing written; disarm "
-                    "it (gh pr merge --disable-auto %d) and retry" % (pr, error, pr))
+        # #2813 (owner decision 20/10, supersedes #1656 here): the direct
+        # merge no longer disarms a GitHub auto-merge. Packet carriers are
+        # merged by ameesh at their published head (`packet_automerge`),
+        # which disarms any GitHub auto-merge it finds; the guards below and
+        # the fresh re-read before the push still bind this merge to `head`.
         _pr_guards(view, pr, head, target, project)
         _stacked_base_guard(owner, fetch_url, repo, view, target)
         ready = _admission(db, cfg, lot, repo, project, owner, view,

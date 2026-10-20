@@ -3563,7 +3563,7 @@ def cmd_cost(cfg: Config, args) -> int:
                 reason = "" if any(e.ok for e in evals) else (
                     "all %s accounts at the threshold — %s" % (harness, "; ".join(
                         "%s: %s" % (e.profile.name, e.reason) for e in evals)))
-                reason = reason or book.over(agent, pace=False)
+                reason = reason or book.over(agent, pace=False, account_checked=True)
             else:
                 reason = book.over(agent)
             if reason:
