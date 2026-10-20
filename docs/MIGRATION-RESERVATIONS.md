@@ -112,12 +112,17 @@ collide with a number another lot reserved meanwhile. A lot that already
 landed keeps `landed` when it is closed with `work_items.migration` still
 set (`merged -> closed`): the projection never turns it back into `released`
 either, so the landing record is not lost. If that lot reserves a new number,
-the record follows the new number as `reserved`. Migration 0420, its copy
-0432 and 0467 each carry the rules in full, since unapplied files are not
-guaranteed to be applied in numeric order. Explicit cleanup and landing remain
-possible after the lot is closed or merged. The reservation stays active across
-freeze, review and lot-state changes until explicitly landed, released, or
-invalidated by target requalification.
+the record follows the new number as `reserved`. 0432 and 0467 each carry the
+rules in full, since unapplied files are not guaranteed to be applied in
+numeric order, but they do not leave the same state: 0467 also preserves
+`landed` for a projection that gives `released` (`merged -> closed`), where
+0432 only preserved it for `reserved`. Migration 0420 is not in the tree;
+should it return, it is only a copy to align with these definitions. 0467 is
+already applied and immutable, so its header's older claim that the last
+applied leaves the same state is superseded by this paragraph. Explicit
+cleanup and landing remain possible after the lot is closed or merged. The
+reservation stays active across freeze, review and lot-state changes until
+explicitly landed, released, or invalidated by target requalification.
 
 Migration `0419_migration_reservation_slots.sql` adds the reservation table,
 a partial unique index on reserved numbers and a trigger for the old

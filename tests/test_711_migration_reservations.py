@@ -610,7 +610,7 @@ class ScopedReservationsTest(PgTestCase):
     def test_landing_projection_and_null_in_one_statement_lands(self):
         """#1022, copie #879 : la fusion qui remet la projection à NULL lande.
 
-        C'est la règle que 0420 et 0432 portent chacune en entier : un client
+        C'est la règle que 0432 et 0467 portent chacune en entier : un client
         peut écrire l'état et la projection en une seule instruction."""
         work.set_branch(self.db, self.a['id'], 'agent/a', target='develop', actor='dev')
         work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo, actor='dev')
