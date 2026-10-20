@@ -27,10 +27,12 @@ instants et mesures. Aucun jeton, aucune clé, aucun contenu de courrier.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import socket
 import socketserver
+import stat
 import struct
 import threading
 import time
@@ -326,12 +328,12 @@ def snapshot(cfg, db, *,
              gate: Optional[Mapping[str, Any]] = None,
              now: Optional[float] = None) -> dict:
     """Lit la base et rend ``ameesh-device/1`` pour cet exécuteur."""
-    wanted = None if names is None else {str(n) for n in names}
+    wanted = {str(n) for n in names} if names is not None else set()
     host = getattr(cfg, "host", "") or ""
     store = storage.of(db)
     rows = [row for row in store.operations.listing()
             if (row.get("host") or "") == host
-            and (wanted is None or row.get("name") in wanted)]
+            and (not wanted or row.get("name") in wanted)]
     lot_ids = sorted({_bigint(row.get("session_work_item")) for row in rows
                       if _bigint(row.get("session_work_item")) is not None}
                      | {_int(row.get("assigned_lot_id")) for row in rows
@@ -446,36 +448,69 @@ class _BaseServer(socketserver.ThreadingUnixStreamServer):
                 pass
 
 
-def _prepare(path: str) -> None:
-    """Dossier 0700 ; socket fossile retirée si personne ne l'écoute."""
-    directory = os.path.dirname(path) or "."
-    os.makedirs(directory, mode=0o700, exist_ok=True)
+def _remove_stale_socket(path: str) -> None:
+    """Remove only an owned socket whose listener is demonstrably absent."""
     try:
-        os.chmod(directory, 0o700)
-    except OSError:
-        pass
-    if not os.path.lexists(path):
+        before = os.lstat(path)
+    except FileNotFoundError:
         return
-    import stat as stat_mod
-    try:
-        mode = os.lstat(path).st_mode
     except OSError as exc:
-        raise DeviceError("local channel path unreadable: %s (%s)" % (path, exc))
-    if not stat_mod.S_ISSOCK(mode):
-        raise DeviceError("refusing to replace a non-socket path: %s" % path)
+        raise DeviceError("local channel path unreadable: %s (%s)" % (path, exc)) from exc
+    if not stat.S_ISSOCK(before.st_mode) or before.st_uid != os.getuid():
+        raise DeviceError("refusing to replace a non-socket or foreign-owned path: %s" % path)
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     probe.settimeout(0.2)
     try:
         probe.connect(path)
-    except OSError:
+    except OSError as exc:
+        if exc.errno not in (errno.ECONNREFUSED, errno.ENOENT):
+            raise DeviceError("local channel liveness uncertain: %s (%s)" % (path, exc)) from exc
         try:
+            current = os.lstat(path)
+            if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
+                raise DeviceError("local channel changed during probe: %s" % path)
             os.unlink(path)
-        except OSError as exc:
-            raise DeviceError("stale socket %s cannot be removed: %s" % (path, exc))
+        except FileNotFoundError:
+            pass
+        except OSError as remove_exc:
+            raise DeviceError("stale socket %s cannot be removed: %s"
+                              % (path, remove_exc)) from remove_exc
     else:
         raise DeviceError("local channel already served: %s" % path)
     finally:
         probe.close()
+
+
+def _prepare(path: str) -> None:
+    """Use a private directory without changing an existing one's permissions.
+
+    Startup also reaps abandoned channel names from previous runner PIDs,
+    including in the persistent state-directory fallback.
+    """
+    directory = os.path.dirname(path) or "."
+    try:
+        os.makedirs(directory, mode=0o700)
+    except FileExistsError:
+        pass
+    else:
+        os.chmod(directory, 0o700)
+    info = os.lstat(directory)
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) & 0o077):
+        raise DeviceError("local channel directory must be owned and private (0700): %s"
+                          % directory)
+    _remove_stale_socket(path)
+    for name in os.listdir(directory):
+        if not (name.startswith((STATE_PREFIX, CONTROL_PREFIX)) and name.endswith(".sock")):
+            continue
+        other = os.path.join(directory, name)
+        if other == path:
+            continue
+        try:
+            _remove_stale_socket(other)
+        except DeviceError:
+            # Live, busy, inaccessible, replaced or unrelated: leave it alone.
+            pass
 
 
 class _StateHandler(socketserver.StreamRequestHandler):
@@ -603,13 +638,17 @@ class StateChannel(LocalChannel):
 
 
 class ControlChannel(LocalChannel):
-    """Canal de contrôle : uniquement l'arrêt propre d'un agent de l'hôte."""
+    """Canal de contrôle : uniquement l'arrêt propre d'un agent de l'hôte.
+
+    An omitted or empty ``allowed`` filter serves all local agents, just
+    like the runner's ``agents_filter``; ``stop_fn`` enforces the host check.
+    """
 
     def __init__(self, path: str, stop_fn: Callable[[str], Any],
                  *, allowed: Optional[Iterable[str]] = None,
                  log: Optional[Callable[[str], None]] = None):
         self.stop_fn = stop_fn
-        self.allowed = None if allowed is None else frozenset(str(a) for a in allowed)
+        self.allowed = (frozenset(str(a) for a in allowed) if allowed is not None else None) or None
         self.log = log or (lambda _m: None)
         super().__init__(path, _ControlHandler)
         self._server.stop_fn = stop_fn

@@ -169,6 +169,10 @@
   "device.stop.clean.help": "Le tour finit au point sûr, le bail est rendu, les lots reviennent à la file.",
   "device.stop.immediate": "Arrêter immédiatement",
   "device.stop.immediate.help": "Le runner Compute détruit le bac à sable ; ameesh constate l'expiration du bail.",
+  "device.stop.confirm.title": "Confirmer l’arrêt immédiat",
+  "device.stop.confirm": "Arrêter {agent} immédiatement ? Le bac à sable sera détruit et le travail en cours peut être perdu.",
+  "device.stop.confirm.action": "Confirmer l’arrêt immédiat",
+  "device.stop.cancel": "Annuler",
   "device.provider.missing": "L'état local n'est lisible que par l'application hôte, qui interroge la socket de l'exécuteur ; une page web ne peut pas l'ouvrir.",
   "device.error": "État local illisible : {message}",
   "device.compute.lease": "Bail Compute : {id}, jusqu'à {at}"
