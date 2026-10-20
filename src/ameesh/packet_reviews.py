@@ -271,9 +271,9 @@ def designation_changes(db, vehicle: int, row, repo: str, base: str, head: str) 
     """Le delta propre à désigner au gel d'un véhicule, ou None.
 
     None quand la ligne n'est pas un véhicule, ou quand aucun membre n'est
-    lisible : la désignation garde alors le diff gelé entier. Un membre sans
-    tête gelée lève : désigner sur un contenu dont on ne sait pas nommer les
-    avis acquis serait une relecture en double, pas une couverture.
+    lisible : la désignation garde alors le diff gelé entier. Une déclaration
+    sans source composée ni gel est ignorée ; un membre composé sans tête
+    gelée lève, car ses avis acquis ne peuvent pas être nommés.
     """
     if not is_vehicle(row):
         return None
@@ -282,7 +282,10 @@ def designation_changes(db, vehicle: int, row, repo: str, base: str, head: str) 
         return None
     sources = []
     for entry in found:
-        _member_row, _marks, freeze = _member_freeze(db, entry["lot"])
+        _member_row, _marks, freeze = _member_freeze(
+            db, entry["lot"], declared_only=not entry.get("source"))
+        if freeze is None:
+            continue
         frozen = plan_git._commit(repo, freeze["sha"])
         if not frozen:
             raise VehicleError("constituent #%d: frozen head %s is not a commit of the "
@@ -295,8 +298,13 @@ def designation_changes(db, vehicle: int, row, repo: str, base: str, head: str) 
 # la porte du véhicule
 # --------------------------------------------------------------------------
 
-def _member_freeze(db, lot: int) -> tuple:
-    """`(row, marks, freeze)` du membre, ou lève : un membre illisible refuse."""
+def _member_freeze(db, lot: int, *, declared_only: bool = False) -> tuple:
+    """`(row, marks, freeze)` du membre ; une simple intention peut attendre.
+
+    Sans source composée ni gel, le landing ne permet d'attribuer aucun
+    contenu au membre. On l'ignore sans soustraire de commits au delta propre
+    du véhicule. Un membre composé sans gel reste refusé (#2775).
+    """
     row = work.get(db, int(lot))
     if row is None:
         raise VehicleError("constituent #%d is not a work item" % int(lot))
@@ -304,6 +312,8 @@ def _member_freeze(db, lot: int) -> tuple:
     freeze = plan_git.latest_freeze(marks)
     sha = str((freeze or {}).get("sha") or "").strip()
     if not sha:
+        if declared_only:
+            return row, marks, None
         raise VehicleError("constituent #%d has no frozen head: compose a reviewed lot"
                            % int(lot))
     return row, marks, dict(freeze, sha=sha)
@@ -347,10 +357,13 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
     for entry in found:
         lot = int(entry["lot"])
         try:
-            member_row, member_marks, freeze = _member_freeze(db, lot)
+            member_row, member_marks, freeze = _member_freeze(
+                db, lot, declared_only=not entry.get("source"))
         except VehicleError as exc:
             return {"ok": False, "required": None, "klass": None,
                     "why": str(exc), "members": found, "own_paths": []}
+        if freeze is None:
+            continue
         frozen = plan_git._commit(repo, freeze["sha"])
         if not frozen:
             return {"ok": False, "required": None, "klass": None,
