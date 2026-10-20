@@ -36,6 +36,44 @@ def journal(root, name, *events, identity="account-a", mtime=None):
 
 
 class CodexReadingsTest(Sandbox, unittest.TestCase):
+    def test_undeclared_default_account_pauses_on_ambiguity_and_recovers(self):
+        agent = self.agent("default-codex", "codex")
+        book = self.book()
+        journal(self.codex, "team", event(self.now, short=5, week=10))
+        for variant in ("plan", "identity", "reset"):
+            with self.subTest(variant=variant):
+                path = journal(
+                    self.codex, "conflict", event(
+                        self.now, short=5, week=10,
+                        plan="pro" if variant == "plan" else "team",
+                        reset_shift=743 if variant == "reset" else 0),
+                    identity="other-private-account" if variant == "identity" else "account-a")
+                gauges = book.gauges("codex")
+                self.assertEqual(gauges, [])
+                self.assertIn("ambiguous Codex account", gauges.errors["codex"])
+                reason = book.pace_exceeded("codex")
+                self.assertIn("pause (account (default))", reason)
+                self.assertIn("ambiguous Codex account", reason)
+                self.assertNotIn("other-private-account", reason)
+                self.assertEqual(book.over(agent, pace=True), reason)
+                self.assertIn("codex", book.gauges().errors)
+                os.unlink(path)
+                self.assertEqual(book.pace_exceeded("codex"), "")
+                self.assertEqual(book.gauges("codex").errors, {})
+
+    def test_undeclared_default_account_report_exposes_ambiguity(self):
+        self.agent("default-codex", "codex")
+        journal(self.codex, "team", event(self.now))
+        journal(self.codex, "pro", event(self.now, short=None, plan="pro"))
+        book = self.book()
+        for record in (False, True):
+            with self.subTest(record=record):
+                rows = book.report(record=record)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["gauges"], [])
+                self.assertIn("ambiguous Codex account", rows[0]["gauge_error"])
+                self.assertIn(rows[0]["gauge_error"], cost.format_report(rows))
+
     def test_partial_newer_session_keeps_saturated_short_window(self):
         journal(self.codex, "full", event(self.now), mtime=self.now)
         journal(self.codex, "partial", event(self.now, short=None), mtime=self.now + 1)

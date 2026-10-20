@@ -223,14 +223,17 @@ class Overage:
 
 class Gauges(list):
     """The gauges of one reading, with the overage flags of the same reading
-    (`overage`, None if unknown): a list, so every reader of gauges is
-    unchanged."""
+    (`overage`, None if unknown), and read refusals keyed by harness (`errors`).
+    Refused readings contain no gauges; budget guards must honor their error.
+    """
 
     overage: Overage | None = None
 
-    def __init__(self, items=(), overage: Overage | None = None):
+    def __init__(self, items=(), overage: Overage | None = None, *,
+                 errors: dict[str, str] | None = None):
         super().__init__(items)
         self.overage = overage
+        self.errors = dict(errors or {})
 
     def in_overage(self, now: float) -> bool:
         """Is the account billed beyond its plan at `now`? A reading in
@@ -1090,7 +1093,7 @@ class CostBook:
             reconcile(readings, now)
         return reconcile(readings, now)
 
-    def gauges(self, harness: str | None = None, *, record: bool = True) -> list:
+    def gauges(self, harness: str | None = None, *, record: bool = True) -> Gauges:
         """Les jauges de forfait, par **source déclarée** dans les descripteurs (L16).
 
         `ameesh.cost.gauges` nomme le lecteur (`transcript` pour Claude,
@@ -1102,7 +1105,9 @@ class CostBook:
         l'historique — les commandes de lecture (`progress`, `cost gauges`
         sans `--record`) ; l'exécuteur, lui, relève avant chaque tour.
         """
-        out: list = []
+        from .codex_gauges import AmbiguousCodexGauges
+
+        out = Gauges()
         for ident, descriptor in harnesses.scan()[0].items():
             if harness not in (None, ident):
                 continue
@@ -1110,7 +1115,12 @@ class CostBook:
                        "sessions": self.codex_gauges}.get(
                            str(descriptor.cost.get("gauges") or ""))
             if lecteur is not None:
-                out += [replace(gauge, harness=ident) for gauge in lecteur()]
+                try:
+                    out += [replace(gauge, harness=ident) for gauge in lecteur()]
+                except AmbiguousCodexGauges as exc:
+                    # The default account has no accounts.evaluate boundary.
+                    # Keep the refusal for its budget guard and reports.
+                    out.errors[ident] = str(exc)
         if record:
             self.record_gauges(out)
         return out
@@ -1161,7 +1171,11 @@ class CostBook:
         `pace_multiplier` de son profil (#1075, #1028).
         """
         now = self.clock()
-        held = [gauge for gauge in self.gauges(harness) if gauge.exceeded(now, reserve)]
+        gauges = self.gauges(harness)
+        if gauges.errors:
+            return "pause (account %s): %s" % (
+                DEFAULT_ACCOUNT_LABEL, gauges.errors[harness])
+        held = [gauge for gauge in gauges if gauge.exceeded(now, reserve)]
         if not held:
             return ""
         # L242b (4), #373 r1 : la pause en court d'abord, comme avec des
@@ -1998,6 +2012,9 @@ class CostBook:
                     for g in by_harness.get(harness, [])
                 ],
             })
+            error = getattr(by_harness.get(harness), "errors", {}).get(harness)
+            if error:
+                rows[-1]["gauge_error"] = error
         return rows
 
 
@@ -2016,7 +2033,7 @@ def format_report(rows: Iterable[dict]) -> str:
                 g["key"], g["used"] * 100, g["cap"] * 100,
                 ", reset passed, last reading %.0f%%" % (g["last_used"] * 100)
                 if g.get("reset_passed") else "")
-            for g in row["gauges"]) or "—"
+            for g in row["gauges"]) or row.get("gauge_error") or "—"
         lines.append("%-16s %-9s %-16s %-8s %10.4f %10.4f  %s" % (
             row["agent"],
             row["harness"] + ("/%s" % row["account"] if row.get("account") else ""),

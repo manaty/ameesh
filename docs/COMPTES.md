@@ -256,6 +256,8 @@ compte. `creator_account_id` ne suffit pas à attribuer un relevé : une session
 reprise peut conserver son créateur alors que ses nouvelles jauges portent
 un autre forfait. Aucune valeur d'identifiant n'apparaît dans le diagnostic.
 Les fenêtres échues ne maintiennent pas ce refus.
+Sans compte déclaré, la garde de rythme met l'agent en pause avec la raison
+d'ambiguïté ; le rapport de coût affiche cette raison avec des jauges vides.
 
 Depuis la tranche 3 de #1580 (15/10/2026), les jauges d'un compte Claude
 peuvent venir du fichier du widget omarchy (`~/.local/state/omarchy/agents/
