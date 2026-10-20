@@ -462,6 +462,20 @@ def write_worktree_marker(cfg: Config, name: str, cwd: str) -> dict:
     return marker
 
 
+def _preemption_generation(worker) -> int:
+    """#2729 : génération des demandes de préemption, lue sous son verrou.
+
+    Point unique des deux lectures de frontière (`pick()` et l'entrée d'un
+    tour direct). Les doublures `SimpleNamespace` de L790 n'ont ni compteur ni
+    verrou : elles partent de zéro.
+    """
+    verrou = getattr(worker, "_preempt_lock", None)
+    if verrou is None:
+        return getattr(worker, "preempt_gen", 0)
+    with verrou:
+        return worker.preempt_gen
+
+
 class AgentWorker(threading.Thread):
     #: nombre d'échecs de battement consécutifs avant d'arrêter le harnais
     MAX_RENEW_FAILURES = 3
@@ -546,6 +560,17 @@ class AgentWorker(threading.Thread):
             # marqueur d'avant le champ `since` : repli sur la date de la ligne
             self.failure_since = (exploitation_mod.failure_since(agent.get("status_text"))
                                   or float(agent.get("status_since_ts") or 0.0))
+        #: #2729 : série de tours interrompus par préemption, lue du marqueur
+        #: posé dans `status_text` (suffixe `preemptions xN`) — elle survit au
+        #: redémarrage de l'exécuteur. Un tour qui n'est pas préempté la remet
+        #: à zéro ; l'alerte `preemption_streak` lit le marqueur.
+        self.preemption_streak = exploitation_mod.preemption_streak(
+            agent.get("status_text"))
+        self.preemption_since = 0.0
+        if self.preemption_streak:
+            self.preemption_since = (
+                exploitation_mod.preemption_since(agent.get("status_text"))
+                or float(agent.get("status_since_ts") or 0.0))
         #: #1270 : épisode de débit/quota fournisseur, relu de la ligne comme la
         #: série d'échecs — la reprise cadencée et son **échéance absolue**
         #: (`retry at`) survivent au redémarrage et ne se court-circuitent pas.
@@ -590,6 +615,15 @@ class AgentWorker(threading.Thread):
         self.watchdog_stop = threading.Event()
         #: message prioritaire : préempte le tour en cours (0018, R19)
         self.preempting = threading.Event()
+        #: #2729 : génération des demandes de préemption. `pick()` fige la
+        #: frontière du tour qu'il sélectionne ; `request_preempt` incrémente
+        #: et pose le drapeau sous le même verrou. Au début du tour, seule une
+        #: demande ANTÉRIEURE à la sélection est un résidu à consommer : une
+        #: demande arrivée depuis est un arrêt pour CE tour, jamais un résidu
+        #: (relecture B1 de #2729 : le clear() fixe effaçait la nouvelle
+        #: préemption reçue pendant la préparation).
+        self.preempt_gen = 0
+        self._preempt_lock = threading.Lock()
         self._refus_vus: set[int] = set()
         #: arrêt demandé avant la publication du Popen (point de passage unique)
         self.stop_requested = threading.Event()
@@ -1430,8 +1464,14 @@ class AgentWorker(threading.Thread):
         Le tour est arrêté (SIGTERM bref puis SIGKILL), sa consigne repart en
         attente, et `pick()` sert le message prioritaire en tête au tour suivant,
         sur la même session.
+
+        #2729 : la génération et le drapeau sont posés sous le même verrou que
+        la consommation du début de tour — une demande ne peut donc pas tomber
+        entre le test de génération et le `clear()`.
         """
-        self.preempting.set()
+        with self._preempt_lock:
+            self.preempt_gen += 1
+            self.preempting.set()
         self.wake.set()
 
     def _preempt_monitor(self, done: threading.Event) -> None:
@@ -4216,8 +4256,18 @@ class AgentWorker(threading.Thread):
         Le tour porte son lot (`lot`, L26) quand il est déductible."""
         if self._attach_pending():
             return None
+        # #2729 : frontière d'un tour ordinaire, prise AVANT la sélection.
+        # Une demande qui entre pendant `_pick` — après la lecture des
+        # urgents, donc hors de ce que le tour choisi sert — ne doit pas être
+        # effacée au début du tour : elle l'arrête.
+        frontiere = _preemption_generation(self)
         spec = self._pick()
         if spec is not None:
+            # Le tour urgent, lui, sert la demande qui l'a fait choisir : sa
+            # frontière est relue après la sélection, sinon il se tuerait
+            # lui-même. Toute demande postérieure arrête le tour.
+            if spec.get("kind") == "urgent":
+                frontiere = _preemption_generation(self)
             # #408 : le réveil sur un lot actionnable porte déjà son lot
             spec["lot"] = spec.get("lot") or self.turn_lot(spec)
             if self._lot_workdir_blocked(spec.get("lot")):
@@ -4227,6 +4277,9 @@ class AgentWorker(threading.Thread):
                     registry.restore_prompt(self.db, self.name, self.runner.runner_id,
                                             self.epoch)
                 return None
+            # transportée par le spec : `rotate_for_lot` et les copies de
+            # `_run_guarded_turn` la gardent (dict(spec, …)).
+            spec["_preempt_gen"] = frontiere
         return spec
 
     def _pick(self) -> dict | None:
@@ -4917,6 +4970,12 @@ class AgentWorker(threading.Thread):
         pas soldée ; elle expire ou change d'epoch, le message est remis plus
         tard et signalé « re-livré » — un doublon signalé, jamais une perte.
         """
+        # #2729 : un appel direct (rotation, compaction, résumé de compte) n'a
+        # pas la frontière figée par `pick()` ; on la fige ici, à l'entrée,
+        # avant toute préparation. Une demande arrivée ensuite reste un arrêt
+        # pour ce tour et ne sera pas effacée à son début.
+        if "_preempt_gen" not in spec:
+            spec = dict(spec, _preempt_gen=_preemption_generation(self))
         candidats = spec.get("candidats")
         if self.runner.draining.is_set():
             # Drainage commencé entre le choix du tour et son lancement : rien
@@ -5583,18 +5642,22 @@ class AgentWorker(threading.Thread):
         par les échecs précédents (#1268/#1270) : `begin_turn` ne les efface
         plus, donc un redémarrage pendant la tentative relit la série, son
         début d'épisode et l'échéance de reprise — sans les recalculer (une
-        échéance n'est jamais repoussée par une tentative interrompue)."""
+        échéance n'est jamais repoussée par une tentative interrompue).
+        #2729 : la série de préemptions est un suffixe, elle aussi conservée."""
         texte = base
         if self.rate_limit:
             texte = rate_limit_mod.status_text(
                 texte, self.rate_limit, self.rate_limit_streak, self.rate_limit_since,
                 rate_limit_mod.delay(self.rate_limit_streak),
                 retry_at=self.rate_limit_retry_at or None)
+        from . import exploitation as exploitation_mod
         if self.failure_streak:
-            from . import exploitation as exploitation_mod
             texte = exploitation_mod.turn_failure_status_text(
                 texte, self.failure_streak, critical=account_turn.is_critical(self),
                 since=self.failure_since)
+        if self.preemption_streak:
+            texte = exploitation_mod.preemption_status_text(
+                texte, self.preemption_streak, since=self.preemption_since)
         return texte
 
     def _run_turn(self, spec: dict) -> bool:
@@ -5982,9 +6045,23 @@ class AgentWorker(threading.Thread):
         # arrêt, préemption) sont revérifiés à la publication (verdict B5).
         self.stop_requested.clear()
         self.host_yield = None
-        if spec["kind"] == "urgent":
-            # Ce tour sert justement le message prioritaire : le signal est consommé.
-            self.preempting.clear()
+        # #2729 : le latch de préemption ne vaut que pour le tour qui l'a reçu.
+        # Il n'était consommé qu'au tour prioritaire : après une préemption, un
+        # tour ordinaire restait tué à la seconde et la boucle ne s'arrêtait
+        # plus (185 tours sur mty-amh-impl-01, 19/10).
+        # La consommation est bornée par la GÉNÉRATION figée à la sélection
+        # (`pick()`, ou l'entrée pour un appel direct) : seule une demande
+        # ANTÉRIEURE est un résidu. Une demande arrivée depuis la sélection —
+        # dispatch pendant la préparation — est un arrêt pour CE tour : on ne
+        # l'efface pas, le moniteur ci-dessous la voit (B1 de la relecture).
+        # Le test et le clear sont sous le verrou de `request_preempt` : pas de
+        # course entre « la génération a-t-elle bougé ? » et l'effacement.
+        frontiere = spec.get("_preempt_gen")
+        if frontiere is None:
+            frontiere = getattr(self, "preempt_gen", 0)
+        with self._preempt_lock:
+            if self.preempt_gen <= frontiere:
+                self.preempting.clear()
         threading.Thread(target=self._preempt_monitor, args=(preempt_done,),
                          daemon=True).start()
         from .platform import audit_guard
@@ -6400,6 +6477,16 @@ class AgentWorker(threading.Thread):
                       "(outside the cap)" % (self.name, relus, relus_sous_agents))
         lost = self.lease_lost.is_set()
         preempte = self.preempting.is_set()
+        # #2729 : la série ne compte que des tours **consécutifs** interrompus
+        # par préemption ; tout autre tour la remet à zéro. Le début d'épisode
+        # est figé à la première préemption (clé d'alerte stable).
+        if preempte:
+            if self.preemption_streak < 1:
+                self.preemption_since = time.time()
+            self.preemption_streak += 1
+        else:
+            self.preemption_streak = 0
+            self.preemption_since = 0.0
         # Comptabilité **avant** toute sortie anticipée : la dépense a eu lieu,
         # même si le bail a été perdu ou le tour préempté (L13 B1). Le modèle
         # est celui du lancement, déjà figé dans le marqueur (L13 B4).
@@ -6475,15 +6562,25 @@ class AgentWorker(threading.Thread):
             # Message prioritaire reçu pendant le tour (0018) : la consigne
             # repart en attente, `pick()` servira le message en tête au tour
             # suivant, sur la même session. Le fil garde la trace.
+            from . import exploitation as exploitation_mod
+            texte_fin = exploitation_mod.preemption_status_text(
+                "turn interrupted: priority message", self.preemption_streak,
+                since=self.preemption_since)
+            if self.preemption_streak == exploitation_mod.PREEMPTIONS_ALERT:
+                # #2729 : une alerte, pas seulement une ligne de journal — sans
+                # elle, 185 tours préemptés d'affilée sont passés inaperçus.
+                log_async("[%s] ALERT: %d consecutive turns interrupted by priority "
+                          "preemption" % (self.name, self.preemption_streak))
             self._avec_reprise("instruction put back in the queue", registry.restore_prompt,
                                self.db, self.name, self.runner.runner_id, self.epoch)
             self._avec_reprise("end-of-turn status", registry.set_status,
                                self.db, self.name, "queued",
-                               status_text="turn interrupted: priority message")
+                               status_text=texte_fin)
             self._fil_note(
                 "Turn interrupted by a priority message; the turn's instruction "
                 "goes back in the queue and the priority message goes first.",
-                meta={"action": "interruption", "tour_s": round(duration, 1)})
+                meta={"action": "interruption", "tour_s": round(duration, 1),
+                      "preemptions": self.preemption_streak})
             return False
         session_fille_ecartee = False
         if not ok:

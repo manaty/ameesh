@@ -16,7 +16,7 @@ from ameesh import adapters, db as db_mod, mail, registry
 from ameesh import platform as os_layer
 from ameesh.runner import AgentWorker, Runner, _AsyncLog
 
-from .support import FAKEBIN, PgTestCase
+from .support import FAKEBIN, PgTestCase, SRC
 
 HARNESSES = {
     "claude": {"session": "claude-sess-1", "reprise": ["--resume", "claude-sess-1"]},
@@ -743,6 +743,46 @@ class RunnerTest(PgTestCase):
         # le tour tourne sous le premier bail ; le rendre en sortant incrémente
         # l'epoch en base, donc on compare au bail du moment, pas à l'après.
         self.assertEqual(int(env["AMEESH_LEASE_EPOCH"]), 1)
+
+    def test_tour_sans_shims_ne_rouvre_pas_le_path_de_production(self):
+        """#2772 : un échec d'écriture des shims ne rouvre pas le PATH du tour.
+
+        Vrai tour d'exécuteur depuis un venv de production simulé : son `bin/`
+        est dans le PATH du runner, les shims ne peuvent pas s'écrire (un
+        fichier occupe leur dossier). Le harnais doit recevoir un PATH sans ce
+        `bin/`, et sans VIRTUAL_ENV.
+        """
+        cwd = self._cwd("sans-shims")
+        self.register("sans-shims", "claude", cwd=cwd, prompt="tour sans shims")
+        # le runner tourne depuis un venv dont le bin/ est exposé au tour
+        productif = os.path.join(self.tmp, "venv-prod")
+        subprocess.run([sys.executable, "-m", "venv", "--without-pip", productif],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # l'écriture des shims échoue : un fichier occupe leur chemin
+        menage = os.path.join(self.state, ".menage")
+        os.makedirs(menage, exist_ok=True)
+        with open(os.path.join(menage, "bin-ameesh"), "w", encoding="utf-8") as fh:
+            fh.write("obstacle\n")
+        # le venv jetable voit les dépendances de la suite par PYTHONPATH
+        import site
+        pythonpath = os.pathsep.join(
+            p for p in [SRC, *site.getsitepackages(),
+                        os.environ.get("PYTHONPATH", "")] if p)
+        env = self.env(
+            PATH=os.pathsep.join([os.path.join(productif, "bin"), "/usr/bin", "/bin"]),
+            VIRTUAL_ENV=productif, PYTHONPATH=pythonpath)
+        proc = subprocess.run(
+            [os.path.join(productif, "bin", "python"), "-m", "ameesh.runner",
+             "--once", "--agents", "sans-shims"],
+            capture_output=True, text=True, timeout=60, env=env, cwd=self.tmp)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        tour = self.turns()[0]
+        path = (tour["env"].get("PATH") or "").split(os.pathsep)
+        productif_bin = os.path.realpath(os.path.join(productif, "bin"))
+        self.assertNotIn(productif_bin, {os.path.realpath(e) for e in path if e}, path)
+        self.assertIsNone(tour["env"].get("VIRTUAL_ENV"))
+        # et c'est bien le chemin d'échec des shims qui a été pris
+        self.assertIn("venv guard: shims not written", proc.stderr)
 
     def test_identite_git_du_tour_vient_du_bail_pas_du_depot(self):
         """#834 : auteur ET committer d'une session, repris ou non.

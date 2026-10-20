@@ -7,6 +7,8 @@ worktree de relecture a visé le venv vivant de pc-smichea (VIRTUAL_ENV et
 
 * l'environnement d'un tour ne porte ni VIRTUAL_ENV ni `bin/` d'un venv
   d'ameesh ; `ameesh` et `agent-mail` y restent joignables (shims) ;
+* un échec d'écriture des shims ne rouvre pas le PATH de production (#2772) :
+  le tour garde les entrées du reste du PATH, jamais le `bin/` du venv vivant ;
 * `ameesh doctor` signale une installation éditable ou un ameesh chargé hors
   du venv ;
 * un venv versionné préparé par `bascule.py` refuse pip, et rien ne peut y
@@ -117,12 +119,48 @@ class ScrubTest(Banc):
         self.assertNotIn("VIRTUAL_ENV", env)
         self.assertEqual([str(self.autre), "/usr/bin"], env["PATH"].split(os.pathsep))
 
-    def test_shims_impossibles_le_path_reste_joignable(self):
+    def test_shims_impossibles_le_path_de_production_reste_ferme(self):
+        """#2772 : un échec d'écriture des shims ne rouvre jamais le PATH.
+
+        Le tour peut perdre `ameesh`/`agent-mail` s'ils ne viennent pas d'un
+        autre dossier du PATH ; le `bin/` du venv vivant, lui, ne revient pas.
+        """
+        _executable(self.autre / "ameesh")
         with self.en_venv(self.vivant), \
              mock.patch.object(venv_guard, "install_shims", side_effect=OSError("ro")):
-            env = venv_guard.scrub(self.env(), str(self.base / "ro"))
+            with self.assertLogs(venv_guard.LOG, level="WARNING") as journal:
+                env = venv_guard.scrub(self.env(), str(self.base / "ro"))
         self.assertNotIn("VIRTUAL_ENV", env)
-        self.assertIn(str(self.vivant / "bin"), env["PATH"])
+        self.assertEqual([str(self.autre), "/usr/bin"],
+                         env["PATH"].split(os.pathsep))
+        self.assertTrue(any("production venv hidden" in ligne
+                            for ligne in journal.output), journal.output)
+        # un point d'entrée fourni par un autre dossier du PATH reste joignable
+        import shutil
+        self.assertEqual(str(self.autre / "ameesh"),
+                         shutil.which("ameesh", path=env["PATH"]))
+        # ni pip ni python3 du venv vivant ne le sont
+        self.assertNotEqual(str(self.vivant / "bin" / "pip"),
+                            shutil.which("pip", path=env["PATH"]))
+        self.assertNotEqual(str(self.vivant / "bin" / "python3"),
+                            shutil.which("python3", path=env["PATH"]))
+        # idempotent : une seconde passe sur un échec persistant ne change rien
+        with self.en_venv(self.vivant), \
+             mock.patch.object(venv_guard, "install_shims", side_effect=OSError("ro")):
+            with self.assertLogs(venv_guard.LOG, level="WARNING"):
+                again = venv_guard.scrub(dict(env), str(self.base / "ro"))
+        self.assertEqual(env, again)
+
+    def test_shims_impossibles_sur_le_disque_le_path_reste_ferme(self):
+        """#2772 : l'échec réel (dossier impossible) ne rouvre pas le PATH."""
+        obstacle = self.base / "ro"
+        obstacle.write_text("pas un dossier\n", encoding="utf-8")
+        with self.en_venv(self.vivant):
+            with self.assertLogs(venv_guard.LOG, level="WARNING"):
+                env = venv_guard.scrub(self.env(), str(obstacle))
+        self.assertNotIn("VIRTUAL_ENV", env)
+        self.assertEqual([str(self.autre), "/usr/bin"],
+                         env["PATH"].split(os.pathsep))
 
     def test_hors_venv_rien_ne_change(self):
         env = self.env()

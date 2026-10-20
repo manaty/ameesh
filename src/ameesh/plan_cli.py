@@ -19,6 +19,8 @@
   ameesh work plan <id|fiche> [--start J] [--end J] [--delivery J] [--source S]  (L96)
                   [--estimate 90m] [--estimate-source S]                (L157, une tâche)
   ameesh work estimates [--app P] [--json]   (L157 : écarts réel/estimé, pour l'auditeur)
+  ameesh work packet record <porteur> [--repo R] [--base SHA] [--head REF] [--dry-run]
+  ameesh work packet show <lot|porteur> [--json]   (#2443 : paquet d'une unité)
 
 Gardées hors de `mesh_cli` (qui les branche) pour que leurs évolutions n'y
 touchent pas. Voir `plan_github` pour les règles de GitHub (vue, jamais
@@ -31,11 +33,12 @@ import json
 import sys
 
 from . import packet_close, plan_git, plan_github, work
+from .canon import GitError
 from .deprecated import DeprecatedAlias
 
 COMMANDS = ("link", "close", "sync-merges", "sync-branches", "sync-packets", "sync-github",
             "project-github",
-            "plan", "estimates", "schedule", "measure")
+            "plan", "estimates", "schedule", "measure", "packet")
 
 
 def add_parsers(work_sub, func) -> None:
@@ -46,6 +49,36 @@ def add_parsers(work_sub, func) -> None:
     p_link.add_argument("--none", action="store_true", help="detach the work item from the plan")
     p_link.add_argument("--actor", default="")
     p_link.set_defaults(func=func)
+
+    p_packet = work_sub.add_parser(
+        "packet", help="#2443: record the composition of a package (a lot on an "
+                       "integration/** branch), or show a lot's recorded package")
+    packet_sub = p_packet.add_subparsers(dest="packet_command", required=True)
+    p_prec = packet_sub.add_parser(
+        "record", help="read the composition commits (`ameesh-work:` trailers) and link "
+                       "each unit to the carrier lot; never reads the manifest")
+    p_prec.add_argument("id", type=int, metavar="CARRIER", help="package carrier lot")
+    p_prec.add_argument("--repo", default=None,
+                        help="local clone of the carrier's repository (default: this "
+                             "worktree; its origin must be the lot's repository)")
+    p_prec.add_argument("--base", default=None,
+                        help="first commit outside the composition (default: merge-base of "
+                             "HEAD and the carrier's target)")
+    p_prec.add_argument("--head", default="HEAD", help="composed head (default: HEAD)")
+    p_prec.add_argument("--branch", default=None,
+                        help="package branch (default: the carrier's branch)")
+    p_prec.add_argument("--target", default=None,
+                        help="target branch (default: the carrier's, then the repository's)")
+    p_prec.add_argument("--dry-run", action="store_true",
+                        help="read and print the composition without writing")
+    p_prec.add_argument("--actor", default="")
+    p_prec.add_argument("--json", action="store_true")
+    p_prec.set_defaults(func=func)
+    p_pshow = packet_sub.add_parser(
+        "show", help="show the recorded packages of a lot, or the units of a carrier")
+    p_pshow.add_argument("id", type=int)
+    p_pshow.add_argument("--json", action="store_true")
+    p_pshow.set_defaults(func=func)
 
     p_close = work_sub.add_parser(
         "close", help="close an abandoned, superseded, delivered-outside-target or done work "
@@ -257,6 +290,11 @@ def run(db, args: argparse.Namespace) -> int:
         else:
             print(lot_measures.format_measures(rows))
         return 0
+    if command == "packet":
+        from . import packet_link
+        if args.packet_command == "record":
+            return _packet_record(db, args, packet_link)
+        return _packet_show(db, args, packet_link)
     if command == "link":
         if args.none == bool(args.package):
             print("error: a package OR --none", file=sys.stderr)
@@ -412,6 +450,62 @@ def _sync_packages(db, args: argparse.Namespace) -> int:
     return 0
 
 
+def _packet_record(db, args: argparse.Namespace, packet_link) -> int:
+    """#2443 : enregistre la composition d'un paquet, sans lire le manifeste."""
+    try:
+        report = packet_link.record(
+            db, args.id, repo=args.repo, base=args.base, head=args.head,
+            branch=args.branch, target=args.target, actor=args.actor,
+            dry_run=args.dry_run, cfg=getattr(db, "cfg", None))
+    except (packet_link.PacketLinkError, work.WorkError, plan_git.MergeProbeError,
+            GitError) as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    print("%slot #%d: %s %d unit(s) %s..%s → %s" % (
+        "[dry run] " if report["dry_run"] else "", report["package"],
+        "would record" if report["dry_run"] else "packet composition recorded",
+        len(report["units"]), report["base"][:12], report["head"][:12],
+        report["branch"]))
+    for unit in report["units"]:
+        print("  #%-5d unit %s source %s freeze %s" % (
+            unit["work_item_id"], (unit["unit_sha"] or "")[:12],
+            (unit.get("source_sha") or "")[:12],
+            (unit.get("frozen_sha") or "")[:12] or "—"))
+    if not report["recorded"]:
+        print("nothing written (dry run)")
+    return 0
+
+
+def _packet_show(db, args: argparse.Namespace, packet_link) -> int:
+    """#2443 : les paquets d'un lot, ou les unités d'un porteur, lus en base."""
+    as_unit = packet_link.for_item(db, args.id)
+    as_package = packet_link.memberships(db, package_ids=[args.id])
+    if args.json:
+        print(json.dumps({"lot": args.id, "as_unit": as_unit,
+                          "as_package": as_package}, ensure_ascii=False, indent=2))
+        return 0
+    if as_package:
+        print("package #%d: %d unit(s)%s" % (
+            args.id, len(as_package),
+            " — %s" % as_package[0]["package_branch"] if as_package else ""))
+        for member in as_package:
+            print("  unit #%-5d %s source %s freeze %s" % (
+                member["work_item_id"], (member["unit_sha"] or "")[:12],
+                (member.get("source_sha") or "")[:12],
+                (member.get("frozen_sha") or "")[:12] or "—"))
+    if as_unit:
+        print("unit #%d: %d package(s)" % (args.id, len(as_unit)))
+        for member in as_unit:
+            print("  package #%-5d %s" % (member["package_id"],
+                                          packet_link.describe(member)))
+    if not as_package and not as_unit:
+        print("lot #%d: no recorded package composition" % args.id)
+    return 0
+
+
 def _sync_merges(db, args: argparse.Namespace) -> int:
     """Le contenu d'abord (git), puis, à défaut et si `--repo`, la PR liée."""
     try:
@@ -432,6 +526,9 @@ def _sync_merges(db, args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps({"git": report, "github": gh_report}, ensure_ascii=False, indent=2))
         return 1 if refused else 0
+    if report.get("packet_error"):
+        print("warning: recorded packet compositions unreadable (%s): falling back to "
+              "the declared freeze" % report["packet_error"], file=sys.stderr)
     print("%s%s (%s): %d work item(s) closed by content" % (
         "[dry run] " if args.dry_run else "", report["git_dir"],
         report["target"] or "no default target",

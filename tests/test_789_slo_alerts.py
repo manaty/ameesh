@@ -122,6 +122,21 @@ class _Base(PgTestCase):
 
 
 class AlerteTest(_Base):
+    def test_intake_reporte_ne_reprend_pas_les_jours_avant_le_debut(self):
+        from ameesh.plan import day_start_ts
+        self.age(8 * 24 * HEURE)
+        self.db.execute("UPDATE work_items SET planned_start = '2026-10-19' WHERE id = %s",
+                        (self.lot["id"],))
+        planned = day_start_ts("2026-10-19")
+        # Une origine ancienne, comme les lots reportés #114/#65/#313.
+        self.db.execute("UPDATE work_items SET created_at = to_timestamp(%s) WHERE id = %s",
+                        (planned - 8 * 24 * HEURE, self.lot["id"]))
+        for offset, levels in ((-1, []), (180, []), (3600, [1]), (10800, [3])):
+            with self.subTest(offset=offset):
+                self.now = planned + offset
+                alerts = [a for a in self.slo() if a["step"] == "intake_started"]
+                self.assertEqual([a["level"] for a in alerts], levels)
+
     def test_niveau_1_assigne(self):
         self.age(1.5 * HEURE)
         alerts = self.slo()

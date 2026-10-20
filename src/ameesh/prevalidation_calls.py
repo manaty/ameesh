@@ -48,6 +48,8 @@ from dataclasses import dataclass, replace
 from . import canon as canon_mod
 from . import lot_class, mechanics, plan_git, prevalidation, registry, work
 
+#: le calculateur du plan L161f, lu dans l'arbre du candidat (convention ameesh)
+PLAN_SCRIPT = "scripts/test-plan.py"
 #: nom du plan écrit dans l'arbre du candidat (relatif, embarqué par l'offload)
 PLAN_NAME = "ameesh-prevalidation-plan.json"
 #: borne de la génération du plan (lecture du dépôt, pas une suite de tests)
@@ -258,6 +260,39 @@ def _run_git(repo: str, *args: str, timeout: int = 120):
                           timeout=timeout)
 
 
+def tooling(repo: str, head: str, params: Parameters) -> None:
+    """#2794 : le plan et le lanceur de part existent au SHA candidat.
+
+    Le bloc ``prevalidation`` global du canon vaut pour tous les projets, mais
+    ``scripts/test-plan.py`` et le lanceur de part sont des outils du dépôt
+    ameesh : un dépôt qui ne les porte pas (nexlink) n'est pas prévalidable.
+    Le refus est nommé ``tooling-missing`` avant tout arbre, carte ou hôte,
+    au lieu d'un ``can't open file`` de Python lu comme ``selection-unsafe``.
+    Une tête qui n'est pas un commit est laissée au refus de ``prepare``.
+    """
+    full = str(head or "").strip().lower()
+    launcher = str(getattr(params.params, "parts_script", None)
+                   or prevalidation.DEFAULT_PARTS_SCRIPT)
+    git = ["git", "-C", repo, *prevalidation.NO_REPLACE]
+    absent = []
+    try:
+        if not full or subprocess.run(
+                [*git, "rev-parse", "--verify", "--quiet", full + "^{commit}"],
+                capture_output=True, text=True, timeout=60).returncode:
+            return
+        for path in (PLAN_SCRIPT, launcher):
+            if subprocess.run([*git, "cat-file", "-e", "%s:%s" % (full, path)],
+                              capture_output=True, text=True, timeout=60).returncode:
+                absent.append(path)
+    except (OSError, subprocess.SubprocessError):
+        return
+    if absent:
+        raise prevalidation.PrevalidationError(
+            "tooling-missing", "%s absent de %s au SHA %s : le projet %s n'outille pas "
+            "la prévalidation (plan L161f et lanceur de part d'ameesh)"
+            % (", ".join(absent), repo, full[:12], params.project or "?"))
+
+
 def _free_name(repo: str, head: str) -> str:
     """Un nom de plan qui ne remplace aucun chemin du SHA candidat."""
     for index in range(0, 20):
@@ -413,6 +448,7 @@ def run(cfg, db, lot: int, *, repo: str, head: str, base: str, project: str,
         raise prevalidation.PrevalidationError(
             "no-vm", "aucun hôte de prévalidation autorisé (%s)"
             % ", ".join(declared))
+    tooling(repo, head, params)
     carte, cleanup = map_for(repo_slug, repo, explicit=map_path)
     prepared = None
     try:
@@ -628,6 +664,7 @@ def gate_train(cfg, *, repo: str, head: str, base: str, canon_repo: str = "",
         params = Parameters(params=replace(params.params, timeout_seconds=governed),
                             repo=params.repo, commit=params.commit,
                             project=params.project)
+        tooling(repo, head, params)
         carte, cleanup = map_for(repo_slug, repo, explicit=map_path)
         prepared = None
         try:

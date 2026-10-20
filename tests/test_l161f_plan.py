@@ -151,6 +151,48 @@ class JudgeTest(unittest.TestCase):
                                             "lines": [10, 10]}])
         self.assertEqual(impact.uncovered, [])
 
+    def test_inherited_changed_block_is_not_a_line_of_the_branch(self):
+        # #1909 : la cible a changé `untested` après la carte (x*2 -> x*4) ; la
+        # branche ne change que `used`. L'empreinte du bloc est la même à la
+        # base de fusion et à HEAD : il n'est pas une ligne de la branche, donc
+        # pas listé — mais la sélection garde le doute de la carte et ses
+        # importateurs (le bloc n'a aucune mesure).
+        inherited = CODE_V1.replace("x * 2", "x * 4")
+        self.repo.write("src/ameesh/code.py", inherited)
+        base = self.repo.commit()
+        self.repo.write("src/ameesh/code.py", inherited.replace("x + 1", "x + 2"))
+        self.repo.commit()
+        impact = plan.judge(self.repo.card(),
+                            plan.changed_files(self.repo.base, "HEAD", self.repo.path),
+                            ["test_a", "test_b", "test_c", "test_db"], "HEAD",
+                            self.repo.path, own={"src/ameesh/code.py"}, own_base=base)
+        self.assertEqual(impact.untested, [])
+        self.assertEqual(impact.importers,
+                         {"src/ameesh/code.py": ["test_a", "test_b", "test_c"]})
+
+    def test_block_changed_by_the_branch_is_listed(self):
+        # #1909 : le bloc sans test que la branche change elle-même reste
+        # listé (la cible l'avait changé après la carte, la branche le change
+        # encore : son empreinte diffère de la base comme de la carte).
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x * 2", "x * 4"))
+        base = self.repo.commit()
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x * 2", "x * 3"))
+        self.repo.commit()
+        impact = plan.judge(self.repo.card(),
+                            plan.changed_files(self.repo.base, "HEAD", self.repo.path),
+                            ["test_a", "test_b", "test_c", "test_db"], "HEAD",
+                            self.repo.path, own={"src/ameesh/code.py"}, own_base=base)
+        self.assertEqual([u["block"] for u in impact.untested], ["untested"])
+
+    def test_changed_block_without_an_own_range_stays_listed(self):
+        # #1909 : sans range propre lisible (`own=None`), le rapport reste
+        # conservateur : le bloc que la cible a changé après la carte est listé
+        # comme avant.
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x * 2", "x * 4"))
+        self.repo.commit()
+        impact = self.repo.judge()
+        self.assertEqual([u["block"] for u in impact.untested], ["untested"])
+
     def test_module_level_change_impacts_every_importer(self):
         self.repo.write("src/ameesh/code.py", CODE_V1.replace("LIMIT = 3", "LIMIT = 4"))
         self.repo.commit()
@@ -333,6 +375,26 @@ class MapTest(unittest.TestCase):
         self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
         self.repo.commit()
         self.assertTrue(self._classify()["phase2_safe"])
+
+    def test_plan_reports_only_the_block_the_branch_changed(self):
+        # #1909 : `classify` lit la base de la branche (`base_fallback`) pour
+        # son range propre. La cible a changé `untested` après la carte, la
+        # branche change `used` : le plan ne liste pas le bloc hérité, et la
+        # sélection garde ses importateurs (la carte est en retard sur lui).
+        inherited = CODE_V1.replace("x * 2", "x * 4")
+        self.repo.write("src/ameesh/code.py", inherited)
+        base = self.repo.commit()
+        self.repo.write("src/ameesh/code.py", inherited.replace("x + 1", "x + 2"))
+        self.repo.commit()
+        mods = ["test_a", "test_b", "test_c", "test_db"]
+        with mock.patch.object(plan, "ALWAYS_FILE", self.repo.path / "none.txt"):
+            out = plan.classify(mods, self.repo.card(), NOW, base_fallback=base,
+                                head="HEAD", repo=self.repo.path)
+        self.assertTrue(out["sure"], out["unsure"])
+        self.assertEqual(out["untested"], [])
+        self.assertEqual(set(out["importers"]["src/ameesh/code.py"]),
+                         {"test_a", "test_b", "test_c"})
+        self.assertEqual(out["classes"]["test_a"][0], "P1")
 
     def test_phase2_safe_with_a_new_plain_function(self):
         # #1339 : une fonction simple nouvelle est couverte par son appelant

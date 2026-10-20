@@ -2,7 +2,8 @@
 // <ameesh-app>: the default assembly of the components, full screen (the
 // standalone page /ui/), with internal navigation (study §2.2). L88 gives
 // the frame and the seven read screens (L89); L90 adds the decisions queue,
-// which files an approval request and emits `ameesh:approval-requested`.
+// which files an approval request and emits `ameesh:approval-requested`;
+// L91 the conversation with an agent (tier 1: mailbox and thread).
 // Per the contract (§2.2) nothing here opens a link or navigates the host:
 // the event goes to the host, and the standalone page shows the link for
 // the human to click. Outputs are DOM events (`ameesh:*`), never navigation.
@@ -148,6 +149,7 @@ export class AmeeshApp extends LitElement {
       case "alerts": return html`<ameesh-alerts .client=${client} theme=${this.theme}></ameesh-alerts>`;
       case "hosts": return html`<ameesh-hosts .client=${client} theme=${this.theme}></ameesh-hosts>`;
       case "budget": return html`<ameesh-budget .client=${client} project=${this.project} theme=${this.theme}></ameesh-budget>`;
+      case "chat": return html`<ameesh-chat .client=${client} project=${this.project} agent=${this.agent} lot=${this.lot} theme=${this.theme}></ameesh-chat>`;
       case "thread": return html`<ameesh-thread .client=${client} project=${this.project} lot=${this.lot} theme=${this.theme}></ameesh-thread>`;
       default: return html`<ameesh-projects .client=${client} project=${this.project} theme=${this.theme}></ameesh-projects>`;
     }
@@ -173,7 +175,7 @@ export class AmeeshApp extends LitElement {
             version: ready.discovery.version, mode: ready.discovery.mode })}</span>` : ""}
       </header>
       <nav aria-label=${this.#t("app.nav")}>
-        <ul>${["projects", "decisions", "timeline", "agent", "alerts", "hosts", "budget", "thread"].map((section) => html`
+        <ul>${["projects", "decisions", "timeline", "agent", "alerts", "hosts", "budget", "thread", "chat"].map((section) => html`
           <li><button type="button" aria-current=${this.section === section ? "page" : "false"}
             @click=${() => { this.section = section; }}>${this.#t(section === "projects" ? "app.home" : "view." + section)}</button></li>`)}</ul>
       </nav>
