@@ -432,13 +432,15 @@ def _open_parent(worktree: str, artifact: str, root: tuple) -> tuple[int, str]:
 
 
 def _delete_tree(parent_fd: int, name: str, *, avoid: set, budget: Budget | None,
-                 gitlink: bool = False) -> dict:
+                 gitlink: bool = False, clone: bool = False) -> dict:
     """Deletes the directory `name` of `parent_fd` through descriptors: links
     are unlinked, never followed; a subtree on another filesystem, holding a
     `.git`, or one of `avoid` ((dev, ino) of the managed roots) is left in
     place; a directory of ours without write permission is opened up.
     `gitlink`: `name` is a removed worktree, whose own `.git` FILE (a link to
     its repository) goes with it; a `.git` below it still keeps its subtree.
+    `clone`: `name` is an ad-hoc clone whose own `.git` DIRECTORY goes with
+    it (#2743); a `.git` below it still keeps its subtree.
     `bytes` freed, `errors`, `left` (subtrees left on purpose), `stopped`
     (time budget)."""
     out: dict = {"bytes": 0, "errors": [], "left": [], "stopped": False}
@@ -475,8 +477,18 @@ def _delete_tree(parent_fd: int, name: str, *, avoid: set, budget: Budget | None
                 out["left"].append("%s (managed root)" % rel)
                 return False
             names = os.listdir(fd)
-            if ".git" in names and not (top and gitlink and stat.S_ISREG(
-                    os.stat(".git", dir_fd=fd, follow_symlinks=False).st_mode)):
+            allow_git = False
+            if top and ".git" in names:
+                try:
+                    mode = os.stat(".git", dir_fd=fd, follow_symlinks=False).st_mode
+                except OSError:
+                    mode = 0
+                # a removed worktree has a `.git` FILE; an ad-hoc clone
+                # (#2743) has a `.git` DIRECTORY. A `.git` below either one
+                # still keeps its subtree.
+                allow_git = (gitlink and stat.S_ISREG(mode)) or (
+                    clone and stat.S_ISDIR(mode))
+            if ".git" in names and not allow_git:
                 out["left"].append("%s (holds a .git)" % rel)
                 return False
             if st.st_uid == uid and (st.st_mode & 0o700) != 0o700:
@@ -562,8 +574,9 @@ def _finish_at(pfd: int, record: dict, journal: Journal, *, avoid, budget) -> di
         journal.drop(record["trash"])
         raise ValueError("%s is not the directory renamed by the pass: left alone"
                          % record["trash"])
+    kind = record.get("kind")
     out = _delete_tree(pfd, name, avoid=avoid, budget=budget,
-                       gitlink=record.get("kind") == "worktree")
+                       gitlink=kind == "worktree", clone=kind == "clone")
     if not (out["stopped"] or out["errors"]):
         journal.drop(record["trash"])   # what is left on purpose stays, never resumed
     out["trash"] = record["trash"]
@@ -632,14 +645,15 @@ def remove_artifact(artifact: str, worktree: str, *, root: tuple, journal: Journ
 
 def remove_worktree_dir(worktree: str, root: tuple, parent_id, *, journal: Journal,
                         avoid: set = frozenset(), budget: Budget | None = None,
-                        check=lambda: "") -> dict:
+                        check=lambda: "", kind: str = "worktree") -> dict:
     """A merged worktree that goes (L230): its directory, `root` (real path,
     identity) under a parent of identity `parent_id`, both as planned
     (`open_checked`), is renamed to a fresh trash name recorded in the
     journal right after `check()` (a process came in), then deleted like an
     artifact (its own `.git` file included, a nested `.git` left). The
-    caller then lets git forget it (`git worktree prune`). `ValueError` if
-    refused; the report of `_delete_tree`, plus `trash`."""
+    caller then lets git forget it (`git worktree prune`). `kind="clone"`
+    (#2743) deletes an ad-hoc clone whose own `.git` DIRECTORY goes too.
+    `ValueError` if refused; the report of `_delete_tree`, plus `trash`."""
     real, ident = root
     parent, name = os.path.split(real)
     pfd = open_checked(parent, parent_id)
@@ -650,7 +664,7 @@ def remove_worktree_dir(worktree: str, root: tuple, parent_id, *, journal: Journ
         refusal = check()
         if refusal:
             raise ValueError(refusal)
-        record = _to_trash(pfd, name, journal, kind="worktree", origin=worktree,
+        record = _to_trash(pfd, name, journal, kind=kind, origin=worktree,
                            worktree=worktree)
         return _finish_at(pfd, record, journal, avoid=avoid, budget=budget)
     finally:

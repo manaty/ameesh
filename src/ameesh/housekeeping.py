@@ -3,7 +3,7 @@
 de base #1, cycle de vie des worktrees).
 
 ameesh fait le ménage de ce que SES agents créent, au lieu de le laisser à
-l'humain. Cinq familles, cinq règles :
+l'humain. Chaque famille a sa règle :
 
 * **Dossier temporaire d'un agent** (jetable) : `TMPDIR`/`TMP`/`TEMP` d'un
   tour pointent vers `<tmp_root>/<agent>` (par défaut
@@ -53,6 +53,15 @@ l'humain. Cinq familles, cinq règles :
 * **Build output of idle worktrees** (L230, [`build_artifacts`]):
   `node_modules`, Rust `target/`, deleted once the worktree is idle for 24 h
   with no process of the user inside; never in a main checkout.
+
+* **Clones ad hoc d'un lot** (#2743, [`housekeeping_clones`]) : enfant direct
+  d'une racine de travail dont le `.git` est un dossier ; rattaché à un lot
+  par son nom ou une branche `lot/`/`work/`, il part après 24 h si tous les
+  lots nommés sont finis depuis plus de 24 h, qu'il est inactif, propre,
+  poussé (toutes ses branches, sans stash), sans copie Git imbriquée, sans
+  autre worktree lié ni alternate dépendant (#2738), et que rien n'y
+  travaille. Un clone sans lot nommé est seulement signalé ; l'essai
+  (`ameesh menage`) montre le plan, `--apply` exécute.
 
 * **Volumes Docker sans conteneur** (L73/#2003, [`reap_volumes`]) : seuls
   ceux dont le mesh a DÉCLARÉ le cycle de vie jetable sont récoltés —
@@ -3697,6 +3706,8 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
       #1665 : un worktree orphelin (aucun lot nommé, ou lot fini sans
       intégration) est retiré après 24 h d'inactivité s'il est propre et
       poussé et qu'aucun agent ne l'utilise ;
+    * #2743 : clones ad hoc rattachés à un lot fini depuis plus de 24 h
+      (`housekeeping_clones`), retirés sous les garde-fous de ce module ;
     * L230: regenerable build dirs of idle worktrees (`build_artifacts`),
       when `artifact_scan` (the runner: at most every `SCAN_EVERY_S`);
     * conteneurs des tours d'ameesh finis (L73, `reap_containers`) ;
@@ -4033,6 +4044,23 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                                              known_agents=registered or ())
         entries += wt_entries
         plan += wt_plan
+        # 3c. #2743: ad-hoc clones of ended lots (dry run by default);
+        #     like the discovery, the runner rescans at most every 6 h.
+        if artifact_scan:
+            from . import housekeeping_clones
+            try:
+                cl_entries, cl_plan, cl_skipped = housekeeping_clones.reap(
+                    db, host, cfg, roots=policy.worktree_roots, agents=cwd_of,
+                    protected=protected, dry_run=dry_run, now=now,
+                    artifacts=policy.artifacts, allow=policy.unreadable_ok,
+                    lock_path=lock_path, journal_path=journal_path,
+                    skip_roots=(troot, croot, cfg.state_dir) + _shared_roots())
+            except Exception as exc:  # never fatal for the pass
+                cl_entries, cl_plan, cl_skipped = [], [], [
+                    "clones: pass failed (%s)" % type(exc).__name__]
+            entries += cl_entries
+            plan += cl_plan
+            skipped += cl_skipped
     # 3b. L230: regenerable build dirs of idle worktrees
     if artifact_scan and registered is not None:
         try:
