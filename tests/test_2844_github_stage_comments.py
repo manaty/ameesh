@@ -92,15 +92,18 @@ class StageCommentsTest(unittest.TestCase):
         self.assertEqual(self.bodies(), [])
 
     def test_private_notes_and_unsafe_opt_in_are_withheld_even_in_private_repo(self):
-        for secret in ("/home/bob/private", "worker-7", "ghp_" + "a1" * 15):
+        for event_id, secret in enumerate(("/home/bob/private", "worker-7", "ghp_" + "a1" * 15), 7):
             with self.subTest(secret=secret[:10]):
-                self.events = [dict(id=7, state="waiting_human", created_ts=2,
+                state = "blocked" if event_id == 8 else "waiting_human"
+                self.events = [dict(id=event_id, state=state, created_ts=2,
                                     note="private detail\nPublic status: Please use " + secret)]
                 report = self.project()
                 self.assertTrue(report["withheld"])
                 self.assertNotIn(secret, json.dumps(report))
                 self.assertNotIn(secret, "\n".join(self.bodies()))
-        self.events = [dict(id=8, state="blocked", created_ts=3, note="private only")]
+                prefix = "Blocked. " if state == "blocked" else "Awaiting a decision. "
+                self.assertIn(prefix + comments.WAIT_DETAIL, self.bodies()[-1])
+        self.events = [dict(id=20, state="blocked", created_ts=3, note="private only")]
         self.project()
         self.assertNotIn("private only", "\n".join(self.bodies()))
         self.assertIn("required decision or information", self.bodies()[-1])
@@ -116,7 +119,7 @@ class StageCommentsTest(unittest.TestCase):
                   "release_sha": "a" * 40, "tag": "v1.2.3", "version": "v1.2.3", "completed_at": 1792454400,
                   "included": [12], "staging": {"exit": 0, "attestation": {
                       "schema": "ameesh-staging-actif/1", "sha": "a" * 40,
-                      "hotes": {str(n): {} for n in range(4)}, "lots": [12]}}}
+                      "hotes": {str(n): {} for n in range(4)}, "lots": ["12"]}}}
         path = folder / "release.json"
         for bad in (dict(report, staging=None), dict(report, project="other"),
                     dict(report, staging={"exit": 0}),
@@ -138,6 +141,60 @@ class StageCommentsTest(unittest.TestCase):
         self.gh.reset_calls()
         self.project()
         self.assertEqual(self.gh.writes(), [])
+        self.assertEqual(self.gh.calls(), [])
+
+    def test_preexisting_closed_ticket_does_not_backfill_or_read_thread(self):
+        self.item["state"] = "closed"
+        self.gh.repo(REPO)["issues"][0]["state"] = "closed"
+        self.marks = [dict(id=4, kind="merged", at_ts=5), dict(id=3, kind="frozen", at_ts=3)]
+        self.st.hosts = SimpleNamespace(current=lambda *_: [])
+        self.st.work.issue_feed = lambda *_: [self.item]
+        before = copy.deepcopy(self.bodies())
+        with mock.patch.object(pg.storage, "of", return_value=self.st):
+            for _ in range(2):
+                self.gh.reset_calls()
+                result = pg.project_lots(self.db, self.gh, "app", REPO)
+                self.assertEqual(result["comments"], [])
+                self.assertFalse(any("/comments" in " ".join(a) for a in self.gh.calls()))
+        self.assertEqual(self.bodies(), before)
+
+    def test_closure_retries_after_post_failure_on_now_closed_ticket(self):
+        self.st.hosts = SimpleNamespace(current=lambda *_: [])
+        self.st.work.issue_feed = lambda *_: [self.item]
+        with mock.patch.object(pg.storage, "of", return_value=self.st):
+            # Existing mirror from before enabling stage comments.
+            with mock.patch.object(comments, "project"):
+                pg.project_lots(self.db, self.gh, "app", REPO)
+            self.item.update(state="merged", pr_ref=REPO + "#42")
+            self.gh.fail = lambda argv: "POST" in argv and "/comments" in " ".join(argv)
+            result = pg.project_lots(self.db, self.gh, "app", REPO)
+            self.assertTrue(result["errors"])
+            self.assertEqual(self.gh.repo(REPO)["issues"][0]["state"], "closed")
+            self.gh.fail = None
+            result = pg.project_lots(self.db, self.gh, "app", REPO)
+            self.assertEqual([r["event"] for r in result["comments"]], ["accepted", "merged"])
+            self.assertIn("Merged by PR #42;", self.bodies()[-1])
+            self.gh.reset_calls()
+            self.assertEqual(pg.project_lots(self.db, self.gh, "app", REPO)["comments"], [])
+            self.assertFalse(any("/comments" in " ".join(a) for a in self.gh.calls()))
+
+    def test_closed_unenrolled_ticket_only_receives_proven_delivery(self):
+        self.gh.repo(REPO)["issues"][0]["state"] = "closed"
+        self.item["state"] = "promoted"
+        with mock.patch.object(comments, "release_receipts", return_value={12: [("v1.2.3", "2026-10-20")]}):
+            result = self.project()
+            self.assertEqual([r["event"] for r in result["comments"]], ["delivered-v1.2.3"])
+            self.gh.reset_calls()
+            self.assertEqual(self.project()["comments"], [])
+            self.assertEqual(self.gh.calls(), [])
+
+    def test_dry_run_never_enrolls_or_consumes_receipts(self):
+        self.project(dry_run=True)
+        self.assertFalse((Path(self.folder.name) / "github-stage-comments.json").exists())
+        self.assertEqual(len(self.project()["comments"]), 1)
+        self.gh.reset_calls()
+        self.assertEqual(self.project()["comments"], [])
+        self.assertEqual(self.gh.calls(), [])
 
     def test_real_projection_calls_comments_when_issue_is_unchanged(self):
         self.st.hosts = SimpleNamespace(current=lambda *_: [])

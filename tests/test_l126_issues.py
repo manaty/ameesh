@@ -424,7 +424,7 @@ class LotIssuesTest(_Base):
         self.assertEqual((merged["state"], merged["state_reason"]), ("closed", "completed"))
         self.assertIn("ameesh:merged", merged["labels"])
         self.assertIn("Accepted.", self.comments(PUBLIC, merged["number"])[0])
-        self.assertIn("Merged;", self.comments(PUBLIC, merged["number"])[1])
+        self.assertIn("Merged by PR #9;", self.comments(PUBLIC, merged["number"])[1])
         self.assertNotIn("Delivered in release", "\n".join(self.comments(PUBLIC, merged["number"])))
         replaced = self.issue(PUBLIC, "Remplacé")
         self.assertEqual((replaced["state"], replaced["state_reason"]), ("closed", "not_planned"))
@@ -560,7 +560,7 @@ class SyncGithubCloseTest(_Base):
         # puis la projection ferme l'issue, avec la PR dans son commentaire
         self.project()
         self.assertEqual(self.issue(PUBLIC, "Export")["state"], "closed")
-        self.assertIn("Merged;", self.comments(PUBLIC, number)[-1])
+        self.assertIn("Merged by PR #5;", self.comments(PUBLIC, number)[-1])
         self.assertEqual(len(self.comments(PUBLIC, number)), 2)
 
 

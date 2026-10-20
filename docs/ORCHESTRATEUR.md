@@ -654,6 +654,13 @@ Les commentaires portent `<!-- ameesh:work-stage:v1 … -->`, que la veille
 GitHub ignore. Ne pas retirer ce marqueur.
 Ils suivent le ticket miroir sélectionné dans le dépôt du projet, même si
 `issue_ref` conserve la référence d'origine dans un autre dépôt ou outil.
+La reprise commence sur les tickets ouverts (y compris ceux fermés pendant
+la passe) : un ticket déjà fermé avant cette fonctionnalité ne reçoit pas
+son historique. Seule une preuve de livraison peut encore y déclencher son
+commentaire de release. Les reçus locaux sous
+`<état>/github-stage-comments.json` évitent de relire les fils déjà traités ;
+un envoi interrompu est réconcilié avec les marqueurs distants. La simulation
+ne modifie pas ces reçus. Sans nouvel événement, aucun fil n'est relu.
 
 Pour préciser ce qui est attendu du demandeur, écrire dans la **note de la
 transition** bloquée/en attente une ligne `Public status: …` limitée aux

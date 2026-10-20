@@ -14,6 +14,11 @@ import re
 
 MARKER = "<!-- ameesh:work-stage:v1 lot=%d event=%s -->"
 PUBLIC_STATUS = re.compile(r"(?im)^Public status:[ \t]*(\S[^\r\n]*)$")
+WAIT_DETAIL = "The team will specify the required decision or information on this ticket."
+
+
+def _waiting(state, detail=WAIT_DETAIL):
+    return ("Blocked. " if state == "blocked" else "Awaiting a decision. ") + detail
 
 
 def _date(value):
@@ -60,8 +65,10 @@ def release_receipts(cfg, project):
         if not isinstance(lots, list):
             continue
         for lot in lots:
-            if isinstance(lot, int) and not isinstance(lot, bool):
-                receipts.setdefault(lot, []).append((version, day))
+            # actif's --lot values are strings; cutoff's included values are ints.
+            if ((isinstance(lot, int) and not isinstance(lot, bool) and lot > 0)
+                    or (isinstance(lot, str) and re.fullmatch(r"[1-9][0-9]*", lot))):
+                receipts.setdefault(int(lot), []).append((version, day))
     return receipts
 
 
@@ -85,11 +92,9 @@ def stages(item, milestones, events, *, receipts=(), closing=None):
         state = event.get("state")
         if state in ("blocked", "waiting_human") and state != previous:
             match = PUBLIC_STATUS.search(event.get("note") or "")
-            detail = (match.group(1) if match else
-                      "The team will specify the required decision or information on this ticket.")
+            detail = match.group(1) if match else WAIT_DETAIL
             timeline.append((float(event.get("created_ts") or 0), "event-%s" % event["id"],
-                             ("Blocked. " if state == "blocked" else
-                              "Awaiting a decision. ") + detail))
+                             _waiting(state, detail)))
         previous = state
     for _at, key, text in sorted(timeline):
         yield key, text
@@ -111,6 +116,23 @@ def project(db, st, gh_repo, report, mine, *, guard, refused, project, closings)
     from . import plan_github
 
     receipts = release_receipts(getattr(db, "cfg", None), project)
+    # Single writer, as for the issue projection. Local receipts avoid re-reading
+    # completed threads; remote markers still reconcile a POST with a lost ack.
+    folder = getattr(getattr(db, "cfg", None), "state_dir", None)
+    path = Path(folder) / "github-stage-comments.json" if folder else None
+    try:
+        checkpoint = json.loads(path.read_text(encoding="utf-8")) if path and path.exists() else {}
+        if not isinstance(checkpoint, dict):
+            raise ValueError("invalid stage-comment checkpoint")
+    except (OSError, ValueError) as exc:
+        report["errors"].append({"action": "stage-checkpoint", "detail": str(exc)})
+        return
+
+    def save():
+        if path and not gh_repo.dry_run:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            plan_github._atomic_write(str(path), checkpoint)
+
     entries = {row["work_item"]: row for row in report["issues"]}
     for item, issue in mine:
         lot = int(item["id"])
@@ -122,28 +144,59 @@ def project(db, st, gh_repo, report, mine, *, guard, refused, project, closings)
         # project_lots selected this mirror. An external issue_ref is kept as
         # the request's origin; it need not point at the projected issue.
         try:
+            ticket = "%s#%s/lot-%s" % (gh_repo.repo, number, lot)
+            saved = checkpoint.get(ticket, {"enrolled": False, "seen": []})
+            # `issue` is the snapshot BEFORE project_lots applies a closure.
+            # Enroll open/new mirrors, never backfill an already closed thread.
+            if issue is None or (issue.get("state") or "").lower() == "open":
+                if not saved["enrolled"]:
+                    saved["enrolled"] = True
+                    checkpoint[ticket] = saved
+                    save()
+            if not saved["enrolled"] and not receipts.get(lot):
+                continue
+            checkpoint[ticket] = saved
             candidates = list(stages(item, st.work.milestones(lot, None),
                                      st.work.events(lot, None), receipts=receipts.get(lot, ()),
                                      closing=closings.get(lot)))
+            if not saved["enrolled"]:
+                candidates = [(key, text) for key, text in candidates if key.startswith("delivered-")]
+            candidates = [(key, text) for key, text in candidates if key not in saved["seen"]]
+            if not candidates:
+                continue
             existing = "\n".join(row.get("body") or "" for row in gh_repo.comments(number))
             seen = set()
             for key, text in candidates:
                 marker = MARKER % (lot, key)
-                if marker in existing or marker in seen:
+                if marker in existing:
+                    if key not in saved["seen"]:
+                        saved["seen"].append(key)
+                    continue
+                if marker in seen:
                     continue
                 seen.add(marker)
+                pr = plan_github._ref_parts(item.get("pr_ref"))
+                if text.startswith("Merged;") and pr and pr[0].casefold() == gh_repo.repo.casefold():
+                    text = text.replace("Merged;", "Merged by PR #%d;" % pr[1], 1)
                 # All comments obey the public policy, even in private repos:
                 # lifecycle receipts never publish private mesh details.
                 problems = guard.problems(text, public=True)
                 if problems:
                     report["withheld"].append({"work_item": lot, "field": "stage comment",
                                                 "reasons": problems})
-                    continue
+                    if key.startswith("event-"):
+                        text = _waiting("blocked" if text.startswith("Blocked.") else "waiting_human")
+                    else:
+                        continue
+                    if guard.problems(text, public=True):
+                        continue
                 body = marker + "\n" + plan_github._quiet(text)
                 report["comments"].append({"work_item": lot, "number": number, "event": key,
                                             "body": body})
                 if not gh_repo.dry_run:
                     gh_repo.comment(number, body)
-        except plan_github.GithubError as exc:
+                    saved["seen"].append(key)
+            save()
+        except (plan_github.GithubError, OSError) as exc:
             report["errors"].append({"work_item": lot, "number": number,
                                      "action": "stage-comment", "detail": plan_github._one_line(exc)})
