@@ -731,7 +731,7 @@ def run_offload(host: str, command: str, *, timeout: int | None = None,
               "host": host, "flow": parse_flow(output)}
     result["seconds"] = parse_seconds(output)
     if result["seconds"] is None:
-        result["seconds"] = round(time.time() - started, 1)
+        result["seconds"] = round(time.monotonic() - started, 1)
     return result
 
 

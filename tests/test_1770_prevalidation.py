@@ -394,6 +394,18 @@ class RunTest(unittest.TestCase):
         result = pv.run_offload("vm-agents-1", "echo ko", runner=lambda *a, **k: Fake())
         self.assertEqual(result["outcome"], "run-red")
 
+    def test_run_offload_duree_murale_sans_marque(self):
+        """#2665 : sans durée lue, le repli est mesuré sur la même horloge
+        monotone que le départ (jamais une date murale moins un instant monotone)."""
+        class Fake:
+            returncode = 0
+            stdout = flux()
+            stderr = ""
+
+        result = pv.run_offload("vm-agents-1", "echo ok", runner=lambda *a, **k: Fake())
+        self.assertGreaterEqual(result["seconds"], 0.0)
+        self.assertLess(result["seconds"], 60.0)
+
     def test_run_offload_preempte_par_la_porte(self):
         """#2298 : la note « stopped on … host draining » sort en gate-preempted."""
         class Fake:
