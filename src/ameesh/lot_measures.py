@@ -292,6 +292,10 @@ def diff_range(repo: str, sha: str, target: str | None = None) -> tuple[str, str
     return (parents[0] if parents else empty), sha
 
 
+class UnprovenLotDiff(ValueError):
+    """The frozen lot cannot be tied to the observed integration merge."""
+
+
 def lot_diff_range(repo: str, sha: str, target: str | None = None,
                    frozen: str | None = None) -> tuple[str, str] | None:
     """The (base, head) of the **lot's own** change brought by `sha` (#2374).
@@ -313,6 +317,10 @@ def lot_diff_range(repo: str, sha: str, target: str | None = None,
     tête du lot (`merge-base(premier parent, gel)..gel`), soit la même lecture
     que le gel d'avant fusion ; sans gel porté par la fusion, le deuxième
     parent reste la tête lue (#2374).
+
+    Un gel connu mais non ancêtre de la fusion (réécriture, cherry-pick)
+    lève `UnprovenLotDiff` (#2823) : aucun delta propre au lot n'est prouvé.
+    L'appelant doit douter, sans repli sur le diff du paquet.
 
     Une cible locale périmée (#2702) ne porte pas `sha` : le repli
     `merge-base(cible, sha)..sha` emporterait tout l'historique entre les deux.
@@ -343,7 +351,11 @@ def lot_diff_range(repo: str, sha: str, target: str | None = None,
     if len(parents) < 2:
         return None
     head = (frozen or "").strip()
-    if head and (head == merge or not _is_ancestor(repo, head, merge)):
+    if head and not _is_ancestor(repo, head, merge):
+        raise UnprovenLotDiff(
+            "gel %s non ancêtre de la fusion %s : delta du lot non prouvé"
+            % (head[:12], merge[:12]))
+    if head == merge:
         head = ""
     if head:
         base = (_git(repo, "merge-base", parents[0], head,

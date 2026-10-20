@@ -130,6 +130,10 @@ DEFAULT_TMP_QUOTA = 4 * GIB          # par agent
 DEFAULT_CACHE_QUOTA = 10 * GIB       # tous caches partagés de l'hôte
 DEFAULT_TMPFS_ALERT = 0.6            # alerte (la contre-pression est à 0,8)
 DEFAULT_ORPHAN_MIN_SIZE = 50 * MIB   # entrée de /tmp signalée au-delà
+DEFAULT_EVENTS_QUOTA = 64 * MIB      # #2820 : flux events.jsonl d'un agent, avant rotation
+#: #2820 : plus petit `events_quota` admis (la reprise du dernier tour en est
+#: le quart)
+MIN_EVENTS_QUOTA = 1 * MIB
 #: âge minimal d'un fichier évincé (secondes) : jamais un fichier en écriture
 EVICT_MIN_AGE_S = 3600.0
 #: #1665 : inactivité (secondes) d'un worktree orphelin (aucun lot nommé par
@@ -241,7 +245,8 @@ POLICY_KEYS = ("tmp_root", "cache_root", "tmp_quota", "cache_quota", "tmpfs_aler
                "redirect", "xdg_cache", "worktrees", "orphan_min_size",
                "orphan_cleanup", "orphan_idle", "deps", "deps_idle", "artifacts",
                "artifact_idle", "unreadable_ok", "docker_orphan_volumes_alert",
-               "docker_build_cache_alert", "docker_volumes", "docker_volume_idle")
+               "docker_build_cache_alert", "docker_volumes", "docker_volume_idle",
+               "events_quota")
 #: racines refusées : le ménage n'y supprimerait que ses sous-dossiers, mais
 #: un dossier partagé par tout le système n'est pas un dossier GÉRÉ
 FORBIDDEN_ROOTS = ("/", "~", "/tmp", "/var/tmp", "/dev/shm", "/home", "/root")
@@ -288,6 +293,9 @@ class Policy:
     #: artifacts of an idle worktree AND the holder check of an abandoned /tmp
     #: entry; empty by default, set per host in its Host card
     unreadable_ok: tuple = ()
+    #: #2820 : taille du flux `events.jsonl` d'un agent au-delà de laquelle il
+    #: tourne au début du tour suivant (`events_rotation`)
+    events_quota: int = DEFAULT_EVENTS_QUOTA
     #: #2180: discovery roots derived from Host work_root/work_roots, never
     #: deletion roots. Not a separate housekeeping setting.
     worktree_roots: tuple = ()
@@ -333,6 +341,12 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             problems.append("`%s`: size in bytes expected (e.g. 4GiB)" % key)
         else:
             parsed[key] = octets
+    if raw.get("events_quota") is not None:
+        octets = resources_mod.parse_bytes(raw["events_quota"])
+        if octets is None or octets < MIN_EVENTS_QUOTA:
+            problems.append("`events_quota`: size of at least 1MiB expected (e.g. 64MiB)")
+        else:
+            parsed["events_quota"] = octets
     if raw.get("docker_orphan_volumes_alert") is not None:
         count = raw["docker_orphan_volumes_alert"]
         if type(count) is not int or count <= 0:
@@ -424,7 +438,8 @@ def effective(canons, host: str) -> Policy:
             if key not in values:
                 values[key], origin[key] = value, label
             elif key in ("tmp_quota", "cache_quota", "orphan_min_size", "tmpfs_alert",
-                         "docker_orphan_volumes_alert", "docker_build_cache_alert") \
+                         "docker_orphan_volumes_alert", "docker_build_cache_alert",
+                         "events_quota") \
                     and value < values[key]:
                 values[key], origin[key] = value, label
             elif (key in ("orphan_idle", "deps_idle", "artifact_idle",
@@ -1918,7 +1933,7 @@ def tmp_recovery_command(path: str, *,
             commands.append("git -C %s log --all --not --remotes" % shlex.quote(copy))
             continue
         commands.append("git -C %s status --short" % shlex.quote(copy))
-        commands.append("git -C %s log --branches --not --remotes" % shlex.quote(copy))
+        commands.append("git -C %s log --all --not --remotes" % shlex.quote(copy))
     return " ; ".join(commands)
 
 
@@ -1964,7 +1979,7 @@ def _git_copy_work(copy: str, entry: str, rules=()) -> str:
     agent directory of `tmp_git_work` — so a guard added for one never misses
     the other: locked, unreadable metadata, submodules, modified or untracked
     files, ignored files outside the build output `rules`, HEAD on no remote
-    branch, for a CLONE its local branches, stash, other linked worktrees and
+    branch, for a CLONE all local refs, stash, other linked worktrees and
     a remote that lives inside `entry`, and no linked worktree whose common
     repository lives inside `entry`. A bare repository has no working tree to
     prove its refs saved: it is a doubt and keeps the entry (#2525)."""
@@ -2000,15 +2015,16 @@ def _git_copy_work(copy: str, entry: str, rules=()) -> str:
             return "%s: linked worktrees unreadable" % copy
         if sum(line.startswith("worktree ") for line in linked.stdout.splitlines()) > 1:
             return "%s: the clone has other linked worktrees" % copy
-        # A clone takes its local branches and its stash with it (a linked
-        # worktree leaves them in its common repository): HEAD alone does
-        # not prove they are saved. Unreadable: a doubt, the copy stays.
-        local = _git(["log", "--branches", "--not", "--remotes", "--format=%H",
+        # A clone takes all its refs with it (a linked worktree leaves them
+        # in its common repository): branches alone miss tags and custom
+        # refs (#2827). Every reachable commit must be on a remote branch.
+        # Unreadable: a doubt, the copy stays.
+        local = _git(["log", "--all", "--not", "--remotes", "--format=%H",
                       "-1"], copy)
         if local is None or local.returncode != 0:
-            return "%s: local branches unreadable" % copy
+            return "%s: local refs unreadable" % copy
         if local.stdout.strip():
-            return "%s: local branch commit %s on no remote branch" % (
+            return "%s: local ref commit %s on no remote branch" % (
                 copy, local.stdout.strip()[:12])
         stash = _git(["rev-parse", "-q", "--verify", "refs/stash"], copy)
         if stash is None or stash.returncode not in (0, 1):
@@ -2026,8 +2042,8 @@ def tmp_git_work(path: str, rules=(), *,
     """#2493 (N2) : why a Git copy inside a temporary directory must be kept,
     empty when every copy is safe to recover: the saved-work guards of
     `_git_copy_work` (clean, pushed or integrated, no ignored file outside
-    the build output, for a clone no unpushed local branch, stash, other
-    linked worktree nor remote inside the directory, and no linked worktree
+    the build output, for a clone no local ref commit outside remote branches,
+    stash, other linked worktree nor remote inside the directory, and no linked worktree
     whose common repository is inside it) and no process inside.
     A directory is never deleted merely because its agent left the registry;
     this check is the second condition. A bare repository, or a directory
@@ -3122,7 +3138,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             if not dry_run and (row["status"] != "kept" or row.get("detail") != detail):
                 store.set_worktree_status(row["id"], "kept", detail)
                 entries.append(dict(base, action="kept", detail=detail, data={
-                    "command": "git -C %s status ; git -C %s log --branches --not --remotes"
+                    "command": "git -C %s status ; git -C %s log --all --not --remotes"
                                % (shlex.quote(path), shlex.quote(path))}))
             continue
         if worktree_in_use(path, allow=allow):
@@ -3195,7 +3211,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             if not dry_run and (row["status"] != "kept" or row.get("detail") != detail):
                 store.set_worktree_status(row["id"], "kept", detail)
                 entries.append(dict(base, action="kept", detail=detail, data={
-                    "command": "git -C %s status ; git -C %s log --branches --not --remotes"
+                    "command": "git -C %s status ; git -C %s log --all --not --remotes"
                                % (shlex.quote(path), shlex.quote(path))}))
             continue
         size = size_of(path)

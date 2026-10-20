@@ -48,6 +48,7 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import canon, review
+from .deadline import Deadline
 
 #: version du contrat `processus/mecanique.yaml`
 SCHEMA = "ameesh-mechanics/1"
@@ -745,33 +746,59 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
 # lecture au commit exact
 # --------------------------------------------------------------------------
 
-def _exact_commit(repo: str, commit: str) -> str:
+def _git_timeout(deadline: Deadline | None, what: str) -> float:
+    """Le délai d'une lecture git : le plafond du canon, ramené au temps restant.
+
+    Une échéance épuisée refuse avant l'appel (#2665) : la lecture ne part pas
+    pour découvrir après coup qu'elle n'avait plus de budget.
+    """
+    if deadline is None:
+        return canon.GIT_TIMEOUT
+    if deadline.expired():
+        raise MechanicsError("deadline exhausted before %s" % what)
+    return deadline.timeout(canon.GIT_TIMEOUT)
+
+
+def _exact_commit(repo: str, commit: str, *,
+                  deadline: Deadline | None = None) -> str:
     if not isinstance(commit, str) or not _SHA.fullmatch(commit):
         raise MechanicsError("an exact canon commit is required")
     try:
-        resolved = canon.git_commit(repo, commit)
+        resolved = canon.git_commit(
+            repo, commit, timeout=_git_timeout(deadline, "the canon commit"))
     except (canon.GitError, OSError) as exc:
+        if deadline is not None and deadline.expired():
+            raise MechanicsError("deadline exhausted while reading the canon commit") from None
         raise MechanicsError("cannot read the canon repository: %s" % exc) from exc
     if resolved != commit:
         raise MechanicsError("an exact canon commit is required")
     return commit
 
 
-def _regular_blob(repo: str, commit: str, path: str) -> str:
+def _regular_blob(repo: str, commit: str, path: str, *,
+                  deadline: Deadline | None = None) -> str:
     """Le texte d'un fichier ordinaire (`path`) au commit exact, sinon refuse.
 
     `_git_list` est le lecteur d'arbre du canon : il ne retient que les
     fichiers ordinaires (ni lien symbolique, ni sous-module), donc un chemin
-    qui n'en est pas un est refusé comme absent.
+    qui n'en est pas un est refusé comme absent. Avec ``deadline`` (#2665),
+    chaque lecture git ne prend que le temps qui reste au passage.
     """
     try:
-        listed = canon._git_list(repo, commit, path)
+        listed = canon._git_list(
+            repo, commit, path, timeout=_git_timeout(deadline, "the canon tree"))
     except (canon.GitError, OSError) as exc:
+        if deadline is not None and deadline.expired():
+            raise MechanicsError("deadline exhausted while reading the canon tree") from None
         raise MechanicsError("cannot read the canon tree: %s" % exc) from exc
     if len([sha for name, sha in listed if name == path]) != 1:
         raise MechanicsAbsent("%s is absent at %s" % (path, commit))
-    raw = canon.git_read(repo, commit, path)
+    raw = canon.git_read(
+        repo, commit, path, timeout=_git_timeout(deadline, "the canon blob"))
     if raw is None:
+        if deadline is not None and deadline.expired():
+            raise MechanicsError("deadline exhausted while reading %s at %s"
+                                 % (path, commit))
         raise MechanicsAbsent("%s is unreadable at %s" % (path, commit))
     try:
         return raw.decode("utf-8")
@@ -779,10 +806,12 @@ def _regular_blob(repo: str, commit: str, path: str) -> str:
         raise MechanicsError("%s is not UTF-8 at %s" % (path, commit)) from exc
 
 
-def load_global(repo: str, commit: str) -> Document:
+def load_global(repo: str, commit: str, *,
+                deadline: Deadline | None = None) -> Document:
     """Le document global (`processus/mecanique.yaml`) au commit exact."""
-    commit = _exact_commit(repo, commit)
-    return compile_document(_regular_blob(repo, commit, PATH), source=PATH)
+    commit = _exact_commit(repo, commit, deadline=deadline)
+    return compile_document(_regular_blob(repo, commit, PATH, deadline=deadline),
+                            source=PATH)
 
 
 #: documents globaux déjà compilés, par `(dépôt, commit exact)` : un commit
@@ -843,10 +872,12 @@ def review_flags_at(repo: str, commit: str) -> tuple[bool, bool]:
     return document.exclude_author_family, document.distinct_families
 
 
-def _federation(repo: str, commit: str) -> dict:
+def _federation(repo: str, commit: str, *,
+                deadline: Deadline | None = None) -> dict:
     try:
-        parsed = canon.load_yaml(_regular_blob(repo, commit, FEDERATION_PATH),
-                                 use_pyyaml=False)
+        parsed = canon.load_yaml(
+            _regular_blob(repo, commit, FEDERATION_PATH, deadline=deadline),
+            use_pyyaml=False)
     except canon.YamlError as exc:
         raise MechanicsError("%s: unreadable YAML: %s" % (FEDERATION_PATH, exc)) from exc
     if not isinstance(parsed, dict):
@@ -915,19 +946,22 @@ def _review_policy(federation: dict, project: str, commit: str
     return policy, tuple(rules)
 
 
-def load(repo: str, commit: str, project: str) -> Mechanics:
+def load(repo: str, commit: str, project: str, *,
+         deadline: Deadline | None = None) -> Mechanics:
     """Compile les paramètres d'un projet depuis le canon, au commit exact.
 
     Aucun repli : projet inconnu, bloc absent, schéma inconnu ou règle mal
     formée refusent, et `commit` doit être un commit exact (jamais une
-    branche ou un tag).
+    branche ou un tag). Avec ``deadline`` (#2665), les lectures git du canon
+    ne prennent que le temps qui reste au passage.
     """
     if not isinstance(project, str) or not project.strip() or project != project.strip():
         raise MechanicsError("an explicit project is required")
-    commit = _exact_commit(repo, commit)
-    document = compile_document(_regular_blob(repo, commit, PATH), source=PATH)
+    commit = _exact_commit(repo, commit, deadline=deadline)
+    document = compile_document(_regular_blob(repo, commit, PATH, deadline=deadline),
+                                source=PATH)
     override = document.override(project)
-    federation = _federation(repo, commit)
+    federation = _federation(repo, commit, deadline=deadline)
     policy, rules = _review_policy(federation, project, commit)
     return Mechanics(
         schema=document.schema,

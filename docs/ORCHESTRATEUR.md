@@ -475,6 +475,17 @@ ameesh work milestone <id> verdict ok --sha <commit>            le GO de revue, 
 ameesh work queue add <id>                                      dans la file
 ```
 
+La tête du gel est un commit **complet** (une abréviation de 12+ hexadécimaux
+est résolue dans le dépôt de l'auteur et écrite complète) ; `HEAD` et un nom
+de branche sont refusés : chaque lecteur les résoudrait dans son clone, et le
+balayage d'un autre arbre a déjà fermé un lot sur ce `HEAD` (#2786, #2712).
+Un gel non conforme resté en base vaut doute, jamais une livraison. Un gel
+dont le commit est déjà ancêtre de la cible au moment du gel (aucun commit
+propre) est refusé : c'est un ancien commit, pas la branche du lot (#2784).
+La cible est lue **publiée et rafraîchie** : un clone en retard sur la forge
+n'accepte pas un gel déjà livré et n'écrit pas de marque d'absence ; si la
+forge est illisible, le gel s'écrit sans cette marque et le balayage doute.
+
 ameesh range la file à chaque passage du radar : priorité, puis les lots
 sans conflit, puis ceux dont les conflits sont préparés (`ameesh work
 resolve`), puis l'arrivée. Il la rejoue empilée (la cible, plus les lots qui
@@ -573,8 +584,9 @@ Le corps du lot porteur nomme ses unités avec leur tête, `#<lot> <tête>`, la
 ligne qu'imprime `scripts/paquet-compose.py --units --base <cible>` (#2360) :
 un `#N` seul n'y déclare aucune unité (#2335). Quand ce corps omet la liste,
 la lecture des attentes retrouve les unités par ces trailers `ameesh-work:`
-de la branche, au-dessus de la cible (#2599) ; un `#N` cité en prose ne
-supprime toujours pas son alerte.
+de la branche, au-dessus de la cible (#2599) ; l'hôte qui lit retrouve un
+clone du registre s'il n'a pas les réglages radar du projet (#2837) ; un `#N`
+cité en prose ne supprime toujours pas son alerte.
 
 Après la composition — et après chaque recomposition — le composeur écrit la
 liaison en base, depuis le worktree du paquet :
@@ -645,6 +657,50 @@ ferme l'issue avec un commentaire qui dit pourquoi. L'issue d'un lot est son
 * Une modification faite dans GitHub n'est jamais reprise dans ameesh :
   c'est le lot qu'on change. Garder le marqueur `<!-- ameesh:work=… -->` du
   corps de l'issue, qui la relie au lot.
+
+Les étapes sont aussi commentées sur le ticket : accepté (priorité, cible),
+gelé, fusionné, bloqué ou en attente. La projection relit les jalons et les
+transitions, même si plusieurs étapes ont eu lieu entre deux passages ; elle
+relit les commentaires GitHub pour éviter un second envoi après une panne.
+Les commentaires portent `<!-- ameesh:work-stage:v1 … -->`, que la veille
+GitHub ignore. Ne pas retirer ce marqueur.
+Ils suivent le ticket miroir sélectionné dans le dépôt du projet, même si
+`issue_ref` conserve la référence d'origine dans un autre dépôt ou outil.
+La reprise commence sur les tickets ouverts (y compris ceux fermés pendant
+la passe) : un ticket déjà fermé avant cette fonctionnalité ne reçoit pas
+son historique. Seule une preuve de livraison peut encore y déclencher son
+commentaire de release. Les reçus locaux sous
+`<état>/github-stage-comments.json` évitent de relire les fils déjà traités ;
+un envoi interrompu est réconcilié avec les marqueurs distants. La simulation
+ne modifie pas ces reçus. Sans nouvel événement, aucun fil n'est relu.
+
+Le fichier est un cache versionné (`schema: ameesh/github-stage-comments/1`),
+clé `dépôt#numéro/lot-<id>` → `{enrolled, seen}`, où `seen` liste `accepted`,
+`event-<id>`, `milestone-<id>`, `merged`, `closed` et `delivered-<version>`.
+Sans version, il est lu comme v0 puis réécrit avec la version à sa prochaine
+écriture ; une version inconnue est laissée intacte (erreur journalisée).
+L'hôte écrivain désigné (L126) et l'écriture atomique tiennent lieu de
+verrou ; un écrivain concurrent est hors contrat et ses pertes rejouent
+depuis les marqueurs. Une entrée illisible est réinitialisée et rejouée. Pour réparer un commentaire supprimé à la main,
+retirer sa clé de `seen` (ou l'entrée entière sur un ticket ouvert), puis
+relancer la projection : les marqueurs présents ne sont pas redoublés. Sur un
+ticket fermé, ne retirer que `seen` pour garder `enrolled` (pas de reprise
+d'historique).
+
+Pour préciser ce qui est attendu du demandeur, écrire dans la **note de la
+transition** bloquée/en attente une ligne `Public status: …` limitée aux
+références et au contrat à confirmer. Les autres lignes restent internes.
+Cette ligne passe le contrôle public (secrets, chemins, hôtes, adresses,
+termes exclus), même pour un dépôt privé ; un refus est journalisé sans son
+texte. Sans ligne publiable, le commentaire annonce l'attente et indique que
+l'équipe précisera sur le ticket la décision ou l'information attendue.
+
+« Livré dans la release X, le … » exige le rapport durable de release sous
+`<état>/release/reports/` : tag, lot inclus, succès de staging et attestation
+d'activation du même commit. Un lot fusionné, promu ou clos avec un jalon
+`delivered` ne prouve pas à lui seul une livraison. Sans cette preuve locale,
+la projection n'annonce aucune release livrée. Application de
+`processus/demandes-github.md` du canon (owner, 20/10/2026, #2844).
 
 ## Le courrier qui réveille (L125)
 

@@ -44,6 +44,8 @@ The executor writes a generated `gh` into `<state>/github/bin/` and puts it firs
 
 This is **attribution, not enforcement**. An agent that calls the real `gh` by its absolute path, or the API through `curl`, is not journaled. Enforcement comes from the permissions of separate identities (§3). That holds only if an agent cannot read another role's token: on a host where all agents share one Unix user, mode 0600 does not separate them, and every agent can read every `token_file`. Real separation needs tokens that agents never see (a GitHub App minter that hands out short-lived installation tokens per turn), or separate Unix users or hosts. Until then, per-role identities limit what a role's token can do, not which agent uses it.
 
+Since #2853, the generated `gh` also **refuses** one gesture before calling the real binary: `pr merge --auto` when GitHub cannot wait for the checks, that is when the repository has `allow_auto_merge=false` (manaty/nexlink and manaty/home), or when the base branch has no protection with required status checks. On such a repository `gh pr merge --auto --match-head-commit` merges immediately instead of arming auto-merge (paquet 111, PR manaty/nexlink#1849: merged 25 s after the CI dispatch). The guard is fail-closed: an unreadable repository, PR or protection refuses too. It is not a general enforcement — a direct call to the real `gh` by absolute path, or a merge without `--auto`, still escapes it — and the refusal names the merge queue (`ameesh work queue add`), which lands on the frozen head once its CI is green.
+
 ### 2. An identity per role, inert until configured
 
 `<config>/github-identities.json` maps agents to a role and each role to a token file. It holds no secret:

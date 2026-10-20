@@ -17,7 +17,9 @@ Quatre types d'alerte, levés par `ameesh alerts` et poussés par
   proche et peu utilisée (`fin_de_fenetre`), ou perte projetée dépassant
   le seuil réglé (`sous_rythme`). Volume perdu estimé : `1 − utilisé` de la
   fenêtre si rien ne change (même définition que les « pertes à la remise à
-  zéro » de L74, `Gauge.expiring`), et la projection au rythme actuel ;
+  zéro » de L74, `Gauge.expiring`), et la projection au rythme actuel ; le
+  débit des six dernières heures ignore les relevés pris pendant que les
+  non-critiques étaient tenus par le plafond de pause (#2816) ;
 * `idle_capacity` : des agents réveillables (mode `execute`, exécuteur
   vivant, au repos, sous leur budget, sans lot actionnable ni courrier)
   alors que du travail attend (lots ouverts sans assigné, courrier en
@@ -45,6 +47,7 @@ import time
 
 from . import accounts as accounts_mod
 from . import cost as cost_mod
+from . import db as db_mod
 from . import planned_waits
 from . import storage
 
@@ -231,6 +234,41 @@ def expiring(gauge, now: float) -> tuple | None:
     return float(gauge.resets_at), max(0.0, 1.0 - float(gauge.used or 0.0))
 
 
+def _gauge_history(db, *, since_s: float) -> list:
+    """Historique des jauges pour la projection au rythme récent (#2759).
+
+    Le try/except seul ne suffisait pas : une erreur SQL dans une transaction
+    ouverte l'avorte (psycopg la garde avortée jusqu'au ROLLBACK, le pilote
+    psql ferme sa session), et les lectures de dépense au token qui suivent
+    échouaient alors aussi. Ici, dans une transaction appelante, l'historique
+    est lu sur une connexion INDÉPENDANTE : son échec reste local et ne touche
+    pas la transaction. Hors transaction (le cas nominal d'`ameesh alerts`),
+    la lecture reste sur la connexion reçue. Un historique illisible rend `[]`,
+    le repli documenté sur la moyenne de fenêtre."""
+    def read(source):
+        return storage.of(source).operations.gauge_history(
+            since_s=since_s, harness=None)
+
+    if not db_mod.in_transaction(db):
+        try:
+            return read(db)
+        except Exception:
+            return []
+    try:
+        own = db_mod.connect(db.cfg)
+    except Exception:
+        return []
+    try:
+        return read(own)
+    except Exception:
+        return []
+    finally:
+        try:
+            own.close()
+        except Exception:
+            pass
+
+
 def latest_account_gauges(db, now: float) -> dict:
     """{(harnais, compte) : [Gauge]} : le dernier relevé de chaque jauge.
 
@@ -249,13 +287,20 @@ def latest_account_gauges(db, now: float) -> dict:
     return out
 
 
-def _projected_plan_loss(gauge, account, now: float, history: list) -> tuple:
+def _projected_plan_loss(gauge, account, now: float, history: list, *,
+                         multiplier: float = 1.0,
+                         ceiling: float = cost_mod.PACE_CEILING,
+                         reserve: float = accounts_mod.RESERVE) -> tuple:
     """(perte, source, durée) : débit des six dernières heures de production.
 
     Même harnais, compte, jauge et échéance ; les échos d'un relevé ne
     créent pas du temps mesuré. Sans deux relevés couvrant 30 min, ou si
     l'usage recule, repli explicite sur la moyenne depuis le début de fenêtre.
     Le rythme autorisé et son multiplicateur ne prédisent pas le débit réel.
+    #2816 : un relevé pris alors que les non-critiques étaient tenus (usage
+    au plafond de pause, réserve déduite) mesure ce plafond, pas la demande ;
+    il est écarté, et l'absence de relevés libres fait retomber sur la
+    moyenne de fenêtre.
     """
     points = {}
     for row in history:
@@ -271,7 +316,10 @@ def _projected_plan_loss(gauge, account, now: float, history: list) -> tuple:
             continue
         if abs(float(reset) - float(gauge.resets_at)) > 1.0:
             continue
-        points[stamp] = float(row.get("used") or 0.0)
+        used_at_stamp = float(row.get("used") or 0.0)
+        if used_at_stamp >= gauge.held_cap(stamp, reserve, multiplier, ceiling):
+            continue
+        points[stamp] = used_at_stamp
     samples = sorted(points.items())
     if len(samples) >= 2:
         start, initial = samples[0]
@@ -321,7 +369,11 @@ def plan_underused(db, listing: list, now: float, *,
     annoncé pour les non-critiques. #2757 :
     le déclenchement dépend de la perte projetée au débit récent, avec repli
     explicite sur la moyenne de fenêtre si les relevés sont insuffisants ;
-    le plafond autorisé reste une limite de capacité, pas une prévision."""
+    le plafond autorisé reste une limite de capacité, pas une prévision.
+    #2816 : les relevés du débit pris alors que les non-critiques étaient
+    tenus par ce plafond mesurent la pause, pas la demande ; ils sont écartés,
+    ce qui fait retomber sur la moyenne de fenêtre quand il n'en reste pas
+    assez."""
     used_max = max(0.0, float(used_pct)) / 100.0
     gap_min = max(0.0, float(pace_gap_pct)) / 100.0
     if (tail_s <= 0 or used_max <= 0) and gap_min <= 0:
@@ -387,13 +439,10 @@ def plan_underused(db, listing: list, now: float, *,
             cap = gauge.held_cap(now, accounts_mod.RESERVE, multiplier, ceiling)
             used = float(gauge.used or 0.0)
             if history is None:
-                try:
-                    history = storage.of(db).operations.gauge_history(
-                        since_s=PLAN_RATE_WINDOW_S, harness=None)
-                except Exception:
-                    history = []  # historique indisponible : moyenne de fenêtre
+                history = _gauge_history(db, since_s=PLAN_RATE_WINDOW_S)
             lost_at_pace, rate_source, rate_span = _projected_plan_loss(
-                gauge, account, now, history)
+                gauge, account, now, history, multiplier=multiplier,
+                ceiling=ceiling, reserve=accounts_mod.RESERVE)
             if gap_min > 0 and lost_at_pace <= gap_min:
                 continue
             reason = None
@@ -1304,7 +1353,8 @@ def host_underused(cfg, db, listing: list, now: float, *,
                    window_s: float = DEFAULT_HOST_UNDERUSED_S,
                    load_max: float = DEFAULT_HOST_UNDERUSED_LOAD,
                    turns_max: float = DEFAULT_HOST_UNDERUSED_TURNS,
-                   idle_mail_s: float = 300.0, canons=None) -> list:
+                   idle_mail_s: float = 300.0, canons=None,
+                   verdicts: dict | None = None) -> list:
     if window_s <= 0 or load_max <= 0:
         return []
     hosts = storage.of(db).hosts
@@ -1314,7 +1364,8 @@ def host_underused(cfg, db, listing: list, now: float, *,
             canons = canon_mod.load_configured(cfg) if cfg is not None else []
         except Exception:
             canons = []
-    verdicts = host_verdicts(db, canons)
+    if verdicts is None:
+        verdicts = host_verdicts(db, canons)
     out = []
     for host, (reading, verdict) in sorted(verdicts.items()):
         if verdict["blocked"]:
@@ -1516,15 +1567,18 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
     names = {row["name"] for row in listing}
     designers = sorted(n for n in role_orchestrators(canons, DESIGN_ROLES) if n in names)
     try:
-        pressured = pressured_hosts(host_verdicts(db, canons), now)
+        # #2851 : un seul relevé d'hôtes pour les deux alertes (la lecture
+        # `current` était payée deux fois par passe).
+        verdicts = host_verdicts(db, canons)
+        pressured = pressured_hosts(verdicts, now)
     except Exception:
-        pressured = {}
+        verdicts, pressured = {}, {}
     out += idle_capacity(db, listing, now, orchestras, idle_s=idle_capacity_s, paid=paid,
                          designers=designers, held=held, held_hosts=held_hosts,
                          pressured=pressured, cfg=cfg)
     out += host_underused(cfg, db, listing, now, window_s=host_underused_s,
                           load_max=host_underused_load, turns_max=host_underused_turns,
-                          idle_mail_s=idle_mail_s, canons=canons)
+                          idle_mail_s=idle_mail_s, canons=canons, verdicts=verdicts)
     out += balance_low(db, listing, now, hours=balance_hours, min_usd=balance_min_usd,
                        window_s=balance_window_s)
     out += backlog_empty(db, listing, now, idle_s=backlog_empty_s)

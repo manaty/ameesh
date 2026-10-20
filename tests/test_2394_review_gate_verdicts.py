@@ -40,7 +40,9 @@ class CanonScaleTest(unittest.TestCase):
         self.assertEqual(merge_queue.required_verdicts({"class": "normal"}), 1)
 
     def test_sensitive_needs_one_review(self):
-        for files in ([], [entry("src/ameesh/work.py")],
+        # `mail.py` reste un chemin sensible hors du périmètre critique ; #1515
+        # y a ajouté `work.py` et `radar.py` (ils participent à la porte).
+        for files in ([], [entry("src/ameesh/mail.py")],
                       [entry("docs/design/notes.md")]):
             with self.subTest(files=files):
                 klass = {"class": "sensitive", "doubt": False, "files": files}
@@ -61,7 +63,8 @@ class CanonScaleTest(unittest.TestCase):
                      "src/ameesh/config.py", "deploy/mise-a-jour/poste.sh",
                      "Dockerfile", ".github/workflows/tests.yml",
                      "scripts/test-plan.py", "src/ameesh/merge_queue.py",
-                     "src/ameesh/merge_pr.py", "src/ameesh/review.py"):
+                     "src/ameesh/merge_pr.py", "src/ameesh/review.py",
+                     "src/ameesh/work.py", "src/ameesh/radar.py"):
             with self.subTest(path=path):
                 klass = {"class": "sensitive", "files": [entry(path)]}
                 self.assertEqual(merge_queue.required_verdicts(klass), 2, path)
@@ -122,7 +125,7 @@ class ClassReaderTest(unittest.TestCase):
         bad = [{"paths": ["x"], "class": "bogus"}]
         for paths, required in ((["src/ameesh/migrations/0460_x.sql"], 2),
                                 ([".github/workflows/tests.yml"], 2),
-                                (["src/ameesh/work.py"], 1)):
+                                (["src/ameesh/mail.py"], 1)):
             with self.subTest(paths=paths):
                 klass = self.classify(paths, bad)
                 self.assertTrue(klass["doubt"])
@@ -168,7 +171,7 @@ class ClassReaderTest(unittest.TestCase):
 
     def test_no_readable_canon_keeps_paths_from_the_lot_diff(self):
         for path, required in (("src/ameesh/db.py", 2),
-                               ("src/ameesh/work.py", 1)):
+                               ("src/ameesh/mail.py", 1)):
             with self.subTest(path=path), \
                     mock.patch.object(lot_class, "default_base", return_value="main"), \
                     mock.patch.object(lot_class.canon_mod, "git_range_paths",

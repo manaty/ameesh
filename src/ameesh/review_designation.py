@@ -823,7 +823,8 @@ class Port(Protocol):
     def commit(self, lot: int, *, freeze: Mapping, required: int, state: str,
                reviewers: Sequence[Mapping], missing: int, why: str,
                authors: Sequence[Mapping], policy_ref: str = "",
-               notify: str = "", messages: Sequence[Mapping] = ()) -> dict:
+               notify: str = "", messages: Sequence[Mapping] = (),
+               unknown_authors: Sequence[str] = ()) -> dict:
         """Writes the freeze's designation in one transaction and returns its shape."""
 
 
@@ -986,7 +987,8 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         return port.commit(lot, freeze=freeze, required=required, state=state,
                            reviewers=selection["reviewers"], missing=selection["missing"],
                            why=selection["why"], authors=authors, policy_ref=policy_ref,
-                           notify=notify, messages=tuple(messages))
+                           notify=notify, messages=tuple(messages),
+                           unknown_authors=tuple(unknown))
     except StaleFreeze as exc:
         # Nothing was written. The provided inputs held for the old freeze:
         # recollect them for the new one before replaying (B1, codex review cx2).

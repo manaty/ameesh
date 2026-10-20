@@ -59,6 +59,7 @@ from typing import Any, Iterable, Mapping
 from . import harnesses
 from . import review as review_mod
 from .config import NAME_RE
+from .deadline import Deadline
 
 try:  # facultatif : jamais requis
     import yaml as _yaml  # type: ignore
@@ -907,10 +908,12 @@ class HostPolicy:
     max_agents: int | None = None
     #: seuils de ressources de l'hôte (L31, 0028) : mapping
     #: `{min_mem_available, max_swap_used, max_load, min_disk_free}`, plus la
-    #: pression (L159d/#2296) `{max_cpu_pressure, max_mem_pressure}`,
-    #: l'alimentation (L106) `{min_battery_percent, stop_battery_percent}` et
-    #: btrfs (#246) `{min_btrfs_unallocated, min_btrfs_metadata_headroom}` ; None =
-    #: valeurs par défaut prudentes (`ameesh.resources`).
+    #: pression (L159d/#2296) `{max_cpu_pressure, max_mem_pressure}`, le
+    #: périmètre et les plafonds du cgroup (#2814) `{pressure_scope,
+    #: max_cgroup_memory_used, max_cgroup_throttled}`, l'alimentation (L106)
+    #: `{min_battery_percent, stop_battery_percent}` et btrfs (#246)
+    #: `{min_btrfs_unallocated, min_btrfs_metadata_headroom}` ; None = valeurs
+    #: par défaut prudentes (`ameesh.resources`).
     resources: dict | None = None
     #: racine de travail par projet (L31, 0029) : `work_roots[projet]` sinon
     #: `work_root/<projet>` ; remplace le `cwd` d'une admission. None = pas de
@@ -1430,6 +1433,17 @@ class GitError(RuntimeError):
     pass
 
 
+class GitDeadline(RuntimeError):
+    """#2665 : l'échéance monotone d'une découverte de canon est épuisée.
+
+    Volontairement **pas** une sous-classe de `GitError` : les lecteurs du
+    canon convertissent un `GitError` en constat (`canon-git-error`,
+    `readable = False`) et continueraient leur découverte. Une échéance
+    épuisée n'est pas un canon illisible : elle remonte jusqu'à l'appelant
+    borné, qui la dit `run-incomplete`, jamais « canon sans bloc ».
+    """
+
+
 def _git_env() -> dict:
     env = {k: v for k, v in os.environ.items()
            if k not in _GIT_ENV_DROP and not k.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))}
@@ -1449,8 +1463,19 @@ NO_LAZY_FETCH = {"GIT_NO_LAZY_FETCH": "1"}
 
 def _git(repo: str, *args: str, stdin: bytes | None = None,
          timeout: float = GIT_TIMEOUT, env_extra: dict | None = None,
+         deadline: Deadline | None = None,
          ) -> subprocess.CompletedProcess:
-    """git sans crochets, sans fsmonitor, sans objets de remplacement, sans pager."""
+    """git sans crochets, sans fsmonitor, sans objets de remplacement, sans pager.
+
+    Avec ``deadline`` (#2665), la commande ne prend que le temps qui reste et
+    une échéance épuisée lève `GitDeadline` : la découverte bornée s'arrête,
+    elle ne se lit pas comme un canon illisible.
+    """
+    if deadline is not None:
+        if deadline.expired():
+            raise GitDeadline("git %s: canon deadline exhausted"
+                              % (args[0] if args else "?"))
+        timeout = deadline.timeout(timeout)
     cmd = ["git", "--no-pager", "--no-replace-objects", "--literal-pathspecs",
            "-c", "core.fsmonitor=false", "-c", "core.hooksPath=%s" % os.devnull,
            *args]
@@ -1469,6 +1494,8 @@ def _git(repo: str, *args: str, stdin: bytes | None = None,
                            % (args[0] if args else "?", repo)) from exc
         raise GitError("git not found") from exc
     except subprocess.TimeoutExpired as exc:
+        if deadline is not None and deadline.expired():
+            raise GitDeadline("git %s: canon deadline exhausted" % args[0]) from exc
         raise GitError("git %s: timed out" % args[0]) from exc
     except OSError as exc:
         # Dossier du dépôt inaccessible (permission refusée, n'est plus un
@@ -1477,8 +1504,9 @@ def _git(repo: str, *args: str, stdin: bytes | None = None,
         raise GitError("git %s: %s" % (args[0], exc.strerror or exc)) from exc
 
 
-def _git_out(repo: str, *args: str) -> str | None:
-    proc = _git(repo, *args)
+def _git_out(repo: str, *args: str, timeout: float = GIT_TIMEOUT,
+             deadline: Deadline | None = None) -> str | None:
+    proc = _git(repo, *args, timeout=timeout, deadline=deadline)
     if proc.returncode != 0:
         return None
     return proc.stdout.decode("utf-8", "replace").strip()
@@ -1609,20 +1637,23 @@ def git_range_paths(repo: str, base: str, head: str) -> list[str]:
     return sorted(_diff_name_status(repo, start, verified_head))
 
 
-def git_toplevel(directory: str) -> str | None:
+def git_toplevel(directory: str, *, timeout: float = GIT_TIMEOUT,
+                 deadline: Deadline | None = None) -> str | None:
     """Racine du dépôt git qui contient `directory`, ou None."""
     try:
-        out = _git_out(directory, "rev-parse", "--show-toplevel")
+        out = _git_out(directory, "rev-parse", "--show-toplevel",
+                       timeout=timeout, deadline=deadline)
     except GitError:
         return None
     return os.path.realpath(out) if out else None
 
 
-def git_commit(repo: str, rev: str) -> str | None:
+def git_commit(repo: str, rev: str, *, timeout: float = GIT_TIMEOUT,
+               deadline: Deadline | None = None) -> str | None:
     if not rev or rev.startswith("-"):
         return None
     return _git_out(repo, "rev-parse", "--verify", "--quiet", "--end-of-options",
-                    rev + "^{commit}")
+                    rev + "^{commit}", timeout=timeout, deadline=deadline)
 
 
 _SHA_RE = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
@@ -1667,12 +1698,14 @@ def git_fast_forward(repo: str, commit: str) -> str:
     return ""
 
 
-def _git_list(repo: str, commit: str, prefix: str) -> list[tuple[str, str]]:
+def _git_list(repo: str, commit: str, prefix: str, *,
+              timeout: float = GIT_TIMEOUT,
+              deadline: Deadline | None = None) -> list[tuple[str, str]]:
     """[(chemin dans le dépôt, sha du blob)] des fichiers ordinaires sous `prefix`."""
     args = ["ls-tree", "-r", "-z", "--full-tree", commit]
     if prefix:
         args += ["--", prefix]
-    proc = _git(repo, *args)
+    proc = _git(repo, *args, timeout=timeout, deadline=deadline)
     if proc.returncode != 0:
         raise GitError("git ls-tree: %s" % proc.stderr.decode("utf-8", "replace").strip())
     out = []
@@ -1687,11 +1720,14 @@ def _git_list(repo: str, commit: str, prefix: str) -> list[tuple[str, str]]:
     return out
 
 
-def _git_blobs(repo: str, shas: Iterable[str]) -> dict[str, bytes]:
+def _git_blobs(repo: str, shas: Iterable[str], *,
+               timeout: float = GIT_TIMEOUT,
+               deadline: Deadline | None = None) -> dict[str, bytes]:
     shas = list(dict.fromkeys(shas))
     if not shas:
         return {}
-    proc = _git(repo, "cat-file", "--batch", stdin=("\n".join(shas) + "\n").encode())
+    proc = _git(repo, "cat-file", "--batch", stdin=("\n".join(shas) + "\n").encode(),
+                timeout=timeout, deadline=deadline)
     if proc.returncode != 0:
         raise GitError("git cat-file: %s" % proc.stderr.decode("utf-8", "replace").strip())
     data = proc.stdout
@@ -1712,17 +1748,22 @@ def _git_blobs(repo: str, shas: Iterable[str]) -> dict[str, bytes]:
     return out
 
 
-def _git_read(repo: str, commit: str, path: str) -> bytes | None:
-    proc = _git(repo, "cat-file", "blob", "%s:%s" % (commit, path))
+def _git_read(repo: str, commit: str, path: str, *,
+              timeout: float = GIT_TIMEOUT,
+              deadline: Deadline | None = None) -> bytes | None:
+    proc = _git(repo, "cat-file", "blob", "%s:%s" % (commit, path),
+                timeout=timeout, deadline=deadline)
     return proc.stdout if proc.returncode == 0 else None
 
 
-def git_read(repo: str, commit: str, path: str) -> bytes | None:
+def git_read(repo: str, commit: str, path: str, *,
+             timeout: float = GIT_TIMEOUT,
+             deadline: Deadline | None = None) -> bytes | None:
     """Contenu de `path` au commit `commit` (objets git), ou None."""
     if not _SHA_RE.fullmatch(commit or ""):
         return None
     try:
-        return _git_read(repo, commit, path)
+        return _git_read(repo, commit, path, timeout=timeout, deadline=deadline)
     except GitError:
         return None
 
@@ -1764,8 +1805,9 @@ def remote_branch(repo: str, name: str) -> str | None:
     return short
 
 
-def _remote_of(repo: str, rev: str) -> str:
-    remotes = (_git_out(repo, "remote") or "").split()
+def _remote_of(repo: str, rev: str, *, timeout: float = GIT_TIMEOUT,
+               deadline: Deadline | None = None) -> str:
+    remotes = (_git_out(repo, "remote", timeout=timeout, deadline=deadline) or "").split()
     head = rev.split("/", 1)[0]
     return head if head in remotes else DEFAULT_REMOTE
 
@@ -1785,10 +1827,12 @@ def _norm_url(url: str) -> str:
     return text.lower()
 
 
-def git_fetch(repo: str, remote: str) -> str:
+def git_fetch(repo: str, remote: str, *, timeout: float = FETCH_TIMEOUT,
+              deadline: Deadline | None = None) -> str:
     """`git fetch` sans crochets ; renvoie '' ou le message d'erreur."""
     try:
-        proc = _git(repo, "fetch", "--quiet", "--no-tags", "--", remote, timeout=FETCH_TIMEOUT)
+        proc = _git(repo, "fetch", "--quiet", "--no-tags", "--", remote,
+                    timeout=timeout, deadline=deadline)
     except GitError as exc:
         return str(exc)
     if proc.returncode != 0:
@@ -2121,12 +2165,16 @@ def _interesting(relpath: str) -> bool:
 
 class _Loader:
     def __init__(self, root: str, *, ref: str, untrusted: bool, fetch: bool,
-                 use_pyyaml: bool | None, default: bool = True):
+                 use_pyyaml: bool | None, default: bool = True,
+                 deadline: Deadline | None = None):
         self.root = os.path.abspath(os.path.expanduser(root))
         self.ref = ref
         self.allow_untrusted = untrusted
         self.fetch = fetch
         self.use_pyyaml = use_pyyaml
+        #: #2665 : échéance d'une découverte bornée (prévalidation du train) ;
+        #: chaque lecture git de ce chargeur ne prend que le temps qui reste.
+        self.deadline = deadline
         self.canon = Canon(root=self.root, is_default=default, rev=ref)
         _identify(self.canon, None)     # repli tant que le manifeste n'est pas lu
         self.fetched: set[str] = set()
@@ -2140,12 +2188,13 @@ class _Loader:
                     explicit: bool) -> Source | None:
         if self.fetch and repo not in self.fetched:
             self.fetched.add(repo)
-            error = git_fetch(repo, _remote_of(repo, rev))
+            error = git_fetch(repo, _remote_of(repo, rev, deadline=self.deadline),
+                              deadline=self.deadline)
             if error:
                 self.add("canon-fetch-failed", WARNING,
                          "git fetch failed (%s): reading the last known revision"
                          % error.splitlines()[0][:200], member=member)
-        commit = git_commit(repo, rev)
+        commit = git_commit(repo, rev, deadline=self.deadline)
         if not commit:
             self.add("canon-ref-missing", ERROR,
                      "canonical revision %s not found in %s (git fetch? %s)"
@@ -2162,14 +2211,14 @@ class _Loader:
 
     def _local_state(self, source: Source) -> None:
         """Signale (sans jamais en tenir compte) l'écart entre le clone et le canon."""
-        head = git_commit(source.repo, "HEAD")
+        head = git_commit(source.repo, "HEAD", deadline=self.deadline)
         if head and head != source.commit:
             self.add("canon-local-divergence", WARNING,
                      "the local clone (HEAD %s) differs from %s (%s): only %s is read"
                      % (head[:12], source.rev, source.commit[:12], source.commit[:12]),
                      member=source.member, path=source.prefix)
         args = ["status", "--porcelain", "--untracked-files=normal", "--", source.prefix or "."]
-        proc = _git(source.repo, *args)
+        proc = _git(source.repo, *args, deadline=self.deadline)
         if proc.returncode == 0 and proc.stdout.strip():
             self.add("canon-worktree-dirty", WARNING,
                      "uncommitted local changes under %s: ignored (only %s is read)"
@@ -2191,7 +2240,7 @@ class _Loader:
     def _source(self, member: str, directory: str, rev: str, explicit: bool,
                 same_repo_commit: tuple[str, str, str] | None = None) -> Source | None:
         try:
-            repo = git_toplevel(directory)
+            repo = git_toplevel(directory, deadline=self.deadline)
         except GitError:
             repo = None
         if repo is None:
@@ -2214,7 +2263,8 @@ class _Loader:
         if source.mode != "git" or not declared:
             return
         remote = source.rev.split("/", 1)[0] if "/" in source.rev else DEFAULT_REMOTE
-        actual = _git_out(source.repo, "remote", "get-url", "--", remote) or ""
+        actual = _git_out(source.repo, "remote", "get-url", "--", remote,
+                          deadline=self.deadline) or ""
         if _norm_url(actual) != _norm_url(declared):
             self.add("member-repository-mismatch", WARNING,
                      "remote %s of %s (%s) is not the one in the manifest (%s)"
@@ -2224,7 +2274,8 @@ class _Loader:
     def _read_manifest(self, source: Source) -> bytes | None:
         if source.mode == "git":
             path = (source.prefix + "/" if source.prefix else "") + "federation.yaml"
-            return _git_read(source.repo, source.commit, path)
+            return _git_read(source.repo, source.commit, path,
+                             deadline=self.deadline)
         path = os.path.join(source.directory, "federation.yaml")
         if os.path.isfile(path) and not os.path.islink(path):
             with open(path, "rb") as fh:
@@ -2248,19 +2299,19 @@ class _Loader:
     # -- chargement --------------------------------------------------------------
     def _bootstrap_rev(self) -> str:
         """Révision où lire le manifeste quand AMEESH_CANON_REF n'est pas posé."""
-        repo = git_toplevel(self.root)
+        repo = git_toplevel(self.root, deadline=self.deadline)
         default = "%s/%s" % (DEFAULT_REMOTE, DEFAULT_BRANCH)
         if repo is None:
             return default
         if self.fetch and repo not in self.fetched:
             self.fetched.add(repo)
-            error = git_fetch(repo, DEFAULT_REMOTE)
+            error = git_fetch(repo, DEFAULT_REMOTE, deadline=self.deadline)
             if error:
                 self.add("canon-fetch-failed", WARNING,
                          "git fetch failed (%s): reading the last known revision"
                          % error.splitlines()[0][:200], member="canon")
         for rev in (default, "%s/HEAD" % DEFAULT_REMOTE):
-            if git_commit(repo, rev):
+            if git_commit(repo, rev, deadline=self.deadline):
                 return rev
         return default
 
@@ -2515,7 +2566,8 @@ class _Loader:
                       and s.prefix != source.prefix
                       and (not source.prefix or s.prefix.startswith(source.prefix + "/"))]
             entries = []
-            listed = _git_list(source.repo, source.commit, source.prefix)
+            listed = _git_list(source.repo, source.commit, source.prefix,
+                               deadline=self.deadline)
             if not listed:
                 self.add("canon-bundle-missing", ERROR,
                          "%s missing from %s (%s): nothing to read" % (
@@ -2531,7 +2583,8 @@ class _Loader:
                 if any(path == n or path.startswith(n + "/") for n in nested):
                     continue
                 entries.append((path, rel, sha))
-            blobs = _git_blobs(source.repo, [sha for _p, _r, sha in entries])
+            blobs = _git_blobs(source.repo, [sha for _p, _r, sha in entries],
+                               deadline=self.deadline)
             return [(path, rel, blobs.get(sha), source.commit) for path, rel, sha in entries]
         if self._scope_missing(source, [
                 s for s in self.canon.scopes.get(source.member) or []
@@ -2913,6 +2966,16 @@ class _Loader:
                      "`policy.resources`: mapping expected", **where, **subject)
             return None
         parsed: dict = {}
+        # #2814: the pressure scope is a name, not a number; it is read first
+        # so that an unknown value is an error, never a silent fallback.
+        scope = raw.get(resources_mod.PRESSURE_SCOPE_KEY)
+        if scope is not None:
+            if not isinstance(scope, str) or scope not in resources_mod.PRESSURE_SCOPES:
+                self.add("host-policy-invalid", ERROR,
+                         "`policy.resources.pressure_scope`: one of %s expected"
+                         % ", ".join(resources_mod.PRESSURE_SCOPES), **where, **subject)
+            else:
+                parsed[resources_mod.PRESSURE_SCOPE_KEY] = scope
         for key in resources_mod.THRESHOLD_KEYS:
             value = raw.get(key)
             if value is None:
@@ -2985,7 +3048,8 @@ class _Loader:
                 continue
             parsed[key] = caps
         for unknown in sorted(set(raw) - set(resources_mod.THRESHOLD_KEYS)
-                              - set(resources_mod.AGENT_MEMORY_KEYS)):
+                              - set(resources_mod.AGENT_MEMORY_KEYS)
+                              - {resources_mod.PRESSURE_SCOPE_KEY}):
             self.add("host-resources-unknown", WARNING,
                      "`policy.resources.%s`: unknown key (ignored)" % unknown,
                      **where, **subject)
@@ -3201,7 +3265,8 @@ def split_ref(ref: str | None) -> tuple[str | None, str, str, str] | None:
 
 
 def load(root: str, *, ref: str = "", untrusted: bool = False, fetch: bool = False,
-         use_pyyaml: bool | None = None, default: bool = True) -> Canon:
+         use_pyyaml: bool | None = None, default: bool = True,
+         deadline: Deadline | None = None) -> Canon:
     """Lit le canon (§4.1). Les problèmes de lecture sont dans `canon.load_findings`.
 
     Une erreur git imprévue (dépôt cassé, délai dépassé) rend le canon
@@ -3210,9 +3275,12 @@ def load(root: str, *, ref: str = "", untrusted: bool = False, fetch: bool = Fal
 
     `default` (L42) : faux pour un canon qui n'est pas le premier configuré —
     ses références sont alors préfixées de son identifiant.
+
+    ``deadline`` (#2665) : la découverte ne prend que le temps qui reste ;
+    une échéance épuisée lève `GitDeadline`, jamais un canon « illisible ».
     """
     loader = _Loader(root, ref=ref, untrusted=untrusted, fetch=fetch, use_pyyaml=use_pyyaml,
-                     default=default)
+                     default=default, deadline=deadline)
     try:
         return loader.load()
     except GitError as exc:
@@ -3241,7 +3309,7 @@ def configured(cfg) -> tuple:
 
 
 def from_config(cfg, *, root: str | None = None, fetch: bool = False,
-                entry=None) -> Canon:
+                entry=None, deadline: Deadline | None = None) -> Canon:
     """Le canon de la configuration (`AMEESH_CANON`, `AMEESH_CANON_REF`, …).
 
     Sans `entry` : le canon par défaut (ou `root`, lu comme canon par défaut).
@@ -3251,13 +3319,14 @@ def from_config(cfg, *, root: str | None = None, fetch: bool = False,
     if entry is not None:
         default = bool(entries) and entries[0].path == entry.path
         canon = load(entry.path, ref=entry.ref, untrusted=entry.untrusted, fetch=fetch,
-                     default=default)
+                     default=default, deadline=deadline)
     else:
         path = root or cfg.canon
         if not path:
             raise CanonError("no canon configured: set AMEESH_CANON (or `canon` in the "
                              "configuration), or pass --canon DIR")
-        canon = load(path, ref=cfg.canon_ref, untrusted=cfg.canon_untrusted, fetch=fetch)
+        canon = load(path, ref=cfg.canon_ref, untrusted=cfg.canon_untrusted, fetch=fetch,
+                     deadline=deadline)
     if len(entries) > 1:
         note_identity(canon)
     return canon
@@ -3303,21 +3372,34 @@ def _configured_key(cfg, fetch: bool) -> tuple:
                   for entry in configured(cfg)), bool(fetch))
 
 
-def load_configured(cfg, *, fetch: bool = False) -> list[Canon]:
+def load_configured(cfg, *, fetch: bool = False,
+                    deadline: Deadline | None = None) -> list[Canon]:
     """Les canons configurés qui se laissent charger, le canon par défaut
     d'abord (lecture seule : seuils, hôtes). Une configuration fautive d'un
-    canon ne masque pas les autres ; un identifiant en double est écarté."""
+    canon ne masque pas les autres ; un identifiant en double est écarté.
+
+    ``deadline`` (#2665) borne la découverte elle-même — résolution du
+    dépôt, références, manifeste et fiches : chaque lecture git ne prend que
+    le temps qui reste, et une échéance épuisée lève `GitDeadline` au lieu de
+    rendre une liste partielle ou vide lue comme « canon sans bloc ».
+    """
+    if deadline is not None and deadline.expired():
+        raise GitDeadline("canon discovery: deadline exhausted")
     cache = getattr(_CANONS, "loaded", None)
     key = _configured_key(cfg, fetch) if cache is not None else None
     if cache is not None and key in cache:
         return list(cache[key])
     out: list[Canon] = []
     for index, entry in enumerate(configured(cfg)):
+        if deadline is not None and deadline.expired():
+            raise GitDeadline("canon discovery: deadline exhausted")
         try:
-            canon = from_config(cfg, fetch=fetch) if index == 0 \
-                else from_config(cfg, entry=entry, fetch=fetch)
+            canon = from_config(cfg, fetch=fetch, deadline=deadline) if index == 0 \
+                else from_config(cfg, entry=entry, fetch=fetch, deadline=deadline)
         except CanonError:
             continue
+        if deadline is not None and deadline.expired():
+            raise GitDeadline("canon discovery: deadline exhausted")
         if any(c.id == canon.id for c in out):
             continue
         out.append(canon)

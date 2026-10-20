@@ -619,7 +619,7 @@ class ReviewerDesignationTest(PgTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         work.milestone(self.db, lot["id"], "verdict", verdict="blocked",
                        sha="a" * 40, actor="chef")
-        work.milestone(self.db, lot["id"], "frozen", sha="b" * 7, actor="chef")
+        work.milestone(self.db, lot["id"], "frozen", sha="b" * 40, actor="chef")
 
         proc = self.mesh("work", "reviewer", str(lot["id"]), "--no-verdict",
                          "--actor", "chef", env=self._env())
@@ -640,7 +640,7 @@ class ReviewerDesignationTest(PgTestCase):
         proc = self.mesh("work", "reviewer", str(lot["id"]), "--no-verdict",
                          "--actor", "chef", env=self._env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        work.milestone(self.db, lot["id"], "frozen", sha="a" * 12, actor="chef")
+        work.milestone(self.db, lot["id"], "frozen", sha="a" * 40, actor="chef")
         self.assertEqual(work.get(self.db, lot["id"])["reviewer"], work.REVIEWER_NONE)
 
         work.milestone(self.db, lot["id"], "frozen", sha="c" * 40, actor="chef")

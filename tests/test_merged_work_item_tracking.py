@@ -770,8 +770,15 @@ class MergeSweepTest(_Base):
     def test_diese_regel_concurrent_ne_ferme_pas(self):
         _git(self.repo, "config", plan_git.LOT_REF_GIT_KEY, "hash")
         n = self.lot()["id"]
-        livre = self.merge("feature/livre", "livraison : #%d" % n)
+        # #2786 (5) : le gel est posé AVANT la fusion ; un gel sur un commit
+        # déjà dans la cible (aucun commit propre) est refusé à l'écriture.
+        _git(self.repo, "checkout", "-q", "-b", "agent/livre", "develop")
+        self.commit("livre")
+        livre = _git(self.repo, "rev-parse", "HEAD")
         work.milestone(self.db, n, "frozen", sha=livre, actor="ouvrier")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet 55 : #%d" % n,
+             "agent/livre")
         _git(self.repo, "checkout", "-q", "-b", "agent/regel", "develop")
         self.commit("regel")
         nouveau = _git(self.repo, "rev-parse", "HEAD")
@@ -1505,7 +1512,14 @@ class ContentDeliveryTest(_Base):
         item = work.add(self.db, title="lot sans branche", assignee="claude1", actor="orch")
         for state in ("build", "qa"):
             work.move(self.db, item["id"], state)
-        work.milestone(self.db, item["id"], "frozen", sha=sha, actor="ouvrier")
+        # #2786 (5) : les tests livrent dans `develop` AVANT de geler. La
+        # marque, écrite ici au stockage, dit ce que le gel réel aurait écrit :
+        # `develop` ne portait pas encore le commit, donc la livraison
+        # constatée reste prouvable. `work.milestone` ignore désormais une
+        # marque d'appelant (avis dev4) : le scénario se pose au stockage.
+        storage.of(self.db).work.add_milestone(
+            item["id"], "frozen", sha=sha, actor="ouvrier", verdict=None,
+            note="ameesh-freeze-absent: develop")
         return item
 
     def sync(self, **kw):

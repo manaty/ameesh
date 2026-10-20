@@ -249,7 +249,8 @@ class Cli(unittest.TestCase):
                                                     "result": "alerted",
                                                     "slot": "04:00"}) as check, \
                     mock.patch("ameesh.release_cutoff.compiled_rules",
-                               return_value=(Hourly(), None)):
+                               return_value=(Hourly(), None)), \
+                    mock.patch("ameesh.packet_automerge.watch", return_value=[]):
                 self.assertEqual(release.run(cfg, args), 0)
             self.assertEqual(check.call_count, 1)
             db.close.assert_called_once()

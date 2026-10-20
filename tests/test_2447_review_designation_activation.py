@@ -154,9 +154,11 @@ class _ActivationFixture:
         # inherit another test's plan pace (or the host's live readings)
         self.db.execute("DELETE FROM quota_gauge_readings")
         self.repo = _Repo(os.path.join(self.tmp, "depot"))
-        self.repo.write("src/ameesh/work.py", "base\n")
+        # `mail.py` reste sensible hors du périmètre critique : #1515 y a fait
+        # entrer `work.py`, qui servait de chemin neutre à ces témoins.
+        self.repo.write("src/ameesh/mail.py", "base\n")
         self.base = self.repo.commit("base")
-        self.repo.write("src/ameesh/work.py", "lot\n")
+        self.repo.write("src/ameesh/mail.py", "lot\n")
         self.frozen = self.repo.commit("lot")
         self.canon = _Canon(os.path.join(self.tmp, "canon"))
         self.cfg = dataclasses.replace(self.cfg, canon=self.canon.root, canon_ref="HEAD")
@@ -418,10 +420,16 @@ class ActivationTest(_ActivationFixture, PgTestCase):
 
     def test_a_stale_light_freeze_does_not_clear_the_new_freeze(self):
         # Same guard on the light/no-path branch, which also writes the column.
+        # #2786: a freeze already in the target is refused, so the empty diff
+        # is an empty commit on top of the base, not the base itself.
         lot_head = self.frozen
-        self.frozen = self.base
+        branch = self.repo.git("rev-parse", "--abbrev-ref", "HEAD")
+        self.repo.git("checkout", "-q", self.base)
+        self.repo.git("commit", "-q", "--allow-empty", "-m", "gel vide")
+        self.frozen = self.repo.git("rev-parse", "HEAD")
         first, light = self.freeze()
         self.assertEqual(light["state"], rd.NONE, light)
+        self.repo.git("checkout", "-q", branch)
         self.frozen = lot_head
         self.repo.write("src/ameesh/work.py", "new head\n")
         self.frozen = self.repo.commit("new head")
@@ -849,6 +857,58 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertEqual(self.marks(), [])
         self.assertEqual(designated(work.get(self.db, self.lot)), ["r1", "r2"])
         self.assertTrue([n for n in self.notes() if "manual reviewer(s)" in n])
+
+    def test_a_manual_reviewer_with_an_unavailable_policy_alerts_and_says_unknown(self):
+        # #2637 : prepare -> Unavailable avec un manuel ne doit plus faire croire
+        # que les avis requis sont couverts, ni taire l'alerte pilote.
+        bad = _Canon(os.path.join(self.tmp, "canon-sans-mecanique"), mechanics=None)
+        cfg = dataclasses.replace(self.cfg, canon=bad.root, canon_ref="HEAD")
+        work.move(self.db, self.lot, "qa")
+        work.designate_reviewer(self.cfg, self.db, self.lot, "r1",
+                                actor="human:smichea")
+        before = len(self.mailbox())
+        _, out = self.freeze(cfg=cfg)
+        self.assertEqual(out["state"], "manual", out)
+        self.assertIn("coverage unknown", out["why"])
+        self.assertEqual([m["recipient"] for m in self.mailbox()[before:]], ["pilot"])
+        notes = [n for n in self.notes() if "coverage of the required" in n]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("manual reviewer(s) kept (r1)", notes[0])
+        self.assertIn("policy unavailable", notes[0])
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1"])
+
+    def test_a_manual_reviewer_with_a_prepare_exception_alerts_and_says_unknown(self):
+        # #2637 : prepare lève, le manuel reste ; l'alerte interne et la
+        # couverture inconnue sont explicites, aucun relecteur n'est ajouté.
+        work.move(self.db, self.lot, "qa")
+        work.designate_reviewer(self.cfg, self.db, self.lot, "r1",
+                                actor="human:smichea")
+        before = len(self.mailbox())
+        with mock.patch.object(act, "prepare", side_effect=RuntimeError("injected")):
+            _, out = self.freeze()
+        self.assertEqual(out["state"], "manual", out)
+        self.assertIn("coverage unknown", out["why"])
+        self.assertEqual([m["recipient"] for m in self.mailbox()[before:]], ["pilot"])
+        notes = [n for n in self.notes() if "coverage of the required" in n]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("internal designation error: RuntimeError: injected", notes[0])
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1"])
+
+    def test_a_manual_reviewer_without_a_canon_notes_unknown_coverage_silently(self):
+        # #2637 : source silencieuse (aucun canon) : pas de courrier, mais la
+        # note ne prétend pas non plus que la couverture est acquise.
+        cfg = dataclasses.replace(self.cfg, canon="")
+        work.move(self.db, self.lot, "qa")
+        work.designate_reviewer(self.cfg, self.db, self.lot, "r1",
+                                actor="human:smichea")
+        before = len(self.mailbox())
+        _, out = self.freeze(cfg=cfg)
+        self.assertEqual(out["state"], "manual", out)
+        self.assertEqual(len(self.mailbox()), before)
+        notes = [n for n in self.notes() if "coverage of the required" in n]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("no canon configured", notes[0])
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1"])
 
     def test_an_insufficient_manual_designation_gets_the_missing_reviewer(self):
         # #2627 / constat #2551 : deux avis requis, un seul relecteur manuel

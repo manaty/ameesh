@@ -1233,7 +1233,13 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         # absolue — la garde de budget désactivée ne le lève pas
         result.hard = bool(getattr(profile, "refused", ""))
         return result
-    result.gauges = gauges_of(book, profile, items, environ, model=model, now=now)
+    from .codex_gauges import AmbiguousCodexGauges
+    try:
+        result.gauges = gauges_of(book, profile, items, environ, model=model, now=now)
+    except AmbiguousCodexGauges as exc:
+        result.reason = str(exc)
+        result.hard = True
+        return result
     if result.gauges and record:
         # historique des jauges de L26, attribué au compte (migration 0028)
         book.record_gauges(result.gauges, account=profile.name)
@@ -1494,9 +1500,12 @@ def _informative_partial(gauges, result: Evaluation, now: float) -> bool:
     vérifié. Le pilote en a borné le classement (GO du 15/10, lot #1566) : il
     garde le rang d'un relevé **courant** (fraîcheur 1, jamais 0) quand
 
-    * son âge est connu, fini et non futur, et ne dépasse pas ce qui reste
-      d'**au moins une** fenêtre datée encore ouverte — même frontière que
-      `cost.reading_outdated` (#1672) ; et
+    * l'âge d'**au moins une** fenêtre encore ouverte est connu, fini et non
+      futur, et ne dépasse pas ce qui lui reste (`now - read_at <=
+      resets_at - now`) — même frontière que `cost.reading_outdated` (#1672),
+      et lue par fenêtre : une fenêtre courte échue conservée par
+      `codex_gauges.reconcile` ne vieillit pas la semaine récemment observée
+      (#2843) ; et
     * **chaque** fenêtre encore ouverte (non datée comprise : elle ne prouve
       pas sa remise à zéro) reste sous son plafond effectif moins `RESERVE`
       (`Evaluation.limits` : rythme, fenêtre courte, plafond fixe ou d'overage
@@ -1508,15 +1517,19 @@ def _informative_partial(gauges, result: Evaluation, now: float) -> bool:
     reste écarté du placement par `placeable`.
     """
     gauges = list(gauges)
-    stamps = [stamp for stamp in (getattr(g, "read_at", None) for g in gauges)
-              if stamp]
-    if not stamps:
-        return False
-    age = now - min(stamps)
-    if not math.isfinite(age) or age < 0:
-        return False
     running = [g for g in gauges if not g.resets_at or not g.reset_passed(now)]
-    if not any(g.resets_at and age <= g.resets_at - now for g in running):
+    ages = []
+    for gauge in running:
+        stamp = getattr(gauge, "read_at", None)
+        if not stamp:
+            continue
+        age = now - float(stamp)
+        if not math.isfinite(age) or age < 0:
+            continue
+        ages.append((age, gauge))
+    if not ages:
+        return False
+    if not any(g.resets_at and age <= g.resets_at - now for age, g in ages):
         return False
     for gauge in running:
         found = result.limits.get(gauge.key)

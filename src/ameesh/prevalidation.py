@@ -47,6 +47,7 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from . import offload
+from .deadline import Deadline
 
 #: schéma du plan lu (`scripts/test-plan.py`, L161f)
 PLAN_SCHEMA = "ameesh-test-plan/1"
@@ -64,6 +65,10 @@ DEFAULT_PARTS_SCRIPT = "scripts/test-parts.py"
 #: remplacement local réécrit le contenu lu sans changer le SHA, la preuve
 #: divergerait de la référence publiée
 NO_REPLACE = offload.NO_REPLACE
+#: marge locale après l'échéance d'un passage : le client offload annule son
+#: job et rend son résultat avant que le lanceur ne soit tué ; le shell invité
+#: annule aussi à la perte de session. Reste sous la marge de publication.
+OFFLOAD_LOCAL_GRACE_S = 15.0
 
 #: causes de refus d'une prévalidation ; le gel n'est pas écrit, la cause est dite
 CAUSES = (
@@ -95,20 +100,34 @@ class PrevalidationError(Exception):
         self.why = why
 
 
-def load_parameters(repo: str, commit: str, project: str):
+def load_parameters(repo: str, commit: str, project: str, *,
+                    deadline: Deadline | None = None):
     """Lit le canon relu (#1616) et rend `(document, bloc prevalidation)`.
 
     Le consommateur explicite refuse un bloc absent, cause `block-missing` :
     aucune sélection, aucun hôte et aucun délai ne se supposent. L'accroche
     automatique du gel ne l'appelle pas tant que la règle n'est pas adoptée.
     Le lecteur `mechanics` est importé ici pour rester nommément refusable.
+    Avec ``deadline`` (#2665), les lectures git du canon ne prennent que le
+    temps qui reste ; une échéance épuisée est ``run-incomplete``, jamais un
+    ``block-missing`` trompeur.
     """
     try:
         from . import mechanics
     except ImportError as exc:  # lecteur absent : refus nommé, jamais de repli
         raise PrevalidationError("block-missing",
                                  "mechanics reader absent: %s" % exc) from exc
-    document = mechanics.load(repo, commit, project)
+    if deadline is not None and deadline.expired():
+        raise PrevalidationError(
+            "run-incomplete", "budget de prévalidation épuisé avant la lecture du canon")
+    try:
+        document = mechanics.load(repo, commit, project, deadline=deadline)
+    except mechanics.MechanicsError:
+        if deadline is not None and deadline.expired():
+            raise PrevalidationError(
+                "run-incomplete",
+                "budget de prévalidation épuisé pendant la lecture du canon") from None
+        raise
     if document.prevalidation is None:
         raise PrevalidationError("block-missing",
                                  "%s has no prevalidation block" % document.source)
@@ -472,7 +491,8 @@ def head_state(root: str, head: str, *,
     return True, "", got
 
 
-def pinned_snapshot(root: str, head: str, plan_rel: str, plan: str) -> str:
+def pinned_snapshot(root: str, head: str, plan_rel: str, plan: str, *,
+                    deadline: Deadline | None = None) -> str:
     """L'identité exacte de ce qui part sur la VM : `head` + le plan relu.
 
     `offload.snapshot()` photographie l'arbre de travail — fichiers non suivis
@@ -484,9 +504,17 @@ def pinned_snapshot(root: str, head: str, plan_rel: str, plan: str) -> str:
     l'état local, et le rapport peut nommer l'identité envoyée.
 
     Un échec de construction est un refus `selection-unsafe` : `head-moved`
-    reste réservé à la tête qui a réellement bougé (`head_state`)."""
+    reste réservé à la tête qui a réellement bougé (`head_state`). Une
+    échéance épuisée est `run-incomplete` : c'est une indisponibilité, pas un
+    contenu faux (#2665)."""
     try:
-        return offload.snapshot_with(root, head, {plan_rel: plan})
+        # `offload` lit une échéance monotone absolute, pas l'objet Deadline
+        bound = None if deadline is None else time.monotonic() + deadline.remaining()
+        return offload.snapshot_with(root, head, {plan_rel: plan}, deadline=bound)
+    except offload.SnapshotTimeout as exc:
+        raise PrevalidationError(
+            "run-incomplete", "arbre du SHA non construit dans le budget: %s" % exc) \
+            from None
     except offload.OffloadError as exc:
         raise PrevalidationError("selection-unsafe",
                                  "arbre du SHA + plan non constructible: %s" % exc) from None
@@ -564,20 +592,25 @@ def _q(value: str) -> str:
 
 
 def offload_argv(host: str, command: str, *, timeout: int | None = None,
-                 snapshot: str = "", profile: str = "",
+                 wait_timeout: int | None = None, snapshot: str = "",
+                 profile: str = "",
                  executable: str = "ameesh") -> list[str]:
     """L'appel d'offload, toujours `--fallback none` : pas de repli local.
 
     `--snapshot` fige le contenu envoyé (arbre construit du SHA + plan) ; sans
     lui, l'offload photographierait l'arbre de travail. `profile` choisit le
     profil du guest L159b (dépendances et base du projet) ; absent, le profil
-    par défaut de l'hôte s'applique."""
+    par défaut de l'hôte s'applique. `--wait-timeout` borne l'attente locale du
+    client (slot, transport, push), `--timeout` le job distant à partir de son
+    slot (#2665)."""
     argv = [executable, "offload", "run", "--host", host]
     if profile:
         argv += ["--profile", str(profile)]
     argv += ["--fallback", "none"]
     if timeout:
         argv += ["--timeout", str(int(timeout))]
+    if wait_timeout:
+        argv += ["--wait-timeout", str(int(wait_timeout))]
     if snapshot:
         argv += ["--snapshot", str(snapshot)]
     return argv + ["--", "bash", "-lc", command]
@@ -659,20 +692,61 @@ def parse_seconds(text: str) -> float | None:
     return float(found.group(1)) if found else None
 
 
+def _as_text(value) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value or "")
+
+
+def _offload_incomplete(host: str, started: float, output: str, why: str) -> dict:
+    """Un run que le budget local a interrompu : indisponible, jamais vert."""
+    return {"outcome": "run-incomplete", "exit": 124, "host": host,
+            "flow": parse_flow(output),
+            "seconds": round(time.monotonic() - started, 1), "reason": why}
+
+
 def run_offload(host: str, command: str, *, timeout: int | None = None,
                 snapshot: str = "", profile: str = "", cwd: str | None = None,
                 env: dict | None = None,
-                runner=subprocess.run, executable: str = "ameesh") -> dict:
+                runner=subprocess.run, executable: str = "ameesh",
+                deadline: Deadline | None = None) -> dict:
     """Exécute la sélection sur la VM et rend `{outcome, exit, seconds, host, flow}`.
 
     Aucun repli : un transport perdu n'est jamais rejoué ici (la suite peut
     tourner encore sur la VM). La durée distante est lue dans la sortie, la
     durée murale sert de repli. `profile` est le profil d'offload du guest
-    (dépendances et base du projet)."""
-    argv = offload_argv(host, command, timeout=timeout, snapshot=snapshot,
+    (dépendances et base du projet).
+
+    Avec `deadline` (#2665/N cx2), le **geste local** est borné : le client
+    reçoit un `--wait-timeout` qui annule son job (slot, transport, push du
+    snapshot) et rend un résultat avant le garde-fou local. Ce garde-fou tue
+    le client en dernier recours ; la perte de session fait annuler le job par
+    le shell invité. Un dépassement est `run-incomplete` (124), jamais un
+    vert."""
+    started = time.monotonic()
+    wait = None if deadline is None else deadline.remaining()
+    if wait is not None and wait <= 0:
+        return _offload_incomplete(host, started, "",
+                                   "budget de prévalidation épuisé avant l'offload")
+    remote_timeout = int(timeout or 0)
+    wait_timeout = 0
+    local_timeout = None
+    if wait is not None:
+        remote_timeout = max(1, int(min(remote_timeout or wait, wait)))
+        wait_timeout = max(1, int(wait - min(OFFLOAD_LOCAL_GRACE_S, wait / 2.0)))
+        local_timeout = wait + OFFLOAD_LOCAL_GRACE_S
+    argv = offload_argv(host, command, timeout=remote_timeout or None,
+                        wait_timeout=wait_timeout or None, snapshot=snapshot,
                         profile=profile, executable=executable)
-    started = time.time()
-    proc = runner(argv, cwd=cwd, env=env, capture_output=True, text=True)
+    local = {} if local_timeout is None else {"timeout": local_timeout}
+    try:
+        proc = runner(argv, cwd=cwd, env=env, capture_output=True, text=True,
+                      **local)
+    except subprocess.TimeoutExpired as exc:
+        output = "\n".join((_as_text(exc.stdout), _as_text(exc.stderr)))
+        return _offload_incomplete(
+            host, started, output,
+            "attente locale de l'offload dépassée; session fermée, job annulé côté VM")
     # Les flux ont des lignes indépendantes, même sans saut final sur stdout.
     output = "\n".join((getattr(proc, "stdout", "") or "",
                         getattr(proc, "stderr", "") or ""))
@@ -680,7 +754,7 @@ def run_offload(host: str, command: str, *, timeout: int | None = None,
               "host": host, "flow": parse_flow(output)}
     result["seconds"] = parse_seconds(output)
     if result["seconds"] is None:
-        result["seconds"] = round(time.time() - started, 1)
+        result["seconds"] = round(time.monotonic() - started, 1)
     return result
 
 
@@ -786,17 +860,48 @@ def published_head(ref: str, *, repo: str = ".", remote: str = "origin",
     raise PrevalidationError("head-moved", "référence publiée introuvable: %s" % ref)
 
 
+def _bounded_runner(runner, deadline: Deadline | None):
+    """Un runner git qui ne dépasse jamais l'échéance du passage (#2665).
+
+    Chaque appel reçoit le temps qui reste ; un dépassement est une
+    indisponibilité `run-incomplete`, jamais un refus de sélection.
+    """
+    if deadline is None:
+        return runner
+
+    def call(*args, **kwargs):
+        left = deadline.remaining()
+        if left <= 0:
+            raise PrevalidationError(
+                "run-incomplete", "budget de prévalidation épuisé avant git")
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = left
+        try:
+            return runner(*args, **kwargs)
+        except subprocess.TimeoutExpired:
+            raise PrevalidationError(
+                "run-incomplete", "budget de prévalidation épuisé pendant git") from None
+
+    return call
+
+
 def validate(*, lot: int, plan_path: str, head: str, host: str, params,
              base: str = "", repo: str = "", published_ref: str = "",
              profile: str = "", remote: str = "origin", local: str | None = None,
              cwd: str | None = None, env: dict | None = None,
              runner=subprocess.run, git_runner=subprocess.run,
-             snapshotter=None, executable: str = "ameesh") -> dict:
+             snapshotter=None, executable: str = "ameesh",
+             deadline: Deadline | None = None) -> dict:
     """Le geste complet : contrôles du canon, exécution distante, rapport.
 
     Refuse avant tout run un hôte hors du canon, un contrat déclaré introuvable
     ou une sélection élargie ; aucun repli local, aucune écriture de jalon. Le
-    rapport rendu n'est pas un verdict (#1617, #1756)."""
+    rapport rendu n'est pas un verdict (#1617, #1756).
+
+    Avec `deadline` (#2665/N cx2), le geste ne commence aucune étape après
+    l'échéance et `run_offload` borne l'attente locale du client (slot,
+    transport, push) ; une échéance épuisée est `run-incomplete`, jamais un
+    vert."""
     #: lot 0 : une composition de train, sans lot de paquet (rapport non
     #: persisté, cf. #2644) ; un identifiant négatif reste refusé.
     if not isinstance(lot, int) or isinstance(lot, bool) or lot < 0:
@@ -808,6 +913,12 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
                                 declared=tuple(getattr(params, "hosts", ()) or ()))
     if not allowed:
         raise PrevalidationError("no-vm", why)
+    if deadline is not None and deadline.expired():
+        raise PrevalidationError("run-incomplete",
+                                 "budget de prévalidation épuisé avant le plan")
+    # chaque git local (contrats, tête avant/après, chemin du plan) reçoit le
+    # temps qui reste : un git bloqué ne dépasse plus le bail (#2665).
+    git_runner = _bounded_runner(git_runner, deadline)
     # Les contrats et le contenu exécuté viennent du même SHA, jamais du disque.
     # `--repo` désigne le dépôt ; sans lui, le cwd.
     root = os.path.abspath(cwd or repo or os.getcwd())
@@ -824,14 +935,20 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
     ok_head, why_head, tree_head = head_state(root, head, runner=git_runner)
     if not ok_head:
         raise PrevalidationError("head-moved", why_head)
+    if deadline is not None and deadline.expired():
+        raise PrevalidationError("run-incomplete",
+                                 "budget de prévalidation épuisé avant l'arbre du SHA")
     remote_plan = remote_plan_path(plan_path, root, head=head, runner=git_runner)
-    pinned = (snapshotter or pinned_snapshot)(root, head, remote_plan, text)
+    if snapshotter is not None:
+        pinned = snapshotter(root, head, remote_plan, text)
+    else:
+        pinned = pinned_snapshot(root, head, remote_plan, text, deadline=deadline)
     result = run_offload(name, remote_script(
         remote_plan, chosen.parts,
         parts_script=getattr(params, "parts_script", None) or ""),
         timeout=int(getattr(params, "timeout_seconds", 0) or 0),
         snapshot=pinned, profile=profile, cwd=root, env=env, runner=runner,
-        executable=executable)
+        executable=executable, deadline=deadline)
     # la tête est relue APRÈS le run : l'arbre local d'abord (a-t-il bougé
     # pendant l'exécution ?), la référence publiée ensuite si elle est nommée.
     # Une relecture impossible ne vaut pas « inchangée » : elle invalide.

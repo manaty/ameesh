@@ -120,9 +120,17 @@ class Recorded:
             historical["assignee"] = reference["name"]
         family_of[str(reference.get("name") or "").strip().lower()] = \
             str(reference.get("family") or "")
+        # #2792 : une admission datée, pas un feu de véhicule. Le train ne
+        # reçoit ni `cfg` ni cible et lit la plage gelée entière : la lecture
+        # du delta propre (membres, atterrissages) est un état de base courant,
+        # qui ne dirait pas ce que le train admettait à cette date.
         gate = merge_queue.review_gate(
             self.db, marks, head, repo=self.path, klass=klass, item=historical,
             required=required, authors=authors,
+            # #2808 : `authors` est la lecture complète et stricte de la plage
+            # exacte (un inconnu lève plus haut) : le titulaire absent n'a rien
+            # écrit et ne doit pas être réintroduit comme auteur par la porte.
+            authors_complete=True,
             # #2726 : le train lit les drapeaux compilés qu'il applique déjà au
             # compte d'avis ; la porte les reçoit au lieu de supposer un repli.
             exclude_author_family=getattr(self.review_rules, "exclude_author_family",

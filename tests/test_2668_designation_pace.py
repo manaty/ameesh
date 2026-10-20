@@ -267,10 +267,11 @@ class _Port:
         return None
 
     def commit(self, lot, *, freeze, required, state, reviewers, missing, why,
-               authors, policy_ref="", notify="", messages=()):
+               authors, policy_ref="", notify="", messages=(), unknown_authors=()):
         out = {"state": state, "required": required,
                "reviewers": [dict(r) for r in reviewers], "missing": missing,
                "why": why, "freeze": dict(freeze), "authors": [dict(a) for a in authors],
+               "unknown_authors": [str(value) for value in unknown_authors],
                "messages": [dict(m) for m in messages]}
         self.commits.append(out)
         return out

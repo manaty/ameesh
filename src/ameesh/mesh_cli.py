@@ -160,7 +160,17 @@ def _annotate_agents(cfg: Config, db, rows: list) -> list:
     # prod.
     for row in rows:
         row["paused_on_budget"] = progress.paused_on_budget(row)
+        # #2814 : l'état « queued » d'un tour différé, lisible par un client
+        # sans décoder le texte français (`ameesh-agents/1`,
+        # `GET /api/v1/agents`) ; None hors d'une attente de pression.
+        row["queue"] = _queue_of(row)
     return rows
+
+
+def _queue_of(row) -> dict | None:
+    """#2814 : le `queued` object d'une ligne d'agent (None sinon)."""
+    from . import resources as resources_mod
+    return resources_mod.parse_queue_status((row or {}).get("status_text"))
 
 
 def agent_rows(cfg: Config, db) -> list:
@@ -183,6 +193,8 @@ def agent_detail(db, name: str) -> dict | None:
     # #1070 : the budget pause reaches `show --json` too, as it does
     # `list --json` and `/api/v1/agents` (set in `_annotate_agents`)
     row["paused_on_budget"] = progress.paused_on_budget(row)
+    # #2814 : même objet `queued` que `ameesh list --json`
+    row["queue"] = _queue_of(row)
     row["key_ready"] = bool(info and info.get("public_key") and not info.get("key_revoked_ts"))
     row["public_key_fingerprint"] = (info or {}).get("public_key_fingerprint")
     row["key_updated_ts"] = (info or {}).get("key_updated_ts")
@@ -476,6 +488,8 @@ def _host_json(part: dict) -> dict:
         "host": part["name"],
         "responsible": host.responsible if host is not None else None,
         "limits": limits,
+        # #2814 : le périmètre d'admission, à côté des seuils qu'il gouverne
+        "pressure_scope": limits.get("pressure_scope"),
         "max_agents": physical["max_agents"],
         "limits_origin": physical["origin"],
         "fiches": [{"canon": canon.id, "default": canon.is_default,
@@ -603,6 +617,21 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
             print("  thresholds memory pressure ≤ %s%s"
                   % (res.fmt_value("max_mem_pressure", limits["max_mem_pressure"]),
                      tag("max_mem_pressure")))
+            # #2814 : le périmètre de pression (cgroup du processus ou hôte) ;
+            # en `own_cgroup`, la charge 1 min n'est plus un critère
+            print("  scope      pressure on %s%s%s" % (
+                res.scope_label(limits.get("pressure_scope")),
+                tag("pressure_scope") if fiches else "",
+                "; load advisory only" if limits.get("pressure_scope") == "own_cgroup"
+                else ""))
+            if limits.get("pressure_scope") == "own_cgroup":
+                print("  thresholds cgroup memory ≤ %s%s; cgroup throttled ≤ %s%s"
+                      % (res.fmt_value("max_cgroup_memory_used",
+                                       limits.get("max_cgroup_memory_used")),
+                         tag("max_cgroup_memory_used"),
+                         res.fmt_value("max_cgroup_throttled",
+                                       limits.get("max_cgroup_throttled")),
+                         tag("max_cgroup_throttled")))
             if limits.get("max_cpu_pressure") is not None:
                 print("  thresholds CPU pressure ≤ %s%s"
                       % (res.fmt_value("max_cpu_pressure", limits["max_cpu_pressure"]),
@@ -614,6 +643,29 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                      _fmt_bytes(latest.get("disk_free_bytes")),
                      latest.get("turns_in_progress")
                      if latest.get("turns_in_progress") is not None else "—"))
+            # #2814 : la mesure du cgroup de l'exécuteur (conteneur), publiée
+            # avec le relevé ; c'est elle que `own_cgroup` gouverne
+            cgroup = latest.get("cgroup") or {}
+            if cgroup:
+                parts = []
+                if cgroup.get("path"):
+                    parts.append("path %s" % cgroup["path"])
+                if cgroup.get("mem_used") is not None:
+                    parts.append("memory %s / %s (%s)" % (
+                        _fmt_bytes(cgroup.get("mem_current_bytes")),
+                        _fmt_bytes(cgroup.get("mem_max_bytes")),
+                        res.fmt_value("max_cgroup_memory_used", cgroup["mem_used"])))
+                if cgroup.get("cpu_quota"):
+                    parts.append("CPU quota %.2f" % cgroup["cpu_quota"])
+                if cgroup.get("throttled") is not None:
+                    parts.append("throttled %s" % res.fmt_value(
+                        "max_cgroup_throttled", cgroup["throttled"]))
+                if cgroup.get("cpu_some") is not None:
+                    parts.append("CPU PSI %.1f %%" % cgroup["cpu_some"])
+                if cgroup.get("mem_some") is not None:
+                    parts.append("memory PSI %.1f %%" % cgroup["mem_some"])
+                if parts:
+                    print("  cgroup     %s" % "; ".join(parts))
             manque = res.unmeasured(latest)
             if manque:
                 # L64: a measure the host cannot give, said rather than a "—"
@@ -1928,6 +1980,18 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 _fmt_moment(item.get("closed_ts"))))
             if item["delays"]:
                 _print_delays(item["delays"])
+            # #2786 : un gel qui ne nomme pas un commit hexadécimal (HEAD,
+            # une branche, un sha vide) n'est jamais une preuve de livraison :
+            # le balayage le tient pour un doute, jamais pour une fusion. Le
+            # dire une fois, sans noyer la frise.
+            from . import plan_git as _plan_git
+            last_freeze = _plan_git.latest_freeze(item["milestones"])
+            if last_freeze is not None and not _plan_git.commit_id(
+                    str(last_freeze.get("sha") or "")):
+                print("gel      : jalon non rattaché à un commit (%r) — le balayage "
+                      "des fusions ne le résout pas (doute, jamais fusion) ; regeler "
+                      "sur un SHA complet (`git rev-parse <ref>`)"
+                      % (str(last_freeze.get("sha") or "") or "sans sha",))
             # #2674 : les verdicts écrits avant la règle de la tête relue ne
             # comptent pas à la porte ; le dire une fois, sans noyer la frise.
             unattached = [m for m in item["milestones"]
@@ -2171,11 +2235,19 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             from . import review_designation_activation as activation
             outcome: dict = {}
             note = args.note or ""
+            sha = args.sha or ""
             if args.kind == "frozen":
+                # #2786 : la tête du gel est un commit complet, résolu dans le
+                # dépôt de l'auteur AVANT les contrôles statiques ; une ref
+                # symbolique (HEAD, branche) est refusée ici.
+                item = work.get(db, args.id)
+                if item is None:
+                    raise work.WorkError("lot %s not found" % args.id)
+                sha = work.freeze_head(db, item, sha, repo=args.repo)
                 # #2542 : un contrôle statique rouge refuse le gel, avant le paquet
                 from . import freeze_checks
                 note = freeze_checks.before_freeze(
-                    cfg, db, args.id, args.sha or "", repo=args.repo,
+                    cfg, db, args.id, sha, repo=args.repo,
                     skip=args.no_static_checks, note=note)
             elif args.no_static_checks is not None or args.prevalidation_map:
                 raise work.WorkError("--no-static-checks and --prevalidation-map "
@@ -2183,7 +2255,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # `--repo` vaut aussi pour un verdict (#2674) : il y résout
             # l'abréviation du SHA relu, et fait alors autorité.
             row = work.milestone(
-                db, args.id, args.kind, sha=args.sha or "", actor=args.actor or "",
+                db, args.id, args.kind, sha=sha, actor=args.actor or "",
                 verdict=args.verdict, note=note, outcome=outcome, repo=args.repo)
             print("milestone %s added to lot #%d%s" % (
                 row["kind"], args.id,
@@ -3326,9 +3398,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help="frozen (branch frozen) or verdict (review delivered); "
                             "the pilot's fire is `ameesh work fire`")
     pw_ms.add_argument("--sha", default="",
-                       help="the frozen or reviewed commit (verdict: the full head, or "
-                            "an abbreviation of at least 12 hex characters resolved in "
-                            "a repository)")
+                       help="the frozen or reviewed commit (frozen: the full 40-hex "
+                            "commit, or an abbreviation of at least 12 hex characters "
+                            "resolved in the author's repository; a symbolic ref is "
+                            "refused. verdict: the full head, or an abbreviation of at "
+                            "least 12 hex characters resolved in a repository)")
     # le verdict est un positionnel (`work milestone 1 verdict ok`), comme la
     # frise se lit ; `frozen` n'en prend pas
     pw_ms.add_argument("verdict", nargs="?", choices=list(work.VERDICTS), default=None,
@@ -3563,7 +3637,7 @@ def cmd_cost(cfg: Config, args) -> int:
                 reason = "" if any(e.ok for e in evals) else (
                     "all %s accounts at the threshold — %s" % (harness, "; ".join(
                         "%s: %s" % (e.profile.name, e.reason) for e in evals)))
-                reason = reason or book.over(agent, pace=False)
+                reason = reason or book.over(agent, pace=False, account_checked=True)
             else:
                 reason = book.over(agent)
             if reason:
