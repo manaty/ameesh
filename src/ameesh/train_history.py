@@ -120,6 +120,10 @@ class Recorded:
             historical["assignee"] = reference["name"]
         family_of[str(reference.get("name") or "").strip().lower()] = \
             str(reference.get("family") or "")
+        # #2792 : une admission datée, pas un feu de véhicule. Le train ne
+        # reçoit ni `cfg` ni cible et lit la plage gelée entière : la lecture
+        # du delta propre (membres, atterrissages) est un état de base courant,
+        # qui ne dirait pas ce que le train admettait à cette date.
         gate = merge_queue.review_gate(
             self.db, marks, head, repo=self.path, klass=klass, item=historical,
             required=required, authors=authors,

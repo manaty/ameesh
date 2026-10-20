@@ -41,6 +41,10 @@ _TEST = re.compile(
     r"(^|/)(tests?|__tests__|spec)/|"
     r"(^|/)test_[^/]*\.py$|(^|/)[^/]*_test\.py$|"
     r"\.(?:test|spec)\.(?:[cm]?[jt]sx?)$")
+#: les entrées du plan de CI (`tests/parts/`) ne sont pas des tests qu'on
+#: adapte : elles décident quels modules tournent, donc elles se relisent
+#: (§8 ameesh : scripts/test*, ci* sensibles ; #2792).
+_CI_PLAN = re.compile(r"(^|/)tests/parts(/|$)")
 
 
 class VehicleError(RuntimeError):
@@ -171,8 +175,12 @@ def _is_review_free(path: str) -> bool:
     """Un chemin que la composition ne soumet à aucun avis (§11 bis).
 
     Une adaptation de test et le manifeste du paquet disent l'état de la
-    composition, pas un contenu relu : ils ne rouvrent pas la relecture.
+    composition, pas un contenu relu : ils ne rouvrent pas la relecture. Une
+    entrée de `tests/parts/` n'est pas une adaptation de test : elle pilote la
+    CI (§8), elle reste un delta à relire (#2792).
     """
+    if _CI_PLAN.search(path):
+        return False
     return bool(_TEST.search(path)) or bool(packet_close.MANIFEST.match(path))
 
 
