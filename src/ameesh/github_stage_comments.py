@@ -11,6 +11,7 @@ import datetime as dt
 import json
 from pathlib import Path
 import re
+import time
 
 MARKER = "<!-- ameesh:work-stage:v1 lot=%d event=%s -->"
 PUBLIC_STATUS = re.compile(r"(?im)^Public status:[ \t]*(\S[^\r\n]*)$")
@@ -68,8 +69,21 @@ def release_receipts(cfg, project):
             # actif's --lot values are strings; cutoff's included values are ints.
             if ((isinstance(lot, int) and not isinstance(lot, bool) and lot > 0)
                     or (isinstance(lot, str) and re.fullmatch(r"[1-9][0-9]*", lot))):
-                receipts.setdefault(int(lot), []).append((version, day))
+                receipts.setdefault(int(lot), []).append(
+                    (version, day, float(report.get("completed_at"))))
     return receipts
+
+
+def _current_receipts(receipts, since):
+    """#2874: one delivery per lot, and only for releases cut after `since`.
+
+    Releases completed before the stage comments were switched on are history:
+    replaying them posted a "Delivered in release X" for every past release on
+    every mirror. A lot listed by several reports keeps its earliest release.
+    """
+    kept = [r for r in receipts if len(r) < 3 or r[2] >= since]
+    kept.sort(key=lambda r: r[2] if len(r) > 2 else 0.0)
+    return [tuple(kept[0][:2])] if kept else []
 
 
 def stages(item, milestones, events, *, receipts=(), closing=None):
@@ -79,12 +93,18 @@ def stages(item, milestones, events, *, receipts=(), closing=None):
     yield "accepted", "Accepted. Priority: %s; target: %s." % (priority, target)
     timeline = []
     kinds = set()
-    for mark in reversed(milestones):
+    for mark in milestones:
         kind = mark.get("kind")
         if kind not in ("frozen", "merged") or mark.get("annulled"):
             continue
+        # #2861: newest-first: retain the latest freeze in the timeline.
+        # One public "Frozen" per lot; a re-freeze is not a new stage
+        # for the requester (a lot can be frozen ten times before it lands).
+        if kind == "frozen" and "frozen" in kinds:
+            continue
         kinds.add(kind)
-        timeline.append((float(mark.get("at_ts") or 0), "milestone-%s" % mark["id"], {
+        key = "frozen" if kind == "frozen" else "milestone-%s" % mark["id"]
+        timeline.append((float(mark.get("at_ts") or 0), key, {
             "frozen": "Frozen for review.", "merged": "Merged; delivery confirmation will follow."
         }[kind]))
     previous = None
@@ -115,7 +135,7 @@ def stages(item, milestones, events, *, receipts=(), closing=None):
 def project(db, st, gh_repo, report, mine, *, guard, refused, project, closings):
     from . import plan_github
 
-    receipts = release_receipts(getattr(db, "cfg", None), project)
+    raw_receipts = release_receipts(getattr(db, "cfg", None), project)
     # Single writer, as for the issue projection. Local receipts avoid re-reading
     # completed threads; remote markers still reconcile a POST with a lost ack.
     folder = getattr(getattr(db, "cfg", None), "state_dir", None)
@@ -128,11 +148,22 @@ def project(db, st, gh_repo, report, mine, *, guard, refused, project, closings)
         report["errors"].append({"action": "stage-checkpoint", "detail": str(exc)})
         return
 
+    # #2874: the first real pass fixes the start of the public timeline.
+    since = checkpoint.get("_since")
+    if not isinstance(since, (int, float)):
+        since = time.time()
+
     def save():
         if path and not gh_repo.dry_run:
             path.parent.mkdir(parents=True, exist_ok=True)
             plan_github._atomic_write(str(path), checkpoint)
 
+    if not gh_repo.dry_run and "_since" not in checkpoint:
+        checkpoint["_since"] = since
+        save()      # the cutoff must survive a pass that posts nothing
+
+    receipts = {lot: kept for lot, rows in raw_receipts.items()
+                if (kept := _current_receipts(rows, since))}
     entries = {row["work_item"]: row for row in report["issues"]}
     for item, issue in mine:
         lot = int(item["id"])
@@ -151,6 +182,9 @@ def project(db, st, gh_repo, report, mine, *, guard, refused, project, closings)
             if issue is None or (issue.get("state") or "").lower() == "open":
                 if not saved["enrolled"]:
                     saved["enrolled"] = True
+                    # #2861: a mirror that already existed is enrolled from
+                    # its current stage only, never with the whole history.
+                    saved["baseline"] = issue is not None
                     checkpoint[ticket] = saved
                     save()
             if not saved["enrolled"] and not receipts.get(lot):
@@ -161,13 +195,30 @@ def project(db, st, gh_repo, report, mine, *, guard, refused, project, closings)
                                      closing=closings.get(lot)))
             if not saved["enrolled"]:
                 candidates = [(key, text) for key, text in candidates if key.startswith("delivered-")]
+            if saved.get("baseline") and not gh_repo.dry_run:
+                # #2861: keep the latest stage, mark the older ones as seen
+                history = [key for key, _text in candidates[:-1]
+                           if not key.startswith("delivered-")]
+                saved["seen"].extend(k for k in history if k not in saved["seen"])
+                saved["baseline"] = False
+                checkpoint[ticket] = saved
+                save()
             candidates = [(key, text) for key, text in candidates if key not in saved["seen"]]
+            if any(key.startswith("delivered-") for key in saved["seen"]):
+                candidates = [(key, text) for key, text in candidates
+                              if not key.startswith("delivered-")]
             if not candidates:
                 continue
             existing = "\n".join(row.get("body") or "" for row in gh_repo.comments(number))
             seen = set()
             for key, text in candidates:
                 marker = MARKER % (lot, key)
+                if key.startswith("delivered-") and (
+                        "<!-- ameesh:work-stage:v1 lot=%d event=delivered-" % lot) in existing:
+                    # A late/reconciled report can change the earliest receipt.
+                    # An existing delivery still closes this lot's timeline.
+                    saved["seen"].append(key)
+                    continue
                 if marker in existing:
                     if key not in saved["seen"]:
                         saved["seen"].append(key)

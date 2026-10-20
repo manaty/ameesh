@@ -17,7 +17,7 @@ chaque fois. Un contrôle statique bon marché se passe avant le gel.
 Le dépôt lu est `--repo` s'il est nommé (il doit porter S), sinon le
 répertoire courant s'il porte S, sinon le dépôt du projet du lot
 (`lot_class.repository`). Un SHA complet qu'aucun dépôt ne porte ou un arbre
-sans script n'ont pas de contrôle à passer. La CLI exige auparavant un identifiant immuable (#2863) :
+sans script n'ont pas de contrôle à passer. La CLI exige auparavant un identifiant immuable (#2786, #2863) :
 pas de référence symbolique ni de tête vide ; une abréviation de 12+ caractères
 hexadécimaux doit se résoudre et est transmise en SHA complet.
 `--no-static-checks "raison"` passe outre, la raison inscrite dans la note du

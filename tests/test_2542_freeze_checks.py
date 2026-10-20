@@ -51,6 +51,10 @@ class Repo:
     def __init__(self) -> None:
         self.root = tempfile.mkdtemp(prefix="ameesh-2542-")
         subprocess.run(["git", "init", "-q", "-b", "main", self.root], check=True, env=ENV)
+        # #2786 : un gel n'est jamais la tête de la cible (aucun commit
+        # propre) ; un socle sur main, puis les commits sur une branche de lot.
+        _git(self.root, "commit", "-q", "--allow-empty", "-m", "socle")
+        _git(self.root, "checkout", "-q", "-b", "lot/test")
 
     def commit(self, *, script: str | None = None, path: str = "lot.txt",
                text: str = "lot\n") -> str:
@@ -269,7 +273,7 @@ class CliTest(PgTestCase):
             with self.subTest(ref=ref):
                 proc = self.freeze(ref, "--no-static-checks", "incident")
                 self.assertEqual(proc.returncode, 1, proc.stdout)
-                self.assertIn("head-invalid", proc.stderr)
+                self.assertIn("head-missing", proc.stderr)
                 self.assertEqual(self.frozen(), [])
 
     def test_abbreviation_is_stored_as_full_commit(self):
@@ -280,7 +284,7 @@ class CliTest(PgTestCase):
 
     def test_short_and_unknown_abbreviations_refused(self):
         sha = self.repo.commit(script=GREEN)
-        for ref, cause in ((sha[:7], "head-invalid"),
+        for ref, cause in ((sha[:7], "head-missing"),
                            ("deadbeefdead", "head-unresolved")):
             with self.subTest(ref=ref):
                 proc = self.freeze(ref)
@@ -291,7 +295,7 @@ class CliTest(PgTestCase):
     def test_direct_api_refuses_symbolic_ref_before_hook(self):
         self.repo.commit(script=GREEN)
         hook = mock.Mock()
-        with self.assertRaisesRegex(work.WorkError, "head-invalid"):
+        with self.assertRaisesRegex(work.WorkError, "head-missing"):
             work.milestone(self.db, self.lot, "frozen", sha="HEAD",
                            repo=self.repo.root, on_frozen=hook)
         hook.assert_not_called()
@@ -320,7 +324,10 @@ class CliTest(PgTestCase):
         self.assertEqual(self.frozen(), [])
         proc = self.freeze(sha, "--no-static-checks", "incident #1", "--note", "regel")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(self.frozen()[0]["note"], "regel — static checks skipped: incident #1")
+        note = self.frozen()[0]["note"]
+        self.assertIn("regel — static checks skipped: incident #1", note)
+        # #2786 (5) : la marque machine des branches absentes au gel suit.
+        self.assertIn("ameesh-freeze-absent: main", note)
 
     def test_vert_gele_et_le_dit(self):
         sha = self.repo.commit(script=GREEN)

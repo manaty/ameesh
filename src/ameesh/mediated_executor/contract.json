@@ -4508,6 +4508,7 @@
     "revoke"
    ],
    "hosts": [
+    "disk_history",
     "gate_guard",
     "harness_versions",
     "history",

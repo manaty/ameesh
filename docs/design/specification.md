@@ -318,6 +318,24 @@ celui de l'assigné) ou dans la tête gelée courante. Sans elle, le jalon est
 refusé et la tête gelée proposée ; les anciens verdicts sans SHA restent
 lisibles mais ne comptent pas à la porte, et `ameesh work show` les signale
 (« avis non rattaché à une tête »).
+Un `frozen` **exige** une tête immuable (#2786) : le commit complet (40 ou 64
+hexadécimaux), ou une abréviation d'au moins 12 caractères hexadécimaux
+résolue dans le dépôt de l'auteur (répertoire courant, `--repo`, dépôt du
+projet ou de l'assigné) et alors **écrite complète** ; une ref symbolique
+(`HEAD`, une branche) est refusée. Le balayage des fusions et la désignation
+automatique n'acceptent qu'un commit complet et ne résolvent jamais une ref
+dans leur propre clone : un gel « HEAD » vaut doute, jamais une livraison, et
+`ameesh work show` le signale (« jalon non rattaché à un commit »). Un gel
+dont le commit est **déjà ancêtre de la cible** au moment du gel (aucun
+commit propre, cas #2784) est refusé à l'écriture ; et le balayage ne compte
+pas comme livraison un gel qui était déjà dans la cible quand il a été posé.
+La cible est lue **publiée et rafraîchie** (fetch borné de `origin`) : un
+clone d'auteur en retard sur la forge ne peut ni accepter un gel déjà livré
+ni écrire la preuve d'absence qui le rendrait livrable. Quand la forge est
+illisible, le gel s'écrit sans cette preuve — le balayage doute, il ne
+devine pas. La preuve d'absence est une ligne machine : une
+`ameesh-freeze-absent:` fournie dans `--note` est ignorée, jamais recopiée
+(sinon n'importe quel appelant contournerait le refus #2784).
 Les durées `demande → gel`, `gel → revue`, `gel → fusion` et le nombre de
 verdicts bloqués se lisent dans `ameesh work list` (colonne DÉLAI), `ameesh work
 show` (frise complète) et le pied de `ameesh list` ; la forme complète est

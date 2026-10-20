@@ -140,11 +140,21 @@ def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=(),
     (#2564) — ou `("", "")` si aucun dépôt ne le résout : l'appelant ne conclut
     pas (jamais de classe rassurante par défaut). `overview` réutilise les
     lignes de `registry.overview` déjà lues par l'appelant (une passe = une
-    lecture pour N lots, #2564) ; `None` les relit. Lecture seule."""
+    lecture pour N lots, #2564) ; `None` les relit. Lecture seule.
+
+    #2851 : la sonde est locale (`plan_git.local_commit`). Un clone partiel
+    d'un autre projet dont le commit manque lançait sinon un fetch paresseux
+    (~10 s) avant d'échouer, et le balayage des dossiers du registre payait ce
+    délai plusieurs fois par passe d'alertes."""
     from . import registry
 
     frozen = str(frozen or "").strip()
     if not frozen:
+        return "", ""
+    # #2786 : un gel qui ne nomme pas un commit hexadécimal (`HEAD`, une
+    # branche) n'est jamais résolu dans le clone de l'hôte, qui lirait une
+    # tête que personne n'a gelée (#2712) ; la lecture reste en doute.
+    if not plan_git.commit_id(frozen):
         return "", ""
     candidates = []
     assignee = str((item or {}).get("assignee") or "").strip()
@@ -180,7 +190,7 @@ def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=(),
             continue
         seen.add(root)
         try:
-            commit = plan_git._commit(root, frozen)
+            commit = plan_git.local_commit(root, frozen)
         except Exception:  # noqa: BLE001 - commit illisible : piste suivante
             continue
         if commit:
@@ -479,6 +489,12 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
             out["why"] = "lot #%d is not frozen" % lot
             return out
         frozen = str(freeze["sha"]).strip()
+        # #2786 : jamais de ref symbolique résolue ici (le `HEAD` d'un autre
+        # clone a classé/fermé le mauvais commit, #2712).
+        if not plan_git.commit_id(frozen):
+            out["why"] = ("the freeze %r is not a commit id (the last freeze must "
+                          "name the full commit)" % (frozen[:24],))
+            return out
         try:
             head = plan_git._commit(repo, frozen)
         except canon_mod.GitError as exc:
