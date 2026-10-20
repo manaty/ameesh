@@ -278,7 +278,7 @@ def commit_actor(repo: str, sha: str) -> tuple[str, float]:
     return email[:-len(suffix)], stamp
 
 
-def commits_written_by(repo: str, commits: Sequence[str], name: str) -> bool:
+def commits_written_by(repo: str, commits: Sequence[str], name: str) -> Optional[bool]:
     """Un commit de la plage porte `name` comme **auteur Git** (`%ae`).
 
     L'auteur Git est la signature du contenu ; le committer (`commit_actor`)
@@ -292,15 +292,15 @@ def commits_written_by(repo: str, commits: Sequence[str], name: str) -> bool:
     if not shas:
         return False
     text = plan_git._out(repo, "log", "--no-walk", "--format=%H%x1f%ae", *shas)
-    if text is None:
-        return False
+    if text is None or len(str(text).splitlines()) != len(set(shas)):
+        return None                     # unreadable is not proof of absence
     from .identity import GIT_EMAIL_DOMAIN
     suffix = "@" + GIT_EMAIL_DOMAIN
     wanted = str(name).strip().lower()
     for line in str(text).splitlines():
         _sha, separator, email = line.partition("\x1f")
         if not separator:
-            continue
+            return None
         email = email.strip().lower()
         if email.endswith(suffix) and email[:-len(suffix)] == wanted:
             return True
@@ -445,9 +445,13 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     if author_name:
         authored = next((name for name in by_name
                          if name.lower() == author_name.lower()), "")
-        if not authored and commits_written_by(repo, commits, author_name):
-            authored = author_name
-            by_name.setdefault(authored, set())
+        if not authored:
+            written = commits_written_by(repo, commits, author_name)
+            if written is None:
+                unknown.extend(str(sha)[:12] for sha in commits if str(sha)[:12] not in unknown)
+            elif written:
+                authored = author_name
+                by_name.setdefault(authored, set())
         if authored and author_family:
             by_name[authored].add(author_family)
     for actor, entries in sorted(review_commits.items()):

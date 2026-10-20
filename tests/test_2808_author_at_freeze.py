@@ -65,6 +65,15 @@ class ReadingTest(TestCase):
         self.assertEqual([row["name"] for row in authors], ["impl"])
         self.assertEqual(unknown, [])
 
+    def test_unreadable_git_authors_cannot_prove_the_titular_wrote_nothing(self):
+        # A receipt for the committer does not identify the original Git
+        # author preserved by an amend. Failed/incomplete reads must wait.
+        for output in (None, "", self.impl, self.impl + "\x1fimpl@ameesh.invalid\nmalformed"):
+            with self.subTest(output=output), mock.patch.object(
+                    review_authors.plan_git, "_out", return_value=output):
+                _authors, unknown, _correctors = self.reading([self.impl])
+                self.assertEqual(unknown, [self.impl[:12]])
+
     def test_the_titular_family_is_eligible_when_they_wrote_nothing(self):
         authors, _unknown, _correctors = self.reading([self.impl])
         out = rd.select(
