@@ -828,7 +828,7 @@ def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
     try:
         return review_gate(db, marks or [], frozen,
                            repo=klass.get("repo") or repo or None,
-                           klass=klass, item=item)
+                           klass=klass, item=item, cfg=cfg, target=target)
     except Exception:  # noqa: BLE001 - une porte illisible ne conclut pas
         return None
 
