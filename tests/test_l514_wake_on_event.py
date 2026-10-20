@@ -203,6 +203,10 @@ class MidTurnHookTest(_Base):
                           payload={"human": True})
                 mail.send(self.db, "human:smichea", name, "Owner: urgent.",
                           payload={"human": True, "urgent": True})
+                # Ancien message humain : sender human:* sans payload.human
+                # (mail.is_human le reconnaît aussi) ; il ne doit pas passer.
+                mail.send(self.db, "human:smichea", name, "Owner: legacy urgent.",
+                          kind="event", payload={"urgent": True})
                 mail.send(self.db, "review", name, "Verdict for the turn.",
                           payload={"verdict": True})
                 out = self._hook(worker, harness, "PostToolUse",
@@ -211,9 +215,12 @@ class MidTurnHookTest(_Base):
                 self.assertIn("Verdict for the turn.", context)
                 self.assertNotIn("Owner: ordinary.", context)
                 self.assertNotIn("Owner: urgent.", context)
+                self.assertNotIn("Owner: legacy urgent.", context)
                 pending = self._pending(name)
                 self.assertIn("Owner: ordinary.", pending)
                 self.assertIn("Owner: urgent.", pending)
+                self.assertIn("Owner: legacy urgent.", pending)
+                self.assertIn("Owner: legacy urgent.", pending)
                 self.assertNotIn("Verdict for the turn.", pending)
                 # Stop ne les remet pas non plus : la file du tour les soldera.
                 self.assertEqual(self._hook(worker, harness, "Stop",
@@ -221,6 +228,7 @@ class MidTurnHookTest(_Base):
                 pending = self._pending(name)
                 self.assertIn("Owner: ordinary.", pending)
                 self.assertIn("Owner: urgent.", pending)
+                self.assertIn("Owner: legacy urgent.", pending)
 
 
 class SendMarksTest(_Base):

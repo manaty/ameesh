@@ -730,6 +730,42 @@ class BareIdentityTest(unittest.TestCase):
         self.assertEqual(rq.human_ref(" alice "), "human:alice")
 
 
+class DeliverableHumanFilterTest(unittest.TestCase):
+    """L77/B11 : tous les retours de `deliverable_unread` filtrent les humains."""
+
+    def _rows(self):
+        return [{"id": 1, "sender": "human:alice", "payload": {"human": True}},
+                {"id": 2, "sender": "agent:b", "payload": {}},
+                {"id": 3, "sender": "human:carol", "payload": {"urgent": True}}]
+
+    def _call(self, cfg, *, patcher):
+        from types import SimpleNamespace
+        from unittest import mock
+        from ameesh import lot_workdir
+        agent = {"name": "worker", "projects": ["p1", "p2"]}
+        with mock.patch.object(lot_workdir.mail, "unread",
+                               return_value=self._rows()), patcher:
+            return lot_workdir.deliverable_unread(
+                cfg, object(), agent, besoin=10, include_human=False)
+
+    def test_canon_error_fallback_filters_humans(self):
+        from unittest import mock
+        from ameesh import canon
+        out = self._call(object(), patcher=mock.patch.object(
+            canon, "load_configured", side_effect=canon.CanonError("illisible")))
+        self.assertEqual([r["id"] for r in out], [2])
+
+    def test_db_error_fallback_filters_humans(self):
+        from unittest import mock
+        from ameesh import db as db_mod, lot_workdir
+        with mock.patch.object(lot_workdir.canon, "load_configured",
+                               return_value=[]):
+            out = self._call(object(), patcher=mock.patch.object(
+                lot_workdir, "deliverable",
+                side_effect=db_mod.DbError("illisible")))
+        self.assertEqual([r["id"] for r in out], [2])
+
+
 class HumanReservationTtlTest(unittest.TestCase):
     """L77/B6 : la réservation humaine couvre tout le tour, pas 10 min."""
 

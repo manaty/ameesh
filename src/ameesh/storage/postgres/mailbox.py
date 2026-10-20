@@ -157,11 +157,13 @@ class Mailbox(interface.Mailbox):
         verdict, un arbitrage, un message humain ou urgent, sans borne sur les
         autres non-lus (les 200 premiers ne sont pas un plafond de lecture).
 
-        L77/B11 : `include_human=False` écarte tout message `payload.human`
-        (même urgent) ; la file du tour résident les réserve et les solde.
+        L77/B11 : `include_human=False` écarte tout message humain au sens de
+        `mail.is_human` — `payload.human` (même urgent) ou ancien
+        `sender human:*` — ; la file du tour résident les réserve et les solde.
         """
         humains = "" if include_human else (
-            " AND NOT (payload @> '{\"human\": true}'::jsonb)")
+            " AND NOT (m.payload @> '{\"human\": true}'::jsonb"
+            " OR starts_with(m.sender, 'human:'))")
         return self.db.query(
             """
             SELECT %s

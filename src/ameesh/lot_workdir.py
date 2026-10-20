@@ -157,20 +157,30 @@ def deliverable_unread(cfg, db, agent, *, besoin, mode="unread", deferred=None,
     marquer, jusqu'à `besoin` remisables ou la fin de la boîte. Mono-projet :
     lecture simple, flux inchangé. Un backend qui borne lui-même la page
     (exécuteur médié) ne fait pas boucler : on s'arrête quand la page ne
-    progresse plus."""
+    progresse plus.
+
+    L77/B11 : `include_human=False` filtre **tous** les retours (lecture
+    simple, replis canon/base) ; un repli ne doit jamais rendre un humain au
+    hook résident qui le solderait."""
     lire = {"unread": mail.unread, "active": mail.unread_active,
             "urgent": mail.unread_urgent}[mode]
     name = agent.get("name")
     besoin = max(1, int(besoin))
+
+    def filtrer(rows):
+        if include_human:
+            return rows
+        return [row for row in rows if not mail.is_human(row)]
+
     if cfg is None:                   # construction partielle : lecture simple
-        return lire(db, name, limit=besoin)
+        return filtrer(lire(db, name, limit=besoin))
     if len(projects.agent_projects(agent)) < 2:
-        return lire(db, name, limit=besoin)
+        return filtrer(lire(db, name, limit=besoin))
     canons = None
     try:
         canons = canon.load_configured(cfg)
     except canon.CanonError:
-        return lire(db, name, limit=besoin)
+        return filtrer(lire(db, name, limit=besoin))
     page = max(MAIL_PAGE, besoin)
     lus = 0
     while True:
@@ -178,12 +188,11 @@ def deliverable_unread(cfg, db, agent, *, besoin, mode="unread", deferred=None,
         try:
             gardes = deliverable(cfg, db, agent, rows, deferred=deferred, canons=canons)
         except db_mod.DbError:
-            return rows               # dossier illisible : page brute, rien perdu
-        if not include_human:
-            # L77/B11 : le hook d'un tour résident ne remet pas les messages
-            # humains, réservés/soldés par la file du tour. On continue de
-            # paginer pour ne pas s'arrêter sur une page pleine d'humains.
-            gardes = [row for row in gardes if not mail.is_human(row)]
+            return filtrer(rows)      # dossier illisible : page brute, rien perdu
+        # L77/B11 : le hook d'un tour résident ne remet pas les messages
+        # humains, réservés/soldés par la file du tour. On continue de paginer
+        # pour ne pas s'arrêter sur une page pleine d'humains.
+        gardes = filtrer(gardes)
         if len(gardes) >= besoin or len(rows) < page or len(rows) <= lus:
             return gardes
         lus = len(rows)
