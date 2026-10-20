@@ -540,7 +540,7 @@ def _resolve_base(repo: str, base: str) -> str:
     return ""
 
 
-def _range(repo: str, base: str, head: str) -> tuple[str, list, list]:
+def _range(repo: str, base: str, head: str, *, bounded: bool = True) -> tuple[str, list, list]:
     """`(start, paths, commits)` of the lot's own frozen change."""
     base = _resolve_base(repo, base)
     if not base:
@@ -558,7 +558,7 @@ def _range(repo: str, base: str, head: str) -> tuple[str, list, list]:
                                  "%s..%s" % (start, head)) or "").split()
     except canon_mod.GitError as exc:
         raise ActivationError("cannot read the frozen diff: %s" % exc) from exc
-    if len(commits) > MAX_COMMITS:
+    if bounded and len(commits) > MAX_COMMITS:
         raise ActivationError("the frozen range carries %d commits (limit %d):"
                               " refusing an unbounded provenance read"
                               % (len(commits), MAX_COMMITS))
@@ -867,10 +867,23 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     base = lot_class.default_base(cfg, item, repo)
     if not base:
         return Unavailable("no target branch known for lot #%d" % int(lot))
+    from . import packet_reviews
+
     try:
-        start, paths, commits = _range(repo, base, str(freeze.get("sha") or ""))
+        start, paths, commits = _range(repo, base, frozen_sha,
+                                       bounded=not packet_reviews.is_vehicle(item))
     except ActivationError as exc:
         return Unavailable(str(exc))
+    if packet_reviews.is_vehicle(item):
+        # #2766 : un véhicule ne désigne que pour son delta propre ; les
+        # membres portent leurs avis sur leur propre tête gelée.
+        try:
+            own = packet_reviews.designation_changes(db, int(lot), item, repo, start,
+                                                     frozen_sha)
+        except packet_reviews.VehicleError as exc:
+            return Unavailable("vehicle review unreadable: %s" % exc)
+        if own is not None:
+            paths, commits = own["paths"], own["commits"]
     project = str(item.get("app") or "").strip()
     if not project:
         return Unavailable("lot #%d declares no project: the review policy is unknown"

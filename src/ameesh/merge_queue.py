@@ -405,7 +405,8 @@ def _corrections_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
 
 def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 item=None, families=None, required=None, family_of=None,
-                authors=None) -> dict:
+                authors=None, cfg=None, project=None, target=None,
+                vehicle=None) -> dict:
     """Les avis requis sur la tête gelée `frozen`, et eux seuls (#1374).
 
     Un verdict ne compte que s'il a été rendu **sur cette tête** (le `sha` du
@@ -463,8 +464,17 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     gel ne couvre jamais la nouvelle tête. Un verdict bloquant courant, lui,
     n'est jamais levé par la dispense : la correction reste due.
 
+    #2766 : pour un **véhicule de paquet** (`integration/**`), la porte ne
+    classe pas le diff gelé entier. `packet_reviews.need` lit les avis de
+    chaque membre sur SA tête gelée et ne retient que le delta propre du
+    véhicule (résolution non mécanique, adaptation) : sans delta, aucun avis
+    de véhicule n'est dû ; un membre sans avis refuse. `vehicle` permet à un
+    appelant qui a déjà fait cette lecture de la passer ; sinon elle est faite
+    ici quand `cfg` et `target` sont fournis. Un véhicule sans membre lisible
+    garde la lecture historique, jamais un passage à zéro avis.
+
     Rend `{ok, why, class, required, accepted, blocked, waived, author,
-    author_family, authors, corrections, on_freeze}` ; ne lève jamais.
+    author_family, authors, corrections, on_freeze, vehicle}` ; ne lève jamais.
     """
     from . import lot_class
     klass = klass or {}
@@ -482,10 +492,48 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     out = {"ok": False, "why": "", "error": "", "class": cls, "required": 0,
            "accepted": [], "blocked": [], "waived": waived, "waived_by": waived_by,
            "author": author, "author_family": "", "authors": [],
-           "corrections": [], "on_freeze": 0}
+           "corrections": [], "on_freeze": 0, "vehicle": None}
     if not frozen:
         out["why"] = "no freeze to review: the fire names the exact frozen head"
         return out
+    if vehicle is None and cfg is not None and target and item is not None:
+        from . import packet_reviews
+        if packet_reviews.is_vehicle(item):
+            try:
+                vehicle = packet_reviews.need(db, int(item.get("id") or 0), item,
+                                              marks, repo or "", target, frozen,
+                                              cfg=cfg)
+            except Exception as exc:  # noqa: BLE001 - lecture impossible : refus
+                vehicle = {"ok": False, "required": None, "klass": None,
+                           "why": "vehicle review unreadable: %s" % exc,
+                           "members": [], "own_paths": []}
+    if vehicle is not None:
+        out["vehicle"] = vehicle
+        if vehicle.get("ok") is False:
+            out["why"] = (vehicle.get("why")
+                          or "no review verdict ok on the freeze %s (class: %s): "
+                             "the vehicle's constituents or proper delta are not "
+                             "proven" % (frozen[:12], cls))
+            return out
+        if vehicle.get("klass"):
+            # #2766 (B cx3) : la classe du delta propre vient de
+            # `class_of_paths` et ne porte ni `base_sha` ni `target`. La base
+            # de provenance reste celle de la plage gelée du lot : sans elle,
+            # `_corrections_on_freeze` rend None et le correcteur d'un petit
+            # correctif compterait sur son propre delta (#2739).
+            outer = klass or {}
+            provenance = {key: outer[key] for key in ("base_sha", "target")
+                          if outer.get(key)}
+            klass = dict(vehicle["klass"], **provenance)
+            cls = str(klass.get("class") or cls)
+            if klass.get("doubt"):
+                cls = lot_class.SENSITIVE
+    vehicle_required = 0
+    if vehicle is not None and vehicle.get("ok") is not False:
+        vehicle_required = int(vehicle.get("required") or 0)
+        if vehicle.get("ok") is True and vehicle_required == 0 and cls != lot_class.RELEASE:
+            klass = {"class": lot_class.LIGHT, "files": []}
+            cls = lot_class.LIGHT
     floor = required_verdicts(klass)
     if required is None:
         required = floor
@@ -495,8 +543,9 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                       " review requirement of 0, 1 or 2 is required, not %r"
                       % (frozen[:12], cls, required))
         return out
-    required = max(required, floor)
+    required = max(required, floor, vehicle_required)
     out["required"] = required
+    out["class"] = cls
     on_freeze = [m for m in (marks or ()) if m.get("kind") == "verdict"
                  and _same_sha(m.get("sha"), frozen, repo)]
     out["on_freeze"] = len(on_freeze)
@@ -1272,7 +1321,8 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     # (familles), et aucun blocage non levé ; un `ok` récent ne masque plus le
     # `blocked` d'un autre relecteur (P1-1). #2281 : la dispense de re-verdict
     # du pilote (#1979) lève l'exigence d'avis sur cette tête gelée.
-    gate = review_gate(db, marks, tip, repo=where, klass=klass, item=row)
+    gate = review_gate(db, marks, tip, repo=where, klass=klass, item=row,
+                       cfg=cfg, target=fresh_target)
     if not gate["ok"]:
         raise QueueError("lot #%d: %s" % (lot, gate["why"]))
     # L756 (#566): un lot de classe release ne se contente pas du check de sa
@@ -1314,7 +1364,8 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
         _required_ci(project, tip, commit_ci, parts=parts, branch=row["branch"])
         proof = getattr(parts, "proof", None)
     return {"target": target, "frozen_sha": tip, "frozen_id": freeze["id"],
-            "pr": (status or {}).get("number"), "class": klass.get("class"),
+            "pr": (status or {}).get("number"),
+            "class": gate.get("class") or klass.get("class"),
             "class_why": klass.get("why") or "", "parts": proof,
             "waived": bool(gate.get("waived")),
             "waived_by": gate.get("waived_by") or ""}
