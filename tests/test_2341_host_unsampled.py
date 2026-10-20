@@ -35,7 +35,9 @@ class HostUnsampledTest(unittest.TestCase):
         store.turn_resources.orphans.return_value = list(orphans)
         store.turn_resources.stale_running.return_value = []
 
-        def physical(_canons, host):
+        def physical(_canons, host, *, reading=None):
+            # #2825 N4 : `_host_alerts` lit le périmètre dans le relevé de
+            # l'hôte ; le faux accepte le mot-clé sans changer son verdict.
             value = max_agents.get(host) if isinstance(max_agents, dict) else max_agents
             return {"limits": resources.thresholds(None), "max_agents": value,
                     "origin": {}, "fiches": []}
