@@ -47,6 +47,32 @@ test("the conversation shows the exchanges with the agent from its project and l
   assert.deepEqual(await violations(), []);
 });
 
+test("a selected lot still reads the project thread, where a reply without --lot lands", async () => {
+  const { client, fetch } = fixture({
+    "/api/v1/threads/ameesh": [200, { entries: [
+      { id: "p1", author: "human:ada", recipient: "agent:ada", text: "Project question", ts: stamp - 10 },
+      { id: "p2", author: "agent:ada", recipient: "human:ada", text: "Project answer", ts: stamp + 10 },
+      // the same exchange recorded in both threads is shown once (id|ts)
+      { id: "p0", author: "human:ada", recipient: "agent:ada", text: "Repeated question", ts: stamp - 5 },
+    ] }],
+    "/api/v1/threads/ameesh/7": [200, { entries: [
+      { id: "l1", author: "human:ada", recipient: "agent:ada", text: "Lot question", ts: stamp },
+      { id: "p0", author: "human:ada", recipient: "agent:ada", text: "Repeated question", ts: stamp - 5 },
+    ] }],
+  });
+  const el = await mount(client, { agent: "ada", lot: "7" });
+  const body = text(el);
+  assert.match(body, /Project answer/);
+  assert.ok(body.indexOf("Project question") < body.indexOf("Lot question"));
+  assert.ok(body.indexOf("Lot question") < body.indexOf("Project answer"));
+  assert.equal(body.split("Repeated question").length - 1, 1);
+  // the agent answered last: nothing waits, even with the lot selected
+  assert.doesNotMatch(body, /Waiting for the next turn/);
+  assert.ok(fetch.calls.some((c) => c.path === "/api/v1/threads/ameesh"));
+  assert.ok(fetch.calls.some((c) => c.path === "/api/v1/threads/ameesh/7"));
+  assert.deepEqual(await violations(), []);
+});
+
 test("a message is sent once to the shared conversation, then waits for the next turn", async () => {
   const { client, fetch } = fixture();
   const keys = [];
