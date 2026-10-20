@@ -285,8 +285,13 @@ class CollectionTest(unittest.TestCase):
         text = watch.digest(SUB, [event], [dict(id=42, state="build", assignee="author",
                                                 issue_ref="acme/app#1")])
         for part in ("#42 (build, author)", "acme/app#1", "ameesh decide ask",
-                     "untrusted external data", "lot note and wake", event["url"]):
+                     "untrusted external data", "information → lot note and wake its author",
+                     event["url"]):
             self.assertIn(part, text)
+        self.assertNotIn("wake its assignee", text)
+        instruction = watch.instruction(SUB, event, [])
+        self.assertIn("information → lot note and wake its author", instruction)
+        self.assertNotIn("wake its assignee", instruction)
 
     def test_digest_is_bounded_and_every_entry_keeps_its_link(self):
         events = watch.collect(Api([issue(n) for n in range(1, 4)]), SUB, NOW)
