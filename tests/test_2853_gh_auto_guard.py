@@ -41,7 +41,10 @@ if args[:2] == ["repo", "view"]:
     print(os.environ.get("FAKE_REPO", "acme/private"))
     sys.exit(0)
 if args[:1] == ["api"]:
-    path = args[1]
+    rest = args[1:]
+    if rest[:1] == ["--hostname"]:
+        rest = rest[2:]
+    path = rest[0]
     if path.endswith("/protection"):
         sys.stderr.write(os.environ.get("FAKE_PROT_ERR", ""))
         print(os.environ.get("FAKE_PROT", "{}"))
@@ -104,7 +107,7 @@ class RefusTest(Base):
         # la commande d'origine n'a jamais rejoint le vrai gh
         self.assertEqual(self.appels(), [
             "pr view 12 --repo acme/private --json baseRefName,url",
-            "api repos/acme/private"])
+            "api --hostname github.com repos/acme/private"])
 
     def test_sans_protection_le_merge_est_refuse(self):
         sortie = self.lancer(
@@ -113,7 +116,8 @@ class RefusTest(Base):
                              FAKE_PROT_ERR="Upgrade to GitHub Pro"))
         self.assertEqual(sortie.returncode, 1, sortie.stderr)
         self.assertIn("sans protection lisible", sortie.stderr)
-        self.assertEqual(self.appels()[1], "api repos/acme/private")
+        self.assertEqual(self.appels()[1],
+                         "api --hostname github.com repos/acme/private")
         self.assertIn("branches/develop/protection", self.appels()[-1])
 
     def test_protection_sans_check_requis_refuse(self):
@@ -141,11 +145,48 @@ class RefusTest(Base):
         self.assertEqual(sortie.returncode, 1, sortie.stderr)
         self.assertIn("PR illisible", sortie.stderr)
 
-    def test_base_illisible_refuse(self):
+    def test_url_illisible_refuse(self):
         sortie = self.lancer("pr", "merge", "12", "--auto", "-R", "acme/private",
                              **self.info_repo(FAKE_VIEW="{}"))
         self.assertEqual(sortie.returncode, 1, sortie.stderr)
+        self.assertIn("URL de la PR illisible", sortie.stderr)
+
+    def test_base_illisible_refuse(self):
+        sortie = self.lancer(
+            "pr", "merge", "12", "--auto", "-R", "acme/private",
+            **self.info_repo(FAKE_VIEW=json.dumps(
+                {"url": "https://github.com/acme/private/pull/12",
+                 "baseRefName": ""})))
+        self.assertEqual(sortie.returncode, 1, sortie.stderr)
         self.assertIn("base illisible", sortie.stderr)
+
+    def test_admin_egal_true_refuse_sans_lire(self):
+        sortie = self.lancer(
+            "pr", "merge", "12", "--auto", "--admin=true", "-R", "acme/private",
+            **self.info_repo(FAKE_PROT=json.dumps(
+                {"required_status_checks": {"contexts": ["tests"]}})))
+        self.assertEqual(sortie.returncode, 1, sortie.stderr)
+        self.assertIn("--admin", sortie.stderr)
+        self.assertEqual(self.appels(), [])
+
+    def test_url_pr_et_repo_different_refuse(self):
+        url = "https://github.com/manaty/nexlink/pull/1849"
+        sortie = self.lancer(
+            "pr", "merge", url, "--auto", "--repo", "acme/private",
+            **self.info_repo(FAKE_VIEW=json.dumps(
+                {"url": url, "baseRefName": "develop"})))
+        self.assertEqual(sortie.returncode, 1, sortie.stderr)
+        self.assertIn("ne désigne pas la PR résolue", sortie.stderr)
+        self.assertEqual(len(self.appels()), 1)  # la PR, aucun appel API
+
+    def test_url_pr_et_hote_different_refuse(self):
+        url = "https://github.example.com/acme/private/pull/12"
+        sortie = self.lancer(
+            "pr", "merge", url, "--auto", "--repo", "github.com/acme/private",
+            **self.info_repo(FAKE_VIEW=json.dumps(
+                {"url": url, "baseRefName": "develop"})))
+        self.assertEqual(sortie.returncode, 1, sortie.stderr)
+        self.assertIn("ne désigne pas la PR résolue", sortie.stderr)
 
     def test_admin_avec_auto_refuse_sans_lire(self):
         sortie = self.lancer("pr", "merge", "12", "--auto", "--admin",
@@ -196,7 +237,65 @@ class AutorisationTest(Base):
         self.assertEqual(sortie.returncode, 1, sortie.stderr)
         self.assertIn("allow_auto_merge=false", sortie.stderr)
         self.assertTrue(self.appels()[0].startswith("pr view"))
-        self.assertEqual(self.appels()[1], "api repos/acme/private")
+        self.assertEqual(self.appels()[1],
+                         "api --hostname github.com repos/acme/private")
+
+    def test_admin_egal_false_autorise(self):
+        sortie = self.lancer(
+            "pr", "merge", "12", "--auto", "--admin=false", "-R", "acme/private",
+            **self.info_repo(FAKE_PROT=json.dumps(
+                {"required_status_checks": {"contexts": ["tests"]}})))
+        self.assertEqual(sortie.returncode, 3, sortie.stderr)
+        self.assertEqual(
+            self.appels()[-1], "pr merge 12 --auto --admin=false -R acme/private")
+
+    def test_admin_valeur_du_corps_ne_refuse_pas(self):
+        sortie = self.lancer(
+            "pr", "merge", "12", "--auto", "--body", "--admin=true",
+            "-R", "acme/private",
+            **self.info_repo(FAKE_PROT=json.dumps(
+                {"required_status_checks": {"contexts": ["tests"]}})))
+        self.assertEqual(sortie.returncode, 3, sortie.stderr)
+        self.assertEqual(
+            self.appels()[-1],
+            "pr merge 12 --auto --body --admin=true -R acme/private")
+
+    def test_auto_egal_false_n_est_pas_auto(self):
+        sortie = self.lancer("pr", "merge", "12", "--auto=false")
+        self.assertEqual(sortie.returncode, 3, sortie.stderr)
+        self.assertEqual(self.appels(), ["pr merge 12 --auto=false"])
+
+    def test_url_pr_et_repo_identique_autorise(self):
+        url = "https://github.com/acme/private/pull/12"
+        sortie = self.lancer(
+            "pr", "merge", url, "--auto", "--repo", "acme/private",
+            **self.info_repo(FAKE_PROT=json.dumps(
+                {"required_status_checks": {"contexts": ["tests"]}})))
+        self.assertEqual(sortie.returncode, 3, sortie.stderr)
+        self.assertEqual(
+            self.appels()[-1], "pr merge %s --auto --repo acme/private" % url)
+
+    def test_repo_avec_hote_identique_autorise(self):
+        sortie = self.lancer(
+            "pr", "merge", "12", "--auto", "--repo", "github.com/acme/private",
+            **self.info_repo(FAKE_PROT=json.dumps(
+                {"required_status_checks": {"contexts": ["tests"]}})))
+        self.assertEqual(sortie.returncode, 3, sortie.stderr)
+        self.assertEqual(
+            self.appels()[-1],
+            "pr merge 12 --auto --repo github.com/acme/private")
+
+    def test_api_utilise_l_hote_de_la_pr(self):
+        url = "https://github.example.com/acme/private/pull/12"
+        sortie = self.lancer(
+            "pr", "merge", url, "--auto",
+            **self.info_repo(
+                FAKE_VIEW=json.dumps({"url": url, "baseRefName": "develop"}),
+                FAKE_PROT=json.dumps(
+                    {"required_status_checks": {"contexts": ["tests"]}})))
+        self.assertEqual(sortie.returncode, 3, sortie.stderr)
+        self.assertIn("api --hostname github.example.com repos/acme/private",
+                      self.appels())
 
     def test_merge_sans_auto_n_est_pas_filtre(self):
         sortie = self.lancer("pr", "merge", "12", "--squash")
@@ -215,7 +314,8 @@ class AutorisationTest(Base):
                 sortie = self.lancer("pr", "merge", "12", "--auto", option)
                 self.assertEqual(sortie.returncode, 1, sortie.stderr)
                 self.assertIn("acme/private", sortie.stderr)
-                self.assertEqual(self.appels()[-1], "api repos/acme/private")
+                self.assertEqual(self.appels()[-1],
+                                 "api --hostname github.com repos/acme/private")
 
 
 if __name__ == "__main__":

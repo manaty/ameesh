@@ -276,21 +276,71 @@ def _real(real, args, timeout=30):
         return subprocess.CompletedProcess([real] + args, 1, "", str(exc))
 
 
-def _slug_from_url(url):
-    """`owner/repo` d'une URL de PR GitHub, ou ""."""
-    parts = str(url or "").rstrip("/").split("/")
-    if len(parts) >= 5 and parts[-2] == "pull":
-        return parts[-4] + "/" + parts[-3]
-    return ""
+def _bool_opt(argv, name):
+    """Valeur booléenne d'une option (`--x`, `--x=true`, `--x=false`), ou
+    False. Les valeurs des options à valeur sont sautées : `--body --x` est
+    un corps, pas l'option. Un `--` termine les options. Une valeur non
+    reconnue vaut True : le doute refuse."""
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            break
+        if a.startswith("-") and a != "-":
+            if a in _MERGE_VALEUR:
+                i += 2
+                continue
+            if a == name:
+                return True
+            if a.startswith(name + "="):
+                v = a.partition("=")[2].strip().lower()
+                return v not in ("false", "0", "f", "no", "n")
+            i += 1
+            continue
+        i += 1
+    return False
+
+
+def _identity_of_url(url):
+    """(hôte, owner, repo) d'une URL de PR, ou None."""
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(str(url or ""))
+    except ValueError:
+        return None
+    if not parts.netloc:
+        return None
+    pieces = [p for p in parts.path.split("/") if p]
+    if len(pieces) < 4 or pieces[2] != "pull":
+        return None
+    return (parts.netloc.lower(), pieces[0], pieces[1])
+
+
+def _identity_of_repo(repo, host):
+    """(hôte, owner, repo) de l'option `--repo`, l'hôte par défaut étant celui
+    de la PR ; None si la valeur n'est pas `[HOST/]OWNER/REPO`."""
+    value = str(repo or "").strip().strip("/")
+    if not value or "://" in value:
+        return None
+    pieces = value.split("/")
+    if len(pieces) == 2:
+        return (host, pieces[0], pieces[1])
+    if len(pieces) == 3:
+        return (pieces[0].lower(), pieces[1], pieces[2])
+    return None
+
+
+def _same_identity(a, b):
+    return tuple(str(p).lower() for p in a) == tuple(str(p).lower() for p in b)
 
 
 def auto_refusal(real, argv):
     """None si `gh pr merge --auto` peut attendre le vert, sinon le refus."""
-    auto = any(a == "--auto" or a.startswith("--auto=") for a in argv)
+    auto = _bool_opt(argv, "--auto")
     found = _merge_argv(argv)
     if found is None or not auto:
         return None
-    if "--admin" in argv:
+    if _bool_opt(argv, "--admin"):
         return ("--admin contourne la protection : l'auto-merge ne garantit "
                 "pas d'attendre le vert")
     pr, repo = found
@@ -307,13 +357,20 @@ def auto_refusal(real, argv):
         return "PR illisible (JSON)"
     if not isinstance(row, dict):
         return "PR illisible (JSON)"
+    identity = _identity_of_url(row.get("url"))
+    if identity is None:
+        return ("URL de la PR illisible : impossible de prouver le dépôt que "
+                "l'auto-merge attendra")
+    host, owner, name = identity
+    given = _identity_of_repo(repo, host)
+    if repo and (given is None or not _same_identity(given, identity)):
+        return ("l'option --repo %r ne désigne pas la PR résolue (%s/%s/%s) : "
+                "refus de contrôler un autre dépôt" % (repo, host, owner, name))
     base = str(row.get("baseRefName") or "")
-    slug = repo.strip() or _slug_from_url(row.get("url"))
-    if not slug:
-        return "dépôt illisible : impossible de prouver que l'auto-merge attendra la CI"
     if not base:
         return "branche de base illisible : impossible de prouver la protection"
-    info = _real(real, ["api", "repos/%s" % slug])
+    slug = "%s/%s" % (owner, name)
+    info = _real(real, ["api", "--hostname", host, "repos/%s" % slug])
     if info.returncode != 0:
         return ("réglages du dépôt illisibles (%s)"
                 % ((info.stderr or info.stdout or "").strip()[:160] or "gh api"))
@@ -325,7 +382,8 @@ def auto_refusal(real, argv):
         return ("auto-merge GitHub désactivé sur %s (allow_auto_merge=false) : "
                 "GitHub fusionne immédiatement au lieu d'attendre le vert" % slug)
     from urllib.parse import quote
-    prot = _real(real, ["api", "repos/%s/branches/%s/protection"
+    prot = _real(real, ["api", "--hostname", host,
+                        "repos/%s/branches/%s/protection"
                         % (slug, quote(base, safe=""))])
     if prot.returncode != 0:
         return ("branche %s sans protection lisible (%s) : l'auto-merge ne "
