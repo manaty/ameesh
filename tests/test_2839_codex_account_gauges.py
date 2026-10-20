@@ -40,13 +40,12 @@ class CodexReadingsTest(Sandbox, unittest.TestCase):
         agent = self.agent("default-codex", "codex")
         book = self.book()
         journal(self.codex, "team", event(self.now, short=5, week=10))
-        for variant in ("plan", "identity", "reset"):
+        for variant in ("plan", "identity"):
             with self.subTest(variant=variant):
                 path = journal(
                     self.codex, "conflict", event(
                         self.now, short=5, week=10,
-                        plan="pro" if variant == "plan" else "team",
-                        reset_shift=743 if variant == "reset" else 0),
+                        plan="pro" if variant == "plan" else "team"),
                     identity="other-private-account" if variant == "identity" else "account-a")
                 gauges = book.gauges("codex")
                 self.assertEqual(gauges, [])
@@ -56,6 +55,10 @@ class CodexReadingsTest(Sandbox, unittest.TestCase):
                 self.assertIn("ambiguous Codex account", reason)
                 self.assertNotIn("other-private-account", reason)
                 self.assertEqual(book.over(agent, pace=True), reason)
+                self.assertEqual(book.over(agent, pace=False), reason)
+                worker = mock.Mock(cfg=mock.Mock(accounts={}), agent={"harness": "codex"},
+                                   name=agent)
+                self.assertEqual(account_turn.choose(worker, book, pause=False), reason)
                 self.assertIn("codex", book.gauges().errors)
                 os.unlink(path)
                 self.assertEqual(book.pace_exceeded("codex"), "")
@@ -178,11 +181,52 @@ class CodexReadingsTest(Sandbox, unittest.TestCase):
             self.book().codex_gauges()
         self.assertNotIn("private-account-b", str(ctx.exception))
 
-    def test_contradictory_weekly_resets_refused(self):
-        journal(self.codex, "a", event(self.now))
-        journal(self.codex, "b", event(self.now, reset_shift=743))
-        with self.assertRaisesRegex(AmbiguousCodexGauges, "resets"):
+    def test_latest_weekly_observation_wins_despite_reset_jitter_or_early_reset(self):
+        for shift in (1, 743, 3 * 86400):
+            with self.subTest(shift=shift):
+                old = event(self.now - 100, week=90)
+                old["payload"]["rate_limits"]["secondary"]["resets_at"] = self.now + 86400
+                journal(self.codex, "old-%s" % shift, old, mtime=self.now + 100)
+                journal(self.codex, "new-%s" % shift,
+                        event(self.now, short=None, week=49, reset_shift=shift),
+                        mtime=self.now)
+                gauges = self.book().codex_gauges()
+                week = next(g for g in gauges if g.key == "codex-10080min")
+                self.assertEqual(week.used, 0.49)
+                self.assertEqual(week.resets_at, self.now + 86400 + shift)
+                self.assertTrue(gauges.in_overage(self.now))
+                for name in ("old", "new"):
+                    os.unlink(os.path.join(self.codex, "%s-%s.jsonl" % (name, shift)))
+
+    def test_sample_caps_file_reads_and_reconciles_only_once(self):
+        for i in range(codex_gauges.MAX_FILES + 7):
+            journal(self.codex, str(i), event(self.now), mtime=self.now + i)
+        with mock.patch.object(codex_gauges, "session_reading",
+                               wraps=codex_gauges.session_reading) as read, \
+                mock.patch.object(codex_gauges, "reconcile",
+                                  wraps=codex_gauges.reconcile) as reconcile:
+            self.assertTrue(self.book().codex_gauges().in_overage(self.now))
+        self.assertEqual(read.call_count, codex_gauges.MAX_FILES)
+        self.assertEqual(reconcile.call_count, 1)
+
+    def test_bounded_sample_cannot_hide_short_window_behind_many_partial_files(self):
+        journal(self.codex, "full", event(self.now), mtime=self.now)
+        for i in range(codex_gauges.MAX_FILES):
+            journal(self.codex, str(i), event(self.now, short=None), mtime=self.now + i + 1)
+        with self.assertRaisesRegex(AmbiguousCodexGauges, "incomplete.*short window"):
             self.book().codex_gauges()
+
+    def test_truncated_tail_cannot_hide_short_window_in_same_file(self):
+        journal(self.codex, "long", event(self.now),
+                {"text": "x" * (codex_gauges.TAIL_BYTES + 100)},
+                event(self.now, short=None))
+        with self.assertRaisesRegex(AmbiguousCodexGauges, "incomplete.*short window"):
+            self.book().codex_gauges()
+
+    def test_bounded_weekly_only_pro_reading_remains_usable(self):
+        for i in range(codex_gauges.MAX_FILES + 1):
+            journal(self.codex, str(i), event(self.now, short=None, plan="pro"))
+        self.assertEqual(len(self.book().codex_gauges()), 1)
 
     def test_expired_other_plan_does_not_hold_account_forever(self):
         journal(self.codex, "old", event(self.now - 8 * 86400, plan="pro"))
@@ -197,6 +241,41 @@ class CodexReadingsTest(Sandbox, unittest.TestCase):
 
 
 class CodexFailoverTest(_Base):
+    def test_runner_with_budget_off_refuses_undeclared_ambiguous_account(self):
+        now = float(int(time.time()))
+        root = os.path.join(self.tmp, "default-sessions")
+        journal(root, "team", event(now, short=95))
+        conflict = journal(root, "pro", event(now, short=None, plan="pro"))
+        runner, worker = self._worker("default-codex", "codex", {})
+        book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db,
+                             codex_sessions=root, tools={worker.name: "codex"})
+        try:
+            with mock.patch.object(runner, "budget_limits", return_value=mock.Mock(per_hour=0)), \
+                    mock.patch("ameesh.account_turn.cost_mod.CostBook", return_value=book):
+                self.assertFalse(worker.budget_ok())
+                self.assertIn("ambiguous Codex account", worker._budget_reason)
+                os.unlink(conflict)
+                # 95% is still above the pace cap, but pace is disabled.
+                self.assertTrue(worker.budget_ok())
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_declared_healthy_account_does_not_read_ambiguous_default(self):
+        now = float(int(time.time()))
+        declared = self._codex_comptes()
+        for profile in declared:
+            journal(os.path.join(profile["path"], "sessions"), "healthy",
+                    event(now, short=1, week=1))
+        runner, worker = self._worker("declared-codex", "codex", {"codex": declared})
+        book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db,
+                             tools={worker.name: "codex"})
+        try:
+            with mock.patch.object(book, "default_account_error",
+                                   side_effect=AssertionError("default must not be read")):
+                self.assertEqual(worker._own_reason(book, margin=False), "")
+        finally:
+            worker.watchdog_stop.set()
+
     def test_weekly_only_reading_after_short_reset_releases_account(self):
         observed = float(int(time.time()))
         now = observed

@@ -1068,30 +1068,19 @@ class CostBook:
         (`<CODEX_HOME>/sessions`) ; par défaut celui de la machine.
         """
         racine = sessions if sessions is not None else self.codex_sessions
-        files = sorted(
-            glob.glob(os.path.join(racine, "**", "*.jsonl"), recursive=True),
-            key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
-        )
-        # #2839 : five newer partial sessions must not evict a still-live
-        # short window. Scan the last plan window; keep the historical sample
-        # as well for the existing expired-reading display. Parsed readings
-        # are cached by file identity/size/mtime/ctime, never raw transcripts.
+        from .codex_gauges import recent_files, reconcile, session_reading
+
+        files, truncated = recent_files(racine)
         now = self.clock()
-        recent = set(files[-CODEX_FILES:])
-        from .codex_gauges import reconcile, session_reading
         readings = []
-        for path in reversed(files):
+        for read_at, path in files:
             try:
-                read_at = os.path.getmtime(path)
-                if path not in recent and read_at < now - KNOWN_WINDOWS["seven_day"]:
-                    continue
-                readings.extend(session_reading(path, read_at))
+                sample = session_reading(path, read_at)
+                readings.extend(sample)
+                truncated = truncated or sample.truncated
             except OSError:
                 continue
-            # Refuse as soon as a contradiction is proven, without scanning
-            # the remainder of a busy account's history.
-            reconcile(readings, now)
-        return reconcile(readings, now)
+        return reconcile(readings, now, truncated=truncated)
 
     def gauges(self, harness: str | None = None, *, record: bool = True) -> Gauges:
         """Les jauges de forfait, par **source déclarée** dans les descripteurs (L16).
@@ -1172,9 +1161,10 @@ class CostBook:
         """
         now = self.clock()
         gauges = self.gauges(harness)
-        if gauges.errors:
+        errors = getattr(gauges, "errors", {})
+        if errors:
             return "pause (account %s): %s" % (
-                DEFAULT_ACCOUNT_LABEL, gauges.errors[harness])
+                DEFAULT_ACCOUNT_LABEL, "; ".join(errors.values()))
         held = [gauge for gauge in gauges if gauge.exceeded(now, reserve)]
         if not held:
             return ""
@@ -1202,6 +1192,14 @@ class CostBook:
                            gauge.held_cap(now, reserve) * 100,
                            ", %.0f points kept for critical agents" % (reserve * 100)
                            if reserve else ""))
+
+    def default_account_error(self, harness: str) -> str:
+        """Hard refusal of a default reading, independent of the pace guard."""
+        if gauges_source(harness) != "sessions":
+            return ""
+        errors = getattr(self.gauges(harness, record=False), "errors", {})
+        return ("pause (account %s): %s" % (
+            DEFAULT_ACCOUNT_LABEL, "; ".join(errors.values()))) if errors else ""
 
     # -- comptabilité par tour ---------------------------------------------
     def baseline(self, agent: str, harness: str, session: str | None = None) -> dict:
@@ -1893,7 +1891,8 @@ class CostBook:
 
     def over(self, agent: str = "all", *,
              paid_harnesses: Sequence[str] | None = None, pace: bool = True,
-             reserve: float = 0.0, hourly_share: float = 1.0) -> str:
+             reserve: float = 0.0, hourly_share: float = 1.0,
+             account_checked: bool = False) -> str:
         """Le garde-fou : raison si l'agent (ou le compte) doit s'arrêter, sinon ''.
 
         Le plafond horaire ne somme que l'usage payé au token
@@ -1907,7 +1906,8 @@ class CostBook:
 
         `pace=False` (L30) : le rythme est jugé compte par compte par
         `ameesh.accounts`, qui bascule au lieu de mettre en pause ; seul le
-        plafond horaire reste ici.
+        plafond horaire reste ici si `account_checked=True`. Sans compte
+        déjà évalué, un relevé ambigu reste interdit même sans rythme.
 
         L70 : même règle pour le plafond par jour glissant du mesh
         (`daily_usd`) et pour les plafonds propres à l'agent
@@ -1918,7 +1918,10 @@ class CostBook:
         (`paid_spent`), l'estimation ne servant qu'entre deux relevés.
         """
         harness = self.tool_of(agent) if agent != "all" else ""
-        reason = self.pace_exceeded(harness, reserve) if (harness and pace) else ""
+        reason = ""
+        if harness:
+            reason = (self.pace_exceeded(harness, reserve) if pace else
+                      "" if account_checked else self.default_account_error(harness))
         if reason:
             return reason
         paid = paid_harnesses_of() if paid_harnesses is None else tuple(paid_harnesses)
@@ -2526,7 +2529,7 @@ def _read_tail(path: str, limit: int = TAIL_BYTES) -> str:
         with open(path, "rb") as fh:
             if size > limit:
                 fh.seek(size - limit)
-            return fh.read().decode("utf-8", "ignore")
+            return fh.read(limit).decode("utf-8", "ignore")
     except OSError:
         return ""
 

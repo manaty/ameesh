@@ -6,6 +6,7 @@ import json
 import os
 import time
 import threading
+import heapq
 from collections import OrderedDict
 from datetime import datetime
 
@@ -23,6 +24,34 @@ def _timestamp(event, fallback):
 
 _READINGS = OrderedDict()
 _CACHE_LOCK = threading.Lock()
+MAX_FILES = 32
+TAIL_BYTES = 256 * 1024
+META_BYTES = 64 * 1024
+
+
+class SessionReadings(list):
+    """A bounded parse, including whether its prefix was omitted."""
+
+    def __init__(self, items, *, truncated):
+        super().__init__(items)
+        self.truncated = truncated
+
+
+def recent_files(root):
+    """Stat once per journal, retain only the newest bounded sample."""
+    def candidates():
+        for directory, _dirs, names in os.walk(root):
+            for name in names:
+                if not name.endswith(".jsonl"):
+                    continue
+                path = os.path.join(directory, name)
+                try:
+                    yield os.stat(path).st_mtime, path
+                except OSError:
+                    continue
+
+    selected = heapq.nlargest(MAX_FILES + 1, candidates())
+    return selected[:MAX_FILES], len(selected) > MAX_FILES
 
 
 def session_reading(path, read_at):
@@ -57,13 +86,13 @@ def _session_reading(path, read_at):
     identity = None
     try:
         with open(path, "rb") as stream:
-            first = json.loads(stream.readline(1_000_000))
+            first = json.loads(stream.readline(META_BYTES))
         if first.get("type") == "session_meta":
             identity = first.get("payload", {}).get("creator_account_id")
     except (OSError, ValueError, AttributeError):
         pass
     windows = {}
-    for line in _read_tail(path, 2_000_000).splitlines():
+    for line in _read_tail(path, TAIL_BYTES).splitlines():
         if '"rate_limits"' not in line:
             continue
         try:
@@ -86,11 +115,11 @@ def _session_reading(path, read_at):
             previous = windows.get(gauge.key)
             if previous is None or (stamp or 0) >= (previous[0].read_at or 0):
                 windows[gauge.key] = (gauge, limits, identity)
-    return list(windows.values())
+    return SessionReadings(windows.values(), truncated=os.path.getsize(path) > TAIL_BYTES)
 
 
-def reconcile(readings, now):
-    """Keep every window, reject conflicting live identities/plans/resets.
+def reconcile(readings, now, *, truncated=False):
+    """Keep the newest observation per window; reject mixed identities/plans.
 
     Session metadata names the creator, not necessarily the account used by
     a resumed session. It cannot by itself certify a later rate-limit event.
@@ -106,15 +135,21 @@ def reconcile(readings, now):
     windows = {}
     for gauge, limits, _identity in readings:
         previous = windows.get(gauge.key)
-        if previous is not None:
-            old = previous[0]
-            if (not old.reset_passed(now) and not gauge.reset_passed(now)
-                    and old.resets_at and gauge.resets_at
-                    and old.resets_at != gauge.resets_at
-                    and abs(old.resets_at - gauge.resets_at) < gauge.window_s):
-                raise AmbiguousCodexGauges("ambiguous Codex account: conflicting live window resets")
         if previous is None or (gauge.read_at or 0) > (previous[0].read_at or 0):
             windows[gauge.key] = (gauge, limits)
+    # A long sequence of partial team readings must not evict a saturated
+    # short window beyond our I/O budget. Pro legitimately has a week only.
+    if truncated:
+        missing = []
+        if plans != {"pro"} and not any(
+                g.window_s <= 5 * 3600 for g, _limits in windows.values()):
+            missing.append("short window")
+        if not any(g.window_s > 5 * 3600 for g, _limits in windows.values()):
+            missing.append("weekly window")
+        if missing:
+            raise AmbiguousCodexGauges(
+                "incomplete Codex account reading: %s absent from bounded session sample"
+                % ", ".join(missing))
     if not windows:
         return []
     gauges = [r[0] for r in windows.values()]

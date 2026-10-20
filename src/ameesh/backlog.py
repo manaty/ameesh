@@ -753,7 +753,8 @@ def _default_budget_check(cfg, db):
     from . import cost as cost_mod
     limits = budget_mod.current(cfg, db)
     book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db, **limits.book_kwargs())
-    return lambda agent: book.over(agent, pace=False)
+    return lambda agent: book.over(
+        agent, pace=False, account_checked=bool(cfg.accounts.get(book.tool_of(agent))))
 
 
 def lot_take_message(item: dict, orchestras: list) -> str:

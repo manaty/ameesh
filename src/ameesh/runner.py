@@ -3560,7 +3560,8 @@ class AgentWorker(threading.Thread):
         if raison is None:
             return book.over(self.name, reserve=accounts_mod.RESERVE if margin else 0.0,
                              hourly_share=part)
-        return raison or book.over(self.name, pace=False, hourly_share=part)
+        return raison or book.over(self.name, pace=False, hourly_share=part,
+                                   account_checked=True)
 
     def _critical_fallback(self, raison: str, limites) -> str:
         """L242b (3) : la pause budget d'un agent critique cède à un autre
