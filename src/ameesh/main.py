@@ -98,7 +98,8 @@
   ameesh memory status|consolidate|close <persona>   neutral persona memory (L54);
   ameesh migrate              apply schema migrations;
   ameesh models list|show|discover      model catalog and discovery;
-  ameesh module <name> …              installed project module commands;
+  ameesh module <name> …              installed project module commands, --list
+                                      for installation evidence;
   ameesh notify [--once] [--dry-run] [--interval S] [--json] | --test human:ID
         alerts PUSHED to the responsible human (desktop, ntfy, Slack;
         `notify` key of the host configuration; L38);
