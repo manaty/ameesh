@@ -1408,6 +1408,7 @@ class AgentWorker(threading.Thread):
             return False
         log("[%s] placed on host %s, not %s, before the work turn: no turn here, "
             "lease released" % (self.name, ailleurs, self.runner.host))
+        self._wake_claim = None  # #2614 : aucun tour ne portera ce claim
         return True
 
     def placed_elsewhere(self) -> str:
@@ -2254,6 +2255,14 @@ class AgentWorker(threading.Thread):
             return spec
         self._open_lot_session(lot)
         return spec
+
+    def _rotate_for_lot_safe(self, spec: dict | None) -> dict | None:
+        """#2614 : une rotation qui échoue abandonne le claim du réveil."""
+        try:
+            return self.rotate_for_lot(spec)
+        except Exception:
+            self._wake_claim = None
+            raise
 
     #: états d'un lot FINI (#794) : sa session se ferme, comme la purge le
     #: faisait — fusionné, livré (`promoted`) ou fermé.
@@ -4219,8 +4228,13 @@ class AgentWorker(threading.Thread):
 
         Le tour porte son lot (`lot`, L26) quand il est déductible."""
         if self._attach_pending():
+            self._wake_claim = None
             return None
         spec = self._pick()
+        if spec is None or not spec.get("scheduled_wake"):
+            # #2614 : aucun réveil programmé ne part avec ce choix — un claim
+            # resté d'un choix abandonné ne doit pas être renouvelé ensuite.
+            self._wake_claim = None
         if spec is not None:
             # #408 : le réveil sur un lot actionnable porte déjà son lot
             spec["lot"] = spec.get("lot") or self.turn_lot(spec)
@@ -4230,6 +4244,7 @@ class AgentWorker(threading.Thread):
                 if spec.get("kind") == "prompt":
                     registry.restore_prompt(self.db, self.name, self.runner.runner_id,
                                             self.epoch)
+                self._wake_claim = None
                 return None
         return spec
 
@@ -6962,7 +6977,7 @@ class AgentWorker(threading.Thread):
                 continue
             self.apply_restart_if_requested()
             self.maybe_rotate()
-            spec = self.rotate_for_lot(self.pick())
+            spec = self._rotate_for_lot_safe(self.pick())
             if spec:
                 # #283 r2 : la même garde que `run()` — une rotation a pu
                 # déplacer l'agent ; la consigne reste alors en attente
@@ -7021,10 +7036,11 @@ class AgentWorker(threading.Thread):
                     if attente_reprise > 0:
                         self._attendre_reprise(attente_reprise)
                         continue
-                    spec = self.rotate_for_lot(self.pick())
+                    spec = self._rotate_for_lot_safe(self.pick())
                     if spec is not None and self._moved_before_turn(spec):
                         break
                 except db_mod.Unavailable as exc:
+                    self._wake_claim = None  # #2614 : choix abandonné
                     self._panne_de_base(exc, "choosing the turn")
                     continue
                 self._base_retablie()
