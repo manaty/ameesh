@@ -516,7 +516,15 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                              "proven" % (frozen[:12], cls))
             return out
         if vehicle.get("klass"):
-            klass = vehicle["klass"]
+            # #2766 (B cx3) : la classe du delta propre vient de
+            # `class_of_paths` et ne porte ni `base_sha` ni `target`. La base
+            # de provenance reste celle de la plage gelée du lot : sans elle,
+            # `_corrections_on_freeze` rend None et le correcteur d'un petit
+            # correctif compterait sur son propre delta (#2739).
+            outer = klass or {}
+            provenance = {key: outer[key] for key in ("base_sha", "target")
+                          if outer.get(key)}
+            klass = dict(vehicle["klass"], **provenance)
             cls = str(klass.get("class") or cls)
             if klass.get("doubt"):
                 cls = lot_class.SENSITIVE
