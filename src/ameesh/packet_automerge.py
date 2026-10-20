@@ -32,9 +32,17 @@ effectif, et aucune auto-fusion GitHub n'est laissée armée.
   (`ameesh work fire <porteur> --sha <tête>`), que le message rappelle.
 * **Le passage** (`watch`, `ameesh release tick` des projets de
   `packet_watch`, toutes les cinq minutes) relit chaque porteur ouvert armé :
-  tête ou cible changée depuis la publication → désarmé (journal, et
-  auto-fusion GitHub éventuelle retirée) ; checks requis verts sur la tête
-  publiée → fusionné. La vitesse du passage ne fait que la latence de la
+  tête, cible ou gel changé depuis la publication → désarmé (journal, et
+  auto-fusion GitHub éventuelle retirée). Sinon la fusion passe les mêmes
+  portes que le feu (R1, ameesh-cx3) : `fire.ready_verdicts` (classe, avis
+  requis et indépendants sur la tête gelée, membres d'un porteur et delta,
+  #2766), puis au moins un check imposé par la forge — et tous ceux épinglés
+  à la publication — `SUCCESS` sur la tête exacte (`fire.ready_pr`). La PR
+  est relue juste avant le geste (tête, cible, état) ; `--match-head-commit`
+  lie la tête au geste, mais aucune API de fusion GitHub ne lie la cible :
+  la fusion est relue après coup, et une cible qui a changé dans cette
+  fenêtre est journalisée en incident et réveille l'assigné (R2, ameesh-cx2 ;
+  même fenêtre résiduelle que la garde 9 de `merge_pr`). La vitesse du passage ne fait que la latence de la
   fusion, jamais sa sûreté : une autre tête ou une autre cible ne fusionne
   jamais par ce chemin.
 
@@ -50,6 +58,7 @@ import os
 import re
 import socket
 import subprocess
+from urllib.parse import quote, unquote
 
 from . import fire, land, storage, work
 
@@ -66,7 +75,8 @@ LOCK_TTL_S = 300.0
 MARK_RE = re.compile(
     r"^auto-merge (?P<state>armed|disarmed|merged|not-armed) "
     r"repo=(?P<repo>[\w.-]+/[\w.-]+) pr=(?P<pr>\d+) sha=(?P<sha>[0-9a-f]{40})"
-    r"(?: base=(?P<base>[\w./-]+))?(?:\s|$)")
+    r"(?: base=(?P<base>[\w./-]+))?(?: method=[a-z]+)?(?: required=(?P<required>\S+))?"
+    r"(?:\s|$)")
 #: marques qui referment un armement de la même PR
 CLOSING = ("disarmed", "merged")
 _SHA = re.compile(r"[0-9a-f]{40}")
@@ -99,20 +109,23 @@ def marks(db, lot: int, *, limit: int = 200) -> list[dict]:
         if m:
             out.append({"id": int(ev.get("id") or 0), "state": m.group("state"),
                         "repo": m.group("repo"), "pr": int(m.group("pr")),
-                        "sha": m.group("sha"), "base": m.group("base") or ""})
+                        "sha": m.group("sha"), "base": m.group("base") or "",
+                        "required": tuple(unquote(name) for name in
+                                          (m.group("required") or "").split(",") if name)})
     return sorted(out, key=lambda m: m["id"])
 
 
 def active(rows) -> dict | None:
     """Le dernier armement qu'aucun désarmement ni fusion n'a suivi, ou None.
 
-    Un armement sans cible ne compte pas (B2 : la cible est épinglée). Un
+    Un armement sans cible ni checks requis ne compte pas (la cible et les
+    checks imposés à la publication sont épinglés, relectures R0/R1). Un
     `not-armed` ne l'efface pas : une republication refusée laisse l'armement
     précédent sous la garde du passage."""
     current = None
     for row in rows or ():
         if row["state"] == "armed":
-            current = row if row["base"] else None
+            current = row if row["base"] and row["required"] else None
         elif row["state"] in CLOSING and current is not None \
                 and current["pr"] == row["pr"] and current["repo"] == row["repo"]:
             current = None
@@ -200,7 +213,7 @@ def pr_status(slug: str, number: int, *, gh) -> dict:
 # publication
 # --------------------------------------------------------------------------
 
-def arm(db, lot: int, *, slug: str, number: int, sha: str, target: str, gh,
+def arm(cfg, db, lot: int, *, slug: str, number: int, sha: str, target: str, gh,
         actor: str = work.SYSTEM_SENDER) -> dict:
     """Arme la fusion du porteur `lot` (PR `number` de `slug`) sur `sha`,
     vers `target`.
@@ -224,7 +237,7 @@ def arm(db, lot: int, *, slug: str, number: int, sha: str, target: str, gh,
                           gh=gh, actor=actor, handle=handle)
         if out["state"] in ("armed", "already-armed"):
             # une composition déjà verte fusionne tout de suite, sous le même bail
-            out["merge"] = _check_locked(db, lot, gh=gh, dry_run=False, actor=actor,
+            out["merge"] = _check_locked(cfg, db, lot, gh=gh, dry_run=False, actor=actor,
                                          handle=handle)
         return out
     finally:
@@ -281,7 +294,8 @@ def _arm_locked(db, lot: int, *, slug: str, number: int, sha: str, target: str, 
             (sha, number, slug, target):
         return {"state": "already-armed",
                 "why": "already armed on %s → %s" % (sha[:12], target)}
-    names = ",".join(dict.fromkeys(context for context, _app in required))
+    names = ",".join(dict.fromkeys(quote(context, safe="")
+                                   for context, _app in required))
     if not _renew(handle):
         return lost
     _note(db, lot, "armed", slug, number, sha,
@@ -301,6 +315,24 @@ def _fire_hint(lot: int, sha: str) -> str:
 # passage : désarmer (tête ou cible changée) ou fusionner (vert)
 # --------------------------------------------------------------------------
 
+def _verdicts(cfg, db, row: dict, milestones: list, *, slug: str, base: str) -> tuple:
+    """`fire.ready_verdicts` sur le porteur, avec le dépôt et le projet que le
+    feu résout (dossier de l'assigné s'il porte ce dépôt, sinon le clone
+    déclaré du projet). Rend `(ok, raison)` ; une erreur refuse."""
+    try:
+        repo = fire._repo_of(db, row)
+        if repo is not None and not fire._same_repository(repo, slug):
+            repo = None
+        project = fire._project(cfg, repo, slug)
+        if repo is None:
+            repo = fire._project_checkout(project)
+        ok, why, _klass = fire.ready_verdicts(cfg, db, row, milestones, repo=repo,
+                                              project=project, target=base)
+    except Exception as exc:  # noqa: BLE001 - une porte illisible ne fusionne pas
+        return False, "the review gate cannot be read: %s: %s" % (type(exc).__name__, exc)
+    return ok, why
+
+
 def open_carriers(db, app: str) -> list[int]:
     """Les porteurs ouverts du projet `app`."""
     st = storage.of(db).work
@@ -311,7 +343,7 @@ def open_carriers(db, app: str) -> list[int]:
     return sorted(set(found))
 
 
-def check(db, lot: int, *, gh, dry_run: bool = False,
+def check(cfg, db, lot: int, *, gh, dry_run: bool = False,
           actor: str = work.SYSTEM_SENDER) -> dict:
     """Un porteur armé : le désarme si sa tête ou sa cible a changé, le
     fusionne si ses checks requis sont verts sur la tête publiée.
@@ -326,13 +358,15 @@ def check(db, lot: int, *, gh, dry_run: bool = False,
     if handle is None and not dry_run:
         return {"lot": lot, "result": "busy"}
     try:
-        return _check_locked(db, lot, gh=gh, dry_run=dry_run, actor=actor, handle=handle)
+        return _check_locked(cfg, db, lot, gh=gh, dry_run=dry_run, actor=actor,
+                             handle=handle)
     finally:
         if handle is not None:
             _unlock(handle)
 
 
-def _check_locked(db, lot: int, *, gh, dry_run: bool, actor: str, handle=None) -> dict:
+def _check_locked(cfg, db, lot: int, *, gh, dry_run: bool, actor: str,
+                  handle=None) -> dict:
     # relu sous le bail : une publication a pu réarmer depuis la première lecture
     mine = active(marks(db, lot))
     if mine is None:
@@ -345,11 +379,17 @@ def _check_locked(db, lot: int, *, gh, dry_run: bool, actor: str, handle=None) -
         return dict(out, result="error", error=str(exc))
     if view["state"] != "OPEN":
         return dict(out, result="closed", state=view["state"])
+    row, milestones = fire._fresh(db, lot)
+    if row is None:
+        return dict(out, result="error", error="lot #%d not found" % lot)
+    frozen = fire._norm((fire.freeze_of(milestones) or {}).get("sha"))
     moved = []
     if view["head"] != sha:
         moved.append("head=%s" % (view["head"] or "?"))
     if view["base"] != base:
         moved.append("now targets %s" % (view["base"] or "?"))
+    if frozen != sha:
+        moved.append("frozen=%s" % (frozen or "none"))
     if moved:
         out["moved"] = moved
         if dry_run:
@@ -371,30 +411,85 @@ def _check_locked(db, lot: int, *, gh, dry_run: bool, actor: str, handle=None) -
         error = land.pr_disable_auto(slug, number, gh=gh)
         if error is not None:
             return dict(out, result="error", error="disarm: %s" % error)
-    ok, why = fire.ready_pr(view, target=base, project=None, frozen=sha, slug=slug, gh=gh)
+    # R1 B1 (cx3) : la porte complète des verdicts, comme le feu (classe,
+    # avis requis et indépendants sur la tête gelée, membres d'un porteur et
+    # delta, #2766), avant toute lecture de CI et tout geste de fusion.
+    ok, why = _verdicts(cfg, db, row, milestones, slug=slug, base=base)
+    if not ok:
+        return dict(out, result="pending", why=why)
+    # R1 B2 (cx3) : au geste, au moins un check imposé par la forge, et tous
+    # ceux de la publication ; une protection allégée depuis ne fusionne rien.
+    try:
+        required = fire.required_checks(slug, base, None, gh=gh)
+    except land.LandError as exc:
+        return dict(out, result="pending",
+                    why="the required checks of %s cannot be read: %s" % (base, exc))
+    names = set(context for context, _app in required)
+    dropped = [name for name in mine["required"] if name not in names]
+    if not required or dropped:
+        return dict(out, result="error", error=(
+            "%s no longer enforces %s: nothing proves the CI the publication relied on, "
+            "nothing merged" % (base, ", ".join(dropped) or "any required check")))
+    ok, why = fire.ready_pr(view, target=base, project=None, frozen=sha, required=required,
+                            slug=slug, gh=gh)
     if not ok:
         return dict(out, result="pending", why=why)
     if dry_run:
         return dict(out, result="would-merge")
+    # R2 B2 (cx2) : `--match-head-commit` lie la tête au geste, aucune API de
+    # fusion ne lie la cible. La PR est relue juste avant le geste, après
+    # toutes les lectures de la porte ; une tête, une cible ou un état changés
+    # depuis ne fusionnent pas (le passage suivant désarme).
+    try:
+        fresh = pr_status(slug, number, gh=gh)
+    except land.LandError as exc:
+        return dict(out, result="error", error="fresh read: %s" % exc)
+    if (fresh["state"], fresh["head"], fresh["base"]) != ("OPEN", sha, base):
+        return dict(out, result="pending", why=(
+            "PR #%d changed just before the merge (%s, head %s, base %s): nothing merged"
+            % (number, fresh["state"] or "?", fresh["head"][:12] or "?",
+               fresh["base"] or "?")))
     if not _renew(handle):
         return dict(out, result="busy")
     # le seul geste de fusion : GitHub vérifie la tête à cet instant précis
     error = land.pr_merge(slug, number, sha, METHOD, gh=gh)
     if error is not None:
         return dict(out, result="error", error="merge: %s" % error)
-    _note(db, lot, "merged", slug, number, sha,
-          "base=%s — merged by ameesh at its published head, required checks green" % base,
-          actor)
-    return dict(out, result="merged")
+    return _read_back(db, lot, row, out, slug=slug, gh=gh, actor=actor)
 
 
-def watch(db, app: str, *, gh=None, dry_run: bool = False) -> list[dict]:
+def _read_back(db, lot: int, row: dict, out: dict, *, slug: str, gh, actor: str) -> dict:
+    """Après le geste : la cible réelle de la fusion. Un reciblage glissé entre
+    la relecture fraîche et le geste (fenêtre qu'aucune API GitHub ne ferme)
+    est constaté, journalisé en incident et réveille l'assigné du porteur."""
+    number, sha, base = out["pr"], out["sha"], out["base"]
+    try:
+        after = pr_status(slug, number, gh=gh)
+    except land.LandError as exc:
+        after = None
+        unread = str(exc)
+    if after is not None and after["base"] == base:
+        _note(db, lot, "merged", slug, number, sha,
+              "base=%s — merged by ameesh at its published head, required checks green"
+              % base, actor)
+        return dict(out, result="merged")
+    where = after["base"] if after is not None else "unreadable (%s)" % unread
+    text = ("base=%s — INCIDENT: PR #%d merged at %s but its target now reads %s, not the "
+            "pinned %s: check where the packet landed (retarget during the merge?)"
+            % (base, number, sha[:12], where, base))
+    _note(db, lot, "merged", slug, number, sha, text, actor)
+    fire._wake(db, row.get("assignee"), lot, "Packet #%d: %s" % (lot, text),
+               {"project": row.get("app") or "", "pr": number, "anomaly": True})
+    return dict(out, result="error", error=text)
+
+
+def watch(cfg, db, app: str, *, gh=None, dry_run: bool = False) -> list[dict]:
     """Tous les porteurs ouverts de `app` ; un porteur ne fait pas tomber l'autre."""
     gh = gh or land._gh
     results = []
     for lot in open_carriers(db, app):
         try:
-            results.append(check(db, lot, gh=gh, dry_run=dry_run))
+            results.append(check(cfg, db, lot, gh=gh, dry_run=dry_run))
         except Exception as exc:  # noqa: BLE001 - un porteur ne fait pas tomber l'autre
             results.append({"lot": lot, "result": "error",
                             "error": "%s: %s" % (type(exc).__name__, exc)})

@@ -3142,7 +3142,7 @@ def _packet_prevalidation(cfg, db, item, decision, args) -> int:
     return 0
 
 
-def _arm_packet(db, decision: dict, gh, args) -> dict | None:
+def _arm_packet(cfg, db, decision: dict, gh, args) -> dict | None:
     """#2813 (canon §12) : publier un porteur `integration/**` — sa suite
     complète demandée, en vol ou verte sur la tête gelée — arme sa fusion
     automatique sur cette tête et cette cible (`packet_automerge.arm`) :
@@ -3158,7 +3158,7 @@ def _arm_packet(db, decision: dict, gh, args) -> dict | None:
         return None
     try:
         out = packet_automerge.arm(
-            db, args.id, slug=decision["repo"], number=decision["pr"], sha=decision["sha"],
+            cfg, db, args.id, slug=decision["repo"], number=decision["pr"], sha=decision["sha"],
             target=decision.get("base_ref") or "", gh=packet_automerge.gh_of(gh),
             actor=getattr(args, "actor", "") or work.SYSTEM_SENDER)
     except Exception as exc:  # noqa: BLE001 - l'étiquette est posée : jamais fatal
@@ -3215,7 +3215,7 @@ def cmd_ci_run(cfg, args) -> int:
         return 1
     if args.dry_run or decision["action"] != "request":
         if not args.dry_run:
-            _arm_packet(db, decision, gh, args)
+            _arm_packet(cfg, db, decision, gh, args)
         if args.json:
             print(json.dumps({**decision, "ok": True, "requested": False},
                              ensure_ascii=False, indent=1))
@@ -3254,7 +3254,7 @@ def cmd_ci_run(cfg, args) -> int:
             return 1
         decision = {**decision, "action": result["action"], "why": result["why"],
                     "run": result.get("run")}
-        _arm_packet(db, decision, gh, args)
+        _arm_packet(cfg, db, decision, gh, args)
         if args.json:
             print(json.dumps({**decision, "ok": True, "requested": False},
                              ensure_ascii=False, indent=1))
@@ -3263,7 +3263,7 @@ def cmd_ci_run(cfg, args) -> int:
         return 0
     if result.get("warnings"):
         print("ameesh ci run: posed, with warnings: %s" % "; ".join(result["warnings"]))
-    _arm_packet(db, decision, gh, args)
+    _arm_packet(cfg, db, decision, gh, args)
     if args.json:
         print(json.dumps({**decision, "ok": True, "requested": True,
                           "run": result.get("run") or {}}, ensure_ascii=False, indent=1))

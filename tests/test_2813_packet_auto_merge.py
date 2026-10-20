@@ -35,7 +35,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from ameesh import ci, packet_automerge, plan_github, work  # noqa: E402
+from ameesh import ci, fire, packet_automerge, plan_github, work  # noqa: E402
 
 from .test_l161g_ci_gel import (BASE, DEPOT, GEL, LABEL_FULL, PR, GelTestCase,  # noqa: E402
                                 Gh as LabelGh, Github, pull)
@@ -163,6 +163,19 @@ class Journal(unittest.TestCase):
         stack.enter_context(mock.patch.object(packet_automerge, "_unlock", lambda h: None))
         stack.enter_context(mock.patch.object(packet_automerge, "_renew",
                                               lambda h: self.renew))
+        #: le porteur, son gel (la tête publiée par défaut) et la porte des avis
+        self.frozen = HEAD
+        self.gate = (True, "")
+        stack.enter_context(mock.patch.object(fire, "_fresh", lambda db, lot: (
+            {"id": int(lot), "app": "ameesh", "assignee": "composeur",
+             "branch": "integration/paquet-h-20261020-0500"},
+            [{"id": 1, "kind": "frozen", "sha": self.frozen, "at_ts": 1.0}]
+            if self.frozen else [])))
+        stack.enter_context(mock.patch.object(
+            packet_automerge, "_verdicts", lambda cfg, db, row, ms, slug, base: self.gate))
+        self.wakes: list[tuple] = []
+        stack.enter_context(mock.patch.object(
+            fire, "_wake", lambda db, to, lot, text, data: self.wakes.append((to, text))))
 
     def _events(self, db, item_id, limit=100):
         return list(reversed(self.events.get(int(item_id), [])))
@@ -177,13 +190,13 @@ class Journal(unittest.TestCase):
 
     def armed(self, sha: str = HEAD, lot: int = LOT, pr: int = NUM, base: str = "main"):
         self._note(None, lot, "auto-merge armed repo=%s pr=%d sha=%s base=%s method=merge "
-                              "required=tests" % (SLUG, pr, sha, base))
+                              "required=tests — test" % (SLUG, pr, sha, base))
 
     def active(self, lot: int = LOT):
         return packet_automerge.active(packet_automerge.marks(None, lot))
 
     def arm(self, gh, sha: str = HEAD) -> dict:
-        return packet_automerge.arm(None, LOT, slug=SLUG, number=NUM, sha=sha,
+        return packet_automerge.arm(None, None, LOT, slug=SLUG, number=NUM, sha=sha,
                                     target="main", gh=gh)
 
 
@@ -226,6 +239,7 @@ class ArmTest(Journal):
 
     def test_a_new_publication_moves_the_pin(self):
         self.armed(sha=HEAD)
+        self.frozen = NEW
         gh = FakeGh(head=NEW)
         self.assertEqual(self.arm(gh, sha=NEW)["state"], "armed")
         self.assertEqual(self.active()["sha"], NEW)
@@ -293,13 +307,14 @@ class LeaseTest(Journal):
         self.armed()
         self.held.add(LOT)
         gh = FakeGh(head=NEW, auto=True)
-        self.assertEqual(packet_automerge.check(None, LOT, gh=gh)["result"], "busy")
+        self.assertEqual(packet_automerge.check(None, None, LOT, gh=gh)["result"], "busy")
         self.assertEqual(gh.calls, [])
 
     def test_the_marks_are_read_again_under_the_lease(self):
         """Une publication réarme sur la nouvelle tête entre la première lecture
         du passage et son bail : le passage relit et garde l'armement."""
         self.armed(sha=HEAD)
+        self.frozen = NEW
         gh = FakeGh(head=NEW)
         real = packet_automerge._lock
 
@@ -307,7 +322,7 @@ class LeaseTest(Journal):
             self.armed(sha=NEW)          # la publication s'est faite juste avant
             return real(db, lot)
         with mock.patch.object(packet_automerge, "_lock", lock):
-            out = packet_automerge.check(None, LOT, gh=gh)
+            out = packet_automerge.check(None, None, LOT, gh=gh)
         self.assertEqual(out["result"], "pending", out)
         self.assertEqual(self.active()["sha"], NEW)
 
@@ -324,14 +339,14 @@ class LeaseTest(Journal):
         self.renew = False
         for gh in (FakeGh(tests="success"), FakeGh(head=NEW, auto=True)):
             with self.subTest(head=gh.head):
-                self.assertEqual(packet_automerge.check(None, LOT, gh=gh)["result"], "busy")
+                self.assertEqual(packet_automerge.check(None, None, LOT, gh=gh)["result"], "busy")
                 self.assertEqual(gh.merges() + gh.disarms(), [])
 
 
 class MarksTest(unittest.TestCase):
-    def row(self, ident, state, sha=HEAD, pr=NUM, base="main"):
+    def row(self, ident, state, sha=HEAD, pr=NUM, base="main", required=("tests",)):
         return {"id": ident, "state": state, "repo": SLUG, "pr": pr, "sha": sha,
-                "base": base}
+                "base": base, "required": required}
 
     def test_a_disarm_or_a_merge_closes_the_arming(self):
         for closing in ("disarmed", "merged"):
@@ -347,8 +362,15 @@ class MarksTest(unittest.TestCase):
         self.assertEqual(packet_automerge.active([self.row(1, "armed"),
                                                   self.row(2, "disarmed", pr=1)])["id"], 1)
 
-    def test_an_arming_without_target_is_not_followed(self):
+    def test_an_arming_without_target_or_checks_is_not_followed(self):
         self.assertIsNone(packet_automerge.active([self.row(1, "armed", base="")]))
+        self.assertIsNone(packet_automerge.active([self.row(1, "armed", required=())]))
+
+    def test_the_pinned_checks_are_read_back_exactly(self):
+        m = packet_automerge.MARK_RE.match(
+            "auto-merge armed repo=%s pr=%d sha=%s base=main method=merge "
+            "required=tests,couverture%%20(PR),a%%2Cb — x" % (SLUG, NUM, HEAD))
+        self.assertEqual(m.group("required"), "tests,couverture%20(PR),a%2Cb")
 
     def test_the_journal_line_is_parsed_with_its_target(self):
         m = packet_automerge.MARK_RE.match(
@@ -363,7 +385,7 @@ class PassTest(Journal):
     """`check` : fusionner la tête publiée au vert, désarmer toute autre."""
 
     def check(self, gh, **kw):
-        return packet_automerge.check(None, LOT, gh=gh, **kw)
+        return packet_automerge.check(None, None, LOT, gh=gh, **kw)
 
     def test_nothing_armed_reads_nothing(self):
         gh = FakeGh()
@@ -435,6 +457,105 @@ class PassTest(Journal):
         self.assertEqual(gh.state, "OPEN")
         self.assertIsNotNone(self.active())
 
+    def retarget_on(self, gh, when):
+        """La cible passe à `release/production` dès l'appel `gh` que `when` désigne."""
+        real = gh.answer
+
+        def answer(args):
+            out = real(args)
+            if when(args):
+                gh.base = "release/production"
+            return out
+        gh.answer = answer
+
+    def test_r2_b2_a_retarget_during_the_gate_reads_never_merges(self):
+        """Repro cx2 : la cible change après la lecture des check runs, dans
+        les lectures de `ready_pr` ; la relecture fraîche la voit."""
+        self.armed()
+        gh = FakeGh(tests="success")
+        self.retarget_on(gh, lambda args: args[:1] == ["api"] and "/check-runs" in args[-1])
+        out = self.check(gh)
+        self.assertEqual(out["result"], "pending", out)
+        self.assertIn("changed just before the merge", out["why"])
+        self.assertEqual(gh.merges(), [])
+        self.assertEqual(gh.state, "OPEN")
+        # le passage suivant désarme
+        self.assertEqual(self.check(gh)["result"], "disarmed")
+
+    def test_r2_b2_a_retarget_at_the_gesture_is_an_incident(self):
+        """La fenêtre qu'aucune API ne ferme : constatée, journalisée, assigné réveillé."""
+        self.armed()
+        gh = FakeGh(tests="success")
+        self.retarget_on(gh, lambda args: args[:2] == ["pr", "merge"]
+                         and "--match-head-commit" in args)
+        out = self.check(gh)
+        self.assertEqual(out["result"], "error", out)
+        self.assertIn("INCIDENT", out["error"])
+        self.assertIn("release/production", self.notes()[-1])
+        self.assertEqual([to for to, _ in self.wakes], ["composeur"])
+        self.assertIsNone(self.active())
+
+    def test_an_unreadable_read_back_is_an_incident_too(self):
+        self.armed()
+        gh = FakeGh(tests="success")
+        real = gh.answer
+        views = []
+
+        def answer(args):
+            if args[:2] == ["pr", "view"]:
+                views.append(args)
+                if len(views) == 3:
+                    return 1, "", "HTTP 502"
+            return real(args)
+        gh.answer = answer
+        out = self.check(gh)
+        self.assertEqual(out["result"], "error", out)
+        self.assertIn("unreadable", out["error"])
+        self.assertEqual(len(self.wakes), 1)
+
+    def test_a_merge_reads_the_pr_three_times(self):
+        """Lecture, relecture fraîche juste avant le geste, relecture après."""
+        self.armed()
+        gh = FakeGh(tests="success")
+        self.assertEqual(self.check(gh)["result"], "merged")
+        kinds = [c[:2] for c in gh.calls if c[:1] == ["pr"]]
+        self.assertEqual(kinds, [["pr", "view"], ["pr", "view"], ["pr", "merge"],
+                                 ["pr", "view"]])
+        self.assertEqual(self.wakes, [])
+
+    def test_r1_b1_a_refused_review_gate_never_merges(self):
+        """cx3 R1 : la porte des verdicts (classe, avis, membres et delta d'un
+        porteur) passe avant toute CI et tout geste de fusion."""
+        self.armed()
+        self.gate = (False, "2 independent reviews missing on 1111111111")
+        gh = FakeGh(tests="success")
+        out = self.check(gh)
+        self.assertEqual(out["result"], "pending", out)
+        self.assertIn("reviews missing", out["why"])
+        self.assertEqual(gh.merges(), [])
+        self.assertEqual([c for c in gh.calls if c[:1] == ["api"]], [])
+
+    def test_r1_b2_a_protection_emptied_after_publication_never_merges(self):
+        self.armed()
+        for protection in ({"required_status_checks": None},
+                           {"required_status_checks": {"contexts": ["other"],
+                                                       "checks": []}}):
+            with self.subTest(protection=protection):
+                gh = FakeGh(tests="success", protection=protection)
+                out = self.check(gh)
+                self.assertEqual(out["result"], "error", out)
+                self.assertIn("no longer enforces", out["error"])
+                self.assertEqual(gh.merges(), [])
+
+    def test_a_refreeze_on_another_head_disarms(self):
+        self.armed()
+        self.frozen = NEW
+        gh = FakeGh(tests="success")
+        out = self.check(gh)
+        self.assertEqual(out["result"], "disarmed", out)
+        self.assertIn("frozen=%s" % NEW, self.notes()[-1])
+        self.assertEqual(gh.merges(), [])
+
     def test_a_github_auto_merge_armed_by_hand_is_disarmed_before_merging(self):
         self.armed()
         gh = FakeGh(tests="success", auto=True)
@@ -479,7 +600,7 @@ class PassTest(Journal):
         self.armed(lot=9, pr=NUM - 1)
         gh = FakeGh(head=NEW, auto=True, sticky=True)
         with mock.patch("ameesh.storage.of", return_value=types.SimpleNamespace(work=store)):
-            out = packet_automerge.watch(None, "ameesh", gh=gh)
+            out = packet_automerge.watch(None, None, "ameesh", gh=gh)
         self.assertEqual(sorted(r["lot"] for r in out), [9, LOT])
         self.assertEqual({r["result"] for r in out}, {"disarmed"})
         self.assertEqual(sorted(c[2] for c in gh.calls if c[:2] == ["pr", "view"]),
@@ -498,8 +619,34 @@ class PassTest(Journal):
             return real(db, lot)
         with mock.patch("ameesh.storage.of", return_value=types.SimpleNamespace(work=store)), \
                 mock.patch.object(packet_automerge, "marks", marks):
-            out = packet_automerge.watch(None, "ameesh", gh=FakeGh(head=NEW, auto=True))
+            out = packet_automerge.watch(None, None, "ameesh", gh=FakeGh(head=NEW, auto=True))
         self.assertEqual({r["lot"]: r["result"] for r in out}, {LOT: "error", 9: "disarmed"})
+
+
+class VerdictsTest(unittest.TestCase):
+    """`_verdicts` : la porte du feu, sur le dépôt et le projet que le feu résout."""
+
+    def test_the_fire_gate_runs_on_the_resolved_repository(self):
+        row, ms = {"id": LOT, "assignee": "composeur"}, [{"kind": "frozen", "sha": HEAD}]
+        project = types.SimpleNamespace(name="ameesh")
+        with mock.patch.object(fire, "_repo_of", return_value="/autre"), \
+                mock.patch.object(fire, "_same_repository", return_value=False), \
+                mock.patch.object(fire, "_project", return_value=project) as resolve, \
+                mock.patch.object(fire, "_project_checkout", return_value="/clone"), \
+                mock.patch.object(fire, "ready_verdicts",
+                                  return_value=(False, "verdicts-missing", {})) as gate:
+            out = packet_automerge._verdicts("cfg", "db", row, ms, slug=SLUG, base="main")
+        self.assertEqual(out, (False, "verdicts-missing"))
+        resolve.assert_called_once_with("cfg", None, SLUG)
+        gate.assert_called_once_with("cfg", "db", row, ms, repo="/clone", project=project,
+                                     target="main")
+
+    def test_an_unreadable_gate_refuses(self):
+        with mock.patch.object(fire, "_repo_of", side_effect=RuntimeError("registre")):
+            ok, why = packet_automerge._verdicts(None, None, {"id": LOT}, [], slug=SLUG,
+                                                 base="main")
+        self.assertFalse(ok)
+        self.assertIn("registre", why)
 
 
 class TickTest(unittest.TestCase):
@@ -521,7 +668,7 @@ class TickTest(unittest.TestCase):
         out, watch = self.tick([{"lot": LOT, "result": "pending"},
                                 {"lot": 9, "result": "idle"}])
         self.assertEqual([r["result"] for r in out], ["grace"])
-        watch.assert_called_once_with(None, "ameesh", gh="gh", dry_run=False)
+        watch.assert_called_once_with(mock.ANY, None, "ameesh", gh="gh", dry_run=False)
 
     def test_a_merge_a_disarm_and_an_error_are_reported(self):
         out, _watch = self.tick([{"lot": LOT, "result": "merged", "pr": NUM},
@@ -570,6 +717,8 @@ class CiRunTest(GelTestCase):
                                                   lambda h: None))
         self.work.enter_context(mock.patch.object(packet_automerge, "_renew",
                                                   lambda h: True))
+        self.work.enter_context(mock.patch.object(packet_automerge, "_verdicts",
+                                                  lambda *a, **k: (True, "")))
         self.work.enter_context(mock.patch(
             "ameesh.prevalidation_calls.gate_packet",
             return_value={"state": "unavailable", "cause": "test"}))
@@ -650,7 +799,7 @@ class ArmPacketTest(unittest.TestCase):
         args = argparse.Namespace(id=LOT)
         with mock.patch.object(packet_automerge, "arm",
                                return_value={"state": "armed", "why": "ok"}) as arm:
-            out = ci._arm_packet(None, decision, LabelGh(), args)
+            out = ci._arm_packet(None, None, decision, LabelGh(), args)
         return out, arm
 
     def test_a_carrier_full_request_arms_on_the_target_branch(self):
