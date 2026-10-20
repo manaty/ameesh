@@ -1492,6 +1492,11 @@ class _Repo:
         return data if isinstance(data, dict) else None
 
     def comment(self, number: int, body: str) -> dict:
+        # #2845: every projection comment must be ignored by the incoming
+        # watch, including closure and duplicate comments. Accounts can be
+        # shared with humans, so author identity cannot serve as a filter.
+        if "<!-- ameesh:" not in body:
+            body += "\n\n<!-- ameesh:projection:v1 -->"
         return _json(self.gh, ["api", "-X", "POST",
                                "repos/%s/issues/%d/comments" % (self.repo, number),
                                "--input", "-"], json.dumps({"body": body})) or {}

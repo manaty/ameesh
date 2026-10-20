@@ -4325,7 +4325,8 @@
    "watches": "CI watches: mesh server only",
    "handoffs": "host handoff controller: mesh server only",
    "lot_sessions": "session parking and activity wake listing: runner of the mesh server only; scheduled lot wakes pass by lot_sessions.due_wakes/claim_wake/consume_wake",
-   "host_lifecycle": "host withdrawal and loss recovery: mesh server only"
+   "host_lifecycle": "host withdrawal and loss recovery: mesh server only",
+   "github_watch": "GitHub intake cursors and deduplication: notifier host only"
   },
   "operations": {
    "accounts": [
@@ -4815,6 +4816,14 @@
     "listing",
     "progress",
     "undrain"
+   ],
+   "github_watch": [
+    "advance",
+    "checkpoint",
+    "cursor",
+    "lock",
+    "remember",
+    "scan"
    ]
   }
  },

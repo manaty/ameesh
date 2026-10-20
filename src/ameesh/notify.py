@@ -1182,6 +1182,7 @@ class Notifier:
         self.clock = clock or time.time
         #: L126 : projection des lots en issues GitHub (créée au premier passage)
         self._projector = None
+        self._github_watcher = None
         #: L161c : relevé de la CI, échecs au courrier de l'agent du lot
         self._ci_watcher = None
 
@@ -1383,6 +1384,7 @@ class Notifier:
         if self.wip:
             self._wip_sweep(db, now)
         self._github_issues(db, now)
+        self._github_inputs(db, now)
         self._ci_failures(db)
         for human in list(self.state["rate"]):
             window = [t for t in self.state["rate"][human] if now - t < RATE_WINDOW_S]
@@ -1551,6 +1553,19 @@ class Notifier:
             self._projector.tick(db, now)
         except Exception as exc:  # noqa: BLE001 - jamais fatal au passage des alertes
             self.log("GitHub issues: pass failed (%s)" % _clean(exc, 200))
+
+    def _github_inputs(self, db, now: float) -> None:
+        """#2845: feed external issues/comments to the canonical watcher."""
+        if not getattr(self.cfg, "github", None):
+            return
+        from . import github_watch
+        try:
+            if self._github_watcher is None:
+                self._github_watcher = github_watch.Watcher(
+                    self.cfg, dry_run=self.dry_run, log=self.log)
+            self._github_watcher.tick(db, now)
+        except Exception as exc:
+            self.log("GitHub watch: pass failed (%s)" % _clean(exc, 200))
 
     # -- échecs de CI au courrier de l'agent du lot (L161c) ----------------------
     def _ci_failures(self, db) -> None:
