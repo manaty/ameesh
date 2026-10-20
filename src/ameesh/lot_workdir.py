@@ -146,7 +146,8 @@ def deliverable(cfg, db, agent, rows, *, deferred=None, canons=None) -> list[dic
 MAIL_PAGE = mail.UNREAD_LIMIT
 
 
-def deliverable_unread(cfg, db, agent, *, besoin, mode="unread", deferred=None) -> list[dict]:
+def deliverable_unread(cfg, db, agent, *, besoin, mode="unread", deferred=None,
+                       include_human=True) -> list[dict]:
     """#811 R3 : les non-lus remisables, au-delà d'un préfixe qui les masquait.
 
     `mail.unread` — et ses variantes — borne la lecture aux plus anciens : un
@@ -178,6 +179,11 @@ def deliverable_unread(cfg, db, agent, *, besoin, mode="unread", deferred=None) 
             gardes = deliverable(cfg, db, agent, rows, deferred=deferred, canons=canons)
         except db_mod.DbError:
             return rows               # dossier illisible : page brute, rien perdu
+        if not include_human:
+            # L77/B11 : le hook d'un tour résident ne remet pas les messages
+            # humains, réservés/soldés par la file du tour. On continue de
+            # paginer pour ne pas s'arrêter sur une page pleine d'humains.
+            gardes = [row for row in gardes if not mail.is_human(row)]
         if len(gardes) >= besoin or len(rows) < page or len(rows) <= lus:
             return gardes
         lus = len(rows)

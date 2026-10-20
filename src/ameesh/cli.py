@@ -812,9 +812,13 @@ class _Remise:
     l'annuler si rien n'a été montré. Repli fichier : lecture et marquage v0.
     """
 
-    def __init__(self, cfg, bk, name: str, binding) -> None:
+    def __init__(self, cfg, bk, name: str, binding, *,
+                 resident: bool = False) -> None:
         self.cfg, self.bk, self.name = cfg, bk, name
         self.pg = getattr(bk, "kind", None) == "pg"
+        #: L77/B11 : un hook de tour résident ne remet pas les messages
+        #: humains ; la file du tour les réserve et les solde à sa fin.
+        self.include_human = not resident
         self.owner = binding.runner_id if binding.bound_to_lease else None
         self.epoch = binding.epoch if self.owner else None
         #: #811 : projets de l'agent lus avec le bail (`None` = inconnus). Un
@@ -841,6 +845,8 @@ class _Remise:
         qui pouvait masquer un message remisable plus récent."""
         if not self.pg:
             tous = self.bk.unread(self.name)
+            if not self.include_human:
+                tous = [m for m in tous if not mail.is_human(m)]
             self.msgs = tous if limite is None else tous[:max(0, limite)]
             self.reste = len(tous) - len(self.msgs)
             return self.msgs
@@ -886,14 +892,47 @@ class _Remise:
 
     def _reserver_simple(self, borne: int) -> list[dict]:
         """#811 : réservation sans filtre de lot (mono-projet, ou règle du lot
-        retenu indécidable) — le chemin d'origine du hook, budget L61 gardé."""
-        rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
-                            porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
-                            limit=borne)
+        retenu indécidable) — le chemin d'origine du hook, budget L61 gardé.
+
+        L77/B11 : en tour résident, les messages humains sont écartés de la
+        réservation ; ils restent à la file du tour. On lit donc les non-lus
+        non humains (lots retenus écartés si la règle est décidable) avant de
+        réserver leurs ids.
+        """
+        if not self.include_human:
+            rows = self._non_human_unread(borne)
+            ids = [int(row["id"]) for row in rows if row.get("id") is not None]
+            if not ids:
+                self.ouverte = False
+                self.msgs = []
+                self.reste = 0
+                return []
+            rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
+                                ids=ids, porteur="hook",
+                                ttl_seconds=mail.HOOK_RESERVATION_TTL, limit=borne)
+        else:
+            rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
+                                porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
+                                limit=borne)
         self.ouverte = bool(rows)
         self.msgs = [mail.normalize(row) for row in rows]
         self.reste = 1 if len(self.msgs) >= borne else 0
         return self.msgs
+
+    def _non_human_unread(self, borne: int) -> list[dict]:
+        """L77/B11 : les non-lus non humains d'un tour résident, lots retenus
+        écartés quand la règle est visible du hook (sinon lecture simple)."""
+        from . import lot_workdir, registry
+        from .mediated_executor.contract import NotSupportedRemotely
+        besoin = max(int(borne), mail.UNREAD_LIMIT)
+        try:
+            agent = registry.get(self.bk.db, self.name) or {"name": self.name}
+            rows = lot_workdir.deliverable_unread(
+                self.cfg, self.bk.db, agent, besoin=besoin,
+                include_human=False)
+        except NotSupportedRemotely:
+            rows = mail.unread(self.bk.db, self.name, limit=besoin)
+        return [row for row in rows if not mail.is_human(row)][:int(borne)]
 
     def _deliverable(self, borne: int) -> list[int] | None:
         """#811 B1/R3 : les ids à réserver, les lots retenus laissés en place.
@@ -909,7 +948,9 @@ class _Remise:
             agent = registry.get(self.bk.db, self.name) or {"name": self.name}
         except NotSupportedRemotely:
             return None
-        rows = lot_workdir.deliverable_unread(self.cfg, self.bk.db, agent, besoin=borne)
+        rows = lot_workdir.deliverable_unread(
+            self.cfg, self.bk.db, agent, besoin=borne,
+            include_human=self.include_human)
         return [int(row["id"]) for row in rows if row.get("id") is not None]
 
     def prendre_mi_tour(self, limite: int | None = None) -> list[dict]:
@@ -923,7 +964,8 @@ class _Remise:
         non-lus est vu au prochain point sûr, pas à la fin du tour."""
         if not self.pg:
             tous = self.bk.unread(self.name)
-            gardes = [m for m in tous if mail.mid_turn(m)]
+            gardes = [m for m in tous
+                      if mail.mid_turn(m) and (self.include_human or not mail.is_human(m))]
             self.msgs = gardes if limite is None else gardes[:max(0, limite)]
             self.reste = len(gardes) - len(self.msgs)
             return self.msgs
@@ -934,7 +976,8 @@ class _Remise:
             self.reste = 0
             return []
         taille = mail.UNREAD_LIMIT if limite is None else limite
-        voulus = mail.unread_mid_turn(self.bk.db, self.name, taille)
+        voulus = mail.unread_mid_turn(self.bk.db, self.name, taille,
+                                      include_human=self.include_human)
         ids = [int(m["id"]) for m in voulus if m.get("id") is not None]
         if not ids:
             self.msgs = []
@@ -1341,7 +1384,10 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             # pour que le chemin rapide ne conclue pas « rien à faire ».
             _marque_boite(cfg, name, attente)
             return 0
-        remise = _Remise(cfg, bk, name, binding)
+        #: L77/B11 : un tour résident (fichier de tour posé) ne remet pas les
+        #: messages humains par le hook ; la file du tour les possède.
+        remise = _Remise(cfg, bk, name, binding,
+                         resident=bool(tour and binding.bound_to_lease))
         #: #1628 : un drapeau local, pas `sys.exc_info()` — un `cmd_hook` appelé
         #: depuis un `except` verrait l'exception extérieure et ne marquerait
         #: jamais la boîte.

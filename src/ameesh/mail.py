@@ -151,10 +151,15 @@ def unread_urgent(db: Db, recipient: str, limit: int = 50) -> list[dict]:
     return storage.of(db).mailbox.unread_urgent(recipient, limit)
 
 
-def unread_mid_turn(db: Db, recipient: str, limit: int = UNREAD_LIMIT) -> list[dict]:
+def unread_mid_turn(db: Db, recipient: str, limit: int = UNREAD_LIMIT, *,
+                    include_human: bool = True) -> list[dict]:
     """L514/#885 : les non-lus qu'une remise mi-tour peut livrer — verdict,
     arbitrage, message d'un humain, urgent (`mid_turn`) —, filtrés DANS la
     requête : un verdict derrière plus de `UNREAD_LIMIT` non-lus est vu.
+
+    ``include_human=False`` (L77/B11) : un tour résident ne remet pas les
+    messages humains par le hook ; ils restent à la file du tour, qui les
+    réserve et les solde à sa fin effective (rang 1/2, au moins une fois).
 
     Chemin médié : `mailbox.unread_mid_turn` n'est pas dans le contrat 1.1, il
     lit `mailbox.unread` (admis) et filtre ici, comme `unread_active` — au plus
@@ -162,8 +167,9 @@ def unread_mid_turn(db: Db, recipient: str, limit: int = UNREAD_LIMIT) -> list[d
     st = storage.of(db)
     if getattr(st, "driver", None) == "mediated":
         rows = st.mailbox.unread(recipient, max(int(limit), UNREAD_LIMIT))
-        return [row for row in rows if mid_turn(row)][:int(limit)]
-    return st.mailbox.unread_mid_turn(recipient, limit)
+        return [row for row in rows
+                if mid_turn(row) and (include_human or not is_human(row))][:int(limit)]
+    return st.mailbox.unread_mid_turn(recipient, limit, include_human=include_human)
 
 
 def get(db: Db, message_id: int) -> dict | None:
