@@ -20,8 +20,8 @@ A clone is removed only when ALL of this is proved:
   metadata included); the walk must be complete;
 * its saved work is proved by [`housekeeping._git_copy_work`]: clean,
   ignored files only under the host's build artifacts, HEAD pushed or
-  integrated, no unpushed local branch, no stash, no submodule, no other
-  linked worktree, no remote stored inside it;
+  integrated, no local ref commit outside remote branches, no stash, no
+  submodule, no other linked worktree, no remote stored inside it;
 * it contains no nested Git copy (a nested clone with its own work would
   go with it);
 * no other clone has an ``.git/objects/info/alternates`` entry pointing at
