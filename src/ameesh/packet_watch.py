@@ -329,9 +329,10 @@ def tick(cfg, db, *, now: float, rules_of, dry_run: bool = False,
     """Tous les projets surveillés de l'hôte ; `rules_of(name)` rend la
     mécanique compilée (`release_cutoff.compiled_rules`, sans repli).
 
-    #2813 : le même passage désarme l'auto-fusion d'un porteur dont la tête a
-    bougé depuis son armement (`packet_automerge.watch`) ; seuls un
-    désarmement et une erreur sont rendus, un porteur tranquille ne dit rien."""
+    #2813 : le même passage fusionne au vert un porteur publié, ou le désarme
+    si sa tête ou sa cible a changé depuis la publication
+    (`packet_automerge.watch`) ; seuls une fusion, un désarmement et une
+    erreur sont rendus, un porteur en attente ne dit rien."""
     declared = projects(cfg)
     if only:
         if only not in declared:
@@ -355,7 +356,7 @@ def tick(cfg, db, *, now: float, rules_of, dry_run: bool = False,
 
 
 def _auto_merge(db, name: str, app: str, *, gh, dry_run: bool) -> list[dict]:
-    """#2813 : les désarmements et erreurs d'auto-fusion des porteurs de `app`."""
+    """#2813 : les fusions, désarmements et erreurs des porteurs publiés de `app`."""
     from . import packet_automerge
     try:
         rows = packet_automerge.watch(db, app, gh=gh, dry_run=dry_run)
@@ -367,6 +368,6 @@ def _auto_merge(db, name: str, app: str, *, gh, dry_run: bool) -> list[dict]:
         if row["result"] == "error":
             out.append({"project": name, "result": "error", "lot": row["lot"],
                         "error": "auto-merge of #%d: %s" % (row["lot"], row.get("error"))})
-        elif row["result"] in ("disarmed", "would-disarm"):
+        elif row["result"] in ("disarmed", "would-disarm", "merged", "would-merge"):
             out.append(dict(row, project=name, result="auto-merge-" + row["result"]))
     return out

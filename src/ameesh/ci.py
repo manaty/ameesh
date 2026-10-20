@@ -3066,8 +3066,12 @@ def _render_gel(decision: dict) -> list[str]:
     armed = decision.get("auto_merge")
     if armed:
         lines.append(("  auto-merge: %s — %s" if armed["state"] in
-                      ("armed", "rearmed", "already-armed") else
+                      ("armed", "already-armed") else
                       "  auto-merge NOT armed (%s): %s") % (armed["state"], armed["why"]))
+        merge = armed.get("merge") or {}
+        if merge.get("result") in ("merged", "error", "busy"):
+            lines.append("  auto-merge now: %s%s" % (
+                merge["result"], (" — %s" % merge["error"]) if merge.get("error") else ""))
     return lines
 
 
@@ -3140,8 +3144,9 @@ def _packet_prevalidation(cfg, db, item, decision, args) -> int:
 
 def _arm_packet(db, decision: dict, gh, args) -> dict | None:
     """#2813 (canon §12) : publier un porteur `integration/**` — sa suite
-    complète demandée, en vol ou verte sur la tête gelée — arme son
-    auto-fusion GitHub sur cette tête (`packet_automerge.arm`).
+    complète demandée, en vol ou verte sur la tête gelée — arme sa fusion
+    automatique sur cette tête et cette cible (`packet_automerge.arm`) :
+    ameesh la fusionne lui-même au vert, sous `--match-head-commit`.
 
     L'issue est rangée dans `decision["auto_merge"]` et rendue avec la
     décision ; elle ne change jamais le code de retour : l'étiquette est
