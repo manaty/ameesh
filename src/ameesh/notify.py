@@ -276,6 +276,9 @@ TYPE_LABELS = {
     "critical_budget_pause": "critical agent paused on budget",
     # #1268 : deux échecs de tour réels d'affilée sur un agent critique
     "critical_turn_failures": "critical agent failing turns",
+    # #2729 : plus aucun tour n'aboutit — la préemption prioritaire se répète ;
+    # pas poussée par défaut (à ajouter dans `notify.types`), lue par `ameesh alerts`
+    "preemption_streak": "agent preempted turn after turn",
     "critical_roles_unreadable": "canon unreadable: critical roles held",
     # #1466: briefed to the orchestrators and auditors (alert_briefs); not
     # pushed to humans by default (add it to `notify.types` to receive it)
