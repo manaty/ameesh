@@ -266,6 +266,12 @@ class Manager:
                 return None
             self._last_need = now
             self._needs.append(now)
+            # The placeholder is set BEFORE the provider call: two worker
+            # threads must never send two scale-out requests for one calm
+            # window (one outstanding request at a time).
+            placeholder = {"state": "requesting", "action": None,
+                           "since": now, "agent": agent, "host": host}
+            self._outstanding = placeholder
         payload = event(
             "need", host=host, agent=agent, ts=now,
             scope=(verdict or {}).get("scope"),
@@ -287,7 +293,8 @@ class Manager:
                  "capacity_id": reply.get("capacity_id"),
                  "detail": reply.get("detail") or reply.get("error")}
         with self._lock:
-            self._outstanding = state
+            if self._outstanding is placeholder:
+                self._outstanding = state
             self._idle_since = None
         _log(self.log, "capacity: need for %s on %s (%s) -> %s%s"
              % (agent, host, (verdict or {}).get("scope") or "?",
@@ -307,6 +314,8 @@ class Manager:
                 return None
             if self._outstanding is None:
                 return None
+            if self._outstanding.get("state") != "requested":
+                return None  # the provider call is still in flight
             if self._idle_since is None:
                 self._idle_since = now
                 return None

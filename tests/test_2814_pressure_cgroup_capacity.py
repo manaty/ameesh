@@ -255,6 +255,21 @@ class BreachesScopeTest(unittest.TestCase):
             limits=limits(pressure_scope="own_cgroup", max_load=1))
         self.assertFalse(verdict["blocked"])
 
+    def test_a_host_swap_stock_does_not_block_an_own_cgroup_host(self):
+        # the container's /proc/meminfo shows the NODE's swap; without the
+        # node's PSI it must not apply the 0028 fallback (a stock is not a
+        # pressure) — the cgroup's memory.max is the real guard
+        reading = {"swap_used_bytes": 20 * GIB, "load1": 50.0}
+        self.assertEqual(resources.breaches(
+            reading, limits(pressure_scope="own_cgroup")), [])
+        # a declared swap ceiling still counts, corroborated by the cgroup's
+        # own memory pressure
+        found = resources.breaches(
+            dict(reading, cgroup_mem_some=40.0),
+            limits(pressure_scope="own_cgroup", max_swap_used="16GiB",
+                   max_mem_pressure="50%"))
+        self.assertEqual([b["key"] for b in found], ["max_swap_used"])
+
 
 class QueueStatusTest(unittest.TestCase):
     def test_waiting_text_round_trips(self):

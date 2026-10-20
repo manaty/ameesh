@@ -498,6 +498,9 @@ class AgentWorker(threading.Thread):
     #: texte « queued N s » que lit le client ; défaut de classe comme les
     #: reports, une construction partielle ne doit pas lever.
     queue_since = 0.0
+    #: #2814 : instant du dernier texte de pression écrit, pour ne pas
+    #: réécrire `status_text` à chaque sondage (l'âge change à chaque seconde)
+    _pressure_text_at = 0.0
 
     #: L76 : le processus résident de l'agent entre ses tours, ou None.
     #: Défaut de classe : les constructions partielles (`__new__` sans
@@ -3994,8 +3997,10 @@ class AgentWorker(threading.Thread):
         waiting = self._work_waiting()
         queued_s = self._queue_since(waiting)
         capacity = self._capacity_request(pressure, queued_s) if waiting else None
+        # pas d'âge dans le texte critique : il resterait constant, et la
+        # pause n'est posée qu'une fois par motif
         raisons = resources_mod.queue_text(
-            self.runner.host, pressure, queued_s=queued_s if waiting else None,
+            self.runner.host, pressure,
             retry_s=pressure.get("retry_in_s", resources_mod.QUEUE_RETRY_S),
             capacity=capacity)
         if waiting:
@@ -4016,6 +4021,7 @@ class AgentWorker(threading.Thread):
             self._pressure_before = self.agent.get("status_text") or ""
         self._pressure_reason = texte
         self._pressure_text = "paused: " + texte
+        self._pressure_text_at = time.time()
         self._fil_note("Pause: %s. No new turn until the pressure goes back "
                        "down; the current turn is never interrupted." % texte,
                        meta={"action": "pression-hote", "hote": self.runner.host})
@@ -4122,7 +4128,14 @@ class AgentWorker(threading.Thread):
             self.runner.host, pressure, queued_s=queued_s,
             retry_s=pressure.get("retry_in_s", resources_mod.QUEUE_RETRY_S),
             capacity=capacity)
+        now = time.time()
         if getattr(self, "_pressure_text", "") == texte:
+            return
+        # L'âge change à chaque sondage : réécrire `status_text` toutes les
+        # secondes ferait du bruit en base pour rien. Un texte déjà posé est
+        # rafraîchi au plus toutes les dix secondes.
+        if getattr(self, "_pressure_text_at", 0.0) \
+                and now - self._pressure_text_at < 10.0:
             return
         try:
             posee = registry.hold_note(self.db, self.name, self.runner.runner_id,
@@ -4134,6 +4147,7 @@ class AgentWorker(threading.Thread):
             if not getattr(self, "_pressure_text", ""):
                 self._pressure_before = self.agent.get("status_text") or ""
             self._pressure_text = texte
+            self._pressure_text_at = now
 
     def _host_pressure_release(self) -> None:
         """L31b : la pression est retombée — l'attente ou la pause s'efface,
@@ -4141,6 +4155,7 @@ class AgentWorker(threading.Thread):
         d'avant (« reprise : même session »…) revient."""
         self._pause_refused = ""
         self.queue_since = 0.0
+        self._pressure_text_at = 0.0
         texte = getattr(self, "_pressure_text", "")
         if not texte:
             return

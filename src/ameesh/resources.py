@@ -1573,7 +1573,18 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
     # not a pressure (see `swap_ceiling_applies`). #2354: on a host that cannot
     # measure PSI and declares no ceiling, the 0028 conservative fallback is
     # the only memory signal left, and the label says so.
-    if swap_ceiling_applies(reading, limits):
+    if own:
+        # #2814 : en périmètre `own_cgroup`, le swap est un stock de l'HÔTE ;
+        # il ne compte que si une fiche le plafonne ET que le cgroup lui-même
+        # rapporte une pression mémoire. Sans mesure du cgroup, le plafond de
+        # `memory.max` est la vraie garde : on ne retient pas sur le stock.
+        declared = limits.get("max_swap_used")
+        psi, mem_limit = cg("mem_some"), limits.get("max_mem_pressure")
+        if declared is not None and psi is not None and mem_limit is not None \
+                and psi > mem_limit * SWAP_PRESSURE_SHARE:
+            ceiling("max_swap_used", "swap used (own cgroup memory pressure)",
+                    reading.get("swap_used_bytes"), declared, CRITICAL_SWAP_FACTOR)
+    elif swap_ceiling_applies(reading, limits):
         fallback = limits.get("max_swap_used") is None
         ceiling("max_swap_used",
                 "swap used (no PSI: conservative default)" if fallback else "swap used",
