@@ -108,15 +108,24 @@ def events_from(sub, kind, rows):
 
 
 def collect_batch(api, sub, since, now, scan):
-    """Bound each tick to two pages; persist the exact window and next page."""
+    """Read at most two pages, validating a saved boundary after the next read.
+
+    Updated ordering is mutable. An offset alone can skip rows when an older
+    row moves to the end. Re-read the preceding page *after* fetching the next
+    one, before accepting it; a changed boundary restarts this stream. The
+    durable event digest makes replay harmless, including equal timestamps.
+    """
     state = dict(scan) if scan is not None else dict(since=since, until=now, kind="issue", page=1)
+    if state["page"] > 1 and "boundary" not in state:
+        state["page"] = 1  # upgrade an old, unprotected checkpoint safely
     events = []
     until = state["until"]
-    for _ in range(PAGES_PER_TICK):
+
+    def read(page):
         kind = state["kind"]
         path = "/repos/" + sub.repo + ("/issues" if kind == "issue" else "/issues/comments")
         query = dict(since=iso(state["since"]), sort="updated", direction="asc",
-                     per_page=PAGE_SIZE, page=state["page"])
+                     per_page=PAGE_SIZE, page=page)
         if kind == "issue":
             query["state"] = "all"
         rows = api.get(path + "?" + urlencode(query), ttl=0)
@@ -124,11 +133,30 @@ def collect_batch(api, sub, since, now, scan):
             raise plan_github.GithubError("GitHub watch: stale quota fallback; cursor retained")
         if not isinstance(rows, list) or len(rows) > PAGE_SIZE or not all(isinstance(r, dict) for r in rows):
             raise plan_github.GithubError("GitHub watch: invalid list response")
-        events.extend(events_from(sub, kind, rows))
+        return rows
+
+    def boundary(rows):
+        return hashlib.sha256(json.dumps(
+            [(row["id"], row.get("updated_at")) for row in rows]).encode()).hexdigest()
+
+    remaining = PAGES_PER_TICK
+    while remaining:
+        checking = "boundary" in state
+        cost = 2 if checking else 1
+        if remaining < cost:
+            break
+        rows = read(state["page"])
+        remaining -= cost
+        if checking and boundary(read(state["page"] - 1)) != state["boundary"]:
+            state.update(page=1)
+            state.pop("boundary")
+            return events, state, until
+        events.extend(events_from(sub, state["kind"], rows))
         if len(rows) == PAGE_SIZE:
-            state["page"] += 1
-        elif kind == "issue":
+            state.update(page=state["page"] + 1, boundary=boundary(rows))
+        elif state["kind"] == "issue":
             state.update(kind="comment", page=1)
+            state.pop("boundary", None)
         else:
             return events, None, until
     return events, state, until
@@ -224,20 +252,22 @@ class Watcher:
             self.next[key] = now + sub.interval
             try:
                 since = storage.of(db).github_watch.cursor(*key)
-                if since is not None and now - since < sub.interval:
+                scan = storage.of(db).github_watch.scan(*key)
+                if scan is None and since is not None and now - since < sub.interval:
                     self.next[key] = since + sub.interval
                     continue
                 if self.api is None:
                     self.api = plan_github.client(cache_dir=self.cfg.state_dir)
                 if self.api is None:
                     raise plan_github.GithubError("GitHub watch: no token or gh")
-                scan = storage.of(db).github_watch.scan(*key)
                 events, next_scan, until = collect_batch(
                     self.api, sub, (since if since is not None else now - BOOTSTRAP) - OVERLAP,
                     now, scan)
                 count = len(events) if self.dry_run else deliver(
                     db, sub, events, until, storage.of(db).work.issue_feed(plan_github.FEED_LIMIT),
                     self.cfg.host, partial=True, scan_before=scan, scan_after=next_scan)
+                if next_scan is not None and not self.dry_run:
+                    self.next[key] = now  # continue at the next notifier tick
                 reports.append(dict(project=sub.project, repo=sub.repo, events=count))
                 if count:
                     self.log("GitHub watch %s (%s): %d inputs%s" %

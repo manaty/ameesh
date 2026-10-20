@@ -69,11 +69,12 @@ class CollectionTest(unittest.TestCase):
     def test_pages_closed_tickets_and_comments_on_old_issues(self):
         api = Api([issue(n) for n in range(1, 203)], [comment()])
         first, scan, until = watch.collect_batch(api, SUB, NOW - 3600, NOW, None)
-        rest, done, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, scan)
-        self.assertIsNone(done)
-        events = first + rest
+        events = first
+        while scan is not None:
+            rest, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, scan)
+            events += rest
         self.assertEqual(len(events), 203)
-        self.assertEqual(len(api.calls), 4)
+        self.assertEqual(len(api.calls), 6)
         self.assertEqual(events[-1]["issue_ref"], "acme/app#1")
         self.assertEqual(events[-1]["url"], "https://github.com/acme/app/issues/1#issuecomment-10")
         self.assertIn("state=all", api.calls[0])
@@ -90,12 +91,64 @@ class CollectionTest(unittest.TestCase):
     def test_large_feed_is_bounded_and_resumes_past_the_old_page_limit(self):
         api = Api([issue(n) for n in range(1, 10002)])
         scan = dict(since=NOW - 3600, until=NOW, kind="issue", page=100)
-        events, next_scan, until = watch.collect_batch(api, SUB, NOW, NOW + 500, scan)
-        self.assertEqual(len(events), 101)
-        self.assertEqual(next_scan["kind"], "comment")
+        # Legacy offset without a boundary must be replayed safely.
+        events, scan, until = watch.collect_batch(api, SUB, NOW, NOW + 500, scan)
+        self.assertEqual(events[0]["object_id"], 1)
         self.assertEqual(until, NOW)
-        self.assertEqual(scan["page"], 100)
-        self.assertEqual(len(api.calls), watch.PAGES_PER_TICK)
+        for _ in range(101):
+            api.calls.clear()
+            more, scan, _ = watch.collect_batch(api, SUB, NOW, NOW + 500, scan)
+            events += more
+            self.assertLessEqual(len(api.calls), watch.PAGES_PER_TICK)
+        self.assertIsNone(scan)
+        self.assertEqual(len(events), 10001)
+
+    def test_updated_order_drift_replays_without_losing_boundary_issue_or_comment(self):
+        for kind in ("issue", "comment"):
+            with self.subTest(kind=kind):
+                rows = [(issue(n) if kind == "issue" else comment(n)) for n in range(1, 301)]
+                # Equal updated_at is intentional: timestamp-only keys lose ties.
+                for row in rows:
+                    row["updated_at"] = watch.iso(NOW - 1000)
+                api = Api(issues=rows if kind == "issue" else (),
+                          comments=rows if kind == "comment" else ())
+                events, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, None)
+                more, scan, _ = watch.collect_batch(api, SUB, NOW, NOW + 1, scan)
+                events += more
+                self.assertEqual(len(events), 200)
+                # Move #1 after 200 rows: the old offset lost #201 permanently.
+                source = api.issues if kind == "issue" else api.comments
+                moved = source.pop(0)
+                moved["updated_at"] = watch.iso(NOW + 1)
+                source.append(moved)
+                events2, scan, _ = watch.collect_batch(api, SUB, NOW, NOW + 5, scan)
+                self.assertEqual(events2, [])
+                self.assertEqual(scan["page"], 1)
+                self.assertNotIn("boundary", scan)
+                for _ in range(10):
+                    if scan is None:
+                        break
+                    api.calls.clear()
+                    batch, scan, _ = watch.collect_batch(api, SUB, NOW, NOW + 10, scan)
+                    self.assertLessEqual(len(api.calls), watch.PAGES_PER_TICK)
+                    events += batch
+                self.assertIsNone(scan)
+                self.assertEqual({e["object_id"] for e in events}, set(range(1, 301)))
+
+    def test_drift_during_next_page_read_is_detected_before_acceptance(self):
+        api = Api([issue(n) for n in range(1, 301)])
+        _, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, None)
+        get = api.get
+
+        def mutate(path, **kw):
+            if "page=2" in path:
+                api.issues.append(api.issues.pop(0))
+            return get(path, **kw)
+
+        with mock.patch.object(api, "get", side_effect=mutate):
+            events, scan, _ = watch.collect_batch(api, SUB, NOW, NOW + 5, scan)
+        self.assertEqual(events, [])
+        self.assertEqual(scan["page"], 1)
 
     def test_collection_bounds_every_excerpt_and_hashes_the_complete_content(self):
         body = "Long request. " * 5000
@@ -128,9 +181,9 @@ class CollectionTest(unittest.TestCase):
         row = dict(issue(), body="Readable request. " * 4096)
         api = Api([dict(row, id=n, number=n) for n in range(1, 1001)])
         events, scan, until = watch.collect_batch(api, SUB, NOW - 3600, NOW, None)
-        self.assertEqual(len(events), 200)
-        self.assertEqual(len(api.calls), 2)
-        self.assertEqual(scan["page"], 3)
+        self.assertEqual(len(events), 100)
+        self.assertEqual(len(api.calls), 1)
+        self.assertEqual(scan["page"], 2)
         self.assertLessEqual(sum(len(e["body"]) + len(e["title"]) for e in events),
                              200 * (watch.MAX_BODY + watch.MAX_TITLE))
         self.assertTrue(all(e["truncated"] for e in events))
@@ -258,10 +311,39 @@ class DeliveryTest(PgTestCase):
             self.assertEqual((progress["kind"], progress["page"]), ("comment", 2))
             self.assertLess(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW)
             self.watcher(api).tick(self.db, NOW + 901)
+            self.watcher(api).tick(self.db, NOW + 902)
         self.assertEqual(len(self.messages()), 5)
         self.assertIsNone(storage.of(self.db).github_watch.scan("app", "acme/app"))
         self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW)
         self.assertIn("page=2", api.calls[2])
+
+    def test_drift_checkpoint_replays_without_duplicate_mail_or_early_advance(self):
+        api = Api([issue(n) for n in range(1, 7)])
+        watcher = self.watcher(api)
+        with mock.patch.object(watch, "PAGE_SIZE", 2):
+            watcher.tick(self.db, NOW)
+            watcher.tick(self.db, NOW + 1)
+            self.assertEqual(len(self.messages()), 4)
+            api.issues.append(api.issues.pop(0))
+            watcher.tick(self.db, NOW + 2)
+            self.assertEqual(len(self.messages()), 4)
+            self.assertEqual(storage.of(self.db).github_watch.scan("app", "acme/app")["page"], 1)
+            self.assertLess(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW)
+            for delta in range(3, 8):
+                watcher.tick(self.db, NOW + delta)
+        self.assertEqual(len(self.messages()), 6)
+        self.assertIsNone(storage.of(self.db).github_watch.scan("app", "acme/app"))
+        self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW)
+
+    def test_partial_scan_continues_on_next_tick_even_with_hourly_interval(self):
+        api = Api(comments=[comment(n) for n in range(10, 15)])
+        watcher = watch.Watcher(self.cfg, api=api,
+                                declarations=[dataclasses.replace(SUB, interval=3600)])
+        with mock.patch.object(watch, "PAGE_SIZE", 2):
+            for delta, expected in ((0, 2), (1, 4), (2, 5)):
+                watcher.tick(self.db, NOW + delta)
+                self.assertEqual(len(self.messages()), expected)
+        self.assertIsNone(storage.of(self.db).github_watch.scan("app", "acme/app"))
 
     def test_failed_partial_batch_retains_previous_checkpoint(self):
         api = Api(comments=[comment(n) for n in range(10, 15)])
@@ -273,6 +355,7 @@ class DeliveryTest(PgTestCase):
             self.assertEqual(storage.of(self.db).github_watch.scan("app", "acme/app"), progress)
             self.assertEqual(len(self.messages()), 2)
             self.watcher(api).tick(self.db, NOW + 1802)
+            self.watcher(api).tick(self.db, NOW + 1803)
         self.assertEqual(len(self.messages()), 5)
 
     def test_stale_partial_batch_cannot_rewind_the_checkpoint(self):
