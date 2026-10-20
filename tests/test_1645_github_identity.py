@@ -141,7 +141,10 @@ class ApplicationTest(Base):
     def test_journal_desactive_par_la_configuration(self):
         self.ecrire_config({"journal": False})
         env, _ = self.env_tour()
-        self.assertEqual(env["PATH"].split(os.pathsep)[0], str(self.bin))
+        # le shim reste posé (#2848 : marqueur des commentaires), sans journal
+        self.assertEqual(env["PATH"].split(os.pathsep)[0],
+                         str(self.state / "github" / "bin"))
+        self.assertEqual(env[gi.ENV_REAL], str(self.bin / "gh"))
         self.assertNotIn(gi.ENV_JOURNAL, env)
 
     def test_sans_gh_sur_le_path_le_journal_est_sans_objet(self):
@@ -354,6 +357,71 @@ class JournalTest(Base):
         self.assertEqual([g["argv"][2] for g in lire(since=datetime.timedelta(hours=1))],
                          ["9", "3"])
         self.assertEqual([g["agent"] for g in lire(agent="b")], ["b"])
+
+
+class MarqueurCommentaireTest(Base):
+    """#2848 : le `gh` généré marque les commentaires directs d'un tour."""
+
+    def lancer(self, env: dict, *args: str, entree: str | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run(["gh", *args], env=env, capture_output=True,
+                              text=True, timeout=30, input=entree)
+
+    def test_commentaires_issue_et_pr_marques(self):
+        env, _ = self.env_tour(agent="dev-x", lot="2848")
+        for commande in (("issue", "comment", "12"), ("pr", "comment", "7")):
+            with self.subTest(commande=commande):
+                sortie = self.lancer(env, *commande, "--body", "État: gelé")
+                self.assertEqual(sortie.returncode, 3)
+                self.assertIn("État: gelé", sortie.stdout)
+                self.assertEqual(sortie.stdout.count("<!-- ameesh:"), 1)
+                self.assertIn("<!-- ameesh:work-stage:v1 lot=2848 event=manual -->",
+                              sortie.stdout)
+
+    def test_marqueur_existant_preserve(self):
+        env, _ = self.env_tour(lot="2848")
+        body = "Done\n\n<!-- ameesh:work-stage:v1 lot=2848 event=freeze -->"
+        sortie = self.lancer(env, "issue", "comment", "12", "--body", body)
+        self.assertEqual(sortie.stdout.count("<!-- ameesh:"), 1)
+
+    def test_commentaire_humain_non_marque(self):
+        env, _ = self.env_tour()
+        env.pop("AGENT_MAIL_NAME")
+        env.pop("AMEESH_TURN_ID")
+        sortie = self.lancer(env, "issue", "comment", "12", "--body", "Note de l'owner")
+        self.assertNotIn("<!-- ameesh:", sortie.stdout)
+
+    def test_corps_vide_non_marque(self):
+        env, _ = self.env_tour(lot="2848")
+        for args in (("--body", ""), ("--body", "  \n ")):
+            with self.subTest(args=args):
+                sortie = self.lancer(env, "issue", "comment", "12", *args)
+                self.assertNotIn("<!-- ameesh:", sortie.stdout)
+
+    def test_body_file_stdin_et_option_attachee(self):
+        env, _ = self.env_tour(lot="2848")
+        sortie = self.lancer(env, "issue", "comment", "12", "--body-file", "-",
+                             entree="Depuis stdin")
+        self.assertIn("Depuis stdin", sortie.stdout)
+        self.assertEqual(sortie.stdout.count("<!-- ameesh:"), 1)
+        sortie = self.lancer(env, "issue", "comment", "12", "--body=Depuis option")
+        self.assertIn("Depuis option", sortie.stdout)
+        self.assertEqual(sortie.stdout.count("<!-- ameesh:"), 1)
+        sortie = self.lancer(env, "issue", "comment", "12", "-bDepuis attache")
+        self.assertIn("Depuis attache", sortie.stdout)
+        self.assertEqual(sortie.stdout.count("<!-- ameesh:"), 1)
+
+    def test_autres_commandes_inchangees(self):
+        env, _ = self.env_tour(lot="2848")
+        sortie = self.lancer(env, "issue", "view", "12")
+        self.assertNotIn("<!-- ameesh:", sortie.stdout)
+
+    def test_marqueur_actif_meme_journal_desactive(self):
+        self.ecrire_config({"journal": False})
+        env, _ = self.env_tour(lot="2848")
+        sortie = self.lancer(env, "issue", "comment", "12", "--body", "Sans journal")
+        self.assertIn("<!-- ameesh:work-stage:v1 lot=2848 event=manual -->",
+                      sortie.stdout)
+        self.assertNotIn(gi.ENV_JOURNAL, env)
 
 
 class ExecuteurTest(Base):

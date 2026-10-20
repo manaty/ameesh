@@ -5,7 +5,8 @@ Constat du 15/10/2026 : la CI du paquet de 11 h a été annulée à 13:46 sans
 auteur identifiable. Tous les tours héritaient de l'environnement de
 l'exécuteur, donc du jeton de l'owner (`GH_TOKEN` de `~/.config/ameesh/env`,
 sinon `~/.config/gh/hosts.yml`), et aucun geste `gh` lancé par un agent
-n'était consigné. Ce module ferme les deux trous, de façon réversible :
+n'était consigné. Ce module ferme les deux trous, de façon réversible, et son
+`gh` généré marque les commentaires directs d'un tour (#2848) :
 
 1. **Journal** (actif par défaut) : le tour reçoit en tête de `PATH` un `gh`
    généré qui écrit une ligne JSON (agent, tour, lot, rôle, commande) dans
@@ -23,6 +24,11 @@ n'était consigné. Ce module ferme les deux trous, de façon réversible :
    `https://github.com` ; `GITHUB_TOKEN` hérité est retiré. Sans fichier, ou
    sans jeton lisible, rien ne change : le tour garde l'identité héritée, et
    le journal le dit (`role` vide, `identity: inherited`).
+
+Le `gh` généré ajoute aussi le marqueur `<!-- ameesh:work-stage:v1 … -->` aux
+commentaires `gh issue comment` et `gh pr comment` d'un tour d'agent, quand le
+corps n'en porte pas déjà un ; hors d'un tour (shell humain, session attachée
+sans identifiant de tour), le corps est laissé intact.
 
 Format de `github-identities.json` (aucun secret dedans, seulement des
 chemins vers des fichiers 0600) ::
@@ -216,6 +222,75 @@ _ns: dict = {"re": re}
 exec(SANITIZE, _ns)  # noqa: S102 — source constante de ce module
 sanitize_argv = _ns["sanitize_argv"]
 
+#: #2848 : le `gh` d'un tour d'agent marque lui-même ses commentaires d'étape.
+#: Il n'agit que dans un tour du maillage (`AGENT_MAIL_NAME` + `AMEESH_TURN_ID`),
+#: jamais dans un shell humain, et préserve un marqueur déjà présent. Les corps
+#: `--body`/`-b` et `--body-file`/`-F` (fichier ou `-`) sont couverts ; le mode
+#: éditeur interactif (`--editor`) est laissé intact et signalé.
+COMMENT_MARKER = r'''
+def _annotated(argv):
+    if not (os.environ.get("AGENT_MAIL_NAME") and os.environ.get("AMEESH_TURN_ID")):
+        return argv
+    if len(argv) < 2 or argv[0] not in ("issue", "pr") or argv[1] != "comment":
+        return argv
+    if "--delete-last" in argv:
+        return argv
+    lot = "".join(c for c in os.environ.get("AMEESH_LOT", "") if c.isdigit()) or "0"
+    marker = "<!-- ameesh:work-stage:v1 lot=%s event=manual -->" % lot
+
+    def annotated(body):
+        if "<!-- ameesh:" in body or not body.strip():
+            return body
+        return body.rstrip("\n") + "\n\n" + marker
+
+    def read_body(path):
+        if path == "-":
+            return sys.stdin.buffer.read().decode("utf-8", "replace")
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+
+    for index, arg in enumerate(argv):
+        if arg in ("--body", "-b"):
+            if index + 1 < len(argv):
+                argv[index + 1] = annotated(argv[index + 1])
+            return argv
+        if arg.startswith("--body="):
+            argv[index] = "--body=" + annotated(arg[len("--body="):])
+            return argv
+        if arg.startswith("-b") and len(arg) > 2:
+            body = arg[2:]
+            if body.startswith("="):
+                body = body[1:]
+            argv[index] = "-b" + annotated(body)
+            return argv
+        if arg in ("--body-file", "-F"):
+            if index + 1 >= len(argv):
+                return argv
+            try:
+                body = read_body(argv[index + 1])
+            except (OSError, UnicodeError):
+                return argv
+            return argv[:index] + ["--body", annotated(body)] + argv[index + 2:]
+        if arg.startswith("--body-file="):
+            try:
+                body = read_body(arg[len("--body-file="):])
+            except (OSError, UnicodeError):
+                return argv
+            return argv[:index] + ["--body=" + annotated(body)] + argv[index + 1:]
+        if arg.startswith("-F") and len(arg) > 2:
+            path = arg[2:]
+            if path.startswith("="):
+                path = path[1:]
+            try:
+                body = read_body(path)
+            except (OSError, UnicodeError):
+                return argv
+            return argv[:index] + ["--body=" + annotated(body)] + argv[index + 1:]
+    if "--editor" in argv or "-e" in argv:
+        sys.stderr.write("ameesh: work-stage marker not added in editor mode\n")
+    return argv
+'''
+
 #: le `gh` généré. Volontairement autonome (bibliothèque standard seule) : il
 #: tourne sous l'interpréteur de l'exécuteur, sans importer ameesh.
 SHIM = r'''#!{python}
@@ -223,6 +298,7 @@ SHIM = r'''#!{python}
 # éditer ; il est réécrit à chaque tour.
 import json, os, re, sys, time
 {sanitize}
+{marker}
 real = os.environ.get("{real}", "")
 if not real or not os.access(real, os.X_OK):
     sys.stderr.write("ameesh: vrai gh introuvable ({real}=%r)\n" % real)
@@ -252,7 +328,11 @@ if journal:
             sys.stderr.flush()
         except Exception:
             pass
-os.execv(real, [real] + sys.argv[1:])
+try:
+    argv = _annotated(sys.argv[1:])
+except Exception:  # le marqueur ne bloque jamais la commande
+    argv = sys.argv[1:]
+os.execv(real, [real] + argv)
 '''
 
 
@@ -364,7 +444,7 @@ def write_shim(shim_dir: str, python: str | None = None) -> str:
     os.makedirs(shim_dir, mode=0o700, exist_ok=True)
     contenu = SHIM.format(python=python or sys.executable, real=ENV_REAL,
                           journal=ENV_JOURNAL, role=ENV_ROLE,
-                          sanitize=SANITIZE)
+                          sanitize=SANITIZE, marker=COMMENT_MARKER)
     cible = os.path.join(shim_dir, "gh")
     try:
         with open(cible, encoding="utf-8") as fh:
@@ -391,10 +471,11 @@ def _problem(info: dict, texte: str) -> None:
 
 def apply(env: dict, agent: str, config_dir: str, state_dir: str,
           lot: str | None = None) -> dict:
-    """Pose sur `env` (celui du tour) le journal et, s'il est configuré, le
-    jeton du rôle. Rend la résolution (sans jeton), pour le journal de
-    l'exécuteur. Jamais bloquant : chaque étape se prépare sur une copie et
-    n'est publiée qu'entière ; un échec laisse l'environnement hérité."""
+    """Pose sur `env` (celui du tour) le shim `gh` (journal et marqueur #2848)
+    et, s'il est configuré, le jeton du rôle. Rend la résolution (sans jeton),
+    pour le journal de l'exécuteur. Jamais bloquant : chaque étape se prépare
+    sur une copie et n'est publiée qu'entière ; un échec laisse l'environnement
+    hérité."""
     info, jeton = _resolve(config_dir, agent)
     nouveau = dict(env)
     if lot:
@@ -417,19 +498,21 @@ def apply(env: dict, agent: str, config_dir: str, state_dir: str,
             identite[ENV_ROLE] = info["role"]
             _git_credential(identite)
             nouveau = identite
-    if info["journal"]:
-        try:
-            shim_dir = os.path.join(state_dir, "github", "bin")
-            reel = real_gh(nouveau.get("PATH", os.defpath), shim_dir)
-            if reel:
-                write_shim(shim_dir)
-                nouveau[ENV_REAL] = reel
+    try:
+        shim_dir = os.path.join(state_dir, "github", "bin")
+        reel = real_gh(nouveau.get("PATH", os.defpath), shim_dir)
+        if reel:
+            # #2848 : le shim sert aussi au marqueur des commentaires, même si
+            # le journal est désactivé par la configuration.
+            write_shim(shim_dir)
+            nouveau[ENV_REAL] = reel
+            if info["journal"]:
                 nouveau[ENV_JOURNAL] = journal_pattern(state_dir)
-                nouveau["PATH"] = shim_dir + os.pathsep + nouveau.get("PATH", os.defpath)
-            else:
-                _problem(info, "gh absent du PATH : journal sans objet")
-        except OSError as exc:
-            _problem(info, "journal gh non installé (%s)" % exc)
+            nouveau["PATH"] = shim_dir + os.pathsep + nouveau.get("PATH", os.defpath)
+        elif info["journal"]:
+            _problem(info, "gh absent du PATH : journal sans objet")
+    except OSError as exc:
+        _problem(info, "gh non installé (%s)" % exc)
     env.clear()
     env.update(nouveau)
     return info
