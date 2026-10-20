@@ -325,6 +325,39 @@ ameesh release calendar                # prochaine coupure et canon lu
 ameesh release cutoff --dry-run        # plan, notes, aucun effet
 ```
 
+**Alerte « créneau manqué » (#2601)** : le même tick relit la cadence des
+paquets (`packets.cutoffs`) et réveille le composeur et le pilote quand un
+créneau passe sans paquet alors que des lots sont prêts (voir
+[ORCHESTRATEUR.md](ORCHESTRATEUR.md)). Sans bloc `packet_watch`, rien ne
+tourne : un #2601 fusionné reste éteint (canon §5). Le bloc s'ajoute à côté de
+`release`, sur l'hôte opérateur seulement ; aucune unité de plus :
+
+```json
+"packet_watch": {
+  "host": "pc-smichea",
+  "projects": {
+    "ameesh": {
+      "notify": ["<composeur>", "<pilote>"],
+      "grace_s": 900,
+      "target": "main",
+      "repo": "/home/ameesh/work/ameesh"
+    }
+  }
+}
+```
+
+`repo` est requis quand l'hôte n'a pas de bloc `radar` (cas de pc-smichea) :
+sans lui, chaque tick échoue sur la liste calculée (`project 'ameesh' is in
+neither radar.projects nor packet_watch.projects.ameesh.repo`). Le clone de
+`release.projects.<projet>.repo` convient : il n'est lu qu'à travers un clone
+jetable `--shared`. `target` évite de dépendre de `origin/HEAD`. Vérification
+après l'ajout :
+
+```sh
+ameesh release packet-watch --dry-run      # grace, busy, served, nothing-ready, would-alert… ; jamais error
+journalctl --user -u ameesh-release -n 5   # une ligne « packet-watch ameesh: … » par tick
+```
+
 **Ce que fait un tick** : il prend `B`, la tête de la cible si la CI du
 commit exact est verte, sinon le plus récent commit vert de la chaîne
 first-parent (un commit de release `[skip ci]` hérite de l'état de son premier
