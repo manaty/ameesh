@@ -12,7 +12,7 @@ from unittest import mock
 from tests import support  # isolate host config before module tests
 from tests.support import PgTestCase
 from ameesh import canon, canon_sync, db as db_mod, identity, modules, work
-from ameesh.modules import it
+from ameesh.modules import it, lifecycle
 from ameesh.modules.it.execution import OUTPUT_BYTES, digest, execute
 from ameesh.modules.storage import ModuleStore
 
@@ -61,6 +61,30 @@ class ModuleConfigurationTest(unittest.TestCase):
                     {"extensions": {"ameesh": {"projects": []}}}):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 modules.declarations(raw)
+
+    def test_lifecycle_declares_the_five_documentary_types(self):
+        self.assertEqual(lifecycle.NAME, "lifecycle")
+        self.assertEqual(set(lifecycle.TYPES), {
+            "docs", "investigation", "governance-tracking",
+            "promotion", "human_operation"})
+        descriptor = lifecycle.descriptor()
+        self.assertEqual(descriptor["types"], list(lifecycle.TYPES))
+        # Q1 #1915 : aucun schéma ni règle métier inventé pour ces types.
+        self.assertEqual(descriptor["schemas"], {})
+        self.assertEqual(descriptor["rules"], [])
+        with self.assertRaisesRegex(ValueError, "unknown lifecycle module option"):
+            lifecycle.descriptor({"require_qa": ["promoted"]})
+
+    def test_lifecycle_and_it_coexist_with_disjoint_types(self):
+        entries = modules.declarations(federation(names=["it", "lifecycle"]))
+        self.assertEqual([(e["project"], e["module"]) for e in entries],
+                         [("acme", "it"), ("acme", "lifecycle")])
+        it_types = set(next(e["types"] for e in entries if e["module"] == "it"))
+        lifecycle_types = set(next(e["types"] for e in entries
+                                   if e["module"] == "lifecycle"))
+        self.assertEqual(lifecycle_types, set(lifecycle.TYPES))
+        self.assertFalse(it_types & lifecycle_types)
+        self.assertEqual(modules.installed()["lifecycle"], lifecycle)
 
     def test_canon_check_reports_module_errors(self):
         c = canon.Canon(root=".", readable=True, federation=federation(names=["missing"]))
@@ -374,3 +398,51 @@ class LifecycleGateTest(PgTestCase):
         proc = self.mesh("work", "add", "--title", "Store upload", "--type", "publication",
                          "--app", "acme", "--estimate", "1h", "--actor", "human:test")
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
+class DocumentaryTypesGateTest(PgTestCase):
+    """Q1 #1915 : le module lifecycle déclare les cinq types documentaires.
+
+    Le descripteur les rend installables ; l'activation reste une sélection de
+    canon par projet. Un projet sans module continue de les refuser, côté CLI
+    comme par écriture SQL directe.
+    """
+
+    def setUp(self):
+        super().setUp()
+        with self.db.transaction() as tx:
+            ModuleStore(tx).replace(
+                "", modules.declarations(federation(names=["lifecycle"])))
+
+    def test_each_declared_type_is_admitted_for_the_project(self):
+        for kind in lifecycle.TYPES:
+            with self.subTest(kind=kind):
+                lot = work.add(self.db, title="Documentary", type=kind, app="acme")
+                self.assertEqual((lot["type"], lot["app"]), (kind, "acme"))
+                self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+                self.assertTrue(ModuleStore(self.db).admits("acme", kind))
+
+    def test_a_project_without_the_module_still_refuses_each_type(self):
+        for kind in lifecycle.TYPES:
+            with self.subTest(kind=kind):
+                with self.assertRaisesRegex(work.WorkError, "enable its module"):
+                    work.add(self.db, title="No module", type=kind, app="other")
+                with self.assertRaisesRegex(db_mod.DbError, "AMEESH_MODULE_RULE"):
+                    self.db.execute(
+                        "INSERT INTO work_items(title,type,app) "
+                        "VALUES ('raw',%s,'other')", (kind,))
+
+    def test_declaration_does_not_admit_other_module_types(self):
+        core = work.add(self.db, title="Core", app="other")["id"]
+        self.assertEqual(work.get(self.db, core)["type"], "evolution")
+        with self.assertRaises(work.WorkError):
+            work.add(self.db, title="Release", type="release", app="acme")
+        self.assertFalse(ModuleStore(self.db).admits("acme", "release"))
+        self.assertTrue(ModuleStore(self.db).admits("acme", "docs"))
+
+    def test_cli_adds_a_documentary_lot_when_the_module_is_active(self):
+        proc = self.mesh("work", "add", "--title", "Read the contract",
+                         "--type", "docs", "--app", "acme", "--new-project",
+                         "--actor", "human:test")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Read the contract", proc.stdout)

@@ -12,8 +12,8 @@ NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 def installed():
-    from . import it
-    return {it.NAME: it}
+    from . import it, lifecycle
+    return {it.NAME: it, lifecycle.NAME: lifecycle}
 
 
 def declarations(federation):
