@@ -43,9 +43,9 @@ class ReadingTest(TestCase):
         self.root = os.path.join(os.environ.get("TMPDIR") or "/tmp",
                                  "ameesh-2808-%d" % id(self))
         self.repo = _Repo(self.root)
-        self.repo.write("src/ameesh/work.py", "base\n")
+        self.repo.write("src/ameesh/chat.py", "base\n")
         self.base = self.repo.commit("base")
-        self.repo.write("src/ameesh/work.py", "lot\n")
+        self.repo.write("src/ameesh/chat.py", "lot\n")
         self.impl = self.repo.commit("impl: lot", agent="impl")
         self.provider = ReceiptProvider({
             self.impl: {"actor": "impl", "harness": "codex"},
@@ -85,7 +85,7 @@ class ReadingTest(TestCase):
                          ["deepseek"])
 
     def test_a_titular_who_wrote_a_commit_is_an_author(self):
-        self.repo.write("src/ameesh/work.py", "lot\nby titular\n")
+        self.repo.write("src/ameesh/chat.py", "lot\nby titular\n")
         by_titular = self.repo.commit("titular: touch", agent="titular")
         self.provider.rows[by_titular] = {"actor": "titular", "harness": "deepseek"}
         authors, unknown, _correctors = self.reading([self.impl, by_titular])
@@ -103,7 +103,7 @@ class ReadingTest(TestCase):
     def test_a_third_party_without_a_receipt_stays_unknown(self):
         # Un tiers sans reçu n'est attribué à personne : la désignation attend
         # (échec fermé), elle ne suppose pas l'indépendance.
-        self.repo.write("src/ameesh/work.py", "lot\nby ghost\n")
+        self.repo.write("src/ameesh/chat.py", "lot\nby ghost\n")
         ghost = self.repo.commit("ghost: touch", agent="ghost")
         authors, unknown, _correctors = self.reading([self.impl, ghost])
         self.assertEqual([row["name"] for row in authors], ["impl"])
@@ -120,9 +120,9 @@ class GateTitularTest(PgTestCase):
             self.db.execute("DELETE FROM %s" % table)
         self.ops = storage.of(self.db).work
         self.repo = _Repo(os.path.join(self.tmp, "depot"))
-        self.repo.write("src/ameesh/work.py", "base\n")
+        self.repo.write("src/ameesh/chat.py", "base\n")
         self.base = self.repo.commit("base")
-        self.repo.write("src/ameesh/work.py", "lot\n")
+        self.repo.write("src/ameesh/chat.py", "lot\n")
         self.impl = self.repo.commit("impl: lot", agent="impl")
         for name, harness in (("titular", "claude"), ("impl", "deepseek"),
                               ("r_claude", "claude"), ("r_codex", "codex"),
@@ -154,7 +154,7 @@ class GateTitularTest(PgTestCase):
 
     def klass(self, *, base=True):
         out = {"class": "sensitive", "project": "ameesh",
-               "files": [{"path": "src/ameesh/work.py"}]}
+               "files": [{"path": "src/ameesh/chat.py"}]}
         if base:
             out["base_sha"] = self.base
         return out
@@ -184,7 +184,7 @@ class GateTitularTest(PgTestCase):
         self.assertEqual([row["actor"] for row in out["accepted"]], ["r_claude"])
 
     def test_a_titular_who_wrote_a_commit_still_forbids_their_family(self):
-        self.repo.write("src/ameesh/work.py", "lot\nby titular\n")
+        self.repo.write("src/ameesh/chat.py", "lot\nby titular\n")
         by_titular = self.repo.commit("titular: touch", agent="titular")
         self.receipt("titular", "claude", [by_titular])
         self.freeze(by_titular, actor="titular")
@@ -198,7 +198,7 @@ class GateTitularTest(PgTestCase):
         # Un amend conserve l'auteur Git (le titulaire) et change le committer
         # (impl) : les deux ont écrit la plage. La famille du titulaire reste
         # interdite, même si son seul commit a été réécrit par un autre.
-        self.repo.write("src/ameesh/work.py", "lot\nby titular\n")
+        self.repo.write("src/ameesh/chat.py", "lot\nby titular\n")
         self.repo.commit("titular: lot", agent="titular")
         env = dict(self.repo.dry, GIT_AUTHOR_NAME="titular",
                    GIT_AUTHOR_EMAIL="titular@ameesh.invalid",
@@ -217,7 +217,7 @@ class GateTitularTest(PgTestCase):
         # Auditeur #2808 : un titulaire qui n'a rien poussé, avec un commit
         # d'un tiers sans reçu, garde la porte fermée (pas d'indépendance
         # supposée). La provenance est inconnue : la plage n'est pas concluante.
-        self.repo.write("src/ameesh/work.py", "lot\nby ghost\n")
+        self.repo.write("src/ameesh/chat.py", "lot\nby ghost\n")
         ghost = self.repo.commit("ghost: touch", agent="ghost")
         self.freeze(ghost)
         out = self.gate(ghost, ["r_claude"])
