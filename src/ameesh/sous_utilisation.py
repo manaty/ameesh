@@ -17,7 +17,9 @@ Quatre types d'alerte, levés par `ameesh alerts` et poussés par
   proche et peu utilisée (`fin_de_fenetre`), ou perte projetée dépassant
   le seuil réglé (`sous_rythme`). Volume perdu estimé : `1 − utilisé` de la
   fenêtre si rien ne change (même définition que les « pertes à la remise à
-  zéro » de L74, `Gauge.expiring`), et la projection au rythme actuel ;
+  zéro » de L74, `Gauge.expiring`), et la projection au rythme actuel ; le
+  débit des six dernières heures ignore les relevés pris pendant que les
+  non-critiques étaient tenus par le plafond de pause (#2816) ;
 * `idle_capacity` : des agents réveillables (mode `execute`, exécuteur
   vivant, au repos, sous leur budget, sans lot actionnable ni courrier)
   alors que du travail attend (lots ouverts sans assigné, courrier en
@@ -249,13 +251,20 @@ def latest_account_gauges(db, now: float) -> dict:
     return out
 
 
-def _projected_plan_loss(gauge, account, now: float, history: list) -> tuple:
+def _projected_plan_loss(gauge, account, now: float, history: list, *,
+                         multiplier: float = 1.0,
+                         ceiling: float = cost_mod.PACE_CEILING,
+                         reserve: float = accounts_mod.RESERVE) -> tuple:
     """(perte, source, durée) : débit des six dernières heures de production.
 
     Même harnais, compte, jauge et échéance ; les échos d'un relevé ne
     créent pas du temps mesuré. Sans deux relevés couvrant 30 min, ou si
     l'usage recule, repli explicite sur la moyenne depuis le début de fenêtre.
     Le rythme autorisé et son multiplicateur ne prédisent pas le débit réel.
+    #2816 : un relevé pris alors que les non-critiques étaient tenus (usage
+    au plafond de pause, réserve déduite) mesure ce plafond, pas la demande ;
+    il est écarté, et l'absence de relevés libres fait retomber sur la
+    moyenne de fenêtre.
     """
     points = {}
     for row in history:
@@ -271,7 +280,10 @@ def _projected_plan_loss(gauge, account, now: float, history: list) -> tuple:
             continue
         if abs(float(reset) - float(gauge.resets_at)) > 1.0:
             continue
-        points[stamp] = float(row.get("used") or 0.0)
+        used_at_stamp = float(row.get("used") or 0.0)
+        if used_at_stamp >= gauge.held_cap(stamp, reserve, multiplier, ceiling):
+            continue
+        points[stamp] = used_at_stamp
     samples = sorted(points.items())
     if len(samples) >= 2:
         start, initial = samples[0]
@@ -321,7 +333,11 @@ def plan_underused(db, listing: list, now: float, *,
     annoncé pour les non-critiques. #2757 :
     le déclenchement dépend de la perte projetée au débit récent, avec repli
     explicite sur la moyenne de fenêtre si les relevés sont insuffisants ;
-    le plafond autorisé reste une limite de capacité, pas une prévision."""
+    le plafond autorisé reste une limite de capacité, pas une prévision.
+    #2816 : les relevés du débit pris alors que les non-critiques étaient
+    tenus par ce plafond mesurent la pause, pas la demande ; ils sont écartés,
+    ce qui fait retomber sur la moyenne de fenêtre quand il n'en reste pas
+    assez."""
     used_max = max(0.0, float(used_pct)) / 100.0
     gap_min = max(0.0, float(pace_gap_pct)) / 100.0
     if (tail_s <= 0 or used_max <= 0) and gap_min <= 0:
@@ -393,7 +409,8 @@ def plan_underused(db, listing: list, now: float, *,
                 except Exception:
                     history = []  # historique indisponible : moyenne de fenêtre
             lost_at_pace, rate_source, rate_span = _projected_plan_loss(
-                gauge, account, now, history)
+                gauge, account, now, history, multiplier=multiplier,
+                ceiling=ceiling, reserve=accounts_mod.RESERVE)
             if gap_min > 0 and lost_at_pace <= gap_min:
                 continue
             reason = None
