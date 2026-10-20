@@ -252,7 +252,7 @@ class EcheanceTest(_Base):
     def test_autres_preuves_de_travail(self):
         preuves = {
             "note": lambda i: work.note(self.db, i, "j'avance", actor="relais"),
-            "jalon": lambda i: work.milestone(self.db, i, "frozen", sha="abc", actor="relais"),
+            "jalon": lambda i: work.milestone(self.db, i, "frozen", sha="a" * 40, actor="relais"),
             "message": lambda i: mail.send(self.db, "relais", "orch", "point d'étape",
                                            work_item_id=str(i)),
             "transition": lambda i: work.move(self.db, i, "build", actor="agent:relais"),
