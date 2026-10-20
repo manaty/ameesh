@@ -19,7 +19,9 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
+from ameesh import canon
 from ameesh import mechanics
+from ameesh import plan_git
 from ameesh import prevalidation as pv
 from ameesh import prevalidation_calls as calls
 
@@ -128,7 +130,7 @@ class ParametersTest(unittest.TestCase):
                   SimpleNamespace(root="/canon2", sources=(second,))]
         block = params(hosts=("vm1",))
 
-        def load(repo, commit, project):
+        def load(repo, commit, project, *, deadline=None):
             if repo == "/canon1":
                 raise pv.PrevalidationError("block-missing", "absent")
             return None, block
@@ -138,6 +140,56 @@ class ParametersTest(unittest.TestCase):
             got = calls.parameters(cfg, "ameesh")
         self.assertEqual(got.repo, "/canon2")
         self.assertEqual(got.commit, "2" * 40)
+
+    def test_the_deadline_reaches_the_canon_reader(self):
+        block = params(hosts=("vm1",))
+        deadline = calls.Deadline(5.0)
+        seen = {}
+
+        def load(repo, commit, project, *, deadline=None):
+            seen["deadline"] = deadline
+            seen["source"] = (repo, commit, project)
+            return None, block
+
+        with mock.patch.object(pv, "load_parameters", side_effect=load):
+            got = calls.parameters(None, "ameesh", canon_repo="/canon",
+                                   canon_commit="d" * 40, deadline=deadline)
+        self.assertIs(seen["deadline"], deadline)
+        self.assertEqual(seen["source"], ("/canon", "d" * 40, "ameesh"))
+        self.assertEqual(got.hosts, ("vm1",))
+
+    def test_an_expired_budget_is_run_incomplete_not_block_missing(self):
+        # #2665/B1 cx2 : l'échéance épuisée ne se lit pas « canon sans bloc ».
+        cfg = SimpleNamespace(canon="/canon")
+        source = SimpleNamespace(mode="git", repo="/canon", commit="e" * 40, prefix="")
+        configured = SimpleNamespace(root="/canon", sources=(source,))
+        deadline = calls.Deadline(0.0)
+        with mock.patch("ameesh.canon.load_configured", return_value=[configured]), \
+                mock.patch.object(pv, "load_parameters") as load:
+            with self.assertRaises(pv.PrevalidationError) as caught:
+                calls.parameters(cfg, "ameesh", deadline=deadline)
+        self.assertEqual(caught.exception.cause, "run-incomplete")
+        load.assert_not_called()
+
+    def test_an_expired_canon_read_is_run_incomplete(self):
+        now = [100.0]
+        deadline = calls.Deadline(5.0, clock=lambda: now[0])
+
+        def slow_read(*args, **kwargs):
+            now[0] += 10.0
+            raise mechanics.MechanicsError("git ls-tree: timed out")
+
+        with mock.patch.object(mechanics, "load", side_effect=slow_read):
+            with self.assertRaises(pv.PrevalidationError) as caught:
+                pv.load_parameters("/repo", "a" * 40, "ameesh", deadline=deadline)
+        self.assertEqual(caught.exception.cause, "run-incomplete")
+
+    def test_a_canon_read_error_with_budget_left_is_not_masked(self):
+        deadline = calls.Deadline(60.0)
+        with mock.patch.object(mechanics, "load",
+                               side_effect=mechanics.MechanicsError("bad canon")):
+            with self.assertRaises(mechanics.MechanicsError):
+                pv.load_parameters("/repo", "a" * 40, "ameesh", deadline=deadline)
 
 
 class RepositoryTest(unittest.TestCase):
@@ -201,6 +253,58 @@ class PrepareTest(unittest.TestCase):
             calls.prepare(self.repo.root, head, self.repo.base)
         self.assertEqual(caught.exception.cause, "selection-unsafe")
         self.assertIn("refusé le plan", caught.exception.why)
+
+    def test_both_commit_probes_read_the_shared_deadline(self):
+        # #2665/B1 cx2 : les sondes head/base repartaient de GIT_TIMEOUT (60 s).
+        now = [100.0]
+        deadline = calls.Deadline(1.0, clock=lambda: now[0])
+        seen = []
+
+        def probe(repo, rev, *, timeout=None):
+            seen.append((rev, timeout))
+            now[0] += 0.25
+            return self.repo.head if len(seen) == 1 else self.repo.base
+
+        with mock.patch.object(plan_git, "_commit", side_effect=probe):
+            prepared = calls.prepare(self.repo.root, self.repo.head, self.repo.base,
+                                     deadline=deadline)
+        self.addCleanup(prepared.close)
+        self.assertEqual(seen[0], (self.repo.head, 1.0))
+        self.assertAlmostEqual(seen[1][1], 0.75)
+
+    def test_an_overrunning_commit_probe_is_run_incomplete(self):
+        # La preuve de cx2 : une sonde lente ne doit pas rendre selection-unsafe.
+        now = [100.0]
+        deadline = calls.Deadline(0.03, clock=lambda: now[0])
+        seen = {}
+
+        def probe(repo, rev, *, timeout=None):
+            seen["timeout"] = timeout
+            now[0] += timeout
+            raise canon.GitError("git rev-parse: timed out")
+
+        with mock.patch.object(plan_git, "_commit", side_effect=probe):
+            with self.assertRaises(pv.PrevalidationError) as caught:
+                calls.prepare(self.repo.root, self.repo.head, self.repo.base,
+                              deadline=deadline)
+        self.assertEqual(caught.exception.cause, "run-incomplete")
+        self.assertAlmostEqual(seen["timeout"], 0.03)
+
+
+class CommitProbeTest(unittest.TestCase):
+    def test_the_probe_keeps_no_lazy_fetch_and_the_bound(self):
+        # #1749 ne doit pas se perdre en bornant la sonde (#2665).
+        seen = {}
+
+        def fake_git(repo, *args, **kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(returncode=0, stdout=b"a" * 40 + b"\n")
+
+        with mock.patch.object(plan_git, "_git", side_effect=fake_git):
+            got = plan_git._commit("/repo", "abc", timeout=1.25)
+        self.assertEqual(got, "a" * 40)
+        self.assertEqual(seen.get("timeout"), 1.25)
+        self.assertIs(seen.get("env_extra"), canon.NO_LAZY_FETCH)
 
 
 class RunTest(unittest.TestCase):

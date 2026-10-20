@@ -1472,8 +1472,8 @@ def _git(repo: str, *args: str, stdin: bytes | None = None,
         raise GitError("git %s: %s" % (args[0], exc.strerror or exc)) from exc
 
 
-def _git_out(repo: str, *args: str) -> str | None:
-    proc = _git(repo, *args)
+def _git_out(repo: str, *args: str, timeout: float = GIT_TIMEOUT) -> str | None:
+    proc = _git(repo, *args, timeout=timeout)
     if proc.returncode != 0:
         return None
     return proc.stdout.decode("utf-8", "replace").strip()
@@ -1613,11 +1613,11 @@ def git_toplevel(directory: str) -> str | None:
     return os.path.realpath(out) if out else None
 
 
-def git_commit(repo: str, rev: str) -> str | None:
+def git_commit(repo: str, rev: str, *, timeout: float = GIT_TIMEOUT) -> str | None:
     if not rev or rev.startswith("-"):
         return None
     return _git_out(repo, "rev-parse", "--verify", "--quiet", "--end-of-options",
-                    rev + "^{commit}")
+                    rev + "^{commit}", timeout=timeout)
 
 
 _SHA_RE = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
@@ -1662,12 +1662,13 @@ def git_fast_forward(repo: str, commit: str) -> str:
     return ""
 
 
-def _git_list(repo: str, commit: str, prefix: str) -> list[tuple[str, str]]:
+def _git_list(repo: str, commit: str, prefix: str, *,
+              timeout: float = GIT_TIMEOUT) -> list[tuple[str, str]]:
     """[(chemin dans le dépôt, sha du blob)] des fichiers ordinaires sous `prefix`."""
     args = ["ls-tree", "-r", "-z", "--full-tree", commit]
     if prefix:
         args += ["--", prefix]
-    proc = _git(repo, *args)
+    proc = _git(repo, *args, timeout=timeout)
     if proc.returncode != 0:
         raise GitError("git ls-tree: %s" % proc.stderr.decode("utf-8", "replace").strip())
     out = []
@@ -1707,17 +1708,19 @@ def _git_blobs(repo: str, shas: Iterable[str]) -> dict[str, bytes]:
     return out
 
 
-def _git_read(repo: str, commit: str, path: str) -> bytes | None:
-    proc = _git(repo, "cat-file", "blob", "%s:%s" % (commit, path))
+def _git_read(repo: str, commit: str, path: str, *,
+              timeout: float = GIT_TIMEOUT) -> bytes | None:
+    proc = _git(repo, "cat-file", "blob", "%s:%s" % (commit, path), timeout=timeout)
     return proc.stdout if proc.returncode == 0 else None
 
 
-def git_read(repo: str, commit: str, path: str) -> bytes | None:
+def git_read(repo: str, commit: str, path: str, *,
+             timeout: float = GIT_TIMEOUT) -> bytes | None:
     """Contenu de `path` au commit `commit` (objets git), ou None."""
     if not _SHA_RE.fullmatch(commit or ""):
         return None
     try:
-        return _git_read(repo, commit, path)
+        return _git_read(repo, commit, path, timeout=timeout)
     except GitError:
         return None
 

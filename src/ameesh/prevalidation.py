@@ -100,20 +100,34 @@ class PrevalidationError(Exception):
         self.why = why
 
 
-def load_parameters(repo: str, commit: str, project: str):
+def load_parameters(repo: str, commit: str, project: str, *,
+                    deadline: Deadline | None = None):
     """Lit le canon relu (#1616) et rend `(document, bloc prevalidation)`.
 
     Le consommateur explicite refuse un bloc absent, cause `block-missing` :
     aucune sélection, aucun hôte et aucun délai ne se supposent. L'accroche
     automatique du gel ne l'appelle pas tant que la règle n'est pas adoptée.
     Le lecteur `mechanics` est importé ici pour rester nommément refusable.
+    Avec ``deadline`` (#2665), les lectures git du canon ne prennent que le
+    temps qui reste ; une échéance épuisée est ``run-incomplete``, jamais un
+    ``block-missing`` trompeur.
     """
     try:
         from . import mechanics
     except ImportError as exc:  # lecteur absent : refus nommé, jamais de repli
         raise PrevalidationError("block-missing",
                                  "mechanics reader absent: %s" % exc) from exc
-    document = mechanics.load(repo, commit, project)
+    if deadline is not None and deadline.expired():
+        raise PrevalidationError(
+            "run-incomplete", "budget de prévalidation épuisé avant la lecture du canon")
+    try:
+        document = mechanics.load(repo, commit, project, deadline=deadline)
+    except mechanics.MechanicsError:
+        if deadline is not None and deadline.expired():
+            raise PrevalidationError(
+                "run-incomplete",
+                "budget de prévalidation épuisé pendant la lecture du canon") from None
+        raise
     if document.prevalidation is None:
         raise PrevalidationError("block-missing",
                                  "%s has no prevalidation block" % document.source)
