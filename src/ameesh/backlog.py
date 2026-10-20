@@ -369,15 +369,15 @@ def rules(cfg, project: str) -> Rules | None:
 
 
 #: une source de relecture : « relecture #313 », « verdict dev7 #2525 »,
-#: « R2 #1300 », « review of #12 », « avis … #N »
+#: « R2 #1300 », « review of #12 », « en relisant #N », « avis … #N »
 REVIEW_WORDS = re.compile(
-    r"\b(?:relectures?|relire|relis|relit|relu|relue|relus|verdicts?|reviews?|reviewed|"
+    r"\b(?:relectures?|relire|relis|relit|relisant|relu|relue|relus|verdicts?|reviews?|reviewed|"
     r"avis|r[0-9])\b", re.I)
 #: une référence de lot `#N` (jamais `owner/repo#N`, une issue GitHub)
 LOT_REF = re.compile(r"(?<![\w/])#([0-9]+)\b")
 #: ce qui précède un `#N` qui n'est pas un lot : « PR #1943 », « pull request
-#: #1943 », « issue #12 »
-NOT_LOT_REF = re.compile(r"\b(?:prs?|pull(?:\s+requests?)?|issues?)\s*$", re.I)
+#: #1943 », « pull-request #1943 », « issue #12 »
+NOT_LOT_REF = re.compile(r"\b(?:prs?|pull(?:[\s-]+requests?)?|issues?)\s*$", re.I)
 
 
 def _lot_ref(text: str) -> int | None:
