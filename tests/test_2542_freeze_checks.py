@@ -130,6 +130,29 @@ class ScriptTest(unittest.TestCase):
         code, _out = self.main(root)
         self.assertEqual(code, 2)
 
+    def test_garde_mecanique_refuse_un_litteral_et_montre_le_constat(self):
+        """#2809 : le vrai garde du projet tourne sur l'arbre contrôlé."""
+        root = self.tree()
+        shutil.copyfile(REPO / "scripts/garde-mecanique.py",
+                        pathlib.Path(root, "scripts/garde-mecanique.py"))
+        checks = tuple(c for c in script.CHECKS
+                       if "scripts/garde-mecanique.py" in c[1])
+        self.assertEqual(len(checks), 1)
+        source = pathlib.Path(root, "src/ameesh/example.py")
+        source.write_text("def f(*, distinct_families=False):\n    pass\n",
+                          encoding="utf-8")
+        code, out = self.main(root, checks)
+        self.assertEqual(code, 1, out)
+        self.assertIn("RED garde mécanique", out)
+        self.assertIn("src/ameesh/example.py", out)
+        self.assertIn("reviews.distinct_families", out)
+        # Une lecture dynamique du canon est acceptée par le même contrôle.
+        source.write_text("distinct_families = policy.distinct_families\n",
+                          encoding="utf-8")
+        code, out = self.main(root, checks)
+        self.assertEqual(code, 0, out)
+        self.assertIn("ok  garde mécanique", out)
+
 
 class GuardTest(unittest.TestCase):
     """`freeze_checks` : le script du commit gelé, sur l'arbre de ce commit."""
