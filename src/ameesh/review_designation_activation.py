@@ -1160,6 +1160,50 @@ def _latest_freeze(db, lot: int) -> Optional[dict]:
             "at_ts": row.get("at_ts"), "actor": row.get("actor") or ""}
 
 
+def frozen_authors(db, item: Mapping) -> Optional[list]:
+    """Les auteurs de la tête gelée, tels que la désignation de son gel les a lus.
+
+    #2864 : la proposition de relecture (#1677) doit écarter les familles de
+    **tous** les auteurs de la plage gelée, comme la désignation au gel
+    (#1617) et la porte (#2726), et pas seulement celle de l'assigné au gel.
+    La marque `review-designation` du dernier gel garde la lecture exacte de
+    `review_authors.reading` (noms, familles, preuves) : c'est cette lecture
+    qui fait foi ici, sans relire la plage ni deviner une famille.
+
+    Rend la liste `{name, family}`, ou None quand aucune lecture durable n'est
+    disponible : pas de gel, pas de marque pour ce gel, journal illisible,
+    marque antérieure à #2721 (sans `authors`), ou liste vide. L'appelant
+    échoue alors fermé — aucune proposition de relecture.
+    """
+    lot = int((item or {}).get("id") or 0)
+    if not lot:
+        return None
+    freeze = _latest_freeze(db, lot)
+    if freeze is None:
+        return None
+    try:
+        marks = _marks(db, lot, freeze_id=int(freeze["id"]),
+                       since_ts=float(freeze.get("at_ts") or 0.0))
+    except Exception:  # noqa: BLE001 - journal illisible : lecture inconnue
+        return None
+    for _row_id, kind, noted, _ts in reversed(marks or ()):
+        if kind != "designation":
+            continue
+        rows = noted.get("authors")
+        if not isinstance(rows, list):
+            continue
+        authors = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            name = str(row.get("name") or "").strip()
+            if name:
+                authors.append({"name": name,
+                                "family": str(row.get("family") or "").strip().lower()})
+        return authors or None
+    return None
+
+
 def _lock_current_freeze(db, lot: int, freeze: Mapping) -> bool:
     """Locks the lot row and says whether `freeze` is still the latest one.
 
