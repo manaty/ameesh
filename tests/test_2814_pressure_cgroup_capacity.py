@@ -314,6 +314,7 @@ class _Provider:
         self.replies = []
         self.release_replies = []
         self.need_gate: threading.Event | None = None
+        self.release_gate: threading.Event | None = None
 
     def need(self, event):
         self.events.append(event)
@@ -324,6 +325,8 @@ class _Provider:
 
     def release(self, event):
         self.events.append(event)
+        if self.release_gate is not None:
+            self.release_gate.wait(2.0)
         return self.release_replies.pop(0) if self.release_replies \
             else {"action": "none"}
 
@@ -429,6 +432,55 @@ class CapacityProviderTest(unittest.TestCase):
         self.assertEqual(done[0]["state"], "requested")
         self.assertEqual(manager.snapshot()["state"], "requested")
 
+    def test_a_release_in_flight_is_never_started_twice(self):
+        # B1 (seconde sonde) : deux observe concurrents ne lancent pas deux
+        # release ; le second ne doit ni effacer ni remplacer le slot.
+        provider = _Provider()
+        provider.release_gate = threading.Event()
+        manager = capacity.Manager(provider, min_interval_s=0,
+                                   needs_per_hour=5, release_after_s=0)
+        self.assertEqual(manager.need(host="h", agent="a")["capacity_id"], "c1")
+        clock = [101.0]
+        manager._clock = lambda: clock[0]
+        manager.observe(False)  # the calm starts
+        clock[0] = 102.0
+        done = []
+        thread = threading.Thread(target=lambda: done.append(manager.observe(False)))
+        thread.start()
+        deadline = time.time() + 2.0
+        while len(provider.events) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual([e["event"] for e in provider.events], ["need", "release"])
+        # a second fresh verdict while the RPC is in flight: no second call
+        self.assertIsNone(manager.observe(False))
+        self.assertEqual(len(provider.events), 2)
+        provider.release_gate.set()
+        thread.join(3.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(done[0]["state"], "released")
+        self.assertIsNone(manager.snapshot())
+
+    def test_a_release_wait_is_not_a_confirmation(self):
+        # B2 (contrat de réponse) : wait/refused/objet vide ne libèrent pas.
+        provider = _Provider()
+        provider.release_replies = [{"action": "wait"},
+                                    {"action": "none"}]
+        clock = [100.0]
+        manager = capacity.Manager(provider, now=lambda: clock[0],
+                                   min_interval_s=0, needs_per_hour=5,
+                                   release_after_s=0)
+        manager.need(host="h", agent="a")
+        clock[0] = 101.0
+        manager.observe(False)
+        clock[0] = 102.0
+        failed = manager.observe(False)
+        self.assertEqual(failed["state"], "release_failed")
+        self.assertEqual(failed["capacity_id"], "c1")
+        clock[0] = 110.0
+        self.assertEqual(manager.need(host="h", agent="b")["state"], "release_failed")
+        clock[0] = 133.0
+        self.assertEqual(manager.observe(False)["state"], "released")
+
     def test_a_failed_release_keeps_the_slot_until_confirmed(self):
         # B2 de la relecture Codex : une libération en échec ne rouvre pas une
         # seconde allocation ; le même capacity_id est représenté.
@@ -468,32 +520,59 @@ class CapacityProviderTest(unittest.TestCase):
 
 
 class MailExpiryTest(unittest.TestCase):
-    def test_only_a_signed_past_deadline_expires(self):
-        self.assertFalse(mail.is_expired({"signature_expires_ts": None}))
-        self.assertFalse(mail.is_expired({"signature_expires_ts": 0}))
-        self.assertFalse(mail.is_expired({"signature_expires_ts": time.time() + 60}))
-        self.assertTrue(mail.is_expired({"signature_expires_ts": time.time() - 1}))
-        self.assertFalse(mail.is_expired({"signature_expires_ts": "nope"}))
+    def test_a_signature_ttl_is_not_a_request_deadline(self):
+        now = time.time()
+        row = {"signature_expires_ts": now - 1, "payload": {}}
+        self.assertIsNone(mail.request_deadline(row))
+        self.assertFalse(mail.request_expired(row))
+        # even a signed message past its signature TTL is not a request
+        # deadline: an owner order must not disappear because its signature
+        # has aged
+        self.assertFalse(mail.request_expired(
+            {"signature_expires_ts": 0, "payload": None}))
+
+    def test_only_an_explicit_request_deadline_expires(self):
+        now = time.time()
+        self.assertTrue(mail.request_expired(
+            {"payload": {"request_expires_ts": now - 1}}))
+        self.assertFalse(mail.request_expired(
+            {"payload": {"request_expires_ts": now + 60}}))
+        for value in (None, 0, -1, True, "soon", float("nan")):
+            with self.subTest(value=value):
+                self.assertIsNone(mail.request_deadline(
+                    {"payload": {"request_expires_ts": value}}))
+                self.assertFalse(mail.request_expired(
+                    {"payload": {"request_expires_ts": value}}))
 
 
 class MailExpiryDbTest(PgTestCase):
-    def test_drop_expired_settles_without_a_turn(self):
+    def test_drop_expired_settles_only_explicit_request_deadlines(self):
         now = time.time()
-        old = storage.of(self.db).mailbox.send(
+        expired = storage.of(self.db).mailbox.send(
             "orchestre", "relecteur", "requête expirée", host="atelier",
-            kind="request", payload={}, work_item_id=None, signature="s",
-            signature_key="k", signed_payload="{}", nonce="n",
-            created_us=None, expires_us=int((now - 60) * 1_000_000))
+            kind="request",
+            payload={"request_expires_ts": int(now - 60)},
+            work_item_id=None, signature=None, signature_key=None,
+            signed_payload=None, nonce=None, created_us=None, expires_us=None)
         live = storage.of(self.db).mailbox.send(
             "orchestre", "relecteur", "requête vivante", host="atelier",
+            kind="request",
+            payload={"request_expires_ts": int(now + 60)},
+            work_item_id=None, signature=None, signature_key=None,
+            signed_payload=None, nonce=None, created_us=None, expires_us=None)
+        # a signed message past its signature TTL but with no request deadline
+        # is NOT expired: it stays deliverable
+        signed_old = storage.of(self.db).mailbox.send(
+            "orchestre", "relecteur", "ordre signé ancien", host="atelier",
             kind="request", payload={}, work_item_id=None, signature="s",
-            signature_key="k", signed_payload="{}", nonce="n2",
-            created_us=None, expires_us=int((now + 60) * 1_000_000))
+            signature_key="k", signed_payload="{}", nonce="n3",
+            created_us=None, expires_us=int((now - 60) * 1_000_000))
         unread = mail.unread(self.db, "relecteur")
-        self.assertEqual([row["id"] for row in unread], [old["id"], live["id"]])
+        self.assertEqual([row["id"] for row in unread],
+                         [expired["id"], live["id"], signed_old["id"]])
         self.assertEqual(mail.drop_expired(self.db, unread), 1)
         self.assertEqual([row["id"] for row in mail.unread(self.db, "relecteur")],
-                         [live["id"]])
+                         [live["id"], signed_old["id"]])
 
 
 class QueueJsonDbTest(PgTestCase):
@@ -663,3 +742,23 @@ class RunnerCgroupDbTest(test_canon._CanonDbCase):
         self.assertEqual(needs[0]["agent"], "orchestre")
         row = registry.get(self.db, "orchestre")
         self.assertIn("capacity requested", row["status_text"])
+
+
+class RunnerExpiredRequestDbTest(test_canon._CanonDbCase):
+    def test_an_expired_request_notifies_the_sender_and_never_starts(self):
+        self.sync()
+        sent = mail.send(self.db, "relecteur", "orchestre", "requête à échéance",
+                         host="atelier", kind="request",
+                         payload={"request_expires_ts": int(time.time() - 60)})
+        proc = self.runner("--once", "--wait", "0", "--agents", "orchestre",
+                           env=self.env(
+                               AMEESH_CANON=self.root, AMEESH_CANON_UNTRUSTED="1",
+                               AMEESH_HOST="atelier", AMEESH_RESOURCE_INTERVAL="0"))
+        self.assertIsNotNone(proc.returncode, proc.stdout + proc.stderr)
+        self.assertEqual(self.turns(), [])
+        self.assertEqual(mail.unread(self.db, "orchestre"), [])
+        notices = mail.unread(self.db, "relecteur")
+        self.assertEqual(len(notices), 1, notices)
+        self.assertEqual(notices[0]["sender"], "ameesh")
+        self.assertIn("expired", notices[0]["body"])
+        self.assertEqual(mail.message_payload(notices[0]).get("request_expired"), sent)

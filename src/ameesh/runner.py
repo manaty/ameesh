@@ -4039,15 +4039,20 @@ class AgentWorker(threading.Thread):
     def _live_mail(self, rows) -> list[dict]:
         """#2814 : les messages qui peuvent encore ouvrir un tour.
 
-        Une requête signée dont l'échéance (`signature_expires_at`) est
-        passée ne démarre JAMAIS : elle est soldée sans tour (la deadline
-        était explicite) et le journal dit combien. Un échec de base laisse
-        le message en place, mais il ne passe pas non plus : on ne démarre
-        pas après l'échéance, même si le solde a échoué."""
+        Une requête dont l'échéance EXPLICITE (`payload.request_expires_ts`,
+        posée par `--request-expires`) est passée ne démarre JAMAIS : elle est
+        soldée sans tour et l'EXPÉDITEUR reçoit un événement qui dit l'échéance
+        (le message reste dans l'historique et le fil). La TTL de signature
+        (`signature_expires_at`) n'est PAS une échéance de requête : un ordre
+        signé non lu ne disparaît pas parce que sa signature a vieilli. Un
+        échec de base laisse le message en place, mais il ne passe pas non
+        plus : on ne démarre pas après l'échéance, même si le solde a échoué."""
         rows = list(rows or ())
-        expired = [row for row in rows if mail.is_expired(row)]
+        expired = [row for row in rows if mail.request_expired(row)]
         if not expired:
             return rows
+        for row in expired:
+            self._notify_expired_request(row)
         try:
             mail.drop_expired(self.db, expired)
         except db_mod.DbError as exc:
@@ -4055,7 +4060,29 @@ class AgentWorker(threading.Thread):
         else:
             log_async("[%s] %d request(s) expired before a turn: not started"
                       % (self.name, len(expired)))
-        return [row for row in rows if not mail.is_expired(row)]
+        return [row for row in rows if not mail.request_expired(row)]
+
+    def _notify_expired_request(self, row: dict) -> None:
+        """#2814 : dit à l'expéditeur qu'une requête à échéance explicite n'a
+        pas été livrée, avant de la solder. Un message de service `ameesh`
+        (événement) laisse une trace dans le fil ; jamais pour soi-même."""
+        sender = str(row.get("sender") or "")
+        mid = row.get("id")
+        if not sender or sender in ("ameesh", self.name):
+            return
+        deadline = mail.request_deadline(row)
+        when = time.strftime("%Y-%m-%d %H:%M:%S",
+                             time.localtime(deadline)) if deadline else "?"
+        body = ("request #%s expired at %s before a turn could start: it was not "
+                "delivered. Resend it with a new --request-expires deadline if still "
+                "needed." % (mid, when))
+        try:
+            mail.send(self.db, "ameesh", sender, body, kind="event",
+                      payload={"request_expired": int(mid) if mid else None},
+                      work_item_id=row.get("work_item_id"))
+        except Exception as exc:  # a notice never blocks the settlement
+            log("[%s] expired request #%s notice not sent (%s)"
+                % (self.name, mid, type(exc).__name__))
 
     def _queue_since(self, waiting: bool) -> float:
         """#2814 : âge (s) du premier tour retenu, 0 sans travail en attente.

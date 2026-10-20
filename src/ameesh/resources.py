@@ -1872,9 +1872,9 @@ def parse_queue_status(text: str | None) -> dict | None:
     None for any other status. `state` is `queued` (a turn is waiting, not
     running); `scope`, `critical`, `queued_s`, `retry_s`, `capacity` and the
     human `detail` are the fields of `queue_text`. A turn never starts after
-    its request expired: ameesh mail has no expiry by default, and a signed
-    message's `signature_expires_at` is the deadline when it has one
-    (`mail.expired`)."""
+    its request expired: only an explicit `payload.request_expires_ts` is a
+    deadline (`mail.request_expired`); a signature's `signature_expires_at`
+    is not one, and mail without the explicit key never expires."""
     match = _QUEUE_STATUS_RE.match((text or "").strip())
     if match is None:
         return None

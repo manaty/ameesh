@@ -49,6 +49,10 @@ import time
 SCHEMA = "ameesh-capacity/1"
 EVENTS = ("need", "release")
 ACTIONS = ("granted", "wait", "none", "refused", "error")
+#: release replies that CONFIRM the capacity is gone; anything else (wait,
+#: refused, unknown, missing action) keeps the slot `release_failed` and is
+#: retried with the same `capacity_id`
+RELEASE_CONFIRMATIONS = ("none", "granted", "released")
 #: borne de la réponse d'un fournisseur lue sur sa sortie standard
 MAX_REPLY_BYTES = 4096
 #: délai d'un appel de fournisseur (secondes)
@@ -331,6 +335,10 @@ class Manager:
             state_name = state.get("state")
             if state_name == "requesting":
                 return None  # the provider need call is still in flight
+            if state_name == "releasing":
+                # a release RPC is in flight: never start a second one (the
+                # caller that finishes would otherwise drop a newer slot)
+                return None
             if state_name == "requested":
                 if blocked:
                     self._idle_since = None
@@ -340,7 +348,7 @@ class Manager:
                     return None
                 if now - self._idle_since < self.release_after_s:
                     return None
-            elif state_name in ("releasing", "release_failed"):
+            elif state_name == "release_failed":
                 # the capacity exists: release it even if pressure came back;
                 # retry only after the delay, and only a bounded number of
                 # times (a failed release still holds the slot)
@@ -365,22 +373,27 @@ class Manager:
         except Exception as exc:
             reply = {"action": "error", "error": type(exc).__name__}
         reply = dict(reply) if isinstance(reply, dict) else {"action": "error"}
-        action = reply.get("action") or "none"
-        failed = action == "error"
+        action = reply.get("action")
+        # Explicit confirmation only: a provider that says `wait`, `refused`,
+        # gives no action or an unknown one has NOT released the capacity.
+        failed = not (isinstance(action, str) and action in RELEASE_CONFIRMATIONS)
         with self._lock:
-            if failed and self._outstanding is state:
+            if self._outstanding is not state:
+                # another release/need replaced the slot while this RPC was in
+                # flight; never clear or overwrite someone else's allocation
+                result = dict(self._outstanding or state)
+            elif failed:
                 state = dict(state)
                 state["state"] = "release_failed"
-                state["action"] = "error"
-                state["detail"] = reply.get("detail") or reply.get("error")
+                state["action"] = action or "error"
+                state["detail"] = reply.get("detail") or reply.get("error") \
+                    or "release not confirmed (%r)" % (action,)
                 if state["release_attempts"] >= self.max_release_attempts:
                     state["next_retry"] = None
                 else:
                     state["next_retry"] = now + self.release_retry_s
                 self._outstanding = state
                 result = dict(state)
-            elif failed:
-                result = dict(self._outstanding or state)
             else:
                 self._outstanding = None
                 self._idle_since = None
