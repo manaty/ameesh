@@ -82,14 +82,17 @@ def _reading(row: dict) -> dict:
     # L159e6 (0361): `guard_restart` read as text (whatever the driver)
     if isinstance(row.get("guard_restart"), str):
         row["guard_restart"] = json.loads(row["guard_restart"])
-    # #2814 (0469): the cgroup measure as a mapping, {} before the migration
-    cgroup = row.get("cgroup")
-    if isinstance(cgroup, str):
-        try:
-            cgroup = json.loads(cgroup)
-        except ValueError:
-            cgroup = None
-    row["cgroup"] = cgroup if isinstance(cgroup, dict) else {}
+    # #2814 (0469): the cgroup measure as a mapping, {} before the migration.
+    # Une lecture étroite (#2851, disk_history) qui ne sélectionne pas la
+    # colonne ne doit pas gagner la clé : on ne normalise que si elle est là.
+    if "cgroup" in row:
+        cgroup = row.get("cgroup")
+        if isinstance(cgroup, str):
+            try:
+                cgroup = json.loads(cgroup)
+            except ValueError:
+                cgroup = None
+        row["cgroup"] = cgroup if isinstance(cgroup, dict) else {}
     return row
 
 
