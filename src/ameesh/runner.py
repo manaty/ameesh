@@ -3952,13 +3952,15 @@ class AgentWorker(threading.Thread):
         Exacte quand le marqueur la porte (#2166 : `agent:index:created_at`,
         texte UTC à la microseconde), jamais dérivée d'un float8 relu — une
         connexion à précision réduite en perd les derniers chiffres. Un
-        marqueur d'avant 0471 (`spend_key` NULL) garde la clé historique
-        dérivée du float8 : sa réparation dédoublonne la ligne déjà écrite et
-        règle la réservation existante. Un float reste accepté pour les
-        appelants historiques (tests) et ne sert qu'à ce repli.
+        marqueur d'avant 0471 (`spend_key` NULL) porte `ledger_key`, la clé
+        durable déjà écrite par son tour (ligne ou réservation, retrouvée par
+        l'identité du marqueur côté stockage) : sa réparation dédouble la
+        ligne existante et règle la réservation, quelle que soit la précision
+        de la connexion. Un float reste accepté pour les appelants
+        historiques (tests) et ne sert qu'à ce repli.
         """
         if isinstance(marker, dict):
-            key = marker.get("spend_key")
+            key = marker.get("ledger_key") or marker.get("spend_key")
             if key:
                 return str(key)
             cree = marker.get("created_ts")

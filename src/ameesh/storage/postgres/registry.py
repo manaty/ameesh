@@ -1137,7 +1137,11 @@ class PendingSpend(interface.PendingSpend):
              None if work_item_id is None else int(work_item_id),
              turn_id or None, name, int(start_index)),
         )
-        return rows[0] if rows else None
+        if not rows:
+            return None
+        row = rows[0]
+        row["ledger_key"] = row.get("spend_key")
+        return row
 
     def set_model(self, name, model) -> bool:
         rows = self.db.query(
@@ -1165,6 +1169,46 @@ class PendingSpend(interface.PendingSpend):
                 (value, name, str(created_at), spend_key))
         return bool(rows)
 
+    def _durable_ledger_key(self, row) -> str | None:
+        """La clé déjà écrite par ce tour, même sur un marqueur d'avant 0471.
+
+        Un marqueur d'avant 0471 n'a pas de `spend_key`. La clé de son tour
+        vit dans la ligne du grand livre ou dans la réservation #1469 ; elle a
+        été calculée par l'ancien exécuteur avec SA précision float8, que la
+        connexion de réparation ne connaît pas (0→3 change le texte). On la
+        retrouve donc par l'identité du marqueur, pas en la recalculant : le
+        marqueur étant le tour le PLUS RÉCENT (un nouveau `put` l'aurait
+        remplacé), la première ligne écrite après son `created_at` est la
+        sienne, et la première réservation de même. Aucune des deux : le tour
+        n'a rien écrit, la clé exacte du marqueur suffit.
+
+        Deux clés différentes (ligne et réservation) ne peuvent venir que du
+        même vieux tour : on rend celle de la ligne, qui dédouble le grand
+        livre, et le règlement la retrouve.
+        """
+        if row.get("spend_key"):
+            return str(row["spend_key"])
+        created_at = row.get("created_at")
+        if not created_at:
+            return None
+        lines = self.db.query(
+            "SELECT spend_key FROM turn_costs"
+            " WHERE agent = %s AND spend_key IS NOT NULL"
+            "   AND recorded_at >= %s::timestamptz"
+            " ORDER BY recorded_at ASC, id ASC LIMIT 1",
+            (row["agent"], created_at))
+        if lines:
+            return str(lines[0]["spend_key"])
+        reservations = self.db.query(
+            "SELECT spend_key FROM account_reservations"
+            " WHERE agent = %s AND spend_key IS NOT NULL"
+            "   AND created_at >= %s::timestamptz"
+            " ORDER BY created_at ASC, id ASC LIMIT 1",
+            (row["agent"], created_at))
+        if reservations:
+            return str(reservations[0]["spend_key"])
+        return "%s:%s:%s" % (row["agent"], int(row["start_index"]), created_at)
+
     def get(self, name) -> dict | None:
         rows = self.db.query(
             """
@@ -1176,7 +1220,13 @@ class PendingSpend(interface.PendingSpend):
             """,
             (name,),
         )
-        return rows[0] if rows else None
+        if not rows:
+            return None
+        row = rows[0]
+        # #2166 : la clé exacte si le marqueur la porte, sinon celle déjà
+        # écrite par son tour (ligne ou réservation), jamais un float8 recalculé.
+        row["ledger_key"] = self._durable_ledger_key(row)
+        return row
 
     def clear(self, name) -> bool:
         rows = self.db.query("DELETE FROM spend_pending WHERE agent = %s RETURNING agent",

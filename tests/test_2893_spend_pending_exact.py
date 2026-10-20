@@ -169,6 +169,10 @@ class PendingSpendExactTest(PgTestCase):
             db.execute(
                 "INSERT INTO turn_costs (agent, harness, turn, model, usd, spend_key)"
                 " VALUES (%s, 'deepseek', 'tour', 'm', 1.5, %s)", (name, legacy_key))
+            # La réparation relit le marqueur APRÈS que l'ancien exécuteur a
+            # écrit sa ligne : c'est cette lecture qui retrouve la clé durable.
+            marker = registry.pending_spend_get(db, name)
+            self.assertEqual(marker["ledger_key"], legacy_key)
             worker = self._worker(db, name)
             self.assertTrue(worker._compta_ecrit(marker))
             lignes = db.query(
@@ -201,6 +205,102 @@ class PendingSpendExactTest(PgTestCase):
             self.assertIsNone(registry.pending_spend_get(db, name))
         finally:
             db.close()
+
+    def _legacy_marker(self, db, name: str) -> dict:
+        """Un marqueur d'avant 0471, à la microseconde .123456."""
+        db.execute(
+            "INSERT INTO spend_pending (agent, start_index, turn, model, created_at)"
+            " VALUES (%s, 0, 'tour', 'm',"
+            "  date_trunc('second', now()) - interval '5 minutes'"
+            "  + interval '0.123456 seconds')", (name,))
+        marker = registry.pending_spend_get(db, name)
+        self.assertIsNone(marker["spend_key"])
+        return marker
+
+    def test_reparation_avant_0471_sous_une_autre_precision_ne_double_pas(self):
+        """0→3 : la clé durable vient de la ligne, pas du float8 recalculé.
+
+        L'ancien exécuteur a écrit la ligne sous `extra_float_digits=0`
+        (…123460) ; la réparation lit le marqueur sous 3 (…123456). Recalculer
+        la clé historique doublerait le grand livre : elle se retrouve par
+        l'identité du marqueur (première ligne après son `created_at`).
+        """
+        db0 = self._db(0)
+        try:
+            name = "legacy-precision"
+            marker = self._legacy_marker(db0, name)
+            legacy_key = "%s:0:%.6f" % (name, float(marker["created_ts"]))
+            self.assertNotEqual(legacy_key, "%s:0:%s" % (name, marker["created_at"]))
+            db0.execute(
+                "INSERT INTO turn_costs (agent, harness, turn, model, usd, spend_key,"
+                " recorded_at) VALUES (%s, 'deepseek', 'tour', 'm', 1.5, %s, now())",
+                (name, legacy_key))
+        finally:
+            db0.close()
+        db3 = self._db(3)
+        try:
+            marker3 = registry.pending_spend_get(db3, name)
+            recalc = "%s:0:%.6f" % (name, float(marker3["created_ts"]))
+            self.assertNotEqual(recalc, legacy_key,
+                                "la précision n'a pas changé : le test ne couvre rien")
+            self.assertEqual(marker3["ledger_key"], legacy_key,
+                             "la clé durable n'a pas été retrouvée dans la ligne")
+            worker = self._worker(db3, name)
+            self.assertTrue(worker._compta_ecrit(marker3))
+            lignes = db3.query(
+                "SELECT spend_key, usd::float8 AS usd FROM turn_costs WHERE agent = %s",
+                (name,))
+            self.assertEqual(len(lignes), 1, "la réparation a doublé la ligne")
+            self.assertEqual(lignes[0]["spend_key"], legacy_key)
+            self.assertAlmostEqual(lignes[0]["usd"], 1.5)
+            self.assertIsNone(registry.pending_spend_get(db3, name))
+        finally:
+            db3.close()
+
+    def test_reparation_avant_0471_reservation_ouverte_autre_precision(self):
+        """0→3, réservation encore ouverte : sa clé exacte est retrouvée.
+
+        Le tour est mort avant d'écrire sa ligne : la seule clé durable est
+        celle de la réservation #1469. La réparation doit écrire la ligne sous
+        cette clé et régler la réservation, sans en créer une autre.
+        """
+        db0 = self._db(0)
+        try:
+            name = "legacy-reservation"
+            marker = self._legacy_marker(db0, name)
+            legacy_key = "%s:0:%.6f" % (name, float(marker["created_ts"]))
+            db0.execute(
+                "INSERT INTO account_reservations (billing_account, agent, usd,"
+                " period, state, spend_key, created_at)"
+                " VALUES ('deepseek-manaty', %s, 2.0, current_date, 'open', %s, now())",
+                (name, legacy_key))
+        finally:
+            db0.close()
+        db3 = self._db(3)
+        try:
+            marker3 = registry.pending_spend_get(db3, name)
+            recalc = "%s:0:%.6f" % (name, float(marker3["created_ts"]))
+            self.assertNotEqual(recalc, legacy_key)
+            self.assertEqual(marker3["ledger_key"], legacy_key,
+                             "la clé de la réservation n'a pas été retrouvée")
+            worker = self._worker(db3, name)
+            self.assertTrue(worker._compta_ecrit(marker3))
+            lignes = db3.query(
+                "SELECT spend_key, billing_account FROM turn_costs WHERE agent = %s",
+                (name,))
+            self.assertEqual(len(lignes), 1)
+            self.assertEqual(lignes[0]["spend_key"], legacy_key)
+            self.assertEqual(lignes[0]["billing_account"], "deepseek-manaty")
+            reservation = db3.query(
+                "SELECT state FROM account_reservations WHERE spend_key = %s",
+                (legacy_key,))[0]
+            # Une réparation est incertaine (L13) : la réservation est gardée
+            # (`kept`), mais elle a bien été retrouvée par sa clé et la ligne
+            # lui est rattachée (billing_account ci-dessus).
+            self.assertEqual(reservation["state"], "kept")
+            self.assertIsNone(registry.pending_spend_get(db3, name))
+        finally:
+            db3.close()
 
 
 if __name__ == "__main__":  # pragma: no cover

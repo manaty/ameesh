@@ -577,9 +577,13 @@ class PendingSpend(Domain):
     @abc.abstractmethod
     def get(self, name: str) -> dict | None:
         """Le marqueur (agent, start_index, turn, model, created_at,
-        created_ts, spend_key, work_item_id, turn_id, resident_usage), ou None.
-        `created_at` est l'identité exacte (#2166) ; `created_ts` reste
-        l'epoch float8 pour le début du tour (`turn_costs.started_at`)."""
+        created_ts, spend_key, ledger_key, work_item_id, turn_id,
+        resident_usage), ou None. `created_at` est l'identité exacte (#2166) ;
+        `spend_key` est la clé du marqueur (NULL avant 0471) ; `ledger_key` est
+        la clé déjà écrite par ce tour — celle du marqueur, ou celle retrouvée
+        dans sa ligne `turn_costs`/sa réservation #1469 pour un marqueur
+        d'avant 0471 ; `created_ts` reste l'epoch float8 pour le début du tour
+        (`turn_costs.started_at`)."""
 
     @abc.abstractmethod
     def clear(self, name: str) -> bool:
