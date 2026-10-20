@@ -126,21 +126,21 @@ class BuildTest(unittest.TestCase):
 
 class StopTest(unittest.TestCase):
     def test_strict_stop_refuses_an_unknown_or_foreign_agent(self):
-        db = object()
-        store = SimpleNamespace(agents=SimpleNamespace(get=lambda _n: None))
-        with mock.patch("ameesh.storage.of", return_value=store):
-            with self.assertRaises(ValueError):
-                D.stop_agent(cfg(), db, "agent-a", strict=True)
-        store = SimpleNamespace(agents=SimpleNamespace(get=lambda _n: {"host": "other"}))
-        with mock.patch("ameesh.storage.of", return_value=store):
-            with self.assertRaises(ValueError):
-                D.stop_agent(cfg(), db, "agent-a", strict=True)
+        for rows in ([], [{"name": "agent-a", "host": "other"}]):
+            db = mock.MagicMock()
+            db.transaction.return_value.__enter__.return_value = db
+            db.query.return_value = rows
+            with mock.patch("ameesh.registry.set_status") as set_status:
+                with self.assertRaises(ValueError):
+                    D.stop_agent(cfg(), db, "agent-a", strict=True)
+            set_status.assert_not_called()
+            self.assertIn("FOR NO KEY UPDATE", db.query.call_args.args[0])
 
     def test_strict_stop_uses_the_same_gesture_as_agent_runner_stop(self):
-        db = object()
-        store = SimpleNamespace(agents=SimpleNamespace(get=lambda _n: {"host": HOST}))
-        with mock.patch("ameesh.storage.of", return_value=store), \
-                mock.patch("ameesh.registry.set_status") as set_status, \
+        db = mock.MagicMock()
+        db.transaction.return_value.__enter__.return_value = db
+        db.query.return_value = [{"name": "agent-a", "host": HOST}]
+        with mock.patch("ameesh.registry.set_status") as set_status, \
                 mock.patch("ameesh.work.measurement_actor", return_value="auditeur"), \
                 mock.patch("ameesh.work.release_lots", return_value=[{"id": 382}]) as release:
             returned = D.stop_agent(cfg(), db, "agent-a", strict=True)

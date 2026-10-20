@@ -365,13 +365,22 @@ def stop_agent(cfg, db, name: str, *, strict: bool = False) -> list[dict]:
     """
     if not isinstance(name, str) or not NAME_RE.match(name):
         raise ValueError("invalid agent name: %r" % (name,))
-    from . import registry, storage as storage_mod, work as work_mod
+    from . import registry, work as work_mod
     if strict:
-        row = storage_mod.of(db).agents.get(name)
-        if row is None:
-            raise ValueError("unknown agent: %s" % name)
-        if (row.get("host") or "") != (getattr(cfg, "host", "") or ""):
-            raise ValueError("agent %s is not on this host" % name)
+        # Keep the host check and the whole stop in one transaction: a
+        # concurrent placement must not move the agent between the check
+        # and the status/lot writes. Existing lock order: registry -> lots.
+        with db.transaction() as tx:
+            rows = tx.query(
+                "SELECT name, host FROM agent_registry WHERE name = "
+                "(SELECT ameesh_resolve_agent_name(%s, %s)) FOR NO KEY UPDATE",
+                (name, "device.stop"))
+            if not rows:
+                raise ValueError("unknown agent: %s" % name)
+            row = rows[0]
+            if (row.get("host") or "") != (getattr(cfg, "host", "") or ""):
+                raise ValueError("agent %s is not on this host" % name)
+            return stop_agent(cfg, tx, row["name"])
     registry.set_status(db, name, "stopped", status_text="stopped by hand",
                         stop_reason="manuel")
     measure_actor = work_mod.measurement_actor(db, cfg)
