@@ -215,6 +215,19 @@ class ServeurExecTest(PgTestCase):
         self.assertEqual(result.status, 200, result.body)
         self.assertIsNone(self.row("inge-front")["runner_seen_at"])
 
+    def test_runner_seen_includes_admitted_stopped_agents_without_waking_them(self):
+        self.db.execute("UPDATE agent_registry SET status = 'stopped', lease_owner = NULL,"
+                        " lease_expires_at = NULL WHERE name IN ('inge-front', 'tresorier')")
+        result = self.op("agents.runner_seen", ["wrong-host", OWNER, None])
+        self.assertEqual(result.status, 200, result.body)
+        row = self.row("inge-front")
+        self.assertIsNotNone(row["runner_seen_at"])
+        self.assertEqual(row["runner_seen_host"], HOST)
+        self.assertEqual(row["runner_seen_owner"], OWNER)
+        self.assertEqual(row["status"], "stopped")
+        self.assertIsNone(row["lease_owner"])
+        self.assertIsNone(self.row("tresorier")["runner_seen_at"])
+
     def test_runner_seen_refuses_foreign_owner_and_session(self):
         result = self.op("agents.runner_seen", [HOST, "host:123", None])
         self.assertEqual(result.status, 403, result.body)

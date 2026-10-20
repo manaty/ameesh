@@ -28,6 +28,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 #: (nom, arguments de l'interpréteur) ; un `unittest` nomme des classes de la suite
 CHECKS = (
+    # #2809/#2449 : refuser les paramètres du canon codés en dur avant la relecture
+    ("garde mécanique #2449", ["scripts/garde-mecanique.py", "--root", "."]),
     # une erreur de syntaxe ne se voit sinon qu'à l'import, dans la part qui l'importe
     ("compilation", ["-m", "compileall", "-q", "-j", "0", "src", "scripts", "tests"]),
     # #1632/#1944 : aucune classe de test concrète d'un autre module liée au module

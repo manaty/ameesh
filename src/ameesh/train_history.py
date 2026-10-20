@@ -123,6 +123,11 @@ class Recorded:
         gate = merge_queue.review_gate(
             self.db, marks, head, repo=self.path, klass=klass, item=historical,
             required=required, authors=authors,
+            # #2726 : le train lit les drapeaux compilés qu'il applique déjà au
+            # compte d'avis ; la porte les reçoit au lieu de supposer un repli.
+            exclude_author_family=getattr(self.review_rules, "exclude_author_family",
+                                           None),
+            distinct_families=getattr(self.review_rules, "distinct_families", None),
             family_of=lambda name: family_of.get(str(name or "").strip().lower(), ""))
         if gate.get("error"):
             raise TrainError(gate["error"])

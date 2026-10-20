@@ -134,6 +134,35 @@ class GateCorrectorTest(PgTestCase):
             self.db, work.milestones(self.db, self.lot), self.frozen,
             repo=self.repo.root, klass=klass, item=work.get(self.db, self.lot))
 
+    def vehicle_gate(self):
+        """#2766 B cx3: the proper-delta class comes from `class_of_paths` and
+        carries no provenance base; the gate must keep the lot's, or #2739's
+        corrector exclusion is skipped on the vehicle's own delta."""
+        klass = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "src/ameesh/merge_queue.py",
+                            "class": "sensitive",
+                            "rule": ["src/ameesh/merge_queue.py"]}],
+                 "repo": self.repo.root, "target": self.base,
+                 "base_sha": self.base}
+        delta = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "src/ameesh/merge_queue.py",
+                            "class": "sensitive",
+                            "rule": ["src/ameesh/merge_queue.py"]}]}
+        return merge_queue.review_gate(
+            self.db, work.milestones(self.db, self.lot), self.frozen,
+            repo=self.repo.root, klass=klass, item=work.get(self.db, self.lot),
+            vehicle={"ok": None, "required": 1, "klass": delta})
+
+    def test_2766_a_vehicle_delta_keeps_the_provenance_base(self):
+        out = self.vehicle_gate()
+        self.assertFalse(out.get("error"), out)
+        self.assertEqual(out["corrections"], ["cx2"])
+        self.assertTrue(out["ok"], out["why"])
+        # cx2 (the corrector) is out; cx3, same codex family, stays eligible.
+        self.assertEqual([entry["actor"] for entry in out["accepted"]],
+                         ["cx3", "dev1"])
+        self.assertNotIn("cx2", [entry["actor"] for entry in out["accepted"]])
+
     def test_the_corrector_verdict_does_not_count_and_its_family_does(self):
         out = self.gate()
         self.assertFalse(out.get("error"), out)
@@ -161,6 +190,32 @@ class GateCorrectorTest(PgTestCase):
         self.assertEqual(receipt["actor"], "cx2")
         out = self.gate()
         self.assertEqual(out["corrections"], ["cx2"])
+
+    def test_the_gate_reads_the_coauthor_it_was_not_given(self):
+        # #2726 : la porte lit elle-même les auteurs de la plage gelée quand
+        # l'appelant ne les passe pas (le feu, la file, le paquet). Un tiers
+        # avec reçu exact est un auteur : ni son avis ni sa famille ne comptent.
+        self.repo.write("src/ameesh/work.py", "lot\ncx2 small fix\nthird work\n")
+        head = self.repo.commit("third: coauthor")
+        self.receipt("third", "claude", [head])
+        registry.upsert(self.db, "third", harness="claude", host=self.cfg.host,
+                        cwd=self.repo.root, status="idle")
+        work.milestone(self.db, self.lot, "frozen", sha=head, actor="author")
+        for actor in ("third", "cx3"):
+            work.milestone(self.db, self.lot, "verdict", sha=head,
+                           actor=actor, verdict="ok")
+        self.frozen = head
+        klass = {"class": "normal", "doubt": False,
+                 "repo": self.repo.root, "target": self.base,
+                 "base_sha": self.base}
+        out = merge_queue.review_gate(
+            self.db, work.milestones(self.db, self.lot), self.frozen,
+            repo=self.repo.root, klass=klass, item=work.get(self.db, self.lot),
+            required=1)
+        self.assertFalse(out.get("error"), out)
+        self.assertIn("third", {entry["name"] for entry in out["authors"]})
+        self.assertNotIn("third", [entry["actor"] for entry in out["accepted"]])
+        self.assertEqual([entry["actor"] for entry in out["accepted"]], ["cx3"])
 
     def test_unreadable_correction_provenance_refuses_the_gate(self):
         self.db.execute("DELETE FROM provenance_receipts WHERE subject = %s",
