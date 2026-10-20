@@ -176,6 +176,17 @@ class DeliveryTest(PgTestCase):
         self.watcher(api).tick(self.db, NOW + 901)
         self.assertEqual(len(self.messages()), 2)
 
+    def test_unreadable_external_body_is_delivered_without_excerpt(self):
+        api = Api([dict(issue(), body="Please inspect " + "A" * 300)])
+        self.assertEqual(self.watcher(api).tick(self.db, NOW)[0]["events"], 1)
+        messages = self.messages()
+        self.assertEqual(len(messages), 1)
+        self.assertIn("not reproduced", messages[0]["body"])
+        self.assertIn("acme/app#1", messages[0]["body"])
+        self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW)
+        self.watcher(api).tick(self.db, NOW + 901)
+        self.assertEqual(len(self.messages()), 1)
+
     def test_stale_scan_cannot_replay_an_old_comment_version(self):
         old = watch.collect(Api(comments=[comment()]), SUB, NOW)
         new = watch.collect(Api(comments=[comment(body="Edited")]), SUB, NOW)
