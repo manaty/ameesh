@@ -89,9 +89,9 @@ marqueur de conflit). Le seul contenu hors fusions est ce manifeste.
 - `scripts/garde-mecanique.py --json` : **0 constat**, 0 exemption inutilisée.
 - `scripts/doc-links.py` : 172 fichiers, **0 lien cassé**.
 - `scripts/freeze-checks.py` : **6 contrôles verts**.
-- Tests ciblés Python sur l'arbre composé (pilote psql local, les 26 modules
-  touchés ou de contrat) : **à compléter par le résultat du run** ; la suite
-  complète les couvre en CI.
+- Tests ciblés Python sur l'arbre composé (pilote psql local, 6 modules :
+  #2843, #2851, #2808, #2844, #2786, #1374 — **179 tests, 0 échec**, 5 min
+  22 s) ; le pilote psycopg et la suite complète sont couverts par la CI.
 - Migrations : **aucune** au diff (`git diff --name-only` sans `.sql` ni
   `migrations/`).
 - UI : aucun fichier UI au diff.
