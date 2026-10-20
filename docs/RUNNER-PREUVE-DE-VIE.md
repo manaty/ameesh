@@ -35,7 +35,9 @@ La disponibilité de l’hôte ne bloque pas cette preuve de vie.
 
 `ameesh resume` avertit aussi pour une persona arrêtée sans bail, sauf si
 elle porte une preuve du même hôte, avec une identité de runner, datant
-d’au plus deux intervalles (`max(60 s, poll, runner_liveness_interval)`).
+d’au plus `2 × max(60 s, poll, runner_liveness_interval)`.
+Ce seuil utilise la configuration locale de `resume` et suppose une cadence
+homogène dans le mesh, y compris pour le runner de l’hôte distant.
 L’âge est mesuré avec l’heure de la base. Cette preuve évite un avertissement
 quand le runner a rendu normalement le bail ; elle ne garantit pas un tour
 immédiat et ne change pas la valeur `runner_live`, réservée au bail.

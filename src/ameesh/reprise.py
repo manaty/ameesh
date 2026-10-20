@@ -1427,8 +1427,11 @@ def resume(cfg: Config, db, name: str, *, brief: str = "", fresh: bool = False,
     if not live and not runner_seen:
         # #293: without a lease (or #2625's stopped-agent proof), the queued
         # instruction waits for a runner, including admission/capacity holds.
-        warn("no runner holds %s's lease on %s: the instruction waits until a runner "
-             "serves it again" % (name, row.get("host") or "?"))
+        warning = ("no runner has reported serving %s on %s recently"
+                   if row.get("status") == "stopped"
+                   else "no runner holds %s's lease on %s")
+        warn((warning + ": the instruction waits until a runner serves it again")
+             % (name, row.get("host") or "?"))
     decision = plan(cfg, db, row, fresh=fresh)
     if (not live and decision["keep"] and decision["session"]
             and (row.get("host") or "") == cfg.host):

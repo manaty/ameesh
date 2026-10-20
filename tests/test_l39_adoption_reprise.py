@@ -486,7 +486,8 @@ class ResumeTest(_Base):
         avertissements: list[str] = []
         out = reprise.resume(self.cfg, self.db, "orphelin", warn=avertissements.append)
         self.assertFalse(out["runner_live"])
-        self.assertTrue(any("no runner" in a for a in avertissements), avertissements)
+        self.assertTrue(any("no runner holds orphelin's lease" in a
+                            for a in avertissements), avertissements)
 
     def test_resume_warns_only_without_runner(self):
         # A live lease, or a recent runner pass for a stopped agent, avoids
@@ -522,7 +523,9 @@ class ResumeTest(_Base):
                 out = reprise.resume(self.cfg, self.db, name, brief="REPRENDRE",
                                      warn=warnings.append)
                 self.assertFalse(out["runner_live"])
-                self.assertTrue(any("no runner holds" in w for w in warnings), warnings)
+                self.assertIn(
+                    "no runner has reported serving %s on %s recently: the instruction "
+                    "waits until a runner serves it again" % (name, self.cfg.host), warnings)
                 self.assertIn("REPRENDRE", registry.get(self.db, name)["pending_prompt"])
 
     def test_resume_stopped_respects_runner_interval(self):
