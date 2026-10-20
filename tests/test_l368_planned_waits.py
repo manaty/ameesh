@@ -120,6 +120,25 @@ class PacketTrailersTest(unittest.TestCase):
             self.assertEqual(W.packet_attachments(None, [carrier], db=db),
                              {9001: {1234, 5678}})
 
+    def test_registry_clone_reads_the_observed_head_not_a_stale_published_ref(self):
+        # #2837 : un clone du registre peut garder une ref publiée en retard.
+        # La tête observée (`branch_head`) fait foi : un lot retiré de la
+        # recomposition ne reste pas attaché au véhicule.
+        old = self.packet_branch()
+        self.git("remote", "add", "origin", self.repo)
+        self.git("update-ref", "refs/remotes/origin/main", "main")
+        self.git("update-ref", "refs/remotes/origin/integration/paquet-test", old)
+        self.git("checkout", "-q", "-b", "observed", "main")
+        self.commit("vehicule : #5678 abcdef0\n\nameesh-work: 5678")
+        head = self.git("rev-parse", "HEAD").strip()
+        carrier = {"id": 9001, "state": "qa", "app": "ameesh",
+                   "branch": "integration/paquet-test", "branch_head": head}
+        with mock.patch.object(registry, "overview",
+                               return_value=[{"cwd": self.repo}]):
+            self.assertEqual(W.packet_attachments(None, [carrier],
+                                                  db=types.SimpleNamespace()),
+                             {9001: {5678}})
+
     def test_a_registry_clone_without_the_carrier_head_attaches_nothing(self):
         self.packet_branch()
         carrier = {"id": 9001, "state": "qa", "app": "ameesh",

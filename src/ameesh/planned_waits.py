@@ -254,18 +254,20 @@ def _carrier_ref(repo, carrier):
     return None
 
 
-def packet_trailers(repo, carrier, target=None):
+def packet_trailers(repo, carrier, target=None, *, head=None):
     """#2599 : les lots liés par les trailers `ameesh-work:` de la branche.
 
     Le corps du lot porteur peut manquer la liste « #N <tête> » (paquets
     h-2300 et h-0100) ; les commits de composition `vehicule …` portent, eux,
     leur `ameesh-work: <lot>`. On ne lit que les commits **au-dessus de la
     cible** (`<merge-base>..<branche>`) : les trailers hérités de `main` ne
-    désignent pas les unités de ce paquet. Rend un ensemble, ou None quand la
-    branche n'est pas lisible — un doute ne tait aucune alerte."""
+    désignent pas les unités de ce paquet. `head` (#2837) lit un commit exact
+    — la tête observée du porteur quand le dépôt a été retrouvé par elle — au
+    lieu d'une ref de clone qui peut être en retard. Rend un ensemble, ou None
+    quand la branche n'est pas lisible — un doute ne tait aucune alerte."""
     from . import plan_git
 
-    ref = _carrier_ref(repo, carrier)
+    ref = head or _carrier_ref(repo, carrier)
     if ref is None:
         return None
     rev = ref
@@ -286,22 +288,26 @@ def packet_trailers(repo, carrier, target=None):
 
 
 def _carrier_repo(db, cfg, carrier, *, overview=None):
-    """Le dépôt local où lire la composition d'un porteur (#2599, #2837).
+    """Le dépôt local et la tête exacte où lire la composition (#2599, #2837).
 
-    `radar.projects` d'abord : l'hôte opérateur connaît le dépôt du projet.
-    Un hôte d'agents ne l'a pas forcément ; on y retrouve alors un clone qui
-    résout la tête observée (`branch_head`), la ref publiée de la branche ou
-    la branche locale — la même découverte que `lot_class.repo_for_freeze`
-    (#2564), sans quoi un porteur composé sur cet hôte restait invisible et
-    ses unités levaient un faux retard `verdict_merge`. Sans dépôt, aucun
+    `radar.projects` d'abord : l'hôte opérateur connaît le dépôt du projet, et
+    la ref publiée qu'il y lit est la plus fraîche (tête rendue vide : c'est
+    `packet_trailers` qui choisit la ref). Un hôte d'agents ne l'a pas
+    forcément ; on y retrouve alors un clone qui résout la tête observée
+    (`branch_head`), la ref publiée de la branche ou la branche locale — la
+    même découverte que `lot_class.repo_for_freeze` (#2564), sans quoi un
+    porteur composé sur cet hôte restait invisible et ses unités levaient un
+    faux retard `verdict_merge`. La tête résolue est rendue avec le dépôt :
+    lire ce commit exact plutôt qu'une ref de clone en retard garantit qu'un
+    lot retiré du véhicule ne reste pas attaché. Sans dépôt, aucun
     attachement : le doute ne tait aucune alerte."""
     from . import lot_class
 
     repo = lot_class.repository(cfg, carrier)
     if repo:
-        return repo
+        return repo, ""
     if db is None:
-        return None
+        return None, ""
     branch = str(carrier.get("branch") or "").strip()
     refs = [str(carrier.get("branch_head") or "").strip()]
     if branch:
@@ -310,13 +316,13 @@ def _carrier_repo(db, cfg, carrier, *, overview=None):
         if not ref:
             continue
         try:
-            repo, _commit = lot_class.repo_for_freeze(
+            repo, commit = lot_class.repo_for_freeze(
                 db, cfg, carrier, ref, overview=overview)
         except Exception:  # noqa: BLE001 - registre ou clone illisible : doute
             continue
         if repo:
-            return repo
-    return None
+            return repo, str(commit or "")
+    return None, ""
 
 
 def packet_attachments(cfg, open_items, rows=(), *, db=None):
@@ -352,7 +358,8 @@ def packet_attachments(cfg, open_items, rows=(), *, db=None):
     out: dict[int, set[int]] = {}
     for cid, carrier in carriers.items():
         try:
-            repo = repos[cid] or _carrier_repo(db, cfg, carrier, overview=overview)
+            repo, head = ((repos[cid], "") if repos[cid]
+                          else _carrier_repo(db, cfg, carrier, overview=overview))
             if not repo:
                 continue
             target = lot_class.default_base(cfg, carrier, repo)
@@ -360,7 +367,7 @@ def packet_attachments(cfg, open_items, rows=(), *, db=None):
                 target = plan_git.default_target(repo)
             if not target:
                 continue
-            members = packet_trailers(repo, carrier, target)
+            members = packet_trailers(repo, carrier, target, head=head or None)
         except Exception:  # noqa: BLE001 - dépôt illisible : aucune conclusion
             continue
         if members:
