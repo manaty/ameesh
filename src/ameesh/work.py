@@ -1018,6 +1018,15 @@ def release_lots(db: Db, agent: str, *, reason: str, actor: str = "",
         stopped_with=stopped_with)
 
 
+def held_lots(db: Db, agents) -> dict[str, dict]:
+    """#2877 : ce que ces agents tiennent encore, en une lecture sans verrou —
+    par nom, `open` (un lot ouvert) et `promoted` (un lot promu) ; un agent qui
+    ne tient rien est absent. `release_lots` verrouille la ligne du registre de
+    l'agent : on ne l'appelle que s'il y a quelque chose à rendre."""
+    names = [(name or "").strip() for name in agents]
+    return storage.of(db).work.held_by([name for name in names if name])
+
+
 def measurement_actor(db: Db, cfg=None, *, listing=None, canons=None) -> str:
     """#753 : l'acteur de la mesure post-déploiement d'un lot promu —
     l'auditeur du registre (l'agent `auditeur`, ou celui dont la fiche Agent

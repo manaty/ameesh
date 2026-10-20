@@ -19,12 +19,15 @@ NOW = 1800000000
 
 
 def issue(n=1, **kw):
-    return dict(id=n, number=n, title="A request", body="Please fix export", updated_at=watch.iso(NOW - 1000), **kw)
+    return dict(id=n, number=n, title="A request", body="Please fix export",
+                html_url="https://github.com/acme/app/issues/%d" % n,
+                updated_at=watch.iso(NOW - 1000), **kw)
 
 
 def comment(n=10, body="More information"):
-    return dict(id=n, issue_url="https://api.github.com/repos/acme/app/issues/1", body=body,
-                updated_at=watch.iso(NOW - 1000))
+    return dict(id=n, issue_url="https://api.github.com/repos/acme/app/issues/1",
+                html_url="https://github.com/acme/app/issues/1#issuecomment-%d" % n,
+                body=body, updated_at=watch.iso(NOW - 1000))
 
 
 class Api:
@@ -57,6 +60,15 @@ class CollectionTest(unittest.TestCase):
         row = dict(comment(), user={"login": "smichea"})
         events = watch.collect(Api(comments=[row]), SUB, NOW)
         self.assertEqual([(e["kind"], e["object_id"]) for e in events], [("comment", 10)])
+
+    def test_discussion_comment_on_a_pull_request_is_included_with_its_link(self):
+        row = comment(12, "Please check this")
+        row["issue_url"] = "https://api.github.com/repos/acme/app/issues/7"
+        row["html_url"] = "https://github.com/acme/app/pull/7#issuecomment-12"
+        events = watch.collect(Api(comments=[row]), SUB, NOW)
+        self.assertEqual(events[0]["issue_ref"], "acme/app#7")
+        self.assertEqual(events[0]["url"],
+                         "https://github.com/acme/app/pull/7#issuecomment-12")
 
     def test_projection_comments_are_marked_on_wire_and_filtered(self):
         gh = mock.Mock()
@@ -268,12 +280,25 @@ class CollectionTest(unittest.TestCase):
         with self.assertRaisesRegex(plan_github.GithubError, "stale quota fallback"):
             watch.collect(api, SUB, NOW)
 
-    def test_instruction_links_existing_lots_and_requires_judgment(self):
+    def test_digest_links_existing_lots_and_requires_judgment(self):
         event = watch.collect(Api(comments=[comment()]), SUB, NOW)[0]
-        text = watch.instruction(SUB, event, [dict(id=42, state="build", assignee="author")])
-        for part in ("#42 (build, author)", "issue_ref acme/app#1", "ameesh decide ask",
-                     "untrusted external data", "lot note and wake", event["url"]):
+        text = watch.digest(SUB, [event], [dict(id=42, state="build", assignee="author",
+                                                issue_ref="acme/app#1")])
+        for part in ("#42 (build, author)", "acme/app#1", "ameesh decide ask",
+                     "untrusted external data", "information → lot note and wake its author",
+                     event["url"]):
             self.assertIn(part, text)
+        self.assertNotIn("wake its assignee", text)
+        instruction = watch.instruction(SUB, event, [])
+        self.assertIn("information → lot note and wake its author", instruction)
+        self.assertNotIn("wake its assignee", instruction)
+
+    def test_digest_is_bounded_and_every_entry_keeps_its_link(self):
+        events = watch.collect(Api([issue(n) for n in range(1, 4)]), SUB, NOW)
+        text = watch.digest(SUB, events)
+        self.assertIn("3 input(s)", text)
+        for event in events:
+            self.assertIn(event["url"], text)
 
 
 class DeclarationTest(unittest.TestCase):
@@ -288,18 +313,47 @@ class DeclarationTest(unittest.TestCase):
         self.assertEqual(watch.subscriptions([self.bundle()]), [SUB])
         self.assertEqual(watch.subscriptions([NS(agents=[])]), [])
 
-    def test_no_implicit_role_or_foreign_project(self):
+    def test_no_implicit_role_or_foreign_project_is_ignored_and_logged(self):
         for change in (dict(roles=[]), dict(effective_projects=["other"])):
-            with self.subTest(change=change), self.assertRaises(ValueError):
-                watch.subscriptions([self.bundle(**change)])
+            warnings = []
+            with self.subTest(change=change):
+                self.assertEqual(watch.subscriptions([self.bundle(**change)],
+                                                     log=warnings.append), [])
+                self.assertTrue(warnings)
 
-    def test_invalid_cadence_and_conflicting_designation(self):
+    def test_invalid_cadence_and_conflicting_designation_are_isolated(self):
         for interval in (True, 0, 3601, float("nan"), "900"):
-            with self.subTest(interval=interval), self.assertRaises(ValueError):
-                watch.subscriptions([self.bundle(fiche=NS(data={"github_watch": {
-                    "app": {"repos": ["acme/app"], "interval": interval}}}))])
-        with self.assertRaisesRegex(ValueError, "multiple"):
-            watch.subscriptions([self.bundle(), self.bundle(title="other")])
+            warnings = []
+            fiche = NS(data={"github_watch": {
+                "app": {"repos": ["acme/app"], "interval": interval}}})
+            with self.subTest(interval=interval):
+                self.assertEqual(watch.subscriptions([self.bundle(fiche=fiche)],
+                                                     log=warnings.append), [])
+                self.assertIn("interval", warnings[0])
+        warnings = []
+        kept = watch.subscriptions([self.bundle(), self.bundle(title="other")],
+                                   log=warnings.append)
+        self.assertEqual(kept, [SUB])
+        self.assertIn("multiple", warnings[0])
+
+    def test_one_bad_declaration_does_not_disable_the_valid_ones(self):
+        warnings = []
+        kept = watch.subscriptions([self.bundle(title="bad", roles=[]), self.bundle()],
+                                   log=warnings.append)
+        self.assertEqual(kept, [SUB])
+        self.assertIn("role github-watch", warnings[0])
+
+    def test_bad_project_and_repository_keep_the_siblings(self):
+        fiche = NS(data={"github_watch": {
+            "app": {"repos": ["acme/app", "not-a-repo", "acme/site"]},
+            "other": {"repos": []}}})
+        warnings = []
+        kept = watch.subscriptions([self.bundle(
+            effective_projects=["app", "other"], fiche=fiche)], log=warnings.append)
+        self.assertEqual([(sub.project, sub.repo) for sub in kept],
+                         [("app", "acme/app"), ("app", "acme/site")])
+        self.assertTrue(any("not-a-repo" in warning for warning in warnings))
+        self.assertTrue(any("other" in warning for warning in warnings))
 
 
 class DeliveryTest(PgTestCase):
@@ -318,24 +372,29 @@ class DeliveryTest(PgTestCase):
     def test_restart_and_overlap_do_not_duplicate_but_comment_edit_is_delivered(self):
         api = Api([issue()], [comment()])
         self.watcher(api).tick(self.db, NOW)
-        self.assertEqual(len(self.messages()), 2)
+        messages = self.messages()
+        self.assertEqual(len(messages), 1)
+        self.assertIn("2 input(s)", messages[0]["body"])
+        self.assertIn("acme/app#1", messages[0]["body"])
+        self.assertEqual(messages[0]["payload"]["github_watch"]["count"], 2)
         self.watcher(api).tick(self.db, NOW + 901)
-        self.assertEqual(len(self.messages()), 2)
+        self.assertEqual(len(self.messages()), 1)
         api.comments[0]["body"] = "Updated information"
         self.watcher(api).tick(self.db, NOW + 1802)
-        self.assertEqual(len(self.messages()), 3)
-        self.assertEqual(self.messages()[-1]["payload"]["github_watch"]["issue_ref"], "acme/app#1")
+        self.assertEqual(len(self.messages()), 2)
+        self.assertEqual(self.messages()[-1]["payload"]["github_watch"]["items"][0]["issue_ref"],
+                         "acme/app#1")
         self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW + 1802)
 
     def test_committed_mail_is_written_and_indexed_in_the_thread(self):
         self.watcher(Api([issue()], [comment()])).tick(self.db, NOW)
         messages = self.messages()
-        self.assertEqual(len(messages), 2)
+        self.assertEqual(len(messages), 1)
         transport = fil.transport_for(self.db.cfg)
         entries = [entry for thread in transport.threads()
                    for entry in transport.read(thread)
                    if "GitHub watch" in entry.text]
-        self.assertEqual(len(entries), 2)
+        self.assertEqual(len(entries), 1)
         self.assertEqual({mid for entry in entries for mid in entry.meta["ids"]},
                          {int(message["id"]) for message in messages})
         indexed = storage.of(self.db).threads.indexed()
@@ -343,22 +402,74 @@ class DeliveryTest(PgTestCase):
 
     def test_delivery_failure_rolls_back_cursor_events_and_all_messages(self):
         api = Api([issue()], [comment()])
-        real_send = mail.send
         calls = []
 
-        def fail_second(*a, **kw):
+        def fail(*a, **kw):
             calls.append(1)
-            if len(calls) == 2:
-                raise RuntimeError("mailbox failure")
-            return real_send(*a, **kw)
+            raise RuntimeError("mailbox failure")
 
-        with mock.patch.object(mail, "send", side_effect=fail_second):
+        with mock.patch.object(mail, "send", side_effect=fail):
             self.assertEqual(self.watcher(api).tick(self.db, NOW), [])
+        self.assertEqual(len(calls), 1)
         self.assertEqual(self.messages(), [])
         self.assertIsNone(storage.of(self.db).github_watch.cursor("app", "acme/app"))
         self.assertEqual(self.db.query("SELECT * FROM github_watch_events"), [])
         self.watcher(api).tick(self.db, NOW + 901)
-        self.assertEqual(len(self.messages()), 2)
+        self.assertEqual(len(self.messages()), 1)
+
+    def test_a_burst_is_one_bounded_digest_and_cursor_waits_for_the_rest(self):
+        api = Api([issue(n) for n in range(1, 6)])
+        watcher = self.watcher(api)
+        with mock.patch.object(watch, "DIGEST_MAX_ITEMS", 3):
+            watcher.tick(self.db, NOW)
+            messages = self.messages()
+            self.assertEqual(len(messages), 1)
+            self.assertIn("3 input(s)", messages[0]["body"])
+            for n in (1, 2, 3):
+                self.assertIn("acme/app#%d" % n, messages[0]["body"])
+            self.assertNotIn("acme/app#4", messages[0]["body"])
+            self.assertEqual(len(self.db.query("SELECT * FROM github_watch_events")), 3)
+            # The bootstrap cursor row exists, but it has not advanced: the
+            # remaining inputs will be re-read and delivered by the next pass.
+            self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"),
+                             NOW - watch.BOOTSTRAP)
+            # A leftover digest continues on the next notifier tick, without
+            # waiting for the repository cadence.
+            watcher.tick(self.db, NOW)
+            messages = self.messages()
+            self.assertEqual(len(messages), 2)
+            self.assertIn("2 input(s)", messages[-1]["body"])
+            self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW)
+            watcher.tick(self.db, NOW + 901)
+            self.assertEqual(len(self.messages()), 2)
+            self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW + 901)
+
+    def test_leftover_digest_holds_the_scan_checkpoint(self):
+        api = Api([issue(n) for n in range(1, 26)])
+        with mock.patch.object(watch, "PAGE_SIZE", 10), \
+                mock.patch.object(watch, "DIGEST_MAX_ITEMS", 3):
+            events, progress, until = watch.collect_batch(
+                api, SUB, NOW - 3600, NOW, None)
+            self.assertEqual(len(events), 10)
+            self.assertIsNotNone(progress)
+            for expected in (3, 3, 3):
+                self.assertEqual(watch.deliver(
+                    self.db, SUB, events, until, [], self.cfg.host, partial=True,
+                    scan_before=None, scan_after=progress), expected)
+                self.assertIsNone(storage.of(self.db).github_watch.scan("app", "acme/app"))
+                self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"),
+                                 NOW - watch.BOOTSTRAP)
+            self.assertEqual(watch.deliver(
+                self.db, SUB, events, until, [], self.cfg.host, partial=True,
+                scan_before=None, scan_after=progress), 1)
+        self.assertEqual(storage.of(self.db).github_watch.scan("app", "acme/app"), progress)
+        self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"),
+                         NOW - watch.BOOTSTRAP)
+        messages = self.messages()
+        self.assertEqual(len(messages), 4)
+        text = "\n".join(message["body"] for message in messages)
+        for n in range(1, 11):
+            self.assertEqual(text.count("- acme/app#%d ·" % n), 1)
 
     def test_unreadable_external_body_is_delivered_without_excerpt(self):
         api = Api([dict(issue(), body="Please inspect " + "A" * 300)])
@@ -387,13 +498,26 @@ class DeliveryTest(PgTestCase):
         api = Api(comments=[comment(n) for n in range(10, 15)])
         with mock.patch.object(watch, "PAGE_SIZE", 2):
             self.watcher(api).tick(self.db, NOW)
-            self.assertEqual(len(self.messages()), 2)
+            messages = self.messages()
+            self.assertEqual(len(messages), 1)
+            self.assertIn("2 input(s)", messages[0]["body"])
+            for n in (10, 11):
+                self.assertIn("#issuecomment-%d" % n, messages[0]["body"])
             progress = storage.of(self.db).github_watch.scan("app", "acme/app")
             self.assertEqual((progress["kind"], progress["page"]), ("comment", 2))
             self.assertLess(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW)
             self.watcher(api).tick(self.db, NOW + 901)
             self.watcher(api).tick(self.db, NOW + 902)
-        self.assertEqual(len(self.messages()), 5)
+        messages = self.messages()
+        self.assertEqual(len(messages), 3)
+        self.assertIn("2 input(s)", messages[1]["body"])
+        self.assertIn("1 input(s)", messages[2]["body"])
+        for n in (12, 13):
+            self.assertIn("#issuecomment-%d" % n, messages[1]["body"])
+        self.assertIn("#issuecomment-14", messages[2]["body"])
+        for n in (10, 11):
+            self.assertNotIn("#issuecomment-%d" % n, messages[1]["body"])
+            self.assertNotIn("#issuecomment-%d" % n, messages[2]["body"])
         self.assertIsNone(storage.of(self.db).github_watch.scan("app", "acme/app"))
         self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW)
         self.assertIn("page=2", api.calls[2])
@@ -404,15 +528,15 @@ class DeliveryTest(PgTestCase):
         with mock.patch.object(watch, "PAGE_SIZE", 2):
             watcher.tick(self.db, NOW)
             watcher.tick(self.db, NOW + 1)
-            self.assertEqual(len(self.messages()), 4)
+            self.assertEqual(len(self.messages()), 2)
             api.issues.append(api.issues.pop(0))
             watcher.tick(self.db, NOW + 2)
-            self.assertEqual(len(self.messages()), 4)
+            self.assertEqual(len(self.messages()), 2)
             self.assertEqual(storage.of(self.db).github_watch.scan("app", "acme/app")["page"], 1)
             self.assertLess(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW)
             for delta in range(3, 8):
                 watcher.tick(self.db, NOW + delta)
-        self.assertEqual(len(self.messages()), 6)
+        self.assertEqual(len(self.messages()), 4)
         self.assertIsNone(storage.of(self.db).github_watch.scan("app", "acme/app"))
         self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW)
 
@@ -421,7 +545,7 @@ class DeliveryTest(PgTestCase):
         watcher = watch.Watcher(self.cfg, api=api,
                                 declarations=[dataclasses.replace(SUB, interval=3600)])
         with mock.patch.object(watch, "PAGE_SIZE", 2):
-            for delta, expected in ((0, 2), (1, 4), (2, 5)):
+            for delta, expected in ((0, 1), (1, 2), (2, 3)):
                 watcher.tick(self.db, NOW + delta)
                 self.assertEqual(len(self.messages()), expected)
         self.assertIsNone(storage.of(self.db).github_watch.scan("app", "acme/app"))
@@ -434,10 +558,14 @@ class DeliveryTest(PgTestCase):
             with mock.patch.object(mail, "send", side_effect=RuntimeError("mailbox failed")):
                 self.assertEqual(self.watcher(api).tick(self.db, NOW + 901), [])
             self.assertEqual(storage.of(self.db).github_watch.scan("app", "acme/app"), progress)
-            self.assertEqual(len(self.messages()), 2)
+            self.assertEqual(len(self.messages()), 1)
             self.watcher(api).tick(self.db, NOW + 1802)
             self.watcher(api).tick(self.db, NOW + 1803)
-        self.assertEqual(len(self.messages()), 5)
+        messages = self.messages()
+        self.assertEqual(len(messages), 3)
+        self.assertIn("2 input(s)", messages[1]["body"])
+        self.assertIn("1 input(s)", messages[2]["body"])
+        self.assertIn("#issuecomment-14", messages[2]["body"])
 
     def test_stale_partial_batch_cannot_rewind_the_checkpoint(self):
         api = Api(comments=[comment(n) for n in range(10, 15)])
@@ -448,7 +576,9 @@ class DeliveryTest(PgTestCase):
             self.assertEqual(watch.deliver(self.db, SUB, events, until, [], self.cfg.host,
                              partial=True, scan_after=progress), 0)
         self.assertEqual(storage.of(self.db).github_watch.scan("app", "acme/app"), progress)
-        self.assertEqual(len(self.messages()), 2)
+        messages = self.messages()
+        self.assertEqual(len(messages), 1)
+        self.assertIn("2 input(s)", messages[0]["body"])
 
     def test_stale_scan_cannot_replay_an_old_comment_version(self):
         old = watch.collect(Api(comments=[comment()]), SUB, NOW)

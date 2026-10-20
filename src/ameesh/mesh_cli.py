@@ -458,8 +458,12 @@ def _host_parts(cfg: Config, db, canons, only: str | None, history: int) -> list
         # L43 (0031) : chaque canon décrit l'hôte par sa fiche Host ; les
         # limites physiques sont les plus strictes, avec leur provenance
         fiches = canon_mod.host_fiches(canons, name)
-        physical = res.host_limits(canons, name)
         latest = latest_by_host.get(name)
+        # #2825 N4 : le défaut de CET hôte vient de SA lecture (ou de sa
+        # fiche) ; pour l'hôte local sans relevé, de sa propre détection.
+        default_scope = res.pressure_scope(None) if name == cfg.host else None
+        physical = res.host_limits(canons, name, reading=latest,
+                                   default_scope=default_scope)
         parts.append({
             "name": name, "fiches": fiches, "physical": physical, "latest": latest,
             "host": fiches[0][1] if fiches else None,
@@ -490,6 +494,7 @@ def _host_json(part: dict) -> dict:
         "limits": limits,
         # #2814 : le périmètre d'admission, à côté des seuils qu'il gouverne
         "pressure_scope": limits.get("pressure_scope"),
+        "scope_fallback": physical.get("scope_fallback"),
         "max_agents": physical["max_agents"],
         "limits_origin": physical["origin"],
         "fiches": [{"canon": canon.id, "default": canon.is_default,
@@ -558,7 +563,7 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
         if getattr(args, "report", False):
             return _host_report(cfg, db, canons, args)
         if getattr(args, "fleet", False):
-            return _host_fleet(db, canons, args)
+            return _host_fleet(cfg, db, canons, args)
         parts = _host_parts(cfg, db, canons, args.host, args.history)
         if not parts:
             print("no known host: no published measurement, no Host card in the canon")
@@ -619,11 +624,15 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                      tag("max_mem_pressure")))
             # #2814 : le périmètre de pression (cgroup du processus ou hôte) ;
             # en `own_cgroup`, la charge 1 min n'est plus un critère
+            # #2825 N2 : un repli faute de mesure cgroup est dit ici.
+            scope_note = "; load advisory only" \
+                if limits.get("pressure_scope") == "own_cgroup" else ""
+            if physical.get("scope_fallback"):
+                scope_note = "; " + physical["scope_fallback"]
             print("  scope      pressure on %s%s%s" % (
                 res.scope_label(limits.get("pressure_scope")),
                 tag("pressure_scope") if fiches else "",
-                "; load advisory only" if limits.get("pressure_scope") == "own_cgroup"
-                else ""))
+                scope_note))
             if limits.get("pressure_scope") == "own_cgroup":
                 print("  thresholds cgroup memory ≤ %s%s; cgroup throttled ≤ %s%s"
                       % (res.fmt_value("max_cgroup_memory_used",
@@ -755,7 +764,10 @@ def _host_report(cfg: Config, db, canons, args: argparse.Namespace) -> int:
               "%g days)" % ((res.HISTORY_RETENTION_S / 86400.0,) * 2), file=sys.stderr)
         return 2
     readings = storage.of(db).hosts.since(args.host, days * 86400.0)
-    limits = res.host_limits(canons, args.host)["limits"]
+    limits = res.host_limits(
+        canons, args.host, reading=readings[-1] if readings else None,
+        default_scope=res.pressure_scope(None) if args.host == cfg.host else None,
+    )["limits"]
     rep = pilot.report(args.host, readings, limits, days=days)
     if args.json:
         print(json.dumps(rep, ensure_ascii=False, sort_keys=True))
@@ -795,7 +807,7 @@ def _host_publish(cfg: Config, args) -> int:
     return 0
 
 
-def _host_fleet(db, canons, args) -> int:
+def _host_fleet(cfg, db, canons, args) -> int:
     """`ameesh hosts --fleet` (#2022): one line per measured or canonical host —
     age of its last reading (stale beyond 1 h), worst disk, zombies, what it
     breaches or warns about; the hosts with something to say first. Meant
@@ -809,9 +821,15 @@ def _host_fleet(db, canons, args) -> int:
         host.title for canon in canons for host in canon.hosts})
     for name in sorted(names):
         reading = readings.get(name, {"host": name})
-        limits = res.host_limits(canons, reading["host"])["limits"]
-        history = (storage.of(db).hosts.since(reading["host"], res.DISK_TREND_WINDOW_S)
-                   if name in readings else [])
+        # #2825 N4 : chaque hôte a SON périmètre, lu dans son relevé ; seul
+        # l'hôte local sans relevé retombe sur sa propre détection.
+        limits = res.host_limits(
+            canons, reading["host"], reading=readings.get(name),
+            default_scope=res.pressure_scope(None) if name == cfg.host else None,
+        )["limits"]
+        history = (storage.of(db).hosts.disk_history(
+            reading["host"], res.DISK_TREND_WINDOW_S, res.DISK_TREND_STEP_S)
+            if name in readings else [])
         lines.append(res.fleet_line(reading, limits, [h for h in history
                                                       if h.get("id") != reading.get("id")],
                                     now=now))

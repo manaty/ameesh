@@ -207,6 +207,9 @@ class MeasureCanonsSpacingTest(_Base):
     def test_canons_are_read_once_per_window(self):
         self.agent("dev1")
         self.lot("A", assignee="dev1")
+        # #2877 : la résolution n'est payée que si l'agent tient encore un lot ;
+        # le lot promu reste à dev1 (pas d'auditeur) et le garde à chaque passe
+        self.promoted("dev1")
         self.stopped("dev1")
         fake = self.sweep_runner()               # pas d'agent nommé `auditeur`
         with mock.patch.object(work, "configured_canons", return_value=[]) as read:

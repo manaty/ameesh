@@ -40,7 +40,7 @@ The executor writes a generated `gh` into `<state>/github/bin/` and puts it firs
 * Only the values of a fixed list of options (`--repo`, `--head`, `--match-head-commit`, `--label`, `-X`…) are kept, and only when they look like identifiers; a free value (`--json`, `--body`…) is masked.
 * A write failure prints a warning and never blocks the command.
 * `ameesh github gestes --match 'run cancel' --since 24h` answers "who cancelled this run". `--agent` and `--json` filter and format the output.
-* It is turned off with `"journal": false` in `github-identities.json`.
+* Journaling is turned off with `"journal": false` in `github-identities.json`; the generated `gh` stays on the turn's `PATH` so it still adds the #2848 comment marker, without writing a journal line.
 
 This is **attribution, not enforcement**. An agent that calls the real `gh` by its absolute path, or the API through `curl`, is not journaled. Enforcement comes from the permissions of separate identities (§3). That holds only if an agent cannot read another role's token: on a host where all agents share one Unix user, mode 0600 does not separate them, and every agent can read every `token_file`. Real separation needs tokens that agents never see (a GitHub App minter that hands out short-lived installation tokens per turn), or separate Unix users or hosts. Until then, per-role identities limit what a role's token can do, not which agent uses it.
 

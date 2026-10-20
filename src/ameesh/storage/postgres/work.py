@@ -2580,6 +2580,22 @@ class WorkItems(interface.WorkItems):
             " WHERE assignee = %%s AND state NOT IN ('merged', 'promoted', 'closed')"
             " ORDER BY id" % item_columns(self.db), (assignee,))
 
+    def held_by(self, agents) -> dict[str, dict]:
+        """#2877 : ce que ces agents tiennent encore, en une lecture sans
+        verrou — par assigné, `open` (un lot ni fusionné, ni promu, ni fermé)
+        et `promoted` (un lot promu) ; un agent qui ne tient rien est absent."""
+        names = sorted({str(name) for name in agents if name})
+        if not names:
+            return {}
+        rows = self.db.query(
+            "SELECT assignee, bool_or(state <> 'promoted') AS open,"
+            "       bool_or(state = 'promoted') AS promoted"
+            "  FROM work_items"
+            " WHERE assignee IN (%s) AND state NOT IN ('merged', 'closed')"
+            " GROUP BY assignee" % ", ".join(["%s"] * len(names)), tuple(names))
+        return {row["assignee"]: {"open": bool(row["open"]),
+                                  "promoted": bool(row["promoted"])} for row in rows}
+
     def release_agent(self, agent, *, reason, actor, measure_actor="",
                       measure_reason="", dry_run=False, stopped_with=()) -> list[dict]:
         """#753 : à l'arrêt d'un agent, ses lots ouverts retournent à la file
