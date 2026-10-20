@@ -715,8 +715,27 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
         return False, ("class: release (%s) — the release procedure belongs to the pilot: "
                        "a fire never arms an automatic merge on a release"
                        % (klass.get("why") or "release")), klass
+    gate_authors = {}
+    if frozen and merge_queue.required_verdicts(klass) > 0:
+        # #1515 N1/B1 : la porte compte tous les auteurs du lot — détenteurs
+        # du journal et auteurs du delta gelé (fusions comprises, petit
+        # correctif de relecteur excepté, #2739) —, pas le seul assigné. Une
+        # provenance illisible refuse la porte. On lit même si la ligne
+        # courante porte une dispense : la porte relit la marque après les
+        # jalons (#2281) et une dispense périmée ne doit pas laisser la porte
+        # sur le seul assigné.
+        try:
+            authors, families = merge_queue._complete_authors(
+                db, row, frozen, repo, target, klass=klass, marks=marks)
+        except merge_queue._ProvenanceError as exc:
+            return False, (
+                "no review verdict ok on the freeze %s (class: %s): the complete "
+                "authors of the lot cannot be established (%s), so no verdict can "
+                "be proven independent (canon §2: independence is never assumed)"
+                % (frozen[:12], klass.get("class") or "?", exc)), klass
+        gate_authors = {"authors": authors, "families": families}
     gate = merge_queue.review_gate(db, marks, frozen, repo=repo, klass=klass,
-                                   item=row, cfg=cfg, target=base)
+                                   item=row, cfg=cfg, target=base, **gate_authors)
     if not gate["ok"]:
         return False, gate["why"], klass
     return True, "", klass

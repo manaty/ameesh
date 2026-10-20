@@ -325,7 +325,8 @@ def actor_family(db, actor: str, at_ts: float, families) -> str:
 def reading(db, item: Mapping, milestone: Optional[Mapping],
             commits: Sequence[str], repo: str = "", families=(),
             *, reference: Optional[Mapping] = None, provider=None,
-            strict: bool = False, trace: bool = False) -> tuple[list, list, list]:
+            strict: bool = False, trace: bool = False,
+            families_out: Optional[dict] = None) -> tuple[list, list, list]:
     """`(auteurs, inconnus, correcteurs)` de la plage gelée, même lecture pour tous.
 
     `reference` est l'auteur de référence déjà lu (`reference_author`) : la
@@ -334,6 +335,9 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     au lieu d'une absence (la désignation attend). `trace=True` (désignation)
     ajoute aux auteurs du repli `proof: turn-journal` et `fallback_commits` ;
     le train et la porte gardent la forme exacte `{name, family}`.
+    `families_out` reçoit, par acteur en minuscules, l'ensemble des familles
+    **prouvées** : une famille vide peut être une absence de preuve ou une
+    ambiguïté, et l'appelant qui doit les distinguer ne peut pas la deviner.
 
     Un commit sans reçu est attribué au committer d'adresse d'agent : un commit
     du titulaire de référence reste le sien ; un relecteur désigné sous le
@@ -471,6 +475,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     out = []
     for actor in sorted(by_name):
         proven = {value for value in by_name[actor] if value}
+        if families_out is not None:
+            families_out[actor.lower()] = set(proven)
         # un acteur à deux familles prouvées est ambigu : jamais deviné
         family = next(iter(proven)) if len(proven) == 1 else ""
         row = {"name": actor, "family": family}
@@ -485,6 +491,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         if actor in by_name:
             continue
         proven = {value for _sha, value in review_commits[actor] if value}
+        if families_out is not None:
+            families_out.setdefault(actor.lower(), set()).update(proven)
         # une ambiguïté de familles ne change rien ici : seul le nom exclut
         family = next(iter(proven)) if len(proven) == 1 else ""
         correctors.append({"name": actor, "family": family})
