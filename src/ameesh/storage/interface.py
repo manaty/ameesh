@@ -4221,6 +4221,14 @@ class GithubWatch(Domain):
     def advance(self, project: str, repo: str, until: float) -> None:
         """Advance after every mailbox deposit succeeded, never backwards."""
 
+    @abc.abstractmethod
+    def scan(self, project: str, repo: str) -> dict | None:
+        """Incomplete scan window and next page, absent when the scan is complete."""
+
+    @abc.abstractmethod
+    def checkpoint(self, project: str, repo: str, progress: dict | None) -> None:
+        """Persist or clear partial progress atomically with mailbox delivery."""
+
 
 class Storage(abc.ABC):
     """Les domaines du stockage, liés à une connexion ou une transaction."""

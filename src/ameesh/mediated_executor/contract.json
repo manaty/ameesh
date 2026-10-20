@@ -4818,9 +4818,11 @@
    ],
    "github_watch": [
     "advance",
+    "checkpoint",
     "cursor",
     "lock",
-    "remember"
+    "remember",
+    "scan"
    ]
   }
  },

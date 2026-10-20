@@ -20,7 +20,10 @@ from .fil import UnreadableBody
 
 OVERLAP = 120
 BOOTSTRAP = 3600
-MAX_PAGES = 100
+MAX_BODY = 16000
+MAX_TITLE = 500
+PAGE_SIZE = 100
+PAGES_PER_TICK = 2
 
 
 @dataclass(frozen=True)
@@ -71,61 +74,76 @@ def iso(ts):
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def pages(api, path, query):
-    for page in range(1, MAX_PAGES + 1):
-        rows = api.get(path + "?" + urlencode(dict(query, per_page=100, page=page)), ttl=0)
+def collect(api, sub, since):
+    """Collect the first bounded batch (without committing scan progress)."""
+    return collect_batch(api, sub, since, since + BOOTSTRAP, None)[0]
+
+
+def events_from(sub, kind, rows):
+    for row in rows:
+        body = row.get("body") or ""
+        if "<!-- ameesh:" in body:
+            continue
+        if kind == "issue" and "pull_request" in row:
+            continue
+        # API issue_url is used only to recover the number, never fetched.
+        number = (row.get("number") if kind == "issue" else
+                  str(row.get("issue_url") or "").rsplit("/", 1)[-1])
+        if not str(number).isdigit() or int(number) <= 0:
+            raise plan_github.GithubError("GitHub watch: missing issue number")
+        object_id = int(row["id"])
+        # Issue updated_at also changes on labels/comments: do not create
+        # another demand for those changes. Edited comment bodies do matter.
+        content = {"body": body, "title": row.get("title") or ""}
+        digest = hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
+        ref = "%s#%s" % (sub.repo, number)
+        url = "https://github.com/%s/issues/%s" % (sub.repo, number)
+        if kind == "comment":
+            url += "#issuecomment-%d" % object_id
+        yield dict(kind=kind, object_id=object_id, digest=digest,
+                   issue_ref=ref, url=url,
+                   body=body[:MAX_BODY], title=content["title"][:MAX_TITLE],
+                   truncated=(len(body) > MAX_BODY or
+                              len(content["title"]) > MAX_TITLE))
+
+
+def collect_batch(api, sub, since, now, scan):
+    """Bound each tick to two pages; persist the exact window and next page."""
+    state = dict(scan) if scan is not None else dict(since=since, until=now, kind="issue", page=1)
+    events = []
+    until = state["until"]
+    for _ in range(PAGES_PER_TICK):
+        kind = state["kind"]
+        path = "/repos/" + sub.repo + ("/issues" if kind == "issue" else "/issues/comments")
+        query = dict(since=iso(state["since"]), sort="updated", direction="asc",
+                     per_page=PAGE_SIZE, page=state["page"])
+        if kind == "issue":
+            query["state"] = "all"
+        rows = api.get(path + "?" + urlencode(query), ttl=0)
         if getattr(getattr(api, "last_read", None), "stale", False):
             raise plan_github.GithubError("GitHub watch: stale quota fallback; cursor retained")
-        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        if not isinstance(rows, list) or len(rows) > PAGE_SIZE or not all(isinstance(r, dict) for r in rows):
             raise plan_github.GithubError("GitHub watch: invalid list response")
-        yield from rows
-        if len(rows) < 100:
-            return
-    # Do not advance past unread pages. A later pass retries the same window.
-    raise plan_github.GithubError("GitHub watch: pagination limit reached; cursor retained")
-
-
-def collect(api, sub, since):
-    """Both feeds include closed issues and comments on old tickets."""
-    root = "/repos/" + sub.repo
-    events = []
-    for kind, path, query in (
-        ("issue", root + "/issues", {"state": "all"}),
-        ("comment", root + "/issues/comments", {}),
-    ):
-        query.update(since=iso(since), sort="updated", direction="asc")
-        for row in pages(api, path, query):
-            body = row.get("body") or ""
-            if "<!-- ameesh:" in body:
-                continue
-            if kind == "issue" and "pull_request" in row:
-                continue
-            # API issue_url is used only to recover the number, never fetched.
-            number = (row.get("number") if kind == "issue" else
-                      str(row.get("issue_url") or "").rsplit("/", 1)[-1])
-            if not str(number).isdigit() or int(number) <= 0:
-                raise plan_github.GithubError("GitHub watch: missing issue number")
-            object_id = int(row["id"])
-            # Issue updated_at also changes on labels/comments: do not create
-            # another demand for those changes. Edited comment bodies do matter.
-            content = {"body": body, "title": row.get("title") or ""}
-            digest = hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
-            ref = "%s#%s" % (sub.repo, number)
-            url = "https://github.com/%s/issues/%s" % (sub.repo, number)
-            if kind == "comment":
-                url += "#issuecomment-%d" % object_id
-            events.append(dict(kind=kind, object_id=object_id, digest=digest,
-                               issue_ref=ref, url=url, **content))
-    return events
+        events.extend(events_from(sub, kind, rows))
+        if len(rows) == PAGE_SIZE:
+            state["page"] += 1
+        elif kind == "issue":
+            state.update(kind="comment", page=1)
+        else:
+            return events, None, until
+    return events, state, until
 
 
 def instruction(sub, event, lots, *, quote=True):
     targets = ", ".join("#%s (%s, %s)" % (lot["id"], lot.get("state"),
                         lot.get("assignee") or "unassigned") for lot in lots) or "none"
-    title = event["title"][:500] if quote else ""
-    body = (event["body"][:16000] if quote else
+    title = event["title"] if quote else ""
+    body = (event["body"] if quote else
             "[external text not reproduced: it is not readable as a message; "
             "read it at the link above]")
+    if event.get("truncated"):
+        body += ("\n[external content truncated: read the complete title and body at "
+                 + event["url"] + " before processing this input]")
     return (
         "GitHub watch — project %s — %s\n%s\nLinked lots: %s\n"
         "Process this input within the hour: new need → create a lot with issue_ref %s; "
@@ -139,13 +157,15 @@ def instruction(sub, event, lots, *, quote=True):
          title, body)
 
 
-def deliver(db, sub, events, until, feed, host):
+def deliver(db, sub, events, until, feed, host, *, partial=False, scan_before=None, scan_after=None):
     """One commit for de-duplication, mailbox deposits and scan cursor."""
     after_commit = []
     count = 0
     with db.transaction() as tx:
         st = storage.of(tx)
         previous = st.github_watch.lock(sub.project, sub.repo, until - BOOTSTRAP)
+        if partial and st.github_watch.scan(sub.project, sub.repo) != scan_before:
+            return 0  # another notifier already committed this batch
         if previous >= until:
             return 0  # another notifier completed this window while we read GitHub
         agent = st.agents.get(sub.agent)
@@ -173,7 +193,10 @@ def deliver(db, sub, events, until, feed, host):
                 # repository: keep the event and its link, drop the excerpt.
                 send(instruction(sub, event, lots, quote=False))
             count += 1
-        st.github_watch.advance(sub.project, sub.repo, until)
+        if partial:
+            st.github_watch.checkpoint(sub.project, sub.repo, scan_after)
+        if not partial or scan_after is None:
+            st.github_watch.advance(sub.project, sub.repo, until)
     for record in after_commit:
         record()
     return count
@@ -208,11 +231,13 @@ class Watcher:
                     self.api = plan_github.client(cache_dir=self.cfg.state_dir)
                 if self.api is None:
                     raise plan_github.GithubError("GitHub watch: no token or gh")
-                events = collect(self.api, sub, (since if since is not None
-                                                else now - BOOTSTRAP) - OVERLAP)
+                scan = storage.of(db).github_watch.scan(*key)
+                events, next_scan, until = collect_batch(
+                    self.api, sub, (since if since is not None else now - BOOTSTRAP) - OVERLAP,
+                    now, scan)
                 count = len(events) if self.dry_run else deliver(
-                    db, sub, events, now, storage.of(db).work.issue_feed(plan_github.FEED_LIMIT),
-                    self.cfg.host)
+                    db, sub, events, until, storage.of(db).work.issue_feed(plan_github.FEED_LIMIT),
+                    self.cfg.host, partial=True, scan_before=scan, scan_after=next_scan)
                 reports.append(dict(project=sub.project, repo=sub.repo, events=count))
                 if count:
                     self.log("GitHub watch %s (%s): %d inputs%s" %
