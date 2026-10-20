@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -444,6 +445,47 @@ class PaquetTest(_Base):
         self.assertEqual((info["planned_wait"] or {}).get("what"), "packet")
         self.assertIn("packet merge", info["waiting"]["label"])
         self.assertIsNone(info["stale"])
+
+    def test_membre_d_un_vehicule_ouvert_ne_leve_pas_le_slo_et_revient_s_il_est_retire(self):
+        # #2837 : la composition se lit sur un clone du registre quand l'hôte
+        # n'a pas les réglages radar ; l'unité d'un véhicule ouvert est tue,
+        # et une recomposition qui la retire rend l'alerte.
+        self.qa_at(self.GO)
+        repo = tempfile.mkdtemp(prefix="paquet-2837-")
+        self.addCleanup(shutil.rmtree, repo, True)
+
+        def git(*args):
+            return subprocess.run(
+                ["git", "-C", repo, *args], check=True, capture_output=True,
+                text=True, env=_GIT_DEV1).stdout.strip()
+
+        git("init", "-q", "-b", "main")
+        with open(os.path.join(repo, "README"), "w", encoding="utf-8") as fh:
+            fh.write("base\n")
+        git("add", "README")
+        git("commit", "-q", "-m", "base")
+        git("checkout", "-q", "-b", "integration/paquet-test")
+        with open(os.path.join(repo, "note"), "w", encoding="utf-8") as fh:
+            fh.write("member\n")
+        git("add", "note")
+        git("commit", "-q", "-m", "vehicule : #%d abcdef0\n\nameesh-work: %d"
+            % (self.lot["id"], self.lot["id"]))
+        carrier = self.packet(body="composition sans liste",
+                              head=git("rev-parse", "HEAD"))
+        registry.upsert(self.db, "dev1", harness="claude", host=self.cfg.host,
+                        cwd=repo)
+        self.now = self.GO + 125 * 60
+        self.assertEqual(self.slo(), [])
+        # Recomposition sans le lot : le trailer disparaît, l'alerte revient.
+        git("checkout", "-q", "-b", "observed", "main")
+        with open(os.path.join(repo, "note"), "w", encoding="utf-8") as fh:
+            fh.write("other\n")
+        git("add", "note")
+        git("commit", "-q", "-m",
+            "vehicule : #999999 abcdef0\n\nameesh-work: 999999")
+        self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                        (git("rev-parse", "HEAD"), carrier["id"]))
+        self.assertEqual([a["lot"] for a in self.slo()], [self.lot["id"]])
 
     def test_lot_exclu_en_prose_reste_signale_meme_avec_trailers(self):
         # #2599 : un lot cité en prose n'est pas attaché ; même quand la

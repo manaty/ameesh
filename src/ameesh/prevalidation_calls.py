@@ -18,7 +18,8 @@ classes, contrats, hôtes, délai, lanceur de part) :
   module s'exécute) ; une indisponibilité est journalisée ;
 * ``gate_train`` dans le passage du train, avant publication : un rouge
   arrête la publication, une indisponibilité est journalisée et la CI reste
-  la preuve finale.
+  la preuve finale ; son passage entier est borné sous ``land.LOCK_TTL_S``
+  (#2665).
 
 Les hôtes viennent du bloc canon ; un hôte **local déclaré au canon** est
 admis (décision pilote 19/10 06:03, pour que les accroches tournent depuis
@@ -43,10 +44,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, replace
 
 from . import canon as canon_mod
-from . import lot_class, mechanics, plan_git, prevalidation, registry, work
+from . import land, lot_class, mechanics, plan_git, prevalidation, registry, work
+from .deadline import Deadline
 
 #: le calculateur du plan L161f, lu dans l'arbre du candidat (convention ameesh)
 PLAN_SCRIPT = "scripts/test-plan.py"
@@ -64,10 +67,28 @@ JOURNAL_PREFIX = "prevalidation"
 CARTE_WORKFLOW = "carte.yml"
 CARTE_ARTIFACT = "carte"
 #: #2644/N dev1 : la prévalidation du train tourne avant `_held()`, mais le
-#: bail de la cible (land.LOCK_TTL_S, 1800 s par défaut) court déjà. Plan et
-#: run restent sous 1500 s (300 + 1200) pour ne pas le laisser expirer.
+#: bail de la cible (land.LOCK_TTL_S, 1800 s par défaut) court déjà. Ces deux
+#: plafonds bornent le plan et le run ; ils ne composent pas une borne du
+#: passage (#2665/N cx1) : `Deadline` les ramène au temps qui reste.
 TRAIN_PLAN_TIMEOUT = 300
 TRAIN_RUN_TIMEOUT = 1200
+#: #2665/N cx1 : marge gardée sous le bail de la cible pour relire et publier
+#: après la prévalidation ; proportionnelle quand le bail est réglé plus court.
+TRAIN_LOCK_MARGIN = 300.0
+#: borne du nettoyage d'un arbre préparé (retrait du worktree git)
+TRAIN_CLEANUP_TIMEOUT = 120
+
+
+def train_deadline(clock=time.monotonic) -> Deadline:
+    """Le budget entier d'un passage de prévalidation du train (#2665).
+
+    Le bail de la cible court déjà quand la prévalidation commence ; la marge
+    de publication reste sous ``land.LOCK_TTL_S``, y compris quand ce bail est
+    réglé plus court que la marge par défaut.
+    """
+    ttl = max(0.0, float(land.LOCK_TTL_S))
+    margin = min(TRAIN_LOCK_MARGIN, ttl / 6.0)
+    return Deadline(max(0.0, ttl - margin), clock=clock)
 
 
 @dataclass(frozen=True)
@@ -95,10 +116,12 @@ class Prepared:
     rel: str
     plan: dict
 
-    def close(self) -> None:
+    def close(self, timeout: float = TRAIN_CLEANUP_TIMEOUT) -> None:
+        """Retire le worktree ; ``timeout`` est le temps qui reste au passage."""
         try:
             subprocess.run(["git", "-C", self.repo, "worktree", "remove", "--force",
-                            self.tree], capture_output=True, text=True, timeout=120)
+                            self.tree], capture_output=True, text=True,
+                           timeout=max(0.0, float(timeout)))
         except (OSError, subprocess.SubprocessError):
             pass
         shutil.rmtree(self.root, ignore_errors=True)
@@ -109,23 +132,34 @@ class Prepared:
 # --------------------------------------------------------------------------
 
 def parameters(cfg, project: str, *, canon_repo: str = "",
-               canon_commit: str = "") -> Parameters:
+               canon_commit: str = "",
+               deadline: Deadline | None = None) -> Parameters:
     """Les paramètres de prévalidation du projet, au commit exact du canon.
 
     Un ``canon_repo``/``canon_commit`` explicite est lu tel quel (geste de
     reprise, banc) ; sinon le premier canon configuré qui porte un bloc
     ``prevalidation`` pour ce projet est retenu. Aucun fallback : un canon
     sans bloc, illisible ou sans commit exact refuse ``block-missing``.
+    Avec ``deadline`` (#2665), la découverte des canons configurés
+    (``canon.load_configured`` : résolution git, manifeste, fiches) et la
+    lecture des paramètres ne prennent que le temps qui reste au passage ;
+    une échéance épuisée est ``run-incomplete``, pas un ``block-missing``
+    trompeur.
     """
     if canon_repo and canon_commit:
-        _, params = prevalidation.load_parameters(canon_repo, canon_commit, project)
+        _, params = prevalidation.load_parameters(canon_repo, canon_commit, project,
+                                                  deadline=deadline)
         return Parameters(params=params, repo=canon_repo, commit=canon_commit,
                           project=project)
     if cfg is None or not str(getattr(cfg, "canon", "") or "").strip():
         raise prevalidation.PrevalidationError(
             "block-missing", "aucun canon configuré : paramètres de prévalidation inconnus")
     try:
-        canons = canon_mod.load_configured(cfg)
+        canons = canon_mod.load_configured(cfg, deadline=deadline)
+    except canon_mod.GitDeadline:
+        raise prevalidation.PrevalidationError(
+            "run-incomplete",
+            "budget de prévalidation épuisé pendant la découverte des canons") from None
     except Exception as exc:  # noqa: BLE001 - un canon illisible ne prouve rien
         raise prevalidation.PrevalidationError(
             "block-missing", "canon configuré illisible: %s: %s"
@@ -136,6 +170,10 @@ def parameters(cfg, project: str, *, canon_repo: str = "",
     errors: list[str] = []
     for canon in canons:
         for source in getattr(canon, "sources", ()) or ():
+            if deadline is not None and deadline.expired():
+                raise prevalidation.PrevalidationError(
+                    "run-incomplete",
+                    "budget de prévalidation épuisé pendant la lecture du canon")
             if getattr(source, "mode", "") != "git" or not source.repo or not source.commit:
                 errors.append("%s: source de canon sans commit exact"
                               % (getattr(canon, "root", "") or "canon"))
@@ -145,11 +183,17 @@ def parameters(cfg, project: str, *, canon_repo: str = "",
                 continue
             try:
                 _, params = prevalidation.load_parameters(source.repo, source.commit,
-                                                          project)
+                                                          project, deadline=deadline)
             except prevalidation.PrevalidationError as exc:
+                if exc.cause == "run-incomplete":
+                    raise
                 errors.append("%s@%s: %s" % (source.repo, str(source.commit)[:12], exc))
                 continue
             except mechanics.MechanicsError as exc:
+                if deadline is not None and deadline.expired():
+                    raise prevalidation.PrevalidationError(
+                        "run-incomplete",
+                        "budget de prévalidation épuisé pendant la lecture du canon") from None
                 errors.append("%s@%s: %s" % (source.repo, str(source.commit)[:12],
                                              str(exc)[:200]))
                 continue
@@ -197,7 +241,7 @@ def repository(cfg, db, item, head: str, *, explicit: str = "") -> str:
 
 
 def map_for(repo_slug: str, repo: str = "", *, explicit: str = "",
-            runner=subprocess.run) -> tuple[str, str]:
+            runner=subprocess.run, deadline: Deadline | None = None) -> tuple[str, str]:
     """La carte mesurée à passer au plan : explicite, locale, ou artefact carte.
 
     Rend ``(chemin, répertoire à nettoyer)`` ; ``("", "")`` quand aucune carte
@@ -205,7 +249,8 @@ def map_for(repo_slug: str, repo: str = "", *, explicit: str = "",
     prévalidation refusera). Un artefact de la dernière exécution carte verte
     est téléchargé dans un répertoire temporaire : la fraîcheur et l'ascendance
     de son commit restent vérifiées par ``scripts/test-plan.py``, jamais
-    supposées ici.
+    supposées ici. Avec ``deadline``, les deux appels réseau ne prennent que le
+    temps qui reste au passage (#2665).
     """
     text = (explicit or "").strip()
     if text:
@@ -217,21 +262,25 @@ def map_for(repo_slug: str, repo: str = "", *, explicit: str = "",
     slug = (repo_slug or "").strip()
     if not slug:
         return "", ""
+    if deadline is not None and deadline.expired():
+        return "", ""
     try:
         listed = runner(["gh", "run", "list", "--repo", slug, "--workflow",
                          CARTE_WORKFLOW, "--status", "success", "--limit", "1",
                          "--json", "databaseId"], capture_output=True, text=True,
-                        timeout=30)
+                        timeout=deadline.timeout(30) if deadline is not None else 30)
         if listed.returncode:
             return "", ""
         runs = json.loads(listed.stdout or "[]")
         ident = runs[0].get("databaseId") if runs else None
         if not ident:
             return "", ""
+        if deadline is not None and deadline.expired():
+            return "", ""
         tmp = tempfile.mkdtemp(prefix="ameesh-carte-")
         got = runner(["gh", "run", "download", str(ident), "--repo", slug, "-n",
                       CARTE_ARTIFACT, "-D", tmp], capture_output=True, text=True,
-                     timeout=120)
+                     timeout=deadline.timeout(120) if deadline is not None else 120)
         path = os.path.join(tmp, "carte.json.gz")
         if got.returncode or not os.path.isfile(path):
             shutil.rmtree(tmp, ignore_errors=True)
@@ -260,7 +309,8 @@ def _run_git(repo: str, *args: str, timeout: int = 120):
                           timeout=timeout)
 
 
-def tooling(repo: str, head: str, params: Parameters) -> None:
+def tooling(repo: str, head: str, params: Parameters, *,
+            deadline: Deadline | None = None) -> None:
     """#2794 : le plan et le lanceur de part existent au SHA candidat.
 
     Le bloc ``prevalidation`` global du canon vaut pour tous les projets, mais
@@ -275,14 +325,19 @@ def tooling(repo: str, head: str, params: Parameters) -> None:
                    or prevalidation.DEFAULT_PARTS_SCRIPT)
     git = ["git", "-C", repo, *prevalidation.NO_REPLACE]
     absent = []
+    limit = deadline.timeout if deadline is not None else (lambda cap: cap)
     try:
+        if deadline is not None and deadline.expired():
+            raise prevalidation.PrevalidationError(
+                "run-incomplete", "budget de prévalidation épuisé avant l'outillage")
         if not full or subprocess.run(
                 [*git, "rev-parse", "--verify", "--quiet", full + "^{commit}"],
-                capture_output=True, text=True, timeout=60).returncode:
+                capture_output=True, text=True, timeout=limit(60)).returncode:
             return
         for path in (PLAN_SCRIPT, launcher):
             if subprocess.run([*git, "cat-file", "-e", "%s:%s" % (full, path)],
-                              capture_output=True, text=True, timeout=60).returncode:
+                              capture_output=True, text=True,
+                              timeout=limit(60)).returncode:
                 absent.append(path)
     except (OSError, subprocess.SubprocessError):
         return
@@ -293,11 +348,15 @@ def tooling(repo: str, head: str, params: Parameters) -> None:
             % (", ".join(absent), repo, full[:12], params.project or "?"))
 
 
-def _free_name(repo: str, head: str) -> str:
+def _free_name(repo: str, head: str, *, deadline: Deadline | None = None) -> str:
     """Un nom de plan qui ne remplace aucun chemin du SHA candidat."""
     for index in range(0, 20):
+        if deadline is not None and deadline.expired():
+            raise prevalidation.PrevalidationError(
+                "run-incomplete", "budget de prévalidation épuisé avant le plan")
         name = PLAN_NAME if index == 0 else "ameesh-prevalidation-plan-%d.json" % index
-        proc = _run_git(repo, "cat-file", "-e", "%s:%s" % (head, name))
+        wait = deadline.timeout(120) if deadline is not None else 120
+        proc = _run_git(repo, "cat-file", "-e", "%s:%s" % (head, name), timeout=wait)
         if proc.returncode != 0:
             return name
     raise prevalidation.PrevalidationError(
@@ -305,30 +364,62 @@ def _free_name(repo: str, head: str) -> str:
 
 
 def prepare(repo: str, head: str, base: str, *, map_path: str = "",
-            timeout: int = PLAN_TIMEOUT) -> Prepared:
+            timeout: int = PLAN_TIMEOUT, deadline: Deadline | None = None) -> Prepared:
     """Construit un arbre détaché de ``head`` et y calcule le plan L161f.
 
     Le script ``scripts/test-plan.py`` lu est celui du commit candidat ; la
     carte mesurée est passée en lecture seule à ``--map`` quand l'appelant en
     fournit une. L'arbre reste vivant jusqu'à ``Prepared.close()`` : le plan
-    doit rester dans l'arbre pour être embarqué dans la preuve.
+    doit rester dans l'arbre pour être embarqué dans la preuve. Avec
+    ``deadline`` (#2665), aucun appel git ni le plan ne dépasse le temps qui
+    reste au passage.
     """
+    limit = deadline.timeout if deadline is not None else (lambda cap: cap)
+
+    def commit_probe(rev: str) -> str | None:
+        """La sonde de présence d'un commit, bornée au temps qui reste (#2665).
+
+        La sonde garde ``NO_LAZY_FETCH`` (c'est ``plan_git._commit`` qui la
+        porte) et ne repart pas de ``GIT_TIMEOUT`` : une échéance épuisée est
+        ``run-incomplete``, jamais un ``selection-unsafe`` trompeur.
+        """
+        if deadline is not None and deadline.expired():
+            raise prevalidation.PrevalidationError(
+                "run-incomplete",
+                "budget de prévalidation épuisé avant la sonde du commit")
+        try:
+            return plan_git._commit(repo, rev, timeout=limit(canon_mod.GIT_TIMEOUT))
+        except canon_mod.GitError:
+            if deadline is not None and deadline.expired():
+                raise prevalidation.PrevalidationError(
+                    "run-incomplete",
+                    "budget de prévalidation épuisé pendant la sonde du commit") from None
+            raise
+
+    if deadline is not None and deadline.expired():
+        raise prevalidation.PrevalidationError(
+            "run-incomplete", "budget de prévalidation épuisé avant l'arbre du SHA")
     full = str(head or "").strip().lower()
-    if not plan_git._commit(repo, full):
+    if not commit_probe(full):
         raise prevalidation.PrevalidationError(
             "selection-unsafe", "la tête %s n'est pas un commit de %s"
             % ((full or "?")[:12], repo))
     base = str(base or "").strip().lower()
-    if not base or not plan_git._commit(repo, base):
+    if not base or not commit_probe(base):
         raise prevalidation.PrevalidationError(
             "selection-unsafe", "base de comparaison inconnue de %s: %r"
             % (repo, (base or "—")[:12]))
     root = tempfile.mkdtemp(prefix="ameesh-prevalidation-")
     tree = os.path.join(root, "tree")
     try:
-        proc = _run_git(repo, "worktree", "add", "--detach", tree, full)
+        proc = _run_git(repo, "worktree", "add", "--detach", tree, full,
+                        timeout=limit(120))
     except (OSError, subprocess.SubprocessError) as exc:
         shutil.rmtree(root, ignore_errors=True)
+        if deadline is not None and deadline.expired():
+            raise prevalidation.PrevalidationError(
+                "run-incomplete",
+                "budget de prévalidation épuisé pendant l'arbre du SHA") from None
         raise prevalidation.PrevalidationError(
             "selection-unsafe", "arbre du SHA non constructible: %s: %s"
             % (type(exc).__name__, str(exc)[:300])) from None
@@ -339,8 +430,15 @@ def prepare(repo: str, head: str, base: str, *, map_path: str = "",
             % ((proc.stderr or proc.stdout or "").strip()[-300:] or "git worktree add"))
     try:
         try:
-            rel = _free_name(tree, full)
+            if deadline is not None and deadline.expired():
+                raise prevalidation.PrevalidationError(
+                    "run-incomplete", "budget de prévalidation épuisé avant le plan")
+            rel = _free_name(tree, full, deadline=deadline)
         except (OSError, subprocess.SubprocessError) as exc:
+            if deadline is not None and deadline.expired():
+                raise prevalidation.PrevalidationError(
+                    "run-incomplete",
+                    "budget de prévalidation épuisé pendant le nom du plan") from None
             raise prevalidation.PrevalidationError(
                 "selection-unsafe", "nom du plan non vérifiable: %s: %s"
                 % (type(exc).__name__, str(exc)[:200])) from None
@@ -351,9 +449,16 @@ def prepare(repo: str, head: str, base: str, *, map_path: str = "",
         if map_path:
             argv += ["--map", os.path.abspath(map_path)]
         try:
+            if deadline is not None and deadline.expired():
+                raise prevalidation.PrevalidationError(
+                    "run-incomplete", "budget de prévalidation épuisé avant le plan")
             generated = subprocess.run(argv, cwd=tree, capture_output=True, text=True,
-                                       timeout=timeout)
+                                       timeout=limit(timeout))
         except (OSError, subprocess.SubprocessError) as exc:
+            if deadline is not None and deadline.expired():
+                raise prevalidation.PrevalidationError(
+                    "run-incomplete",
+                    "budget de prévalidation épuisé pendant le plan L161f") from None
             raise prevalidation.PrevalidationError(
                 "selection-unsafe", "plan L161f non calculable: %s: %s"
                 % (type(exc).__name__, str(exc)[:300])) from None
@@ -375,7 +480,8 @@ def prepare(repo: str, head: str, base: str, *, map_path: str = "",
                         rel=rel, plan=plan)
     except BaseException:
         try:
-            _run_git(repo, "worktree", "remove", "--force", tree)
+            _run_git(repo, "worktree", "remove", "--force", tree,
+                     timeout=limit(120))
         except Exception:  # noqa: BLE001 - nettoyage au mieux
             pass
         shutil.rmtree(root, ignore_errors=True)
@@ -473,8 +579,13 @@ def run(cfg, db, lot: int, *, repo: str, head: str, base: str, project: str,
 
 def _run_hosts(prepared: Prepared, params: Parameters, *, lot: int, head: str,
                base: str, branch: str, profile: str, say, executable: str,
-               validate) -> dict:
-    """Les hôtes déclarés, dans l'ordre, sans repli local ni après un rouge."""
+               validate, deadline: Deadline | None = None) -> dict:
+    """Les hôtes déclarés, dans l'ordre, sans repli local ni après un rouge.
+
+    Avec ``deadline`` (#2665), chaque tentative ne reçoit que le temps qui
+    reste au passage ; une échéance épuisée arrête les replis multi-hôtes et
+    se dit ``run-incomplete``, jamais un rouge.
+    """
     check = validate or prevalidation.validate
     hosts = params.hosts
     if not hosts:
@@ -483,18 +594,40 @@ def _run_hosts(prepared: Prepared, params: Parameters, *, lot: int, head: str,
     last: prevalidation.PrevalidationError | None = None
     for index, host in enumerate(hosts):
         last = None
+        attempt = params
+        if deadline is not None:
+            if deadline.expired():
+                raise prevalidation.PrevalidationError(
+                    "run-incomplete",
+                    "budget de prévalidation épuisé avant l'hôte %s" % host)
+            cap = float(getattr(params.params, "timeout_seconds", 0) or 0)
+            remaining = deadline.remaining()
+            governed = int(max(1.0, min(cap or remaining, remaining)))
+            attempt = Parameters(
+                params=replace(params.params, timeout_seconds=governed),
+                repo=params.repo, commit=params.commit, project=params.project)
         try:
             report = check(
                 lot=lot, plan_path=prepared.path, head=head, host=host,
-                params=params.params, base=base, repo=prepared.tree,
-                published_ref=branch, profile=profile, executable=executable)
+                params=attempt.params, base=base, repo=prepared.tree,
+                published_ref=branch, profile=profile, executable=executable,
+                deadline=deadline)
         except prevalidation.PrevalidationError as exc:
             if exc.cause in RETRYABLE and index + 1 < len(hosts):
+                if deadline is not None and deadline.expired():
+                    raise prevalidation.PrevalidationError(
+                        "run-incomplete",
+                        "budget de prévalidation épuisé après l'hôte %s: %s"
+                        % (host, exc.why or exc.cause)) from exc
                 last = exc
                 continue
             raise
         if not report.get("ok") and set(report.get("causes") or ()) & set(RETRYABLE) \
                 and index + 1 < len(hosts):
+            if deadline is not None and deadline.expired():
+                raise prevalidation.PrevalidationError(
+                    "run-incomplete",
+                    "budget de prévalidation épuisé après l'hôte %s" % host)
             last = prevalidation.PrevalidationError(
                 (report.get("causes") or ("no-vm",))[0], describe(report))
             continue
@@ -638,7 +771,7 @@ def _after_freeze(cfg, db, lot: int, sha: str, *, repo: str = "",
 def gate_train(cfg, *, repo: str, head: str, base: str, canon_repo: str = "",
                canon_commit: str = "", project: str = "ameesh",
                repo_slug: str = "", map_path: str = "",
-               say=None, warn=None) -> dict:
+               say=None, warn=None, clock=None) -> dict:
     """La prévalidation de la composition, avant ``train_git.publish``.
 
     Un rouge lève ``PrevalidationError`` : rien n'est publié. Une
@@ -647,12 +780,18 @@ def gate_train(cfg, *, repo: str, head: str, base: str, canon_repo: str = "",
     reste la preuve finale, et le train ne s'arrête pas sur une VM muette.
     Il n'y a pas de lot de paquet à ce stade : le rapport (lot 0) n'est pas
     persisté dans ``prevalidation_reports``.
+
+    Le passage entier est borné sous ``land.LOCK_TTL_S`` (#2665) : carte,
+    préparation, replis multi-hôtes et nettoyage lisent une même échéance
+    monotone, avec la marge gardée pour relire et publier. Une échéance
+    épuisée est une indisponibilité ``run-incomplete``, jamais un rouge.
     """
     if not repo:
         return {"state": "unavailable", "why": "dépôt du train inconnu"}
+    deadline = train_deadline(clock or time.monotonic)
     try:
         params = parameters(cfg, project, canon_repo=canon_repo,
-                            canon_commit=canon_commit)
+                            canon_commit=canon_commit, deadline=deadline)
         declared = params.hosts
         if not any(prevalidation.host_allowed(host, declared=declared)[0]
                    for host in declared):
@@ -664,18 +803,26 @@ def gate_train(cfg, *, repo: str, head: str, base: str, canon_repo: str = "",
         params = Parameters(params=replace(params.params, timeout_seconds=governed),
                             repo=params.repo, commit=params.commit,
                             project=params.project)
-        tooling(repo, head, params)
-        carte, cleanup = map_for(repo_slug, repo, explicit=map_path)
+        tooling(repo, head, params, deadline=deadline)
+        carte, cleanup = map_for(repo_slug, repo, explicit=map_path,
+                                 deadline=deadline)
+        if deadline.expired():
+            raise prevalidation.PrevalidationError(
+                "run-incomplete", "budget de prévalidation épuisé avant l'arbre du SHA")
         prepared = None
         try:
             prepared = prepare(repo, head, base, map_path=carte,
-                               timeout=TRAIN_PLAN_TIMEOUT)
+                               timeout=TRAIN_PLAN_TIMEOUT, deadline=deadline)
+            if deadline.expired():
+                raise prevalidation.PrevalidationError(
+                    "run-incomplete", "budget de prévalidation épuisé avant l'hôte")
             report = _run_hosts(prepared, params, lot=0, head=head, base=base,
                                 branch="", profile="", say=say,
-                                executable="ameesh", validate=None)
+                                executable="ameesh", validate=None,
+                                deadline=deadline)
         finally:
             if prepared is not None:
-                prepared.close()
+                prepared.close(timeout=deadline.timeout(TRAIN_CLEANUP_TIMEOUT))
             if cleanup:
                 shutil.rmtree(cleanup, ignore_errors=True)
     except prevalidation.PrevalidationError as exc:
@@ -692,4 +839,8 @@ def gate_train(cfg, *, repo: str, head: str, base: str, canon_repo: str = "",
         return {"state": "unavailable",
                 "cause": (report.get("causes") or ("run-incomplete",))[0],
                 "why": describe(report), "report": report}
+    if deadline.expired():
+        return {"state": "unavailable", "cause": "run-incomplete",
+                "why": "budget de prévalidation épuisé avant publication",
+                "report": report}
     return {"state": "green", "report": report}

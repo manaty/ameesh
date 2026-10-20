@@ -130,7 +130,7 @@
   "field.due": "Deadline",
   "view.chat": "Conversation",
   "chat.agentState": "{agent}: {state}",
-  "chat.unread": "{count} unread",
+  "chat.unread": { "one": "{count} unread", "other": "{count} unread" },
   "chat.waiting": "Waiting for the next turn: the agent reads your message when it wakes.",
   "chat.asleep": "Agent state: {state}. Your message waits in its mailbox until the agent is resumed.",
   "chat.stopped": "Agent state: {state}. Sending is refused immediately: nothing is queued; resume the agent first with `ameesh resume {agent}`.",

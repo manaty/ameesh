@@ -128,11 +128,14 @@ def _out(repo: str, *args: str) -> str | None:
     return proc.stdout.decode("utf-8", "replace").strip()
 
 
-def _commit(repo: str, rev: str) -> str | None:
+def _commit(repo: str, rev: str, *, timeout: float | None = None) -> str | None:
     # #1749 : sonde de présence — pas de fetch paresseux (l'échec laisse un
     # transport orphelin derrière lui dans un clone partiel).
+    # #2665 : `timeout` laisse l'appelant ramener la sonde au temps qui reste ;
+    # le défaut de `canon._git` (GIT_TIMEOUT) vaut quand il est absent.
+    bound = {} if timeout is None else {"timeout": timeout}
     proc = _git(repo, "rev-parse", "--verify", "--quiet", rev + "^{commit}",
-                env_extra=NO_LAZY_FETCH)
+                env_extra=NO_LAZY_FETCH, **bound)
     if proc.returncode != 0:
         return None
     return proc.stdout.decode("utf-8", "replace").strip()

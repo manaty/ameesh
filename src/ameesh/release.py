@@ -394,9 +394,10 @@ def _packet_watch(cfg, args) -> int:
         if getattr(args, "json", False):
             print(json.dumps(result, ensure_ascii=False, default=str))
         else:
-            print("packet-watch %s: %s%s" % (
+            print("packet-watch %s: %s%s%s" % (
                 result["project"], result["result"],
-                " (%s)" % result["slot"] if result.get("slot") else ""))
+                " (%s)" % result["slot"] if result.get("slot") else "",
+                " #%d" % result["lot"] if result.get("lot") else ""))
             if result.get("body"):
                 print(result["body"])
         if result["result"] in ("error", "not-delivered"):
