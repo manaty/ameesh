@@ -175,8 +175,12 @@ class PreparationTest(history_tests.HistoryFixture, PgTestCase):
         self.db.execute("DELETE FROM work_item_milestones WHERE work_item_id = %s"
                         " AND kind = 'frozen' AND id <> %s",
                         (self.lot, self.frozen["id"]))
-        self.db.execute("DELETE FROM provenance_receipts WHERE subject = %s",
-                        ("commit:" + self.first,))
+        # #2808 : le titulaire n'est auteur que par un commit de la plage.
+        # Sans reçu **ni** tour pour la famille, ses deux commits (first et
+        # head) restent sans famille prouvée : retirer les deux reçus, sinon
+        # celui de `head` suffit encore à prouver la famille de l'auteur.
+        self.db.execute("DELETE FROM provenance_receipts WHERE subject IN (%s, %s)",
+                        ("commit:" + self.first, "commit:" + self.head))
         self.db.execute("DELETE FROM turn_costs WHERE agent = 'author'")
         with self.assertRaisesRegex(train.TrainError,
                                     "unknown (model family|historical author)|no known model family"):

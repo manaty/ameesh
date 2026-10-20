@@ -6,10 +6,14 @@ auteurs que l'appelant lui donne (#2681) ; la désignation au gel
 (`review_designation_activation`) et le train (#1467) doivent lire les mêmes
 auteurs, avec les mêmes exceptions du canon §2 :
 
-* l'auteur de référence est l'assigné au gel (`review_lot._author_at_freeze`,
-  la même trace historique que la porte) ; sur un lot porteur de paquet
-  (`integration/**`), l'assigné est le composeur mécanique, pas un auteur
-  (#2803), et le commit de manifeste est écarté de la même lecture ;
+* le titulaire de référence est l'assigné au gel
+  (`review_lot._author_at_freeze`, la même trace historique que la porte) ;
+  il n'est **auteur que s'il a écrit un commit de la plage gelée** (#2808) :
+  auteur Git du commit, ou committer nommé par le reçu exact / le journal des
+  tours. Sa famille n'est interdite qu'avec cette preuve d'écriture. Sur un lot
+  porteur de paquet (`integration/**`), l'assigné est le composeur mécanique,
+  pas un auteur (#2803), et le commit de manifeste est écarté de la même
+  lecture ;
 * chaque commit du contenu est attribué par son reçu exact (#1465) ;
 * un correctif de premier tour d'un **relecteur désigné** sous le seuil du §2
   (`REVIEWER_FIX_LINES`, pas de conception) ne fait pas de son auteur un auteur
@@ -274,6 +278,35 @@ def commit_actor(repo: str, sha: str) -> tuple[str, float]:
     return email[:-len(suffix)], stamp
 
 
+def commits_written_by(repo: str, commits: Sequence[str], name: str) -> Optional[bool]:
+    """Un commit de la plage porte `name` comme **auteur Git** (`%ae`).
+
+    L'auteur Git est la signature du contenu ; le committer (`commit_actor`)
+    est l'agent qui a créé l'objet. Un amend ou un rebase conserve l'auteur
+    d'origine et change le committer : les deux ont écrit la plage (#2808).
+    Le nom Git seul ne prouve rien : l'adresse `<nom>@ameesh.invalid` est
+    exigée, comme pour le committer."""
+    if not repo or not name:
+        return False
+    shas = [str(sha).strip() for sha in commits or () if str(sha).strip()]
+    if not shas:
+        return False
+    text = plan_git._out(repo, "log", "--no-walk", "--format=%H%x1f%ae", *shas)
+    if text is None or len(str(text).splitlines()) != len(set(shas)):
+        return None                     # unreadable is not proof of absence
+    from .identity import GIT_EMAIL_DOMAIN
+    suffix = "@" + GIT_EMAIL_DOMAIN
+    wanted = str(name).strip().lower()
+    for line in str(text).splitlines():
+        _sha, separator, email = line.partition("\x1f")
+        if not separator:
+            return None
+        email = email.strip().lower()
+        if email.endswith(suffix) and email[:-len(suffix)] == wanted:
+            return True
+    return False
+
+
 def actor_family(db, actor: str, at_ts: float, families) -> str:
     """La famille de session d'un acteur à l'instant d'un fait, ou "".
 
@@ -292,7 +325,8 @@ def actor_family(db, actor: str, at_ts: float, families) -> str:
 def reading(db, item: Mapping, milestone: Optional[Mapping],
             commits: Sequence[str], repo: str = "", families=(),
             *, reference: Optional[Mapping] = None, provider=None,
-            strict: bool = False, trace: bool = False) -> tuple[list, list, list]:
+            strict: bool = False, trace: bool = False,
+            families_out: Optional[dict] = None) -> tuple[list, list, list]:
     """`(auteurs, inconnus, correcteurs)` de la plage gelée, même lecture pour tous.
 
     `reference` est l'auteur de référence déjà lu (`reference_author`) : la
@@ -301,12 +335,15 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     au lieu d'une absence (la désignation attend). `trace=True` (désignation)
     ajoute aux auteurs du repli `proof: turn-journal` et `fallback_commits` ;
     le train et la porte gardent la forme exacte `{name, family}`.
+    `families_out` reçoit, par acteur en minuscules, l'ensemble des familles
+    **prouvées** : une famille vide peut être une absence de preuve ou une
+    ambiguïté, et l'appelant qui doit les distinguer ne peut pas la deviner.
 
-    Un commit sans reçu est attribué au committer d'adresse d'agent : l'auteur
-    de référence reste l'auteur ; un relecteur désigné sous le seuil reste un
-    correctif de relecture ; un tiers non relecteur reste inconnu. Au-delà du
-    seuil (ou pour une conception), le relecteur devient auteur de sa
-    correction, avec sa famille de session.
+    Un commit sans reçu est attribué au committer d'adresse d'agent : un commit
+    du titulaire de référence reste le sien ; un relecteur désigné sous le
+    seuil reste un correctif de relecture ; un tiers non relecteur reste
+    inconnu. Au-delà du seuil (ou pour une conception), le relecteur devient
+    auteur de sa correction, avec sa famille de session.
 
     Les **correcteurs** (#2739) sont les relecteurs désignés dont le correctif
     de premier tour reste sous le seuil : ils ne sont pas auteurs de la tête
@@ -315,11 +352,19 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
 
     #2721 : la famille d'un commit sans reçu vient du journal des tours **à
     l'instant du commit** (le harnais qui a réellement tourné, harnais emprunté
-    compris), pas du harnais déclaré ; à défaut, l'auteur de référence garde sa
-    famille de gel. Un committer distinct de la référence doit être un agent du
-    registre. Les commits admis par ce repli portent la trace
+    compris), pas du harnais déclaré ; à défaut, le titulaire de référence
+    garde sa famille de gel. Un committer distinct de la référence doit être un
+    agent du registre. Les commits admis par ce repli portent la trace
     `proof: turn-journal` et leurs SHA dans `fallback_commits` quand
     `trace=True` (désignation).
+
+    #2808 : le titulaire n'est **pas semé** dans les auteurs par sa seule
+    qualité d'assigné au gel. Il n'entre dans `by_name` que par un commit de la
+    plage : auteur Git (`%ae`, un amend conserve l'auteur d'origine), reçu
+    exact, ou repli #2721 pour son propre commit de committer. Un titulaire
+    réassigné sans commit ne ferme donc plus sa famille (#2805) ; une
+    provenance illisible reste `unknown` et la désignation attend, la porte
+    refuse fermé.
 
     #2803 : sur un lot porteur de paquet (`integration/**`), la référence est
     le composeur mécanique et n'est pas un auteur (`packet_composer`). Le
@@ -336,8 +381,6 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     author_family = str((reference or {}).get("family") or "")
     reviewers = designated_reviewers(db, item, milestone, author_name)
     by_name: dict[str, set] = {}
-    if author_name:
-        by_name.setdefault(author_name, set()).add(author_family)
     unknown: list[str] = []
     review_commits: dict[str, list[tuple[str, str]]] = {}
     proofs: dict[str, set[str]] = {}
@@ -397,6 +440,24 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             review_commits.setdefault(actor, []).append((sha, proven))
         else:
             by_name.setdefault(actor, set()).add(proven)
+    # #2808 : le titulaire n'est un auteur que par un commit de la plage.
+    # Quand il en a écrit un (reçu/committer, ou auteur Git conservé par un
+    # amend), sa famille de gel reste une preuve historique, en plus de celle
+    # du commit : deux familles prouvées sont ambiguës et font attendre
+    # (#2755). Un titulaire sans commit n'ajoute ni nom ni famille.
+    authored = ""
+    if author_name:
+        authored = next((name for name in by_name
+                         if name.lower() == author_name.lower()), "")
+        if not authored:
+            written = commits_written_by(repo, commits, author_name)
+            if written is None:
+                unknown.extend(str(sha)[:12] for sha in commits if str(sha)[:12] not in unknown)
+            elif written:
+                authored = author_name
+                by_name.setdefault(authored, set())
+        if authored and author_family:
+            by_name[authored].add(author_family)
     for actor, entries in sorted(review_commits.items()):
         total, design = 0, False
         for sha, _proven in entries:
@@ -414,6 +475,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     out = []
     for actor in sorted(by_name):
         proven = {value for value in by_name[actor] if value}
+        if families_out is not None:
+            families_out[actor.lower()] = set(proven)
         # un acteur à deux familles prouvées est ambigu : jamais deviné
         family = next(iter(proven)) if len(proven) == 1 else ""
         row = {"name": actor, "family": family}
@@ -428,6 +491,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         if actor in by_name:
             continue
         proven = {value for _sha, value in review_commits[actor] if value}
+        if families_out is not None:
+            families_out.setdefault(actor.lower(), set()).update(proven)
         # une ambiguïté de familles ne change rien ici : seul le nom exclut
         family = next(iter(proven)) if len(proven) == 1 else ""
         correctors.append({"name": actor, "family": family})

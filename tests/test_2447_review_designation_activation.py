@@ -154,9 +154,11 @@ class _ActivationFixture:
         # inherit another test's plan pace (or the host's live readings)
         self.db.execute("DELETE FROM quota_gauge_readings")
         self.repo = _Repo(os.path.join(self.tmp, "depot"))
-        self.repo.write("src/ameesh/work.py", "base\n")
+        # `mail.py` reste sensible hors du périmètre critique : #1515 y a fait
+        # entrer `work.py`, qui servait de chemin neutre à ces témoins.
+        self.repo.write("src/ameesh/mail.py", "base\n")
         self.base = self.repo.commit("base")
-        self.repo.write("src/ameesh/work.py", "lot\n")
+        self.repo.write("src/ameesh/mail.py", "lot\n")
         self.frozen = self.repo.commit("lot")
         self.canon = _Canon(os.path.join(self.tmp, "canon"))
         self.cfg = dataclasses.replace(self.cfg, canon=self.canon.root, canon_ref="HEAD")
@@ -418,10 +420,16 @@ class ActivationTest(_ActivationFixture, PgTestCase):
 
     def test_a_stale_light_freeze_does_not_clear_the_new_freeze(self):
         # Same guard on the light/no-path branch, which also writes the column.
+        # #2786: a freeze already in the target is refused, so the empty diff
+        # is an empty commit on top of the base, not the base itself.
         lot_head = self.frozen
-        self.frozen = self.base
+        branch = self.repo.git("rev-parse", "--abbrev-ref", "HEAD")
+        self.repo.git("checkout", "-q", self.base)
+        self.repo.git("commit", "-q", "--allow-empty", "-m", "gel vide")
+        self.frozen = self.repo.git("rev-parse", "HEAD")
         first, light = self.freeze()
         self.assertEqual(light["state"], rd.NONE, light)
+        self.repo.git("checkout", "-q", branch)
         self.frozen = lot_head
         self.repo.write("src/ameesh/work.py", "new head\n")
         self.frozen = self.repo.commit("new head")
