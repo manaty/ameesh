@@ -255,6 +255,63 @@ class SocketTest(unittest.TestCase):
         merged = D.merge([build(), build(now=1320.0)])
         self.assertEqual(len(merged["meshes"][0]["agents"]), 1)
 
+    def test_merge_keeps_the_most_recent_report_over_a_stale_running_turn(self):
+        # N1 (#382) : un ancien running ne doit pas masquer un idle plus récent
+        # parce que son tour avait commencé plus tôt.
+        stale = build(agents=[row(turn_started_ts=90.0)], now=100.0)
+        fresh = build(agents=[row(status="idle", turn_started_ts=None,
+                                 lease_live=False)], now=110.0,
+                      runner_id="runner-agent-a-idle@" + HOST,
+                      socket_path="/tmp/device-idle.sock",
+                      control_socket="/tmp/control-idle.sock",
+                      runner_readings=[])
+        for snapshots in ([stale, fresh], [fresh, stale]):
+            merged = D.merge(snapshots)
+            self.assertEqual(len(merged["meshes"][0]["agents"]), 1)
+            agent = merged["meshes"][0]["agents"][0]
+            self.assertEqual(agent["status"], "idle")
+            self.assertFalse(agent["turn"]["active"])
+            self.assertIsNone(agent["turn"]["started_ts"])
+            self.assertEqual(agent["runner"], "runner-agent-a-idle@" + HOST)
+
+    def test_merge_running_to_stopped_uses_the_newest_report(self):
+        running = build(agents=[row(turn_started_ts=90.0)], now=100.0)
+        stopped = build(agents=[row(status="stopped", turn_started_ts=None,
+                                    lease_live=False)], now=110.0)
+        for snapshots in ([running, stopped], [stopped, running]):
+            merged = D.merge(snapshots)
+            self.assertEqual(len(merged["meshes"][0]["agents"]), 1)
+            agent = merged["meshes"][0]["agents"][0]
+            self.assertEqual(agent["status"], "stopped")
+            self.assertFalse(agent["turn"]["active"])
+
+    def test_merge_overlapping_channels_keeps_the_newest_report(self):
+        # Les deux canaux servent le même agent : le relevé le plus récent
+        # gagne, quel que soit l'ordre de lecture.
+        older = build(agents=[row()], now=100.0)
+        newer = build(agents=[row()], now=110.0,
+                      runner_id="runner-agent-a-new@" + HOST,
+                      socket_path="/tmp/device-new.sock",
+                      control_socket="/tmp/control-new.sock",
+                      runner_readings=[])
+        for snapshots in ([older, newer], [newer, older]):
+            merged = D.merge(snapshots)
+            self.assertEqual(len(merged["meshes"][0]["agents"]), 1)
+            self.assertEqual(merged["meshes"][0]["agents"][0]["runner"],
+                             "runner-agent-a-new@" + HOST)
+
+    def test_merge_a_fresh_running_report_replaces_an_older_idle_one(self):
+        idle = build(agents=[row(status="idle", turn_started_ts=None,
+                                 lease_live=False)], now=100.0)
+        running = build(agents=[row(turn_started_ts=105.0)], now=110.0)
+        for snapshots in ([idle, running], [running, idle]):
+            merged = D.merge(snapshots)
+            self.assertEqual(len(merged["meshes"][0]["agents"]), 1)
+            agent = merged["meshes"][0]["agents"][0]
+            self.assertEqual(agent["status"], "running")
+            self.assertTrue(agent["turn"]["active"])
+            self.assertEqual(agent["turn"]["started_ts"], 105.0)
+
     def test_runner_starts_and_stops_its_two_channels(self):
         runner = SimpleNamespace(
             once=False, dry_run=False, mediated=False,
