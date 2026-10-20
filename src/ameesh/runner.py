@@ -3820,6 +3820,14 @@ class AgentWorker(threading.Thread):
         except (TypeError, ValueError):
             self._compta_en_echec = True
             return False
+        if travail.get("ledger_ambiguous"):
+            # #2166/B1 : plusieurs clés candidates pour ce marqueur (un ancien
+            # worker a écrit une ligne que son identité ne distingue pas) :
+            # écrire au hasard réglerait le mauvais tour. On suspend.
+            self._compta_en_echec = True
+            log_async("[%s] accounting marker ambiguous: turn accounting "
+                      "suspended" % self.name)
+            return False
         try:
             from . import accounts as accounts_mod
             book = cost_mod.CostBook(
@@ -3960,6 +3968,8 @@ class AgentWorker(threading.Thread):
         historiques (tests) et ne sert qu'à ce repli.
         """
         if isinstance(marker, dict):
+            if marker.get("ledger_ambiguous"):
+                return None       # B1 : ne jamais choisir une clé au hasard
             key = marker.get("ledger_key") or marker.get("spend_key")
             if key:
                 return str(key)

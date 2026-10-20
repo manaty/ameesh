@@ -540,7 +540,10 @@ class PendingSpend(Domain):
     conditionnelle s'y compare, jamais à un `extract(epoch)::float8` relu —
     une connexion à précision réduite (`extra_float_digits=0`) en perd les
     derniers chiffres. `spend_key` est NULL sur les marqueurs d'avant 0471 :
-    leur réparation garde la clé historique dérivée du float8.
+    leur réparation retrouve la clé déjà écrite par leur tour (ligne ou
+    réservation) par l'identité du tour, jamais par un float8 recalculé ni
+    par l'ordre des écritures ; plusieurs candidats incohérents suspendent
+    (`ledger_ambiguous`).
 
     Extensions PostgreSQL optionnelles (#1469), détectées par `hasattr` :
     `put_get(name, start_index, turn, model)` écrit et rend le marqueur comme
@@ -577,12 +580,14 @@ class PendingSpend(Domain):
     @abc.abstractmethod
     def get(self, name: str) -> dict | None:
         """Le marqueur (agent, start_index, turn, model, created_at,
-        created_ts, spend_key, ledger_key, work_item_id, turn_id,
-        resident_usage), ou None. `created_at` est l'identité exacte (#2166) ;
-        `spend_key` est la clé du marqueur (NULL avant 0471) ; `ledger_key` est
-        la clé déjà écrite par ce tour — celle du marqueur, ou celle retrouvée
-        dans sa ligne `turn_costs`/sa réservation #1469 pour un marqueur
-        d'avant 0471 ; `created_ts` reste l'epoch float8 pour le début du tour
+        created_ts, spend_key, ledger_key, ledger_ambiguous, work_item_id,
+        turn_id, resident_usage), ou None. `created_at` est l'identité exacte
+        (#2166) ; `spend_key` est la clé du marqueur (NULL avant 0471) ;
+        `ledger_key` est la clé déjà écrite par ce tour — celle du marqueur,
+        ou celle retrouvée dans sa ligne `turn_costs`/sa réservation #1469 par
+        l'identité du tour, jamais par ordre temporel ; `ledger_ambiguous`
+        vrai interdit de deviner et suspend la comptabilité (B1) ;
+        `created_ts` reste l'epoch float8 pour le début du tour
         (`turn_costs.started_at`)."""
 
     @abc.abstractmethod

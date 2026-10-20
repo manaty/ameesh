@@ -1103,6 +1103,92 @@ class PendingSpend(interface.PendingSpend):
         "to_char(created_at at time zone 'UTC',"
         " 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')")
 
+    #: #2166/B1 : un tour d'avant 0423 n'a pas de `turn_id` ; sa ligne se
+    #: reconnaît alors à son `started_at`, l'instant de pose du marqueur. La
+    #: clé historique pouvait être calculée depuis un float8 imprimé à
+    #: précision réduite (`extra_float_digits=0`, ~4 µs) : 1 ms couvre ces
+    #: arrondis sans confondre deux tours réels, qui sont séparés de secondes.
+    _STARTED_AT_TOLERANCE_S = 0.001
+
+    def _get_sql(self) -> str:
+        """`get` en UNE instruction : marqueur et clé durable du MÊME état.
+
+        La clé se retrouve par l'identité du tour, jamais par ordre temporel :
+        `turn_id` (exact), sinon `started_at` (instant du marqueur), sinon
+        l'index de début porté par la clé (tour d'avant 0423). Un ancien
+        worker peut écrire sa ligne APRÈS le marqueur de son remplaçant
+        (#1469) : la première ligne après `created_at` n'est pas forcément
+        celle du marqueur. Plusieurs candidats incohérents : pas de clé,
+        `ledger_ambiguous` vrai, l'appelant suspend.
+        """
+        return """
+WITH marqueur AS (
+    SELECT agent, start_index, turn, model, work_item_id, turn_id,
+           resident_usage, spend_key,
+           """ + self._EXACT_CREATED_AT + """ AS created_at,
+           extract(epoch from created_at)::float8 AS created_ts,
+           created_at AS created_at_ts
+      FROM spend_pending WHERE agent = %s
+), lignes AS (
+    SELECT tc.spend_key,
+           CASE
+             WHEN m.turn_id IS NOT NULL AND tc.turn_id = m.turn_id THEN 1
+             WHEN tc.turn_id IS NULL AND tc.started_at IS NOT NULL
+                  AND abs(extract(epoch from tc.started_at - m.created_at_ts)) <= %s
+               THEN 2
+             WHEN tc.turn_id IS NULL AND tc.started_at IS NULL
+                  AND left(tc.spend_key,
+                           length(m.agent || ':' || m.start_index || ':'))
+                      = m.agent || ':' || m.start_index || ':' THEN 3
+           END AS rang
+      FROM turn_costs tc
+      JOIN marqueur m ON tc.agent = m.agent
+     WHERE m.spend_key IS NULL
+       AND (   (m.turn_id IS NOT NULL AND tc.turn_id = m.turn_id)
+            OR (tc.turn_id IS NULL AND tc.started_at IS NOT NULL
+                AND abs(extract(epoch from tc.started_at - m.created_at_ts)) <= %s)
+            OR (tc.turn_id IS NULL AND tc.started_at IS NULL
+                AND left(tc.spend_key,
+                         length(m.agent || ':' || m.start_index || ':'))
+                    = m.agent || ':' || m.start_index || ':'))
+), meilleur AS (
+    SELECT min(rang) AS rang FROM lignes
+), lignes_retenues AS (
+    SELECT DISTINCT spend_key FROM lignes
+     WHERE rang = (SELECT rang FROM meilleur)
+), reservations AS (
+    SELECT DISTINCT ar.spend_key
+      FROM account_reservations ar
+      JOIN marqueur m ON ar.agent = m.agent
+     WHERE m.spend_key IS NULL
+       AND left(ar.spend_key, length(m.agent || ':' || m.start_index || ':'))
+           = m.agent || ':' || m.start_index || ':'
+), candidats AS (
+    SELECT spend_key FROM lignes_retenues WHERE spend_key IS NOT NULL
+    UNION
+    SELECT spend_key FROM reservations
+)
+SELECT m.agent, m.start_index, m.turn, m.model, m.work_item_id, m.turn_id,
+       m.resident_usage, m.spend_key, m.created_at, m.created_ts,
+       CASE
+         WHEN m.spend_key IS NOT NULL THEN m.spend_key
+         WHEN (SELECT count(*) FROM candidats) = 1
+              AND NOT EXISTS (SELECT 1 FROM lignes_retenues
+                               WHERE spend_key IS NULL)
+           THEN (SELECT min(spend_key) FROM candidats)
+         WHEN (SELECT count(*) FROM candidats) = 0
+              AND NOT EXISTS (SELECT 1 FROM lignes_retenues
+                               WHERE spend_key IS NULL)
+           THEN m.agent || ':' || m.start_index || ':' || m.created_at
+         ELSE NULL
+       END AS ledger_key,
+       (m.spend_key IS NULL
+        AND ((SELECT count(*) FROM candidats) > 1
+             OR EXISTS (SELECT 1 FROM lignes_retenues
+                         WHERE spend_key IS NULL))) AS ledger_ambiguous
+  FROM marqueur m
+"""
+
     def put(self, name, start_index, turn, model, work_item_id=None, turn_id=None) -> bool:
         return self.put_get(name, start_index, turn, model,
                             work_item_id=work_item_id, turn_id=turn_id) is not None
@@ -1141,6 +1227,7 @@ class PendingSpend(interface.PendingSpend):
             return None
         row = rows[0]
         row["ledger_key"] = row.get("spend_key")
+        row["ledger_ambiguous"] = False
         return row
 
     def set_model(self, name, model) -> bool:
@@ -1169,63 +1256,29 @@ class PendingSpend(interface.PendingSpend):
                 (value, name, str(created_at), spend_key))
         return bool(rows)
 
-    def _durable_ledger_key(self, row) -> str | None:
-        """La clé déjà écrite par ce tour, même sur un marqueur d'avant 0471.
-
-        Un marqueur d'avant 0471 n'a pas de `spend_key`. La clé de son tour
-        vit dans la ligne du grand livre ou dans la réservation #1469 ; elle a
-        été calculée par l'ancien exécuteur avec SA précision float8, que la
-        connexion de réparation ne connaît pas (0→3 change le texte). On la
-        retrouve donc par l'identité du marqueur, pas en la recalculant : le
-        marqueur étant le tour le PLUS RÉCENT (un nouveau `put` l'aurait
-        remplacé), la première ligne écrite après son `created_at` est la
-        sienne, et la première réservation de même. Aucune des deux : le tour
-        n'a rien écrit, la clé exacte du marqueur suffit.
-
-        Deux clés différentes (ligne et réservation) ne peuvent venir que du
-        même vieux tour : on rend celle de la ligne, qui dédouble le grand
-        livre, et le règlement la retrouve.
-        """
-        if row.get("spend_key"):
-            return str(row["spend_key"])
-        created_at = row.get("created_at")
-        if not created_at:
-            return None
-        lines = self.db.query(
-            "SELECT spend_key FROM turn_costs"
-            " WHERE agent = %s AND spend_key IS NOT NULL"
-            "   AND recorded_at >= %s::timestamptz"
-            " ORDER BY recorded_at ASC, id ASC LIMIT 1",
-            (row["agent"], created_at))
-        if lines:
-            return str(lines[0]["spend_key"])
-        reservations = self.db.query(
-            "SELECT spend_key FROM account_reservations"
-            " WHERE agent = %s AND spend_key IS NOT NULL"
-            "   AND created_at >= %s::timestamptz"
-            " ORDER BY created_at ASC, id ASC LIMIT 1",
-            (row["agent"], created_at))
-        if reservations:
-            return str(reservations[0]["spend_key"])
-        return "%s:%s:%s" % (row["agent"], int(row["start_index"]), created_at)
-
     def get(self, name) -> dict | None:
+        """Le marqueur et la clé durable de SON tour, en une seule lecture.
+
+        `ledger_key` est la clé exacte du marqueur s'il la porte ; sinon celle
+        de la ligne `turn_costs` ou de la réservation #1469 de ce tour,
+        retrouvée par son identité (`turn_id`, `started_at`, index de début),
+        jamais par ordre temporel : un ancien worker peut écrire sa ligne
+        après le marqueur de son remplaçant (#1469). Aucun candidat : la clé
+        exacte du marqueur. Plusieurs candidats incohérents :
+        `ledger_key` NULL et `ledger_ambiguous` vrai — l'appelant suspend, il
+        ne devine pas.
+
+        Une seule instruction : le marqueur lu et la clé résolue voient le
+        même état, même si un remplaçant écrit entre-temps.
+        """
         rows = self.db.query(
-            """
-            SELECT agent, start_index, turn, model, work_item_id, turn_id,
-                   resident_usage, spend_key,
-                   """ + self._EXACT_CREATED_AT + """ as created_at,
-                   extract(epoch from created_at)::float8 as created_ts
-              FROM spend_pending WHERE agent = %s
-            """,
-            (name,),
+            self._get_sql(),
+            (name, self._STARTED_AT_TOLERANCE_S, self._STARTED_AT_TOLERANCE_S),
         )
         if not rows:
             return None
         row = rows[0]
-        # #2166 : la clé exacte si le marqueur la porte, sinon celle déjà
-        # écrite par son tour (ligne ou réservation), jamais un float8 recalculé.
-        row["ledger_key"] = self._durable_ledger_key(row)
+        row["ledger_ambiguous"] = bool(row.get("ledger_ambiguous"))
         return row
 
     def clear(self, name) -> bool:
