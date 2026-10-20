@@ -8,11 +8,14 @@ merge-pr` ne désarme plus (`test_1656_auto_merge`).
 
 Relectures de 249b5911 (ameesh-cx2, mty-amh-impl-01) tenues ici :
 B1 — aucune auto-fusion GitHub n'est armée (elle survivrait à un push d'un
-compte en écriture) : ameesh fusionne lui-même la tête publiée, sous
-`--match-head-commit`, une autre tête déjà verte ne fusionne jamais ;
-B2 — la cible est épinglée, une PR reciblée est désarmée ; B3 — sans
-armement GitHub, aucun armement côté forge ne peut échapper au journal ;
-B4 — le bail est renouvelé avant chaque geste, un bail perdu n'agit pas.
+compte en écriture) : ameesh fusionne lui-même la tête publiée, une autre
+tête déjà verte ne fusionne jamais ; B2 — la cible est épinglée, une PR
+reciblée est désarmée ; B3 — sans armement GitHub, aucun armement côté forge
+ne peut échapper au journal ; B4 — le bail est renouvelé avant chaque geste,
+un bail perdu n'agit pas. R1/R2 (ameesh-cx3, ameesh-cx2) : la porte des
+verdicts du feu, le projet résolu pour toute la porte de CI, une preuve de la
+forge non vide, et l'écriture `POST merges` liée à la cible et au commit
+publiés (un reciblage au dernier instant ne la redirige pas).
 
 Témoins sans réseau ni base : un faux `gh` (protection, PR, checks de la
 tête, fusion, désarmement) et un faux journal de lot (`work.events`/`note`).
@@ -76,11 +79,28 @@ class Forge:
         #: plusieurs PR partagent ce faux : un geste ne vaut pas pour l'autre
         self.sticky = sticky
         self.calls: list[list[str]] = []
+        #: les écritures `POST merges` : (branche écrite, commit fusionné)
+        self.landed: list[tuple[str, str]] = []
+        #: tête déjà contenue dans la cible : GitHub répond 204 sans corps
+        self.contained = False
 
     def answer(self, args) -> tuple[int, str, str]:
         args = list(args)
         self.calls.append(args)
         path = args[-1] if args else ""
+        if args[:3] == ["api", "-X", "POST"] and args[3].endswith("/merges"):
+            fields = dict(a.split("=", 1) for a in args[4:] if a != "-f")
+            if self.merge_error:
+                return 1, "", self.merge_error
+            if self.contained:
+                return 0, "", ""
+            self.landed.append((fields["base"], fields["head"]))
+            # GitHub marque la PR fusionnée quand sa tête entre dans SA base
+            if fields["base"] == self.base and fields["head"] == self.head \
+                    and not self.sticky:
+                self.state = "MERGED"
+            return 0, json.dumps({"sha": "3" * 40, "commit": {
+                "message": fields["commit_message"]}}), ""
         if args[:1] == ["api"] and path.endswith("/protection"):
             if self.protection_error:
                 return 1, "", self.protection_error
@@ -126,8 +146,11 @@ class Forge:
         return 1, "", "unexpected gh call %s" % args
 
     def merges(self) -> list[list[str]]:
-        return [c for c in self.calls if c[:2] == ["pr", "merge"]
-                and "--match-head-commit" in c]
+        """Tout geste de fusion : l'écriture liée à la cible, ou un `gh pr merge`
+        (qu'ameesh ne fait plus)."""
+        return [c for c in self.calls if (c[:3] == ["api", "-X", "POST"]
+                                          and c[3].endswith("/merges"))
+                or (c[:2] == ["pr", "merge"] and "--disable-auto" not in c)]
 
     def disarms(self) -> list[list[str]]:
         return [c for c in self.calls if c[:2] == ["pr", "merge"] and "--disable-auto" in c]
@@ -165,7 +188,7 @@ class Journal(unittest.TestCase):
                                               lambda h: self.renew))
         #: le porteur, son gel (la tête publiée par défaut) et la porte des avis
         self.frozen = HEAD
-        self.gate = (True, "")
+        self.gate = (True, "", None)
         stack.enter_context(mock.patch.object(fire, "_fresh", lambda db, lot: (
             {"id": int(lot), "app": "ameesh", "assignee": "composeur",
              "branch": "integration/paquet-h-20261020-0500"},
@@ -173,9 +196,6 @@ class Journal(unittest.TestCase):
             if self.frozen else [])))
         stack.enter_context(mock.patch.object(
             packet_automerge, "_verdicts", lambda cfg, db, row, ms, slug, base: self.gate))
-        self.wakes: list[tuple] = []
-        stack.enter_context(mock.patch.object(
-            fire, "_wake", lambda db, to, lot, text, data: self.wakes.append((to, text))))
 
     def _events(self, db, item_id, limit=100):
         return list(reversed(self.events.get(int(item_id), [])))
@@ -217,8 +237,7 @@ class ArmTest(Journal):
         gh = FakeGh(tests="success")
         out = self.arm(gh)
         self.assertEqual(out["merge"]["result"], "merged", out)
-        self.assertEqual(gh.merges(), [["pr", "merge", str(NUM), "--repo", SLUG, "--merge",
-                                        "--match-head-commit", HEAD]])
+        self.assertEqual(gh.landed, [("main", HEAD)])
         self.assertTrue(self.notes()[-1].startswith("auto-merge merged"), self.notes())
         self.assertIsNone(self.active())
 
@@ -411,10 +430,14 @@ class PassTest(Journal):
         gh = FakeGh(tests="success")
         out = self.check(gh)
         self.assertEqual(out["result"], "merged", out)
-        self.assertEqual(gh.merges(), [["pr", "merge", str(NUM), "--repo", SLUG, "--merge",
-                                        "--match-head-commit", HEAD]])
+        self.assertEqual(gh.landed, [("main", HEAD)])
+        post = gh.merges()[0]
+        self.assertEqual(post[:4], ["api", "-X", "POST", "repos/%s/merges" % SLUG])
+        self.assertIn("commit_message=Merge pull request #%d from manaty/integration/"
+                      "paquet-h-20261020-0500" % NUM, post[-1])
         self.assertTrue(self.notes()[-1].startswith(
-            "auto-merge merged repo=%s pr=%d sha=%s base=main" % (SLUG, NUM, HEAD)))
+            "auto-merge merged repo=%s pr=%d sha=%s base=main commit=%s"
+            % (SLUG, NUM, HEAD, "3" * 40)))
         self.assertEqual(self.check(gh)["result"], "idle")
 
     def test_b1_a_new_head_already_green_is_never_merged(self):
@@ -441,21 +464,20 @@ class PassTest(Journal):
         self.assertEqual(len(gh.disarms()), 1)
         self.assertIn("now targets release/production", self.notes()[-1])
 
-    def test_a_head_pushed_between_read_and_merge_is_refused_by_github(self):
+    def test_a_head_pushed_at_the_gesture_never_changes_the_merged_commit(self):
+        """L'écriture nomme le commit publié : une poussée sur la branche du
+        porteur au dernier instant n'entre pas dans la cible."""
         self.armed()
         gh = FakeGh(tests="success")
         real = gh.answer
 
         def answer(args):
-            if args[:2] == ["pr", "merge"] and "--match-head-commit" in args:
+            if args[:3] == ["api", "-X", "POST"]:
                 gh.head = NEW               # push juste avant le geste
             return real(args)
         gh.answer = answer
-        out = self.check(gh)
-        self.assertEqual(out["result"], "error", out)
-        self.assertIn("Head branch was modified", out["error"])
-        self.assertEqual(gh.state, "OPEN")
-        self.assertIsNotNone(self.active())
+        self.assertEqual(self.check(gh)["result"], "merged")
+        self.assertEqual(gh.landed, [("main", HEAD)])
 
     def retarget_on(self, gh, when):
         """La cible passe à `release/production` dès l'appel `gh` que `when` désigne."""
@@ -482,52 +504,87 @@ class PassTest(Journal):
         # le passage suivant désarme
         self.assertEqual(self.check(gh)["result"], "disarmed")
 
-    def test_r2_b2_a_retarget_at_the_gesture_is_an_incident(self):
-        """La fenêtre qu'aucune API ne ferme : constatée, journalisée, assigné réveillé."""
-        self.armed()
-        gh = FakeGh(tests="success")
-        self.retarget_on(gh, lambda args: args[:2] == ["pr", "merge"]
-                         and "--match-head-commit" in args)
-        out = self.check(gh)
-        self.assertEqual(out["result"], "error", out)
-        self.assertIn("INCIDENT", out["error"])
-        self.assertIn("release/production", self.notes()[-1])
-        self.assertEqual([to for to, _ in self.wakes], ["composeur"])
-        self.assertIsNone(self.active())
-
-    def test_an_unreadable_read_back_is_an_incident_too(self):
+    def test_r2_b2_a_retarget_at_the_gesture_cannot_redirect_the_write(self):
+        """Repro cx2 R2 : la PR passe à `release/production` juste avant le
+        geste. L'écriture nomme la cible épinglée : rien n'entre ailleurs."""
         self.armed()
         gh = FakeGh(tests="success")
         real = gh.answer
-        views = []
 
         def answer(args):
-            if args[:2] == ["pr", "view"]:
-                views.append(args)
-                if len(views) == 3:
-                    return 1, "", "HTTP 502"
+            if args[:3] == ["api", "-X", "POST"]:
+                gh.base = "release/production"
             return real(args)
         gh.answer = answer
-        out = self.check(gh)
-        self.assertEqual(out["result"], "error", out)
-        self.assertIn("unreadable", out["error"])
-        self.assertEqual(len(self.wakes), 1)
+        self.check(gh)
+        self.assertEqual(gh.landed, [("main", HEAD)])
+        self.assertNotIn("release/production", [base for base, _ in gh.landed])
 
-    def test_a_merge_reads_the_pr_three_times(self):
-        """Lecture, relecture fraîche juste avant le geste, relecture après."""
+    def test_no_gh_pr_merge_is_ever_used(self):
+        self.armed()
+        gh = FakeGh(tests="success", auto=True)
+        self.assertEqual(self.check(gh)["result"], "merged")
+        self.assertEqual([c for c in gh.calls if c[:2] == ["pr", "merge"]
+                          and "--disable-auto" not in c], [])
+        kinds = [c[:2] for c in gh.calls if c[:1] == ["pr"]]
+        self.assertEqual(kinds, [["pr", "view"], ["pr", "merge"], ["pr", "view"]])
+
+    def test_a_head_already_in_the_target_is_recorded(self):
         self.armed()
         gh = FakeGh(tests="success")
+        gh.contained = True
         self.assertEqual(self.check(gh)["result"], "merged")
-        kinds = [c[:2] for c in gh.calls if c[:1] == ["pr"]]
-        self.assertEqual(kinds, [["pr", "view"], ["pr", "view"], ["pr", "merge"],
-                                 ["pr", "view"]])
-        self.assertEqual(self.wakes, [])
+        self.assertIn("commit=already-contained", self.notes()[-1])
+
+    def test_a_refused_write_keeps_the_arming(self):
+        self.armed()
+        gh = FakeGh(tests="success", merge_error="HTTP 409: Merge conflict")
+        out = self.check(gh)
+        self.assertEqual(out["result"], "error", out)
+        self.assertIn("Merge conflict", out["error"])
+        self.assertIsNotNone(self.active())
+
+    def project(self, **over):
+        values = {"name": "ameesh", "required_checks": (), "required_statuses": (),
+                  "ci_required": False}
+        values.update(over)
+        return types.SimpleNamespace(**values)
+
+    def test_r2_the_resolved_project_gates_the_ci_too(self):
+        """Témoin cx3 R2 : la forge seule est verte, le projet exige un statut
+        `full-suite` sur `integration/**` : rien ne fusionne."""
+        self.armed()
+        self.gate = (True, "", self.project(
+            required_statuses=(("integration/**", "full-suite"),)))
+        gh = FakeGh(tests="success")
+        out = self.check(gh)
+        self.assertEqual(out["result"], "pending", out)
+        self.assertIn("full-suite", out["why"])
+        self.assertEqual(gh.merges(), [])
+
+    def test_r2_a_declared_check_adds_to_the_forge(self):
+        self.armed()
+        self.gate = (True, "", self.project(required_checks=("lint",)))
+        gh = FakeGh(tests="success")
+        out = self.check(gh)
+        self.assertEqual(out["result"], "pending", out)
+        self.assertIn("lint", out["why"])
+        self.assertEqual(gh.merges(), [])
+
+    def test_r2_a_declaration_never_replaces_the_forge_proof(self):
+        self.armed()
+        self.gate = (True, "", self.project(required_checks=("tests",)))
+        gh = FakeGh(tests="success", protection={"required_status_checks": None})
+        out = self.check(gh)
+        self.assertEqual(out["result"], "error", out)
+        self.assertIn("no longer enforces", out["error"])
+        self.assertEqual(gh.merges(), [])
 
     def test_r1_b1_a_refused_review_gate_never_merges(self):
         """cx3 R1 : la porte des verdicts (classe, avis, membres et delta d'un
         porteur) passe avant toute CI et tout geste de fusion."""
         self.armed()
-        self.gate = (False, "2 independent reviews missing on 1111111111")
+        self.gate = (False, "2 independent reviews missing on 1111111111", None)
         gh = FakeGh(tests="success")
         out = self.check(gh)
         self.assertEqual(out["result"], "pending", out)
@@ -560,9 +617,9 @@ class PassTest(Journal):
         self.armed()
         gh = FakeGh(tests="success", auto=True)
         self.assertEqual(self.check(gh)["result"], "merged")
-        merges = [c for c in gh.calls if c[:2] == ["pr", "merge"]]
-        self.assertIn("--disable-auto", merges[0])
-        self.assertIn("--match-head-commit", merges[1])
+        gestures = [c for c in gh.calls if c[:2] == ["pr", "merge"] or c[:2] == ["api", "-X"]]
+        self.assertIn("--disable-auto", gestures[0])
+        self.assertEqual(gestures[1][:3], ["api", "-X", "POST"])
 
     def test_a_dry_run_writes_nothing(self):
         self.armed()
@@ -636,16 +693,17 @@ class VerdictsTest(unittest.TestCase):
                 mock.patch.object(fire, "ready_verdicts",
                                   return_value=(False, "verdicts-missing", {})) as gate:
             out = packet_automerge._verdicts("cfg", "db", row, ms, slug=SLUG, base="main")
-        self.assertEqual(out, (False, "verdicts-missing"))
+        self.assertEqual(out, (False, "verdicts-missing", project))
         resolve.assert_called_once_with("cfg", None, SLUG)
         gate.assert_called_once_with("cfg", "db", row, ms, repo="/clone", project=project,
                                      target="main")
 
     def test_an_unreadable_gate_refuses(self):
         with mock.patch.object(fire, "_repo_of", side_effect=RuntimeError("registre")):
-            ok, why = packet_automerge._verdicts(None, None, {"id": LOT}, [], slug=SLUG,
-                                                 base="main")
+            ok, why, project = packet_automerge._verdicts(None, None, {"id": LOT}, [],
+                                                          slug=SLUG, base="main")
         self.assertFalse(ok)
+        self.assertIsNone(project)
         self.assertIn("registre", why)
 
 
@@ -695,6 +753,7 @@ class ArmingGh(LabelGh):
     def run(self, argv, stdin=None):
         path = argv[-1] if argv else ""
         if argv[:2] in (["pr", "view"], ["pr", "merge"]) or (
+                argv[:3] == ["api", "-X", "POST"] and argv[3].endswith("/merges")) or (
                 argv[:1] == ["api"] and (path.endswith("/protection")
                                          or "/rules/branches/" in path
                                          or "/check-runs" in path)):
@@ -718,7 +777,7 @@ class CiRunTest(GelTestCase):
         self.work.enter_context(mock.patch.object(packet_automerge, "_renew",
                                                   lambda h: True))
         self.work.enter_context(mock.patch.object(packet_automerge, "_verdicts",
-                                                  lambda *a, **k: (True, "")))
+                                                  lambda *a, **k: (True, "", None)))
         self.work.enter_context(mock.patch(
             "ameesh.prevalidation_calls.gate_packet",
             return_value={"state": "unavailable", "cause": "test"}))

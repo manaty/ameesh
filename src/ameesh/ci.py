@@ -3146,7 +3146,7 @@ def _arm_packet(cfg, db, decision: dict, gh, args) -> dict | None:
     """#2813 (canon §12) : publier un porteur `integration/**` — sa suite
     complète demandée, en vol ou verte sur la tête gelée — arme sa fusion
     automatique sur cette tête et cette cible (`packet_automerge.arm`) :
-    ameesh la fusionne lui-même au vert, sous `--match-head-commit`.
+    ameesh fusionne lui-même cette tête dans cette cible, portes vertes.
 
     L'issue est rangée dans `decision["auto_merge"]` et rendue avec la
     décision ; elle ne change jamais le code de retour : l'étiquette est

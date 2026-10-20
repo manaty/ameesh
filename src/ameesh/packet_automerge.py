@@ -12,9 +12,12 @@ ameesh-cx2 de 249b5911, B1/P1) : GitHub ne vérifie `--match-head-commit`
 qu'à l'armement et ne désarme pas sur un push d'un compte en écriture (#1656,
 `fire` P1-4). Une tête poussée après la publication et déjà verte (commit
 déjà testé, run lancé à la main) fusionnerait avant toute surveillance. La
-fusion est donc faite **par ameesh**, par `gh pr merge --merge
---match-head-commit <tête publiée>` : GitHub vérifie la tête au geste
-effectif, et aucune auto-fusion GitHub n'est laissée armée.
+fusion est donc faite **par ameesh**, et aucune auto-fusion GitHub n'est
+laissée armée. Le geste lie la tête **et** la cible (R2, ameesh-cx2) :
+`gh pr merge --match-head-commit` ne lie que la tête, une PR reciblée juste
+avant fusionnerait ailleurs ; l'API « merge a branch » (`POST
+repos/<slug>/merges`, `base=<cible épinglée>`, `head=<tête publiée>`)
+écrit la branche qu'elle nomme et le commit qu'elle nomme (`merge_into`).
 
 * **Publier** un porteur `integration/**`, c'est demander sa suite complète :
   `ameesh ci run <porteur> --full` (étiquette `ci-full-<tête>`). Juste après la
@@ -26,7 +29,8 @@ effectif, et aucune auto-fusion GitHub n'est laissée armée.
   requis imposé par GitHub sur la cible (protection classique ou ruleset,
   `fire.required_checks` sans déclaration de projet), et la fusion exige ces
   checks présents et `SUCCESS` sur la tête exacte (`fire.ready_pr`) — un
-  jeton administrateur passerait outre la protection, ameesh la relit.
+  jeton administrateur passerait outre la protection, ameesh la relit ; une
+  déclaration de projet s'y ajoute, elle ne remplace jamais la forge.
   Sans check imposé (manaty/nexlink, privé sans GitHub Pro, protection en
   403), rien n'est armé : l'équivalent est le feu du pilote à la composition
   (`ameesh work fire <porteur> --sha <tête>`), que le message rappelle.
@@ -37,14 +41,12 @@ effectif, et aucune auto-fusion GitHub n'est laissée armée.
   portes que le feu (R1, ameesh-cx3) : `fire.ready_verdicts` (classe, avis
   requis et indépendants sur la tête gelée, membres d'un porteur et delta,
   #2766), puis au moins un check imposé par la forge — et tous ceux épinglés
-  à la publication — `SUCCESS` sur la tête exacte (`fire.ready_pr`). La PR
-  est relue juste avant le geste (tête, cible, état) ; `--match-head-commit`
-  lie la tête au geste, mais aucune API de fusion GitHub ne lie la cible :
-  la fusion est relue après coup, et une cible qui a changé dans cette
-  fenêtre est journalisée en incident et réveille l'assigné (R2, ameesh-cx2 ;
-  même fenêtre résiduelle que la garde 9 de `merge_pr`). La vitesse du passage ne fait que la latence de la
-  fusion, jamais sa sûreté : une autre tête ou une autre cible ne fusionne
-  jamais par ce chemin.
+  à la publication — `SUCCESS` sur la tête exacte, avec le projet résolu
+  (checks déclarés, `required_statuses`, `ci_required` ; R2, ameesh-cx3) par
+  `fire.ready_pr`. La PR est relue juste avant le geste (tête, cible, état).
+  La vitesse du passage ne fait que la latence de la fusion, jamais sa
+  sûreté : une autre tête ou une autre cible ne fusionne jamais par ce
+  chemin.
 
 La trace est le journal du lot (aucun état local) : `auto-merge armed …`,
 `disarmed …`, `merged …` et `not-armed …`, avec dépôt, PR, tête et cible. La
@@ -188,7 +190,7 @@ def pr_status(slug: str, number: int, *, gh) -> dict:
     from . import radar
     proc = gh(["pr", "view", str(int(number)), "--repo", slug, "--json",
                "state,headRefOid,headRefName,baseRefName,isDraft,autoMergeRequest,"
-               "statusCheckRollup"])
+               "statusCheckRollup,title"])
     if proc.returncode != 0:
         raise land.LandError("gh pr view %d: %s" % (int(number), _error(proc)))
     try:
@@ -206,7 +208,8 @@ def pr_status(slug: str, number: int, *, gh) -> dict:
             "base": str(data.get("baseRefName") or "").strip(),
             "branch": str(data.get("headRefName") or "").strip(),
             "draft": bool(data.get("isDraft")), "ci": ci, "rollup": rollup,
-            "auto": data.get("autoMergeRequest") is not None}
+            "auto": data.get("autoMergeRequest") is not None,
+            "title": str(data.get("title") or "")}
 
 
 # --------------------------------------------------------------------------
@@ -315,10 +318,48 @@ def _fire_hint(lot: int, sha: str) -> str:
 # passage : désarmer (tête ou cible changée) ou fusionner (vert)
 # --------------------------------------------------------------------------
 
+def merge_into(slug: str, target: str, sha: str, *, number: int, branch: str, title: str,
+               gh) -> tuple:
+    """R2 B2 (ameesh-cx2) : LE geste de fusion, lié à la cible épinglée.
+
+    `gh pr merge --match-head-commit` ne lie que la tête : la PR reciblée
+    juste avant l'appel fusionnerait dans une autre branche. L'API « merge a
+    branch » (`POST repos/<slug>/merges`) nomme la branche écrite (`base`) et
+    le commit fusionné (`head`, la tête publiée) : un reciblage de la PR ne
+    redirige pas l'écriture, une poussée sur la branche du porteur ne change
+    pas le commit fusionné. GitHub marque la PR fusionnée quand sa tête entre
+    dans sa base. Comme la poussée de `merge_pr`, l'écriture ne passe pas par
+    la porte de la PR : les checks requis sont prouvés par ameesh juste avant.
+
+    Rend `(commit de fusion, None)`, `("", None)` quand la tête est déjà
+    contenue dans la cible (204), ou `(None, erreur)`."""
+    owner = slug.split("/", 1)[0]
+    text = "Merge pull request #%d from %s/%s\n\n%s%sMerged by ameesh at the published " \
+           "head %s into %s (packet auto-merge, #2813).\n" % (
+               int(number), owner, branch, title, "\n\n" if title else "", sha, target)
+    proc = gh(["api", "-X", "POST", "repos/%s/merges" % slug, "-f", "base=%s" % target,
+               "-f", "head=%s" % sha, "-f", "commit_message=%s" % text], timeout=120.0)
+    if proc.returncode != 0:
+        return None, _error(proc)
+    out = (proc.stdout or "").strip()
+    if not out:
+        return "", None
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None, "unreadable merge response: %s" % out[:200]
+    commit = str((data or {}).get("sha") or "").strip().lower() if isinstance(data, dict) \
+        else ""
+    if not _SHA.fullmatch(commit):
+        return None, "merge response without a commit: %s" % out[:200]
+    return commit, None
+
+
 def _verdicts(cfg, db, row: dict, milestones: list, *, slug: str, base: str) -> tuple:
     """`fire.ready_verdicts` sur le porteur, avec le dépôt et le projet que le
     feu résout (dossier de l'assigné s'il porte ce dépôt, sinon le clone
-    déclaré du projet). Rend `(ok, raison)` ; une erreur refuse."""
+    déclaré du projet). Rend `(ok, raison, projet)` ; le projet résolu sert
+    ensuite à toute la porte de CI (R2, cx3). Une erreur refuse."""
     try:
         repo = fire._repo_of(db, row)
         if repo is not None and not fire._same_repository(repo, slug):
@@ -329,8 +370,9 @@ def _verdicts(cfg, db, row: dict, milestones: list, *, slug: str, base: str) -> 
         ok, why, _klass = fire.ready_verdicts(cfg, db, row, milestones, repo=repo,
                                               project=project, target=base)
     except Exception as exc:  # noqa: BLE001 - une porte illisible ne fusionne pas
-        return False, "the review gate cannot be read: %s: %s" % (type(exc).__name__, exc)
-    return ok, why
+        return (False, "the review gate cannot be read: %s: %s" % (type(exc).__name__, exc),
+                None)
+    return ok, why, project
 
 
 def open_carriers(db, app: str) -> list[int]:
@@ -414,32 +456,36 @@ def _check_locked(cfg, db, lot: int, *, gh, dry_run: bool, actor: str,
     # R1 B1 (cx3) : la porte complète des verdicts, comme le feu (classe,
     # avis requis et indépendants sur la tête gelée, membres d'un porteur et
     # delta, #2766), avant toute lecture de CI et tout geste de fusion.
-    ok, why = _verdicts(cfg, db, row, milestones, slug=slug, base=base)
+    ok, why, project = _verdicts(cfg, db, row, milestones, slug=slug, base=base)
     if not ok:
         return dict(out, result="pending", why=why)
     # R1 B2 (cx3) : au geste, au moins un check imposé par la forge, et tous
     # ceux de la publication ; une protection allégée depuis ne fusionne rien.
+    # Cette preuve se lit sans déclaration : une déclaration ne la remplace pas.
     try:
-        required = fire.required_checks(slug, base, None, gh=gh)
+        forged = fire.required_checks(slug, base, None, gh=gh)
+        # R2 (cx3) : la porte de CI garde le projet résolu — checks déclarés,
+        # `required_statuses`, `ci_required` — en plus de la forge.
+        required = (fire.required_checks(slug, base, project, gh=gh)
+                    if project is not None else forged)
     except land.LandError as exc:
         return dict(out, result="pending",
                     why="the required checks of %s cannot be read: %s" % (base, exc))
-    names = set(context for context, _app in required)
+    names = set(context for context, _app in forged)
     dropped = [name for name in mine["required"] if name not in names]
-    if not required or dropped:
+    if not forged or dropped:
         return dict(out, result="error", error=(
             "%s no longer enforces %s: nothing proves the CI the publication relied on, "
             "nothing merged" % (base, ", ".join(dropped) or "any required check")))
-    ok, why = fire.ready_pr(view, target=base, project=None, frozen=sha, required=required,
-                            slug=slug, gh=gh)
+    ok, why = fire.ready_pr(view, target=base, project=project, frozen=sha,
+                            required=required, slug=slug, gh=gh)
     if not ok:
         return dict(out, result="pending", why=why)
     if dry_run:
         return dict(out, result="would-merge")
-    # R2 B2 (cx2) : `--match-head-commit` lie la tête au geste, aucune API de
-    # fusion ne lie la cible. La PR est relue juste avant le geste, après
-    # toutes les lectures de la porte ; une tête, une cible ou un état changés
-    # depuis ne fusionnent pas (le passage suivant désarme).
+    # La PR est relue juste avant le geste, après toutes les lectures de la
+    # porte ; une tête, une cible ou un état changés depuis ne fusionnent pas
+    # (le passage suivant désarme).
     try:
         fresh = pr_status(slug, number, gh=gh)
     except land.LandError as exc:
@@ -451,36 +497,14 @@ def _check_locked(cfg, db, lot: int, *, gh, dry_run: bool, actor: str,
                fresh["base"] or "?")))
     if not _renew(handle):
         return dict(out, result="busy")
-    # le seul geste de fusion : GitHub vérifie la tête à cet instant précis
-    error = land.pr_merge(slug, number, sha, METHOD, gh=gh)
+    commit, error = merge_into(slug, base, sha, number=number, branch=fresh["branch"],
+                               title=fresh.get("title") or "", gh=gh)
     if error is not None:
         return dict(out, result="error", error="merge: %s" % error)
-    return _read_back(db, lot, row, out, slug=slug, gh=gh, actor=actor)
-
-
-def _read_back(db, lot: int, row: dict, out: dict, *, slug: str, gh, actor: str) -> dict:
-    """Après le geste : la cible réelle de la fusion. Un reciblage glissé entre
-    la relecture fraîche et le geste (fenêtre qu'aucune API GitHub ne ferme)
-    est constaté, journalisé en incident et réveille l'assigné du porteur."""
-    number, sha, base = out["pr"], out["sha"], out["base"]
-    try:
-        after = pr_status(slug, number, gh=gh)
-    except land.LandError as exc:
-        after = None
-        unread = str(exc)
-    if after is not None and after["base"] == base:
-        _note(db, lot, "merged", slug, number, sha,
-              "base=%s — merged by ameesh at its published head, required checks green"
-              % base, actor)
-        return dict(out, result="merged")
-    where = after["base"] if after is not None else "unreadable (%s)" % unread
-    text = ("base=%s — INCIDENT: PR #%d merged at %s but its target now reads %s, not the "
-            "pinned %s: check where the packet landed (retarget during the merge?)"
-            % (base, number, sha[:12], where, base))
-    _note(db, lot, "merged", slug, number, sha, text, actor)
-    fire._wake(db, row.get("assignee"), lot, "Packet #%d: %s" % (lot, text),
-               {"project": row.get("app") or "", "pr": number, "anomaly": True})
-    return dict(out, result="error", error=text)
+    _note(db, lot, "merged", slug, number, sha,
+          "base=%s commit=%s — merged by ameesh into %s at its published head, gates green"
+          % (base, commit or "already-contained", base), actor)
+    return dict(out, result="merged", commit=commit)
 
 
 def watch(cfg, db, app: str, *, gh=None, dry_run: bool = False) -> list[dict]:
