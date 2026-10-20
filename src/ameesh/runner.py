@@ -2169,6 +2169,15 @@ class AgentWorker(threading.Thread):
                       % (self.name, ", ".join("#%d" % i for i in debuts)))
 
     def rotate_for_lot(self, spec: dict | None) -> dict | None:
+        try:
+            return self._rotate_for_lot(spec)
+        except Exception:
+            # #2614 : aucun run_turn ne nettoiera ce réveil abandonné.
+            if spec and spec.get("scheduled_wake"):
+                self._wake_claim = None
+            raise
+
+    def _rotate_for_lot(self, spec: dict | None) -> dict | None:
         """Avant un tour : passe à la session du lot du tour s'il change
         (0025 ; #408, une session par lot).
 
@@ -4225,6 +4234,8 @@ class AgentWorker(threading.Thread):
             # #408 : le réveil sur un lot actionnable porte déjà son lot
             spec["lot"] = spec.get("lot") or self.turn_lot(spec)
             if self._lot_workdir_blocked(spec.get("lot")):
+                if spec.get("scheduled_wake"):
+                    self._wake_claim = None
                 # #811 (B1) : ne pas relancer en boucle le tour d'un lot
                 # secondaire sans dossier ; la consigne repart en attente.
                 if spec.get("kind") == "prompt":

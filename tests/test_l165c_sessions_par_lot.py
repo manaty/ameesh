@@ -1292,6 +1292,39 @@ class ReveilTest(_Base):
             worker._renew_wake_claim()
         claim.assert_not_called()
 
+    def test_reveil_programme_abandonne_avant_run_turn(self):
+        """#2614 : dossier refusé ou rotation en panne ne retient pas le bail."""
+        for abandon in ("dossier", "rotation"):
+            with self.subTest(abandon=abandon):
+                name = "r7f_" + abandon
+                worker = self._worker(name)
+                lot = work.add(self.db, title="séance owner", assignee=name,
+                               force=_FORCE)["id"]
+                work.note(self.db, lot, "hold: séance owner", actor=name,
+                          wake_ts=time.time() - 1)
+                if abandon == "dossier":
+                    with mock.patch.object(worker, "_lot_workdir_blocked",
+                            side_effect=lambda lot: worker._wake_claim is not None):
+                        self.assertIsNone(self.pick(worker))
+                else:
+                    spec = self.pick(worker)
+                    with mock.patch.object(worker, "session_policy", return_value="par-lot"), \
+                         mock.patch.object(worker, "_lot_is_finished",
+                                           side_effect=db_mod.Unavailable("offline")):
+                        with self.assertRaises(db_mod.Unavailable):
+                            worker.rotate_for_lot(spec)
+                self.assertIsNone(worker._wake_claim)
+                self.db.execute("UPDATE work_items SET wake_claim_at ="
+                                " now() - interval '10 minutes' WHERE id = %s", (lot,))
+                worker._wake_claim_renewed = float("-inf")
+                worker._renew_wake_claim()
+                worker._scheduled_wake_checked = float("-inf")
+                again = worker._scheduled_wake_spec()
+                self.assertIsNotNone(again, "le battement laisse le claim expirer")
+                self.assertEqual(again["lot"], str(lot))
+                self.assertFalse(any(e["note"].startswith("wake:")
+                                     for e in work.events(self.db, lot)))
+
     def test_reveil_programme_non_consomme_si_le_tour_n_est_pas_lance(self):
         """#2466 B1 (cx2, 2e tour) : tant que le harnais n'a pas démarré
         (`_turn_launched` faux : refus READY, send résident en échec), la
