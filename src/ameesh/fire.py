@@ -733,7 +733,8 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
                 "authors of the lot cannot be established (%s), so no verdict can "
                 "be proven independent (canon §2: independence is never assumed)"
                 % (frozen[:12], klass.get("class") or "?", exc)), klass
-        gate_authors = {"authors": authors, "families": families}
+        gate_authors = {"authors": authors, "families": families,
+                        "authors_complete": True}
     gate = merge_queue.review_gate(db, marks, frozen, repo=repo, klass=klass,
                                    item=row, cfg=cfg, target=base, **gate_authors)
     if not gate["ok"]:

@@ -1402,6 +1402,24 @@ class CompleteAuthorsTest(unittest.TestCase):
     def _git(tmp):
         return DeltaBaseTest._git(tmp)
 
+    def test_a_holder_who_only_wrote_a_merge_cannot_review_it(self):
+        # La lecture complète voit la fusion de rev1 ; la lecture partagée
+        # des commits sans fusion ne voit que author. Elle ne doit pas
+        # effacer rev1 des auteurs ni compter son propre avis.
+        authors = [{"name": "author", "family": "deepseek"},
+                   {"name": "rev1", "family": "codex"}]
+        marks = _marks(_verdict("rev1"), _verdict("rev2"))
+        with mock.patch.object(merge_queue, "_attribution_on_freeze",
+                               return_value=([authors[0]], [])):
+            gate = merge_queue.review_gate(
+                None, marks, A, item={"assignee": "rev1"},
+                klass={"class": "sensitive"}, required=2,
+                authors=authors, authors_complete=True, family_of=FAM.get)
+        self.assertFalse(gate["ok"], gate["why"])
+        self.assertEqual({entry["name"] for entry in gate["authors"]},
+                         {"author", "rev1"})
+        self.assertEqual([entry["actor"] for entry in gate["accepted"]], ["rev2"])
+
     def _repo(self, tmp, git, *commits):
         DeltaBaseTest._write(tmp, "a", "a\n")
         git("init", "-q", "-b", "main")

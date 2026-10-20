@@ -718,11 +718,13 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     # La lecture de la plage (ou une liste que l'appelant déclare complète et
     # exacte, le train) dit s'il a écrit ; sans aucune preuve, il reste la
     # référence (direction stricte : l'indépendance ne se suppose jamais).
-    if attribution is not None:
+    if authors_complete and not exact and authors is not None:
+        # La lecture complète inclut les auteurs de fusion ; la lecture des
+        # seuls commits de contenu ne peut pas effacer cette preuve (#1515).
+        reference_is_author = bool(author) and author.lower() in _author_names(authors)
+    elif attribution is not None:
         reference_is_author = bool(author) and author.lower() in _author_names(
             range_authors)
-    elif authors is not None and authors_complete:
-        reference_is_author = bool(author) and author.lower() in _author_names(authors)
     else:
         reference_is_author = True
     # #2681/#2808 : les auteurs **reconnus** de la tête, quand l'appelant les a
@@ -1772,7 +1774,8 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
                 "lot #%d: the complete authors of the lot cannot be established "
                 "(%s), so no verdict can be proven independent (canon §2)"
                 % (lot, exc)) from exc
-        gate_authors = {"authors": authors, "families": families}
+        gate_authors = {"authors": authors, "families": families,
+                        "authors_complete": True}
     gate = review_gate(db, marks, tip, repo=where, klass=klass, item=row,
                        cfg=cfg, target=fresh_target, **gate_authors)
     if not gate["ok"]:
