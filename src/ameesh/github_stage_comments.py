@@ -79,11 +79,12 @@ def stages(item, milestones, events, *, receipts=(), closing=None):
     yield "accepted", "Accepted. Priority: %s; target: %s." % (priority, target)
     timeline = []
     kinds = set()
-    for mark in reversed(milestones):
+    for mark in milestones:
         kind = mark.get("kind")
         if kind not in ("frozen", "merged") or mark.get("annulled"):
             continue
-        # #2861: one public "Frozen" per lot; a re-freeze is not a new stage
+        # #2861: newest-first: retain the latest freeze in the timeline.
+        # One public "Frozen" per lot; a re-freeze is not a new stage
         # for the requester (a lot can be frozen ten times before it lands).
         if kind == "frozen" and "frozen" in kinds:
             continue

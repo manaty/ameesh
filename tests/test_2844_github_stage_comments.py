@@ -69,7 +69,7 @@ class StageCommentsTest(unittest.TestCase):
         # #2861: enrolling an open mirror that predates the feature posts no
         # history, and re-freezes never repeat "Frozen for review."
         self.marks = [dict(id=n, kind="frozen", at_ts=n) for n in (6, 5, 4, 3)]
-        self.events = [dict(id=7, state="blocked", created_ts=2,
+        self.events = [dict(id=7, state="blocked", created_ts=5,
                             note="Public status: Please confirm."), *self.events]
         self.assertEqual([r["event"] for r in self.project()["comments"]], ["frozen"])
         self.assertEqual(len(self.bodies()), 1)
