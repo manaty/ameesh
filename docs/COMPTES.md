@@ -246,6 +246,17 @@ sont tues tant que le relevé n'est pas rafraîchi (#1561). Chaque relevé porte
 son horodatage (`read_at` : marqueur de compte Claude, date du journal Codex),
 exposé par `accounts list --json` et l'instantané `progress`.
 
+Les journaux Codex récents sont réconciliés fenêtre par fenêtre (#2839) :
+un relevé hebdomadaire seul ne supprime plus une fenêtre courte encore
+ouverte. Leur horodatage d'événement prime sur la date de modification du
+fichier. Des relevés vivants qui portent des identités de créateur, des
+forfaits ou des remises à zéro incompatibles rendent le compte ambigu :
+il est refusé, même garde de rythme désactivée, et le choix cherche un autre
+compte. `creator_account_id` ne suffit pas à attribuer un relevé : une session
+reprise peut conserver son créateur alors que ses nouvelles jauges portent
+un autre forfait. Aucune valeur d'identifiant n'apparaît dans le diagnostic.
+Les fenêtres échues ne maintiennent pas ce refus.
+
 Depuis la tranche 3 de #1580 (15/10/2026), les jauges d'un compte Claude
 peuvent venir du fichier du widget omarchy (`~/.local/state/omarchy/agents/
 usage/claude*.json`, dossier réglable par l'hôte avec

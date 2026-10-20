@@ -1052,7 +1052,10 @@ class CostBook:
         return storage.of(self.db).operations.gauge_latest(harness=harness, account=account)
 
     def codex_gauges(self, sessions: str | None = None) -> list:
-        """Les `rate_limits` primaire et secondaire du journal de session le plus récent.
+        """Les fenêtres `rate_limits` des journaux récents du compte.
+
+        #2839 : une lecture partielle ne masque aucune fenêtre ; des relevés
+        vivants contradictoires refusent le compte au lieu de choisir au mtime.
 
         Lecture **JSON structurée**, pas une expression régulière : l'ordre des clés
         n'est pas garanti (`plan_type` peut précéder `primary`), `secondary` peut
@@ -1065,43 +1068,27 @@ class CostBook:
         files = sorted(
             glob.glob(os.path.join(racine, "**", "*.jsonl"), recursive=True),
             key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
-        )[-CODEX_FILES:]
+        )
+        # #2839 : five newer partial sessions must not evict a still-live
+        # short window. Scan the last plan window; keep the historical sample
+        # as well for the existing expired-reading display. Parsed readings
+        # are cached by file identity/size/mtime/ctime, never raw transcripts.
+        now = self.clock()
+        recent = set(files[-CODEX_FILES:])
+        from .codex_gauges import reconcile, session_reading
+        readings = []
         for path in reversed(files):
             try:
                 read_at = os.path.getmtime(path)
+                if path not in recent and read_at < now - KNOWN_WINDOWS["seven_day"]:
+                    continue
+                readings.extend(session_reading(path, read_at))
             except OSError:
-                read_at = None
-            limits = None
-            for line in _read_tail(path, 2_000_000).splitlines():
-                line = line.strip()
-                if not line or "rate_limits" not in line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except ValueError:
-                    continue
-                found = _find_rate_limits(event)
-                if found:
-                    limits = found          # le dernier de la session gagne
-            if not limits:
                 continue
-            gauges = []
-            for key in ("primary", "secondary"):
-                value = limits.get(key)
-                if not isinstance(value, dict):
-                    continue                    # `secondary: null` n'est pas une jauge
-                minutes = float(value.get("window_minutes") or 0)
-                gauges.append(Gauge(
-                    "codex",
-                    "codex-%dmin" % int(minutes or 0),
-                    _fraction(value.get("used_percent"), percent=True),
-                    _epoch(value.get("resets_at")),
-                    minutes * 60 if minutes else float(KNOWN_WINDOWS["seven_day"]),
-                    read_at,
-                ))
-            if gauges:
-                return Gauges(gauges, _codex_overage(limits, gauges))
-        return []
+            # Refuse as soon as a contradiction is proven, without scanning
+            # the remainder of a busy account's history.
+            reconcile(readings, now)
+        return reconcile(readings, now)
 
     def gauges(self, harness: str | None = None, *, record: bool = True) -> list:
         """Les jauges de forfait, par **source déclarée** dans les descripteurs (L16).
