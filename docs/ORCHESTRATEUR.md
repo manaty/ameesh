@@ -475,6 +475,17 @@ ameesh work milestone <id> verdict ok --sha <commit>            le GO de revue, 
 ameesh work queue add <id>                                      dans la file
 ```
 
+La tête du gel est un commit **complet** (une abréviation de 12+ hexadécimaux
+est résolue dans le dépôt de l'auteur et écrite complète) ; `HEAD` et un nom
+de branche sont refusés : chaque lecteur les résoudrait dans son clone, et le
+balayage d'un autre arbre a déjà fermé un lot sur ce `HEAD` (#2786, #2712).
+Un gel non conforme resté en base vaut doute, jamais une livraison. Un gel
+dont le commit est déjà ancêtre de la cible au moment du gel (aucun commit
+propre) est refusé : c'est un ancien commit, pas la branche du lot (#2784).
+La cible est lue **publiée et rafraîchie** : un clone en retard sur la forge
+n'accepte pas un gel déjà livré et n'écrit pas de marque d'absence ; si la
+forge est illisible, le gel s'écrit sans cette marque et le balayage doute.
+
 ameesh range la file à chaque passage du radar : priorité, puis les lots
 sans conflit, puis ceux dont les conflits sont préparés (`ameesh work
 resolve`), puis l'arrivée. Il la rejoue empilée (la cible, plus les lots qui
