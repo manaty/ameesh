@@ -129,6 +129,14 @@ DISK_TREND_HORIZON_S = 24 * 3600.0
 DISK_TREND_CRITICAL_S = 6 * 3600.0
 DISK_TREND_MIN_POINTS = 6
 DISK_TREND_MIN_SPAN_S = 3600.0
+#: #2879: the fit reads ONE point per 5-minute bucket, not every reading.
+#: pc-smichea already stores ~4 800 readings per host over the 6 h window
+#: (~one every 4 s) and 3.3 MB of `volumes` jsonb: on a degraded 30 KiB/s
+#: link that transfer took 53-63 s per host, while the same query runs in
+#: ~0.1 s server-side. A bucket keeps the last reading of the tranche, so
+#: 72 points cover the window — a few KB — and the least-squares fit sees
+#: the same line (a bucket is well under `DISK_TREND_MIN_SPAN_S`).
+DISK_TREND_STEP_S = 300.0
 #: #2022: zombies of a host at or over this count raise `host_zombies` — a
 #: warning, no pause (16/10, found by hand: 99 on ameesh-ci-3, 5 900 on the
 #: workstation, 11 000 on agents-1, #1749)

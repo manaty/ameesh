@@ -827,8 +827,10 @@ def _host_fleet(cfg, db, canons, args) -> int:
             canons, reading["host"], reading=readings.get(name),
             default_scope=res.pressure_scope(None) if name == cfg.host else None,
         )["limits"]
-        history = (storage.of(db).hosts.since(reading["host"], res.DISK_TREND_WINDOW_S)
-                   if name in readings else [])
+        # #2879 : la tendance disque ne rapatrie que les volumes utiles.
+        history = (storage.of(db).hosts.disk_history(
+            reading["host"], res.DISK_TREND_WINDOW_S, res.DISK_TREND_STEP_S)
+            if name in readings else [])
         lines.append(res.fleet_line(reading, limits, [h for h in history
                                                       if h.get("id") != reading.get("id")],
                                     now=now))
