@@ -93,7 +93,7 @@ class AlertTest(unittest.TestCase):
         store = mock.MagicMock()
         store.hosts.current.return_value = [dict({"host": "pc", "sampled_ts": 100.0},
                                                  **reading)]
-        store.hosts.since.return_value = []
+        store.hosts.disk_history.return_value = []
         store.hosts.runners.return_value = list(runners)
         store.turn_resources.orphans.return_value = []
         store.turn_resources.stale_running.return_value = []

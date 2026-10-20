@@ -212,9 +212,15 @@ class Hosts(interface.HostResources):
         if host:
             where = " WHERE host = %s"
             params.append(host)
+        # #2851 : les colonnes coûteuses (`ameesh_host_gate_state`) ne sont
+        # calculées que pour les derniers relevés. Le DISTINCT ON sur les
+        # seules clés primaires laissait sinon la fonction s'exécuter sur tout
+        # l'historique : ~1 s par lecture, et `alerts` en fait quatre.
         rows = self.db.query(
-            "SELECT DISTINCT ON (host) " + READING_COLUMNS + " FROM host_resources"
-            + where + " ORDER BY host, sampled_at DESC, id DESC", tuple(params))
+            "SELECT " + READING_COLUMNS + " FROM host_resources WHERE id IN ("
+            "SELECT DISTINCT ON (host) id FROM host_resources"
+            + where + " ORDER BY host, sampled_at DESC, id DESC) ORDER BY host",
+            tuple(params))
         return [_reading(row) for row in rows]
 
     def runners(self, host, since_s) -> list[dict]:
@@ -245,6 +251,14 @@ class Hosts(interface.HostResources):
         return [_reading(row) for row in self.db.query(
             "SELECT " + READING_COLUMNS + " FROM host_resources WHERE host = %s"
             " AND sampled_at >= now() - make_interval(secs => %s)"
+            " ORDER BY sampled_at, id", (host, float(since_s)))]
+
+    def disk_history(self, host, since_s) -> list[dict]:
+        """#2851 : la tendance disque ne lit que ses quatre champs."""
+        return [_reading(row) for row in self.db.query(
+            "SELECT id, extract(epoch from sampled_at)::float8 AS sampled_ts,"
+            " volumes, disk_path, disk_free_bytes FROM host_resources"
+            " WHERE host = %s AND sampled_at >= now() - make_interval(secs => %s)"
             " ORDER BY sampled_at, id", (host, float(since_s)))]
 
     def record_harness_version(self, host, harness, *, path, version, raw) -> None:
