@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -39,6 +40,31 @@ class Api:
 
 
 class CollectionTest(unittest.TestCase):
+    def test_shared_owner_account_without_marker_is_delivered(self):
+        row = dict(comment(), user={"login": "smichea"})
+        events = watch.collect(Api(comments=[row]), SUB, NOW)
+        self.assertEqual([(e["kind"], e["object_id"]) for e in events], [("comment", 10)])
+
+    def test_projection_comments_are_marked_on_wire_and_filtered(self):
+        gh = mock.Mock()
+        gh.run.return_value = (0, "{}", "")
+        repo = plan_github._Repo(gh, SUB.repo, False)
+        bodies = []
+        for state in ("merged", "promoted", "closed"):
+            bodies.append(plan_github._closing(dict(id=42, state=state),
+                          repo=SUB.repo, public=True, issue_of=lambda _: None))
+        bodies += ["Duplicate of #99, created at the same time for the same work item: closed by ameesh.",
+                   "Done\n\n<!-- ameesh:work-stage:v1 lot=42 event=freeze -->"]
+        rows = []
+        for n, body in enumerate(bodies, 10):
+            with self.subTest(body=body):
+                repo.comment(1, body)
+                sent = json.loads(gh.run.call_args.args[1])["body"]
+                self.assertEqual(sent.count("<!-- ameesh:"), 1)
+                self.assertIn(body, sent)
+                rows.append(comment(n, sent))
+        self.assertEqual(watch.collect(Api(comments=rows), SUB, NOW), [])
+
     def test_pages_closed_tickets_and_comments_on_old_issues(self):
         api = Api([issue(n) for n in range(1, 203)], [comment()])
         events = watch.collect(api, SUB, NOW - 3600)
