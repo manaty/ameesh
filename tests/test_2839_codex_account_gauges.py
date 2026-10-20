@@ -62,6 +62,26 @@ class CodexReadingsTest(Sandbox, unittest.TestCase):
         os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
         self.assertFalse(self.book().codex_gauges().in_overage(self.now))
 
+    def test_retained_short_window_expires_at_its_own_reset(self):
+        observed = self.now
+        journal(self.codex, "full", event(observed), mtime=observed)
+        book = self.book()
+        self.assertTrue(book.codex_gauges().in_overage(observed + 3599))
+        partial = event(observed, short=None)
+        partial["timestamp"] = datetime.fromtimestamp(
+            observed + 3600, timezone.utc).isoformat()
+        journal(self.codex, "after-reset", partial, mtime=observed + 3600)
+        for offset in (3600, 3601):
+            with self.subTest(offset=offset):
+                self.now = observed + offset
+                gauges = book.codex_gauges()
+                short = next(g for g in gauges if g.key == "codex-300min")
+                self.assertEqual(short.used, 1.0)  # Historical value stays visible.
+                self.assertEqual(short.used_at(self.now), 0.0)
+                self.assertFalse(gauges.in_overage(self.now))
+                self.assertEqual(next(g.used_at(self.now) for g in gauges
+                                      if g.key == "codex-10080min"), 0.49)
+
     def test_partial_event_in_same_session_keeps_short_window(self):
         journal(self.codex, "same", event(self.now), event(self.now, short=None))
         self.assertEqual(len(self.book().codex_gauges()), 2)
@@ -109,6 +129,28 @@ class CodexReadingsTest(Sandbox, unittest.TestCase):
 
 
 class CodexFailoverTest(_Base):
+    def test_weekly_only_reading_after_short_reset_releases_account(self):
+        observed = float(int(time.time()))
+        now = observed
+        declared = self._codex_comptes()
+        items = accounts.parse({"codex": declared})["codex"]
+        secondary = os.path.join(items[1].path, "sessions")
+        journal(secondary, "full", event(observed), mtime=observed)
+        book = cost.CostBook(state_dir=self.tmp, db=self.db, clock=lambda: now)
+        self.assertFalse(accounts.evaluate(book, items[1], items, now, record=False).ok)
+        now = observed + 3601
+        partial = event(observed, short=None)
+        partial["timestamp"] = datetime.fromtimestamp(now, timezone.utc).isoformat()
+        journal(secondary, "after-reset", partial, mtime=now)
+        result = accounts.evaluate(book, items[1], items, now, record=False)
+        self.assertTrue(result.ok, result.reason)
+        self.assertFalse(result.hard)
+        choice = accounts.choose(self.db, self.cfg.host, "codex", items, book,
+                                 now=now, session_account="secondaire")
+        self.assertEqual(choice.profile.name, "secondaire")
+        allowed, reason = account_turn.summary_possible(items[1], book, items, now)
+        self.assertTrue(allowed, reason)
+
     def test_threshold_and_ambiguity_failover_for_new_and_existing_sessions(self):
         now = float(int(time.time()))
         declared = self._codex_comptes()
