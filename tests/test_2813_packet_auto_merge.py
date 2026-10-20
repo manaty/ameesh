@@ -61,6 +61,8 @@ def rollup(tests):
         return []
     status, conclusion = RUNS[tests]
     return [{"__typename": "CheckRun", "name": "tests", "workflowName": "tests",
+             "detailsUrl": "https://github.com/manaty/ameesh/actions/runs/200/job/123",
+             "startedAt": "2026-10-20T03:00:00Z", "completedAt": "2026-10-20T03:20:00Z",
              "status": status, "conclusion": conclusion}]
 
 
@@ -88,6 +90,14 @@ class Forge:
         args = list(args)
         self.calls.append(args)
         path = args[-1] if args else ""
+        # #2876 : une PR verte prouve aussi qu'aucun portier invisible ne
+        # tourne encore sur cette tête. Ce banc ne crée aucun run paquet.
+        if args[:1] == ["api"] and "/actions/workflows/paquet.yml/runs?" in path:
+            return 0, json.dumps({"total_count": 0, "workflow_runs": []}), ""
+        if args[:1] == ["api"] and path.endswith("/actions/runs/200"):
+            return 0, json.dumps({"id": 200, "head_sha": self.head, "head_branch": self.branch,
+                                  "event": "pull_request", "path": ".github/workflows/tests.yml",
+                                  "status": "completed", "conclusion": "success"}), ""
         if args[:3] == ["api", "-X", "POST"] and args[3].endswith("/merges"):
             fields = dict(a.split("=", 1) for a in args[4:] if a != "-f")
             if self.merge_error:
@@ -582,7 +592,8 @@ class PassTest(Journal):
 
     def test_r1_b1_a_refused_review_gate_never_merges(self):
         """cx3 R1 : la porte des verdicts (classe, avis, membres et delta d'un
-        porteur) passe avant toute CI et tout geste de fusion."""
+        porteur) passe avant la lecture des protections et tout geste de fusion.
+        La lecture du statut CI inclut la preuve de run du portier (#2876)."""
         self.armed()
         self.gate = (False, "2 independent reviews missing on 1111111111", None)
         gh = FakeGh(tests="success")
@@ -590,7 +601,8 @@ class PassTest(Journal):
         self.assertEqual(out["result"], "pending", out)
         self.assertIn("reviews missing", out["why"])
         self.assertEqual(gh.merges(), [])
-        self.assertEqual([c for c in gh.calls if c[:1] == ["api"]], [])
+        self.assertEqual([c for c in gh.calls if c[:1] == ["api"]
+                          and "/actions/" not in c[1]], [])
 
     def test_r1_b2_a_protection_emptied_after_publication_never_merges(self):
         self.armed()

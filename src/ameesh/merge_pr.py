@@ -475,7 +475,11 @@ def pr_view(slug: str, pr: int, gh=land._gh) -> dict:
     if proc.returncode != 0:
         raise MergePrError("gh pr view #%s: %s"
                            % (pr, (proc.stderr or proc.stdout or "").strip()[:300]))
-    return _json(proc, "gh pr view #%s" % pr)
+    view = _json(proc, "gh pr view #%s" % pr)
+    view["statusCheckRollup"] = radar.merge_rollup(view.get("statusCheckRollup"), slug=slug,
+                                                 head=view.get("headRefOid") or "",
+                                                 branch=view.get("headRefName") or "", gh=gh)
+    return view
 
 
 def message(pr: int, head: str, target: str, tip: str, tree: str, *,
