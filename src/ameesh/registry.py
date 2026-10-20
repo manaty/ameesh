@@ -446,13 +446,17 @@ def pending_spend_set_model(db: Db, name: str, model: str | None) -> bool:
 
 
 def pending_spend_set_resident_usage(db: Db, name: str, usage: dict | None,
-                                     created_ts: float | None = None) -> bool:
+                                     marker: dict | None = None) -> bool:
     """Pose (ou efface avec None) l'événement `resident.turn` du marqueur (L80a).
 
     L'état durable du tour incomplet : un worker de remplacement y retrouve la
-    mesure et peut écrire l'événement puis la ligne du grand livre. `created_ts`
-    borne l'écriture au marqueur de ce tour, jamais celui d'un remplaçant."""
-    return storage.of(db).pending_spend.set_resident_usage(name, usage, created_ts)
+    mesure et peut écrire l'événement puis la ligne du grand livre. `marker`
+    porte l'identité exacte (#2166 : `created_at`, `spend_key`) et borne
+    l'écriture au marqueur de ce tour, jamais celui d'un remplaçant."""
+    return storage.of(db).pending_spend.set_resident_usage(
+        name, usage,
+        None if marker is None else marker.get("created_at"),
+        None if marker is None else marker.get("spend_key"))
 
 
 def pending_spend_get(db: Db, name: str) -> dict | None:
@@ -470,7 +474,13 @@ def _pending_spend_row(row: dict | None) -> dict | None:
         "start": int(row["start_index"]),
         "turn": row.get("turn") or "",
         "model": row.get("model"),
+        # #2166 : l'identité exacte du marqueur (texte UTC à la microseconde),
+        # jamais un float8 relu ; `created_ts` reste l'epoch pour `started_at`.
+        "created_at": row.get("created_at"),
         "created_ts": row.get("created_ts"),
+        # #2166 : la clé exacte du grand livre et de la réservation #1469 ;
+        # None sur un marqueur d'avant 0471 (clé historique dérivée du float8).
+        "spend_key": row.get("spend_key"),
         # #796 : le lot du tour (None si inconnu, ou marqueur d'avant 0423)
         "work_item_id": row.get("work_item_id"),
         # #796 : l'identifiant du tour, pour relier la ligne à ses ressources
@@ -480,20 +490,29 @@ def _pending_spend_row(row: dict | None) -> dict | None:
     }
 
 
-def pending_spend_clear(db: Db, name: str, created_ts: float | None = None) -> bool:
-    """Efface le marqueur ; avec `created_ts` (#1469), seulement s'il est encore
-    celui de ce tour — un worker en retard n'efface pas celui de son remplaçant."""
+def pending_spend_clear(db: Db, name: str, marker: dict | None = None) -> bool:
+    """Efface le marqueur ; avec `marker` (#1469), seulement s'il est encore
+    celui de ce tour — un worker en retard n'efface pas celui de son
+    remplaçant. L'identité est exacte (#2166) : `created_at` en texte et
+    `spend_key`, jamais un float8 relu à précision réduite."""
     from .agent_names import resolve as resolve_agent_name
     name = resolve_agent_name(name, db=db, operation="registry.pending_spend_clear")
     api = storage.of(db).pending_spend
-    if created_ts is None:
+    if marker is None:
         return api.clear(name)
+    created_at = marker.get("created_at")
+    if not created_at:
+        # pas d'identité exacte : on n'efface pas un marqueur qu'on ne peut pas
+        # identifier (fail-closed), même si l'ancien float8 correspondait.
+        return False
+    spend_key = marker.get("spend_key")
     if hasattr(api, "clear_if"):
-        return api.clear_if(name, created_ts)
-    # backend médié : pas d'opération conditionnelle, le bail est fencé au serveur
+        return api.clear_if(name, created_at, spend_key)
+    # backend médié : pas d'opération conditionnelle, le bail est fencé au
+    # serveur ; on compare l'identité exacte rendue par `get`.
     row = api.get(name)
-    if row is None or row.get("created_ts") is None \
-            or abs(float(row["created_ts"]) - float(created_ts)) >= 0.0000005:
+    if row is None or row.get("created_at") != created_at \
+            or (row.get("spend_key") or None) != (spend_key or None):
         return False
     return api.clear(name)
 

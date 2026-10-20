@@ -1095,6 +1095,14 @@ class Leases(interface.Leases):
 
 class PendingSpend(interface.PendingSpend):
 
+    #: #2166 : identité exacte du marqueur, en texte UTC à la microseconde.
+    #: Jamais `extract(epoch ...)::float8` relu : une connexion qui l'imprime
+    #: à précision réduite (`extra_float_digits=0`, pools, production) en perd
+    #: les derniers chiffres, et la comparaison échouait après le règlement.
+    _EXACT_CREATED_AT = (
+        "to_char(created_at at time zone 'UTC',"
+        " 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')")
+
     def put(self, name, start_index, turn, model, work_item_id=None, turn_id=None) -> bool:
         return self.put_get(name, start_index, turn, model,
                             work_item_id=work_item_id, turn_id=turn_id) is not None
@@ -1105,23 +1113,29 @@ class PendingSpend(interface.PendingSpend):
         rows = self.db.query(
             """
             INSERT INTO spend_pending (agent, start_index, turn, model, work_item_id,
-                                       turn_id, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, now())
+                                       turn_id, spend_key, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s,
+                    %s || ':' || %s || ':' ||
+                    to_char(now() at time zone 'UTC',
+                            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+                    now())
             ON CONFLICT (agent) DO UPDATE SET
                 start_index  = excluded.start_index,
                 turn         = excluded.turn,
                 model        = excluded.model,
                 work_item_id = excluded.work_item_id,
                 turn_id      = excluded.turn_id,
+                spend_key    = excluded.spend_key,
                 resident_usage = null,
                 created_at   = now()
             RETURNING agent, start_index, turn, model, work_item_id, turn_id,
-                      resident_usage,
+                      resident_usage, spend_key,
+                      """ + self._EXACT_CREATED_AT + """ as created_at,
                       extract(epoch from created_at)::float8 as created_ts
             """,
             (name, int(start_index), turn, model,
              None if work_item_id is None else int(work_item_id),
-             turn_id or None),
+             turn_id or None, name, int(start_index)),
         )
         return rows[0] if rows else None
 
@@ -1132,11 +1146,12 @@ class PendingSpend(interface.PendingSpend):
         )
         return bool(rows)
 
-    def set_resident_usage(self, name, usage, created_ts=None) -> bool:
+    def set_resident_usage(self, name, usage, created_at=None, spend_key=None) -> bool:
         """L80a : l'événement `resident.turn` d'un tour non réglé, dans le
-        marqueur ; `created_ts` borne l'écriture au marqueur de ce tour."""
+        marqueur ; `created_at`/`spend_key` (#2166) bornent l'écriture au
+        marqueur de CE tour, comparés en texte/timestamptz exacts."""
         value = None if usage is None else json.dumps(usage, ensure_ascii=False)
-        if created_ts is None:
+        if created_at is None:
             rows = self.db.query(
                 "UPDATE spend_pending SET resident_usage = %s::jsonb"
                 " WHERE agent = %s RETURNING agent", (value, name))
@@ -1144,15 +1159,18 @@ class PendingSpend(interface.PendingSpend):
             rows = self.db.query(
                 "UPDATE spend_pending SET resident_usage = %s::jsonb"
                 " WHERE agent = %s"
-                " AND abs(extract(epoch from created_at)::float8 - %s) < 0.0000005"
-                " RETURNING agent", (value, name, float(created_ts)))
+                " AND created_at = %s::timestamptz"
+                " AND spend_key IS NOT DISTINCT FROM %s"
+                " RETURNING agent",
+                (value, name, str(created_at), spend_key))
         return bool(rows)
 
     def get(self, name) -> dict | None:
         rows = self.db.query(
             """
             SELECT agent, start_index, turn, model, work_item_id, turn_id,
-                   resident_usage,
+                   resident_usage, spend_key,
+                   """ + self._EXACT_CREATED_AT + """ as created_at,
                    extract(epoch from created_at)::float8 as created_ts
               FROM spend_pending WHERE agent = %s
             """,
@@ -1165,11 +1183,13 @@ class PendingSpend(interface.PendingSpend):
                              (name,))
         return bool(rows)
 
-    def clear_if(self, name, created_ts) -> bool:
+    def clear_if(self, name, created_at, spend_key=None) -> bool:
         """#1469 : efface le marqueur seulement s'il est encore celui de ce tour
-        (même `created_ts`) — jamais celui d'un remplaçant, en une instruction."""
+        — même `created_at` exact et même `spend_key` (#2166), jamais celui
+        d'un remplaçant, en une instruction."""
         rows = self.db.query(
             "DELETE FROM spend_pending WHERE agent = %s"
-            " AND abs(extract(epoch from created_at)::float8 - %s) < 0.0000005"
-            " RETURNING agent", (name, float(created_ts)))
+            " AND created_at = %s::timestamptz"
+            " AND spend_key IS NOT DISTINCT FROM %s"
+            " RETURNING agent", (name, str(created_at), spend_key))
         return bool(rows)

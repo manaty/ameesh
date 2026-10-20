@@ -42,6 +42,7 @@ test_2446_train_shadow  # stockage : plan ombre sur file, historique et prépara
 test_2839_codex_account_gauges  # stockage : seuil et ambiguïté Codex au placement, continuité et rapport (#2839)
 test_2786_freeze_head  # stockage : gel écrit en SHA complet (#2786), balayage et désignation sans ref résolue
 test_2845_github_watch  # stockage : curseur, déduplication et checkpoint de la veille GitHub (#2845)
+test_2893_spend_pending_exact  # stockage : identité exacte du marqueur (created_at, clé 0471) sous extra_float_digits, réparation d'avant 0471 (#2166)
 test_423_agent_aliases  # storage: alias namespace guards, audit, same fenced lease/session and canon sync (#423)
 test_1022_creneau_landed  # storage: une fusion lande le creneau de migration, une liberation sans atterrissage le libere (#1022)
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
