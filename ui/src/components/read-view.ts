@@ -76,7 +76,7 @@ export abstract class ReadView extends LitElement {
     this.#signature = [];
     if (this.#timer !== null) clearTimeout(this.#timer); this.#timer = null;
   }
-  override willUpdate(): void { this.#sync(); }
+  override willUpdate(_changed: Map<PropertyKey, unknown>): void { this.#sync(); }
   #sync(): void {
     if (!this.isConnected) return;
     const client = this.api;

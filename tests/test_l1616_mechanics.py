@@ -14,9 +14,11 @@ import tempfile
 import unittest
 from datetime import datetime
 from types import SimpleNamespace
+from unittest import mock
 from zoneinfo import ZoneInfo
 
-from ameesh import canon_sync, mechanics
+from ameesh import canon, canon_sync, mechanics
+from ameesh.deadline import Deadline
 
 MECHANICS = """schema: ameesh-mechanics/1
 timezone: Europe/Paris
@@ -132,6 +134,55 @@ class MechanicsTest(unittest.TestCase):
 
     def repo(self, **kwargs) -> _Repo:
         return _Repo(self.tmp.name, **kwargs)
+
+
+class TestDeadline(MechanicsTest):
+    """#2665 : les lectures du canon ne repartent pas de GIT_TIMEOUT."""
+
+    def test_an_expired_deadline_refuses_before_git(self):
+        repo = self.repo()
+        head = repo.git("rev-parse", "HEAD")
+        with mock.patch.object(canon, "_git") as git:
+            with self.assertRaises(mechanics.MechanicsError) as caught:
+                mechanics.load(repo.root, head, "ameesh", deadline=Deadline(0.0))
+        self.assertIn("deadline", str(caught.exception))
+        git.assert_not_called()
+
+    def test_each_canon_read_takes_only_the_remaining_time(self):
+        repo = self.repo()
+        head = repo.git("rev-parse", "HEAD")
+        now = [1000.0]
+        seen = []
+        real = canon._git
+
+        def timed(repo_path, *args, **kwargs):
+            seen.append(kwargs.get("timeout"))
+            now[0] += 1.0
+            return real(repo_path, *args, **kwargs)
+
+        with mock.patch.object(canon, "_git", side_effect=timed):
+            loaded = mechanics.load(repo.root, head, "ameesh",
+                                    deadline=Deadline(50.0, clock=lambda: now[0]))
+        self.assertEqual(loaded.commit, head)
+        self.assertGreaterEqual(len(seen), 4)
+        self.assertEqual(seen[0], 50.0)
+        self.assertLess(seen[-1], 50.0)
+        self.assertTrue(all(0 < value <= 50.0 for value in seen))
+
+    def test_a_git_timeout_is_a_named_mechanics_error(self):
+        repo = self.repo()
+        head = repo.git("rev-parse", "HEAD")
+        now = [1000.0]
+
+        def slow(repo_path, *args, **kwargs):
+            now[0] += kwargs.get("timeout", 0.0)
+            raise canon.GitError("git ls-tree: timed out")
+
+        with mock.patch.object(canon, "_git", side_effect=slow):
+            with self.assertRaises(mechanics.MechanicsError) as caught:
+                mechanics.load(repo.root, head, "ameesh",
+                               deadline=Deadline(5.0, clock=lambda: now[0]))
+        self.assertIn("deadline", str(caught.exception))
 
 
 class TestCutoffs(MechanicsTest):

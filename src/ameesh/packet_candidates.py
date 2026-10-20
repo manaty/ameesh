@@ -352,7 +352,8 @@ def evaluate_remise(db, row: dict, marks, *, repo: str, package_base: str,
         dict(effective, **{"class": lot_class.NORMAL})
     try:
         gate = merge_queue.review_gate(db, marks, sha, repo=repo, klass=gate_class,
-                                       item=_without_waiver(row))
+                                       item=_without_waiver(row), cfg=cfg,
+                                       target=row.get("branch_target") or None)
     except Exception as exc:  # noqa: BLE001 - porte illisible : on refuse
         out["why"] = "review gate of the remise unreadable: %s" % exc
         return out
@@ -723,7 +724,8 @@ def _candidate(db, row: dict, *, target_branch: str, tips: dict, where: str,
     try:
         if frozen:
             gate = merge_queue.review_gate(db, marks, frozen, repo=where,
-                                           klass=klass, item=row)
+                                           klass=klass, item=row,
+                                           cfg=cfg, target=target)
             entry["gate"] = gate
             if gate.get("error"):
                 # #2521 : une lecture impossible n'est pas un verdict manquant ;

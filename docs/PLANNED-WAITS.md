@@ -160,8 +160,10 @@ starts with `integration/`, whose body/manifest names each carried lot with
 its frozen head (`#<lot> @ <sha>` / `#<lot> <sha>`, at least 7 hex digits).
 Since #2599 the carrier's body may omit that list: the `ameesh-work: <lot>`
 trailers of the composition commits on its branch, above the target, are also
-read (the repo comes from `radar.projects.<app>.repo`; an unreadable branch
-concludes nothing and the alert stays due). A bare `#<lot>` in running text
+read (the repo comes from `radar.projects.<app>.repo`, or from a registry
+clone that resolves the carrier's head when the reading host has no such
+setting, #2837; an unreadable branch concludes nothing and the alert stays
+due). A bare `#<lot>` in running text
 is **not** an inclusion — an excluded lot (« #2203 exclu », « garder #1024 »)
 must keep its `stale` and `slo_breach` alerts. The units declared with their
 head wait for the packet merge, not for a lot executor, so `stale` and

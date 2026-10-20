@@ -19,7 +19,9 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
+from ameesh import canon
 from ameesh import mechanics
+from ameesh import plan_git
 from ameesh import prevalidation as pv
 from ameesh import prevalidation_calls as calls
 
@@ -128,7 +130,7 @@ class ParametersTest(unittest.TestCase):
                   SimpleNamespace(root="/canon2", sources=(second,))]
         block = params(hosts=("vm1",))
 
-        def load(repo, commit, project):
+        def load(repo, commit, project, *, deadline=None):
             if repo == "/canon1":
                 raise pv.PrevalidationError("block-missing", "absent")
             return None, block
@@ -138,6 +140,85 @@ class ParametersTest(unittest.TestCase):
             got = calls.parameters(cfg, "ameesh")
         self.assertEqual(got.repo, "/canon2")
         self.assertEqual(got.commit, "2" * 40)
+
+    def test_the_deadline_reaches_the_canon_reader(self):
+        block = params(hosts=("vm1",))
+        deadline = calls.Deadline(5.0)
+        seen = {}
+
+        def load(repo, commit, project, *, deadline=None):
+            seen["deadline"] = deadline
+            seen["source"] = (repo, commit, project)
+            return None, block
+
+        with mock.patch.object(pv, "load_parameters", side_effect=load):
+            got = calls.parameters(None, "ameesh", canon_repo="/canon",
+                                   canon_commit="d" * 40, deadline=deadline)
+        self.assertIs(seen["deadline"], deadline)
+        self.assertEqual(seen["source"], ("/canon", "d" * 40, "ameesh"))
+        self.assertEqual(got.hosts, ("vm1",))
+
+    def test_an_expired_budget_is_run_incomplete_not_block_missing(self):
+        # #2665/B1 cx2 : l'échéance épuisée ne se lit pas « canon sans bloc ».
+        cfg = SimpleNamespace(canon="/canon")
+        source = SimpleNamespace(mode="git", repo="/canon", commit="e" * 40, prefix="")
+        configured = SimpleNamespace(root="/canon", sources=(source,))
+        deadline = calls.Deadline(0.0)
+        with mock.patch("ameesh.canon.load_configured", return_value=[configured]), \
+                mock.patch.object(pv, "load_parameters") as load:
+            with self.assertRaises(pv.PrevalidationError) as caught:
+                calls.parameters(cfg, "ameesh", deadline=deadline)
+        self.assertEqual(caught.exception.cause, "run-incomplete")
+        load.assert_not_called()
+
+    def test_the_configured_discovery_is_bounded_by_the_deadline(self):
+        # #2665/B1 cx1+cx2 : load_configured→from_config→load→git_toplevel
+        # gardait 60 s ; le faux git dormant 0,15 s doit être coupé à 0,03 s.
+        root = tempfile.mkdtemp(prefix="ameesh-2665-canon-")
+        self.addCleanup(shutil.rmtree, root, True)
+        cfg = SimpleNamespace(canon=root, canon_ref="", canon_untrusted=False)
+        now = [100.0]
+        deadline = calls.Deadline(0.03, clock=lambda: now[0])
+
+        def slow(cmd, **kwargs):
+            now[0] += 0.15
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+
+        with mock.patch.object(canon.subprocess, "run", side_effect=slow):
+            with self.assertRaises(pv.PrevalidationError) as caught:
+                calls.parameters(cfg, "ameesh", deadline=deadline)
+        self.assertEqual(caught.exception.cause, "run-incomplete")
+        self.assertIn("découverte des canons", caught.exception.why)
+
+    def test_an_expired_discovery_launches_no_git(self):
+        root = tempfile.mkdtemp(prefix="ameesh-2665-canon-")
+        self.addCleanup(shutil.rmtree, root, True)
+        cfg = SimpleNamespace(canon=root, canon_ref="", canon_untrusted=False)
+        with mock.patch.object(canon.subprocess, "run") as run:
+            with self.assertRaises(pv.PrevalidationError) as caught:
+                calls.parameters(cfg, "ameesh", deadline=calls.Deadline(0.0))
+        self.assertEqual(caught.exception.cause, "run-incomplete")
+        run.assert_not_called()
+
+    def test_an_expired_canon_read_is_run_incomplete(self):
+        now = [100.0]
+        deadline = calls.Deadline(5.0, clock=lambda: now[0])
+
+        def slow_read(*args, **kwargs):
+            now[0] += 10.0
+            raise mechanics.MechanicsError("git ls-tree: timed out")
+
+        with mock.patch.object(mechanics, "load", side_effect=slow_read):
+            with self.assertRaises(pv.PrevalidationError) as caught:
+                pv.load_parameters("/repo", "a" * 40, "ameesh", deadline=deadline)
+        self.assertEqual(caught.exception.cause, "run-incomplete")
+
+    def test_a_canon_read_error_with_budget_left_is_not_masked(self):
+        deadline = calls.Deadline(60.0)
+        with mock.patch.object(mechanics, "load",
+                               side_effect=mechanics.MechanicsError("bad canon")):
+            with self.assertRaises(mechanics.MechanicsError):
+                pv.load_parameters("/repo", "a" * 40, "ameesh", deadline=deadline)
 
 
 class RepositoryTest(unittest.TestCase):
@@ -201,6 +282,58 @@ class PrepareTest(unittest.TestCase):
             calls.prepare(self.repo.root, head, self.repo.base)
         self.assertEqual(caught.exception.cause, "selection-unsafe")
         self.assertIn("refusé le plan", caught.exception.why)
+
+    def test_both_commit_probes_read_the_shared_deadline(self):
+        # #2665/B1 cx2 : les sondes head/base repartaient de GIT_TIMEOUT (60 s).
+        now = [100.0]
+        deadline = calls.Deadline(1.0, clock=lambda: now[0])
+        seen = []
+
+        def probe(repo, rev, *, timeout=None):
+            seen.append((rev, timeout))
+            now[0] += 0.25
+            return self.repo.head if len(seen) == 1 else self.repo.base
+
+        with mock.patch.object(plan_git, "_commit", side_effect=probe):
+            prepared = calls.prepare(self.repo.root, self.repo.head, self.repo.base,
+                                     deadline=deadline)
+        self.addCleanup(prepared.close)
+        self.assertEqual(seen[0], (self.repo.head, 1.0))
+        self.assertAlmostEqual(seen[1][1], 0.75)
+
+    def test_an_overrunning_commit_probe_is_run_incomplete(self):
+        # La preuve de cx2 : une sonde lente ne doit pas rendre selection-unsafe.
+        now = [100.0]
+        deadline = calls.Deadline(0.03, clock=lambda: now[0])
+        seen = {}
+
+        def probe(repo, rev, *, timeout=None):
+            seen["timeout"] = timeout
+            now[0] += timeout
+            raise canon.GitError("git rev-parse: timed out")
+
+        with mock.patch.object(plan_git, "_commit", side_effect=probe):
+            with self.assertRaises(pv.PrevalidationError) as caught:
+                calls.prepare(self.repo.root, self.repo.head, self.repo.base,
+                              deadline=deadline)
+        self.assertEqual(caught.exception.cause, "run-incomplete")
+        self.assertAlmostEqual(seen["timeout"], 0.03)
+
+
+class CommitProbeTest(unittest.TestCase):
+    def test_the_probe_keeps_no_lazy_fetch_and_the_bound(self):
+        # #1749 ne doit pas se perdre en bornant la sonde (#2665).
+        seen = {}
+
+        def fake_git(repo, *args, **kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(returncode=0, stdout=b"a" * 40 + b"\n")
+
+        with mock.patch.object(plan_git, "_git", side_effect=fake_git):
+            got = plan_git._commit("/repo", "abc", timeout=1.25)
+        self.assertEqual(got, "a" * 40)
+        self.assertEqual(seen.get("timeout"), 1.25)
+        self.assertIs(seen.get("env_extra"), canon.NO_LAZY_FETCH)
 
 
 class RunTest(unittest.TestCase):
@@ -440,7 +573,7 @@ class GatePacketTest(unittest.TestCase):
 
 class GateTrainTest(unittest.TestCase):
     def test_red_composition_is_refused(self):
-        prepared = SimpleNamespace(close=lambda: None)
+        prepared = SimpleNamespace(close=lambda *a, **kw: None)
         with mock.patch.object(calls, "parameters",
                                return_value=calls.Parameters(
                                    params=params(), repo="/canon",
@@ -456,7 +589,7 @@ class GateTrainTest(unittest.TestCase):
         self.assertIn("tests.test_x", caught.exception.why)
 
     def test_unavailable_composition_does_not_block(self):
-        prepared = SimpleNamespace(close=lambda: None)
+        prepared = SimpleNamespace(close=lambda *a, **kw: None)
         with mock.patch.object(calls, "parameters",
                                return_value=calls.Parameters(
                                    params=params(), repo="/canon",
@@ -482,7 +615,7 @@ class GateTrainTest(unittest.TestCase):
     def test_the_train_timeout_stays_below_the_lock_ttl(self):
         # N dev1 : le run de prévalidation ne doit pas dépasser le bail de la
         # cible (land.LOCK_TTL_S 1800 s) ; plan 300 + run 1200.
-        prepared = SimpleNamespace(close=lambda: None)
+        prepared = SimpleNamespace(close=lambda *a, **kw: None)
         seen = {}
         block = replace(params(), timeout_seconds=3600)
 
@@ -503,7 +636,7 @@ class GateTrainTest(unittest.TestCase):
         self.assertLess(calls.TRAIN_PLAN_TIMEOUT + seen["timeout"], 1800)
 
     def test_a_no_vm_report_does_not_block_publication(self):
-        prepared = SimpleNamespace(close=lambda: None)
+        prepared = SimpleNamespace(close=lambda *a, **kw: None)
         with mock.patch.object(calls, "parameters",
                                return_value=calls.Parameters(
                                    params=params(), repo="/canon",
@@ -516,6 +649,141 @@ class GateTrainTest(unittest.TestCase):
             got = calls.gate_train(None, repo="/repo", head="a" * 40, base="b" * 40)
         self.assertEqual(got["state"], "unavailable")
         self.assertEqual(got["cause"], "no-vm")
+
+    def test_one_deadline_covers_map_tree_run_and_cleanup(self):
+        # #2665/N cx1 : carte, préparation, run et nettoyage lisent la même
+        # échéance ; le plan et le run ne repartent pas chacun de leur plafond.
+        now = [1000.0]
+        budget = calls.train_deadline(clock=lambda: 0.0).at
+        seen = {}
+        prepared = SimpleNamespace(
+            close=lambda **kw: seen.__setitem__("close", kw.get("timeout")))
+
+        def map_for(*args, **kw):
+            seen["map"] = kw.get("deadline")
+            now[0] += 100.0
+            return "", ""
+
+        def prepare(*args, **kw):
+            seen["prepare"] = kw.get("deadline")
+            seen["plan_timeout"] = kw.get("timeout")
+            return prepared
+
+        def run_hosts(*args, **kw):
+            seen["run"] = kw.get("deadline")
+            seen["run_remaining"] = kw["deadline"].remaining()
+            now[0] += seen["run_remaining"] - 50.0
+            return report()
+
+        with mock.patch.object(calls, "parameters",
+                               return_value=calls.Parameters(
+                                   params=params(), repo="/canon",
+                                   commit="c" * 40, project="ameesh")), \
+                mock.patch.object(calls, "map_for", side_effect=map_for), \
+                mock.patch.object(calls, "prepare", side_effect=prepare), \
+                mock.patch.object(calls, "_run_hosts", side_effect=run_hosts):
+            got = calls.gate_train(None, repo="/repo", head="a" * 40, base="b" * 40,
+                                   clock=lambda: now[0])
+        self.assertEqual(got["state"], "green")
+        deadline = seen["run"]
+        self.assertIs(seen["map"], deadline)
+        self.assertIs(seen["prepare"], deadline)
+        self.assertEqual(seen["plan_timeout"],
+                         min(calls.TRAIN_PLAN_TIMEOUT, budget - 100.0))
+        self.assertAlmostEqual(seen["run_remaining"], budget - 100.0, places=3)
+        self.assertEqual(seen["close"], 50.0)
+
+    def test_an_expired_budget_stops_before_the_tree_and_the_hosts(self):
+        now = [1000.0]
+
+        def map_for(*args, **kw):
+            # la carte a consommé tout le bail de la cible
+            now[0] += calls.land.LOCK_TTL_S
+            return "", ""
+
+        with mock.patch.object(calls, "parameters",
+                               return_value=calls.Parameters(
+                                   params=params(), repo="/canon",
+                                   commit="c" * 40, project="ameesh")), \
+                mock.patch.object(calls, "map_for", side_effect=map_for), \
+                mock.patch.object(calls, "prepare") as prepare, \
+                mock.patch.object(calls, "_run_hosts") as run_hosts:
+            got = calls.gate_train(None, repo="/repo", head="a" * 40, base="b" * 40,
+                                   clock=lambda: now[0])
+        self.assertEqual(got["state"], "unavailable")
+        self.assertEqual(got["cause"], "run-incomplete")
+        prepare.assert_not_called()
+        run_hosts.assert_not_called()
+
+    def test_a_red_result_is_not_masked_by_an_expired_budget(self):
+        # Un rouge exécuté reste un résultat : il arrête le train même si le
+        # nettoyage a consommé la marge de publication.
+        now = [1000.0]
+        prepared = SimpleNamespace(close=lambda *a, **kw: None)
+
+        def run_hosts(*args, **kw):
+            now[0] += 10 * calls.land.LOCK_TTL_S
+            return report(ok=False, causes=("run-red",), failed=("tests.test_x",))
+
+        with mock.patch.object(calls, "parameters",
+                               return_value=calls.Parameters(
+                                   params=params(), repo="/canon",
+                                   commit="c" * 40, project="ameesh")), \
+                mock.patch.object(calls, "map_for", return_value=("", "")), \
+                mock.patch.object(calls, "prepare", return_value=prepared), \
+                mock.patch.object(calls, "_run_hosts", side_effect=run_hosts):
+            with self.assertRaises(pv.PrevalidationError) as caught:
+                calls.gate_train(None, repo="/repo", head="a" * 40, base="b" * 40,
+                                 clock=lambda: now[0])
+        self.assertEqual(caught.exception.cause, "run-red")
+        self.assertIn("tests.test_x", caught.exception.why)
+
+
+class DeadlineTest(unittest.TestCase):
+    def test_timeout_never_exceeds_the_shared_deadline(self):
+        now = [100.0]
+        deadline = calls.Deadline(50.0, clock=lambda: now[0])
+        self.assertEqual(deadline.timeout(120), 50.0)
+        now[0] += 40.0
+        self.assertEqual(deadline.timeout(120), 10.0)
+        now[0] += 10.0
+        self.assertTrue(deadline.expired())
+        self.assertEqual(deadline.timeout(120), 0.0)
+
+    def test_the_train_budget_keeps_a_margin_under_the_lock(self):
+        now = [100.0]
+        budget = calls.train_deadline(clock=lambda: now[0]).at - now[0]
+        ttl = calls.land.LOCK_TTL_S
+        self.assertLess(budget, ttl)
+        self.assertAlmostEqual(budget, ttl - min(calls.TRAIN_LOCK_MARGIN, ttl / 6.0))
+
+
+class HostFallbackTest(unittest.TestCase):
+    def test_host_fallbacks_never_run_past_the_deadline(self):
+        # #2665/N cx1 : chaque repli ne reçoit que le temps restant ; l'hôte
+        # suivant n'est pas essayé après l'échéance.
+        now = [100.0]
+        deadline = calls.Deadline(100.0, clock=lambda: now[0])
+        seen = []
+
+        def check(**kwargs):
+            # l'échéance atteint le geste complet (validate → run_offload)
+            self.assertIs(kwargs.get("deadline"), deadline)
+            seen.append(kwargs["params"].timeout_seconds)
+            now[0] += 80.0
+            return report(ok=False, causes=("no-vm",), outcome="no-vm")
+
+        prepared = SimpleNamespace(path="/plan", tree="/tree")
+        block = replace(params(hosts=("vm1", "vm2", "vm3")), timeout_seconds=1000)
+        with self.assertRaises(pv.PrevalidationError) as caught:
+            calls._run_hosts(
+                prepared,
+                calls.Parameters(params=block, repo="", commit="", project="x"),
+                lot=0, head="a" * 40, base="b" * 40, branch="",
+                profile="", say=None, executable="ameesh", validate=check,
+                deadline=deadline)
+        self.assertEqual(caught.exception.cause, "run-incomplete")
+        self.assertEqual(seen, [100, 20])
 
 
 class MapTest(unittest.TestCase):

@@ -85,10 +85,10 @@ ESM) with `contextIsolation: true`, `sandbox: true`, `nodeIntegration: false`
 
 ## Screens
 
-The bundle served at `/ui/ameesh-ui.js` registers `<ameesh-app>` and eight
+The bundle served at `/ui/ameesh-ui.js` registers `<ameesh-app>` and nine
 independent elements: `<ameesh-projects>`, `<ameesh-timeline>`, `<ameesh-agent>`,
-`<ameesh-alerts>`, `<ameesh-hosts>`, `<ameesh-budget>`, `<ameesh-thread>` and
-`<ameesh-decisions>`.
+`<ameesh-alerts>`, `<ameesh-hosts>`, `<ameesh-budget>`, `<ameesh-thread>`,
+`<ameesh-decisions>` and `<ameesh-chat>`.
 The standalone `/ui/` page assembles them with internal navigation.
 
 An embedded screen uses the nearest `<ameesh-config api-base="…">`, or a
@@ -107,6 +107,11 @@ without it the thread is the project's. The projects screen accepts an optional
 `project` filter. Without a required selection, the component displays a prompt.
 `lang="fr"` / `lang="en"`, `theme` and the L88 CSS tokens apply to each screen.
 
+`<ameesh-chat>` reads the threads where the server writes the conversation: the
+agent's project thread for a message without a lot, and each lot's thread in the
+lot's own project. Its `project` attribute is the context the screen is
+embedded in, not a redirect: a message always lands where the server routes it.
+
 Selection buttons emit bubbling, composed `ameesh:open-project`,
 `ameesh:open-agent` and `ameesh:open-lot` events. Their `detail` contains the
 selected `project`, `agent` or `lot`; the host chooses navigation. The app handles
@@ -124,7 +129,9 @@ stays a real `target="_blank" rel="noopener noreferrer"` anchor: the human opens
 it. The passkey is signed on ameesh-approve's origin and the receipt comes back
 through the event stream (`receipt.attached`). One `Idempotency-Key` per action
 makes a retry after a network refusal replay the same request instead of filing
-twice. No other screen exposes a write action.
+twice. `<ameesh-chat>` is the other writer: it posts the human's message to the
+agent's conversation (`POST /api/v1/agents/{agent}/chat`); no other screen
+exposes a write action.
 
 Views using the same client share one `/api/v1/events` connection. Event bursts
 coalesce into at most one scheduled refresh per second per view; a change during
