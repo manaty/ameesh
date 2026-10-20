@@ -92,6 +92,20 @@ class RulesTest(unittest.TestCase):
 class ReviewOriginTest(unittest.TestCase):
     """L'origine d'un élément issu d'une relecture, lue sur son texte."""
 
+    def test_relisant_and_hyphenated_pull_request_variants(self):
+        cases = [
+            ("en relisant #2580", 2580),
+            ("EN RELISANT #2580 (N1)", 2580),
+            ("relecture de la pull-request #1943", None),
+            ("relecture des PULL-REQUESTS #1943", None),
+            ("en relisant la pull-request #1943, lot #2580", 2580),
+            ("en relisant manaty/ameesh#1943", None),
+            ("constat en relisant le code", None),
+        ]
+        for source, expected in cases:
+            with self.subTest(source=source):
+                self.assertEqual(backlog.review_origin(source=source), expected)
+
     def test_sources_and_titles_of_the_study(self):
         cases = [
             ({"source": "relecture #313 (mty-amh-qa-01, N1)"}, 313),

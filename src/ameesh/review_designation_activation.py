@@ -540,7 +540,7 @@ def _resolve_base(repo: str, base: str) -> str:
     return ""
 
 
-def _range(repo: str, base: str, head: str) -> tuple[str, list, list]:
+def _range(repo: str, base: str, head: str, *, bounded: bool = True) -> tuple[str, list, list]:
     """`(start, paths, commits)` of the lot's own frozen change."""
     base = _resolve_base(repo, base)
     if not base:
@@ -558,7 +558,7 @@ def _range(repo: str, base: str, head: str) -> tuple[str, list, list]:
                                  "%s..%s" % (start, head)) or "").split()
     except canon_mod.GitError as exc:
         raise ActivationError("cannot read the frozen diff: %s" % exc) from exc
-    if len(commits) > MAX_COMMITS:
+    if bounded and len(commits) > MAX_COMMITS:
         raise ActivationError("the frozen range carries %d commits (limit %d):"
                               " refusing an unbounded provenance read"
                               % (len(commits), MAX_COMMITS))
@@ -661,6 +661,23 @@ def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
             if str(value).strip() and str(value).strip() != author}
 
 
+def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
+                        repo: str, base: str, head: str, *, families=()) -> tuple[list, list, list]:
+    """`(auteurs, inconnus, correcteurs)` de la plage gelée `base..head` (#2681/#2739).
+
+    La même lecture partagée que la désignation (`review_authors.reading`),
+    offerte à la porte de fusion : quand l'appelant ne passe pas les auteurs,
+    elle les lit elle-même sur la plage exacte et exclut tous les auteurs
+    reconnus, pas seulement l'assigné (#2726). `milestone` est le gel du lot
+    quand la tête est celle-là ; il laisse `_designated_reviewers` reconnaître
+    un correcteur retiré par une désignation ultérieure. Ne lève pas sur un
+    inconnu : l'appelant décide (la porte refuse fermé, le train lève).
+    """
+    _start, _paths, commits = _range(repo, base, head)
+    return review_authors.reading(db, item, milestone, commits, repo,
+                                  families=families)
+
+
 def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
                         repo: str, base: str, head: str, *, families=()) -> list:
     """The designated reviewers' small first-round corrections of `base..head`.
@@ -672,9 +689,8 @@ def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
     designation. The caller (the merge gate) handles an unreadable range as it
     must; this reader invents no name.
     """
-    _start, _paths, commits = _range(repo, base, head)
-    _authors_, unknown, correctors = review_authors.reading(
-        db, item, milestone, commits, repo, families=families)
+    _authors, unknown, correctors = attribution_of_head(
+        db, item, milestone, repo, base, head, families=families)
     if unknown:
         raise ActivationError("author provenance unknown for frozen commit(s): %s"
                               % ", ".join(unknown))
@@ -867,10 +883,23 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     base = lot_class.default_base(cfg, item, repo)
     if not base:
         return Unavailable("no target branch known for lot #%d" % int(lot))
+    from . import packet_reviews
+
     try:
-        start, paths, commits = _range(repo, base, str(freeze.get("sha") or ""))
+        start, paths, commits = _range(repo, base, frozen_sha,
+                                       bounded=not packet_reviews.is_vehicle(item))
     except ActivationError as exc:
         return Unavailable(str(exc))
+    if packet_reviews.is_vehicle(item):
+        # #2766 : un véhicule ne désigne que pour son delta propre ; les
+        # membres portent leurs avis sur leur propre tête gelée.
+        try:
+            own = packet_reviews.designation_changes(db, int(lot), item, repo, start,
+                                                     frozen_sha)
+        except packet_reviews.VehicleError as exc:
+            return Unavailable("vehicle review unreadable: %s" % exc)
+        if own is not None:
+            paths, commits = own["paths"], own["commits"]
     project = str(item.get("app") or "").strip()
     if not project:
         return Unavailable("lot #%d declares no project: the review policy is unknown"
@@ -1415,7 +1444,8 @@ def _manual_outcome(db, item: Mapping, freeze: Mapping, manual: Sequence[str], *
 
 
 def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
-                              threads: list, carried: Optional[Mapping] = None) -> dict:
+                              threads: list, carried: Optional[Mapping] = None,
+                              reading: Optional[dict] = None) -> dict:
     """The `on_frozen` body: all writes stay in the freeze's transaction.
 
     `carried` (#2487) : le plan du report quand il couvre la tête gelée ; la
@@ -1466,6 +1496,13 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
             _sync_reviewers(tx, item, freeze, [])
         return {"state": "unavailable", "reviewers": [], "freeze": freeze,
                 "why": inputs.why}
+    if reading is not None:
+        # #2812 : la même lecture que la désignation, réutilisée par la
+        # notification des blocages levés (aucune lecture git redoublée).
+        reading["excluded"] = {
+            str(row.get("name") or "").strip().lower()
+            for row in list(inputs.authors or ()) + list(inputs.correctors or ())
+            if str(row.get("name") or "").strip()}
     if _manual_covers(inputs):
         return _manual_outcome(tx, item, freeze, inputs.manual)
     checkpoint = len(threads)
@@ -1510,8 +1547,40 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
 SUPERSEDED_PREFIX = "review-block-superseded:"
 
 
+def _excluded_on_freeze(cfg, db, item: Mapping, freeze: Mapping) -> set[str]:
+    """Les noms que la porte écarte sur cette tête gelée (#2812).
+
+    Même lecture que la porte et la désignation (`review_authors.reading`) :
+    les auteurs de la plage gelée et les petits correctifs de premier tour des
+    relecteurs désignés. Le gel n'envoie donc pas l'invitation à un agent qui
+    ne peut pas rendre un avis indépendant. Une lecture impossible rend
+    l'ensemble vide : la notification garde son comportement historique et ne
+    perd jamais un gel.
+    """
+    sha = str((freeze or {}).get("sha") or "").strip().lower()
+    if cfg is None or db is None or not sha:
+        return set()
+    try:
+        item = dict(item or {})
+        repo = _repository(db, cfg, item, sha, fetch=False)
+        if not repo:
+            return set()
+        base = lot_class.default_base(cfg, item, repo)
+        if not base:
+            return set()
+        _start, _paths, commits = _range(repo, base, sha)
+        authors, _unknown, correctors = review_authors.reading(
+            db, item, dict(freeze or {}), commits, repo, families=())
+    except Exception:  # noqa: BLE001 - plage illisible : comportement historique
+        return set()
+    return {str(row.get("name") or "").strip().lower()
+            for row in list(authors or ()) + list(correctors or ())
+            if str(row.get("name") or "").strip()}
+
+
 def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mapping,
-                              threads: list) -> None:
+                              threads: list, *, cfg=None,
+                              excluded: set[str] | None = None) -> None:
     """Notifie le relecteur dont le blocage portait sur une tête antérieure.
 
     #2681 : la porte ne lit que les verdicts de la tête gelée ; un blocage
@@ -1519,7 +1588,13 @@ def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mappi
     nouvelle tête suffit. Le relecteur qui a bloqué doit le savoir : un
     `notify` par (lot, gel, relecteur), jamais un doublon, et pas de courrier
     quand sa désignation du gel le prévient déjà. Une lecture impossible ne
-    perd jamais un gel : la notification est au mieux."""
+    perd jamais un gel : la notification est au mieux.
+
+    #2812 : on n'invite pas un agent que la porte écarte sur cette tête — un
+    auteur de la plage gelée ou un relecteur dont le petit correctif de premier
+    tour est lu par `review_authors.reading`. `excluded` est la lecture déjà
+    faite par la désignation ; à défaut (`None`), elle est refaite ici, et son
+    échec laisse le courrier historique."""
     lot = int((item or {}).get("id") or 0)
     freeze_id = int((freeze or {}).get("id") or 0)
     sha = str((freeze or {}).get("sha") or "").strip().lower()
@@ -1543,6 +1618,7 @@ def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mappi
     designated.update(str(name or "").strip().lower()
                       for name in (outcome or {}).get("manual") or ())
     author = str((item or {}).get("assignee") or "").strip().lower()
+    candidates = []
     for key, (_order, row) in sorted(latest.items()):
         if (row.get("verdict") or "") != "blocked" or key == author:
             continue
@@ -1552,6 +1628,16 @@ def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mappi
         if current or key in designated:
             # un blocage sur la tête gelée reste en vigueur ; une désignation
             # du gel envoie déjà son propre courrier au relecteur
+            continue
+        candidates.append((key, row, mark_sha))
+    if not candidates:
+        return
+    if excluded is None:
+        excluded = _excluded_on_freeze(cfg, db, item, freeze)
+    for key, row, mark_sha in candidates:
+        if key in excluded:
+            # #2812 : auteur de la tête ou auteur d'un petit correctif, son
+            # avis ne compterait pas sur cette tête ; ne pas l'inviter.
             continue
         prefix = "%s%d:%d:%s:" % (SUPERSEDED_PREFIX, lot, freeze_id, key)
         if storage.of(db).work.events_noted(prefix, 0.0, ids=[lot]):
@@ -1589,11 +1675,14 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
     an error there never loses the freeze or its designation. The gate rule
     (only the frozen head's verdicts) is unchanged; this only tells a reviewer
     whose earlier block no longer blocks the new head."""
+    reading: dict = {}
     result = _designate_in_transaction(cfg, tx, lot, milestone=milestone,
-                                       threads=threads, carried=carried)
+                                       threads=threads, carried=carried,
+                                       reading=reading)
     try:
         item = work.get(tx, int(lot)) or {"id": int(lot)}
-        _notify_superseded_blocks(tx, item, milestone or {}, result, threads)
+        _notify_superseded_blocks(tx, item, milestone or {}, result, threads,
+                                  cfg=cfg, excluded=reading.get("excluded"))
     except Exception:  # noqa: BLE001 - une notification ne perd pas un gel
         pass
     return result

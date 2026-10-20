@@ -5,9 +5,11 @@
 // the server deposits it in the agent's mailbox, which wakes the agent at its
 // next turn, and writes its readable copy in the thread. The answer arrives
 // as mail, so through the thread: the screen shows the exchanges between the
-// human and the agent in the threads where they land (the lot's when one is
-// set; otherwise the agent's project and its current lot), the agent's state
-// and, while the last word is the human's, "waiting for the next turn".
+// human and the agent in the threads where they land (the selected lot's and
+// its project's; otherwise the agent's project and its current lot), the
+// agent's state and, while the last word is the human's, "waiting for the
+// next turn". A reply sent without `--lot` lands in the project thread, so a
+// selected lot must not hide it.
 // Tier 2 (live answer of a resident agent, `chat.delta`) follows L75–L83.
 import { css, html, nothing } from "lit";
 import { ApiError, type Client } from "../api/client";
@@ -16,8 +18,14 @@ import { ReadView, label, number, object, rows, type Row } from "./read-view";
 
 /** The API's limit on a message (`MAX_TEXT`). */
 const MAX_TEXT = 8000;
-/** States in which a message waits without waking the agent. */
-const ASLEEP = new Set(["paused", "stopped", "dead", "error"]);
+/** States in which a message waits in the mailbox without waking the agent:
+ * the send is accepted, a turn opens once the cause is lifted. */
+const ASLEEP = new Set(["paused", "error"]);
+/** Raw registry statuses that refuse the message instead of queueing it
+ * (`undeliverable.check_send`, without `--queue`): a stopped agent never
+ * receives it, the human must resume it first. `dead` is apart: its expired
+ * lease is taken back by the executor, so the message does wait in its box. */
+const REFUSED = new Set(["stopped"]);
 
 const parties = (value: unknown): string[] => label(value).split(",").map((part) => part.trim());
 
@@ -50,7 +58,9 @@ export class AmeeshChat extends ReadView {
       .find((a) => a.name === this.agent);
     const agent = { ...object(object(detail).agent), ...current };
     const project = this.project || label(agent.project);
-    const lots = this.lot ? [this.lot] : [null, object(agent.lot).id ?? null];
+    // a reply sent without `--lot` lands in the project thread: keep reading
+    // it beside the selected lot's thread, never instead of it
+    const lots = this.lot ? [null, this.lot] : [null, object(agent.lot).id ?? null];
     const threads = project === "—" ? [] : await Promise.all(
       [...new Set(lots.map((lot) => lot === null ? null : String(lot)))].map((lot) => {
         const read = lot === null
@@ -91,6 +101,9 @@ export class AmeeshChat extends ReadView {
     const client = this.api;
     const text = this.draft.trim();
     if (!client || !text || this.sending || !this.agent) return;
+    // a stopped agent refuses the message (409 refused): the form is disabled,
+    // and a direct call must not pretend to queue anything either
+    if (REFUSED.has(label(object(object(this.data).agent).status))) return;
     const lot = /^[1-9][0-9]{0,8}$/.test(this.lot) ? Number(this.lot) : null;
     if (this.#key?.text !== text || this.#key.agent !== this.agent
       || this.#key.lot !== lot || this.#key.client !== client) {
@@ -122,16 +135,31 @@ export class AmeeshChat extends ReadView {
   }
 
   #wake(agent: Row, last: Row | undefined, me: string) {
-    const state = label(agent.state ?? agent.status);
+    const status = label(agent.status);
+    const state = label(agent.state ?? status);
+    // `progress` merges `dead` (expired lease) into `stopped`, but the API
+    // still queues the message there and the executor takes the agent back by
+    // itself: show it apart from a manual stop, which only a human resumes.
+    const offline = state === "dead" || (state === "stopped" && !REFUSED.has(status));
+    const shown = offline ? "dead" : state;
     const waiting = last !== undefined && label(last.author) !== "agent:" + this.agent && me !== "—";
-    return html`<p role="status">${this.t("chat.agentState", { agent: this.agent, state: this.state(state) })}
+    const stopped = REFUSED.has(status);
+    const notice = stopped
+      ? this.t("chat.stopped", { state: this.state(shown), agent: this.agent })
+      : offline
+        ? this.t("chat.dead", { state: this.state(shown) })
+        : ASLEEP.has(shown)
+          ? this.t("chat.asleep", { state: this.state(shown) })
+          : this.t("chat.waiting");
+    return html`<p role="status">${this.t("chat.agentState", { agent: this.agent, state: this.state(shown) })}
       ${agent.unread ? html` · ${this.t("chat.unread", { count: label(agent.unread) })}` : nothing}</p>
-      ${waiting ? html`<p class="muted">${ASLEEP.has(state)
-        ? this.t("chat.asleep", { state: this.state(state) }) : this.t("chat.waiting")}</p>` : nothing}`;
+      ${waiting || stopped ? html`<p class="muted">${notice}</p>` : nothing}`;
   }
 
   protected content(data: Row) {
     const agent = object(data.agent);
+    // the form is disabled for a stopped agent: the API would refuse the send
+    const refused = REFUSED.has(label(agent.status));
     const entries = this.#exchanges(data);
     const me = label(data.me);
     return html`
@@ -144,10 +172,10 @@ export class AmeeshChat extends ReadView {
         <p><label for="message">${this.t("chat.message", { agent: this.agent })}</label></p>
         <textarea id="message" rows="4" maxlength=${MAX_TEXT} .value=${this.draft}
           @input=${(event: Event) => { this.draft = (event.target as HTMLTextAreaElement).value; }}
-          ?disabled=${this.sending}></textarea>
-        <p><button type="submit" ?disabled=${!this.api || this.sending || !this.draft.trim()}>${this.sending
+          ?disabled=${this.sending || refused}></textarea>
+        <p><button type="submit" ?disabled=${!this.api || this.sending || refused || !this.draft.trim()}>${this.sending
           ? this.t("chat.sending") : this.t("chat.send")}</button>
-          <span class="muted">${this.t("chat.hint")}</span></p>
+          ${refused ? nothing : html`<span class="muted">${this.t("chat.hint")}</span>`}</p>
         ${this.failed ? html`<p role="alert" class="critical">${this.t("chat.failed", { code: this.failed })}</p>` : nothing}
       </form>`;
   }

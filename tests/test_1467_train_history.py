@@ -156,6 +156,38 @@ class RecordedHistoryTest(HistoryFixture, PgTestCase):
         self.assertEqual({row["name"] for row in reviews["authors"]},
                          {"author"})
 
+    def test_the_compiled_family_flags_drive_the_train_gate(self):
+        # #2726 : le train passe `exclude_author_family` et `distinct_families`
+        # de son document compilé à la porte, au lieu de laisser le repli.
+        head = self.commit("second author work", actor="author")
+        self.receipt_commit(head, "author", "deepseek")
+        frozen = self.freeze(head)
+        entry = dict(self.entry, frozen_id=frozen["id"], frozen_sha=head)
+        self.turn("author", "deepseek")
+        registry.upsert(self.db, "r5", harness="codex", host=self.cfg.host,
+                        cwd=self.repo, status="idle")
+        self.verdict(head, "r2", "codex")
+        self.verdict(head, "r5", "codex")
+        normal = {"class": "normal", "files": ()}
+        families = ("claude", "codex", "deepseek")
+        loose = train_history.Recorded(
+            self.db, self.repo, provider=review_provenance,
+            review_rules=types.SimpleNamespace(
+                families=families, exclude_author_family=False,
+                distinct_families=False))
+        proof = loose.qualify_subject(entry, self.base, required=2, klass=normal)
+        self.assertTrue(proof["reviews"]["gate"]["ok"], proof["reviews"]["gate"])
+        self.assertEqual([row["actor"]
+                          for row in proof["reviews"]["gate"]["accepted"]],
+                         ["r2", "r5"])
+        strict = train_history.Recorded(
+            self.db, self.repo, provider=review_provenance,
+            review_rules=types.SimpleNamespace(
+                families=families, exclude_author_family=False,
+                distinct_families=True))
+        with self.assertRaisesRegex(train.TrainError, "two independent"):
+            strict.qualify_subject(entry, self.base, required=2, klass=normal)
+
     def test_old_blockage_on_an_earlier_head_is_not_read(self):
         # #2602/#879 : le dernier verdict de r3 sur une tête antérieure est
         # bloquant ; la tête gelée a ses deux ok indépendants.
