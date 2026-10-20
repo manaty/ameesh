@@ -6,6 +6,10 @@ Composeur : mesh-design, pilote (§12). Reprise du créneau signalée par
 l’événement ameesh #120516 du 20/10/2026 à 22:15 Europe/Paris.
 Une seule CI complète demandée sur la tête finale du paquet.
 
+Main a avancé de `37493145c856` à `c5cd599a83d4` (release 1.16.0 :
+`pyproject.toml` + notes) sans chevauchement avec le contenu du paquet ; la
+base de composition reste `37493145c856` (§12, aucun chevauchement).
+
 ## Admissions
 
 | lot | source | classe | avis | motif |
@@ -21,6 +25,30 @@ Une seule CI complète demandée sur la tête finale du paquet.
 1 unité de fusion, 1 lot porté : #2889 4ff97962fa96.
 Le commit de composition conserve la tête source comme second parent et porte
 le trailer `ameesh-work: 2889`.
+S’y ajoute une adaptation de test après la CI rouge (section suivante), sans
+changement du contenu relu de #2889 ni de sa tête de composition.
+
+## Adaptation de test après la CI rouge (20/10 20:59Z)
+
+La suite complète du run [39490886347](https://github.com/manaty/ameesh/actions/runs/39490886347)
+a rougi sur une seule part, `psql 15/16`, et un seul test :
+`tests.test_l514_wake_on_event.DoctorHooksTest.test_hook_binaire_sous_home_variable_est_trouve`,
+`assertNotIn("127", sortie)`. La sortie du doctor cite le chemin du fichier de
+hooks, dont le répertoire temporaire est aléatoire : le suffixe
+`l514-hooks-kcw3127v` contient « 127 », et un doctor pourtant vert était lu
+comme rouge. Le même test est vert dans le run `tests`
+[39491160526](https://github.com/manaty/ameesh/actions/runs/39491160526) :
+c’est une course de la suite, sans rapport avec #2889.
+
+Correction `1b88e90f3b3c` (adaptation, sans trailer) : les six témoins « 127 »
+de `DoctorHooksTest` portent désormais sur le message `exits 127` du doctor,
+et non sur un nombre libre de la sortie ; le sens est conservé des deux côtés
+(binaire absent → KO, binaire présent → aucun KO). Test seul, aucun code de
+production ; vérifié localement par une reproduction forçant un chemin
+temporaire contenant `127` (rouge avant, vert après), 20 tests
+`DoctorHooksTest` et les 50 tests de contrat `test_l232d_oauth` verts.
+Test seul : aucun avis requis (§11 bis, adaptation de suite), le contenu relu
+de #2889 (`4ff97962fa96`) ne change pas.
 
 ## Écartés
 
@@ -37,5 +65,9 @@ Inventaire complet par `scripts/paquet-candidats.py --project ameesh --target ma
 1 prêt (#2889), 4 en attente, 0 erreur ; aucun lot prêt omis.
 Composition sans conflit ; aucun fichier de production ni migration changé.
 L’auteur rapporte 114 tests ciblés verts ; la relecture indépendante est acquise.
-Le contenu source est repris tel quel ; la suite complète s’exécute en CI sur
-la tête finale, sans rejouer localement les suites de l’auteur.
+Le contenu source est repris tel quel ; l’adaptation de test est la seule
+modification hors manifeste. Contrôles locaux de l’adaptation : reproduction
+forcée du chemin `127` (rouge sur la tête précédente, vert sur celle-ci), 20
+`DoctorHooksTest` et 50 tests de contrat `test_l232d_oauth` verts. La suite
+complète s’exécute en CI sur la tête finale, sans rejouer localement les
+suites de l’auteur.
