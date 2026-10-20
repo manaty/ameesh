@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import unicodedata
 import uuid
 from typing import Any, Sequence
@@ -486,6 +487,53 @@ def is_event(row: Any) -> bool:
 def is_urgent(row: Any) -> bool:
     """Un événement `urgent` perce le regroupement (C9)."""
     return bool(message_payload(row).get("urgent"))
+
+
+#: #2814: the EXPLICIT request deadline, in the message payload. It is NOT
+#: the signature's `signature_expires_at` (a TTL for the signature, 24 h by
+#: default): a signed owner order must never disappear because its signature
+#: aged. A client that wants a deadline sets this key (absolute epoch
+#: seconds), e.g. `agent-mail send … --request-expires 2h`.
+REQUEST_DEADLINE_KEY = "request_expires_ts"
+
+
+def request_deadline(row: Any) -> float | None:
+    """The explicit request deadline of a message (epoch seconds), or None.
+
+    Only `payload.request_expires_ts` counts; `signature_expires_ts` is the
+    signature's own TTL and never a request deadline. A missing, non-numeric,
+    non-finite or non-positive value means "no deadline" (never guessed)."""
+    value = _payload(row).get(REQUEST_DEADLINE_KEY)
+    if isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    moment = float(value)
+    if moment != moment or moment <= 0:
+        return None
+    return moment
+
+
+def request_expired(row: Any, now: float | None = None) -> bool:
+    """#2814: has the message's explicit request deadline passed?
+
+    No deadline (the ordinary case, including every signed message that does
+    not carry one) means it never expires while queued."""
+    deadline = request_deadline(row)
+    return deadline is not None and deadline <= (time.time() if now is None else float(now))
+
+
+def drop_expired(db: Db, rows: Sequence[dict]) -> int:
+    """#2814 : solde des requêtes à échéance explicite dépassée, sans tour.
+
+    Rend le nombre de messages marqués remis. L'échéance est celle que
+    l'expéditeur a posée (`request_expires_ts`) ; le message reste dans
+    l'historique et le fil, et l'appelant prévient l'expéditeur avant de le
+    solder. Une erreur de base est laissée à l'appelant (le tour est différé,
+    rien n'est consommé)."""
+    ids = [int(row["id"]) for row in rows or ()
+           if row.get("id") is not None and request_expired(row)]
+    return mark_delivered(db, ids) if ids else 0
 
 
 # --------------------------------------------------------------------------

@@ -46,6 +46,8 @@ READING_COLUMNS = (
     "volumes, "
     # L159e6 (0361): the guard's last restart, decoded by `_reading`
     "guard_restart::text AS guard_restart, "
+    # #2814 (0469): the executor's own cgroup measure, decoded by `_reading`
+    "cgroup::text AS cgroup, "
     # L159f (0069): host gate the executor obeys
     "ameesh_host_gate_state(host, gate_state) AS gate_state, gate_seq, gate_reason, "
     # #2022 (0455): processes and zombies, of the host and of the runner
@@ -80,6 +82,14 @@ def _reading(row: dict) -> dict:
     # L159e6 (0361): `guard_restart` read as text (whatever the driver)
     if isinstance(row.get("guard_restart"), str):
         row["guard_restart"] = json.loads(row["guard_restart"])
+    # #2814 (0469): the cgroup measure as a mapping, {} before the migration
+    cgroup = row.get("cgroup")
+    if isinstance(cgroup, str):
+        try:
+            cgroup = json.loads(cgroup)
+        except ValueError:
+            cgroup = None
+    row["cgroup"] = cgroup if isinstance(cgroup, dict) else {}
     return row
 
 
@@ -170,9 +180,10 @@ class Hosts(interface.HostResources):
                 (host, mem_available_bytes, swap_used_bytes, load1, cpu_count,
                  disk_free_bytes, disk_path, turns_in_progress,
                  tmp_path, tmp_fstype, tmp_size_bytes, tmp_used_bytes,
-                 on_ac, battery_percent, volumes, guard_restart, """ + ", ".join(MEASURE_COLUMNS) + """)
+                 on_ac, battery_percent, volumes, guard_restart, cgroup, """
+            + ", ".join(MEASURE_COLUMNS) + """)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb,
-                    %s::jsonb, """
+                    %s::jsonb, %s::jsonb, """
             + ", ".join(["%s"] * len(MEASURE_COLUMNS)) + """)
             RETURNING """ + READING_COLUMNS,
             (reading.get("host") or "", reading.get("mem_available_bytes"),
@@ -185,6 +196,7 @@ class Hosts(interface.HostResources):
              _volumes_param(reading.get("volumes")),
              None if reading.get("guard_restart") is None
              else json.dumps(reading["guard_restart"]),
+             json.dumps(reading.get("cgroup") or {}, ensure_ascii=False),
              *(reading.get(column) for column in MEASURE_COLUMNS)),
         )
         # Historique court : au-delà de sept jours, la ligne n'a plus d'usage

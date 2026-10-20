@@ -22,7 +22,11 @@
                                                  refused to a name not in the registry (close
                                                  names suggested), to a stopped agent
                                                  (unless --queue) and from a stopped identity
-                       [--urgent] [--ack] [--cc NAME[,NAME…]]
+                       [--urgent] [--ack] [--cc NAME[,NAME…]] [--request-expires 2h]
+                                                 a request deadline (`request_expires_ts`,
+                                                 distinct from the signature TTL): after it,
+                                                 no turn starts, the sender is notified and
+                                                 the message is settled (resend to renew)
                                                  L125: an idle agent is woken only
                                                  after a batching window
                                                  (AMEESH_MAIL_BATCH, 90 s); --urgent wakes
@@ -263,6 +267,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     sender = None
     key_path = None
     expires = None
+    request_expires = None
     lot = None
     new_lot = None
     parent_lot = None
@@ -299,8 +304,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     explicit_sender = "--from" in args
     estimate = None
     force = None
-    for flag in ("--from", "--key", "--expires", "--lot", "--new-lot", "--parent-lot",
-                 "--kind", "--estimate", "--app", "--force"):
+    for flag in ("--from", "--key", "--expires", "--request-expires", "--lot",
+                 "--new-lot", "--parent-lot", "--kind", "--estimate", "--app", "--force"):
         if flag in args:
             index = args.index(flag)
             value = args[index + 1] if index + 1 < len(args) else None
@@ -311,6 +316,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 key_path = value
             elif flag == "--expires":
                 expires = value
+            elif flag == "--request-expires":
+                request_expires = value
             elif flag == "--lot":
                 lot = value
             elif flag == "--new-lot":
@@ -366,7 +373,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
               "[--parent-lot ID]] "
               "[--kind request|reply|notify|event] "
               "[--urgent] [--verdict|--arbitration] "
-              "[--ack] [--cc NAME[,NAME…]] [--sign --key FILE] [--expires 24h] [--queue]",
+              "[--ack] [--cc NAME[,NAME…]] [--sign --key FILE] [--expires 24h] "
+              "[--request-expires 2h] [--queue]",
               file=sys.stderr)
         return 2
     if lot is not None and not NAME_RE.match(lot):
@@ -535,6 +543,16 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                and lot is None and new_lot is None and kind in ("notify", "reply")
                and mail.looks_like_ack(text)):
         payload["ack"] = True
+    if request_expires is not None:
+        # #2814 : échéance de REQUÊTE explicite, distincte de la TTL de
+        # signature (`--expires`). Absolue en base, pour ne pas dépendre de
+        # l'horloge du destinataire ; une requête sans elle n'expire jamais.
+        try:
+            ttl = authority.parse_ttl(request_expires)
+        except authority.AuthorityError as exc:
+            print("--request-expires: %s" % exc, file=sys.stderr)
+            return 2
+        payload[mail.REQUEST_DEADLINE_KEY] = int(time.time() + ttl)
 
     # L118 : le courrier qui confie du travail est lié à un lot (avant le
     # dépôt : une attribution refusée ne dépose rien)

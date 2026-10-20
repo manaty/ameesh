@@ -332,6 +332,11 @@ class LimitesPhysiquesTest(_Canons, unittest.TestCase):
             "warn_disk_used": resources.DEFAULT_WARN_DISK_USED,
             "warn_disk_free": resources.DEFAULT_WARN_DISK_FREE,
             "max_zombies": resources.DEFAULT_MAX_ZOMBIES,
+            # #2814: périmètre de pression et plafonds du cgroup, personne ne
+            # les déclare (défaut = hôte ici, sauf conteneur détecté)
+            "pressure_scope": defaut["pressure_scope"],
+            "max_cgroup_memory_used": resources.DEFAULT_MAX_CGROUP_MEMORY_USED,
+            "max_cgroup_throttled": resources.DEFAULT_MAX_CGROUP_THROTTLED,
         })
         self.assertEqual(got["max_agents"], 3)
         self.assertEqual(got["origin"], {
@@ -347,6 +352,9 @@ class LimitesPhysiquesTest(_Canons, unittest.TestCase):
             "warn_disk_used": resources.DEFAULT_ORIGIN,
             "warn_disk_free": resources.DEFAULT_ORIGIN,
             "max_zombies": resources.DEFAULT_ORIGIN,
+            "pressure_scope": resources.DEFAULT_ORIGIN,
+            "max_cgroup_memory_used": resources.DEFAULT_ORIGIN,
+            "max_cgroup_throttled": resources.DEFAULT_ORIGIN,
             "max_agents": ID_T})
         self.assertEqual(got["fiches"], [ID_A, ID_T])
         # une fiche qui se tait n'impose pas le défaut à celle qui déclare
