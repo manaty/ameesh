@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from ameesh import lot_measures, plan_git, review_lot
 
@@ -75,6 +76,40 @@ class LotDiffRangeTest(unittest.TestCase):
     def files(self, rng):
         self.assertIsNotNone(rng)
         return _git(self.repo, "diff", "--name-only", *rng).splitlines()
+
+    def rewritten_packet(self):
+        # Le même contenu léger entre par cherry-pick après le voisin SQL ;
+        # son gel original ne fait donc pas partie des ancêtres de la fusion.
+        _git(self.repo, "checkout", "-q", "-b", "integration/reecrit", self.sensible)
+        _git(self.repo, "cherry-pick", self.leger)
+        _git(self.repo, "update-ref", "refs/heads/main", self.base)
+        _git(self.repo, "checkout", "-q", "main")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet reecrit",
+             "integration/reecrit")
+        return _git(self.repo, "rev-parse", "HEAD")
+
+    def test_un_gel_non_ancetre_ne_lit_pas_le_paquet(self):
+        packet = self.rewritten_packet()
+        with self.assertRaisesRegex(lot_measures.UnprovenLotDiff, "non ancêtre"):
+            lot_measures.lot_diff_range(self.repo, packet, "main", frozen=self.leger)
+
+    def test_un_gel_absent_ne_lit_pas_le_paquet(self):
+        with self.assertRaisesRegex(lot_measures.UnprovenLotDiff, "non ancêtre"):
+            lot_measures.lot_diff_range(self.repo, self.merge, "main", frozen="f" * 40)
+
+    def test_la_classe_doute_sans_repli_apres_cherry_pick(self):
+        packet = self.rewritten_packet()
+        with mock.patch.object(review_lot.work, "milestones", return_value=[
+                {"kind": "frozen", "sha": self.leger}]), \
+                mock.patch.object(lot_measures, "diff_range") as fallback, \
+                mock.patch.object(review_lot.lot_class, "of_lot") as classify:
+            klass = review_lot.class_at_merge(None, 2823, item={"id": 2823},
+                                              repo=self.repo, target="main", sha=packet)
+        self.assertTrue(klass["doubt"], klass)
+        self.assertIn("non ancêtre", klass["why"])
+        self.assertEqual(klass["files"], [])
+        fallback.assert_not_called()
+        classify.assert_not_called()
 
     def test_le_merge_du_paquet_se_lit_sur_le_gel_du_lot(self):
         """Le jalon `merged` porte le merge du paquet (b053ee26) : la classe se
@@ -136,14 +171,18 @@ class LotDiffRangeTest(unittest.TestCase):
 class PacketClassWitness(_Witness):
     """La même fusion, vue par `class_at_merge` et par l'ouverture L539."""
 
-    def mixed_packet(self, lot_branch):
+    def mixed_packet(self, lot_branch, *, rewritten=False):
         """Un paquet de deux lots sur `develop` : `lot_branch` et un voisin
         sensible ; rend le merge du paquet dans la cible."""
         _git(self.repo, "checkout", "-q", "-b", "lot/2702-voisin", "develop")
         self.commit("db/voisin.sql")
         _git(self.repo, "checkout", "-q", "-b", "integration/2702", "develop")
-        _git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet: lot",
-             lot_branch)
+        if rewritten:
+            _git(self.repo, "cherry-pick", "--no-commit", lot_branch)
+            _git(self.repo, "commit", "-q", "-m", "paquet: lot reecrit")
+        else:
+            _git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet: lot",
+                 lot_branch)
         _git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet: voisin",
              "lot/2702-voisin")
         _git(self.repo, "checkout", "-q", "develop")
@@ -164,6 +203,17 @@ class PacketClassWitness(_Witness):
         self.assertTrue(opened["created"], opened)
         self.assertEqual(opened["class"], "light", opened)
         self.assertEqual(len(self.review_lots(lot)), 1)
+
+    def test_un_lot_reecrit_dans_un_paquet_mixte_reste_en_doute(self):
+        lot = self.lot()
+        self.frozen_on_branch(lot, "lot/2823-reecrit")
+        packet = self.mixed_packet("lot/2823-reecrit", rewritten=True)
+        opened = review_lot.open_for_merge(self.db, lot, merged_sha=packet,
+                                           repo=self.repo, target="develop")
+        self.assertFalse(opened["created"], opened)
+        self.assertTrue(opened["doubt"], opened)
+        self.assertIn("non ancêtre", opened["why"])
+        self.assertEqual(self.review_lots(lot), [])
 
     def test_un_lot_sensible_dans_un_paquet_mixte_n_ouvre_rien(self):
         lot = self.lot()
