@@ -19,11 +19,12 @@ NOW = 1800000000
 
 
 def issue(n=1, **kw):
-    return dict(id=n, number=n, title="A request", body="Please fix export", **kw)
+    return dict(id=n, number=n, title="A request", body="Please fix export", updated_at=watch.iso(NOW - 1000), **kw)
 
 
 def comment(n=10, body="More information"):
-    return dict(id=n, issue_url="https://api.github.com/repos/acme/app/issues/1", body=body)
+    return dict(id=n, issue_url="https://api.github.com/repos/acme/app/issues/1", body=body,
+                updated_at=watch.iso(NOW - 1000))
 
 
 class Api:
@@ -38,6 +39,17 @@ class Api:
         page = int(parse_qs(bits.query)["page"][0])
         size = int(parse_qs(bits.query)["per_page"][0])
         return rows[(page - 1) * size:page * size]
+
+
+class UpdatedApi(Api):
+    def get(self, path, **kw):
+        self.calls.append(path)
+        query = parse_qs(urlsplit(path).query)
+        source = self.comments if urlsplit(path).path.endswith("/comments") else self.issues
+        eligible = sorted([r for r in source if r["updated_at"] > query["since"][0]],
+                          key=lambda r: r["updated_at"])
+        page, size = int(query["page"][0]), int(query["per_page"][0])
+        return eligible[(page - 1) * size:page * size]
 
 
 class CollectionTest(unittest.TestCase):
@@ -149,6 +161,61 @@ class CollectionTest(unittest.TestCase):
             events, scan, _ = watch.collect_batch(api, SUB, NOW, NOW + 5, scan)
         self.assertEqual(events, [])
         self.assertEqual(scan["page"], 1)
+
+    def test_continuous_updates_finish_fixed_window_with_key_progress(self):
+        for kind in ("issue", "comment"):
+            with self.subTest(kind=kind):
+                rows = [(issue(n) if kind == "issue" else comment(n)) for n in range(1, 601)]
+                for n, row in enumerate(rows):
+                    row["updated_at"] = watch.iso(NOW - 1000 + n)
+
+                api = UpdatedApi(issues=rows if kind == "issue" else (),
+                              comments=rows if kind == "comment" else ())
+                scan, events = None, []
+                for tick in range(20):
+                    api.calls.clear()
+                    batch, scan, until = watch.collect_batch(api, SUB, NOW - 3600, NOW + tick, scan)
+                    self.assertLessEqual(len(api.calls), watch.PAGES_PER_TICK)
+                    events += batch
+                    if scan is None:
+                        break
+                    # Every pass moves a previously read old row to the live tail.
+                    source = api.issues if kind == "issue" else api.comments
+                    source[tick]["updated_at"] = watch.iso(NOW + tick + 1)
+                    # New live entries cannot indefinitely extend this fixed window.
+                    for n in range(200):
+                        row = issue(10000 + tick * 200 + n) if kind == "issue" else comment(10000 + tick * 200 + n)
+                        row["updated_at"] = watch.iso(NOW + tick + 1)
+                        source.append(row)
+                self.assertIsNone(scan, "continuous updates must not restart the full scan forever")
+                self.assertEqual(until, NOW)
+                self.assertTrue(set(range(1, 601)) <= {e["object_id"] for e in events})
+                self.assertLess(tick, 10)
+
+    def test_key_progress_keeps_timestamp_ties_and_original_comment_window(self):
+        rows = [issue(n) for n in range(1, 401)]
+        for n, row in enumerate(rows):
+            row["updated_at"] = watch.iso(NOW - (1000 if n < 50 else 500 if n < 350 else 100))
+        api = UpdatedApi(issues=rows, comments=[comment()])
+        scan, events = None, []
+        for _ in range(20):
+            batch, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, scan)
+            events += batch
+            if scan is None:
+                break
+        self.assertIsNone(scan)
+        self.assertEqual({e["object_id"] for e in events if e["kind"] == "issue"}, set(range(1, 401)))
+        self.assertEqual([e["object_id"] for e in events if e["kind"] == "comment"], [10])
+
+    def test_window_defers_live_entries_to_next_scan(self):
+        api = UpdatedApi(issues=[dict(issue(), updated_at=watch.iso(NOW + 1))])
+        events, done, until = watch.collect_batch(api, SUB, NOW - 3600, NOW, None)
+        self.assertEqual(events, [])
+        self.assertIsNone(done)
+        self.assertEqual(until, NOW)
+        events, done, _ = watch.collect_batch(api, SUB, NOW - watch.OVERLAP, NOW + 2, None)
+        self.assertEqual([e["object_id"] for e in events], [1])
+        self.assertIsNone(done)
 
     def test_collection_bounds_every_excerpt_and_hashes_the_complete_content(self):
         body = "Long request. " * 5000

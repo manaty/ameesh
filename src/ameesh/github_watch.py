@@ -112,12 +112,17 @@ def collect_batch(api, sub, since, now, scan):
 
     Updated ordering is mutable. An offset alone can skip rows when an older
     row moves to the end. Re-read the preceding page *after* fetching the next
-    one, before accepting it; a changed boundary restarts this stream. The
-    durable event digest makes replay harmless, including equal timestamps.
+    one, before accepting it. Advance since by the last accepted timestamp
+    whenever a page spans timestamps; retain one second to include equal keys.
+    Equal-timestamp groups use guarded offsets. A changed boundary restarts at
+    its saved timestamp, never at an older window. Stop at the fixed window end
+    so continuous updates cannot keep extending the scan. Durable digests make
+    replay harmless.
     """
-    state = dict(scan) if scan is not None else dict(since=since, until=now, kind="issue", page=1)
+    state = dict(scan) if scan is not None else dict(since=since, window_since=since, until=now, kind="issue", page=1)
     if state["page"] > 1 and "boundary" not in state:
         state["page"] = 1  # upgrade an old, unprotected checkpoint safely
+    state.setdefault("window_since", state["since"])
     events = []
     until = state["until"]
 
@@ -148,15 +153,29 @@ def collect_batch(api, sub, since, now, scan):
         rows = read(state["page"])
         remaining -= cost
         if checking and boundary(read(state["page"] - 1)) != state["boundary"]:
-            state.update(page=1)
+            state.update(page=1, since=max(state["since"], state.get("boundary_since", state["since"])))
             state.pop("boundary")
+            state.pop("boundary_since", None)
             return events, state, until
-        events.extend(events_from(sub, state["kind"], rows))
-        if len(rows) == PAGE_SIZE:
-            state.update(page=state["page"] + 1, boundary=boundary(rows))
+        times = [datetime.fromisoformat(row["updated_at"].replace("Z", "+00:00")).timestamp()
+                 for row in rows]
+        if times != sorted(times):
+            raise plan_github.GithubError("GitHub watch: updated order is invalid")
+        events.extend(events_from(sub, state["kind"],
+                                  [row for row, ts in zip(rows, times) if ts <= until]))
+        if len(rows) == PAGE_SIZE and times[-1] <= until:
+            cutoff = times[-1] - 1  # GitHub since is exclusive, timestamps have second precision
+            if times[0] < times[-1] and cutoff > state["since"]:
+                state.update(since=cutoff, page=1)
+                state.pop("boundary", None)
+                state.pop("boundary_since", None)
+            else:
+                state.update(page=state["page"] + 1, boundary=boundary(rows),
+                             boundary_since=cutoff)
         elif state["kind"] == "issue":
-            state.update(kind="comment", page=1)
+            state.update(kind="comment", page=1, since=state["window_since"])
             state.pop("boundary", None)
+            state.pop("boundary_since", None)
         else:
             return events, None, until
     return events, state, until
