@@ -485,6 +485,9 @@ def _pending_spend_row(row: dict | None) -> dict | None:
         # clé durable retrouvée dans sa ligne/réservation (marqueur d'avant
         # 0471, quelle que soit la précision de la connexion de réparation).
         "ledger_key": row.get("ledger_key") or row.get("spend_key"),
+        # #2166/B1 : plusieurs candidats incohérents, aucun tour identifiable :
+        # la comptabilité de ce tour doit rester suspendue (fail-closed).
+        "ledger_ambiguous": bool(row.get("ledger_ambiguous")),
         # #796 : le lot du tour (None si inconnu, ou marqueur d'avant 0423)
         "work_item_id": row.get("work_item_id"),
         # #796 : l'identifiant du tour, pour relier la ligne à ses ressources

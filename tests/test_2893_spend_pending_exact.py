@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest import mock
 from urllib.parse import quote
 
-from ameesh import registry
+from ameesh import registry, storage
 from ameesh.runner import AgentWorker, Runner
 
 from .support import PgTestCase
@@ -301,6 +302,201 @@ class PendingSpendExactTest(PgTestCase):
             self.assertIsNone(registry.pending_spend_get(db3, name))
         finally:
             db3.close()
+
+
+    def _legacy_marker_row(self, db, name: str, *, start: int = 0,
+                           turn_id: str | None = None, age: str = "5 minutes") -> dict:
+        """Un marqueur d'avant 0471 (clé NULL), à l'identité près."""
+        db.execute(
+            "INSERT INTO spend_pending (agent, start_index, turn, model, turn_id,"
+            " created_at) VALUES (%s, %s, 'tour', 'm', %s,"
+            " now() - %s::interval)", (name, start, turn_id, age))
+        marker = registry.pending_spend_get(db, name)
+        self.assertIsNone(marker["spend_key"])
+        return marker
+
+    def test_reparation_avant_0471_ignore_une_ligne_ancienne_tardive(self):
+        """B1 : la ligne d'un ancien worker écrite APRÈS le marqueur B n'est
+        pas celle de B ; sa réservation ouverte, elle, identifie B.
+
+        #1469 autorise l'ancien worker à terminer après son remplacement. La
+        clé durable se retrouve par l'identité du tour (`turn_id`), jamais par
+        l'ordre des écritures.
+        """
+        db = self._db(0)
+        try:
+            name = "late-a"
+            marker = self._legacy_marker_row(db, name, turn_id="B", age="1 minute")
+            old_key = "%s:0:%.6f" % (name, float(marker["created_ts"]) - 300.0)
+            db.execute(
+                "INSERT INTO turn_costs (agent, harness, turn, model, usd, spend_key,"
+                " turn_id, started_at, recorded_at)"
+                " VALUES (%s, 'deepseek', 'tour', 'm', 1.5, %s, 'A',"
+                " now() - interval '5 minutes', now())", (name, old_key))
+            reservation_key = "%s:0:%.6f" % (name, float(marker["created_ts"]))
+            db.execute(
+                "INSERT INTO account_reservations (billing_account, agent, usd,"
+                " period, state, spend_key, created_at)"
+                " VALUES ('deepseek-manaty', %s, 2.0, current_date, 'open', %s, now())",
+                (name, reservation_key))
+
+            relu = registry.pending_spend_get(db, name)
+            self.assertFalse(relu["ledger_ambiguous"])
+            self.assertEqual(relu["ledger_key"], reservation_key,
+                             "la clé de l'ancien worker A a été attribuée à B")
+
+            worker = self._worker(db, name)
+            self.assertTrue(worker._compta_ecrit(relu))
+            lignes = db.query(
+                "SELECT spend_key FROM turn_costs WHERE agent = %s ORDER BY id",
+                (name,))
+            self.assertEqual([ligne["spend_key"] for ligne in lignes],
+                             [old_key, reservation_key])
+            reservation = db.query(
+                "SELECT state FROM account_reservations WHERE spend_key = %s",
+                (reservation_key,))[0]
+            self.assertEqual(reservation["state"], "kept")
+            self.assertIsNone(registry.pending_spend_get(db, name))
+        finally:
+            db.close()
+
+    def test_reparation_avant_0471_ignore_une_ligne_ancienne_par_son_debut(self):
+        """Même sans `turn_id` (marqueur d'avant 0423), `started_at` porte
+        l'instant du tour : la ligne de A, commencée avant B, est écartée."""
+        db = self._db(3)
+        try:
+            name = "late-start"
+            marker = self._legacy_marker_row(db, name, age="1 minute")
+            old_key = "%s:0:%.6f" % (name, float(marker["created_ts"]) - 300.0)
+            db.execute(
+                "INSERT INTO turn_costs (agent, harness, turn, model, usd, spend_key,"
+                " started_at, recorded_at)"
+                " VALUES (%s, 'deepseek', 'tour', 'm', 1.5, %s,"
+                " now() - interval '5 minutes', now())", (name, old_key))
+            reservation_key = "%s:0:%.6f" % (name, float(marker["created_ts"]))
+            db.execute(
+                "INSERT INTO account_reservations (billing_account, agent, usd,"
+                " period, state, spend_key, created_at)"
+                " VALUES ('deepseek-manaty', %s, 2.0, current_date, 'open', %s, now())",
+                (name, reservation_key))
+
+            relu = registry.pending_spend_get(db, name)
+            self.assertFalse(relu["ledger_ambiguous"])
+            self.assertEqual(relu["ledger_key"], reservation_key)
+
+            worker = self._worker(db, name)
+            self.assertTrue(worker._compta_ecrit(relu))
+            self.assertIsNone(registry.pending_spend_get(db, name))
+        finally:
+            db.close()
+
+    def test_reparation_avant_0471_ambigue_suspend_sans_deviner(self):
+        """B1 : ligne et réservation indistinguables -> aucune clé, suspension.
+
+        L'ancienne ligne A n'a ni `turn_id` ni `started_at`, et partage
+        l'index de début de B : deux clés candidates. Choisir l'une réglerait
+        le mauvais tour ; le marqueur et la réservation restent en place.
+        """
+        db = self._db(3)
+        try:
+            name = "ambiguous"
+            marker = self._legacy_marker_row(db, name, age="1 minute")
+            old_key = "%s:0:%.6f" % (name, float(marker["created_ts"]) - 300.0)
+            db.execute(
+                "INSERT INTO turn_costs (agent, harness, turn, model, usd, spend_key,"
+                " recorded_at) VALUES (%s, 'deepseek', 'tour', 'm', 1.5, %s, now())",
+                (name, old_key))
+            reservation_key = "%s:0:%.6f" % (name, float(marker["created_ts"]))
+            db.execute(
+                "INSERT INTO account_reservations (billing_account, agent, usd,"
+                " period, state, spend_key, created_at)"
+                " VALUES ('deepseek-manaty', %s, 2.0, current_date, 'open', %s, now())",
+                (name, reservation_key))
+
+            relu = registry.pending_spend_get(db, name)
+            self.assertTrue(relu["ledger_ambiguous"])
+            self.assertIsNone(relu["ledger_key"])
+            worker = self._worker(db, name)
+            self.assertIsNone(worker._spend_key(0, relu))
+            self.assertFalse(worker._compta_ecrit(relu))
+            self.assertTrue(worker._compta_en_echec)
+            self.assertIsNotNone(registry.pending_spend_get(db, name),
+                                 "le marqueur ambigu a été effacé")
+            reservation = db.query(
+                "SELECT state FROM account_reservations WHERE spend_key = %s",
+                (reservation_key,))[0]
+            self.assertEqual(reservation["state"], "open")
+            self.assertEqual(
+                db.query("SELECT count(*) AS n FROM turn_costs WHERE agent = %s",
+                         (name,))[0]["n"], 1,
+                "la réparation ambiguë a écrit une ligne")
+        finally:
+            db.close()
+
+    def test_get_ne_melange_pas_un_marqueur_remplace_a_sa_cle(self):
+        """B1 : un remplaçant qui écrit entre les deux lectures.
+
+        L'ancien code lisait le marqueur, puis cherchait la clé ; le
+        remplaçant faisait attribuer SA clé à l'ancien `created_at`. La
+        résolution en une instruction rend les deux cohérents.
+        """
+        db = self._db(0)
+        try:
+            name = "race"
+            marker = self._legacy_marker_row(db, name, turn_id="B", age="1 minute")
+            key_b = "%s:0:%.6f" % (name, float(marker["created_ts"]))
+            db.execute(
+                "INSERT INTO account_reservations (billing_account, agent, usd,"
+                " period, state, spend_key, created_at)"
+                " VALUES ('deepseek-manaty', %s, 2.0, current_date, 'open', %s, now())",
+                (name, key_b))
+            key_c = "%s:0:%.6f" % (name, float(marker["created_ts"]) + 10.0)
+            original = db.query
+            remplace = {"fait": False}
+
+            def query(sql, params=()):
+                rows = original(sql, params)
+                if not remplace["fait"]:
+                    remplace["fait"] = True
+                    # le remplaçant écrit APRÈS la lecture du marqueur
+                    db.execute("DELETE FROM spend_pending WHERE agent = %s", (name,))
+                    db.execute(
+                        "INSERT INTO spend_pending (agent, start_index, turn, model,"
+                        " turn_id, spend_key, created_at)"
+                        " VALUES (%s, 0, 'tour', 'm', 'C', %s, now())",
+                        (name, key_c))
+                    db.execute(
+                        "UPDATE account_reservations SET spend_key = %s"
+                        " WHERE agent = %s", (key_c, name))
+                return rows
+
+            with mock.patch.object(db, "query", side_effect=query):
+                row = storage.of(db).pending_spend.get(name)
+            self.assertEqual(row["created_at"], marker["created_at"])
+            self.assertEqual(row["ledger_key"], key_b,
+                             "la clé du remplaçant a été attribuée à ce tour")
+            self.assertNotEqual(row["ledger_key"], key_c)
+        finally:
+            db.close()
+
+    def test_get_lit_le_marqueur_et_sa_cle_en_une_seule_instruction(self):
+        """B1 : pas de course entre le SELECT du marqueur et celui de la clé.
+
+        Un remplaçant qui écrit entre les deux lectures ferait attribuer sa
+        clé à l'ancien `created_at`. La résolution est une seule instruction.
+        """
+        db = self._db(0)
+        try:
+            name = "atomic"
+            self._legacy_marker_row(db, name)
+            api = storage.of(db).pending_spend
+            with mock.patch.object(db, "query", wraps=db.query) as query:
+                row = api.get(name)
+            self.assertIsNotNone(row)
+            self.assertEqual(query.call_count, 1,
+                             "le marqueur et sa clé sont lus séparément")
+        finally:
+            db.close()
 
 
 if __name__ == "__main__":  # pragma: no cover
