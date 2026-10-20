@@ -31,8 +31,12 @@ bornes restent celles de l'exécuteur :
 * le fournisseur est appelé par un worker qui a déjà vérifié le budget
   (`AgentWorker.budget_ok`) — un dépassement de budget ferme la porte, pas le
   fournisseur ;
-* une erreur, un délai dépassé ou une sortie illisible laisse la pression
+* une erreur, un délai de `cmd:` ou une sortie illisible laisse la pression
   telle quelle (fail closed : rien n'est accordé) ;
+* un appel de module qui dépasse `AMEESH_CAPACITY_PROVIDER_TIMEOUT` garde son
+  slot (`requesting`/`releasing`) ; sa réponse tardive est appliquée au
+  prochain `need`/`observe`, avec le même `capacity_id`, et aucun second appel
+  ne démarre tant que l'appel est en vol (#2825, verdict cx2) ;
 * un `refused`, `error` ou `none` ne garde pas le slot `requested` (#2825) :
   la fenêtre suivante peut redemander ; un `release` n'est émis qu'avec un
   `capacity_id` réellement accordé.
@@ -114,36 +118,6 @@ def capacity_id(value) -> str | int | float | None:
     if value != value:  # NaN
         return None
     return value
-
-
-def _call_bounded(log, label: str, timeout: float, fn, *args) -> dict:
-    """Appelle `fn(*args)` avec un délai, comme le fournisseur `cmd:` (#2825).
-
-    Un fournisseur de module tourne DANS l'exécuteur : un appel qui ne rend
-    jamais la main retiendrait le worker (et laisserait `releasing` à vie).
-    Le thread est un démon : même bloqué, il ne retarde pas l'arrêt du
-    processus ; la décision rendue est `error` (fail closed)."""
-    if not timeout or timeout <= 0:
-        return fn(*args)
-    box: dict = {}
-
-    def run() -> None:
-        try:
-            box["reply"] = fn(*args)
-        except BaseException as exc:  # the caller decides; never kill the worker
-            box["error"] = exc
-
-    thread = threading.Thread(target=run, daemon=True,
-                              name="capacity-%s" % label)
-    thread.start()
-    thread.join(float(timeout))
-    if thread.is_alive():
-        _log(log, "capacity: %s provider did not answer in %gs"
-             % (label, float(timeout)))
-        return {"action": "error", "error": "timeout"}
-    if "error" in box:
-        raise box["error"]
-    return box.get("reply")
 
 
 def event(kind: str, **fields) -> dict:
@@ -232,19 +206,85 @@ class ModuleProvider(Provider):
     """Un fournisseur `<module>:<classe>`, borné comme le fournisseur `cmd:`.
 
     La classe importée n'est pas un sous-processus : ses méthodes rendent la
-    main ou bloquent l'exécuteur. Chaque appel est donc attendu au plus
-    `AMEESH_CAPACITY_PROVIDER_TIMEOUT` (5 s par défaut) ; au-delà, `error`
-    (rien n'est accordé, une libération repasse en `release_failed`)."""
+    main ou bloquent l'exécuteur. Chaque appel est attendu au plus
+    `AMEESH_CAPACITY_PROVIDER_TIMEOUT` (5 s par défaut) ; au-delà, le SLOT
+    reste tenu (`pending`) et l'appel continue. `poll()` rend sa réponse
+    tardive au Manager, qui la traite comme la réponse synchrone (grant →
+    `requested`, release confirmée → libéré). Aucun second appel n'est lancé
+    tant que l'appel en vol n'a pas rendu la main : deux `need` ne peuvent ni
+    accorder deux capacités ni en perdre une (#2825, verdict cx2)."""
 
     def __init__(self, provider, *, timeout: float = DEFAULT_TIMEOUT_S, log=None) -> None:
         self.provider = provider
         self.timeout = _number(timeout, DEFAULT_TIMEOUT_S, minimum=0.1)
         self.log = log
         self.is_noop = bool(getattr(provider, "is_noop", False))
+        self._lock = threading.Lock()
+        self._seq = 0
+        self._inflight: dict | None = None
 
     def _call(self, method: str, event: dict) -> dict:
-        return _call_bounded(self.log, method, self.timeout,
-                             getattr(self.provider, method), dict(event))
+        with self._lock:
+            current = self._inflight
+            if current is not None:
+                # The Manager serializes calls; defensive only: the call in
+                # flight keeps its token and the slot stays occupied.
+                return {"action": "wait", "pending": True,
+                        "token": current["token"],
+                        "detail": "provider call in flight"}
+            self._seq += 1
+            token = self._seq
+            box: dict = {}
+
+            def run() -> None:
+                try:
+                    box["reply"] = getattr(self.provider, method)(dict(event))
+                except Exception as exc:  # a provider never takes us down
+                    box["reply"] = {"action": "error",
+                                    "error": type(exc).__name__}
+
+            thread = threading.Thread(target=run, daemon=True,
+                                      name="capacity-%s" % method)
+            self._inflight = {"token": token, "method": method,
+                              "thread": thread, "box": box, "waiting": True}
+        thread.start()
+        thread.join(float(self.timeout))
+        with self._lock:
+            inflight = self._inflight
+            if inflight is None or inflight["token"] != token:
+                return {"action": "error", "error": "call lost"}
+            inflight["waiting"] = False
+            if thread.is_alive():
+                _log(self.log, "capacity: %s provider still running after %gs "
+                     "(slot kept; the late reply will be polled)"
+                     % (method, float(self.timeout)))
+                return {"action": "wait", "pending": True, "token": token,
+                        "detail": "provider call in flight"}
+            self._inflight = None
+            reply = box.get("reply")
+        return reply if isinstance(reply, dict) else {"action": "error"}
+
+    def poll(self) -> dict | None:
+        """La réponse d'un appel qui a dépassé le délai, ou None (#2825).
+
+        Ne rend jamais un appel encore en vol, ni un appel qu'un `need`/
+        `observe` synchrone est en train d'attendre (`waiting`)."""
+        with self._lock:
+            inflight = self._inflight
+            if inflight is None or inflight["waiting"]:
+                return None
+        if inflight["thread"].is_alive():
+            return None
+        with self._lock:
+            if self._inflight is not inflight:
+                return None
+            self._inflight = None
+            box = inflight["box"]
+        reply = box.get("reply")
+        if not isinstance(reply, dict):
+            reply = {"action": "error"}
+        return {"token": inflight["token"], "method": inflight["method"],
+                "reply": reply}
 
     def need(self, event: dict) -> dict:
         return self._call("need", event)
@@ -336,6 +376,111 @@ class Manager:
     def _clean(self, now: float) -> None:
         self._needs = [ts for ts in self._needs if now - ts < 3600.0]
 
+    @staticmethod
+    def _need_action(reply: dict) -> tuple[str, object, str | None]:
+        action = reply.get("action")
+        if action not in ACTIONS:
+            action = "error"
+        granted = capacity_id(reply.get("capacity_id"))
+        detail = reply.get("detail") or reply.get("error")
+        if action == "granted" and granted is None:
+            # #2825 N1: a grant without an identifier cannot be released nor
+            # represented with the same id later; it is not a usable capacity
+            action = "error"
+            detail = detail or "granted without capacity_id"
+        return action, granted, detail
+
+    def _need_state(self, state: dict, reply: dict) -> tuple[dict, str]:
+        """L'état d'une demande qui vient de rendre (ou de rendre tardivement)."""
+        action, granted, detail = self._need_action(reply)
+        settled = dict(state)
+        settled.update({"action": action, "capacity_id": granted,
+                        "detail": detail, "pending": False})
+        settled.pop("call", None)
+        settled["state"] = "requested" if action in ("granted", "wait") else "idle"
+        return settled, action
+
+    def _release_result(self, state: dict, reply: dict, now: float):
+        """(nouvel état ou None, résultat rendu à l'appelant) d'un release."""
+        action = reply.get("action")
+        # Explicit confirmation only: a provider that says `wait`, `refused`,
+        # gives no action or an unknown one has NOT released the capacity.
+        failed = not (isinstance(action, str) and action in RELEASE_CONFIRMATIONS)
+        if not failed:
+            return None, {"state": "released", "action": action,
+                          "since": state.get("since"), "agent": state.get("agent"),
+                          "host": state.get("host"),
+                          "capacity_id": state.get("capacity_id")}
+        failed_state = dict(state)
+        failed_state.update({
+            "state": "release_failed", "action": action or "error",
+            "detail": reply.get("detail") or reply.get("error")
+                      or "release not confirmed (%r)" % (action,),
+            "pending": False})
+        failed_state.pop("call", None)
+        if failed_state["release_attempts"] >= self.max_release_attempts:
+            failed_state["next_retry"] = None
+        else:
+            failed_state["next_retry"] = now + self.release_retry_s
+        return failed_state, dict(failed_state)
+
+    def _poll(self) -> None:
+        """Consomme la réponse tardive d'un fournisseur asynchrone (#2825).
+
+        Appelé au début de `need` et `observe`, jamais sous le verrou du
+        Manager : l'appel en vol garde son slot (`requesting`/`releasing`) et
+        son token ; une réponse d'un ancien appel est ignorée."""
+        poll = getattr(self.provider, "poll", None)
+        if not callable(poll):
+            return
+        try:
+            late = poll()
+        except Exception as exc:  # a provider never takes the executor down
+            _log(self.log, "capacity: late provider reply lost (%s)"
+                 % type(exc).__name__)
+            return
+        if not isinstance(late, dict):
+            return
+        token = late.get("token")
+        method = late.get("method")
+        reply = late.get("reply")
+        reply = dict(reply) if isinstance(reply, dict) else {"action": "error"}
+        now = self._now()
+        if method == "need":
+            with self._lock:
+                state = self._outstanding
+                if state is None or state.get("state") != "requesting":
+                    return
+                if state.get("call") is not None and state.get("call") != token:
+                    return
+                settled, action = self._need_state(state, reply)
+                if action in ("granted", "wait"):
+                    self._outstanding = settled
+                else:
+                    self._outstanding = None
+                self._idle_since = None
+            _log(self.log, "capacity: late need for %s on %s -> %s%s"
+                 % (settled.get("agent"), settled.get("host"), action,
+                    " (%s)" % settled.get("detail")
+                    if settled.get("detail") else ""))
+        elif method == "release":
+            with self._lock:
+                state = self._outstanding
+                if state is None or state.get("state") != "releasing":
+                    return
+                if state.get("call") is not None and state.get("call") != token:
+                    return
+                new, result = self._release_result(state, reply, now)
+                self._outstanding = new
+                if new is None:
+                    self._idle_since = None
+            _log(self.log, "capacity: late release for %s on %s -> %s%s (attempt %d)"
+                 % (state.get("agent"), state.get("host"),
+                    reply.get("action") or "error",
+                    " (retry in %ds)" % int(self.release_retry_s)
+                    if new is not None and new.get("next_retry") else "",
+                    state.get("release_attempts") or 0))
+
     def need(self, *, host: str, agent: str, verdict: dict | None = None,
              budget_usd_hour: float | None = None, max_agents: int | None = None,
              queued_s: float | None = None) -> dict | None:
@@ -343,9 +488,13 @@ class Manager:
 
         Rend l'état de la demande (y compris `action: none` du no-op), ou None
         quand le fournisseur est absent/refusé par les bornes. Un appelant
-        sans budget disponible ne doit pas appeler cette méthode."""
+        sans budget disponible ne doit pas appeler cette méthode. Un appel de
+        module qui dépasse son délai rend `state: requesting` (`pending`) : le
+        slot reste tenu, aucun second appel ne démarre, et sa réponse tardive
+        est consommée au prochain `need`/`observe` (#2825)."""
         if not self.enabled:
             return None
+        self._poll()
         now = self._now()
         with self._lock:
             if self._outstanding is not None:
@@ -375,25 +524,26 @@ class Manager:
             reply = self.provider.need(payload)
         except Exception as exc:  # a provider never takes the executor down
             reply = {"action": "error", "error": type(exc).__name__}
+        if isinstance(reply, dict) and reply.get("pending"):
+            # #2825 (verdict cx2): the call is still in flight. Keep the slot
+            # and its token; the late reply will be applied by `_poll`, never
+            # lost, and no second need can start meanwhile.
+            with self._lock:
+                if self._outstanding is placeholder:
+                    placeholder.update({
+                        "action": "wait",
+                        "detail": reply.get("detail") or "provider call in flight",
+                        "pending": True, "call": reply.get("token")})
+            _log(self.log, "capacity: need for %s on %s (%s) pending: provider "
+                 "call in flight" % (agent, host,
+                                     (verdict or {}).get("scope") or "?"))
+            return dict(placeholder)
         reply = dict(reply) if isinstance(reply, dict) else {"action": "error"}
-        action = reply.get("action")
-        if action not in ACTIONS:
-            action = "error"
-        granted = capacity_id(reply.get("capacity_id"))
-        detail = reply.get("detail") or reply.get("error")
-        if action == "granted" and granted is None:
-            # #2825 N1: a grant without an identifier cannot be released nor
-            # represented with the same id later; it is not a usable capacity
-            action = "error"
-            detail = detail or "granted without capacity_id"
-        state = {"state": "requested", "action": action, "since": now,
-                 "agent": agent, "host": host,
-                 "capacity_id": granted,
-                 "detail": detail}
+        settled, action = self._need_state(placeholder, reply)
         with self._lock:
             if self._outstanding is placeholder:
                 if action in ("granted", "wait"):
-                    self._outstanding = state
+                    self._outstanding = settled
                 else:
                     # #2825 N1: refused/error/none granted nothing. Drop the
                     # slot so a later window can ask again (min_interval and
@@ -403,8 +553,8 @@ class Manager:
             self._idle_since = None
         _log(self.log, "capacity: need for %s on %s (%s) -> %s%s"
              % (agent, host, (verdict or {}).get("scope") or "?",
-                action, " (%s)" % state["detail"] if state["detail"] else ""))
-        return dict(state)
+                action, " (%s)" % settled["detail"] if settled["detail"] else ""))
+        return dict(settled)
 
     def observe(self, blocked: bool, *, now: float | None = None) -> dict | None:
         """Après un verdict frais : libère la capacité après le calme requis.
@@ -415,9 +565,13 @@ class Manager:
         que le fournisseur n'a pas confirmé, et le même identifiant est
         représenté aux tentatives suivantes (idempotence). Après
         `max_release_attempts`, le slot reste `release_failed` : un opérateur
-        (ou un redémarrage) tranche, jamais une seconde allocation."""
+        (ou un redémarrage) tranche, jamais une seconde allocation. Un appel
+        de module qui dépasse son délai garde `releasing` (`pending`) ; sa
+        réponse tardive est appliquée par le `observe` suivant, sans chevaucher
+        l'appel vivant (#2825)."""
         if not self.enabled:
             return None
+        self._poll()
         now = self._now() if now is None else float(now)
         with self._lock:
             state = self._outstanding
@@ -479,35 +633,32 @@ class Manager:
             reply = self.provider.release(payload)
         except Exception as exc:
             reply = {"action": "error", "error": type(exc).__name__}
+        if isinstance(reply, dict) and reply.get("pending"):
+            # #2825 (verdict cx2): the release is still in flight. Keep
+            # `releasing` and its token; the late reply is applied by `_poll`.
+            with self._lock:
+                if self._outstanding is state:
+                    state["pending"] = True
+                    state["detail"] = reply.get("detail") or "provider call in flight"
+                    state["call"] = reply.get("token")
+            _log(self.log, "capacity: release for %s on %s pending: provider "
+                 "call in flight (attempt %d)"
+                 % (state.get("agent"), state.get("host"),
+                    state.get("release_attempts") or 0))
+            return dict(state)
         reply = dict(reply) if isinstance(reply, dict) else {"action": "error"}
         action = reply.get("action")
-        # Explicit confirmation only: a provider that says `wait`, `refused`,
-        # gives no action or an unknown one has NOT released the capacity.
         failed = not (isinstance(action, str) and action in RELEASE_CONFIRMATIONS)
         with self._lock:
             if self._outstanding is not state:
                 # another release/need replaced the slot while this RPC was in
                 # flight; never clear or overwrite someone else's allocation
                 result = dict(self._outstanding or state)
-            elif failed:
-                state = dict(state)
-                state["state"] = "release_failed"
-                state["action"] = action or "error"
-                state["detail"] = reply.get("detail") or reply.get("error") \
-                    or "release not confirmed (%r)" % (action,)
-                if state["release_attempts"] >= self.max_release_attempts:
-                    state["next_retry"] = None
-                else:
-                    state["next_retry"] = now + self.release_retry_s
-                self._outstanding = state
-                result = dict(state)
             else:
-                self._outstanding = None
-                self._idle_since = None
-                result = {"state": "released", "action": action,
-                          "since": state.get("since"), "agent": state.get("agent"),
-                          "host": state.get("host"),
-                          "capacity_id": state.get("capacity_id")}
+                new, result = self._release_result(state, reply, now)
+                self._outstanding = new
+                if new is None:
+                    self._idle_since = None
         _log(self.log, "capacity: release for %s on %s -> %s%s (attempt %d)"
              % (state.get("agent"), state.get("host"), action,
                 " (retry in %ds)" % int(self.release_retry_s)

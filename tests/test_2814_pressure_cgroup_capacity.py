@@ -64,6 +64,13 @@ def write_cgroup(root: str, *, cpu_psi: float = 0.0, mem_psi: float = 0.0,
     return root
 
 
+def write_module(root: str, name: str, body: str) -> str:
+    """#2825 : un module de fournisseur de capacité pour les tests."""
+    with open(os.path.join(root, name + ".py"), "w", encoding="utf-8") as fh:
+        fh.write(body)
+    return os.path.join(root, name + ".py")
+
+
 class PlatformCgroupTest(unittest.TestCase):
     def test_own_cgroup_reads_the_v2_line(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as fh:
@@ -394,6 +401,16 @@ class _Provider:
 
 
 class CapacityProviderTest(unittest.TestCase):
+    def drain_observes(self, manager, timeout=2.0):
+        """Laisse le Manager consommer une réponse tardive puis libérer."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            manager.observe(False)
+            if manager.snapshot() is None:
+                return
+            time.sleep(0.01)
+        self.fail("late provider reply not applied: %r" % (manager.snapshot(),))
+
     def test_no_provider_is_the_noop_and_never_signals(self):
         provider = capacity.load_provider("", log=None)
         self.assertTrue(provider.is_noop)
@@ -650,74 +667,149 @@ class CapacityProviderTest(unittest.TestCase):
         clock[0] = 110.0
         self.assertEqual(manager.need(host="h", agent="b")["action"], "granted")
 
-    def test_a_slow_module_need_is_bounded(self):
-        # #2825 N3 : un fournisseur `module:` qui pend ne retient pas le
-        # worker ; son appel est borné comme celui de `cmd:`.
+    def test_a_timed_out_module_need_keeps_its_slot_and_its_late_grant(self):
+        # #2825 verdict cx2 : un need temporisé ne rend pas le slot ; l'appel
+        # reste suivi, aucun second need ne démarre, et le grant tardif est
+        # libéré avec SON capacity_id (pas de c2 perdu).
         with tempfile.TemporaryDirectory() as root:
-            path = os.path.join(root, "slow_capacity_need.py")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(
-                    "import time\n"
-                    "class SlowNeed:\n"
-                    "    is_noop = False\n"
-                    "    def need(self, event):\n"
-                    "        time.sleep(3.0)\n"
-                    "        return {'action': 'granted', 'capacity_id': 'late'}\n"
-                    "    def release(self, event):\n"
-                    "        return {'action': 'none'}\n")
+            write_module(root, "gated_capacity_need", '''
+import threading
+gate = threading.Event()
+started = []
+releases = []
+class GatedNeed:
+    is_noop = False
+    def need(self, event):
+        started.append(event)
+        gate.wait(5.0)
+        return {"action": "granted", "capacity_id": "c%d" % len(started)}
+    def release(self, event):
+        releases.append(event.get("capacity_id"))
+        return {"action": "none"}
+''')
             sys.path.insert(0, root)
             try:
                 with mock.patch.dict(os.environ,
-                                     {"AMEESH_CAPACITY_PROVIDER_TIMEOUT": "0.2"}):
+                                     {"AMEESH_CAPACITY_PROVIDER_TIMEOUT": "0.1"}):
                     provider = capacity.load_provider(
-                        "slow_capacity_need:SlowNeed")
-                    self.assertIsInstance(provider, capacity.ModuleProvider)
+                        "gated_capacity_need:GatedNeed")
+                    module = sys.modules["gated_capacity_need"]
                     manager = capacity.Manager(provider, min_interval_s=0,
-                                               needs_per_hour=5)
+                                               needs_per_hour=5,
+                                               release_after_s=0)
                     started = time.monotonic()
-                    state = manager.need(host="h", agent="a")
-                self.assertLess(time.monotonic() - started, 1.5)
-                self.assertEqual(state["action"], "error")
-                self.assertEqual(state["detail"], "timeout")
+                    pending = manager.need(host="h", agent="a")
+                    self.assertLess(time.monotonic() - started, 1.5)
+                    self.assertEqual(pending["state"], "requesting")
+                    self.assertTrue(pending["pending"])
+                    # a second need returns the SAME slot; no second call
+                    second = manager.need(host="h", agent="b")
+                    self.assertEqual(second["state"], "requesting")
+                    self.assertEqual(len(module.started), 1)
+                    module.gate.set()
+                    self.drain_observes(manager)
+                self.assertEqual(len(module.started), 1)
+                self.assertEqual(module.releases, ["c1"])
             finally:
                 sys.path.remove(root)
-                sys.modules.pop("slow_capacity_need", None)
+                sys.modules.pop("gated_capacity_need", None)
 
-    def test_a_slow_module_release_is_bounded_and_not_left_releasing(self):
-        # #2825 N3 : un release qui pend ne laisse pas l'état `releasing` à
-        # vie ; il repasse en `release_failed` (retenté avec le même id).
+    def test_a_timed_out_module_release_is_not_retried_over_the_live_call(self):
+        # #2825 verdict cx2 : un release temporisé garde `releasing` et son
+        # token ; tant que l'appel vit, aucun retry ne se chevauche.
         with tempfile.TemporaryDirectory() as root:
-            path = os.path.join(root, "slow_capacity_release.py")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(
-                    "import time\n"
-                    "class SlowRelease:\n"
-                    "    is_noop = False\n"
-                    "    def need(self, event):\n"
-                    "        return {'action': 'granted', 'capacity_id': 'c1'}\n"
-                    "    def release(self, event):\n"
-                    "        time.sleep(3.0)\n"
-                    "        return {'action': 'none'}\n")
+            write_module(root, "gated_capacity_release", '''
+import threading
+gate = threading.Event()
+releases = []
+class GatedRelease:
+    is_noop = False
+    def need(self, event):
+        return {"action": "granted", "capacity_id": "c1"}
+    def release(self, event):
+        releases.append(event.get("capacity_id"))
+        gate.wait(5.0)
+        return {"action": "none"}
+''')
             sys.path.insert(0, root)
             try:
                 with mock.patch.dict(os.environ,
-                                     {"AMEESH_CAPACITY_PROVIDER_TIMEOUT": "0.2"}):
+                                     {"AMEESH_CAPACITY_PROVIDER_TIMEOUT": "0.1"}):
                     provider = capacity.load_provider(
-                        "slow_capacity_release:SlowRelease")
+                        "gated_capacity_release:GatedRelease")
+                    module = sys.modules["gated_capacity_release"]
+                    manager = capacity.Manager(provider, min_interval_s=0,
+                                               needs_per_hour=5,
+                                               release_after_s=0)
+                    self.assertEqual(
+                        manager.need(host="h", agent="a")["capacity_id"], "c1")
+                    manager.observe(False)  # the calm starts
+                    started = time.monotonic()
+                    pending = manager.observe(False)  # release starts, times out
+                    self.assertLess(time.monotonic() - started, 1.5)
+                    self.assertEqual(pending["state"], "releasing")
+                    self.assertTrue(pending["pending"])
+                    self.assertEqual(pending["capacity_id"], "c1")
+                    # the live release is not duplicated by a retry
+                    self.assertIsNone(manager.observe(False))
+                    self.assertEqual(len(module.releases), 1)
+                    module.gate.set()
+                    self.drain_observes(manager)
+                self.assertEqual(len(module.releases), 1)
+                self.assertIsNone(manager.snapshot())
+            finally:
+                sys.path.remove(root)
+                sys.modules.pop("gated_capacity_release", None)
+
+    def test_a_late_failed_release_is_settled_before_any_retry(self):
+        # #2825 verdict cx2 : une réponse tardive d'échec est appliquée au
+        # slot (`release_failed`), et le retry attend son délai.
+        with tempfile.TemporaryDirectory() as root:
+            write_module(root, "gated_capacity_failed_release", '''
+import threading
+gate = threading.Event()
+releases = []
+class GatedFailedRelease:
+    is_noop = False
+    def need(self, event):
+        return {"action": "granted", "capacity_id": "c1"}
+    def release(self, event):
+        releases.append(event.get("capacity_id"))
+        gate.wait(5.0)
+        return {"action": "error", "error": "late boom"}
+''')
+            sys.path.insert(0, root)
+            try:
+                with mock.patch.dict(os.environ,
+                                     {"AMEESH_CAPACITY_PROVIDER_TIMEOUT": "0.1"}):
+                    provider = capacity.load_provider(
+                        "gated_capacity_failed_release:GatedFailedRelease")
+                    module = sys.modules["gated_capacity_failed_release"]
                     manager = capacity.Manager(provider, min_interval_s=0,
                                                needs_per_hour=5,
                                                release_after_s=0)
                     manager.need(host="h", agent="a")
                     manager.observe(False)  # the calm starts
-                    started = time.monotonic()
-                    failed = manager.observe(False)
-                self.assertLess(time.monotonic() - started, 1.5)
-                self.assertEqual(failed["state"], "release_failed")
-                self.assertEqual(failed["capacity_id"], "c1")
-                self.assertEqual(failed["detail"], "timeout")
+                    manager.observe(False)  # release starts, times out
+                    module.gate.set()
+                    deadline = time.time() + 2.0
+                    snapshot = None
+                    while time.time() < deadline:
+                        manager.observe(False)
+                        snapshot = manager.snapshot()
+                        if snapshot and snapshot["state"] == "release_failed":
+                            break
+                        time.sleep(0.01)
+                    self.assertEqual(snapshot["state"], "release_failed")
+                    self.assertEqual(snapshot["capacity_id"], "c1")
+                    self.assertIn("late boom", snapshot["detail"])
+                    self.assertEqual(len(module.releases), 1)
+                    # before `next_retry`, no second release call
+                    self.assertIsNone(manager.observe(False))
+                    self.assertEqual(len(module.releases), 1)
             finally:
                 sys.path.remove(root)
-                sys.modules.pop("slow_capacity_release", None)
+                sys.modules.pop("gated_capacity_failed_release", None)
 
 
 class MailExpiryTest(unittest.TestCase):
