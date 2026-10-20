@@ -140,7 +140,12 @@ def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=(),
     (#2564) — ou `("", "")` si aucun dépôt ne le résout : l'appelant ne conclut
     pas (jamais de classe rassurante par défaut). `overview` réutilise les
     lignes de `registry.overview` déjà lues par l'appelant (une passe = une
-    lecture pour N lots, #2564) ; `None` les relit. Lecture seule."""
+    lecture pour N lots, #2564) ; `None` les relit. Lecture seule.
+
+    #2851 : la sonde est locale (`plan_git.local_commit`). Un clone partiel
+    d'un autre projet dont le commit manque lançait sinon un fetch paresseux
+    (~10 s) avant d'échouer, et le balayage des dossiers du registre payait ce
+    délai plusieurs fois par passe d'alertes."""
     from . import registry
 
     frozen = str(frozen or "").strip()
@@ -180,7 +185,7 @@ def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=(),
             continue
         seen.add(root)
         try:
-            commit = plan_git._commit(root, frozen)
+            commit = plan_git.local_commit(root, frozen)
         except Exception:  # noqa: BLE001 - commit illisible : piste suivante
             continue
         if commit:

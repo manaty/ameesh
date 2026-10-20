@@ -30,7 +30,7 @@ class HostUnsampledTest(unittest.TestCase):
         store = mock.MagicMock()
         store.hosts.current.return_value = [
             dict({"host": host}, **reading) for host, reading in readings.items()]
-        store.hosts.since.return_value = []
+        store.hosts.disk_history.return_value = []
         store.hosts.runners.return_value = []
         store.turn_resources.orphans.return_value = list(orphans)
         store.turn_resources.stale_running.return_value = []
