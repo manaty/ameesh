@@ -265,7 +265,10 @@ class Gauge:
     resets_at: float | None         #: epoch, ou None si le harnais ne le dit pas
     window_s: float
     #: #1561 : quand le relevé a été produit (epoch), None si la source ne le
-    #: date pas. Toutes les fenêtres d'un même relevé portent le même âge.
+    #: date pas. Un même relevé porte le même âge pour toutes ses fenêtres,
+    #: mais `codex_gauges.reconcile` conserve chaque fenêtre depuis sa propre
+    #: observation : une fenêtre réconciliée peut donc être plus récente
+    #: qu'une autre du même compte (#2843).
     read_at: float | None = None
     #: #1132 : instant de PRODUCTION du relevé (epoch), None quand le flux ne
     #: le date pas (sans marqueur, ou Codex) — l'heure d'insertion n'en tient
@@ -442,8 +445,11 @@ def reading_outdated(gauges, now: float) -> bool:
 
     `stale_reading` dit qu'un relevé partiel — une fenêtre datée remise à zéro,
     une autre encore ouverte — n'est plus un instantané courant ; il reste
-    néanmoins informatif pour les fenêtres encore ouvertes tant que son âge
-    (`now - read_at`) ne dépasse pas ce qui leur reste (`resets_at - now`).
+    néanmoins informatif pour les fenêtres encore ouvertes tant que l'âge de
+    **chacune** (`now - read_at` de son observation) ne dépasse pas ce qui lui
+    reste (`resets_at - now`). Une fenêtre court échue conservée par
+    `codex_gauges.reconcile` ne vieillit donc pas une semaine récemment
+    observée, sans relever l'âge d'une semaine réellement ancienne (#2843).
     Au-delà, la remise à zéro qui rendra le relevé caduc est plus proche que le
     trou d'observation : **prudence sur une information ancienne**, pas la
     preuve d'un quota atteint. Le cas réel du 15/10 : relevé de 30 % vieux de
@@ -454,8 +460,8 @@ def reading_outdated(gauges, now: float) -> bool:
     pour un relevé dont **toutes** les fenêtres datées sont échues (L71, la
     suivante est vierge à 0 %). Faux sans âge connu (`read_at` absent : une
     date manquante ne prouve aucune péremption de plus). Faux dès qu'**une**
-    fenêtre encore ouverte reste plus longue que l'âge : le relevé garde du
-    sens pour elle.
+    fenêtre encore ouverte reste plus longue que son propre âge : le relevé
+    garde du sens pour elle.
     """
     dated = [g for g in gauges if g.resets_at]
     if not any(g.reset_passed(now) for g in dated):
@@ -463,11 +469,13 @@ def reading_outdated(gauges, now: float) -> bool:
     opened = [g for g in dated if not g.reset_passed(now)]
     if not opened:
         return False                    # L71 : toutes échues, la suivante est vierge
-    stamps = [stamp for stamp in (getattr(g, "read_at", None) for g in gauges) if stamp]
-    if not stamps:
-        return False
-    age = now - min(stamps)
-    return all(age > float(g.resets_at) - now for g in opened)
+    for gauge in opened:
+        stamp = getattr(gauge, "read_at", None)
+        if not stamp:
+            return False                # âge inconnu : aucune péremption de plus
+        if now - float(stamp) <= float(gauge.resets_at) - now:
+            return False                # cette fenêtre reste plus longue que son âge
+    return True
 
 
 @dataclass(frozen=True)

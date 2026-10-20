@@ -43,8 +43,11 @@ class ReviewerFixFamilyTest(_ActivationFixture, PgTestCase):
     """The reference author is the assignee; a small reviewer fix keeps its family."""
 
     # -- helpers ----------------------------------------------------------
-    def commit(self, actor, harness, text, path="src/ameesh/work.py"):
-        """A new frozen head whose exact receipt names `actor` / `harness`."""
+    def commit(self, actor, harness, text, path="src/ameesh/mail.py"):
+        """A new frozen head whose exact receipt names `actor` / `harness`.
+
+        `mail.py` reste sensible hors du périmètre critique : #1515 y a fait
+        entrer `work.py`, qui servait de chemin neutre à ces témoins."""
         self.repo.write(path, text)
         sha = self.repo.commit("%s: %s" % (actor, path))
         self.receipts(actor=actor, harness=harness, commits=[sha])

@@ -67,18 +67,23 @@ class TrainMachineryScaleTest(unittest.TestCase):
 
     def test_a_control_path_keeps_one_review(self):
         # Le voisin direct de train*.py n'est pas dans la règle : un avis.
+        # `mail.py` est hors du périmètre critique ; `work.py` y est entré
+        # avec #1515 (il participe à la porte des avis).
         source = canon(reviews=[{"paths": list(TRAIN_PATHS), "reviews": 2}])
         klass = lot_class.class_of_paths([source], "ameesh",
-                                         ["src/ameesh/work.py"])
+                                         ["src/ameesh/mail.py"])
         self.assertFalse(klass["doubt"])
         self.assertEqual(merge_queue.required_verdicts(klass), 1)
 
     def test_the_declaration_is_read_for_the_lot_project_only(self):
         # Un train_reviews d'un autre projet ne change rien pour ameesh.
+        # Le chemin d'exemple est hors du périmètre critique : `resolutions.py`
+        # y est entré avec R12 (canon §8), on prend `mail.py` comme voisin
+        # direct, déjà témoin de ce périmètre dans le test précédent.
         source = canon(reviews=[{"paths": list(TRAIN_PATHS), "reviews": 2}],
                        risk_project="ameesh", train_project="nexlink")
         klass = lot_class.class_of_paths([source], "ameesh",
-                                         ["src/ameesh/resolutions.py"])
+                                         ["src/ameesh/mail.py"])
         self.assertFalse(klass["doubt"])
         self.assertEqual(merge_queue.required_verdicts(klass), 1)
 

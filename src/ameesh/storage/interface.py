@@ -3563,6 +3563,13 @@ class HostResources(Domain):
         oldest first (the pilot report)."""
 
     @abc.abstractmethod
+    def disk_history(self, host: str, since_s: float) -> list[dict]:
+        """#2851: the disk fields of the host's readings over the last
+        `since_s` seconds, oldest first (`id`, `sampled_ts`, `volumes`,
+        `disk_path`, `disk_free_bytes` only) — the disk trend does not pay for
+        the ~50 columns of `since` on thousands of readings."""
+
+    @abc.abstractmethod
     def record_harness_version(self, host: str, harness: str, *, path: str | None,
                                version: str | None, raw: str | None) -> None:
         """L120: the last version read of `harness` on `host` (one row per
@@ -3727,10 +3734,22 @@ class Housekeeping(Domain):
         dans les bilans), les plus récentes d'abord ; instant en `at_ts`."""
 
     @abc.abstractmethod
-    def latest_by_path(self, host: str | None, kind: str) -> list[dict]:
+    def latest_by_path(self, host: str | None, kind: str,
+                       *, since_s: float | None = None,
+                       only_paths_with: Sequence[str] | None = None) -> list[dict]:
         """#222: the last line of each (host, path) of this `kind` (of the host
-        if given), with no time window nor limit: only the retention of the
-        log bounds it."""
+        if given). Without `since_s`, no time window nor limit: only the
+        retention of the log bounds it; with it (#2851), the lines older than
+        `since_s` seconds are left out — a caller that ignores them anyway
+        does not sort the whole journal.
+
+        `only_paths_with` (#2851) restricts the result to the paths that have
+        at least one line whose `action` is in this set. The line returned is
+        still the **latest of that path, whatever its action and whatever its
+        age**: a path last seen `unowned` then `deleted` comes back with
+        `deleted`, so the caller never keeps a closed alert alive. The
+        candidate filter runs in SQL, which keeps the sort on a handful of
+        paths instead of the whole journal."""
 
     @abc.abstractmethod
     def summary(self, host: str | None, since_s: float) -> list[dict]:

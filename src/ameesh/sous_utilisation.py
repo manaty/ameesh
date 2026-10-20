@@ -1353,7 +1353,8 @@ def host_underused(cfg, db, listing: list, now: float, *,
                    window_s: float = DEFAULT_HOST_UNDERUSED_S,
                    load_max: float = DEFAULT_HOST_UNDERUSED_LOAD,
                    turns_max: float = DEFAULT_HOST_UNDERUSED_TURNS,
-                   idle_mail_s: float = 300.0, canons=None) -> list:
+                   idle_mail_s: float = 300.0, canons=None,
+                   verdicts: dict | None = None) -> list:
     if window_s <= 0 or load_max <= 0:
         return []
     hosts = storage.of(db).hosts
@@ -1363,7 +1364,8 @@ def host_underused(cfg, db, listing: list, now: float, *,
             canons = canon_mod.load_configured(cfg) if cfg is not None else []
         except Exception:
             canons = []
-    verdicts = host_verdicts(db, canons)
+    if verdicts is None:
+        verdicts = host_verdicts(db, canons)
     out = []
     for host, (reading, verdict) in sorted(verdicts.items()):
         if verdict["blocked"]:
@@ -1565,15 +1567,18 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
     names = {row["name"] for row in listing}
     designers = sorted(n for n in role_orchestrators(canons, DESIGN_ROLES) if n in names)
     try:
-        pressured = pressured_hosts(host_verdicts(db, canons), now)
+        # #2851 : un seul relevé d'hôtes pour les deux alertes (la lecture
+        # `current` était payée deux fois par passe).
+        verdicts = host_verdicts(db, canons)
+        pressured = pressured_hosts(verdicts, now)
     except Exception:
-        pressured = {}
+        verdicts, pressured = {}, {}
     out += idle_capacity(db, listing, now, orchestras, idle_s=idle_capacity_s, paid=paid,
                          designers=designers, held=held, held_hosts=held_hosts,
                          pressured=pressured, cfg=cfg)
     out += host_underused(cfg, db, listing, now, window_s=host_underused_s,
                           load_max=host_underused_load, turns_max=host_underused_turns,
-                          idle_mail_s=idle_mail_s, canons=canons)
+                          idle_mail_s=idle_mail_s, canons=canons, verdicts=verdicts)
     out += balance_low(db, listing, now, hours=balance_hours, min_usd=balance_min_usd,
                        window_s=balance_window_s)
     out += backlog_empty(db, listing, now, idle_s=backlog_empty_s)

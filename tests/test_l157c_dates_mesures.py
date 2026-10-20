@@ -620,7 +620,7 @@ class MeasurePgTest(PgTestCase):
         lot = work.add(self.db, title="measured", size="s", branch="lot/x")
         lid = lot["id"]
         work.move(self.db, lid, "build")
-        work.milestone(self.db, lid, "frozen", sha="abc1234")
+        work.milestone(self.db, lid, "frozen", sha="a" * 40)
         with tempfile.TemporaryDirectory() as root:
             repo, sha = make_repo(root)
             work.close_merged(self.db, lid, sha=sha)

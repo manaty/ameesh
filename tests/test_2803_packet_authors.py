@@ -105,13 +105,13 @@ class VehicleDeltaTest(PgTestCase):
             self.db.execute("UPDATE agent_registry SET team = 'ameesh'"
                             " WHERE name = %s", (name,))
         self.repo = _Repo(os.path.join(self.tmp, "vehicle"))
-        self.repo.write("src/ameesh/work.py", "base\n")
+        self.repo.write("src/ameesh/vehicle.py", "base\n")
         self.base = self.repo.commit("base")
         self.repo.write("src/ameesh/member.py", "member\n")
         self.member = self.repo.commit("member", agent="impl")
         self.repo.write("reviews/integration-paquet-test.md", "# manifest\n")
         self.manifest = self.repo.commit("manifest", agent="composer")
-        self.repo.write("src/ameesh/work.py", "resolution\n")
+        self.repo.write("src/ameesh/vehicle.py", "resolution\n")
         self.resolution = self.repo.commit("resolution", agent="resolver")
         self.receipts = {
             self.member: ("impl", "codex"),
@@ -145,14 +145,14 @@ class VehicleDeltaTest(PgTestCase):
         head = head or self.resolution
         vehicle = {"ok": None, "required": required,
                    "klass": {"class": "sensitive",
-                             "files": [{"path": "src/ameesh/work.py"}]},
+                             "files": [{"path": "src/ameesh/vehicle.py"}]},
                    "commits": list(commits),
-                   "own_paths": ["src/ameesh/work.py"]}
+                   "own_paths": ["src/ameesh/vehicle.py"]}
         return merge_queue.review_gate(
             self.db, marks, head, repo=self.repo.root,
             klass={"class": "sensitive", "project": "ameesh",
                    "base_sha": self.base,
-                   "files": [{"path": "src/ameesh/work.py"}]},
+                   "files": [{"path": "src/ameesh/vehicle.py"}]},
             item=item or self.item(), families=FAMILIES, vehicle=vehicle,
             authors=authors)
 
@@ -226,7 +226,7 @@ class VehicleDeltaTest(PgTestCase):
             "UPDATE work_items SET reviewers = ARRAY['r_codex'] WHERE id = %s",
             (int(item["id"]),))
         item = work.get(self.db, int(item["id"]))
-        self.repo.write("src/ameesh/work.py", "resolution\nsmall fix\n")
+        self.repo.write("src/ameesh/vehicle.py", "resolution\nsmall fix\n")
         fix = self.repo.commit("r_codex: small fix", agent="r_codex")
         self.db.execute(
             "INSERT INTO provenance_receipts"

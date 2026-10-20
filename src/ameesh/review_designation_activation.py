@@ -484,7 +484,13 @@ def _repository(db, cfg, item: Mapping, frozen_sha: str, *,
     `fetch=False` (the freeze transaction) never reaches the network: the head
     found only on origin is journaled unavailable, then fetched by the retry
     that runs outside any transaction (`retry_pending`).
+
+    #2786: `frozen_sha` must be a full commit id. A symbolic ref (`HEAD`, a
+    branch) is never resolved in this host's clone: it would read a commit
+    that nobody froze (#2712).
     """
+    if not _SHA_TEXT.fullmatch(str(frozen_sha or "").strip().lower()):
+        return ""
     candidates = _candidate_paths(db, cfg, item)
     seen: set[str] = set()
     for path in candidates:
@@ -545,7 +551,13 @@ def _range(repo: str, base: str, head: str, *, bounded: bool = True) -> tuple[st
     base = _resolve_base(repo, base)
     if not base:
         raise ActivationError("no readable target branch to diff the freeze against")
-    head = str(head or "").strip()
+    head = str(head or "").strip().lower()
+    if not _SHA_TEXT.fullmatch(head):
+        # #2786: never resolve a symbolic ref (`HEAD`, a branch) in this
+        # clone: the frozen diff would be another commit's diff (#2712).
+        raise ActivationError(
+            "the frozen head %r is not a full commit id: the designation never "
+            "resolves a ref in its own clone" % (head[:24],))
     if not plan_git._commit(repo, head):
         raise ActivationError("the frozen commit %s is not in %s" % (head[:12], repo))
     proc = plan_git._out(repo, "merge-base", base, head)
@@ -884,6 +896,15 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     frozen_sha = str(freeze.get("sha") or "").strip()
     if not frozen_sha:
         return Unavailable("freeze #%s names no commit" % (freeze.get("id"),))
+    # #2786: a freeze must name a full commit id. Never resolve `HEAD` or a
+    # branch in this host's clone to compute the frozen diff: that is how the
+    # automatic designation read "no changed path" on the #2712 freeze.
+    if not _SHA_TEXT.fullmatch(frozen_sha.lower()):
+        return Unavailable(
+            "freeze #%s names %r, not a full commit id: the designation never "
+            "resolves a ref in its own clone — freeze again with the full head "
+            "(`ameesh work milestone %d frozen --sha <commit>`)"
+            % (freeze.get("id"), frozen_sha, int(lot)))
     repo = _repository(db, cfg, item, frozen_sha, fetch=fetch)
     if not repo:
         return Unavailable("no repository holds the frozen head %s: cannot read the"
@@ -1764,6 +1785,15 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         freeze = {"id": int(row["id"]), "sha": str(row.get("sha") or "").strip(),
                   "at_ts": row.get("at_ts"), "actor": row.get("actor") or ""}
     freeze = dict(freeze)
+    # #2786: validate the freeze BEFORE any read that resolves it — including
+    # the carry plan and the effective-mark replay. A `HEAD` or a branch is
+    # never resolved in this clone, and nothing is written for it.
+    frozen_sha = str(freeze.get("sha") or "").strip().lower()
+    if not _SHA_TEXT.fullmatch(frozen_sha):
+        return {"state": "unavailable", "reviewers": [], "freeze": freeze,
+                "why": ("freeze #%s names %r, not a full commit id: the designation "
+                        "never resolves a ref in its own clone, nothing written"
+                        % (freeze.get("id"), str(freeze.get("sha") or "")))}
     manual = _manual(db, item)
     if _waiver(item):
         return {"state": "manual", "reviewers": [], "freeze": freeze,

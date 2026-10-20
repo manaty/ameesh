@@ -79,12 +79,18 @@ def stages(item, milestones, events, *, receipts=(), closing=None):
     yield "accepted", "Accepted. Priority: %s; target: %s." % (priority, target)
     timeline = []
     kinds = set()
-    for mark in reversed(milestones):
+    for mark in milestones:
         kind = mark.get("kind")
         if kind not in ("frozen", "merged") or mark.get("annulled"):
             continue
+        # #2861: newest-first: retain the latest freeze in the timeline.
+        # One public "Frozen" per lot; a re-freeze is not a new stage
+        # for the requester (a lot can be frozen ten times before it lands).
+        if kind == "frozen" and "frozen" in kinds:
+            continue
         kinds.add(kind)
-        timeline.append((float(mark.get("at_ts") or 0), "milestone-%s" % mark["id"], {
+        key = "frozen" if kind == "frozen" else "milestone-%s" % mark["id"]
+        timeline.append((float(mark.get("at_ts") or 0), key, {
             "frozen": "Frozen for review.", "merged": "Merged; delivery confirmation will follow."
         }[kind]))
     previous = None
@@ -151,6 +157,9 @@ def project(db, st, gh_repo, report, mine, *, guard, refused, project, closings)
             if issue is None or (issue.get("state") or "").lower() == "open":
                 if not saved["enrolled"]:
                     saved["enrolled"] = True
+                    # #2861: a mirror that already existed is enrolled from
+                    # its current stage only, never with the whole history.
+                    saved["baseline"] = issue is not None
                     checkpoint[ticket] = saved
                     save()
             if not saved["enrolled"] and not receipts.get(lot):
@@ -161,6 +170,14 @@ def project(db, st, gh_repo, report, mine, *, guard, refused, project, closings)
                                      closing=closings.get(lot)))
             if not saved["enrolled"]:
                 candidates = [(key, text) for key, text in candidates if key.startswith("delivered-")]
+            if saved.get("baseline") and not gh_repo.dry_run:
+                # #2861: keep the latest stage, mark the older ones as seen
+                history = [key for key, _text in candidates[:-1]
+                           if not key.startswith("delivered-")]
+                saved["seen"].extend(k for k in history if k not in saved["seen"])
+                saved["baseline"] = False
+                checkpoint[ticket] = saved
+                save()
             candidates = [(key, text) for key, text in candidates if key not in saved["seen"]]
             if not candidates:
                 continue
