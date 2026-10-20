@@ -237,17 +237,16 @@ class NarrowReadsTest(PgTestCase):
         self.assertEqual({row["path"] for row in hk.latest_by_path("pc", "orphan")},
                          {"/tmp/ancien", "/tmp/recent"})
 
-    def test_action_lines_ne_rend_que_les_actions_demandees(self):
+    def test_latest_by_path_ne_garde_que_les_chemins_d_unowned(self):
         hk = storage.of(self.db).housekeeping
         hk.log("pc", [
             {"kind": "tmp", "action": "signaled", "path": "/tmp/bruit",
              "bytes": 1},
             {"kind": "tmp", "action": "unowned", "path": "/tmp/a", "bytes": 2},
-            {"kind": "tmp", "action": "gone", "path": "/tmp/b", "bytes": 3},
+            {"kind": "tmp", "action": "deleted", "path": "/tmp/b", "bytes": 3},
         ], actor="test")
-        rows = hk.action_lines("pc", "tmp", ("unowned", "gone"))
-        self.assertEqual([(row["action"], row["path"]) for row in rows],
-                         [("gone", "/tmp/b"), ("unowned", "/tmp/a")])
+        rows = hk.latest_by_path("pc", "tmp", only_paths_with=("unowned",))
+        self.assertEqual([row["path"] for row in rows], ["/tmp/a"])
 
     def test_unowned_ancien_reste_signale(self):
         hk = storage.of(self.db).housekeeping
@@ -261,16 +260,24 @@ class NarrowReadsTest(PgTestCase):
                   if a["type"] == "tmp_unowned"]
         self.assertEqual([a["path"] for a in alerts], ["/tmp/ancien"])
 
-    def test_une_ligne_gone_plus_recente_clot_l_unowned(self):
+    def test_toute_action_ulterieure_clot_l_unowned_meme_hors_fenetre(self):
+        """#2851 (relecture cx3) : `unowned` puis `deleted`/`evicted`/`held`/
+        `gone` — la dernière ligne du chemin fait foi, quel que soit son âge ;
+        seule une action postérieure plus récente qu'une ligne `unowned` compte."""
         hk = storage.of(self.db).housekeeping
-        hk.log("pc", [{"kind": "tmp", "action": "unowned", "path": "/tmp/parti",
-                       "bytes": 2, "agent": "a"},
-                      {"kind": "tmp", "action": "unowned", "path": "/tmp/reste",
-                       "bytes": 3, "agent": "a"}], actor="test")
-        self.db.execute("UPDATE housekeeping_log SET at = now() - interval '30 hours'"
-                        " WHERE path = '/tmp/parti'")
-        hk.log("pc", [{"kind": "tmp", "action": "gone", "path": "/tmp/parti",
-                       "bytes": 0}], actor="test")
+        paths = ("/tmp/supprime", "/tmp/evince", "/tmp/tenu", "/tmp/parti",
+                 "/tmp/reste")
+        for path in paths:
+            hk.log("pc", [{"kind": "tmp", "action": "unowned", "path": path,
+                           "bytes": 2, "agent": "a"}], actor="test")
+        self.db.execute("UPDATE housekeeping_log SET at = now() - interval '3 days'"
+                        " WHERE path <> '/tmp/reste'")
+        for action, path in (("deleted", "/tmp/supprime"),
+                             ("evicted", "/tmp/evince"),
+                             ("held", "/tmp/tenu"),
+                             ("gone", "/tmp/parti")):
+            hk.log("pc", [{"kind": "tmp", "action": action, "path": path,
+                           "bytes": 1}], actor="test")
         alerts = [a for a in exploitation._housekeeping_alerts([], self.db)
                   if a["type"] == "tmp_unowned"]
         self.assertEqual([a["path"] for a in alerts], ["/tmp/reste"])

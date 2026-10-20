@@ -72,35 +72,42 @@ class Housekeeping(interface.Housekeeping):
             " ORDER BY at DESC, id DESC LIMIT %s", tuple(params))
         return [_data(dict(r)) for r in rows]
 
-    def latest_by_path(self, host, kind, *, since_s=None) -> list[dict]:
-        where, params = "", [kind]
+    def latest_by_path(self, host, kind, *, since_s=None,
+                       only_paths_with=None) -> list[dict]:
+        where, params = " WHERE kind = %s", [kind]
+        window = ""
         if host:
-            where = " AND host = %s"
+            where += " AND host = %s"
             params.append(host)
         if since_s is not None:
             # #2851 : une alerte qui ignore de toute façon les lignes plus
             # vieilles ne doit pas trier tout le journal de rétention.
-            where += " AND at >= now() - make_interval(secs => %s)"
+            window = " AND at >= now() - make_interval(secs => %s)"
+            where += window
             params.append(float(since_s))
+        if only_paths_with is not None:
+            actions = [str(action) for action in only_paths_with]
+            if not actions:
+                return []
+            # #2851 : les chemins qui portent une de ces actions, puis la
+            # dernière ligne de chacun — toutes actions et tous âges confondus.
+            # Le filtre des candidats passe en SQL : sans lui, le DISTINCT ON
+            # triait les 4 000 chemins `tmp` du journal pour n'en garder
+            # qu'une poignée, et un `unowned` suivi d'un `deleted` restait
+            # alerté faute de relire la dernière action.
+            sub_where, sub_params = "kind = %s", [kind]
+            if host:
+                sub_where += " AND host = %s"
+                sub_params.append(host)
+            sub_where += window
+            sub_params.extend([float(since_s)] if since_s is not None else [])
+            marks = ", ".join(["%s"] * len(actions))
+            where += (" AND (host, path) IN (SELECT host, path FROM housekeeping_log"
+                      " WHERE " + sub_where + " AND action IN (" + marks + "))")
+            params.extend(sub_params + actions)
         rows = self.db.query(
             "SELECT DISTINCT ON (host, path) " + LOG_COLUMNS + " FROM housekeeping_log"
-            " WHERE kind = %s" + where +
-            " ORDER BY host, path, at DESC, id DESC", tuple(params))
-        return [_data(dict(r)) for r in rows]
-
-    def action_lines(self, host, kind, actions) -> list[dict]:
-        actions = [str(action) for action in actions or ()]
-        if not actions:
-            return []
-        where, params = "", [kind, *actions]
-        if host:
-            where = " AND host = %s"
-            params.append(host)
-        marks = ", ".join(["%s"] * len(actions))
-        rows = self.db.query(
-            "SELECT " + LOG_COLUMNS + " FROM housekeeping_log"
-            " WHERE kind = %s AND action IN (" + marks + ")" + where +
-            " ORDER BY at DESC, id DESC", tuple(params))
+            + where + " ORDER BY host, path, at DESC, id DESC", tuple(params))
         return [_data(dict(r)) for r in rows]
 
     def summary(self, host, since_s) -> list[dict]:
