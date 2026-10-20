@@ -32,11 +32,15 @@ suivante réarme sur la nouvelle tête.
 
 La trace est le journal du lot (aucun état local) : `auto-merge armed …`,
 `auto-merge disarmed …` et `auto-merge not-armed …`, avec dépôt, PR et têtes.
+L'armement et le désarmement d'un même porteur se sérialisent sous le bail
+`auto-merge:<lot>` ; le passage relit les marques sous ce bail.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
+import socket
 import subprocess
 
 from . import fire, land, storage, work
@@ -47,6 +51,8 @@ CARRIER_PREFIX = "integration/"
 METHOD = "merge"
 #: états d'un porteur que `watch` relit
 OPEN_STATES = ("intake", "build", "qa", "blocked", "waiting_human")
+#: durée du bail `auto-merge:<lot>` qui sérialise l'armement et le désarmement
+LOCK_TTL_S = 120.0
 #: une marque du journal du lot
 MARK_RE = re.compile(
     r"^auto-merge (?P<state>armed|disarmed|not-armed) repo=(?P<repo>[\w.-]+/[\w.-]+) "
@@ -97,6 +103,27 @@ def active(rows) -> dict | None:
                 and current["pr"] == row["pr"] and current["repo"] == row["repo"]:
             current = None
     return current
+
+
+def _lock(db, lot: int):
+    """Le bail `auto-merge:<lot>`, ou None si un autre le tient.
+
+    `arm` (publication) et `check` (passage) le prennent tous deux : sans lui,
+    un passage qui a lu l'ancien armement désarmerait l'armement que la
+    publication vient de faire sur la nouvelle tête."""
+    ops = storage.of(db).work
+    owner = "auto-merge:%s:%d" % (socket.gethostname(), os.getpid())
+    key = "auto-merge:%d" % int(lot)
+    epoch = ops.land_lock(key, owner, LOCK_TTL_S)
+    return (ops, owner, epoch, key) if epoch is not None else None
+
+
+def _unlock(handle) -> None:
+    ops, owner, epoch, key = handle
+    try:
+        ops.land_unlock(key, owner, epoch)
+    except Exception:  # noqa: BLE001 - le bail expire seul
+        pass
 
 
 def _note(db, lot: int, state: str, slug: str, number: int, sha: str, rest: str,
@@ -150,7 +177,19 @@ def arm(db, lot: int, *, slug: str, number: int, sha: str, target: str, gh,
     number = int(number)
     if not _SHA.fullmatch(sha):
         return {"state": "error", "why": "the frozen head %r is not a full commit id" % sha}
+    handle = _lock(db, lot)
+    if handle is None:
+        return {"state": "error", "why": "another auto-merge operation holds lot #%d: "
+                                         "rerun `ameesh ci run %d --full`" % (lot, lot)}
+    try:
+        return _arm_locked(db, lot, slug=slug, number=number, sha=sha, target=target,
+                           gh=gh, actor=actor)
+    finally:
+        _unlock(handle)
 
+
+def _arm_locked(db, lot: int, *, slug: str, number: int, sha: str, target: str, gh,
+                actor: str) -> dict:
     def refuse(state: str, why: str) -> dict:
         _note(db, lot, "not-armed", slug, number, sha, "— %s" % why, actor)
         return {"state": state, "why": why}
@@ -231,7 +270,22 @@ def check(db, lot: int, *, gh, dry_run: bool = False,
 
     `result` : `idle` (rien d'armé par ameesh), `armed` (même tête), `unarmed`
     (plus d'auto-fusion sur la PR), `closed` (PR fusionnée ou fermée),
-    `disarmed`/`would-disarm`, ou `error`."""
+    `disarmed`/`would-disarm`, `busy` (une publication tient le bail : au
+    passage suivant) ou `error`."""
+    if not active(marks(db, lot)):
+        return {"lot": lot, "result": "idle"}
+    handle = None if dry_run else _lock(db, lot)
+    if handle is None and not dry_run:
+        return {"lot": lot, "result": "busy"}
+    try:
+        return _check_locked(db, lot, gh=gh, dry_run=dry_run, actor=actor)
+    finally:
+        if handle is not None:
+            _unlock(handle)
+
+
+def _check_locked(db, lot: int, *, gh, dry_run: bool, actor: str) -> dict:
+    # relu sous le bail : une publication a pu réarmer depuis la première lecture
     mine = active(marks(db, lot))
     if mine is None:
         return {"lot": lot, "result": "idle"}

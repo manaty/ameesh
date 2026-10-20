@@ -109,6 +109,12 @@ class Journal(unittest.TestCase):
         self.addCleanup(stack.close)
         stack.enter_context(mock.patch.object(work, "events", self._events))
         stack.enter_context(mock.patch.object(work, "note", self._note))
+        #: le bail `auto-merge:<lot>` : libre, sauf quand un témoin le prend
+        self.held: set[int] = set()
+        stack.enter_context(mock.patch.object(
+            packet_automerge, "_lock",
+            lambda db, lot: None if int(lot) in self.held else ("bail", int(lot))))
+        stack.enter_context(mock.patch.object(packet_automerge, "_unlock", lambda h: None))
 
     def _events(self, db, item_id, limit=100):
         return list(reversed(self.events.get(int(item_id), [])))
@@ -228,6 +234,40 @@ class ArmTest(Journal):
         gh = FakeGh()
         self.assertEqual(self.arm(gh, sha=HEAD[:12])["state"], "error")
         self.assertEqual(gh.calls, [])
+
+
+class LeaseTest(Journal):
+    """Le bail `auto-merge:<lot>` sérialise la publication et le passage."""
+
+    def test_a_held_lease_arms_nothing(self):
+        self.held.add(LOT)
+        gh = FakeGh()
+        out = self.arm(gh)
+        self.assertEqual(out["state"], "error", out)
+        self.assertIn("ameesh ci run %d --full" % LOT, out["why"])
+        self.assertEqual(gh.calls, [])
+
+    def test_a_held_lease_defers_the_disarm_to_the_next_pass(self):
+        self.armed()
+        self.held.add(LOT)
+        gh = FakeGh(head=NEW, auto=True)
+        self.assertEqual(packet_automerge.check(None, LOT, gh=gh)["result"], "busy")
+        self.assertEqual(gh.calls, [])
+
+    def test_the_marks_are_read_again_under_the_lease(self):
+        """Une publication réarme sur la nouvelle tête entre la première lecture
+        du passage et son bail : le passage relit et laisse l'armement."""
+        self.armed(sha=HEAD)
+        gh = FakeGh(head=NEW, auto=True)
+        real = packet_automerge._lock
+
+        def lock(db, lot):
+            self.armed(sha=NEW)          # la publication s'est faite juste avant
+            return real(db, lot)
+        with mock.patch.object(packet_automerge, "_lock", lock):
+            out = packet_automerge.check(None, LOT, gh=gh)
+        self.assertEqual(out["result"], "armed", out)
+        self.assertEqual(gh.disarms(), [])
 
 
 class MarksTest(unittest.TestCase):
@@ -411,6 +451,10 @@ class CiRunTest(GelTestCase):
         self.notes: list[str] = []
         self.seq = itertools.count(1)
         self.work.enter_context(mock.patch.object(work, "note", self._note))
+        self.work.enter_context(mock.patch.object(packet_automerge, "_lock",
+                                                  lambda db, lot: ("bail", lot)))
+        self.work.enter_context(mock.patch.object(packet_automerge, "_unlock",
+                                                  lambda h: None))
         self.work.enter_context(mock.patch(
             "ameesh.prevalidation_calls.gate_packet",
             return_value={"state": "unavailable", "cause": "test"}))
