@@ -1103,23 +1103,30 @@ class PendingSpend(interface.PendingSpend):
         "to_char(created_at at time zone 'UTC',"
         " 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')")
 
-    #: #2166/B1 : un tour d'avant 0423 n'a pas de `turn_id` ; sa ligne se
-    #: reconnaît alors à son `started_at`, l'instant de pose du marqueur. La
-    #: clé historique pouvait être calculée depuis un float8 imprimé à
-    #: précision réduite (`extra_float_digits=0`, ~4 µs) : 1 ms couvre ces
-    #: arrondis sans confondre deux tours réels, qui sont séparés de secondes.
-    _STARTED_AT_TOLERANCE_S = 0.001
+    #: #2166/B1 : l'instant de pose du marqueur vit aussi dans `started_at`
+    #: et dans l'époque de la clé historique (`agent:index:epoch`). Cet
+    #: instant pouvait être imprimé par une connexion à `extra_float_digits`
+    #: réduit avant d'être formaté (0 → ~4 µs, -5 → ~123 ms) : 200 ms couvre
+    #: ces arrondis sans confondre deux tours réels. Un index de début
+    #: réutilisé vient d'un tour antérieur, séparé de secondes : sa clé, elle,
+    #: n'est pas celle du marqueur.
+    _TIME_TOLERANCE_S = 0.2
 
     def _get_sql(self) -> str:
         """`get` en UNE instruction : marqueur et clé durable du MÊME état.
 
         La clé se retrouve par l'identité du tour, jamais par ordre temporel :
-        `turn_id` (exact), sinon `started_at` (instant du marqueur), sinon
-        l'index de début porté par la clé (tour d'avant 0423). Un ancien
-        worker peut écrire sa ligne APRÈS le marqueur de son remplaçant
-        (#1469) : la première ligne après `created_at` n'est pas forcément
-        celle du marqueur. Plusieurs candidats incohérents : pas de clé,
-        `ledger_ambiguous` vrai, l'appelant suspend.
+        `turn_id` exact ; sinon `started_at` (instant de pose du marqueur) ;
+        sinon, pour une ligne d'avant 0423, l'époque portée par sa clé, qui
+        doit être celle du marqueur. L'index de début seul ne prouve rien : il
+        est réutilisé après une rotation du flux, donc une réservation (ou une
+        ligne) au même index mais à un autre instant est étrangère. Elle n'est
+        jamais retenue ; une réservation étrangère sans candidat, une
+        réservation étrangère encore ouverte, ou une ligne étrangère au
+        repli rendent la clé indémontrable (`ledger_ambiguous`), et l'appelant
+        suspend au lieu de deviner. Un ancien worker peut écrire sa ligne APRÈS
+        le marqueur de son remplaçant (#1469) : la première ligne après
+        `created_at` n'est pas forcément celle du marqueur.
         """
         return """
 WITH marqueur AS (
@@ -1127,66 +1134,120 @@ WITH marqueur AS (
            resident_usage, spend_key,
            """ + self._EXACT_CREATED_AT + """ AS created_at,
            extract(epoch from created_at)::float8 AS created_ts,
-           created_at AS created_at_ts
+           extract(epoch from created_at)::numeric AS epoch,
+           %s::numeric AS tolerance
       FROM spend_pending WHERE agent = %s
 ), lignes AS (
-    SELECT tc.spend_key,
-           CASE
-             WHEN m.turn_id IS NOT NULL AND tc.turn_id = m.turn_id THEN 1
-             WHEN tc.turn_id IS NULL AND tc.started_at IS NOT NULL
-                  AND abs(extract(epoch from tc.started_at - m.created_at_ts)) <= %s
-               THEN 2
-             WHEN tc.turn_id IS NULL AND tc.started_at IS NULL
-                  AND left(tc.spend_key,
-                           length(m.agent || ':' || m.start_index || ':'))
-                      = m.agent || ':' || m.start_index || ':' THEN 3
-           END AS rang
+    SELECT tc.spend_key, tc.turn_id, tc.started_at,
+           m.turn_id AS marqueur_turn_id,
+           m.epoch AS marqueur_epoch,
+           m.tolerance AS tolerance,
+           (left(tc.spend_key,
+                 length(m.agent || ':' || m.start_index || ':'))
+                = m.agent || ':' || m.start_index || ':') AS meme_index,
+           CASE WHEN split_part(tc.spend_key, ':', 3)
+                     ~ '^[0-9]+([.][0-9]+)?$'
+                THEN split_part(tc.spend_key, ':', 3)::numeric
+           END AS cle_epoch
       FROM turn_costs tc
       JOIN marqueur m ON tc.agent = m.agent
      WHERE m.spend_key IS NULL
-       AND (   (m.turn_id IS NOT NULL AND tc.turn_id = m.turn_id)
-            OR (tc.turn_id IS NULL AND tc.started_at IS NOT NULL
-                AND abs(extract(epoch from tc.started_at - m.created_at_ts)) <= %s)
-            OR (tc.turn_id IS NULL AND tc.started_at IS NULL
-                AND left(tc.spend_key,
-                         length(m.agent || ':' || m.start_index || ':'))
-                    = m.agent || ':' || m.start_index || ':'))
-), meilleur AS (
-    SELECT min(rang) AS rang FROM lignes
 ), lignes_retenues AS (
-    SELECT DISTINCT spend_key FROM lignes
+    SELECT DISTINCT spend_key,
+           CASE
+             WHEN marqueur_turn_id IS NOT NULL
+                  AND turn_id = marqueur_turn_id THEN 1
+             WHEN turn_id IS NULL AND started_at IS NOT NULL
+                  AND abs(extract(epoch from started_at) - marqueur_epoch)
+                      <= tolerance THEN 2
+             WHEN turn_id IS NULL AND started_at IS NULL AND meme_index
+                  AND cle_epoch IS NOT NULL
+                  AND abs(cle_epoch - marqueur_epoch) <= tolerance THEN 3
+           END AS rang
+      FROM lignes
+), meilleur AS (
+    SELECT min(rang) AS rang FROM lignes_retenues
+), retenues AS (
+    SELECT DISTINCT spend_key FROM lignes_retenues
      WHERE rang = (SELECT rang FROM meilleur)
-), reservations AS (
-    SELECT DISTINCT ar.spend_key
+), lignes_etrangeres AS (
+    -- repli sans turn_id ni started_at : l'époque de la clé doit être celle
+    -- du marqueur, sinon c'est la ligne d'un index réutilisé.
+    SELECT 1 FROM lignes
+     WHERE turn_id IS NULL AND started_at IS NULL AND meme_index
+       AND (cle_epoch IS NULL
+            OR abs(cle_epoch - marqueur_epoch) > tolerance)
+), lignes_contradictoires AS (
+    -- l'instant de début et l'époque de la clé se contredisent : aucune
+    -- identité démontrable, même si un seul candidat en sort.
+    SELECT 1 FROM lignes
+     WHERE turn_id IS NULL AND started_at IS NOT NULL
+       AND ((abs(extract(epoch from started_at) - marqueur_epoch) <= tolerance
+             AND (cle_epoch IS NULL
+                  OR abs(cle_epoch - marqueur_epoch) > tolerance))
+            OR (abs(extract(epoch from started_at) - marqueur_epoch) > tolerance
+                AND cle_epoch IS NOT NULL
+                AND abs(cle_epoch - marqueur_epoch) <= tolerance))
+), reservations_lues AS (
+    SELECT ar.spend_key, ar.state,
+           (left(ar.spend_key,
+                 length(m.agent || ':' || m.start_index || ':'))
+                = m.agent || ':' || m.start_index || ':') AS meme_index,
+           CASE WHEN split_part(ar.spend_key, ':', 3)
+                     ~ '^[0-9]+([.][0-9]+)?$'
+                THEN split_part(ar.spend_key, ':', 3)::numeric
+           END AS cle_epoch,
+           m.epoch AS marqueur_epoch,
+           m.tolerance AS tolerance
       FROM account_reservations ar
       JOIN marqueur m ON ar.agent = m.agent
      WHERE m.spend_key IS NULL
-       AND left(ar.spend_key, length(m.agent || ':' || m.start_index || ':'))
-           = m.agent || ':' || m.start_index || ':'
+), reservations AS (
+    -- la réservation du tour porte l'époque du marqueur dans sa clé : au
+    -- même index, une réservation d'un autre instant est étrangère.
+    SELECT DISTINCT spend_key FROM reservations_lues
+     WHERE meme_index AND cle_epoch IS NOT NULL
+       AND abs(cle_epoch - marqueur_epoch) <= tolerance
+), reservations_etrangeres AS (
+    SELECT DISTINCT state FROM reservations_lues
+     WHERE meme_index
+       AND (cle_epoch IS NULL
+            OR abs(cle_epoch - marqueur_epoch) > tolerance)
 ), candidats AS (
-    SELECT spend_key FROM lignes_retenues WHERE spend_key IS NOT NULL
+    SELECT spend_key FROM retenues WHERE spend_key IS NOT NULL
     UNION
     SELECT spend_key FROM reservations
+), constat AS (
+    SELECT
+      (SELECT count(*) FROM candidats) AS n_candidats,
+      EXISTS (SELECT 1 FROM retenues WHERE spend_key IS NULL) AS sans_cle,
+      EXISTS (SELECT 1 FROM lignes_etrangeres) AS ligne_etrangere,
+      EXISTS (SELECT 1 FROM lignes_contradictoires) AS contradictoire,
+      EXISTS (SELECT 1 FROM reservations_etrangeres
+               WHERE state = 'open') AS ouverte_etrangere,
+      EXISTS (SELECT 1 FROM reservations_etrangeres) AS reservation_etrangere
 )
 SELECT m.agent, m.start_index, m.turn, m.model, m.work_item_id, m.turn_id,
        m.resident_usage, m.spend_key, m.created_at, m.created_ts,
        CASE
          WHEN m.spend_key IS NOT NULL THEN m.spend_key
-         WHEN (SELECT count(*) FROM candidats) = 1
-              AND NOT EXISTS (SELECT 1 FROM lignes_retenues
-                               WHERE spend_key IS NULL)
+         WHEN c.n_candidats = 1 AND NOT c.sans_cle
+              AND NOT c.ligne_etrangere AND NOT c.contradictoire
+              AND NOT c.ouverte_etrangere
+              AND NOT (c.reservation_etrangere AND c.n_candidats = 0)
            THEN (SELECT min(spend_key) FROM candidats)
-         WHEN (SELECT count(*) FROM candidats) = 0
-              AND NOT EXISTS (SELECT 1 FROM lignes_retenues
-                               WHERE spend_key IS NULL)
+         WHEN c.n_candidats = 0 AND NOT c.sans_cle
+              AND NOT c.ligne_etrangere AND NOT c.contradictoire
+              AND NOT c.reservation_etrangere
            THEN m.agent || ':' || m.start_index || ':' || m.created_at
          ELSE NULL
        END AS ledger_key,
        (m.spend_key IS NULL
-        AND ((SELECT count(*) FROM candidats) > 1
-             OR EXISTS (SELECT 1 FROM lignes_retenues
-                         WHERE spend_key IS NULL))) AS ledger_ambiguous
-  FROM marqueur m
+        AND (c.n_candidats > 1 OR c.sans_cle OR c.ligne_etrangere
+             OR c.contradictoire OR c.ouverte_etrangere
+             OR (c.reservation_etrangere AND c.n_candidats = 0)))
+         AS ledger_ambiguous
+  FROM marqueur m CROSS JOIN constat c
 """
 
     def put(self, name, start_index, turn, model, work_item_id=None, turn_id=None) -> bool:
@@ -1261,19 +1322,20 @@ SELECT m.agent, m.start_index, m.turn, m.model, m.work_item_id, m.turn_id,
 
         `ledger_key` est la clé exacte du marqueur s'il la porte ; sinon celle
         de la ligne `turn_costs` ou de la réservation #1469 de ce tour,
-        retrouvée par son identité (`turn_id`, `started_at`, index de début),
-        jamais par ordre temporel : un ancien worker peut écrire sa ligne
-        après le marqueur de son remplaçant (#1469). Aucun candidat : la clé
-        exacte du marqueur. Plusieurs candidats incohérents :
-        `ledger_key` NULL et `ledger_ambiguous` vrai — l'appelant suspend, il
-        ne devine pas.
+        retrouvée par son identité (`turn_id`, `started_at`, époque de la clé),
+        jamais par le seul index de début (réutilisé après une rotation) ni
+        par ordre temporel : un ancien worker peut écrire sa ligne après le
+        marqueur de son remplaçant (#1469). Aucun candidat : la clé exacte du
+        marqueur. Candidats incohérents, réservation étrangère sans candidat
+        ou encore ouverte, ligne étrangère au repli : `ledger_key` NULL et
+        `ledger_ambiguous` vrai — l'appelant suspend, il ne devine pas.
 
         Une seule instruction : le marqueur lu et la clé résolue voient le
         même état, même si un remplaçant écrit entre-temps.
         """
         rows = self.db.query(
             self._get_sql(),
-            (name, self._STARTED_AT_TOLERANCE_S, self._STARTED_AT_TOLERANCE_S),
+            (self._TIME_TOLERANCE_S, name),
         )
         if not rows:
             return None
