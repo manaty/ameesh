@@ -9,6 +9,7 @@ sources:
   - { resource: "manaty/ameesh#2202", title: "TPK: native support for bounded external-sandbox reviewer turns" }
   - { resource: "manaty/ameesh#2167", title: "Supported turn-context and turn-observation API (lot #2894, note first)" }
   - { resource: "manaty/ameesh#2110", title: "Container-aware admission and elastic capacity (shipped in v1.16.0)" }
+  - { resource: "manaty/ameesh#2166 and lot #2893", title: "PendingSpend.clear_if precision; exact marker clear by turn_id" }
   - { resource: "thepackengers/issue-manager-agent#837 and #843", title: "IMA P4/M3 bounded reviewer preparation, focused proposal and qualification" }
   - { resource: "docs/V1-MAILBOX-RUNNER.md §3", title: "Leases, epochs and the turn fence" }
   - { resource: "src/ameesh/account_budget.py; src/ameesh/storage/postgres/budgets.py", title: "Daily account envelope, reserve/settle, kept uncertainty" }
@@ -106,13 +107,19 @@ those names, this note follows it rather than defining a second vocabulary.
   `start_index`, `turn`, `work_item_id`, `turn_id`), and `turn_costs` (with
   `spend_key`, `turn_id`, `work_item_id`, `started_at`, `source`, `executor`,
   `lease_owner`, `lease_epoch`, `billing_account`, `void_reason`).
-  `runner._spend_key()` is `agent:start_index:marker_created_ts`; the marker is
-  written before the harness and cleared only after the ledger row is written.
+  `runner._spend_key()` is currently `agent:start_index:marker_created_ts`;
+  the contract treats it as **opaque** (a consumer never parses or re-derives
+  it). The marker is written before the harness and cleared only after the
+  ledger row is written.
 * **Daily account envelope.** `account_budgets` and `account_reservations`
   (`0443`): admission reserves `profile.reserve_usd` under an advisory lock on
   the billing account; usage is settled + open + kept; an uncertain outcome is
   `kept` in full and only a human releases it (`account_budget.reserve/settle`,
   `storage/postgres/budgets.py`).
+* **Marker-clear precision.** `spend_pending` is currently cleared by
+`created_ts` (a float); #2166 reports the precision defect and lot #2893
+carries the exact fix. This design **depends** on an exact clear by
+`turn_id` (or #2893's exact key) and never uses `created_ts` alone.
 * **Model relay.** `relay.py` verifies a short session token, checks the model
   policy and the budget, adds the server-side provider key, forwards the
   stream, and writes `turn_costs` rows with `source = 'relay'`, the agent,
@@ -196,11 +203,21 @@ is a block in one of the delivered requests' payloads
 (`ameesh-sandbox-request/1`), not a fresh mailbox read. **One authorization
 per turn**: a sandbox request is authorized only if its message id is in the
 context's `requests[]`; a request outside that set, or withdrawn before
-admission, is `unauthorized-request` (a withdrawal after admission is a
-cancel request). The `turn_id` is the one allocated before the
-first side effect of the turn (#2167), so `turn_resources`, `spend_pending`,
-`turn_costs` and `sandbox_turns` carry the same id. The `spend_key` is opaque:
-the adapter reads it from the context/marker and never re-derives it.
+delivery (hence absent from the set), is `unauthorized-request`. A request
+in the set whose payload has no `ameesh-sandbox-request/1` is
+`not-a-sandbox-request` and is skipped. After admission a cancel does
+**not** change the request's `request.state` (it stays `delivered`); it
+sets `sandbox.state = cancelled` and `cancel_requested_at`.
+The `turn_id` is the one allocated before the first side effect of the turn
+(#2167), so `turn_resources`, `spend_pending`, `turn_costs` and
+`sandbox_turns` carry the same id. The `spend_key` is opaque: the adapter
+reads it from the context/marker and never re-derives it. The context's
+`turn.session` is the ameesh harness session; it is not the reviewer's
+session. A sandbox turn never writes `agent_registry.session_id` from the
+sandbox: the reviewer's session (if any) is
+`sandbox_turns.sandbox_session`, and it is null for `session: none`.
+`turn.kind` is not overwritten: it stays `mail`/`prompt`/etc., and the sandbox
+fact lives in the block (no new `turn.kind` value).
 
 The sandbox turn is launched by the ameesh runner (adapter + supervisor
 child), so it is inside #2167's covered boundary: the runner launches the
@@ -229,8 +246,8 @@ create table sandbox_turns (
     turn_id          text primary key,             -- turn_resources.turn_id
     agent            text not null,
     owner            text not null,
-    lease_epoch      integer not null,
-    session          text,
+    lease_epoch      bigint not null,              -- agent_registry.lease_epoch is bigint
+    sandbox_session  text,                         -- reviewer session, never the ameesh harness session
     request_ids      bigint[] not null default '{}',
     work_item_id     bigint,
     scope            jsonb not null,               -- repo, pr, head, base, generation, attempt
@@ -269,7 +286,7 @@ create index sandbox_turns_job on sandbox_turns (namespace, job_name);
 
 create table sandbox_results (
     turn_id       text primary key references sandbox_turns(turn_id),
-    epoch         integer not null,
+    epoch         bigint not null,
     result_id     text not null unique,            -- client idempotency id
     result_sha256 text not null,
     payload       jsonb not null,                  -- bounded, sanitized
@@ -277,6 +294,16 @@ create table sandbox_results (
     accepted_at   timestamptz not null default now()
 );
 ```
+
+`request_ids` is the subset of the context's `requests[]` whose payload carries
+`ameesh-sandbox-request/1`; it is not the full `requests[]`. The public
+sandbox block exposes `request_ids`, never a second `requests[]`. The public
+`sandbox.work_item_id` is the context's text form (a lot reference, like
+`agent_mailbox.work_item_id`); the internal `bigint` column is an
+implementation detail. The public block exposes `started_ts` (epoch float,
+like #2167), `sandbox.session` (the reviewer session or null, distinct from
+#2167's `turn.session`) and `work_item_id` (text); `sandbox_turns.started_at`
+and `work_item_id` are internal.
 
 Invariants:
 
@@ -406,13 +433,18 @@ path for a sandbox turn. In one transaction:
    `result_id`, `result_sha256`, `completed_at`.
 7. Close the turn **once**, by a shared internal `ameesh_turn_close()` factored
    out of `end_turn()`: `turns = turns + 1`, status `idle`/`queued`, clear the
-   prompt, set `last_turn_at`/`last_seen`, keep the session only if the sandbox
-   reported one and the profile allows it.
+   prompt, set `last_turn_at`/`last_seen`. Do **not** write
+   `agent_registry.session_id` from the sandbox: the sandbox session (if any)
+   stays in `sandbox_turns.sandbox_session` and the result; `session: none`
+   leaves it null and the agent's own session unchanged.
 8. Settle the account reservation by `spend_key` (actual cost from the relay
    rows tagged with the turn, or `kept` when the cost is unknown) and the
    tranche reservation in the same fixed lock order used by admission.
-9. Clear the `spend_pending` marker (matching `created_at`) and mark the
-   `turn_resources` row `done`.
+9. Clear the `spend_pending` marker **by `turn_id`** (the exact storage method),
+   never by a re-read `created_at` float: the float `created_ts` path is #2166,
+   and #2893 carries the exact fix. This is a declared dependency; the sandbox
+   close does not use `created_ts` alone. Then mark the `turn_resources` row
+   `done`.
 10. Emit `sandbox.result` and the journal/event; return
     `ameesh-sandbox-receipt/1`.
 
@@ -440,7 +472,7 @@ and sanitised:
   "evidence": [ { "kind": "check", "head": "…", "name": "unit", "conclusion": "success" } ],
   "usage": { "turns": 1, "tool_calls": 37, "seconds": 412, "model_calls": 18 },
   "cost": { "usd": 0.84 },
-  "session": null,
+  "sandbox_session": null,
   "source": { "release": "1.16.0", "commit": "…", "contract": "ameesh-sandbox/1" },
   "finished_at": "2026-10-20T21:40:00Z"
 }
@@ -694,6 +726,8 @@ contract). It defines:
   prompt reference, relay base/token, result path);
 * the Job output `ameesh-sandbox-result/1` (the envelope in §4);
 * the native receipt `ameesh-sandbox-receipt/1`;
+* the standalone block `ameesh-sandbox-turn/1` and the list
+  `ameesh-sandbox-turns/1`, additive with #2167's observation;
 * the request `ameesh-sandbox-request/1` (scope + responsible + required
   checks), carried in the existing mail/work payload;
 * the closed refusal table below.
@@ -701,11 +735,13 @@ contract). It defines:
 An incompatible change is `ameesh-sandbox/2`, never a silent edit. A test
 checks the contract against the storage interface and the golden envelopes.
 
-**Metering link.** The relay session token for a sandbox turn carries the
-turn id and the spend key; every relay cost row is written with
-`turn_costs.turn_id`, `spend_key` and the profile's `billing_account`.
-That is what makes the account and tranche settlement exact, and what lets
-the tranche count a turn whose result is never delivered.
+**Metering link.** The columns `turn_costs.turn_id` (0423), `spend_key` (0041)
+and `billing_account` (0443) already exist, as do `lease_owner`/`lease_epoch`
+(0064); only the relay must fill them for a sandbox turn. Its session token
+carries the turn id and the spend key; every relay cost row is written with
+the existing `turn_costs.turn_id`, `spend_key` and the profile's
+`billing_account`. That is what makes the account and tranche settlement
+exact, and what lets the tranche count a turn whose result is never delivered.
 
 **Source reference.** Every receipt carries
 `source = {release, commit, contract}`. The implementation adds a build stamp
@@ -719,36 +755,47 @@ is therefore reproducible from an immutable release/source reference.
 **Read API.** `/api/v1` (existing Bearer token and `Context.sees`) gains the
 sandbox view, composed with #2167's `ameesh-turn-observation/1`:
 
-* `GET /api/v1/turns/{turn_id}` gains a `sandbox` block (state, Job
-  namespace/name/UID/phase, receipt when accepted, refusal) in the turn
-  observation object; the turn's accounting state stays #2167's;
-* `GET /api/v1/sandbox/turns/{turn_id}` → the same sandbox block alone; the
-  block's `state` is the sandbox state above, while #2167's `turn.state`
-  (`starting|running|ended|orphan|unknown`) is unchanged;
-* `GET /api/v1/sandbox/turns?agent=&state=&scope=&limit=` → the sandbox blocks,
-  bounded, for adoption/reconciliation and for IMA's poll.
+* `GET /api/v1/turns/{turn}` gains an optional `sandbox` block (state, Job
+  namespace/name/UID/phase, receipt when accepted, refusal) in the
+  `ameesh-turn-observation/1` object; the turn's `accounting` state stays
+  #2167's. The nested block is additive: a consumer that does not know it
+  ignores it;
+* `GET /api/v1/sandbox/turns/{turn}` → the same block alone, schema
+  `ameesh-sandbox-turn/1`; the block's `state` is the sandbox state above,
+  while #2167's `turn.state` (`starting|running|ended|orphan|unknown`) is
+  unchanged. `turn.state=orphan` is the resource ledger (a surviving
+  process/container); `sandbox.state=orphaned` is the correlation (a Job
+  whose turn is gone). They are different fields and can both be present;
+* `GET /api/v1/sandbox/turns?agent=&state=&scope=&limit=` → schema
+  `ameesh-sandbox-turns/1`, bounded, for adoption/reconciliation and for
+  IMA's poll.
 
 The block carries no secrets. The receipt is returned by the turn observation
 too, so a consumer that already reads `/api/v1/turns/{turn}` does not need a
 second call. The turn's `accounting` object stays #2167's
 (`pending|settled|kept|released|none|unknown`, ledger first); the sandbox
-block adds the tranche view (`tranche_id`, reserved/settled/kept) and the
-result receipt, not a second accounting state.
+block adds a **distinct** `sandbox.tranche` object
+(`{tranche_id, state, reserved_usd, settled_usd, kept_usd}`, with `state`
+`open|settled|kept|released`) and the result receipt, not a second accounting
+state. `accounting.reservation` remains the
+account envelope (`billing_account`, `usd`, `period`, `state
+open|settled|kept|released`).
 
 There is no `POST` for lifecycle in the pilot: the runner is the only writer.
 IMA reads the receipt with the same credential it already uses for `/api/v1`.
 The endpoint is part of the #2167 observation family; if #2167 publishes a
 common turn-observation object, the sandbox fields nest under it.
 
-**Refusals.** Stable `error.type` strings; the CLI/API return them and the
-tests assert them:
+**Refusals and non-error outcomes.** Stable `error.type` strings; the CLI/API
+return them and the tests assert them:
 
 | Code | When | Retry |
 |---|---|---|
 | `missing` | required field, scope, Job UID or counter absent | no |
-| `unauthorized-request` | request id not in the turn context's `requests[]`, or withdrawn before admission | no |
+| `unauthorized-request` | request id not in the turn context's `requests[]`, or withdrawn before delivery (absent from the set) | no |
+| `not-a-sandbox-request` | request in `requests[]` without an `ameesh-sandbox-request/1` payload; skipped, not a sandbox trigger | n/a |
 | `unknown-turn` | no `sandbox_turns` row | no |
-| `stale` | owner/epoch/session no longer current; lease expired; superseded generation/head; attempt behind | no (new turn) |
+| `stale` | owner/epoch no longer current; lease expired; superseded generation/head; attempt behind | no (new turn) |
 | `late` | after `deadline_ts`, or on a terminal turn that was not cancelled | no |
 | `duplicate` | another result already accepted for this turn/epoch (different digest) | no |
 | `revoked` | cancel/revocation; result fenced | no |
@@ -768,6 +815,10 @@ Precedence is fixed and tested: `unknown-turn` → `revoked` → `stale` →
 `late` → `duplicate`/`replayed` → `scope-mismatch` → `limit-exceeded` →
 insert. A late result on a revoked turn is `revoked` (the most specific
 authority), never `late`; a stale owner is `stale` even after the deadline.
+Admission-time codes (`unauthorized-request`, `not-a-sandbox-request`,
+`profile-refused`, `tranche-exhausted`, `account-exhausted`, `missing`) are
+checked before a turn or a Job exists; the precedence above is the result
+path only.
 
 ## 10. Observability
 
@@ -852,7 +903,7 @@ Proposed lots (estimates in agent hours, to be re-estimated by the bureau):
 
 | Lot | Scope | Class | Estimate |
 |---|---|---|---|
-| S1 | `sandbox_turns`/`sandbox_results`, `ameesh_turn_close`, `ameesh_sandbox_complete`, `ameesh_sandbox_bind/cancel`, refusal codes; real-Postgres race tests | sensitive (SQL, concurrency) | 8–10 h |
+| S1 | `sandbox_turns`/`sandbox_results`, `ameesh_turn_close`, `ameesh_sandbox_complete`, `ameesh_sandbox_bind/cancel`, refusal codes; exact `spend_pending` clear by `turn_id` (or #2893); real-Postgres race tests | sensitive (SQL, concurrency) | 8–10 h |
 | S2 | Agent/Host `sandbox` blocks, `canon check`, bureau admission/revocation, placement freshness; tests | sensitive (canon, rights) | 5–7 h |
 | S3 | `ameesh_admit_turn`/`ameesh_settle_turn`, tranche tables/CLI, account coupling, relay spend linkage; concurrency/kept tests | sensitive (money, SQL) | 6–8 h |
 | S4 | sandbox supervisor + provider (create/get/list/logs/delete), deterministic Job identity, adoption/cancel, fake provider + `kind` tests | sensitive (infra, secrets) | 8–10 h |
