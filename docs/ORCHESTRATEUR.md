@@ -663,6 +663,19 @@ commentaire de release. Les reçus locaux sous
 un envoi interrompu est réconcilié avec les marqueurs distants. La simulation
 ne modifie pas ces reçus. Sans nouvel événement, aucun fil n'est relu.
 
+Le fichier est un cache versionné (`schema: ameesh/github-stage-comments/1`),
+clé `dépôt#numéro/lot-<id>` → `{enrolled, seen}`, où `seen` liste `accepted`,
+`event-<id>`, `milestone-<id>`, `merged`, `closed` et `delivered-<version>`.
+Sans version, il est lu comme v0 puis réécrit avec la version à sa prochaine
+écriture ; une version inconnue est laissée intacte (erreur journalisée).
+L'hôte écrivain désigné (L126) et l'écriture atomique tiennent lieu de
+verrou ; un écrivain concurrent est hors contrat et ses pertes rejouent
+depuis les marqueurs. Une entrée illisible est réinitialisée et rejouée. Pour réparer un commentaire supprimé à la main,
+retirer sa clé de `seen` (ou l'entrée entière sur un ticket ouvert), puis
+relancer la projection : les marqueurs présents ne sont pas redoublés. Sur un
+ticket fermé, ne retirer que `seen` pour garder `enrolled` (pas de reprise
+d'historique).
+
 Pour préciser ce qui est attendu du demandeur, écrire dans la **note de la
 transition** bloquée/en attente une ligne `Public status: …` limitée aux
 références et au contrat à confirmer. Les autres lignes restent internes.
