@@ -3063,6 +3063,11 @@ def _render_gel(decision: dict) -> list[str]:
     if run.get("id"):
         lines.append("  run %s %s %s" % (run.get("id"), run.get("status"),
                                          run.get("url") or ""))
+    armed = decision.get("auto_merge")
+    if armed:
+        lines.append(("  auto-merge: %s — %s" if armed["state"] in
+                      ("armed", "rearmed", "already-armed") else
+                      "  auto-merge NOT armed (%s): %s") % (armed["state"], armed["why"]))
     return lines
 
 
@@ -3133,6 +3138,30 @@ def _packet_prevalidation(cfg, db, item, decision, args) -> int:
     return 0
 
 
+def _arm_packet(db, decision: dict, gh, args) -> dict | None:
+    """#2813 (canon §12) : publier un porteur `integration/**` — sa suite
+    complète demandée, en vol ou verte sur la tête gelée — arme son
+    auto-fusion GitHub sur cette tête (`packet_automerge.arm`).
+
+    L'issue est rangée dans `decision["auto_merge"]` et rendue avec la
+    décision ; elle ne change jamais le code de retour : l'étiquette est
+    posée, la CI part, et un armement manqué laisse seulement le paquet à
+    fusionner à la main (le motif est au journal du lot)."""
+    from . import packet_automerge, work
+    if decision.get("mode") != "full" or not packet_automerge.carrier(decision.get("head_ref")) \
+            or decision.get("action") not in ("request", "green", "running"):
+        return None
+    try:
+        out = packet_automerge.arm(
+            db, args.id, slug=decision["repo"], number=decision["pr"], sha=decision["sha"],
+            target=decision.get("base_ref") or "", gh=packet_automerge.gh_of(gh),
+            actor=getattr(args, "actor", "") or work.SYSTEM_SENDER)
+    except Exception as exc:  # noqa: BLE001 - l'étiquette est posée : jamais fatal
+        out = {"state": "error", "why": "%s: %s" % (type(exc).__name__, exc)}
+    decision["auto_merge"] = out
+    return out
+
+
 def cmd_ci_run(cfg, args) -> int:
     """`ameesh ci run <lot>` : vérifie le gel et pose l'étiquette, une fois.
 
@@ -3180,6 +3209,8 @@ def cmd_ci_run(cfg, args) -> int:
             print("ameesh ci run: %s" % exc)
         return 1
     if args.dry_run or decision["action"] != "request":
+        if not args.dry_run:
+            _arm_packet(db, decision, gh, args)
         if args.json:
             print(json.dumps({**decision, "ok": True, "requested": False},
                              ensure_ascii=False, indent=1))
@@ -3218,6 +3249,7 @@ def cmd_ci_run(cfg, args) -> int:
             return 1
         decision = {**decision, "action": result["action"], "why": result["why"],
                     "run": result.get("run")}
+        _arm_packet(db, decision, gh, args)
         if args.json:
             print(json.dumps({**decision, "ok": True, "requested": False},
                              ensure_ascii=False, indent=1))
@@ -3226,6 +3258,7 @@ def cmd_ci_run(cfg, args) -> int:
         return 0
     if result.get("warnings"):
         print("ameesh ci run: posed, with warnings: %s" % "; ".join(result["warnings"]))
+    _arm_packet(db, decision, gh, args)
     if args.json:
         print(json.dumps({**decision, "ok": True, "requested": True,
                           "run": result.get("run") or {}}, ensure_ascii=False, indent=1))
