@@ -1471,9 +1471,130 @@ def latest_rollup(rollup) -> list:
     return latest
 
 
+def merge_rollup(rollup, *, slug: str, head: str, branch: str, gh) -> list:
+    """#2876 : remplacer un portier seulement sur preuve de son run annulé.
+
+    Lire le run PR et TOUS les runs push paquet de la composition : le plus
+    récent peut être actif sans aucun check visible dans le rollup. Sans
+    preuve API fraîche, aucun remplacement et aucun vert d'intégration.
+    `ci_green` reste un prédicat pur ; les lecteurs lui passent ce rollup.
+    """
+    from datetime import datetime
+    from urllib.parse import urlencode
+
+    original = list(rollup or ())
+    rows = latest_rollup(original)
+    if not branch.startswith("integration/"):
+        return rows
+    aggregate = [c for c in rows if c.get("__typename") == "CheckRun"
+                 and c.get("workflowName") == "tests" and c.get("name") == "tests"]
+    if len(aggregate) != 1 or aggregate[0].get("conclusion") != "SUCCESS":
+        return rows
+
+    def blocked():
+        return rows + [{"__typename": "CheckRun", "name": "paquet (run proof unavailable)",
+                        "status": "COMPLETED", "conclusion": "FAILURE"}]
+
+    def read(path):
+        if hasattr(gh, "run"):
+            code, out, _ = gh.run(["api", path])
+        else:
+            proc = gh(["api", path])
+            code, out = proc.returncode, proc.stdout
+        if code:
+            raise ValueError("packet run proof unavailable")
+        return json.loads(out)
+
+    def run_id(check):
+        url = check.get("detailsUrl") or ""
+        if not isinstance(url, str):
+            return None
+        match = re.fullmatch(r"https://github[.]com/" + re.escape(slug)
+                             + r"/actions/runs/([1-9][0-9]*)/job/[1-9][0-9]*", url)
+        return int(match.group(1)) if match else None
+
+    def finished(check):
+        if check.get("status") != "COMPLETED":
+            return None
+        try:
+            stamp = datetime.fromisoformat(check["completedAt"].replace("Z", "+00:00"))
+            return stamp.timestamp() if stamp.tzinfo is not None else None
+        except (KeyError, AttributeError, TypeError, ValueError, OverflowError):
+            return None
+
+    try:
+        runs, page = [], 1
+        while True:
+            query = urlencode({"head_sha": head, "branch": branch, "event": "push",
+                               "per_page": 100, "page": page})
+            # La liste générale fonctionne aussi dans un dépôt sans portier
+            # (pas de 404 ambigu sur un workflow absent).
+            data = read("repos/%s/actions/runs?%s" % (slug, query))
+            batch = data["workflow_runs"]
+            total = data["total_count"]
+            if not isinstance(batch, list) or type(total) is not int or total < 0:
+                return blocked()
+            runs.extend(batch)
+            if len(runs) >= total:
+                if len(runs) != total:
+                    return blocked()
+                break
+            if not batch:
+                return blocked()
+            page += 1
+        if any(type(r.get("id")) is not int or r["id"] <= 0
+               or r.get("head_sha") != head or r.get("head_branch") != branch
+               or r.get("event") != "push" or not isinstance(r.get("path"), str)
+               for r in runs):
+            return blocked()
+        if len({r["id"] for r in runs}) != len(runs):
+            return blocked()  # pagination déplacée pendant la lecture
+        runs = [r for r in runs if r.get("path") == ".github/workflows/paquet.yml"]
+        if not runs:
+            # Aucun portier créé : la PR porte toute la validation.
+            return rows if not any(c.get("workflowName") == "paquet" for c in rows) else blocked()
+        if any(r.get("status") != "completed" for r in runs):
+            return blocked()  # y compris une nouvelle tentative d'un ancien run
+        latest = max(runs, key=lambda r: r["id"])
+        if latest.get("conclusion") == "success":
+            return rows  # aucun échec de portier n'est effacé sans annulation
+        if latest.get("conclusion") != "cancelled":
+            return blocked()
+        replacement = aggregate[0]
+        end, replacement_id = finished(replacement), run_id(replacement)
+        if end is None or replacement_id is None or gh is None:
+            return blocked()
+        pr_run = read("repos/%s/actions/runs/%d" % (slug, replacement_id))
+        if (pr_run.get("id") != replacement_id or pr_run.get("head_sha") != head
+                or pr_run.get("head_branch") != branch or pr_run.get("event") != "pull_request"
+                or pr_run.get("path") != ".github/workflows/tests.yml"
+                or pr_run.get("status") != "completed" or pr_run.get("conclusion") != "success"):
+            return blocked()
+    except (ValueError, KeyError, TypeError, AttributeError, OSError, RuntimeError):
+        return blocked()
+
+    all_packet = [c for c in original if c.get("__typename") == "CheckRun"
+                  and c.get("workflowName") == "paquet"]
+    packet = [c for c in all_packet
+              if (c.get("name") == "couverture (PR ouverte sur cette tête)"
+                   or (c.get("name") or "").startswith("suite complète du paquet / "))]
+    # Le run annulé le plus récent doit être visible : un CANCELLED d'un
+    # ancien run ne permet jamais de retirer les FAILURE d'un nouveau run.
+    ids = [run_id(c) for c in all_packet]
+    if (not packet or None in ids or any(i not in {r["id"] for r in runs} for i in ids)
+            or not any(run_id(c) == latest["id"] and c.get("conclusion") == "CANCELLED"
+                       for c in packet)):
+        return blocked()
+    ends = [finished(c) for c in all_packet]
+    if any(t is None for t in ends) or end <= max(ends):
+        return blocked()
+    return [c for c in rows if c not in packet]
+
+
 def ci_green(rollup, required=()) -> bool:
     """`statusCheckRollup` d'une PR : vert si au moins un check, et tous
     terminés sans échec, après sélection des derniers checks (#2524).
+    Les lecteurs valident le remplacement éventuel du portier via merge_rollup (#2876).
     #1748 (a) : chaque préfixe de `required`
     (`required_statuses`) doit en outre être porté par un statut de commit
     (`StatusContext`, jamais un check run, dont le nom est libre) en
@@ -1522,10 +1643,11 @@ def github_ci(project: Project, gh=None, *, strict: bool = False):
             return None
         if not rows:
             return None
+        rollup = merge_rollup(rows[0].get("statusCheckRollup"), slug=slug,
+                              head=rows[0].get("headRefOid") or "", branch=branch, gh=gh)
         return {"number": rows[0].get("number"), "url": rows[0].get("url"),
                 "head": rows[0].get("headRefOid"),
-                "green": ci_green(rows[0].get("statusCheckRollup"),
-                                  required_statuses(project, branch)),
+                "green": ci_green(rollup, required_statuses(project, branch)),
                 "draft": bool(rows[0].get("isDraft"))}
     return status
 

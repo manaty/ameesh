@@ -199,7 +199,9 @@ def pr_status(slug: str, number: int, *, gh) -> dict:
         raise land.LandError("gh pr view %d: unreadable output" % int(number)) from exc
     if not isinstance(data, dict):
         raise land.LandError("gh pr view %d: unexpected output" % int(number))
-    rollup = radar.latest_rollup(data.get("statusCheckRollup"))
+    rollup = radar.merge_rollup(data.get("statusCheckRollup"), slug=slug,
+                                head=data.get("headRefOid") or "",
+                                branch=data.get("headRefName") or "", gh=gh)
     pending = any((c.get("status") or "COMPLETED") != "COMPLETED"
                   or (c.get("state") or "") == "PENDING" for c in rollup)
     ci = "green" if radar.ci_green(rollup) else "pending" if pending or not rollup else "red"
