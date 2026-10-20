@@ -96,6 +96,7 @@
   ameesh mail forward <old> <new> [--dry-run]
         re-delivers the pending mail of a stopped agent to a live agent;
   ameesh memory status|consolidate|close <persona>   neutral persona memory (L54);
+  ameesh memoria --config FILE context|ask|tell …   external cited memory (opt-in);
   ameesh migrate              apply schema migrations;
   ameesh models list|show|discover      model catalog and discovery;
   ameesh module <name> …              installed project module commands;
@@ -321,6 +322,9 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "memory":
         from . import persona_memory
         return persona_memory.main(rest)
+    if command == "memoria":
+        from . import memoria
+        return memoria.main(rest)
     if command == "fil":
         from . import fil
         return fil.main(rest)
