@@ -197,17 +197,21 @@ runner (lease owner, epoch, turn, spend marker, budget/tranche reservation)
 
 **Turn-context handoff (#2167).** The runner's `ameesh-turn-context/1`
 document (the `AMEESH_TURN_CONTEXT` file) is the single source of the turn
-id, the live lease, the delivered requests and the open accounting marker/
-spend key. The sandbox adapter reads it for those facts; the review request
-is a block in one of the delivered requests' payloads
-(`ameesh-sandbox-request/1`), not a fresh mailbox read. **One authorization
-per turn**: a sandbox request is authorized only if its message id is in the
-context's `requests[]`; a request outside that set, or withdrawn before
-delivery (hence absent from the set), is `unauthorized-request`. A request
-in the set whose payload has no `ameesh-sandbox-request/1` is
-`not-a-sandbox-request` and is skipped. After admission a cancel does
-**not** change the request's `request.state` (it stays `delivered`); it
-sets `sandbox.state = cancelled` and `cancel_requested_at`.
+id, the live lease, the requests shown to this turn (the turn's reservation)
+and the open accounting marker/spend key. The sandbox adapter reads it for
+those facts; the review request is a block in one of the turn's requests'
+payloads (`ameesh-sandbox-request/1`), not a fresh mailbox read. **One
+authorization per turn**: a sandbox request is authorized only if its message
+id is in the context's `requests[]`; a request absent from that set (not
+reserved for this turn, including a message withdrawn before the turn's
+reservation) is `unauthorized-request`. Presence in the list is the
+authorization: do **not** filter `requests[]` on `delivered_ts`/`delivered_at`
+— the document is written before launch, so `delivered_ts` is normally null
+and delivery is settled just after launch. A request in the set whose payload
+has no `ameesh-sandbox-request/1` is `not-a-sandbox-request` and is skipped.
+After admission a cancel does **not** change the request's `request.state` (it
+stays `delivered`); it sets `sandbox.state = cancelled` and
+`cancel_requested_at`.
 The `turn_id` is the one allocated before the first side effect of the turn
 (#2167), so `turn_resources`, `spend_pending`, `turn_costs` and
 `sandbox_turns` carry the same id. The `spend_key` is opaque: the adapter
@@ -295,9 +299,9 @@ create table sandbox_results (
 );
 ```
 
-`request_ids` is the subset of the context's `requests[]` whose payload carries
-`ameesh-sandbox-request/1`; it is not the full `requests[]`. The public
-sandbox block exposes `request_ids`, never a second `requests[]`. The public
+`request_ids` is the subset of the requests shown to this turn (`requests[]`)
+whose payload carries `ameesh-sandbox-request/1`; it is not the full list.
+The public sandbox block exposes `request_ids`, never a second `requests[]`. The public
 `sandbox.work_item_id` is the context's text form (a lot reference, like
 `agent_mailbox.work_item_id`); the internal `bigint` column is an
 implementation detail. The public block exposes `started_ts` (epoch float,
@@ -792,7 +796,7 @@ return them and the tests assert them:
 | Code | When | Retry |
 |---|---|---|
 | `missing` | required field, scope, Job UID or counter absent | no |
-| `unauthorized-request` | request id not in the turn context's `requests[]`, or withdrawn before delivery (absent from the set) | no |
+| `unauthorized-request` | request id not in the turn's `requests[]` (not reserved for this turn, including a message withdrawn before the reservation) | no |
 | `not-a-sandbox-request` | request in `requests[]` without an `ameesh-sandbox-request/1` payload; skipped, not a sandbox trigger | n/a |
 | `unknown-turn` | no `sandbox_turns` row | no |
 | `stale` | owner/epoch no longer current; lease expired; superseded generation/head; attempt behind | no (new turn) |
