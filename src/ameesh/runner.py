@@ -4073,7 +4073,12 @@ class AgentWorker(threading.Thread):
 
     def _capacity_label(self, state: dict | None) -> str | None:
         """#2814 : le mot du fournisseur dans le statut, jamais un secret."""
-        action = (state or {}).get("action")
+        state = state or {}
+        if state.get("state") == "releasing":
+            return "releasing"
+        if state.get("state") == "release_failed":
+            return "release pending"
+        action = state.get("action")
         return {"granted": "granted", "wait": "requested", "refused": "refused",
                 "error": "unavailable"}.get(action)
 

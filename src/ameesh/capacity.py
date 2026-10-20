@@ -57,11 +57,18 @@ DEFAULT_TIMEOUT_S = 5.0
 DEFAULT_MIN_INTERVAL_S = 15.0
 DEFAULT_NEEDS_PER_HOUR = 4
 DEFAULT_RELEASE_AFTER_S = 60.0
+#: a failed release is retried, with the SAME capacity_id, after this delay;
+#: the slot stays occupied (no new need) until the provider confirms
+DEFAULT_RELEASE_RETRY_S = 30.0
+#: bounded retries: after that the slot stays `release_failed` (an operator
+#: or a restart is needed), so a new scale-out is never admitted
+DEFAULT_MAX_RELEASE_ATTEMPTS = 5
 PROVIDER_ENV = "AMEESH_CAPACITY_PROVIDER"
 TIMEOUT_ENV = "AMEESH_CAPACITY_PROVIDER_TIMEOUT"
 MIN_INTERVAL_ENV = "AMEESH_CAPACITY_MIN_INTERVAL"
 NEEDS_PER_HOUR_ENV = "AMEESH_CAPACITY_NEEDS_PER_HOUR"
 RELEASE_AFTER_ENV = "AMEESH_CAPACITY_RELEASE_AFTER"
+RELEASE_RETRY_ENV = "AMEESH_CAPACITY_RELEASE_RETRY"
 #: valeurs magiques qui désactivent explicitement le fournisseur
 DISABLED = ("", "none", "noop", "off", "0")
 
@@ -223,6 +230,9 @@ class Manager:
         self.release_after_s = _number(
             os.environ.get(RELEASE_AFTER_ENV) if release_after_s is None else release_after_s,
             DEFAULT_RELEASE_AFTER_S)
+        self.release_retry_s = _number(os.environ.get(RELEASE_RETRY_ENV),
+                                       DEFAULT_RELEASE_RETRY_S)
+        self.max_release_attempts = DEFAULT_MAX_RELEASE_ATTEMPTS
         try:
             per_hour = int(os.environ.get(NEEDS_PER_HOUR_ENV)
                            if needs_per_hour is None else needs_per_hour)
@@ -304,39 +314,86 @@ class Manager:
     def observe(self, blocked: bool, *, now: float | None = None) -> dict | None:
         """Après un verdict frais : libère la capacité après le calme requis.
 
-        Rend l'état de la libération quand elle vient d'être envoyée."""
+        Rend l'état de la libération quand elle vient d'être envoyée ou
+        retentée. Une libération en échec garde le `capacity_id` et le slot
+        occupé (`release_failed`) : aucune nouvelle demande n'est admise tant
+        que le fournisseur n'a pas confirmé, et le même identifiant est
+        représenté aux tentatives suivantes (idempotence). Après
+        `max_release_attempts`, le slot reste `release_failed` : un opérateur
+        (ou un redémarrage) tranche, jamais une seconde allocation."""
         if not self.enabled:
             return None
         now = self._now() if now is None else float(now)
         with self._lock:
-            if blocked:
-                self._idle_since = None
+            state = self._outstanding
+            if state is None:
                 return None
-            if self._outstanding is None:
+            state_name = state.get("state")
+            if state_name == "requesting":
+                return None  # the provider need call is still in flight
+            if state_name == "requested":
+                if blocked:
+                    self._idle_since = None
+                    return None
+                if self._idle_since is None:
+                    self._idle_since = now
+                    return None
+                if now - self._idle_since < self.release_after_s:
+                    return None
+            elif state_name in ("releasing", "release_failed"):
+                # the capacity exists: release it even if pressure came back;
+                # retry only after the delay, and only a bounded number of
+                # times (a failed release still holds the slot)
+                if state.get("next_retry") is not None and now < state["next_retry"]:
+                    return None
+                if int(state.get("release_attempts") or 0) >= self.max_release_attempts:
+                    return None
+            else:
                 return None
-            if self._outstanding.get("state") != "requested":
-                return None  # the provider call is still in flight
-            if self._idle_since is None:
-                self._idle_since = now
-                return None
-            if now - self._idle_since < self.release_after_s:
-                return None
-            state, self._outstanding = self._outstanding, None
-            self._idle_since = None
+            state = dict(state)
+            state["state"] = "releasing"
+            state["release_attempts"] = int(state.get("release_attempts") or 0) + 1
+            state["release_last_at"] = now
+            state["next_retry"] = None
+            self._outstanding = state
         payload = event("release", host=state.get("host"), agent=state.get("agent"),
                         ts=now, capacity_id=state.get("capacity_id"),
+                        release_attempt=state["release_attempts"],
                         sent_s=round(now - float(state.get("since") or now), 3))
         try:
             reply = self.provider.release(payload)
         except Exception as exc:
             reply = {"action": "error", "error": type(exc).__name__}
         reply = dict(reply) if isinstance(reply, dict) else {"action": "error"}
-        released = {"state": "released", "action": reply.get("action") or "none",
-                    "since": state.get("since"), "agent": state.get("agent"),
-                    "host": state.get("host"), "capacity_id": state.get("capacity_id")}
-        _log(self.log, "capacity: release for %s on %s -> %s"
-             % (state.get("agent"), state.get("host"), released["action"]))
-        return released
+        action = reply.get("action") or "none"
+        failed = action == "error"
+        with self._lock:
+            if failed and self._outstanding is state:
+                state = dict(state)
+                state["state"] = "release_failed"
+                state["action"] = "error"
+                state["detail"] = reply.get("detail") or reply.get("error")
+                if state["release_attempts"] >= self.max_release_attempts:
+                    state["next_retry"] = None
+                else:
+                    state["next_retry"] = now + self.release_retry_s
+                self._outstanding = state
+                result = dict(state)
+            elif failed:
+                result = dict(self._outstanding or state)
+            else:
+                self._outstanding = None
+                self._idle_since = None
+                result = {"state": "released", "action": action,
+                          "since": state.get("since"), "agent": state.get("agent"),
+                          "host": state.get("host"),
+                          "capacity_id": state.get("capacity_id")}
+        _log(self.log, "capacity: release for %s on %s -> %s%s (attempt %d)"
+             % (state.get("agent"), state.get("host"), action,
+                " (retry in %ds)" % int(self.release_retry_s)
+                if failed and result.get("next_retry") else "",
+                state.get("release_attempts") or 0))
+        return result
 
     def snapshot(self) -> dict | None:
         """L'état de la demande en cours (ou de la dernière libération), pour

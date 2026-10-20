@@ -20,6 +20,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -311,15 +312,20 @@ class _Provider:
     def __init__(self):
         self.events = []
         self.replies = []
+        self.release_replies = []
+        self.need_gate: threading.Event | None = None
 
     def need(self, event):
         self.events.append(event)
+        if self.need_gate is not None:
+            self.need_gate.wait(2.0)
         return self.replies.pop(0) if self.replies else {"action": "granted",
                                                          "capacity_id": "c1"}
 
     def release(self, event):
         self.events.append(event)
-        return {"action": "none"}
+        return self.release_replies.pop(0) if self.release_replies \
+            else {"action": "none"}
 
 
 class CapacityProviderTest(unittest.TestCase):
@@ -396,6 +402,69 @@ class CapacityProviderTest(unittest.TestCase):
         manager.observe(False)  # release_after_s = 0: the calm is immediate
         clock[0] = 300.0
         self.assertIsNone(manager.need(host="h", agent="b"))
+
+    def test_two_threads_share_one_outstanding_request(self):
+        # B1 de la relecture Codex : le slot est réservé AVANT l'appel au
+        # fournisseur ; deux workers ne lancent pas deux demandes.
+        provider = _Provider()
+        provider.need_gate = threading.Event()
+        manager = capacity.Manager(provider, min_interval_s=0, needs_per_hour=5)
+        done = []
+
+        def first():
+            done.append(manager.need(host="h", agent="a"))
+
+        thread = threading.Thread(target=first)
+        thread.start()
+        deadline = time.time() + 2.0
+        while not provider.events and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(provider.events), 1)
+        second = manager.need(host="h", agent="b")
+        self.assertEqual(second["state"], "requesting")
+        self.assertEqual(len(provider.events), 1)
+        provider.need_gate.set()
+        thread.join(3.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(done[0]["state"], "requested")
+        self.assertEqual(manager.snapshot()["state"], "requested")
+
+    def test_a_failed_release_keeps_the_slot_until_confirmed(self):
+        # B2 de la relecture Codex : une libération en échec ne rouvre pas une
+        # seconde allocation ; le même capacity_id est représenté.
+        provider = _Provider()
+        provider.release_replies = [{"action": "error", "error": "boom"},
+                                    {"action": "none"}]
+        clock = [100.0]
+        manager = capacity.Manager(provider, now=lambda: clock[0],
+                                   min_interval_s=0, needs_per_hour=5,
+                                   release_after_s=0)
+        self.assertEqual(manager.need(host="h", agent="a")["capacity_id"], "c1")
+        clock[0] = 101.0
+        manager.observe(False)          # the calm starts
+        clock[0] = 102.0
+        failed = manager.observe(False)  # release attempt 1 -> error
+        self.assertEqual(failed["state"], "release_failed")
+        self.assertEqual(failed["capacity_id"], "c1")
+        # a new need returns the failed slot, it never calls need again
+        clock[0] = 110.0
+        self.assertEqual(manager.need(host="h", agent="b")["state"], "release_failed")
+        self.assertEqual([e["event"] for e in provider.events],
+                         ["need", "release"])
+        # before the retry delay: no call
+        clock[0] = 120.0
+        self.assertIsNone(manager.observe(False))
+        self.assertEqual(len(provider.events), 2)
+        # retry with the same id, then the slot is free
+        clock[0] = 140.0
+        released = manager.observe(False)
+        self.assertEqual(released["state"], "released")
+        self.assertEqual(provider.events[-1]["capacity_id"], "c1")
+        self.assertIsNone(manager.snapshot())
+        clock[0] = 150.0
+        self.assertEqual(manager.need(host="h", agent="c")["state"], "requested")
+        self.assertEqual([e["event"] for e in provider.events],
+                         ["need", "release", "release", "need"])
 
 
 class MailExpiryTest(unittest.TestCase):
