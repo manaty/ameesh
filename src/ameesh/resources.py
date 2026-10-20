@@ -859,6 +859,9 @@ class CgroupMeter:
             or platform.host.cgroup_dir()
         out = {
             "path": base,
+            # #2825: what the publisher itself observed, so another host can
+            # read this host's default scope without asking its own process
+            "container": False, "bounded": False,
             "cpu_some": None, "mem_some": None, "mem_full": None,
             "cpu_quota": None,
             "mem_current_bytes": None, "mem_max_bytes": None,
@@ -867,6 +870,8 @@ class CgroupMeter:
         if not base or not os.path.isdir(base):
             self._prev, self._prev_path = None, None
             return out
+        out["container"] = platform.host.in_container()
+        out["bounded"] = platform.host.own_cgroup_bounded(base)
         cpu = platform.cgroup_pressure("cpu", base)
         mem = platform.cgroup_pressure("memory", base)
         out["cpu_some"] = cpu.get("some", {}).get("avg60")
@@ -1246,15 +1251,22 @@ GATE_KEYS = ("gate_state", "gate_seq", "gate_reason")
 # seuils (canon) et pression
 # --------------------------------------------------------------------------
 
-def pressure_scope(policy=None) -> str:
+def pressure_scope(policy=None, *, local: bool = True,
+                   default_scope: str | None = None) -> str:
     """#2814 : où l'admission lit la pression — `own_cgroup` ou `host`.
 
-    Ordre : la fiche `Host` (`policy.resources.pressure_scope`), puis
-    `AMEESH_PRESSURE_SCOPE` (dérogation d'un exécuteur, sans édition de
-    canon), puis le défaut : `own_cgroup` dès que le processus tourne dans un
-    conteneur (`platform.host.in_container`), `host` sinon. Un service systemd
-    borné n'est PAS un conteneur : pour le mesurer sur son propre cgroup, la
-    fiche le déclare (ou `AMEESH_PRESSURE_SCOPE=own_cgroup`)."""
+    Ordre : la fiche `Host` (`policy.resources.pressure_scope`), puis pour un
+    exécuteur LOCAL `AMEESH_PRESSURE_SCOPE` (dérogation d'un exécuteur, sans
+    édition de canon), puis `default_scope` (la lecture de l'hôte nommé), puis
+    le défaut : `own_cgroup` dès que le processus tourne dans un conteneur
+    dont le cgroup v2 est lisible et borné (`platform.host.own_cgroup_bounded`,
+    #2825 N2), `host` sinon. Un service systemd borné n'est PAS un conteneur :
+    pour le mesurer sur son propre cgroup, la fiche le déclare (ou
+    `AMEESH_PRESSURE_SCOPE=own_cgroup`).
+
+    `local=False` n'interroge ni l'environnement de l'exécuteur ni son propre
+    conteneur : les limites d'un hôte NOMMÉ ne dépendent jamais du processus
+    qui les lit (#2825 N4)."""
     raw = None
     if policy is not None:
         raw = getattr(policy, "resources", None)
@@ -1264,10 +1276,54 @@ def pressure_scope(policy=None) -> str:
         declared = raw.get(PRESSURE_SCOPE_KEY)
         if isinstance(declared, str) and declared in PRESSURE_SCOPES:
             return declared
-    override = os.environ.get(PRESSURE_SCOPE_ENV)
-    if override in PRESSURE_SCOPES:
-        return override
-    return "own_cgroup" if platform.host.in_container() else "host"
+    if local:
+        override = os.environ.get(PRESSURE_SCOPE_ENV)
+        if override in PRESSURE_SCOPES:
+            return override
+    if default_scope in PRESSURE_SCOPES:
+        return default_scope
+    if local and platform.host.in_container() \
+            and platform.host.own_cgroup_bounded():
+        return "own_cgroup"
+    return "host"
+
+
+def reading_pressure_scope(reading: dict | None) -> str:
+    """#2825 N4 : le périmètre par défaut que la lecture de CET hôte justifie.
+
+    Le relevé porte (`cgroup.container`, `cgroup.bounded`) ce que l'exécuteur
+    de l'hôte a constaté sur lui-même : `own_cgroup` n'est le défaut que si
+    l'hôte nommé est dans un conteneur ET que son cgroup v2 est borné. Une
+    lecture absente ou ancienne (sans ces clés) garde `host` : on ne déduit
+    pas le périmètre d'un autre hôte que celui qui a mesuré."""
+    cgroup = (reading or {}).get("cgroup")
+    if not isinstance(cgroup, dict):
+        return "host"
+    if cgroup.get("container") is True and cgroup.get("bounded") is True:
+        return "own_cgroup"
+    return "host"
+
+
+#: mesures d'un cgroup v2 qui rendent `own_cgroup` utile (#2825 N2)
+CGROUP_MEASURES = ("cpu_some", "mem_some", "mem_full", "cpu_quota",
+                   "mem_current_bytes", "mem_max_bytes", "mem_used",
+                   "throttled", "cpu_used")
+
+
+def cgroup_measured(reading: dict | None) -> bool:
+    """#2825 N2 : le relevé porte-t-il au moins une mesure de cgroup v2 ?
+
+    Sans aucune mesure, le périmètre `own_cgroup` n'a plus de garde CPU/mémoire
+    (la charge du nœud est écartée) : il faut alors revenir visiblement au
+    périmètre `host` au lieu de perdre les gardes en silence."""
+    reading = reading or {}
+    stored = reading.get("cgroup")
+    for key in CGROUP_MEASURES:
+        if reading.get("cgroup_" + key) is not None:
+            return True
+        if isinstance(stored, dict) and stored.get(key) is not None:
+            return True
+    return False
 
 
 def scope_label(scope: str | None) -> str:
@@ -1275,7 +1331,8 @@ def scope_label(scope: str | None) -> str:
     return "own cgroup" if scope == "own_cgroup" else "host"
 
 
-def thresholds(policy=None) -> dict:
+def thresholds(policy=None, *, local: bool = True,
+               default_scope: str | None = None) -> dict:
     """Seuils effectifs d'un hôte : `policy.resources` de sa fiche `Host`,
     complétés par les valeurs par défaut prudentes.
 
@@ -1331,7 +1388,8 @@ def thresholds(policy=None) -> dict:
                              else mem_pressure),
         # #2814: where the pressure is read; the cgroup ceilings only apply
         # in own_cgroup mode unless the policy overrides them
-        "pressure_scope": pressure_scope(policy),
+        "pressure_scope": pressure_scope(policy, local=local,
+                                         default_scope=default_scope),
         "max_cgroup_memory_used": (DEFAULT_MAX_CGROUP_MEMORY_USED
                                    if cg_mem_used is None else cg_mem_used),
         "max_cgroup_throttled": (DEFAULT_MAX_CGROUP_THROTTLED
@@ -1407,7 +1465,8 @@ def agent_memory_cap(canons, host: str, agent: str) -> dict:
             "origin": chosen[1]}
 
 
-def host_limits(canons, host: str) -> dict:
+def host_limits(canons, host: str, *, reading: dict | None = None,
+                default_scope: str | None = None) -> dict:
     """Limites PHYSIQUES de `host` (L43, décision 0031 point 6) : les plus
     strictes de toutes les fiches Host qui le décrivent dans les canons chargés.
 
@@ -1418,6 +1477,11 @@ def host_limits(canons, host: str) -> dict:
       défaut n'est qu'un repli) ;
     * `max_agents` : le plus petit des maxima déclarés (None : aucun).
 
+    #2825 N4 : sans `pressure_scope` déclaré, le défaut vient de la LECTURE de
+    cet hôte (`reading`, `cgroup.container`/`cgroup.bounded`) ou de
+    `default_scope` ; jamais du processus appelant (`in_container()` de
+    `ameesh hosts` sur un autre hôte). Sans lecture ni défaut : `host`.
+
     `origin` dit d'où vient chaque limite (identifiant du canon, ou
     « défaut ») ; `fiches` : les canons qui décrivent l'hôte. L'admission d'un
     agent, elle, se juge toujours avec la fiche de SON canon (`placement`)."""
@@ -1426,7 +1490,9 @@ def host_limits(canons, host: str) -> dict:
         fiche = canon.host(host) if hasattr(canon, "host") else None
         if fiche is not None:
             fiches.append((getattr(canon, "id", "") or "?", fiche))
-    limits = thresholds(None)
+    if default_scope is None and reading is not None:
+        default_scope = reading_pressure_scope(reading)
+    limits = thresholds({}, local=False, default_scope=default_scope)
     origin = {key: DEFAULT_ORIGIN for key in THRESHOLD_KEYS}
     origin[PRESSURE_SCOPE_KEY] = DEFAULT_ORIGIN
     best: dict = {}
@@ -1450,6 +1516,15 @@ def host_limits(canons, host: str) -> dict:
         value, label = next(((v, l) for v, l in scopes if v == "own_cgroup"), scopes[0])
         limits[PRESSURE_SCOPE_KEY] = value
         origin[PRESSURE_SCOPE_KEY] = label
+    # #2825 N2 : un `own_cgroup` demandé sans AUCUNE mesure de cgroup dans la
+    # lecture perdrait les gardes CPU/mémoire (la charge du nœud est écartée).
+    # Repli visible au périmètre `host`, qui garde ses seuils.
+    scope_fallback = None
+    if limits[PRESSURE_SCOPE_KEY] == "own_cgroup" and reading is not None \
+            and not cgroup_measured(reading):
+        limits[PRESSURE_SCOPE_KEY] = "host"
+        scope_fallback = ("own_cgroup requested but the reading has no cgroup v2 "
+                          "measure: host scope keeps the guards")
     max_agents, max_origin = None, None
     for label, fiche in fiches:
         value = getattr(getattr(fiche, "policy", None), "max_agents", None)
@@ -1459,7 +1534,8 @@ def host_limits(canons, host: str) -> dict:
     # L159d: the strictest offer (relocation, `ameesh hosts`)
     limits["lend"] = host_offer(canons, host)
     return {"host": host, "limits": limits, "max_agents": max_agents, "origin": origin,
-            "fiches": [label for label, _f in fiches]}
+            "fiches": [label for label, _f in fiches],
+            "scope_fallback": scope_fallback}
 
 
 def swap_ceiling(reading: dict, limits: dict) -> int | None:
@@ -1530,7 +1606,10 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
     """
     out: list[dict] = []
     scope = limits.get("pressure_scope", "host")
-    own = scope == "own_cgroup"
+    # #2825 N2: an own-cgroup scope with no cgroup measure at all is blind;
+    # use the host criteria rather than dropping load/PSI without a word. The
+    # verdict (`pressure`) says the fallback; here the guards stay in force.
+    own = scope == "own_cgroup" and cgroup_measured(reading)
 
     def cg(key):
         """The cgroup measure of the reading: the live flat key when the
@@ -1818,8 +1897,16 @@ def pressure(reading: dict, policy=None, *, limits: dict | None = None) -> dict:
     """
     if limits is None:
         limits = thresholds(policy)
-    found = breaches(reading, limits)
     scope = limits.get("pressure_scope", "host")
+    scope_fallback = None
+    if scope == "own_cgroup" and not cgroup_measured(reading):
+        # #2825 N2: without a single cgroup measure, own_cgroup would drop the
+        # node load and keep no CPU/memory guard. Fall back visibly to host.
+        scope_fallback = ("own_cgroup requested but the reading has no cgroup v2 "
+                          "measure: host scope keeps the guards")
+        limits = dict(limits, pressure_scope="host")
+        scope = "host"
+    found = breaches(reading, limits)
     stored_cgroup = reading.get("cgroup") if isinstance(reading.get("cgroup"), dict) else {}
 
     def cgroup_value(key):
@@ -1828,7 +1915,7 @@ def pressure(reading: dict, policy=None, *, limits: dict | None = None) -> dict:
             return reading[flat]
         return stored_cgroup.get(key)
 
-    return {
+    verdict = {
         "limits": limits,
         "scope": scope,
         "breaches": found,
@@ -1842,6 +1929,9 @@ def pressure(reading: dict, policy=None, *, limits: dict | None = None) -> dict:
                     "mem_current_bytes", "mem_max_bytes", "mem_used",
                     "throttled", "cpu_used")},
     }
+    if scope_fallback:
+        verdict["scope_fallback"] = scope_fallback
+    return verdict
 
 
 #: #2814 : the admission verdict is cached 10 s by the executor; a deferred
@@ -1859,6 +1949,10 @@ def queue_text(host: str, verdict: dict, *, queued_s: float | None = None,
     text = "pressure on host %s (%s) — %s" % (
         host, scope_label(verdict.get("scope")),
         describe(verdict.get("breaches")) or "threshold")
+    if verdict.get("scope_fallback"):
+        # #2825 N2: the scope the admission actually applied is not the one
+        # requested; say why instead of leaving a guard silently behind.
+        text += "; " + verdict["scope_fallback"]
     if queued_s is not None:
         text += "; queued %d s" % int(max(0.0, queued_s))
     if capacity:

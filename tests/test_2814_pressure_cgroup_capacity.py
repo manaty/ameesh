@@ -22,10 +22,12 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
-from ameesh import capacity, canon, mail, mesh_cli, platform, registry, resources, storage
+from ameesh import (capacity, canon, db as db_mod, mail, mesh_cli, platform,
+                    registry, resources, runner, storage)
 
 from . import test_canon
 from .support import PgTestCase
@@ -60,6 +62,13 @@ def write_cgroup(root: str, *, cpu_psi: float = 0.0, mem_psi: float = 0.0,
     with open(os.path.join(root, "memory.max"), "w", encoding="utf-8") as fh:
         fh.write("max\n" if maximum is None else "%d\n" % maximum)
     return root
+
+
+def write_module(root: str, name: str, body: str) -> str:
+    """#2825 : un module de fournisseur de capacité pour les tests."""
+    with open(os.path.join(root, name + ".py"), "w", encoding="utf-8") as fh:
+        fh.write(body)
+    return os.path.join(root, name + ".py")
 
 
 class PlatformCgroupTest(unittest.TestCase):
@@ -169,11 +178,63 @@ class ScopeThresholdsTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"AMEESH_PRESSURE_SCOPE": "own_cgroup"}):
             self.assertEqual(resources.thresholds(None)["pressure_scope"], "own_cgroup")
 
-    def test_default_is_own_cgroup_only_in_a_container(self):
-        with mock.patch.dict(os.environ, {"AMEESH_CONTAINER": "1"}):
-            self.assertEqual(resources.thresholds(None)["pressure_scope"], "own_cgroup")
+    def test_default_is_own_cgroup_only_in_a_bounded_container(self):
+        # #2825 N2 : un conteneur sans cgroup v2 lisible garde les gardes de
+        # l'hôte au lieu de perdre CPU/mémoire en silence.
+        with tempfile.TemporaryDirectory() as root:
+            write_cgroup(root, maximum=1024 ** 3)
+            with mock.patch.dict(os.environ, {"AMEESH_CONTAINER": "1",
+                                              "AMEESH_CGROUP_DIR": root}):
+                self.assertEqual(resources.thresholds(None)["pressure_scope"],
+                                 "own_cgroup")
+        with tempfile.TemporaryDirectory() as root:  # no cpu.max/memory.max
+            with mock.patch.dict(os.environ, {"AMEESH_CONTAINER": "1",
+                                              "AMEESH_CGROUP_DIR": root}):
+                self.assertEqual(resources.thresholds(None)["pressure_scope"], "host")
         with mock.patch.dict(os.environ, {"AMEESH_CONTAINER": "0"}):
             self.assertEqual(resources.thresholds(None)["pressure_scope"], "host")
+
+    def test_host_limits_never_read_the_callers_container(self):
+        # #2825 N4 : `ameesh hosts` sur un autre hôte ne déduit pas son
+        # périmètre du processus qui interroge.
+        with tempfile.TemporaryDirectory() as root:
+            write_cgroup(root, maximum=1024 ** 3)
+            with mock.patch.dict(os.environ, {"AMEESH_CONTAINER": "1",
+                                              "AMEESH_CGROUP_DIR": root}):
+                got = resources.host_limits([], "ailleurs")
+        self.assertEqual(got["limits"]["pressure_scope"], "host")
+
+    def test_a_reading_sets_the_default_scope_of_its_host(self):
+        # #2825 N4 : le défaut vient de la lecture de l'hôte nommé, et une
+        # lecture ancienne (sans les clés) reste prudente.
+        own = {"cgroup": {"container": True, "bounded": True, "mem_used": 0.2}}
+        self.assertEqual(resources.host_limits([], "atelier", reading=own)
+                         ["limits"]["pressure_scope"], "own_cgroup")
+        blind = {"cgroup": {"container": True, "bounded": False}}
+        self.assertEqual(resources.host_limits([], "atelier", reading=blind)
+                         ["limits"]["pressure_scope"], "host")
+        old = {"cgroup": {"mem_used": 0.5}}
+        self.assertEqual(resources.host_limits([], "atelier", reading=old)
+                         ["limits"]["pressure_scope"], "host")
+
+    def test_an_own_cgroup_fiche_without_measure_falls_back_with_a_note(self):
+        # #2825 N2 : même demandé par une fiche, `own_cgroup` sans aucune
+        # mesure cgroup revient à `host` et le dit, au lieu de perdre les
+        # gardes en silence.
+        class Fiche:
+            policy = type("P", (), {"resources": {"pressure_scope": "own_cgroup"},
+                                    "max_agents": None})()
+
+        class Canon:
+            id = "a"
+
+            def host(self, name):
+                return Fiche()
+
+        got = resources.host_limits([Canon()], "atelier",
+                                    reading={"cgroup": {}})
+        self.assertEqual(got["limits"]["pressure_scope"], "host")
+        self.assertIn("no cgroup v2 measure", got["scope_fallback"])
 
     def test_cgroup_ceilings_have_prudent_defaults(self):
         self.assertEqual(limits()["max_cgroup_memory_used"],
@@ -250,17 +311,25 @@ class BreachesScopeTest(unittest.TestCase):
             limits=limits(pressure_scope="host"))
         self.assertFalse(verdict["blocked"])
 
-    def test_no_cgroup_measure_is_no_breach(self):
+    def test_own_cgroup_without_any_cgroup_measure_falls_back_to_host(self):
+        # #2825 N2 : sans aucune mesure cgroup, la charge du nœud n'est plus
+        # écartée en silence : le périmètre `host` garde ses seuils, et le
+        # repli est dit dans le verdict.
         verdict = resources.pressure(
             {"load1": 100.0},
             limits=limits(pressure_scope="own_cgroup", max_load=1))
-        self.assertFalse(verdict["blocked"])
+        self.assertTrue(verdict["blocked"])
+        self.assertEqual(verdict["scope"], "host")
+        self.assertIn("no cgroup v2 measure", verdict["scope_fallback"])
+        self.assertEqual([b["key"] for b in verdict["breaches"]], ["max_load"])
 
     def test_a_host_swap_stock_does_not_block_an_own_cgroup_host(self):
         # the container's /proc/meminfo shows the NODE's swap; without the
         # node's PSI it must not apply the 0028 fallback (a stock is not a
-        # pressure) — the cgroup's memory.max is the real guard
-        reading = {"swap_used_bytes": 20 * GIB, "load1": 50.0}
+        # pressure) — the cgroup's memory.max is the real guard. The cgroup
+        # must be measured, otherwise #2825 N2 keeps the host guards.
+        reading = {"swap_used_bytes": 20 * GIB, "load1": 50.0,
+                   "cgroup_mem_used": 0.2}
         self.assertEqual(resources.breaches(
             reading, limits(pressure_scope="own_cgroup")), [])
         # a declared swap ceiling still counts, corroborated by the cgroup's
@@ -332,6 +401,16 @@ class _Provider:
 
 
 class CapacityProviderTest(unittest.TestCase):
+    def drain_observes(self, manager, timeout=2.0):
+        """Laisse le Manager consommer une réponse tardive puis libérer."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            manager.observe(False)
+            if manager.snapshot() is None:
+                return
+            time.sleep(0.01)
+        self.fail("late provider reply not applied: %r" % (manager.snapshot(),))
+
     def test_no_provider_is_the_noop_and_never_signals(self):
         provider = capacity.load_provider("", log=None)
         self.assertTrue(provider.is_noop)
@@ -517,6 +596,220 @@ class CapacityProviderTest(unittest.TestCase):
         self.assertEqual(manager.need(host="h", agent="c")["state"], "requested")
         self.assertEqual([e["event"] for e in provider.events],
                          ["need", "release", "release", "need"])
+
+    def test_a_refused_or_failed_need_never_holds_the_slot(self):
+        # #2825 N1 : un refus ou une erreur n'accorde rien ; le slot
+        # `requested` est rendu (une fenêtre ultérieure peut redemander) et
+        # aucun `release` n'est envoyé.
+        provider = _Provider()
+        provider.replies = [{"action": "refused", "detail": "no quota"},
+                            {"action": "error", "error": "boom"},
+                            {"action": "granted", "capacity_id": "c9"}]
+        clock = [100.0]
+        manager = capacity.Manager(provider, now=lambda: clock[0],
+                                   min_interval_s=15, needs_per_hour=5,
+                                   release_after_s=0)
+        refused = manager.need(host="h", agent="a")
+        self.assertEqual(refused["action"], "refused")
+        self.assertEqual(refused["capacity_id"], None)
+        self.assertIsNone(manager.snapshot())
+        # the min interval still bounds the next attempt
+        self.assertIsNone(manager.need(host="h", agent="a"))
+        self.assertEqual(len(provider.events), 1)
+        clock[0] = 116.0
+        failed = manager.need(host="h", agent="a")
+        self.assertEqual(failed["action"], "error")
+        self.assertIsNone(manager.snapshot())
+        # nothing was granted: a calm pressure releases nothing
+        self.assertIsNone(manager.observe(False))
+        self.assertEqual([e["event"] for e in provider.events], ["need", "need"])
+        clock[0] = 132.0
+        granted = manager.need(host="h", agent="a")
+        self.assertEqual(granted["capacity_id"], "c9")
+        self.assertEqual(manager.snapshot()["state"], "requested")
+
+    def test_a_granted_without_capacity_id_is_not_a_releasable_slot(self):
+        # #2825 N1 : un `granted` sans identifiant n'est pas une capacité
+        # utilisable ; on ne libère jamais `capacity_id: None`.
+        provider = _Provider()
+        provider.replies = [{"action": "granted"}]
+        clock = [100.0]
+        manager = capacity.Manager(provider, now=lambda: clock[0],
+                                   min_interval_s=0, needs_per_hour=5,
+                                   release_after_s=0)
+        state = manager.need(host="h", agent="a")
+        self.assertEqual(state["action"], "error")
+        self.assertIn("capacity_id", state["detail"])
+        self.assertIsNone(manager.snapshot())
+        self.assertIsNone(manager.observe(False))
+        self.assertEqual([e["event"] for e in provider.events], ["need"])
+
+    def test_a_wait_without_capacity_id_is_dropped_without_a_release(self):
+        # #2825 N1 : `wait` n'accorde encore rien. Au calme, le slot est rendu
+        # sans appeler le fournisseur (aucun identifiant à libérer).
+        provider = _Provider()
+        provider.replies = [{"action": "wait"}]
+        clock = [100.0]
+        manager = capacity.Manager(provider, now=lambda: clock[0],
+                                   min_interval_s=0, needs_per_hour=5,
+                                   release_after_s=0)
+        state = manager.need(host="h", agent="a")
+        self.assertEqual(state["action"], "wait")
+        self.assertEqual(manager.snapshot()["state"], "requested")
+        clock[0] = 101.0
+        self.assertIsNone(manager.observe(False))  # the calm starts
+        clock[0] = 102.0
+        skipped = manager.observe(False)
+        self.assertEqual(skipped["state"], "idle")
+        self.assertEqual([e["event"] for e in provider.events], ["need"])
+        self.assertIsNone(manager.snapshot())
+        # the slot is free: the next window may ask again
+        clock[0] = 110.0
+        self.assertEqual(manager.need(host="h", agent="b")["action"], "granted")
+
+    def test_a_timed_out_module_need_keeps_its_slot_and_its_late_grant(self):
+        # #2825 verdict cx2 : un need temporisé ne rend pas le slot ; l'appel
+        # reste suivi, aucun second need ne démarre, et le grant tardif est
+        # libéré avec SON capacity_id (pas de c2 perdu).
+        with tempfile.TemporaryDirectory() as root:
+            write_module(root, "gated_capacity_need", '''
+import threading
+gate = threading.Event()
+started = []
+releases = []
+class GatedNeed:
+    is_noop = False
+    def need(self, event):
+        started.append(event)
+        gate.wait(5.0)
+        return {"action": "granted", "capacity_id": "c%d" % len(started)}
+    def release(self, event):
+        releases.append(event.get("capacity_id"))
+        return {"action": "none"}
+''')
+            sys.path.insert(0, root)
+            try:
+                with mock.patch.dict(os.environ,
+                                     {"AMEESH_CAPACITY_PROVIDER_TIMEOUT": "0.1"}):
+                    provider = capacity.load_provider(
+                        "gated_capacity_need:GatedNeed")
+                    module = sys.modules["gated_capacity_need"]
+                    manager = capacity.Manager(provider, min_interval_s=0,
+                                               needs_per_hour=5,
+                                               release_after_s=0)
+                    started = time.monotonic()
+                    pending = manager.need(host="h", agent="a")
+                    self.assertLess(time.monotonic() - started, 1.5)
+                    self.assertEqual(pending["state"], "requesting")
+                    self.assertTrue(pending["pending"])
+                    # a second need returns the SAME slot; no second call
+                    second = manager.need(host="h", agent="b")
+                    self.assertEqual(second["state"], "requesting")
+                    self.assertEqual(len(module.started), 1)
+                    module.gate.set()
+                    self.drain_observes(manager)
+                self.assertEqual(len(module.started), 1)
+                self.assertEqual(module.releases, ["c1"])
+            finally:
+                sys.path.remove(root)
+                sys.modules.pop("gated_capacity_need", None)
+
+    def test_a_timed_out_module_release_is_not_retried_over_the_live_call(self):
+        # #2825 verdict cx2 : un release temporisé garde `releasing` et son
+        # token ; tant que l'appel vit, aucun retry ne se chevauche.
+        with tempfile.TemporaryDirectory() as root:
+            write_module(root, "gated_capacity_release", '''
+import threading
+gate = threading.Event()
+releases = []
+class GatedRelease:
+    is_noop = False
+    def need(self, event):
+        return {"action": "granted", "capacity_id": "c1"}
+    def release(self, event):
+        releases.append(event.get("capacity_id"))
+        gate.wait(5.0)
+        return {"action": "none"}
+''')
+            sys.path.insert(0, root)
+            try:
+                with mock.patch.dict(os.environ,
+                                     {"AMEESH_CAPACITY_PROVIDER_TIMEOUT": "0.1"}):
+                    provider = capacity.load_provider(
+                        "gated_capacity_release:GatedRelease")
+                    module = sys.modules["gated_capacity_release"]
+                    manager = capacity.Manager(provider, min_interval_s=0,
+                                               needs_per_hour=5,
+                                               release_after_s=0)
+                    self.assertEqual(
+                        manager.need(host="h", agent="a")["capacity_id"], "c1")
+                    manager.observe(False)  # the calm starts
+                    started = time.monotonic()
+                    pending = manager.observe(False)  # release starts, times out
+                    self.assertLess(time.monotonic() - started, 1.5)
+                    self.assertEqual(pending["state"], "releasing")
+                    self.assertTrue(pending["pending"])
+                    self.assertEqual(pending["capacity_id"], "c1")
+                    # the live release is not duplicated by a retry
+                    self.assertIsNone(manager.observe(False))
+                    self.assertEqual(len(module.releases), 1)
+                    module.gate.set()
+                    self.drain_observes(manager)
+                self.assertEqual(len(module.releases), 1)
+                self.assertIsNone(manager.snapshot())
+            finally:
+                sys.path.remove(root)
+                sys.modules.pop("gated_capacity_release", None)
+
+    def test_a_late_failed_release_is_settled_before_any_retry(self):
+        # #2825 verdict cx2 : une réponse tardive d'échec est appliquée au
+        # slot (`release_failed`), et le retry attend son délai.
+        with tempfile.TemporaryDirectory() as root:
+            write_module(root, "gated_capacity_failed_release", '''
+import threading
+gate = threading.Event()
+releases = []
+class GatedFailedRelease:
+    is_noop = False
+    def need(self, event):
+        return {"action": "granted", "capacity_id": "c1"}
+    def release(self, event):
+        releases.append(event.get("capacity_id"))
+        gate.wait(5.0)
+        return {"action": "error", "error": "late boom"}
+''')
+            sys.path.insert(0, root)
+            try:
+                with mock.patch.dict(os.environ,
+                                     {"AMEESH_CAPACITY_PROVIDER_TIMEOUT": "0.1"}):
+                    provider = capacity.load_provider(
+                        "gated_capacity_failed_release:GatedFailedRelease")
+                    module = sys.modules["gated_capacity_failed_release"]
+                    manager = capacity.Manager(provider, min_interval_s=0,
+                                               needs_per_hour=5,
+                                               release_after_s=0)
+                    manager.need(host="h", agent="a")
+                    manager.observe(False)  # the calm starts
+                    manager.observe(False)  # release starts, times out
+                    module.gate.set()
+                    deadline = time.time() + 2.0
+                    snapshot = None
+                    while time.time() < deadline:
+                        manager.observe(False)
+                        snapshot = manager.snapshot()
+                        if snapshot and snapshot["state"] == "release_failed":
+                            break
+                        time.sleep(0.01)
+                    self.assertEqual(snapshot["state"], "release_failed")
+                    self.assertEqual(snapshot["capacity_id"], "c1")
+                    self.assertIn("late boom", snapshot["detail"])
+                    self.assertEqual(len(module.releases), 1)
+                    # before `next_retry`, no second release call
+                    self.assertIsNone(manager.observe(False))
+                    self.assertEqual(len(module.releases), 1)
+            finally:
+                sys.path.remove(root)
+                sys.modules.pop("gated_capacity_failed_release", None)
 
 
 class MailExpiryTest(unittest.TestCase):
@@ -762,3 +1055,28 @@ class RunnerExpiredRequestDbTest(test_canon._CanonDbCase):
         self.assertEqual(notices[0]["sender"], "ameesh")
         self.assertIn("expired", notices[0]["body"])
         self.assertEqual(mail.message_payload(notices[0]).get("request_expired"), sent)
+
+    def test_a_failed_settlement_does_not_repeat_the_notice(self):
+        # #2825 N5 : quand le soldage échoue, le message revient au sondage
+        # suivant ; l'avis `request_expired` n'est envoyé qu'une fois et le
+        # soldage est retenté.
+        self.sync()
+        sent = mail.send(self.db, "relecteur", "orchestre", "requête à échéance",
+                         host="atelier", kind="request",
+                         payload={"request_expires_ts": int(time.time() - 60)})
+        expired = [row for row in mail.unread_active(self.db, "orchestre")
+                   if mail.request_expired(row)]
+        self.assertEqual([row["id"] for row in expired], [sent])
+        worker = types.SimpleNamespace(name="orchestre", db=self.db)
+        worker._notify_expired_request = types.MethodType(
+            runner.AgentWorker._notify_expired_request, worker)
+        with mock.patch.object(mail, "drop_expired",
+                               side_effect=db_mod.DbError("boom")):
+            runner.AgentWorker._live_mail(worker, expired)
+            runner.AgentWorker._live_mail(worker, expired)
+        notices = mail.unread(self.db, "relecteur")
+        self.assertEqual(len(notices), 1, notices)
+        # the settlement succeeds on the next poll, without a second notice
+        runner.AgentWorker._live_mail(worker, expired)
+        self.assertEqual(mail.unread(self.db, "orchestre"), [])
+        self.assertEqual(len(mail.unread(self.db, "relecteur")), 1)

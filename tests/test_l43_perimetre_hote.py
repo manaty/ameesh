@@ -333,8 +333,9 @@ class LimitesPhysiquesTest(_Canons, unittest.TestCase):
             "warn_disk_free": resources.DEFAULT_WARN_DISK_FREE,
             "max_zombies": resources.DEFAULT_MAX_ZOMBIES,
             # #2814: périmètre de pression et plafonds du cgroup, personne ne
-            # les déclare (défaut = hôte ici, sauf conteneur détecté)
-            "pressure_scope": defaut["pressure_scope"],
+            # les déclare : #2825 N4, un hôte nommé sans lecture garde `host`
+            # (le défaut ne vient jamais du processus appelant)
+            "pressure_scope": "host",
             "max_cgroup_memory_used": resources.DEFAULT_MAX_CGROUP_MEMORY_USED,
             "max_cgroup_throttled": resources.DEFAULT_MAX_CGROUP_THROTTLED,
         })
@@ -360,8 +361,9 @@ class LimitesPhysiquesTest(_Canons, unittest.TestCase):
         # une fiche qui se tait n'impose pas le défaut à celle qui déclare
         seul = resources.host_limits([a], HOST)
         self.assertEqual(seul["limits"]["max_swap_used"], 16 * GIB)
-        # hôte inconnu : valeurs par défaut prudentes
-        self.assertEqual(resources.host_limits([a, t], "autre")["limits"], defaut)
+        # hôte inconnu : valeurs par défaut prudentes, périmètre `host`
+        self.assertEqual(resources.host_limits([a, t], "autre")["limits"],
+                         dict(defaut, pressure_scope="host"))
         self.assertIsNone(resources.host_limits([a, t], "autre")["max_agents"])
 
     def test_l_executeur_applique_les_plus_strictes(self):

@@ -94,7 +94,11 @@ class FleetCommandTest(unittest.TestCase):
                 mock.patch.object(mesh_cli.time, "time", return_value=10_000.0), \
                 contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(err or io.StringIO()):
-            self.assertEqual(mesh_cli._host_fleet("db", canons, args), code)
+            # #2825 N4: the fleet resolves each host's scope from its own
+            # reading; the local config names the host whose own detection
+            # may fill in when it has no reading.
+            self.assertEqual(mesh_cli._host_fleet(config_mod.Config(), "db",
+                                                  canons, args), code)
         return out.getvalue()
 
     def test_canon_host_without_retained_reading_stays_visible(self):
