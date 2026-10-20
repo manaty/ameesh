@@ -193,13 +193,25 @@ document (the `AMEESH_TURN_CONTEXT` file) is the single source of the turn
 id, the live lease, the delivered requests and the open accounting marker/
 spend key. The sandbox adapter reads it for those facts; the review request
 is a block in one of the delivered requests' payloads
-(`ameesh-sandbox-request/1`), not a fresh mailbox read. The `turn_id` is the
-one allocated before the first side effect of the turn (#2167), so
-`turn_resources`, `spend_pending`, `turn_costs` and `sandbox_turns` carry the
-same id. If #2167 chooses a CLI-only or document-only shape, the runner passes
-the same facts to the adapter from its turn state; the sandbox contract
-depends on the facts, not on the file. If #2167's note changes a field name,
-this note follows it.
+(`ameesh-sandbox-request/1`), not a fresh mailbox read. **One authorization
+per turn**: a sandbox request is authorized only if its message id is in the
+context's `requests[]`; a request outside that set is `missing`, and a
+message withdrawn before admission is not authorized (a withdrawal after
+admission is a cancel request). The `turn_id` is the one allocated before the
+first side effect of the turn (#2167), so `turn_resources`, `spend_pending`,
+`turn_costs` and `sandbox_turns` carry the same id. The `spend_key` is opaque:
+the adapter reads it from the context/marker and never re-derives it.
+
+The sandbox turn is launched by the ameesh runner (adapter + supervisor
+child), so it is inside #2167's covered boundary: the runner launches the
+turn, writes the context and holds the lease; the supervisor never holds the
+lease and never writes the context. The mediated-executor path is out of
+scope for both notes.
+
+If #2167 chooses a CLI-only or document-only shape, the runner passes the
+same facts to the adapter from its turn state; the sandbox contract depends
+on the facts, not on the file. If #2167's note changes a field name, this note
+follows it.
 
 There is no new external write API. IMA's controller sends the structured
 `ameesh-sandbox-request/1` payload (in an existing mail/work request) and reads
@@ -710,13 +722,18 @@ sandbox view, composed with #2167's `ameesh-turn-observation/1`:
 * `GET /api/v1/turns/{turn_id}` gains a `sandbox` block (state, Job
   namespace/name/UID/phase, receipt when accepted, refusal) in the turn
   observation object; the turn's accounting state stays #2167's;
-* `GET /api/v1/sandbox/turns/{turn_id}` → the same sandbox block alone;
+* `GET /api/v1/sandbox/turns/{turn_id}` → the same sandbox block alone; the
+  block's `state` is the sandbox state above, while #2167's `turn.state`
+  (`starting|running|ended|orphan|unknown`) is unchanged;
 * `GET /api/v1/sandbox/turns?agent=&state=&scope=&limit=` → the sandbox blocks,
   bounded, for adoption/reconciliation and for IMA's poll.
 
 The block carries no secrets. The receipt is returned by the turn observation
 too, so a consumer that already reads `/api/v1/turns/{turn}` does not need a
-second call.
+second call. The turn's `accounting` object stays #2167's
+(`pending|settled|kept|released|none|unknown`, ledger first); the sandbox
+block adds the tranche view (`tranche_id`, reserved/settled/kept) and the
+result receipt, not a second accounting state.
 
 There is no `POST` for lifecycle in the pilot: the runner is the only writer.
 IMA reads the receipt with the same credential it already uses for `/api/v1`.
