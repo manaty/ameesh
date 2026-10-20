@@ -59,6 +59,12 @@ proprement. **Une migration SQL est portée par #2443** :
 interne `work_packet_members`), déjà relue sur `4575e7fd` ; aucune autre
 migration n'est ajoutée ni modifiée par la composition.
 
+## Adaptation de contrat CI (1)
+
+| source | changement | preuve |
+|---|---|---|
+| `src/ameesh/train_contracts.py` | blob épinglé de `scripts/test-plan.py` : `8f192023…` → `b930dd3e…` | #2538 a modifié `scripts/test-plan.py`, relu par dev1 (Claude) + cx3 (codex) sur `e7834ed9` ; le changement ne touche que le rapport des blocs changés, pas l'ensemble des modules exécutés par la suite. Le contrat #2446 exige le blob audité : `tests.test_2446_train_contract` est vert après la mise à jour. Précédent identique : `85fad987b` (#2446, blob de `test-plan.py` après #2397) |
+
 ## Écartés (ce véhicule)
 
 | lot | motif |
@@ -88,3 +94,13 @@ migration n'est ajoutée ni modifiée par la composition.
 - `scripts/garde-mecanique.py --json` : **0 constat**, 1 exemption utilisée
   (#2642), 0 inutilisée.
 - `scripts/doc-links.py` : 172 fichiers, **0 lien cassé**.
+- Contrat CI #2446 : `scripts/test-plan.py` modifié par #2538 sans mise à jour
+  du blob épinglé (rouge de la première CI, run 39350455986, sur les parts
+  psql 12/16 et psycopg 1/8) ; adaptation mécanique du blob seul dans
+  `train_contracts.py` (voir ci-dessus), **2 tests OK**, puis suite complète
+  relancée sur la nouvelle tête.
+- Tests ciblés avant la première CI : **404 tests OK en psql** sur 13 modules
+  des 9 unités, 0 échec ; **26 tests OK en psql et 26 en psycopg** sur
+  `test_1227_suite_1176`, `test_2648_next_choice_underuse` et
+  `test_2443_packet_members` ; la passe psycopg des 13 autres modules n'a pas
+  été terminée localement (timeout du banc), la suite complète la couvre.
