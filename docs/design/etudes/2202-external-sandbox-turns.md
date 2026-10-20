@@ -195,9 +195,9 @@ spend key. The sandbox adapter reads it for those facts; the review request
 is a block in one of the delivered requests' payloads
 (`ameesh-sandbox-request/1`), not a fresh mailbox read. **One authorization
 per turn**: a sandbox request is authorized only if its message id is in the
-context's `requests[]`; a request outside that set is `missing`, and a
-message withdrawn before admission is not authorized (a withdrawal after
-admission is a cancel request). The `turn_id` is the one allocated before the
+context's `requests[]`; a request outside that set, or withdrawn before
+admission, is `unauthorized-request` (a withdrawal after admission is a
+cancel request). The `turn_id` is the one allocated before the
 first side effect of the turn (#2167), so `turn_resources`, `spend_pending`,
 `turn_costs` and `sandbox_turns` carry the same id. The `spend_key` is opaque:
 the adapter reads it from the context/marker and never re-derives it.
@@ -746,6 +746,7 @@ tests assert them:
 | Code | When | Retry |
 |---|---|---|
 | `missing` | required field, scope, Job UID or counter absent | no |
+| `unauthorized-request` | request id not in the turn context's `requests[]`, or withdrawn before admission | no |
 | `unknown-turn` | no `sandbox_turns` row | no |
 | `stale` | owner/epoch/session no longer current; lease expired; superseded generation/head; attempt behind | no (new turn) |
 | `late` | after `deadline_ts`, or on a terminal turn that was not cancelled | no |
