@@ -7,7 +7,9 @@ auteurs que l'appelant lui donne (#2681) ; la désignation au gel
 auteurs, avec les mêmes exceptions du canon §2 :
 
 * l'auteur de référence est l'assigné au gel (`review_lot._author_at_freeze`,
-  la même trace historique que la porte) ;
+  la même trace historique que la porte) ; sur un lot porteur de paquet
+  (`integration/**`), l'assigné est le composeur mécanique, pas un auteur
+  (#2803), et le commit de manifeste est écarté de la même lecture ;
 * chaque commit du contenu est attribué par son reçu exact (#1465) ;
 * un correctif de premier tour d'un **relecteur désigné** sous le seuil du §2
   (`REVIEWER_FIX_LINES`, pas de conception) ne fait pas de son auteur un auteur
@@ -36,6 +38,46 @@ from . import plan_git, registry, review_lot, review_provenance
 REVIEWER_FIX_LINES = 50
 #: canon §2 « ou de conception » : un document de conception n'est jamais petit
 DESIGN_PREFIXES = ("docs/design/",)
+#: le manifeste d'un paquet (`reviews/integration-<nom>.md`) : la composition
+#: mécanique du composeur, jamais le contenu relu (#2803)
+PACKET_MANIFEST_PREFIX = "reviews/integration-"
+PACKET_MANIFEST_SUFFIX = ".md"
+
+
+def packet_composer(item: Mapping) -> str:
+    """Le composeur d'un lot **porteur de paquet** (`integration/**`), sinon "".
+
+    Un lot dont la branche est `integration/**` est le véhicule d'un paquet :
+    son assigné est le composeur, dont le geste est mécanique (canon §2 et
+    §11 bis). Ce n'est pas un auteur du contenu relu (#2803) : les auteurs à
+    exclure sont ceux des lots du manifeste, lus sur la plage gelée. Le
+    composeur reste un auteur s'il a réellement écrit un commit de contenu
+    (le reçu de ce commit le nomme) ; seule sa place de référence tombe.
+    """
+    from . import packet_guard
+
+    item = item or {}
+    if not packet_guard.is_packet_branch(item.get("branch")):
+        return ""
+    return str(item.get("assignee") or "").strip()
+
+
+def _manifest_commit(repo: str, sha: str) -> bool:
+    """Le commit n'écrit que le manifeste d'un paquet (`reviews/integration-*.md`).
+
+    La composition mécanique d'un paquet (#2803) : le composeur y déclare les
+    unités, il n'écrit pas le contenu relu. Un diff illisible ne l'écarte
+    jamais : le doute garde l'auteur (l'indépendance ne se suppose pas).
+    """
+    if not repo:
+        return False
+    text = plan_git._out(repo, "show", "--name-only", "--format=", sha)
+    if text is None:
+        return False
+    paths = [line.strip() for line in str(text).splitlines() if line.strip()]
+    return bool(paths) and all(
+        path.startswith(PACKET_MANIFEST_PREFIX)
+        and path.endswith(PACKET_MANIFEST_SUFFIX) for path in paths)
 
 
 def _family(harness, families) -> str:
@@ -119,8 +161,15 @@ def reference_author(db, item: Mapping, milestone: Optional[Mapping], families,
     jalon quand son acteur est bien l'auteur, sinon de la session ouverte du
     registre. C'est exactement la référence de la porte (`assignee`) ; le
     registre courant ne prouve une famille que lorsque le gel ne la donne pas.
+
+    #2803 : sur un lot porteur de paquet (`integration/**`), l'assigné est le
+    **composeur** — un geste mécanique (canon §2/§11 bis), pas un auteur du
+    contenu relu. La référence est vide : les auteurs sont ceux des lots du
+    manifeste, lus sur les commits de la plage gelée.
     """
     item = dict(item or {})
+    if packet_composer(item):
+        return {"name": "", "family": ""}
     lot = int(item.get("id") or 0)
     assignee = str(item.get("assignee") or "").strip()
     author = {}
@@ -271,8 +320,15 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     registre. Les commits admis par ce repli portent la trace
     `proof: turn-journal` et leurs SHA dans `fallback_commits` quand
     `trace=True` (désignation).
+
+    #2803 : sur un lot porteur de paquet (`integration/**`), la référence est
+    le composeur mécanique et n'est pas un auteur (`packet_composer`). Le
+    commit de manifeste (`reviews/integration-*.md`, écrit par le composeur)
+    est écarté de la même lecture : les auteurs sont ceux des lots du
+    manifeste, ni le composeur ni sa famille.
     """
     item = dict(item or {})
+    packet = bool(packet_composer(item))
     if reference is None:
         reference = reference_author(db, item, milestone, families,
                                      provider=provider, strict=strict)
@@ -289,6 +345,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         sha = str(raw or "").strip()
         if not sha:
             continue
+        if packet and _manifest_commit(repo, sha):
+            continue                      # composition mécanique du composeur (#2803)
         try:
             receipt = _commit_receipt(provider, db, sha, strict=strict)
         except review_provenance.ProvenanceError:
