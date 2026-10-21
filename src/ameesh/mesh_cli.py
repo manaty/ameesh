@@ -2278,7 +2278,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 item = work.get(db, args.id)
                 if item is None:
                     raise work.WorkError("lot %s not found" % args.id)
-                sha = work.freeze_head(db, item, sha, repo=args.repo)
+                sha = work.freeze_head(db, item, sha, repo=args.repo,
+                                       require_present=True)
                 # #2542 : un contrôle statique rouge refuse le gel, avant le paquet
                 from . import freeze_checks
                 note = freeze_checks.before_freeze(
@@ -2287,11 +2288,14 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             elif args.no_static_checks is not None or args.prevalidation_map:
                 raise work.WorkError("--no-static-checks and --prevalidation-map "
                                      "only apply to a freeze")
+            if args.supersedes and args.kind != "frozen":
+                raise work.WorkError("--supersedes only applies to a freeze")
             # `--repo` vaut aussi pour un verdict (#2674) : il y résout
             # l'abréviation du SHA relu, et fait alors autorité.
             row = work.milestone(
                 db, args.id, args.kind, sha=sha, actor=args.actor or "",
-                verdict=args.verdict, note=note, outcome=outcome, repo=args.repo)
+                verdict=args.verdict, note=note, outcome=outcome, repo=args.repo,
+                supersedes=args.supersedes or None)
             print("milestone %s added to lot #%d%s" % (
                 row["kind"], args.id,
                 " (%s)" % row["verdict"] if row.get("verdict") else ""))
@@ -3460,6 +3464,12 @@ def build_parser() -> argparse.ArgumentParser:
                        metavar="REASON",
                        help="frozen: freeze without the project's static checks "
                             "(scripts/freeze-checks.py); the reason goes in the note")
+    pw_ms.add_argument("--supersedes", type=int, action="append", default=[],
+                       metavar="FROZEN_ID",
+                       help="#2989: frozen only: a prior freeze of the same lot this "
+                            "freeze replaces (repeatable); a replaced freeze whose commit "
+                            "is absent from the repository no longer blocks provenance, "
+                            "and the note keeps the machine trace")
     pw_ms.set_defaults(func=cmd_work)
     from . import plan_cli
     plan_cli.add_parsers(work_sub, cmd_work)  # plan de travail (L29)

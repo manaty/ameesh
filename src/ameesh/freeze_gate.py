@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 from . import storage
 
@@ -57,6 +57,17 @@ FREEZE_ABSENT_MARK = "ameesh-freeze-absent:"
 #: ligne fournie par `--note` est retirée avant que le gel n'écrive la sienne
 #: (sinon `--note "ameesh-freeze-absent: main"` contournerait le garde #2784).
 FREEZE_ABSENT_LINE = re.compile(r"(?m)^[ \t]*ameesh-freeze-absent:[^\n]*(?:\n|$)")
+#: #2989 : la ligne machine d'un gel qui déclare un gel antérieur **remplacé**
+#: (typiquement un gel fantôme dont le SHA n'existe nulle part). Elle n'est
+#: écrite que par `work milestone frozen --supersedes <id>`, jamais recopiée
+#: d'une note d'appelant : la porte ignore alors le gel remplacé, avec la note
+#: du nouveau gel comme trace. Sans elle, un gel antérieur absent bloque la
+#: provenance (refus fermé de #2924 B5).
+FREEZE_SUPERSEDES_MARK = "ameesh-freeze-supersedes:"
+FREEZE_SUPERSEDES_LINE = re.compile(
+    r"(?m)^[ \t]*ameesh-freeze-supersedes:[^\n]*(?:\n|$)")
+FREEZE_SUPERSEDES_RE = re.compile(
+    r"(?m)^ameesh-freeze-supersedes:\s*(\d+)\s*$")
 
 
 def milestones(db: Db, item_id: int, limit: int = 100) -> list[dict]:
@@ -322,7 +333,8 @@ def _freeze_absent_marker(db: Db, item: dict, full: str, repo: str | None,
 
 
 def freeze_head(db: Db, item: dict, sha: str, *, repo: str | None = None,
-                refreshed: dict | None = None) -> str:
+                refreshed: dict | None = None,
+                require_present: bool = False) -> str:
     """La tête d'un gel, écrite en commit complet (#2786).
 
     Un gel est une tête **immuable** : il ne peut nommer qu'un commit
@@ -339,7 +351,13 @@ def freeze_head(db: Db, item: dict, sha: str, *, repo: str | None = None,
     la cible **publiée rafraîchie** est refusé — il n'a aucun commit propre
     et ne prouverait aucune livraison (#2784). `refreshed` est le cache de
     fetch partagé avec [`_freeze_absent_marker`] pour un même gel. Le `sha`
-    rendu est donc toujours le commit complet à stocker."""
+    rendu est donc toujours le commit complet à stocker.
+
+    #2989 : `require_present=True` (la CLI, qui écrit un gel) refuse un commit
+    complet qu'aucun dépôt connu ne porte : un SHA fantôme écrit au gel ne
+    pourra jamais être relu et bloquera la provenance des gels suivants. Les
+    appelants qui écrivent un jalon hors CLI (témoins, reprises) gardent le
+    comportement historique en laissant le défaut."""
     from .work import WorkError
     text = str(sha or "").strip().lower()
     from . import freeze_checks
@@ -384,10 +402,35 @@ def freeze_head(db: Db, item: dict, sha: str, *, repo: str | None = None,
         _refuse_freeze_already_in_target(repo, item, full, refreshed)
         return full
     # commit complet : on cherche un dépôt qui le contient pour la garde (4)
-    for where in ([repo] if repo else []) + _head_repos(db, item):
+    found = False
+    candidates = ([repo] if repo else []) + _head_repos(db, item)
+    for where in candidates:
         if where and freeze_checks.commit_in(where, full):
+            found = True
             _refuse_freeze_already_in_target(where, item, full, refreshed)
             break
+    if not found and require_present:
+        # #2989 : un SHA complet absent de tous les dépôts connus est un gel
+        # fantôme ; l'écrire bloquerait la provenance de tous les gels suivants.
+        # Un hôte sans aucun dépôt de lecture (orchestrateur distant) ne peut
+        # pas prouver l'absence : le gel passe, la prévalidation le dira (#2542).
+        proof = bool(repo)
+        if not proof:
+            for where in candidates:
+                if not where:
+                    continue
+                try:
+                    if freeze_checks.git_toplevel(where):
+                        proof = True
+                        break
+                except Exception:  # noqa: BLE001 - dépôt illisible : pas une preuve
+                    continue
+        if proof:
+            raise WorkError(
+                "freeze refused (head-absent): %s is not a commit of any known repository "
+                "(current directory, project repository, assignee's worktree); resolve the "
+                "frozen head (`git rev-parse <ref>`) or pass --repo <the repository holding "
+                "the commit> (#2989)" % full[:12])
     return full
 
 
@@ -404,6 +447,7 @@ def milestone(
     after_commit: list | None = None,
     outcome: dict | None = None,
     repo: str | None = None,
+    supersedes: Sequence[int] | int | None = None,
 ) -> dict:
     """Déclare un jalon que la machine à états ne peut pas déduire.
 
@@ -426,6 +470,14 @@ def milestone(
     hexadécimale d'au moins 12 caractères résolue dans le dépôt de l'auteur
     et alors écrite complète ; une ref symbolique (`HEAD`, une branche) est
     refusée, parce que chaque lecteur la résoudrait dans son propre clone.
+
+    `supersedes` (#2989) nomme un ou des gels antérieurs du même lot que ce
+    gel **remplace** ; la note reçoit alors la ligne machine
+    [`FREEZE_SUPERSEDES_MARK`]. La lecture des auteurs (`review_authors`) ignore
+    un gel remplacé quand son SHA est absent du dépôt : c'est la réparation
+    d'un gel fantôme (un SHA erroné écrit avant la validation de la CLI). Une
+    ligne de note fournie par l'appelant est retirée : la marque ne se
+    contourne pas. Seul `frozen` accepte `supersedes`.
 
     `on_frozen` (facultatif, #1617) : le callback du gel, appelé dans la
     transaction du jalon `frozen` avec `(tx, milestone, after_commit)`. Il
@@ -468,6 +520,22 @@ def milestone(
         raise WorkError("a verdict only makes sense for the `verdict` milestone")
     if on_frozen is not None and kind != "frozen":
         raise WorkError("a freeze callback only makes sense for the `frozen` milestone")
+    replaced: list[int] = []
+    if supersedes is not None:
+        if kind != "frozen":
+            raise WorkError("--supersedes only makes sense for the `frozen` milestone")
+        values = [supersedes] if isinstance(supersedes, int) else list(supersedes)
+        for value in values:
+            try:
+                freeze_id = int(value)
+            except (TypeError, ValueError):
+                raise WorkError("--supersedes expects a freeze milestone id, got %r"
+                                % (value,))
+            if freeze_id <= 0:
+                raise WorkError("--supersedes expects a freeze milestone id, got %r"
+                                % (value,))
+            if freeze_id not in replaced:
+                replaced.append(freeze_id)
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -484,7 +552,22 @@ def milestone(
         # balayage ne confonde pas une livraison (avance rapide) avec un gel
         # déjà dans la cible. C'est une preuve machine : une ligne fournie par
         # l'appelant (`--note`) est ignorée et refaite ici (#2786, avis dev4).
-        note = FREEZE_ABSENT_LINE.sub("", note).rstrip()
+        note = FREEZE_ABSENT_LINE.sub("", note)
+        note = FREEZE_SUPERSEDES_LINE.sub("", note).rstrip()
+        if replaced:
+            # #2989 : la déclaration ne vaut que pour un gel antérieur du même
+            # lot (la ligne machine est écrite ici, jamais recopiée).
+            prior = {int(row.get("id") or 0): row
+                     for row in milestones(db, item_id, None)}
+            for freeze_id in replaced:
+                row = prior.get(freeze_id)
+                if row is None or row.get("kind") != "frozen":
+                    raise WorkError(
+                        "--supersedes %s: not a prior `frozen` milestone of lot #%d"
+                        % (freeze_id, item_id))
+            note = (note + "\n" if note else "") + "\n".join(
+                "%s %d" % (FREEZE_SUPERSEDES_MARK, freeze_id)
+                for freeze_id in replaced)
         marker = _freeze_absent_marker(db, item, sha, repo, refreshed)
         if marker:
             note = (note + "\n" if note else "") + marker
