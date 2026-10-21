@@ -80,8 +80,13 @@ class _Fixture(PgTestCase):
             (agent, harness, "s-" + harness, float(seconds)))
 
     def verdict(self, actor):
-        work.milestone(self.db, self.lot, "verdict", sha=self.frozen,
-                       actor=actor, verdict="ok")
+        mark = work.milestone(self.db, self.lot, "verdict", sha=self.frozen,
+                              actor=actor, verdict="ok")
+        # #2928 : en classe sensible, un verdict ne compte qu'avec son reçu
+        # exact ; le témoin reste valable avant comme après cette garde.
+        harness = {"qa": "deepseek", "dev1": "claude"}.get(actor, "codex")
+        self.receipt("milestone:%d" % mark["id"], actor=actor, harness=harness)
+        return mark
 
     def marks(self):
         return work.milestones(self.db, self.lot)
