@@ -148,7 +148,8 @@ class FreezeHeadWriteTest(PgTestCase):
 
     def test_la_cli_refuse_head_avant_les_controles_statiques(self):
         proc = self.mesh("work", "milestone", str(self.lot), "frozen",
-                         "--sha", "HEAD", "--actor", "auteur")
+                         "--sha", "HEAD", "--actor", "auteur",
+                         env=self.env(AGENT_MAIL_NAME="auteur"))
         self.assertEqual(proc.returncode, 1, proc.stdout)
         self.assertIn("head-missing", proc.stderr)
         self.assertEqual(self.freezes(), [])

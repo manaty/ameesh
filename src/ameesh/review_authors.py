@@ -521,7 +521,8 @@ def authors(db, item: Mapping, milestone: Optional[Mapping],
 
 
 def verdict_families(db, marks, families, *, provider=None,
-                     strict: bool = False) -> dict[str, str]:
+                     strict: bool = False,
+                     require_receipt: bool = False) -> dict[str, str]:
     """Les familles historiques des relecteurs d'une tête gelée.
 
     Pour chaque acteur, seul son **dernier** verdict de la liste compte (la
@@ -530,11 +531,38 @@ def verdict_families(db, marks, families, *, provider=None,
     sans lui, le journal des tours à l'instant du verdict. Une preuve
     contradictoire est une erreur si `strict`, une absence sinon. Le résultat
     est indexé par acteur en minuscules, la casse de la porte.
+
+    `require_receipt` (#2928) : en classe sensible, un verdict sans reçu exact
+    ne compte pas. Les avis sans preuve sont alors écartés **avant** le choix
+    du dernier par acteur, comme à la porte : un faux `ok` sans reçu ne peut
+    ni fournir une famille ni masquer un vrai dernier avis.
     """
+    marks = [mark for mark in (marks or ()) if mark.get("kind") == "verdict"]
+    proven_ids: set[int] | None = None
+    if require_receipt:
+        proven_ids = set()
+        for mark in marks:
+            try:
+                marker = int(mark["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if str(mark.get("actor") or "").strip().startswith("human:"):
+                # la règle vise un verdict d'agent : un humain n'a pas de tour.
+                proven_ids.add(marker)
+                continue
+            # `strict` garde son sens : une preuve contradictoire est une
+            # erreur (le train), pas une simple absence.
+            if _milestone_receipt(provider, db, marker, strict=strict) is not None:
+                proven_ids.add(marker)
     latest: dict[str, dict] = {}
-    for mark in marks or ():
-        if mark.get("kind") != "verdict":
-            continue
+    for mark in marks:
+        if proven_ids is not None:
+            try:
+                marker = int(mark["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if marker not in proven_ids:
+                continue
         actor = str(mark.get("actor") or "").strip()
         key = actor.lower()
         if not key:
