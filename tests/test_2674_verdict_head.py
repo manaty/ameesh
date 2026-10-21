@@ -49,7 +49,8 @@ class ReviewedHeadTest(PgTestCase):
 
     def milestone(self, *args):
         return self.mesh("work", "milestone", str(self.lot), "verdict", *args,
-                         "--actor", "relecteur")
+                         "--actor", "relecteur",
+                         env=self.env(AGENT_MAIL_NAME="relecteur"))
 
     def verdicts(self):
         return [m for m in work.milestones(self.db, self.lot)
@@ -89,7 +90,8 @@ class ReviewedHeadTest(PgTestCase):
         lot = work.add(self.db, title="pas encore gelé", app="ameesh",
                        actor="auteur")["id"]
         proc = self.mesh("work", "milestone", str(lot), "verdict", "ok",
-                         "--sha", "deadbeefdead", "--actor", "relecteur")
+                         "--sha", "deadbeefdead", "--actor", "relecteur",
+                         env=self.env(AGENT_MAIL_NAME="relecteur"))
         self.assertEqual(proc.returncode, 1, proc.stdout)
         self.assertIn("head-unresolved", proc.stderr)
         self.assertIn("no frozen head yet", proc.stderr)

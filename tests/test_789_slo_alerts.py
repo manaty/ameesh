@@ -400,9 +400,20 @@ class ReviewGateRepositoryTest(_Base):
                         cwd=repo)
         registry.upsert(self.db, "cx", harness="codex", host=self.cfg.host)
         row = dict(work.get(self.db, self.lot["id"]), branch_target="main")
+        # #2928 : un avis sensible ne compte que sur son reçu exact, lu sur le
+        # vrai jalon ; l'avis est donc posé en base avant d'être relu.
+        mark = work.milestone(self.db, self.lot["id"], "verdict", sha=sha,
+                              actor="cx", verdict="ok")
+        self.db.execute(
+            "INSERT INTO provenance_receipts"
+            " (subject, sha, actor, session, turn, harness, work_item_id)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            " ON CONFLICT (subject) DO NOTHING",
+            ("milestone:%d" % int(mark["id"]), sha, "cx", "s-codex", "t",
+             "codex", self.lot["id"]))
         marks = [{"kind": "frozen", "sha": sha, "actor": "dev1", "at_ts": 1},
-                 {"kind": "verdict", "sha": sha, "actor": "cx", "verdict": "ok",
-                  "at_ts": 2}]
+                 {"kind": "verdict", "id": int(mark["id"]), "sha": sha,
+                  "actor": "cx", "verdict": "ok", "at_ts": 2}]
         gate = merge_queue.review_gate_for_item(self.db, self.cfg, row, marks)
         self.assertIsNotNone(gate)
         self.assertEqual(gate["required"], 1)

@@ -1382,6 +1382,34 @@ class CostBook:
             return None
         return before_turn
 
+    def codex_last_call_usage(self, thread: str | None) -> dict | None:
+        """L'usage du dernier appel au modèle d'un fil Codex (#2932).
+
+        `codex exec --json` ne publie qu'un usage de fin de tour, cumulé ; le
+        contexte d'un appel (la taille de la session, #2336) se lit dans le
+        journal de session du fil : `info.last_token_usage` du dernier
+        `token_count`, lu depuis la fin. None si le journal est introuvable ou
+        n'en porte aucun.
+        """
+        path = self.codex_rollout(thread)
+        if not path:
+            return None
+        for ligne in _lines_reverse(path):
+            if b"last_token_usage" not in ligne:
+                continue
+            try:
+                event = json.loads(ligne)
+            except ValueError:
+                continue
+            payload = event.get("payload") if isinstance(event, dict) else None
+            if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                continue
+            info = payload.get("info")
+            usage = info.get("last_token_usage") if isinstance(info, dict) else None
+            if isinstance(usage, dict):
+                return usage
+        return None
+
     def codex_session_roots(self) -> list:
         """Les dossiers de sessions Codex de la machine : le défaut, puis ceux
         des comptes déclarés (L95), sans doublon."""

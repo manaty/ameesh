@@ -64,6 +64,8 @@ ARGS = {  # op: (args, kwargs, résultat)
  "leases.set_marked_block": ([AG, OWN, EP, "dossier absent", "cwd: /x", "cwd:"], {}, "done"),
  "leases.clear_marked_block": ([AG, OWN, EP, "dossier absent", "cwd:"], {}, "done"),
  "mailbox.unread": ([AG, 50], {}, [MSG]),
+ "mailbox.unread_human": ([AG, 50], {"names": ["alice"]}, [MSG]),
+ "mailbox.unread_human_page": ([AG, 50], {"after_id": 812, "names": ["alice"]}, [MSG]),
  "mailbox.unread_urgent": ([AG, 50], {}, []),
  "mailbox.get": ([812], {}, MSG),
  "mailbox.reserve": ([AG, OWN, EP, "tok-9a2c"], {"porteur": "turn", "ttl_seconds": 600.0}, [MSG]),
