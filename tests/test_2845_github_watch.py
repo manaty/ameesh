@@ -241,6 +241,46 @@ class CollectionTest(unittest.TestCase):
         self.assertEqual([e["object_id"] for e in events], [1])
         self.assertIsNone(done)
 
+    def test_index_lag_on_a_dense_page_tail_cannot_skip_the_next_row(self):
+        # #2955: page of 3 keys NOW-250/-200/-195 whose last row carries the
+        # updated_at NOW-190 (index lag); seeking to updated_at - 1 skipped the
+        # row keyed NOW-194, which was never read again. A dense page cannot be
+        # advanced safely by the lag margin: it pages by guarded offset.
+        with mock.patch.object(watch, "PAGE_SIZE", 3):
+            rows = [issue(n) for n in range(1, 5)]
+            for row, key, updated in zip(rows, (-250, -200, -195, -194),
+                                         (-250, -200, -190, -194)):
+                row["key"] = watch.iso(NOW + key)
+                row["updated_at"] = watch.iso(NOW + updated)
+            api, scan, events = LagApi(rows, []), None, []
+            for _ in range(10):
+                batch, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, scan)
+                events += batch
+                if scan is None:
+                    break
+            self.assertIsNone(scan)
+            self.assertEqual({e["object_id"] for e in events}, {1, 2, 3, 4})
+
+    def test_index_lag_on_a_sparse_page_tail_cannot_skip_the_next_row(self):
+        # #2955: same lag on a page sparse enough for the lag-margin seek. The
+        # seek re-reads the lagged row and its successor out of updated order;
+        # the already-read rows must not trip the order guard, and the next row
+        # keyed NOW-640 is delivered.
+        with mock.patch.object(watch, "PAGE_SIZE", 3):
+            rows = [issue(n) for n in range(1, 5)]
+            for row, key, updated in zip(rows, (-1000, -900, -700, -640),
+                                         (-1000, -900, -600, -640)):
+                row["key"] = watch.iso(NOW + key)
+                row["updated_at"] = watch.iso(NOW + updated)
+            api, scan, events = LagApi(rows, []), None, []
+            for _ in range(10):
+                batch, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, scan)
+                events += batch
+                if scan is None:
+                    break
+            self.assertIsNone(scan)
+            self.assertEqual({e["object_id"] for e in events}, {1, 2, 3, 4})
+
     def test_index_lag_after_a_write_past_the_window_is_read_next_window(self):
         # #2925: just after the projection wrote, GitHub still sorts and filters
         # the issue by its old key while the row carries the new updated_at.

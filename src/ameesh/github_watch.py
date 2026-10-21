@@ -172,8 +172,12 @@ def collect_batch(api, sub, since, now, scan):
     Updated ordering is mutable. An offset alone can skip rows when an older
     row moves to the end. Re-read the preceding page *after* fetching the next
     one, before accepting it. Advance since by the last accepted timestamp
-    whenever a page spans timestamps; retain one second to include equal keys.
-    Equal-timestamp groups use guarded offsets. A changed boundary restarts at
+    minus the index-lag margin (#2955) whenever the page is sparse enough for
+    that seek to cover half of it; retain one second to include equal keys. The
+    rows that such a seek re-reads are remembered so the order guard only judges
+    the new ones: a lagged tail is, by nature, out of updated order. Dense
+    pages, whose span does not exceed the margin, use guarded offsets instead
+    so progress is never traded for the margin. A changed boundary restarts at
     its saved timestamp, never at an older window. Stop at the fixed window end
     so continuous updates cannot keep extending the scan. Durable digests make
     replay harmless.
@@ -182,6 +186,9 @@ def collect_batch(api, sub, since, now, scan):
     if state["page"] > 1 and "boundary" not in state:
         state["page"] = 1  # upgrade an old, unprotected checkpoint safely
     state.setdefault("window_since", state["since"])
+    # Rows re-read by the previous seek, already delivered: only the new rows
+    # are judged by the updated-order guard.
+    replayed = {tuple(item) for item in state.pop("replayed", ())}
     events = []
     until = state["until"]
 
@@ -222,25 +229,42 @@ def collect_batch(api, sub, since, now, scan):
         # projection writes in the same pass, after `until`). A row past the
         # window end is not taken here and the next window reads it again, so
         # only its place on a full page's tail matters: it ends the window.
-        inside = [ts for ts in times if ts <= until]
+        # #2955: rows re-read by the previous seek are already delivered; they
+        # are excluded from the guard, which then judges only the new rows.
+        fresh = [ts for row, ts in zip(rows, times)
+                 if (row["id"], row.get("updated_at")) not in replayed]
+        inside = [ts for ts in fresh if ts <= until]
         if inside != sorted(inside) or (len(rows) == PAGE_SIZE and times[-1] > until
-                                        and times != sorted(times)):
+                                        and fresh != sorted(fresh)):
             raise plan_github.GithubError("GitHub watch: updated order is invalid")
         events.extend(events_from(sub, state["kind"],
                                   [row for row, ts in zip(rows, times) if ts <= until]))
         if len(rows) == PAGE_SIZE and times[-1] <= until:
-            cutoff = times[-1] - 1  # GitHub since is exclusive, timestamps have second precision
-            if inside[0] < times[-1] and cutoff > state["since"]:
+            # #2955: a row is filtered and sorted by its index key, which can
+            # lag its updated_at. Seeking to updated_at - 1 skipped the rows
+            # whose key fell between the last row's key and its timestamp. Keep
+            # the lag margin (OVERLAP) when the page is sparse enough for the
+            # seek to cover half of it; a dense page cannot progress with that
+            # margin, so it pages by guarded offset instead. GitHub since is
+            # exclusive and timestamps have second precision: retain one second.
+            span = times[-1] - inside[0] if inside else 0
+            cutoff = times[-1] - 1 - OVERLAP
+            if (span > OVERLAP and cutoff - state["since"] >= span // 2
+                    and cutoff > state["since"]):
                 state.update(since=cutoff, page=1)
                 state.pop("boundary", None)
                 state.pop("boundary_since", None)
+                replayed = {(row["id"], row.get("updated_at"))
+                            for row, ts in zip(rows, times) if ts > cutoff}
+                state["replayed"] = [list(item) for item in replayed]
             else:
                 state.update(page=state["page"] + 1, boundary=boundary(rows),
-                             boundary_since=cutoff)
+                             boundary_since=times[-1] - 1)
         elif state["kind"] == "issue":
             state.update(kind="comment", page=1, since=state["window_since"])
             state.pop("boundary", None)
             state.pop("boundary_since", None)
+            state.pop("replayed", None)
         else:
             return events, None, until
     return events, state, until
