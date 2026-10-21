@@ -201,7 +201,7 @@ Python process, no database connection — which is the latency fix for #819.
 Reference reader and CLI, schema `ameesh-turn-context/1`:
 
 ```
-ameesh turn current [--local] [--json]
+ameesh turn current [--local] [--expect-turn <turn-id>] [--json]
 ```
 
 - Without `--local` (default), the command prints the current turn's document
@@ -209,17 +209,40 @@ ameesh turn current [--local] [--json]
   `(lease.owner, lease.epoch)` is still the live lease of `turn.agent` and
   that `spend_pending.turn_id` is `turn.id`. The check is the same fence as the
   mailbox protocol (`identity.resolve_binding`, `registry.lease_matches`).
-- `--local` skips the database check and only requires that the caller's turn
-  identity matches `turn.id` (resident: the `AMEESH_TURN_ID_FILE` content,
-  else `AMEESH_TURN_ID`) and that `lease` matches the environment. It is the
-  documented path for a tool call that must not open a connection; the file
-  is already `0600` in the agent's state directory.
+- `--local` skips the database check and checks that `lease` matches the
+  environment. It is the documented path for a tool call that must not open a
+  connection; the file is already `0600` in the agent's state directory.
+- `--expect-turn <turn-id>` is the **reuse fence**, applied before the database
+  check and with `--local` too. A consumer captures `turn.id` when it authorises
+  an operation (its first read of the document for that operation) and passes
+  it on every later read. The command returns the document only if
+  `document.turn.id == <turn-id>`; a mismatch is exit 3 with reason
+  `turn-mismatch`, even when the lease and `spend_pending` both name the new
+  turn. Without `--expect-turn`, the command is an **authorisation** (a fresh
+  read). A consumer that holds an authorisation MUST pass its turn id on every
+  later read; a reuse without `--expect-turn` is a contract violation, not a
+  fresh authorisation, and the A→B test in the guarantees covers it. The direct `open()`
+  path must apply the same comparison; the CLI is the reference
+  implementation, not a required subprocess.
 - It never writes. Exit codes: `0` current document; `3` not in a turn, stale
-  document, unreadable document, unknown `schema`, or lease mismatch (the
-  error says which, without a DSN or a stack); `2` usage/configuration error.
-  On `3`, nothing is printed on stdout that could be mistaken for a context.
-- The same document is what a consumer may `open()` directly; the CLI is the
-  reference implementation of the checks, not a required subprocess.
+  document, unreadable document, unknown `schema`, lease mismatch, or
+  `turn-mismatch` (the error says which, without a DSN or a stack); `2`
+  usage/configuration error. On `3`, nothing is printed on stdout that could
+  be mistaken for a context.
+
+### Reuse across a resident turn boundary
+
+A resident harness process runs turns A then B under the **same lease**
+(owner+epoch) without restarting. A child or background operation of A can
+still run while B is current. Both shared pointers — `turn-context.json` and
+`AMEESH_TURN_ID_FILE` — now name B, and the database checks (live lease,
+`spend_pending.turn_id`) also name B; none of them proves that the caller was
+authorised for A. The operation therefore records `turn.id` at its
+authorisation in A and passes it as `--expect-turn A` on every later read; B's
+document is refused with `turn-mismatch`. A fresh operation that starts during
+B authorises on B, captures B, and is accepted. The turn id must be captured
+from the document, never from `AMEESH_TURN_ID` (the life id of a resident
+process, not the turn).
 
 `ameesh turn current` is not a general-purpose query: it answers only for the
 turn of the calling process. A supervisor uses section 3.
@@ -307,9 +330,21 @@ consumer's re-derivation:
   pending accounting: a stale marker after settlement must read as `settled`,
   which is exactly what #2166 broke. #2893 still fixes the marker; the
   observation contract remains correct either way.
-- `quiescent` is the exact conjunction IMA needs: `agent.status == idle` and
-  `accounting.state != pending` and `not turn_in_progress`. It is derived and
-  documented, not a new source of truth.
+- `quiescent` is the exact conjunction IMA needs, over an **explicit
+  allowlist** of accounting states:
+
+  ```
+  quiescent = agent.status == "idle"
+              and accounting.state in {"settled", "released", "kept", "none"}
+              and turn_in_progress == false
+  ```
+
+  `pending`, `unknown`, and any value not in the allowlist (a future enum)
+  make it false. `kept` is admitted as a known, terminal outcome (the cost is
+  kept until a human releases it); it is not a success, and a consumer that
+  needs certainty reads `accounting.state == "settled"`. A reservation without
+  a marker or a ledger is `unknown` (above) and is **never** quiescent. It is
+  derived and documented, not a new source of truth.
 - The observation is **metadata only**: no message body and no `payload`.
   Reading content stays the mailbox API (`ameesh mail`, `ameesh fil`). It
   carries no secret and no DSN.
@@ -336,10 +371,11 @@ The supported low-latency configuration is the existing one:
   DeepSeek stay one process per turn until their usage is counted, L80).
 
 The turn context works in both modes. For a resident process the file path is
-fixed at start; its content is replaced per turn, and the existing
-`AMEESH_TURN_ID_FILE` still names the current turn to the hook. No new
-"session reuse" API is proposed: the context is per turn regardless of the
-process lifetime.
+fixed at start and its content is replaced per turn; `AMEESH_TURN_ID_FILE` is
+a current-turn pointer for the hook, **not an authorisation**. A consumer must
+capture `turn.id` at authorisation and verify it with `--expect-turn` on reuse
+(§2, "Reuse across a resident turn boundary"). No new "session reuse" API is
+proposed: the context is per turn regardless of the process lifetime.
 
 # Guarantees and versioning
 
@@ -350,13 +386,16 @@ process lifetime.
 - **Within `/1`**: only additive optional fields; no field is removed,
   renamed, retyped, or given a new meaning. Consumers must ignore unknown
   fields and must require `schema`. Enum values may be added; a consumer
-  treats an unknown enum value as `unknown` and never as success.
+  treats an unknown enum value as `unknown` and never as success. `quiescent`
+  uses an explicit allowlist, so a future accounting state cannot make it
+  true.
 - **Breaking change**: a new major (`/2`), published in parallel with `/1` for
   at least one minor release. The file/CLI/route stay `/1` until the release
   notes say otherwise.
-- **Fail closed**: no file, unreadable file, unknown schema, stale turn id or
-  lease mismatch all mean "not current" (exit 3 / 404), never best effort.
-  `--local` skips only the database re-check, not the turn-id and file checks.
+- **Fail closed**: no file, unreadable file, unknown schema, stale turn id,
+  expected-turn mismatch or lease mismatch all mean "not current" (exit 3 /
+  404), never best effort. `--local` skips only the database re-check, not the
+  turn-id, expected-turn and file checks.
 - **No secret** in either document; no DSN, key, token or password. The
   request bodies are already the agent's mail; observation is metadata.
 - **Performance**: a tool call reads the file, target under 2 ms; `ameesh turn
@@ -365,9 +404,12 @@ process lifetime.
   implementation lot on the IMA document path (#819: non-model overhead ≤ 3 s
   per turn).
 - **Tests**: contract tests for both schemas, a fake-harness end-to-end
-  (mail → turn → context → observation), lease loss → not current, stale
-  marker + ledger row → `settled`, unknown schema → refused, and the doc
-  readers list updated. The read API test is the existing
+  (mail → turn → context → observation), lease loss → not current, a resident
+  A→B same-lease sequence with a lingering A operation (`--expect-turn A`
+  refused, fresh B accepted), stale marker + ledger row → `settled`,
+  reservation without marker/ledger → `unknown` and `quiescent=false`, a
+  future accounting enum → not quiescent, unknown schema → refused, and the
+  doc readers list updated. The read API test is the existing
   `tests/test_l84_serve.py` contract.
 
 # What this note does not cover
@@ -396,7 +438,7 @@ process lifetime.
 
 | Lot | Content | Notes |
 |---|---|---|
-| A | Turn id allocated first; `turn-context.json` + `AMEESH_TURN_CONTEXT`; `ameesh turn current`; `meta.consigne.turn`; contract tests | runner/accounting: sensitive, another family's review and green CI (§2). ~2 days |
+| A | Turn id allocated first; `turn-context.json` + `AMEESH_TURN_CONTEXT`; `ameesh turn current` with the `--expect-turn` reuse fence; `meta.consigne.turn`; contract tests including resident A→B same-lease | runner/accounting: sensitive, another family's review and green CI (§2). ~2 days |
 | B | `ameesh turn observe`; `/api/v1/turns` and `/api/v1/requests`; OpenAPI; docs and contract tests | ~1.5 days |
 | C | IMA bridge migration (TPK): read the context file, use `turn observe`; drop the direct reads it can drop | outside ameesh; acceptance on the document path (#819) |
 | D (optional) | generic `mail send --idempotency-key`; `mail show` | companion, separate sensitive review |
@@ -408,3 +450,8 @@ as written** — the file + `ameesh turn current` + observation CLI/read API,
 with the two versioned schemas and the guarantees; implementation lots A and
 B, then the IMA migration C. The alternatives (b: CLI/read API only; c:
 document only; d: amend) were not retained.
+
+Post-sign-off review (blocked verdict on `38731676`, 2026-10-21) tightened the
+contract within option a: an expected turn id fences the reuse of an
+authorisation across a resident turn boundary, and `quiescent` uses an
+explicit accounting-state allowlist so unknown or future states never count.
