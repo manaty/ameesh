@@ -94,12 +94,15 @@ class Recorded:
         if item is None:
             raise TrainError("lot no longer open for train admission")
         try:
+            reference_families: dict = {}
             reference = review_authors.reference_author(
                 self.db, item, freeze, self.families,
-                provider=self.provider, strict=True)
+                provider=self.provider, strict=True,
+                families_out=reference_families)
             authors, unknown = review_authors.authors(
                 self.db, item, freeze, commits, self.path, self.families,
-                reference=reference, provider=self.provider, strict=True)
+                reference=reference, reference_families=reference_families,
+                provider=self.provider, strict=True)
             if unknown:
                 raise TrainError("unknown historical author for commit %s" % unknown[0])
             missing_family = [entry for entry in authors if not entry["family"]]

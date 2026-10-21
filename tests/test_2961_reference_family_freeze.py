@@ -64,13 +64,14 @@ class _Fixture(PgTestCase):
         return work.milestone(self.db, self.lot, "frozen", sha=self.frozen,
                               actor=actor)
 
-    def receipt(self, subject, *, actor="mesh-design", harness="codex"):
+    def receipt(self, subject, *, sha=None, actor="mesh-design", harness="codex"):
+        sha = self.frozen if sha is None else sha
         self.db.execute(
             "INSERT INTO provenance_receipts"
             " (subject, sha, actor, session, turn, harness, work_item_id)"
             " VALUES (%s, %s, %s, %s, 't', %s, %s)"
             " ON CONFLICT (subject) DO NOTHING",
-            (subject, self.frozen, actor, "s-" + harness, harness, self.lot))
+            (subject, sha, actor, "s-" + harness, harness, self.lot))
 
     def turn(self, harness, agent="mesh-design", seconds=1):
         self.db.execute(
@@ -163,6 +164,64 @@ class TurnJournalFallbackTest(_Fixture):
         self.assertEqual([row["actor"] for row in out["accepted"]], ["qa", "dev1"])
 
 
+class AmbiguousReferenceFamilyTest(_Fixture):
+    """B1 (#2961) : deux familles prouvées ne retombent pas au registre.
+
+    Le journal du gel dit codex, le reçu du commit dit claude : la lecture rend
+    une famille vide pour la référence. Ce n'est pas une absence de preuve —
+    les deux familles ont écrit — et la porte doit refuser au lieu de prendre
+    le registre (codex ici), qui laisserait passer un avis claude.
+    """
+
+    def setUp(self):
+        super().setUp()
+        registry.upsert(self.db, "mesh-design", harness="codex",
+                        host=self.cfg.host, cwd=self.repo.root, status="idle")
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh'"
+                        " WHERE name = 'mesh-design'")
+        self.freeze()
+        self.turn("codex")            # le tour qui a posé le gel
+        self.receipt("commit:" + self.frozen, harness="claude")
+        self.verdict("qa")            # deepseek
+        self.verdict("dev1")          # claude
+
+    def test_an_ambiguous_reference_refuses_instead_of_using_the_registry(self):
+        out = self.gate()
+        self.assertFalse(out["ok"], out)
+        self.assertIn("ambiguous", (out.get("error") or "")
+                      + (out.get("why") or ""))
+        self.assertEqual(out["accepted"], [])
+
+
+class AmbiguousCoauthorFamilyTest(_Fixture):
+    """Le même refus pour un coauteur lu sans famille unique (#2961, auditeur).
+
+    Deux commits du même coauteur, l'un reçu codex, l'autre reçu claude : sa
+    famille est vide par ambiguïté, jamais par absence. La porte du composeur
+    doit refuser comme `_complete_authors` (R9 B cx2).
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.repo.write("src/ameesh/merge_queue.py", "coauteur codex\n")
+        first = self.repo.commit("other: codex", agent="other")
+        self.receipt("commit:" + first, sha=first, actor="other", harness="codex")
+        self.repo.write("src/ameesh/merge_queue.py", "coauteur claude\n")
+        second = self.repo.commit("other: claude", agent="other")
+        self.receipt("commit:" + second, sha=second, actor="other", harness="claude")
+        self.frozen = second
+        self.freeze()
+        self.verdict("qa")
+        self.verdict("dev1")
+
+    def test_an_ambiguous_coauthor_refuses(self):
+        out = self.gate()
+        self.assertFalse(out["ok"], out)
+        self.assertIn("ambiguous", (out.get("error") or "")
+                      + (out.get("why") or ""))
+        self.assertIn("other", (out.get("error") or "") + (out.get("why") or ""))
+
+
 class FreezeReceiptFallbackTest(_Fixture):
     """Le reçu du jalon de gel donne la famille quand le journal est muet."""
 
@@ -200,6 +259,19 @@ class ContradictoryReceiptTest(_Fixture):
             self.db, item, self.mark, FAMILIES)
         self.assertEqual(loose["name"], "mesh-design")
         self.assertEqual(loose["family"], "")
+
+    def test_the_receipt_is_read_even_when_the_turn_gives_a_family(self):
+        # B2 (#2961) : le journal des tours donne codex, mais le reçu du jalon
+        # est contradictoire ; il doit être lu et refusé en strict.
+        self.turn("codex")
+        item = work.get(self.db, self.lot)
+        with self.assertRaises(review_provenance.ProvenanceError):
+            review_authors.reference_author(
+                self.db, item, self.mark, FAMILIES, strict=True)
+        out = self.gate()
+        self.assertFalse(out["ok"], out)
+        self.assertIn("contradictory", (out.get("error") or "")
+                      + (out.get("why") or ""))
 
     def test_the_gate_refuses_the_contradictory_freeze_receipt(self):
         out = self.gate()

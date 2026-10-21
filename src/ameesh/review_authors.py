@@ -161,7 +161,8 @@ def _milestone_receipt(provider, db, milestone_id: int, *, strict: bool) -> Opti
 
 
 def reference_author(db, item: Mapping, milestone: Optional[Mapping], families,
-                     *, provider=None, strict: bool = False) -> dict:
+                     *, provider=None, strict: bool = False,
+                     families_out: Optional[dict] = None) -> dict:
     """L'auteur de référence `{name, family}` : l'assigné au gel.
 
     La famille vient de la trace du gel (`_author_at_freeze`), sinon du reçu du
@@ -169,10 +170,16 @@ def reference_author(db, item: Mapping, milestone: Optional[Mapping], families,
     registre. C'est exactement la référence de la porte (`assignee`) ; le
     registre courant ne prouve une famille que lorsque le gel ne la donne pas.
 
-    `strict=True` (le train) refuse un reçu de jalon contradictoire ou
-    malformé (`ProvenanceError`) au lieu de lire son absence et de retomber
-    sur le registre ; la porte de fusion lit la même trace avec la même
-    exigence (#2961).
+    Le reçu du jalon est **toujours** lu quand il existe (#2961 B2), même si le
+    journal des tours a déjà donné une famille : un reçu contradictoire doit
+    être vu, et deux familles prouvées différentes sont une ambiguïté, pas un
+    choix. La famille rendue n'est renseignée que si une seule famille est
+    prouvée ; `families_out` (indexé par nom en minuscules) reçoit l'ensemble
+    des preuves pour que la porte distingue une absence d'une ambiguïté.
+
+    `strict=True` (le train, la porte) refuse un reçu de jalon contradictoire
+    ou malformé (`ProvenanceError`) au lieu de lire son absence et de retomber
+    sur le registre.
 
     #2803 : sur un lot porteur de paquet (`integration/**`), l'assigné est le
     **composeur** — un geste mécanique (canon §2/§11 bis), pas un auteur du
@@ -190,22 +197,28 @@ def reference_author(db, item: Mapping, milestone: Optional[Mapping], families,
     except Exception:  # noqa: BLE001 - trace illisible : famille inconnue
         author = {}
     name = str(author.get("name") or assignee).strip()
-    family = _family(author.get("harness"), families)
+    proven: set[str] = set()
+
+    def prove(harness) -> None:
+        family = _family(harness, families)
+        if family:
+            proven.add(family)
+
+    prove(author.get("harness"))
     # Un jalon sans identifiant positif n'est pas un reçu lisible : ce n'est
     # pas une preuve contradictoire, seulement une trace absente (#2961).
     try:
         milestone_id = int((milestone or {}).get("id") or 0)
     except (TypeError, ValueError):
         milestone_id = 0
-    if not family and milestone is not None and milestone_id > 0:
+    if milestone is not None and milestone_id > 0:
         try:
             proof = _milestone_receipt(provider, db, milestone_id,
                                        strict=strict)
         except review_provenance.ProvenanceError:
-            # #2961 : en mode strict (train, porte), un reçu contradictoire
-            # n'est pas une absence. La famille de la référence ne se remplace
-            # pas par le registre courant quand la preuve du gel dit autre
-            # chose : l'indépendance ne se suppose jamais.
+            # #2961 B2 : en mode strict (train, porte), un reçu contradictoire
+            # n'est pas une absence — même quand le journal des tours a déjà
+            # donné une famille. La preuve du gel ne se remplace pas.
             if strict:
                 raise
             proof = None
@@ -215,8 +228,8 @@ def reference_author(db, item: Mapping, milestone: Optional[Mapping], families,
                     "malformed freeze milestone for the reference author") from exc
             proof = None
         if proof and str(proof.get("actor") or "").strip() == name:
-            family = _family(proof.get("harness"), families)
-    if not family and name and (milestone is None
+            prove(proof.get("harness"))
+    if not proven and name and (milestone is None
                                 or str(milestone.get("actor") or "").strip()
                                 in ("", name)):
         try:
@@ -224,9 +237,12 @@ def reference_author(db, item: Mapping, milestone: Optional[Mapping], families,
             # le harnais déclaré n'est pas une session : seule une session
             # ouverte prouve la famille qui a réellement tourné (L242b, #1037)
             if row.get("session_id") or row.get("session_harness"):
-                family = _family(row.get("session_harness"), families)
+                prove(row.get("session_harness"))
         except Exception:  # noqa: BLE001 - pas de session : famille inconnue
-            family = ""
+            pass
+    if families_out is not None:
+        families_out[name.lower()] = set(proven)
+    family = next(iter(proven)) if len(proven) == 1 else ""
     return {"name": name, "family": family}
 
 
@@ -349,20 +365,25 @@ def actor_family(db, actor: str, at_ts: float, families) -> str:
 
 def reading(db, item: Mapping, milestone: Optional[Mapping],
             commits: Sequence[str], repo: str = "", families=(),
-            *, reference: Optional[Mapping] = None, provider=None,
+            *, reference: Optional[Mapping] = None,
+            reference_families: Optional[Mapping] = None, provider=None,
             strict: bool = False, trace: bool = False,
             families_out: Optional[dict] = None) -> tuple[list, list, list]:
     """`(auteurs, inconnus, correcteurs)` de la plage gelée, même lecture pour tous.
 
     `reference` est l'auteur de référence déjà lu (`reference_author`) : la
-    désignation et le train la partagent. `provider` est le fournisseur exact
-    de reçus (#1465) ; `strict` fait d'un reçu corrompu une erreur (le train),
-    au lieu d'une absence (la désignation attend). `trace=True` (désignation)
-    ajoute aux auteurs du repli `proof: turn-journal` et `fallback_commits` ;
-    le train et la porte gardent la forme exacte `{name, family}`.
-    `families_out` reçoit, par acteur en minuscules, l'ensemble des familles
-    **prouvées** : une famille vide peut être une absence de preuve ou une
-    ambiguïté, et l'appelant qui doit les distinguer ne peut pas la deviner.
+    désignation et le train la partagent. `reference_families` porte les
+    familles prouvées de cette référence (le `families_out` de
+    `reference_author`, #2961) : deux familles différentes sont une ambiguïté
+    et sont ajoutées aux preuves de l'auteur. `provider` est le fournisseur
+    exact de reçus (#1465) ; `strict` fait d'un reçu corrompu une erreur (le
+    train), au lieu d'une absence (la désignation attend). `trace=True`
+    (désignation) ajoute aux auteurs du repli `proof: turn-journal` et
+    `fallback_commits` ; le train et la porte gardent la forme exacte
+    `{name, family}`. `families_out` reçoit, par acteur en minuscules,
+    l'ensemble des familles **prouvées** : une famille vide peut être une
+    absence de preuve ou une ambiguïté, et l'appelant qui doit les distinguer
+    ne peut pas la deviner.
 
     Un commit sans reçu est attribué au committer d'adresse d'agent : un commit
     du titulaire de référence reste le sien ; un relecteur désigné reste
@@ -402,9 +423,11 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     """
     item = dict(item or {})
     packet = bool(packet_composer(item))
+    proven_reference: dict = dict(reference_families or {})
     if reference is None:
         reference = reference_author(db, item, milestone, families,
-                                     provider=provider, strict=strict)
+                                     provider=provider, strict=strict,
+                                     families_out=proven_reference)
     author_name = str((reference or {}).get("name") or "").strip()
     author_family = str((reference or {}).get("family") or "")
     reviewers = designated_reviewers(db, item, milestone, author_name)
@@ -474,6 +497,9 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     # amend), sa famille de gel reste une preuve historique, en plus de celle
     # du commit : deux familles prouvées sont ambiguës et font attendre
     # (#2755). Un titulaire sans commit n'ajoute ni nom ni famille.
+    # #2961 B2 : la référence peut avoir deux familles prouvées (journal du gel
+    # + reçu du jalon) ; la lecture les rend toutes pour que la porte refuse,
+    # au lieu d'en choisir une.
     authored = ""
     if author_name:
         authored = next((name for name in by_name
@@ -485,8 +511,12 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             elif written:
                 authored = author_name
                 by_name.setdefault(authored, set())
-        if authored and author_family:
-            by_name[authored].add(author_family)
+        if authored:
+            for family in proven_reference.get(author_name.lower()) or ():
+                if family:
+                    by_name[authored].add(family)
+            if author_family:
+                by_name[authored].add(author_family)
     # #2888 : toute correction d'un relecteur désigné fait de lui un auteur de
     # la tête, quelle que soit sa taille. Le seuil du §2 ne décide que de la
     # recevabilité process (une correction trop grosse revient à l'auteur),
@@ -533,12 +563,14 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
 
 def authors(db, item: Mapping, milestone: Optional[Mapping],
             commits: Sequence[str], repo: str = "", families=(),
-            *, reference: Optional[Mapping] = None, provider=None,
+            *, reference: Optional[Mapping] = None,
+            reference_families: Optional[Mapping] = None, provider=None,
             strict: bool = False, trace: bool = False) -> tuple[list, list]:
     """`(auteurs, inconnus)` — la lecture partagée, sans les correcteurs."""
     authors_, unknown, _correctors = reading(
         db, item, milestone, commits, repo, families, reference=reference,
-        provider=provider, strict=strict, trace=trace)
+        reference_families=reference_families, provider=provider,
+        strict=strict, trace=trace)
     return authors_, unknown
 
 
