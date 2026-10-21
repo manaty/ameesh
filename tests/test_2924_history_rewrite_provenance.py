@@ -328,6 +328,49 @@ class NoReceiptCorrectorTest(_RewriteFixture):
         self.assertNotIn("cx3", {row["name"] for row in correctors})
 
 
+class MissingPriorFreezeTest(_RewriteFixture):
+    """#2924 B5 : un gel antérieur absent du dépôt de la porte refuse fermé."""
+
+    def setUp(self):
+        super().setUp()
+        parent = self.repo.git("rev-parse", self.head_a + "^")
+        tree = self.repo.git("rev-parse", self.head_a + "^{tree}")
+        self.head_b = self.squash(tree, parent, "contenu consolidé")
+        self.freeze_b = self.freeze(self.head_b)
+        self.base = parent
+        self.milestone = {"id": int(self.freeze_b["id"]), "sha": self.head_b,
+                          "actor": "impl", "at_ts": self.freeze_b.get("at_ts")}
+        # Un dépôt qui ne contient que la cible et la tête 2 : le gel 1 (tête A)
+        # n'y est pas, comme le clone scratch de `merge-pr`.
+        self.scratch = _Repo(os.path.join(self.tmp, "scratch"))
+        self.scratch.git("remote", "add", "origin", self.repo.root)
+        self.scratch.git("fetch", "-q", "origin", self.head_b)
+
+    def test_the_reader_refuses_closed(self):
+        with self.assertRaises(review_provenance.ProvenanceError):
+            review_authors.reading(
+                self.db, self.lot_item(), self.milestone, [self.head_b],
+                self.scratch.root, FAMILIES, base=self.base, head=self.head_b,
+                strict=True)
+        _authors, unknown, _correctors = review_authors.reading(
+            self.db, self.lot_item(), self.milestone, [self.head_b],
+            self.scratch.root, FAMILIES, base=self.base, head=self.head_b)
+        self.assertEqual(unknown, [self.head_a[:12]])
+
+    def test_the_gate_refuses_closed(self):
+        klass = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "src/ameesh/runner.py",
+                            "class": "sensitive",
+                            "rule": ["src/ameesh/runner.py"]}],
+                 "repo": self.scratch.root, "target": self.base,
+                 "base_sha": self.base}
+        with self.assertRaises(merge_queue._ProvenanceError):
+            merge_queue._complete_authors(
+                self.db, self.lot_item(), self.head_b, self.scratch.root,
+                self.base, klass=klass,
+                marks=work.milestones(self.db, self.lot))
+
+
 class ParserTest(TestCase):
     """#2924 B1 : chaque fichier du diff garde ses propres lignes."""
 

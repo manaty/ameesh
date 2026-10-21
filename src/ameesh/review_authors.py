@@ -741,6 +741,10 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                       reverse=True):
         sha = str(row.get("sha") or "").strip()
         if not sha:
+            if strict:
+                raise review_provenance.ProvenanceError(
+                    "prior freeze #%s of lot #%d names no commit: its authors "
+                    "cannot be carried" % (row.get("id"), lot))
             unknown.append("freeze:%d" % int(row.get("id") or 0))
             continue
         # le contenu d'un gel déjà entré dans la cible n'est pas relu
@@ -751,10 +755,18 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
             continue
         start = plan_git._out(repo, "merge-base", sha, base or head_sha)
         if not start:
+            if strict:
+                raise review_provenance.ProvenanceError(
+                    "prior freeze %s of lot #%d is not readable against the base: "
+                    "its authors cannot be carried" % (sha[:12], lot))
             unknown.append(sha[:12])
             continue
         earlier = _commits_between(repo, start, sha)
         if earlier is None:
+            if strict:
+                raise review_provenance.ProvenanceError(
+                    "the commit range of prior freeze %s of lot #%d is unreadable"
+                    % (sha[:12], lot))
             unknown.append(sha[:12])
             continue
         processed.append(sha)
@@ -765,7 +777,11 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
             by_name, written, review_commits, unreadable = _prior_reading(
                 db, item, row, earlier, repo, families,
                 provider=provider, strict=strict)
-        except Exception:  # noqa: BLE001 - un gel antérieur illisible
+        except Exception as exc:  # noqa: BLE001 - un gel antérieur illisible
+            if strict:
+                raise review_provenance.ProvenanceError(
+                    "the authors of prior freeze %s of lot #%d cannot be read (%s)"
+                    % (sha[:12], lot, exc)) from exc
             unknown.append(sha[:12])
             continue
         unknown.extend(unreadable)

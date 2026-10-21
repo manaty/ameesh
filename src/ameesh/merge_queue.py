@@ -1234,7 +1234,14 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
                 reader_names.add(name.lower())
             add(name, entry.get("family"))
         for sha in unknown or ():
-            add(_commit_author(places, sha))
+            # #2924 B5 : un inconnu qui n'est même pas un commit lisible (un gel
+            # antérieur absent du dépôt scratch, un marqueur « freeze:N ») ne
+            # doit pas être silencieusement ignoré : la porte refuse fermé.
+            fallback = _commit_author(places, sha)
+            if not fallback:
+                raise _ProvenanceError(
+                    "historical author unreadable for the unknown %s" % sha)
+            add(fallback)
     for name in _merge_authors(repo, item, frozen, base=base, base_repo=base_repo,
                                target=target, target_repo=target_repo, queue=queue):
         add(name)

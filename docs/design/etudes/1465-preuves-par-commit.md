@@ -188,7 +188,13 @@ auteurs tant que leur contenu subsiste :
 Un correctif réellement réécrit n'est pas repris (cas admissible, décision
 documentée) ; une réécriture partielle reste attribuée et une lecture illisible
 ou ambiguë conserve l'auteur. Un journal de jalons illisible ne rend jamais une
-liste vide : la lecture stricte refuse, la désignation attend (unknown). La même
+liste vide : la lecture stricte refuse, la désignation attend (unknown). Un gel
+antérieur absent du dépôt de lecture — le clone scratch de `merge-pr` ne
+récupère que la cible et `refs/pull/N/head` — est traité de même : la porte
+stricte refuse plutôt que de retomber sur la plage courante. Consigner la
+lecture des auteurs dans la marque du gel, pour qu'un lecteur ultérieur n'ait
+plus besoin des objets réécrits, est la suite qui rendra la porte passable ;
+tant qu'elle n'est pas faite, le doute ferme la porte. La même
 lecture sert la désignation, la porte et le train (`base`/`head` passés par
 chaque appelant) ; les correcteurs antérieurs restent tracés pour l'exclusion
 personnelle. Un lot porteur de paquet reste hors de la reprise (#2803 : seule
