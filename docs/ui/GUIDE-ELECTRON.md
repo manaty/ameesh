@@ -149,7 +149,13 @@ ipcMain.handle("ameesh:open", (_event, target) => {
   `control-*.sock`), never in the renderer — a page has no socket API. Merge
   the states and expose them as `deviceState()`; a clean stop writes
   `{"op":"stop","agent":"…"}` on the agent's control socket, an immediate
-  stop belongs to the Compute runner. Nothing of this crosses the mesh. See
+  stop belongs to the Compute runner. Resolve the agent's control socket in
+  main from freshly discovered local state; never accept a socket path from
+  the renderer, and reject unknown or ambiguous agent/runner matches. Validate
+  IPC senders and arguments. The component confirms an immediate stop; main
+  must also request native confirmation before destroying a sandbox, because
+  renderer events and direct IPC calls can be forged. Cancellation does
+  nothing. Nothing of this crosses the mesh. See
   [`../DEVICE-LOCAL.md`](../DEVICE-LOCAL.md).
 
 ## Content Security Policy

@@ -375,7 +375,7 @@ def _waiver(db, item) -> tuple:
 
 
 def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=None,
-                           commits=None):
+                           commits=None, strict=False, families_out=None):
     """Les auteurs et correcteurs de la tête gelée (#2681/#2739/#2888).
 
     Lecture des commits exacts de la plage gelée et de leur provenance, la même
@@ -389,6 +389,11 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
     historique. Lève quand une lecture était possible et a échoué : une porte
     qui ne peut pas prouver qui a écrit la tête ne compte pas un avis non
     prouvé (l'indépendance ne se suppose pas).
+
+    #2961 : `strict=True` (la porte) refuse un reçu de provenance
+    contradictoire au lieu de le lire comme une absence. `families_out` reçoit
+    les familles prouvées par acteur : une famille vide est une absence ou une
+    ambiguïté, et la porte doit pouvoir les distinguer.
 
     #2803 : `commits` est la liste déjà calculée du delta propre d'un véhicule
     (`packet_reviews.need`) ; la lecture porte alors sur ce seul contenu relu,
@@ -404,7 +409,7 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
     milestone = _freeze_milestone(marks, frozen, repo)
     authors, unknown, correctors = act.attribution_of_head(
         db, item, milestone, repo, base, frozen, families=families or (),
-        commits=commits)
+        commits=commits, strict=strict, families_out=families_out)
     if unknown:
         raise ValueError("author provenance unknown for frozen commit(s): %s"
                          % ", ".join(unknown))
@@ -492,6 +497,13 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     code de porte, mais les familles des reçus/tours à la date des faits au
     lieu du registre courant. Un appelant qui le fournit ne lit ni le registre
     ni le canon compilé.
+
+    #2961 : sans `family_of`, la famille de la référence se lit sur la même
+    trace du gel que la désignation (`review_authors.reference_author`) : reçu
+    du commit, journal des tours, sinon reçu du jalon de gel. Le registre
+    courant ne remplace pas une famille historique prouvée — un auteur gelé en
+    codex puis rouvert en claude au registre garde codex (#2892) ; un reçu de
+    provenance contradictoire refuse la porte (lecture `strict`).
 
     #2726 : sans `authors`, la porte lit elle-même les auteurs reconnus de la
     plage gelée quand le dépôt, la base et la ligne du lot sont connus
@@ -712,37 +724,20 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             name, family = str(entry or "").strip(), ""
         if name and family:
             provided.setdefault(name.lower(), family)
-    try:
-        if family_of is not None:
-            author_family = _family_of(author)
-            if not author_family and author.lower() in provided:
-                author_family = provided[author.lower()]
-        elif author.lower() in provided:
-            author_family = provided[author.lower()]
-        else:
-            author_family = _family_of(author)
-    except RegistryReadError as exc:
-        # #2521 : le registre est illisible, ce n'est pas « famille inconnue ».
-        # La porte refuse toujours (l'indépendance ne se suppose pas) mais le
-        # diagnostic doit dire la lecture impossible, pas un verdict manquant.
-        out["error"] = str(exc)
-        out["why"] = ("no review verdict ok on the freeze %s (class: %s): the agent "
-                      "registry cannot be read (%s), so no verdict can be proven "
-                      "independent (canon §2: independence is never assumed)"
-                      % (frozen[:12], cls, exc))
-        return out
-    out["author_family"] = author_family
     # #2726 : la porte lit elle-même la plage gelée quand l'appelant ne passe
     # pas les auteurs — le feu, la file et le paquet, qui ne les lisaient pas.
     # La même lecture rend les correcteurs (#2739) et échoue fermé quand la
     # provenance manque : une porte qui ne peut pas prouver qui a écrit la tête
     # ne compte pas un avis non prouvé (l'indépendance ne se suppose pas).
     corrections: set = set()
+    proven_families: dict = {}
     try:
         attribution = _attribution_on_freeze(db, marks, frozen, repo=repo,
                                              klass=klass, item=item,
                                              families=families,
-                                             commits=own_commits if vehicle_delta else None)
+                                             commits=own_commits if vehicle_delta else None,
+                                             strict=True,
+                                             families_out=proven_families)
     except Exception as exc:  # noqa: BLE001 - une plage illisible ne conclut pas
         out["error"] = str(exc)
         out["why"] = ("no review verdict ok on the freeze %s (class: %s): the frozen "
@@ -762,6 +757,20 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                        for row in range_correctors or ()
                        if str((row or {}).get("name") or "").strip()}
     out["corrections"] = sorted(corrections)
+    # #2961 : la famille de la référence est celle de la **trace du gel**,
+    # lue avec la plage gelée (`review_authors.reading` : reçu exact du commit,
+    # journal des tours du commit, sinon famille de référence du gel par
+    # `reference_author` en `strict=True` ci-dessus). Le registre courant ne
+    # remplace plus une famille historique prouvée : un auteur gelé en codex
+    # puis rouvert en claude au registre garde codex comme référence (#2892).
+    # `proven_families` distingue une famille vide par absence de preuve d'une
+    # famille vide par ambiguïté (B1) : seule l'absence garde le repli
+    # historique, l'ambiguïté refuse plus bas.
+    reference_entry = next(
+        (row for row in range_authors or ()
+         if isinstance(row, Mapping) and author
+         and str(row.get("name") or "").strip().lower() == author.lower()),
+        None)
 
     def _author_names(rows) -> set:
         return {str((row or {}).get("name") or "").strip().lower()
@@ -781,6 +790,72 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             range_authors)
     else:
         reference_is_author = True
+    # #2961 B1 : une famille vide n'est pas toujours une absence de preuve.
+    # `families_out` porte les familles réellement prouvées : >1 pour la
+    # référence est une **ambiguïté** (journal du gel codex + reçu de commit
+    # claude, par exemple), jamais un choix à faire au registre courant
+    # (#2755). L'absence de preuve garde, elle, le repli historique.
+    reference_proven: set = set()
+    if attribution is not None and author and reference_is_author:
+        reference_proven = set(proven_families.get(author.lower()) or ())
+        if len(reference_proven) > 1:
+            out["error"] = ("ambiguous historical author family for %s: %s"
+                            % (author, ", ".join(sorted(reference_proven))))
+            out["why"] = (
+                "no review verdict ok on the freeze %s (class: %s): the reference "
+                "author %s has %d proven model families (%s), so no verdict can be "
+                "proven independent (canon §2: independence is never assumed)"
+                % (frozen[:12], cls, author, len(reference_proven),
+                   ", ".join(sorted(reference_proven))))
+            return out
+    try:
+        if family_of is not None:
+            author_family = _family_of(author)
+            if not author_family and author.lower() in provided:
+                author_family = provided[author.lower()]
+        elif reference_is_author and len(reference_proven) == 1:
+            author_family = next(iter(reference_proven))
+        elif reference_entry is not None and not exact:
+            author_family = str(reference_entry.get("family") or "")
+            if not author_family:
+                author_family = (provided.get(author.lower(), "")
+                                 or _family_of(author))
+        elif author.lower() in provided:
+            author_family = provided[author.lower()]
+        else:
+            author_family = _family_of(author)
+    except RegistryReadError as exc:
+        # #2521 : le registre est illisible, ce n'est pas « famille inconnue ».
+        # La porte refuse toujours (l'indépendance ne se suppose pas) mais le
+        # diagnostic doit dire la lecture impossible, pas un verdict manquant.
+        out["error"] = str(exc)
+        out["why"] = ("no review verdict ok on the freeze %s (class: %s): the agent "
+                      "registry cannot be read (%s), so no verdict can be proven "
+                      "independent (canon §2: independence is never assumed)"
+                      % (frozen[:12], cls, exc))
+        return out
+    out["author_family"] = author_family
+    # #2961 (auditeur) : la même distinction pour les autres auteurs lus. Une
+    # entrée sans famille peut cacher deux familles prouvées ; `_complete_authors`
+    # refuse déjà ce cas (R9 B cx2), la porte du composeur doit faire de même.
+    for entry in authors or ():
+        if not isinstance(entry, Mapping):
+            continue
+        name = str(entry.get("name") or "").strip()
+        if not name or str(entry.get("family") or "").strip():
+            continue
+        if author and name.lower() == author.lower():
+            continue
+        proven = set(proven_families.get(name.lower()) or ())
+        if len(proven) > 1:
+            out["error"] = ("ambiguous historical author family for %s: %s"
+                            % (name, ", ".join(sorted(proven))))
+            out["why"] = (
+                "no review verdict ok on the freeze %s (class: %s): the author %s "
+                "has %d proven model families (%s), so no verdict can be proven "
+                "independent (canon §2: independence is never assumed)"
+                % (frozen[:12], cls, name, len(proven), ", ".join(sorted(proven))))
+            return out
     # #2681/#2808/#2888 : les auteurs **reconnus** de la tête, quand l'appelant
     # les a lus (`review_authors.authors`). Un tiers avec reçu exact et tout
     # relecteur qui a poussé un correctif, même petit, s'y ajoutent : leur
@@ -1330,12 +1405,16 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
         commits = _delta_commits(repo, item, frozen, base=base, base_repo=base_repo,
                                  target=target, target_repo=target_repo, queue=queue)
         milestone = _freeze_milestone(marks, frozen, repo)
+        reference_families: dict = {}
         try:
             # #2808 : la référence est l'assigné **au gel**, pas le titulaire
             # courant ; elle n'est auteur que par un commit de la plage. Le
             # repli de famille ne vaut que pour attribuer un commit sans reçu.
+            # #2961 : ses familles prouvées passent à la lecture pour que deux
+            # preuves différentes (journal du gel + reçu) restent ambiguës.
             reference = review_authors.reference_author(
-                db, item, milestone, families, strict=True)
+                db, item, milestone, families, strict=True,
+                families_out=reference_families)
         except Exception as exc:  # noqa: BLE001 - référence illisible : refus
             raise _ProvenanceError(
                 "the reference author of the frozen head cannot be read (%s)"
@@ -1347,7 +1426,8 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
             read, unknown, _correctors = review_authors.reading(
                 db, item, milestone, commits, repo,
                 families=families, strict=True, families_out=proven_families,
-                reference=reference, base=base, head=frozen, recover=recover)
+                reference=reference, reference_families=reference_families,
+                base=base, head=frozen, recover=recover)
         except Exception as exc:  # noqa: BLE001 - une lecture illisible ne conclut pas
             raise _ProvenanceError(
                 "the authors of the frozen range cannot be read (%s)" % exc) from exc

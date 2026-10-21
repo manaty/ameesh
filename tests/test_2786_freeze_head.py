@@ -154,6 +154,30 @@ class FreezeHeadWriteTest(PgTestCase):
         self.assertIn("head-missing", proc.stderr)
         self.assertEqual(self.freezes(), [])
 
+    def test_un_sha_complet_absent_est_refuse_a_la_creation(self):
+        # #2989 : un gel fantôme ne s'écrit plus par la CLI ; sans cette
+        # validation, son SHA inexistant bloquerait la provenance des gels
+        # suivants (#2914, gel 14991). Un `--repo` autoritaire prouve l'absence ;
+        # un hôte sans dépôt de lecture garde l'ancien comportement (#2542).
+        # #2962 : le refus d'une tête absente porte le nom `head-unresolved`,
+        # le même qu'une abréviation non résolue (l'union des deux lots garde
+        # la garde de #2989 et le nom de #2962).
+        ghost = "c" * 40
+        repo = tempfile.mkdtemp(prefix="ameesh-2989-")
+        self.addCleanup(shutil.rmtree, repo, True)
+        repo_with_commit(repo)
+        item = work.get(self.db, self.lot)
+        with self.assertRaises(work.WorkError) as caught:
+            work.freeze_head(self.db, item, ghost, repo=repo, require_present=True)
+        self.assertIn("head-unresolved", str(caught.exception))
+        self.assertIn(ghost[:12], str(caught.exception))
+        proc = self.mesh("work", "milestone", str(self.lot), "frozen",
+                         "--sha", ghost, "--actor", "auteur", "--repo", repo,
+                         env=self.env(AGENT_MAIL_NAME="auteur"))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("head-unresolved", proc.stderr)
+        self.assertEqual(self.freezes(), [])
+
     def test_work_show_signale_un_ancien_gel_head(self):
         # Un gel écrit avant la règle (aucune écriture refusée alors) : il
         # reste lisible, et la vue dit qu'il ne prouve pas une livraison.
