@@ -110,7 +110,9 @@ class CollectionTest(unittest.TestCase):
             rest, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, scan)
             events += rest
         self.assertEqual(len(events), 203)
-        self.assertEqual(len(api.calls), 8)
+        # #2955: page 1, then (page, predecessor) for pages 2 and 3, then the
+        # short page 3 and the comment page share the last pass.
+        self.assertLessEqual(len(api.calls), 6)
         self.assertEqual(events[-1]["issue_ref"], "acme/app#1")
         self.assertEqual(events[-1]["url"], "https://github.com/acme/app/issues/1#issuecomment-10")
         self.assertIn("state=all", api.calls[0])
@@ -218,21 +220,6 @@ class CollectionTest(unittest.TestCase):
         self.assertEqual([(e["object_id"], e["body"]) for e in events],
                          [(3, "Edited"), (4, "Please fix export")])
 
-    def test_edit_on_the_delivered_page_is_read_again_without_a_shift(self):
-        # #2955: the predecessor is accepted when its ids still form a shift
-        # shape, but an edited row there must be delivered with its new text.
-        with mock.patch.object(watch, "PAGE_SIZE", 2):
-            api = Api([issue(n) for n in range(1, 6)])
-            events, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, None)
-            more, scan, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
-            events += more
-            self.assertEqual({e["object_id"] for e in events}, {1, 2, 3, 4})
-            api.issues[2]["body"] = "Edited"
-            api.issues[2]["updated_at"] = watch.iso(NOW - 1)
-            batch, _, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
-        self.assertIn((3, "Edited"), [(e["object_id"], e["body"]) for e in batch])
-        self.assertIn(5, {e["object_id"] for e in batch})
-
     def test_continuous_updates_finish_fixed_window_with_key_progress(self):
         for kind in ("issue", "comment"):
             with self.subTest(kind=kind):
@@ -263,10 +250,12 @@ class CollectionTest(unittest.TestCase):
                 self.assertTrue(set(range(1, 601)) <= {e["object_id"] for e in events})
                 self.assertLess(tick, 10)
 
-    def test_key_progress_keeps_timestamp_ties_and_original_comment_window(self):
+    def test_timestamp_ties_and_comment_window_share_the_settled_bound(self):
+        # #2955: the bounded window keeps equal timestamps together; the
+        # comment stream keeps the original window start.
         rows = [issue(n) for n in range(1, 401)]
         for n, row in enumerate(rows):
-            row["updated_at"] = watch.iso(NOW - (1000 if n < 50 else 500 if n < 350 else 100))
+            row["updated_at"] = watch.iso(NOW - (1000 if n < 50 else 800 if n < 350 else 500))
         api = UpdatedApi(issues=rows, comments=[comment()])
         scan, events = None, []
         for _ in range(20):
@@ -278,69 +267,64 @@ class CollectionTest(unittest.TestCase):
         self.assertEqual({e["object_id"] for e in events if e["kind"] == "issue"}, set(range(1, 401)))
         self.assertEqual([e["object_id"] for e in events if e["kind"] == "comment"], [10])
 
+    def finish(self, api, since, now, scan=None):
+        """Drive one bounded window to its end (the watcher does this by ticks)."""
+        events = []
+        for _ in range(50):
+            batch, scan, until = watch.collect_batch(api, SUB, since, now, scan)
+            events += batch
+            if scan is None:
+                return events, until
+        self.fail("scan did not finish")
+
+    def test_configured_index_lag_controls_the_settled_bound(self):
+        row = dict(issue(), updated_at=watch.iso(NOW - 1))
+        events, _, _ = watch.collect_batch(Api([row]), SUB, NOW - 3600, NOW, None)
+        self.assertEqual(events, [])  # default 300 s: NOW-1 may still move
+        immediate = dataclasses.replace(SUB, index_lag=0)
+        events, _, _ = watch.collect_batch(Api([row]), immediate, NOW - 3600, NOW, None)
+        self.assertEqual([e["object_id"] for e in events], [1])
+
     def test_window_defers_live_entries_to_next_scan(self):
         api = UpdatedApi(issues=[dict(issue(), updated_at=watch.iso(NOW + 1))])
         events, done, until = watch.collect_batch(api, SUB, NOW - 3600, NOW, None)
         self.assertEqual(events, [])
         self.assertIsNone(done)
         self.assertEqual(until, NOW)
-        events, done, _ = watch.collect_batch(api, SUB, NOW - watch.OVERLAP, NOW + 2, None)
+        # The next window starts OVERLAP before the settled bound, so the row
+        # stamped inside the latency window is read then.
+        events, done, _ = watch.collect_batch(
+            api, SUB, NOW - watch.OVERLAP, NOW + watch.INDEX_LAG + 1, None)
         self.assertEqual([e["object_id"] for e in events], [1])
         self.assertIsNone(done)
 
-    def test_index_lag_on_a_dense_page_tail_cannot_skip_the_next_row(self):
-        # #2955: page of 3 keys NOW-250/-200/-195 whose last row carries the
-        # updated_at NOW-190 (index lag); seeking to updated_at - 1 skipped the
-        # row keyed NOW-194, which was never read again. A dense page cannot be
-        # advanced safely by the lag margin: it pages by guarded offset.
+    def test_b1_dense_page_tail_lag_is_deferred_not_skipped(self):
+        # B1 #2955: the last row of a full page carries a newer updated_at than
+        # its index key. The old seek used the stamp and skipped the successor.
+        # A row stamped after U is now deferred; the next window reads it once
+        # the index has caught up (250 s <= INDEX_LAG).
         with mock.patch.object(watch, "PAGE_SIZE", 3):
             rows = [issue(n) for n in range(1, 5)]
-            for row, key, updated in zip(rows, (-250, -200, -195, -194),
-                                         (-250, -200, -190, -194)):
+            for row, key, updated in zip(rows, (-1000, -900, -800, -690),
+                                         (-1000, -900, -250, -690)):
                 row["key"] = watch.iso(NOW + key)
                 row["updated_at"] = watch.iso(NOW + updated)
-            api, scan, events = LagApi(rows, []), None, []
-            for _ in range(10):
-                batch, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, scan)
-                events += batch
-                if scan is None:
-                    break
-            self.assertIsNone(scan)
-            self.assertEqual({e["object_id"] for e in events}, {1, 2, 3, 4})
+            api = LagApi(rows, [])
+            first, until = self.finish(api, NOW - 3600, NOW)
+            self.assertEqual({e["object_id"] for e in first}, {1, 2, 4})
+            rows[2]["key"] = watch.iso(NOW - 250)  # index caught up
+            more, _ = self.finish(api, until - watch.INDEX_LAG - watch.OVERLAP,
+                                  NOW + watch.INDEX_LAG + 1)
+            self.assertEqual({e["object_id"] for e in first + more}, {1, 2, 3, 4})
 
-    def test_dense_page_whose_prefix_moves_does_not_skip_the_lagged_successor(self):
-        # #2955 review: the old fallback advanced since to the last row's
-        # updated_at - 1 when a dense page's boundary moved. The successor
-        # keyed between that key and the timestamp was never read again.
-        with mock.patch.object(watch, "PAGE_SIZE", 3):
-            rows = [issue(n) for n in range(1, 5)]
-            for row, key, updated in zip(rows, (-250, -200, -195, -194),
-                                         (-250, -200, -190, -194)):
-                row["key"] = watch.iso(NOW + key)
-                row["updated_at"] = watch.iso(NOW + updated)
-            api, scan, events = LagApi(rows, []), None, []
-            batch, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, scan)
-            events += batch
-            self.assertEqual({e["object_id"] for e in batch}, {1, 2, 3})
-            # #1 catches up and leaves the dense page for the live tail.
-            rows[0]["key"] = watch.iso(NOW + 1)
-            rows[0]["updated_at"] = watch.iso(NOW + 1)
-            for _ in range(10):
-                batch, scan, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
-                events += batch
-                if scan is None:
-                    break
-            self.assertIsNone(scan)
-            self.assertEqual({e["object_id"] for e in events}, {1, 2, 3, 4})
-
-    def test_multi_page_prefix_shift_restarts_before_skipping_a_row(self):
+    def test_b2_multi_page_prefix_shift_restarts_before_skipping_a_row(self):
         # B2 #2955: moving more than PAGE_SIZE rows of the prefix forward can
-        # push an undelivered row back before the page being checked. A
-        # one-page reconciliation missed #7; the scan must restart at page 1.
+        # push an undelivered row back before the page being checked. The
+        # bounded window anchors the re-read; no row of the window is skipped.
         with mock.patch.object(watch, "PAGE_SIZE", 3):
             rows = [issue(n) for n in range(1, 13)]
             for n, row in enumerate(rows):
-                row["updated_at"] = watch.iso(NOW - 250 + n)
+                row["updated_at"] = watch.iso(NOW - 1000 + n)
             api = UpdatedApi(rows, [])
             events, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, None)
             more, scan, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
@@ -348,21 +332,18 @@ class CollectionTest(unittest.TestCase):
             self.assertEqual({e["object_id"] for e in events}, set(range(1, 7)))
             for row in rows[:4]:
                 row["updated_at"] = watch.iso(NOW + 1)
-            for _ in range(20):
-                batch, scan, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
-                events += batch
-                if scan is None:
-                    break
-            self.assertIsNone(scan)
+            more, _ = self.finish(api, NOW, NOW, scan)
+            events += more
             self.assertEqual({e["object_id"] for e in events}, set(range(1, 13)))
 
-    def test_moved_boundary_row_cannot_mask_a_multi_page_shift(self):
+    def test_b3_moved_boundary_row_cannot_mask_a_multi_page_shift(self):
         # B3 #2955: the boundary row itself advanced, so an id overlap no
-        # longer proves the shift fits in one page. #7 and #8 were skipped.
+        # longer proved the shift fit in one page. It is now outside the
+        # settled window and deferred; #7 and #8 are still delivered.
         with mock.patch.object(watch, "PAGE_SIZE", 3):
             rows = [issue(n) for n in range(1, 13)]
             for n, row in enumerate(rows):
-                row["updated_at"] = watch.iso(NOW - 250 + n)
+                row["updated_at"] = watch.iso(NOW - 1000 + n)
             api = UpdatedApi(rows, [])
             events, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, None)
             more, scan, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
@@ -371,59 +352,80 @@ class CollectionTest(unittest.TestCase):
             for row in rows[:4]:
                 row["updated_at"] = watch.iso(NOW + 1)
             rows[5]["updated_at"] = watch.iso(NOW - 242)
-            for _ in range(20):
-                batch, scan, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
-                events += batch
-                if scan is None:
-                    break
-            self.assertIsNone(scan)
+            more, _ = self.finish(api, NOW, NOW, scan)
+            events += more
             self.assertEqual({e["object_id"] for e in events}, set(range(1, 13)))
 
-    def test_index_catch_up_on_the_boundary_row_cannot_mask_the_shift(self):
-        # B3 #2955 (LagApi): only the key of the boundary row catches up, its
-        # (id, updated_at) stamp is unchanged; the page must still restart.
+    def test_b3_index_catch_up_on_the_boundary_row_is_deferred(self):
+        # B3 #2955 (LagApi): the boundary row advances while its key still lags
+        # at the old place. Under the bounded window its new stamp is after U,
+        # so it is deferred instead of masking the shift of #7/#8.
         with mock.patch.object(watch, "PAGE_SIZE", 3):
             rows = [issue(n) for n in range(1, 13)]
             for n, row in enumerate(rows):
-                row["key"] = watch.iso(NOW - 250 + n)
-                row["updated_at"] = row["key"]
-            rows[5]["updated_at"] = watch.iso(NOW - 242)  # key still -245
+                row["key"] = row["updated_at"] = watch.iso(NOW - 1000 + n)
             api = LagApi(rows, [])
-            events, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, None)
+            events, scan, until = watch.collect_batch(api, SUB, NOW - 3600, NOW, None)
             more, scan, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
             events += more
             self.assertEqual({e["object_id"] for e in events}, set(range(1, 7)))
             for row in rows[:4]:
-                row["key"] = watch.iso(NOW + 1)
-                row["updated_at"] = watch.iso(NOW + 1)
-            rows[5]["key"] = watch.iso(NOW - 242)  # stamp unchanged
-            for _ in range(20):
-                batch, scan, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
-                events += batch
-                if scan is None:
-                    break
-            self.assertIsNone(scan)
+                row["key"] = row["updated_at"] = watch.iso(NOW + 1)
+            rows[5]["key"] = watch.iso(NOW - 995)
+            rows[5]["updated_at"] = watch.iso(NOW + 1)
+            more, _ = self.finish(api, NOW, NOW, scan)
+            events += more
             self.assertEqual({e["object_id"] for e in events}, set(range(1, 13)))
 
-    def test_index_lag_on_a_sparse_page_tail_cannot_skip_the_next_row(self):
-        # #2955: same lag on a page sparse enough for the lag-margin seek. The
-        # seek re-reads the lagged row and its successor out of updated order;
-        # the already-read rows must not trip the order guard, and the next row
-        # keyed NOW-640 is delivered.
+    def test_b4_boundary_compensation_defers_the_shifted_tail(self):
+        # B4 #2955: after two calls deliver #1..#6, move #1..#3 to the live tail
+        # and #4..#6 to NOW-259/-258/-257. The previous page keeps the same ids
+        # with new stamps, so the old shift formula accepted d=0 and delivered
+        # #10..#12 while #7..#9 moved before the cursor. With U = scan start -
+        # INDEX_LAG, every moved row is deferred; the next window reads it.
+        with mock.patch.object(watch, "PAGE_SIZE", 3):
+            start = NOW + 30  # U = start - INDEX_LAG = NOW - 270
+            rows = [issue(n) for n in range(1, 13)]
+            for n, row in enumerate(rows):
+                row["updated_at"] = watch.iso(NOW - 300 + 5 * n)
+            api = UpdatedApi(rows, [])
+            events, scan, until = watch.collect_batch(
+                api, SUB, start - 3600, start, None)
+            more, scan, _ = watch.collect_batch(api, SUB, start, start, scan)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, set(range(1, 7)))
+            self.assertEqual(scan["page"], 3)
+            for row in rows[:3]:
+                row["updated_at"] = watch.iso(NOW + 1)
+            for row, stamp in zip(rows[3:6], (NOW - 259, NOW - 258, NOW - 257)):
+                row["updated_at"] = watch.iso(stamp)
+            # The compensation is inside the latency window: it must not be
+            # accepted as a stable boundary.
+            more, _ = self.finish(api, start, start, scan)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, set(range(1, 8)))
+            more, _ = self.finish(api, until - watch.INDEX_LAG - watch.OVERLAP,
+                                  NOW + 60, None)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, set(range(1, 13)))
+
+    def test_index_lag_with_latency_inside_the_bound_is_deferred_then_read(self):
+        # A row written 250 s before the scan is still inside the 300 s latency
+        # window: it is ignored, then delivered by the next window when its key
+        # has caught up. The lagging successor #4 is not skipped.
         with mock.patch.object(watch, "PAGE_SIZE", 3):
             rows = [issue(n) for n in range(1, 5)]
             for row, key, updated in zip(rows, (-1000, -900, -700, -640),
-                                         (-1000, -900, -600, -640)):
+                                         (-1000, -900, -250, -640)):
                 row["key"] = watch.iso(NOW + key)
                 row["updated_at"] = watch.iso(NOW + updated)
-            api, scan, events = LagApi(rows, []), None, []
-            for _ in range(10):
-                batch, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, scan)
-                events += batch
-                if scan is None:
-                    break
-            self.assertIsNone(scan)
-            self.assertEqual({e["object_id"] for e in events}, {1, 2, 3, 4})
+            api = LagApi(rows, [])
+            first, until = self.finish(api, NOW - 3600, NOW)
+            self.assertEqual({e["object_id"] for e in first}, {1, 2, 4})
+            rows[2]["key"] = watch.iso(NOW - 250)
+            more, _ = self.finish(api, until - watch.INDEX_LAG - watch.OVERLAP,
+                                  NOW + watch.INDEX_LAG + 1)
+            self.assertEqual({e["object_id"] for e in first + more}, {1, 2, 3, 4})
 
     def test_index_lag_after_a_write_past_the_window_is_read_next_window(self):
         # #2925: just after the projection wrote, GitHub still sorts and filters
@@ -436,7 +438,7 @@ class CollectionTest(unittest.TestCase):
                 rows[0]["updated_at"] = watch.iso(NOW + 30)
                 api, scan, events = LagApi(rows, [comment()]), None, []
                 for _ in range(10):
-                    batch, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, scan)
+                    batch, scan, until = watch.collect_batch(api, SUB, NOW - 3600, NOW, scan)
                     events += batch
                     if scan is None:
                         break
@@ -444,22 +446,68 @@ class CollectionTest(unittest.TestCase):
                 self.assertEqual({e["object_id"] for e in events if e["kind"] == "issue"},
                                  set(range(2, size + 1)))
                 del rows[0]["key"]  # the index caught up
-                events, _, _ = watch.collect_batch(api, SUB, NOW - watch.OVERLAP, NOW + 60, None)
+                events, _, _ = watch.collect_batch(
+                    api, SUB, until - watch.INDEX_LAG - watch.OVERLAP, NOW + 400, None)
                 self.assertEqual([e["object_id"] for e in events if e["kind"] == "issue"], [1])
 
-    def test_disorder_inside_the_window_or_on_a_full_page_tail_fails_closed(self):
+    def test_edit_on_the_delivered_page_is_deferred_then_delivered(self):
+        # #2955: an edit moves updated_at after U. It is not smuggled into the
+        # current scan; the next window delivers the new version.
+        with mock.patch.object(watch, "PAGE_SIZE", 2):
+            api = UpdatedApi([issue(n) for n in range(1, 6)])
+            events, scan, until = watch.collect_batch(api, SUB, NOW - 3600, NOW, None)
+            more, scan, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, {1, 2, 3, 4})
+            api.issues[2]["body"] = "Edited"
+            api.issues[2]["updated_at"] = watch.iso(NOW - 1)
+            batch, _, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
+            self.assertNotIn(3, {e["object_id"] for e in batch})
+            self.assertIn(5, {e["object_id"] for e in batch})
+            batch, _ = self.finish(api, until - watch.INDEX_LAG - watch.OVERLAP,
+                                   NOW + watch.INDEX_LAG + 1)
+            self.assertIn((3, "Edited"),
+                          [(e["object_id"], e["body"]) for e in batch])
+
+    def test_legacy_checkpoint_replays_under_the_bounded_window(self):
+        # A checkpoint from before #2955 has no ``settled`` bound. It must
+        # replay page 1 rather than trust the old shift snapshots.
+        rows = [issue(n) for n in range(1, 7)]
+        for n, row in enumerate(rows):
+            row["updated_at"] = watch.iso(NOW - 1000 + n)
+        api = UpdatedApi(rows, [])
+        legacy = dict(since=NOW - 3600, window_since=NOW - 3600, until=NOW,
+                      kind="issue", page=3,
+                      snap_prev=[[3, rows[2]["updated_at"]], [4, rows[3]["updated_at"]]],
+                      snap_cur=[[5, rows[4]["updated_at"]]])
+        with mock.patch.object(watch, "PAGE_SIZE", 2):
+            events, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, legacy)
+            self.assertEqual({e["object_id"] for e in events}, {1, 2})
+            self.assertEqual(scan["page"], 2)
+            self.assertNotIn("snap_cur", scan)
+            more, _ = self.finish(api, NOW, NOW, scan)
+        self.assertEqual({e["object_id"] for e in events + more}, set(range(1, 7)))
+
+    def test_disorder_inside_the_window_fails_closed(self):
         inside = [issue(n) for n in range(1, 4)]
         for n, row in enumerate(inside):
             row["updated_at"] = watch.iso(NOW - 1000 - n)
-        tail = [issue(n) for n in range(1, watch.PAGE_SIZE + 1)]
-        for n, row in enumerate(tail):
-            row["updated_at"] = watch.iso(NOW + 30 if n == watch.PAGE_SIZE - 2 else
-                                          NOW + 10 if n == watch.PAGE_SIZE - 1 else
-                                          NOW - 1000 + n)
-        for rows in (inside, tail):
-            with self.subTest(full=len(rows) == watch.PAGE_SIZE):
-                with self.assertRaisesRegex(plan_github.GithubError, "updated order is invalid"):
-                    watch.collect_batch(Api(rows), SUB, NOW - 3600, NOW, None)
+        with self.assertRaisesRegex(plan_github.GithubError, "updated order is invalid"):
+            watch.collect_batch(Api(inside), SUB, NOW - 3600, NOW, None)
+
+    def test_latency_beyond_the_bound_is_outside_the_model(self):
+        # Contract #2955: a row stamped inside the settled window is assumed to
+        # have its final index place (latency <= INDEX_LAG). A key lagging by
+        # 1500 s violates that hypothesis; the order guard fails closed rather
+        # than silently skipping the row. Such a lag needs a larger INDEX_LAG,
+        # not a hidden fallback (docs/EXPLOITATION.md).
+        rows = [issue(n) for n in range(1, 4)]
+        for row, key, updated in zip(rows, (-1000, -2000, -900),
+                                     (-1000, -500, -400)):
+            row["key"] = watch.iso(NOW + key)
+            row["updated_at"] = watch.iso(NOW + updated)
+        with self.assertRaisesRegex(plan_github.GithubError, "updated order is invalid"):
+            watch.collect_batch(LagApi(rows, []), SUB, NOW - 3600, NOW, None)
 
     def test_collection_bounds_every_excerpt_and_hashes_the_complete_content(self):
         body = "Long request. " * 5000
@@ -493,7 +541,7 @@ class CollectionTest(unittest.TestCase):
         api = Api([dict(row, id=n, number=n) for n in range(1, 1001)])
         events, scan, until = watch.collect_batch(api, SUB, NOW - 3600, NOW, None)
         self.assertEqual(len(events), 100)
-        self.assertEqual(len(api.calls), 2)  # page 1 + its look-ahead
+        self.assertEqual(len(api.calls), 1)  # page 1; the next pass reads its predecessor
         self.assertEqual(scan["page"], 2)
         self.assertLessEqual(sum(len(e["body"]) + len(e["title"]) for e in events),
                              200 * (watch.MAX_BODY + watch.MAX_TITLE))
@@ -552,6 +600,20 @@ class DeclarationTest(unittest.TestCase):
                 self.assertEqual(watch.subscriptions([self.bundle(**change)],
                                                      log=warnings.append), [])
                 self.assertTrue(warnings)
+
+    def test_index_lag_is_configurable_and_bounded(self):
+        fiche = NS(data={"github_watch": {"app": {
+            "repos": ["acme/app"], "index_lag": 600}}})
+        self.assertEqual(watch.subscriptions([self.bundle(fiche=fiche)]),
+                         [dataclasses.replace(SUB, index_lag=600)])
+        for lag in (True, -1, 3601, float("nan"), "300"):
+            warnings = []
+            fiche = NS(data={"github_watch": {
+                "app": {"repos": ["acme/app"], "index_lag": lag}}})
+            with self.subTest(lag=lag):
+                self.assertEqual(watch.subscriptions([self.bundle(fiche=fiche)],
+                                                     log=warnings.append), [])
+                self.assertIn("index_lag", warnings[0])
 
     def test_invalid_cadence_and_conflicting_designation_are_isolated(self):
         for interval in (True, 0, 3601, float("nan"), "900"):
@@ -617,6 +679,20 @@ class DeliveryTest(PgTestCase):
         self.assertEqual(self.messages()[-1]["payload"]["github_watch"]["items"][0]["issue_ref"],
                          "acme/app#1")
         self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW + 1802)
+
+    def test_latency_window_defers_then_delivers_on_the_next_tick(self):
+        # #2955: a write inside INDEX_LAG is ignored by the first window; the
+        # watcher's next read starts INDEX_LAG + OVERLAP before the cursor, so
+        # the row is delivered then.
+        api = UpdatedApi(issues=[dict(issue(), updated_at=watch.iso(NOW - 100))])
+        watcher = self.watcher(api)
+        self.assertEqual(watcher.tick(self.db, NOW), [dict(project="app",
+                                                          repo="acme/app", events=0)])
+        self.assertEqual(self.messages(), [])
+        self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW)
+        self.assertEqual(watcher.tick(self.db, NOW + 901)[0]["events"], 1)
+        self.assertEqual(len(self.messages()), 1)
+        self.assertIn("acme/app#1", self.messages()[0]["body"])
 
     def test_committed_mail_is_written_and_indexed_in_the_thread(self):
         self.watcher(Api([issue()], [comment()])).tick(self.db, NOW)

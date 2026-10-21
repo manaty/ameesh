@@ -28,7 +28,14 @@ BOOTSTRAP = 3600
 MAX_BODY = 16000
 MAX_TITLE = 500
 PAGE_SIZE = 100
-#: One page, its predecessor, and one look-ahead page per pass (#2955).
+#: #2955: the longest latency admitted between an update and the sort index
+#: putting the row at its new place. A row stamped after ``window_end -
+#: INDEX_LAG`` may still move: it is ignored by the current scan and read by
+#: the next one. 300 s covers the 259 s delay measured on #2925; a longer lag
+#: is outside the model and fails closed (see ``docs/EXPLOITATION.md`` and
+#: ``test_latency_beyond_the_bound_is_outside_the_model``).
+INDEX_LAG = 300
+#: One page plus one backward re-read per pass (#2955).
 PAGES_PER_TICK = 3
 #: One digest per repository and pass; a larger burst waits for the next pass.
 DIGEST_MAX_ITEMS = 25
@@ -46,6 +53,8 @@ class Subscription:
     repo: str
     agent: str
     interval: float
+    #: #2955: longest admitted index latency for this watch (INDEX_LAG default).
+    index_lag: float = INDEX_LAG
 
 
 def subscriptions(canons, log=None) -> list[Subscription]:
@@ -83,7 +92,7 @@ def subscriptions(canons, log=None) -> list[Subscription]:
                     warn("%s: invalid github_watch declaration for %s; ignored"
                          % (title, project))
                     continue
-                unknown = set(spec) - {"repos", "interval"}
+                unknown = set(spec) - {"repos", "interval", "index_lag"}
                 if unknown:
                     warn("%s: unknown github_watch setting %s for %s; ignored"
                          % (title, ", ".join(sorted(map(str, unknown))), project))
@@ -92,6 +101,14 @@ def subscriptions(canons, log=None) -> list[Subscription]:
                 if (isinstance(interval, bool) or not isinstance(interval, (int, float))
                         or not math.isfinite(interval) or not 60 <= interval <= 3600):
                     warn("%s: github_watch interval must be 60..3600 seconds for %s; ignored"
+                         % (title, project))
+                    continue
+                index_lag = spec.get("index_lag", INDEX_LAG)
+                if (isinstance(index_lag, bool)
+                        or not isinstance(index_lag, (int, float))
+                        or not math.isfinite(index_lag)
+                        or not 0 <= index_lag <= 3600):
+                    warn("%s: github_watch index_lag must be 0..3600 seconds for %s; ignored"
                          % (title, project))
                     continue
                 repos = spec.get("repos")
@@ -110,7 +127,8 @@ def subscriptions(canons, log=None) -> list[Subscription]:
                              % (title, repo, project, plan_github._one_line(exc)))
                         continue
                     key = (project.casefold(), repo)
-                    sub = Subscription(project, repo, title, float(interval))
+                    sub = Subscription(project, repo, title, float(interval),
+                                       float(index_lag))
                     if key in found:
                         if found[key] != sub:
                             warn("%s/%s: multiple GitHub watchers; keeping %s"
@@ -168,49 +186,50 @@ def events_from(sub, kind, rows):
 
 
 def collect_batch(api, sub, since, now, scan):
-    """Read one page plus its predecessor and one look-ahead, reconciling a move.
+    """Read the settled part of one bounded window, one page at a time.
 
-    GitHub sorts and filters on an index key that can lag ``updated_at``. A
-    page is delivered only after its predecessor is read again: if the
-    predecessor still carries the stamps saved when it was delivered, the
-    offset is stable. If it changed, it is only safe when it is a shifted
-    window of the saved predecessor and the one saved page after it: for some
-    ``d`` in ``0..PAGE_SIZE``, ``new == old[d:] + next[:d]``. That shape means
-    ``d`` rows left the front of the delivered page and the same number came
-    from the next page, no further; the rows that entered are delivered with
-    the re-read page, so the frontier still moves forward, and a row edited in
-    place is delivered with its new version. Any change that is not such a
-    shift (a moved id order, a larger move, a missing look-ahead) restarts at
-    page 1 with the same ``since``: a row can never be passed. The look-ahead
-    is read at the end of the pass that delivers the page before it, so the
-    next pass compares against snapshots taken before its own reads.
+    #2955: GitHub sorts and filters issues on an index key that can lag
+    ``updated_at``. A row stamped after ``settled = now - index_lag`` may still
+    move when the index catches up, so this scan ignores it and the next scan
+    reads it again. A row stamped at or before ``settled`` has a fixed place:
+    the model assumes the index latency never exceeds the configured
+    ``index_lag`` (see
+    ``docs/EXPLOITATION.md``; a longer lag is outside the model and fails
+    closed on the order guard).
 
-    Advance since by the last accepted timestamp minus the index-lag margin
-    (#2955) when the page is sparse enough for that seek to cover half of it;
-    retain one second to include equal keys. The rows that such a seek re-reads
-    are remembered so the order guard only judges the new ones. Stop at the
-    fixed window end so continuous updates cannot keep extending the scan.
-    Durable digests make replay harmless.
+    Inside ``[since, settled]`` a row can only exit (be updated and move to the
+    tail); the positions of the remaining rows only recede. Before trusting a
+    page, the previous page is read again: the last accepted row still present
+    there is the anchor. Rows after it that are inside the window are
+    delivered (they moved backwards); an accepted row edited in place before
+    it is delivered with its new version. If the anchor is gone from the
+    previous page, one earlier page is read; if it is still absent, the scan
+    restarts at page 1 with the same ``since`` (durable digests make replay
+    harmless). The scan stops when the stream ends or when a full page lies
+    entirely past the fixed window end: those recent writes are read by the
+    next scan, so continuous updates cannot extend this scan forever.
     """
-    state = dict(scan) if scan is not None else dict(
-        since=since, window_since=since, until=now, kind="issue", page=1)
-    if state["page"] > 1 and ("snap_prev" not in state or "snap_cur" not in state):
+    lag = getattr(sub, "index_lag", INDEX_LAG)
+    if scan is not None:
+        state = dict(scan)
+        if "settled" not in state:
+            # Checkpoint written before the bounded window: replay the page
+            # under the new model instead of trusting partial snapshots.
+            state.update(page=1, settled=state["until"] - lag)
+            for key in ("snap_prev", "snap_cur", "boundary", "boundary_since",
+                        "last", "replayed"):
+                state.pop(key, None)
+    else:
+        state = dict(since=since, window_since=since, until=now,
+                     settled=now - lag, kind="issue", page=1)
+    if state["page"] > 1 and "snap_prev" not in state:
         state["page"] = 1  # upgrade an old, unprotected checkpoint safely
-        state.pop("boundary", None)
-        state.pop("boundary_since", None)
-        state.pop("snap_prev", None)
-        state.pop("snap_cur", None)
     if state["page"] <= 1:
         state.pop("snap_prev", None)
-        state.pop("snap_cur", None)
     state.setdefault("window_since", state["since"])
-    # #2955: rows already delivered may come back in the next read — the
-    # overlap re-read by a seek, or a row whose index caught up and moved.
-    # Only the new rows are judged by the updated-order guard.
-    replayed = {tuple(item) for item in state.pop("replayed", ())}
-    last = {tuple(item) for item in state.pop("last", ())}
     events = []
-    until = state["until"]
+    until = state["until"]      # fixed end of this scan's wall-clock window
+    settled = state["settled"]  # rows after it may still move: deferred
     calls = 0
 
     def read(page):
@@ -225,7 +244,8 @@ def collect_batch(api, sub, since, now, scan):
         rows = api.get(path + "?" + urlencode(query), ttl=0)
         if getattr(getattr(api, "last_read", None), "stale", False):
             raise plan_github.GithubError("GitHub watch: stale quota fallback; cursor retained")
-        if not isinstance(rows, list) or len(rows) > PAGE_SIZE or not all(isinstance(r, dict) for r in rows):
+        if (not isinstance(rows, list) or len(rows) > PAGE_SIZE
+                or not all(isinstance(r, dict) for r in rows)):
             raise plan_github.GithubError("GitHub watch: invalid list response")
         return rows
 
@@ -237,105 +257,92 @@ def collect_batch(api, sub, since, now, scan):
         return datetime.fromisoformat(
             row["updated_at"].replace("Z", "+00:00")).timestamp()
 
-    def shift_shape(old, ahead, new):
-        """Return d when ``new`` is ``old[d:] + ahead[:d]`` by id, else None."""
-        old_ids = [item[0] for item in old]
-        ahead_ids = [item[0] for item in ahead]
-        new_ids = [row["id"] for row in new]
-        for d in range(len(old_ids) + 1):
-            if old_ids[d:] + ahead_ids[:d] == new_ids:
-                return d
-        return None
+    def inside(row):
+        return when(row) <= settled
+
+    def anchor_position(previous, snapshot):
+        """Position of the last accepted row still present with the same stamp.
+
+        The snapshot only carries ``(id, updated_at)``: the durable digest in
+        ``deliver`` drops a row already sent at this version, so replaying the
+        anchor page or the overlap never duplicates a message.
+        """
+        where = {(row["id"], row.get("updated_at")): index
+                 for index, row in enumerate(previous)}
+        for index in range(len(snapshot) - 1, -1, -1):
+            key = tuple(snapshot[index])
+            if key in where:
+                return where[key], key
+        return None, None
+
+    def recovered_rows(previous, snapshot, position):
+        """Rows after the anchor, plus accepted rows edited in place before it."""
+        snapshot_set = {tuple(item) for item in snapshot}
+        snapshot_ids = {item[0] for item in snapshot}
+        found = []
+        for index, row in enumerate(previous):
+            key = (row["id"], row.get("updated_at"))
+            after = index > position
+            edited = (not after and key not in snapshot_set
+                      and row["id"] in snapshot_ids)
+            if (after or edited) and inside(row):
+                found.append(row)
+        return found
 
     while True:
         rows = read(state["page"])
         previous = read(state["page"] - 1) if state["page"] > 1 else None
-        times = [when(row) for row in rows]
-        excluded = set(last)
-        shifted_ids = set()
+        recovered = []
         if previous is not None:
-            previous_stamps = stamps(previous)
-            if ("snap_prev" in state
-                    and previous_stamps != state["snap_prev"]):
-                if shift_shape(state["snap_prev"], state.get("snap_cur", []),
-                               previous) is None:
-                    # The delivered page changed in a way a front shift cannot
-                    # explain: an undelivered row may have moved before it.
-                    # Restart from page 1 at the same since.
-                    state.update(page=1)
-                    state.pop("snap_prev", None)
-                    state.pop("snap_cur", None)
-                    state.pop("last", None)
-                    replayed.update(last)
-                    state["replayed"] = [list(item) for item in sorted(replayed)]
-                    return events, state, until
-                known = {tuple(item) for item in state["snap_prev"]}
-                shifted = [row for row in previous
-                           if (row["id"], row.get("updated_at")) not in known]
-                shifted_ids = {row["id"] for row in shifted}
-                shifted_times = [when(row) for row in shifted]
-                events.extend(events_from(sub, state["kind"],
-                                          [row for row, ts in
-                                           zip(shifted, shifted_times) if ts <= until]))
-            excluded.update(tuple(item) for item in previous_stamps)
-        # #2925: a row past the window end is not taken here and the next
-        # window reads it again; only its place on a full page's tail ends the
-        # window. #2955: rows already delivered are excluded from the guard.
-        fresh = [ts for row, ts in zip(rows, times)
-                 if row["id"] not in shifted_ids
-                 and (row["id"], row.get("updated_at")) not in replayed
-                 and (row["id"], row.get("updated_at")) not in excluded]
-        inside = [ts for ts in fresh if ts <= until]
-        if inside != sorted(inside) or (len(rows) == PAGE_SIZE and times[-1] > until
-                                        and fresh != sorted(fresh)):
-            raise plan_github.GithubError("GitHub watch: updated order is invalid")
-        events.extend(events_from(sub, state["kind"],
-                                  [row for row, ts in zip(rows, times)
-                                   if ts <= until and row["id"] not in shifted_ids]))
-        if len(rows) == PAGE_SIZE and times[-1] <= until:
-            # #2955: a row is filtered and sorted by its index key, which can
-            # lag its updated_at. Keep the lag margin (OVERLAP) when the page
-            # is sparse enough for the seek to cover half of it; GitHub since
-            # is exclusive and timestamps have second precision: retain one
-            # second.
-            span = times[-1] - inside[0] if inside else 0
-            cutoff = times[-1] - 1 - OVERLAP
-            if (span > OVERLAP and cutoff - state["since"] >= span // 2
-                    and cutoff > state["since"]):
-                state.update(since=cutoff, page=1)
+            snapshot = state.get("snap_prev") or []
+            position, _key = anchor_position(previous, snapshot)
+            if position is None:
+                # The last accepted page is gone, or moved back more than one
+                # page. Read one more page backwards before giving up.
+                if calls < PAGES_PER_TICK and state["page"] >= 3:
+                    back = read(state["page"] - 2)
+                    back_position, _back_key = anchor_position(back, snapshot)
+                    if back_position is not None:
+                        recovered = recovered_rows(back, snapshot, back_position)
+                        events.extend(events_from(sub, state["kind"], recovered))
+                        # The page read before `back` stays unaccepted: the
+                        # next pass resumes just after the found anchor page.
+                        state["page"] -= 1
+                        state["snap_prev"] = stamps(back)
+                        return events, state, until
+                # Anchor absent: only a full restart from the window start is
+                # safe. Durable digests make the replay harmless.
+                state["page"] = 1
                 state.pop("snap_prev", None)
-                state.pop("snap_cur", None)
-                state.pop("last", None)
-                replayed = {(row["id"], row.get("updated_at"))
-                            for row, ts in zip(rows, times) if ts > cutoff}
-                if previous is not None:
-                    replayed.update(tuple(item) for item in previous_stamps)
-                state["replayed"] = [list(item) for item in sorted(replayed)]
                 return events, state, until
-            # Accept: the page becomes the predecessor, and its successor is
-            # read now so the next pass has a coherent look-ahead.
-            state.update(page=state["page"] + 1)
-            state["snap_prev"] = stamps(rows)
-            state["last"] = stamps(rows)
-            state.pop("replayed", None)
-            if calls < PAGES_PER_TICK:
-                state["snap_cur"] = stamps(read(state["page"]))
-            else:
-                state.pop("snap_cur", None)
-            return events, state, until
-        elif state["kind"] == "issue":
-            state.update(kind="comment", page=1, since=state["window_since"])
-            state.pop("snap_prev", None)
-            state.pop("snap_cur", None)
-            state.pop("last", None)
-            state.pop("replayed", None)
-            if calls >= PAGES_PER_TICK:
-                return events, state, until
-            last = set()
-            replayed = set()
-            continue
-        else:
+            recovered = recovered_rows(previous, snapshot, position)
+            events.extend(events_from(sub, state["kind"], recovered))
+
+        replayed = {(row["id"], row.get("updated_at")) for row in recovered}
+        current = [row for row in rows
+                   if inside(row)
+                   and (row["id"], row.get("updated_at")) not in replayed]
+        fresh = [when(row) for row in recovered + current]
+        if fresh != sorted(fresh):
+            raise plan_github.GithubError("GitHub watch: updated order is invalid")
+        events.extend(events_from(sub, state["kind"], current))
+
+        # #2955: a full page entirely past the fixed window closes this
+        # stream; the next window reads those recent rows again. A page that
+        # mixes the window and later rows is still read: the index can put a
+        # lagged row before a row of the window.
+        past_window = all(when(row) > until for row in rows)
+        if len(rows) < PAGE_SIZE or past_window:
+            if state["kind"] == "issue":
+                state.update(kind="comment", page=1, since=state["window_since"])
+                state.pop("snap_prev", None)
+                if calls >= PAGES_PER_TICK:
+                    return events, state, until
+                continue
             return events, None, until
+        state["page"] += 1
+        state["snap_prev"] = stamps(rows)
+        return events, state, until
 
 
 def instruction(sub, event, lots, *, quote=True):
@@ -526,9 +533,14 @@ class Watcher:
                     self.api = plan_github.client(cache_dir=self.cfg.state_dir)
                 if self.api is None:
                     raise plan_github.GithubError("GitHub watch: no token or gh")
+                # The committed cursor is the window end. The scan only trusts
+                # rows older than INDEX_LAG, so the next window starts OVERLAP
+                # before that settled bound, not before the cursor.
+                start = (since if since is not None else now - BOOTSTRAP) - OVERLAP
+                if since is not None:
+                    start -= getattr(sub, "index_lag", INDEX_LAG)
                 events, next_scan, until = collect_batch(
-                    self.api, sub, (since if since is not None else now - BOOTSTRAP) - OVERLAP,
-                    now, scan)
+                    self.api, sub, start, now, scan)
                 count = len(events) if self.dry_run else deliver(
                     db, sub, events, until, storage.of(db).work.issue_feed(plan_github.FEED_LIMIT),
                     self.cfg.host, partial=True, scan_before=scan, scan_after=next_scan)
