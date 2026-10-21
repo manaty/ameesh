@@ -240,7 +240,7 @@ NATIVE_USAGE = ("claude-stream-json",)
 
 
 def usage_event(protocol: str, result: "resident.TurnResult", *,
-                turn: str = "") -> dict | None:
+                turn: str = "", inputs=()) -> dict | None:
     """The ledger event of a finished resident turn (L80a), or None when the
     stream itself already carries the usage (Claude).
 
@@ -250,7 +250,11 @@ def usage_event(protocol: str, result: "resident.TurnResult", *,
     `usage_update.cost`, cumulative for `cost_total`). The event is written
     once per logical turn, so two turns served by the same process each carry
     their own measure, never a cumulative one that the ledger would subtract
-    twice."""
+    twice.
+
+    `inputs` (L80b) are the message ids the turn actually served — the spec's
+    messages and the accepted steers, never a correlation uuid: the ledger
+    line then answers "what did this turn cost, for which messages?"."""
     if protocol in NATIVE_USAGE:
         return None
     event = {
@@ -261,6 +265,8 @@ def usage_event(protocol: str, result: "resident.TurnResult", *,
         "turn": turn or "",
         "status": result.status,
     }
+    if inputs:
+        event["inputs"] = [str(i) for i in inputs if i is not None]
     if result.usage_total:
         event["usage_total"] = dict(result.usage_total)
     if result.cost is not None:
@@ -268,6 +274,28 @@ def usage_event(protocol: str, result: "resident.TurnResult", *,
     if result.cost_total is not None:
         event["cost_total"] = float(result.cost_total)
     return event
+
+
+def inputs_event(protocol: str, result: "resident.TurnResult", *,
+                 turn: str = "", inputs=()) -> dict | None:
+    """The served-message attribution of a native-usage resident turn (L80b).
+
+    Claude's stream already carries the turn's usage, so `usage_event` writes
+    no `resident.turn` for it; the ids of the messages it served still belong
+    on the ledger line, in this separate event. The runner writes it **after**
+    the steer barrier, so an ACK accepted while the turn closes is included;
+    a failed write never fails the turn (the cost is already counted by the
+    stream, only the attribution is lost). None when there is nothing to say."""
+    if protocol not in NATIVE_USAGE or not inputs:
+        return None
+    return {
+        "type": resident.INPUTS_EVENT,
+        "protocol": protocol,
+        "session": result.session or "",
+        "turn": turn or "",
+        "status": result.status,
+        "inputs": [str(i) for i in inputs if i is not None],
+    }
 
 
 def write_usage_event(path: str, event: dict | None) -> bool:

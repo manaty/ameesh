@@ -3592,6 +3592,9 @@ def build_parser() -> argparse.ArgumentParser:
     pc_turns.add_argument("--agent", default=None)
     pc_turns.add_argument("--since", default="24h", help="duration (16h, 2d) or ISO date")
     pc_turns.add_argument("--limit", type=int, default=500)
+    pc_turns.add_argument("--message", default=None,
+                          help="only turns that served this message (mail id); "
+                               "the cost shown is the turn's")
     pc_turns.add_argument("--json", action="store_true")
     pc_turns.set_defaults(func=cmd_cost)
     pc_gauges = cost_sub.add_parser("gauges", help="plan gauge history")
@@ -3995,11 +3998,15 @@ def _cost_l26(cfg: Config, db, what: str, args) -> int:
     ops = storage.of(db).operations
     if what == "turns":
         rows = ops.turns(agent=args.agent, since_s=_since_seconds(args.since),
-                         limit=args.limit)
+                         limit=args.limit, message=getattr(args, "message", None))
         if args.json:
             print(json.dumps({"schema": "ameesh-turns/1", "turns": rows},
                              ensure_ascii=False, indent=2))
             return 0
+        if getattr(args, "message", None) is not None:
+            # L80b : le coût est celui du TOUR qui a servi le message, partagé
+            # avec les autres messages du même tour — jamais divisé.
+            print("turns serving message %s (turn cost, not divided)" % args.message)
         print("%-19s %-16s %-6s %-9s %10s %10s %9s %10s" % (
             "WHEN", "AGENT", "LOT", "HARNESS", "INPUT", "CACHE", "OUTPUT", "USD"))
         for row in rows:
