@@ -67,6 +67,26 @@ Aucune : les huit fusions sont propres.
 | #2989 | `blocked-verdict` (tête bougée après le gel #15484, nouveau gel à venir) |
 | #2994 | `blocked-verdict` (dépend de #2977, relecture en cours) |
 
+## Correctif CI du 21/10 10:1xZ
+
+La première exécution complète (run `39580061451`, tête `65ec5281c`) a rougi
+`tests.test_cluster.SuperviseurRoleTest.test_chaque_colonne_est_accordee_ou_exclue`
+(psycopg 4/8) : la migration `0472` de #288 ajoute `turn_costs.inputs`, colonne
+ni accordée ni exclue au contrat des rôles superviseur. C'est l'attribution
+interne des messages servis par un tour, consommée par le rapport local
+`ameesh cost turns --message` ; le contrat superviseur reste inchangé :
+classement **fermé** dans `tests/test_cluster.py` (`FERMEES`, aucun GRANT
+modifié), sur le modèle du correctif `0464` de h-1300.
+
+- Commit d'adaptation `82452688b` (sans trailer `ameesh-work:`), aucune unité
+  modifiée.
+- `PYTHONPATH=src python -m unittest tests.test_cluster` : **34 tests OK**
+  (327 s, banc local PostgreSQL).
+- `PYTHONPATH=src python -m unittest tests.test_288_cost_per_message` : **14
+  tests OK**.
+- La CI complète est redemandée une seule fois sur la tête finale
+  (ancien run et son verdict remplacés).
+
 ## Contrôles
 
 - Liste calculée `scripts/paquet-candidats.py --repo . --app ameesh --target
@@ -78,6 +98,6 @@ Aucune : les huit fusions sont propres.
   motif (paire #2989) ; #2989 n'était pas prêt.
 - Contrôle d'inclusion : `scripts/paquet-inclusion.py` sur la tête composée.
 - Tests ciblés sur l'arbre composé (local, sans CI).
-- CI complète : à demander une fois sur la tête finale gelée (une seule
-  suite).
+- CI complète : première suite rouge sur le seul garde de classement
+  (corrigé ci-dessus) ; redemandée sur la tête finale après le correctif.
 - Prévalidation indisponible (carte 89 h) : écart noté, non bloquant.
