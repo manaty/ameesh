@@ -31,6 +31,7 @@ import types
 import unittest
 from datetime import datetime, timezone
 from unittest import mock
+from urllib.parse import unquote
 
 from ameesh import ci, db as db_mod, exploitation, mail, notify, registry, runner, storage, work
 from ameesh.storage.postgres.ci import CiResults
@@ -335,7 +336,13 @@ class FauxApi:
             return {"total_count": len(self.runners), "runners": list(self.runners)}
         if "/actions/runs?" in path:
             if "status=completed" in path:
-                return {"workflow_runs": list(self.terminated)}
+                runs = list(self.terminated)
+                # #2935 : le relevé de la tête d'une base filtre par branche
+                if "branch=" in path:
+                    branch = unquote(path.split("branch=")[1].split("&")[0])
+                    runs = [r for r in runs
+                            if (r.get("head_branch") or "") == branch]
+                return {"workflow_runs": runs}
             runs = self._status_runs(path)
             return {"total_count": len(runs) + (1 if self.truncated else 0),
                     "workflow_runs": runs}
@@ -685,6 +692,29 @@ class WatcherTest(PgTestCase):
         self.watcher.tick(self.db)
         self.assertFalse([a for a in exploitation.alerts(self.cfg, self.db)
                           if a["type"] == "ci_main_red"])
+
+    def test_echec_de_main_sans_lot_va_au_pilote_du_projet(self):
+        """#2935 : une poussée sur une base n'appartient souvent à aucun lot
+        (une fusion de paquet ne porte pas la ligne `ameesh-work:`) ; l'échec
+        partait « (no recipient) ». Il va au pilote du projet, qui peut le
+        traiter et suivre la fermeture de l'alerte."""
+        canon = types.SimpleNamespace(agents=[
+            types.SimpleNamespace(
+                title="mesh-design",
+                fiche=types.SimpleNamespace(data={"roles": ["orchestrateur"]}))])
+        registry.upsert(self.db, "mesh-design", harness="claude", host=self.cfg.host)
+        self.db.execute("UPDATE agent_registry SET team = %s WHERE name = %s",
+                        ("ameesh", "mesh-design"))
+        sha = "7" * 40
+        self.api.live = [run_view(310, sha, "main")]
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1",
+                                                   execution=310)])]
+        with mock.patch("ameesh.canon.load_configured", return_value=[canon]):
+            out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["to"], o["urgent"]) for o in out],
+                         [("failures", "mesh-design", True)])
+        (message,) = self.mails("mesh-design")
+        self.assertIn("tests.test_a.T.test_1", message["body"])
 
     def test_poussee_suivante_retire_les_non_lus(self):
         old, new = "3" * 40, "4" * 40
@@ -1695,6 +1725,54 @@ class WatcherTest(PgTestCase):
         self.assertIsNone(st.ci.run(DEPOT, 979))
         self.assertIsNone(st.ci.run(DEPOT, 978))
         self.assertEqual(self.mails("dev-a"), [])
+
+    def test_vert_de_main_hors_fenetre_ferme_l_alerte(self):
+        """#2935 : le vert de main conclu pendant une interruption du veilleur
+        (hors de la fenêtre de rattrapage) est quand même enregistré : l'alerte
+        `ci_main_red` se ferme au premier vert de la même base, sans courrier
+        ni verdict ancien."""
+        st = storage.of(self.db)
+        st.ci.open_run(DEPOT, 4001, head_sha="8" * 20, branch="main", event="push",
+                       base="main", work_item_id=None, url=None, workflow="tests.yml")
+        st.ci.add_failure(DEPOT, 4001, run_attempt=1, part="psql 1/1",
+                          test="tests.test_a.T.test_1", module="tests.test_a",
+                          status="echec", inherited=False, excerpt="", replay="",
+                          duration_s=None, failed_at=None)
+        st.ci.conclude(DEPOT, 4001, "failure")
+        self.assertEqual([r["run_id"] for r in ci.main_red(self.db)], [4001])
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: self.NOW)
+        self.api.terminated = [self.terminated(
+            4002, "9" * 20, "main", conclusion="success",
+            updated_at="1970-01-12T11:46:40+00:00")]  # 2 h : hors fenêtre
+        self.assertEqual(watcher.tick(self.db), [])
+        row = st.ci.run(DEPOT, 4002)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "success")
+        self.assertEqual(ci.main_red(self.db), [])
+        self.assertFalse([a for a in exploitation.alerts(self.cfg, self.db)
+                          if a["type"] == "ci_main_red"])
+        self.assertEqual(self.mails("dev-a") + self.mails("dev-b"), [])
+
+    def test_rouge_de_main_hors_fenetre_est_releve_pour_l_alerte(self):
+        """#2935 : une base rouge conclue pendant l'interruption est relevée
+        pour `ci_main_red` (son état et ses échecs), sans réveiller de lot."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: self.NOW)
+        sha = "a7" * 20
+        self.api.terminated = [self.terminated(
+            4003, sha, "main", conclusion="failure",
+            updated_at="1970-01-12T11:46:40+00:00")]
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_2",
+                                                   execution=4003)])]
+        self.assertEqual(watcher.tick(self.db), [])
+        row = storage.of(self.db).ci.run(DEPOT, 4003)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "failure")
+        self.assertEqual([r["run_id"] for r in ci.main_red(self.db)], [4003])
+        self.assertIn("tests.test_a.T.test_2",
+                      " ".join(ci.main_red(self.db)[0]["tests"]))
+        self.assertEqual(self.mails("dev-a") + self.mails("dev-b"), [])
 
     def test_main_rouge_par_workflow(self):
         """#1110 P2-2 : sur la même tête de main, un succès d'une autre suite
