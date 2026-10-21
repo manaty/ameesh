@@ -452,8 +452,9 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     `authors` (#2681) est l'ensemble des auteurs **reconnus** de la tête, tel
     que l'appelant l'a lu (`review_authors.authors`) : `{name, family}`. La
     porte ne compare plus seulement à l'assigné : un coauteur — tiers avec
-    reçu exact — et tout relecteur qui a poussé une correction, même petite
-    (#2888), ne relit ni lui-même ni sa famille. La famille de l'assigné
+    reçu exact —, tout relecteur qui a poussé une correction, même petite
+    (#2888), et les auteurs d'un gel antérieur dont le contenu subsiste (#2924)
+    ne relisent ni eux-mêmes ni leur famille. La famille de l'assigné
     historique reste celle de la trace du gel (`family_of`) : le reçu d'un
     autre commit du même nom ne la remplace pas. Sans `authors`, la porte garde
     son comportement historique : seul l'assigné est connu.
@@ -1139,11 +1140,14 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
     Les auteurs de **contenu** sont ceux du lecteur partagé (#2681,
     `review_authors.reading`) : reçus exacts, familles **historiques** du
     harnais qui a réellement tourné, coauteurs et correcteurs de relecteur,
-    quelle que soit la taille de leur correction (#2888). Un commit que le
-    lecteur n'attribue pas garde son auteur Git, relu au registre courant : la
-    porte n'oublie pas un auteur parce que sa preuve manque, et ne suppose
-    jamais une famille. S'y ajoutent les **auteurs des fusions** : une fusion
-    peut ajouter du contenu et ne peut pas compter comme relecteur indépendant.
+    quelle que soit la taille de leur correction (#2888). S'y ajoutent les
+    auteurs des gels antérieurs du lot dont le contenu subsiste (#2924) : une
+    réécriture d'historique à contenu identique ne rend pas une famille
+    indépendante. Un commit que le lecteur n'attribue pas garde son auteur Git,
+    relu au registre courant : la porte n'oublie pas un auteur parce que sa
+    preuve manque, et ne suppose jamais une famille. S'y ajoutent les
+    **auteurs des fusions** : une fusion peut ajouter du contenu et ne peut pas
+    compter comme relecteur indépendant.
 
     #2808 : le titulaire n'est **pas semé** dans les auteurs par sa seule
     qualité d'assigné ; les détenteurs du journal non plus. Un détenteur
@@ -1219,7 +1223,7 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
             read, unknown, _correctors = review_authors.reading(
                 db, item, milestone, commits, repo,
                 families=families, strict=True, families_out=proven_families,
-                reference=reference)
+                reference=reference, base=base, head=frozen)
         except Exception as exc:  # noqa: BLE001 - une lecture illisible ne conclut pas
             raise _ProvenanceError(
                 "the authors of the frozen range cannot be read (%s)" % exc) from exc
