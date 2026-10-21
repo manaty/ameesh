@@ -1284,7 +1284,7 @@ class ContentMergeTest(_PlanDb):
         for state in ("build", "qa"):
             work.move(self.db, item["id"], state)
         work.milestone(self.db, item["id"], "verdict", verdict="ok", sha=sha,
-                       actor="relecteur")
+                       actor="relecteur", repo=self.repo)
         self.assertEqual(
             plan_git.freeze_candidate(work.milestones(self.db, item["id"]),
                                       self.repo, "main")["origin"], "verdict")
@@ -1307,7 +1307,7 @@ class ContentMergeTest(_PlanDb):
         for state in ("build", "qa"):
             work.move(self.db, item["id"], state)
         work.milestone(self.db, item["id"], "verdict", verdict="ok", sha=reviewed,
-                       actor="relecteur")
+                       actor="relecteur", repo=self.repo)
         self.commit("src/a.py", "a = 2\n", "après l'avis")   # tête non relue
         git(self.repo, "checkout", "-q", "main")
         git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet", "agent/lot-avance")
@@ -1323,7 +1323,7 @@ class ContentMergeTest(_PlanDb):
         for state in ("build", "qa"):
             work.move(self.db, item["id"], state)
         work.milestone(self.db, item["id"], "verdict", verdict="ok", sha=reviewed,
-                       actor="relecteur")
+                       actor="relecteur", repo=self.repo)
         return item, reviewed
 
     def test_2444_la_tete_publiee_prime_sur_la_locale(self):

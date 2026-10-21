@@ -3106,9 +3106,10 @@ def events(db: Db, item_id: int, limit: int | None = 100) -> list[dict]:
 #: les jalons et la porte du gel/verdict vivent dans `freeze_gate` (#2873),
 #: déclaré sensible à deux avis ; `work` les réexporte pour ses appelants.
 from .freeze_gate import (  # noqa: E402
-    FREEZE_ABSENT_LINE, FREEZE_ABSENT_MARK, FROZEN_HEAD_MIN, MANUAL_KINDS,
-    MILESTONE_KINDS, REVIEWED_HEAD_MIN, VERDICTS, _frozen_head, freeze_head,
-    frozen_head, milestone, milestones, reviewed_head,
+    FREEZE_ABSENT_LINE, FREEZE_ABSENT_MARK, FREEZE_UNPUBLISHED_MARK,
+    FREEZE_UNVERIFIED_MARK, FROZEN_HEAD_MIN, MANUAL_KINDS, MILESTONE_KINDS,
+    REVIEWED_HEAD_MIN, VERDICTS, _frozen_head, freeze_head, frozen_head,
+    milestone, milestones, reviewed_head,
 )
 
 #: les jalons affichés, du plus récent au plus ancien : (nom, colonne d'instant,

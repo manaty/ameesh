@@ -251,7 +251,11 @@ class QaEvidenceTest(PgTestCase):
                             actor=actor)
 
     def go_and_merge(self):
-        work.milestone(self.db, self.lot, "verdict", verdict="ok", sha="a" * 40)
+        # Le verdict est posé au stockage : ce témoin teste la porte QA et la
+        # fusion, pas l'écriture d'un verdict (#2962).
+        storage.of(self.db).work.add_milestone(
+            self.lot, "verdict", sha="a" * 40, actor="relecteur", verdict="ok",
+            note="")
         return work.close_merged(self.db, self.lot, sha="a" * 40)
 
     # -- rôle et portée ---------------------------------------------------

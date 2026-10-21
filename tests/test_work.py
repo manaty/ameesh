@@ -295,10 +295,10 @@ class DelaysTest(PgTestCase):
         # gel, verdict bloqué, nouveau gel, verdict ok, puis fusion
         work.milestone(self.db, item["id"], "frozen", sha="a" * 40, actor="deepseek7")
         work.milestone(self.db, item["id"], "verdict", verdict="blocked",
-                       sha="b" * 40, note="corrections")
+                       sha="a" * 40, note="corrections")
         work.move(self.db, item["id"], "build")
         work.milestone(self.db, item["id"], "frozen", sha="c" * 40)
-        work.milestone(self.db, item["id"], "verdict", verdict="ok", sha="d" * 40)
+        work.milestone(self.db, item["id"], "verdict", verdict="ok", sha="c" * 40)
         for state in ("qa", "merged"):
             work.move(self.db, item["id"], state)
         kinds = [row["kind"] for row in work.milestones(self.db, item["id"])]
