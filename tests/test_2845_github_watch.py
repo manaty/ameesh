@@ -110,7 +110,7 @@ class CollectionTest(unittest.TestCase):
             rest, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, scan)
             events += rest
         self.assertEqual(len(events), 203)
-        self.assertEqual(len(api.calls), 6)
+        self.assertEqual(len(api.calls), 8)
         self.assertEqual(events[-1]["issue_ref"], "acme/app#1")
         self.assertEqual(events[-1]["url"], "https://github.com/acme/app/issues/1#issuecomment-10")
         self.assertIn("state=all", api.calls[0])
@@ -131,11 +131,13 @@ class CollectionTest(unittest.TestCase):
         events, scan, until = watch.collect_batch(api, SUB, NOW, NOW + 500, scan)
         self.assertEqual(events[0]["object_id"], 1)
         self.assertEqual(until, NOW)
-        for _ in range(101):
+        for _ in range(110):
             api.calls.clear()
             more, scan, _ = watch.collect_batch(api, SUB, NOW, NOW + 500, scan)
             events += more
             self.assertLessEqual(len(api.calls), watch.PAGES_PER_TICK)
+            if scan is None:
+                break
         self.assertIsNone(scan)
         self.assertEqual(len(events), 10001)
 
@@ -215,6 +217,21 @@ class CollectionTest(unittest.TestCase):
                 events, _, _ = watch.collect_batch(api, SUB, NOW, NOW + 5, scan)
         self.assertEqual([(e["object_id"], e["body"]) for e in events],
                          [(3, "Edited"), (4, "Please fix export")])
+
+    def test_edit_on_the_delivered_page_is_read_again_without_a_shift(self):
+        # #2955: the predecessor is accepted when its ids still form a shift
+        # shape, but an edited row there must be delivered with its new text.
+        with mock.patch.object(watch, "PAGE_SIZE", 2):
+            api = Api([issue(n) for n in range(1, 6)])
+            events, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, None)
+            more, scan, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, {1, 2, 3, 4})
+            api.issues[2]["body"] = "Edited"
+            api.issues[2]["updated_at"] = watch.iso(NOW - 1)
+            batch, _, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
+        self.assertIn((3, "Edited"), [(e["object_id"], e["body"]) for e in batch])
+        self.assertIn(5, {e["object_id"] for e in batch})
 
     def test_continuous_updates_finish_fixed_window_with_key_progress(self):
         for kind in ("issue", "comment"):
@@ -339,6 +356,55 @@ class CollectionTest(unittest.TestCase):
             self.assertIsNone(scan)
             self.assertEqual({e["object_id"] for e in events}, set(range(1, 13)))
 
+    def test_moved_boundary_row_cannot_mask_a_multi_page_shift(self):
+        # B3 #2955: the boundary row itself advanced, so an id overlap no
+        # longer proves the shift fits in one page. #7 and #8 were skipped.
+        with mock.patch.object(watch, "PAGE_SIZE", 3):
+            rows = [issue(n) for n in range(1, 13)]
+            for n, row in enumerate(rows):
+                row["updated_at"] = watch.iso(NOW - 250 + n)
+            api = UpdatedApi(rows, [])
+            events, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, None)
+            more, scan, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, set(range(1, 7)))
+            for row in rows[:4]:
+                row["updated_at"] = watch.iso(NOW + 1)
+            rows[5]["updated_at"] = watch.iso(NOW - 242)
+            for _ in range(20):
+                batch, scan, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
+                events += batch
+                if scan is None:
+                    break
+            self.assertIsNone(scan)
+            self.assertEqual({e["object_id"] for e in events}, set(range(1, 13)))
+
+    def test_index_catch_up_on_the_boundary_row_cannot_mask_the_shift(self):
+        # B3 #2955 (LagApi): only the key of the boundary row catches up, its
+        # (id, updated_at) stamp is unchanged; the page must still restart.
+        with mock.patch.object(watch, "PAGE_SIZE", 3):
+            rows = [issue(n) for n in range(1, 13)]
+            for n, row in enumerate(rows):
+                row["key"] = watch.iso(NOW - 250 + n)
+                row["updated_at"] = row["key"]
+            rows[5]["updated_at"] = watch.iso(NOW - 242)  # key still -245
+            api = LagApi(rows, [])
+            events, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, None)
+            more, scan, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, set(range(1, 7)))
+            for row in rows[:4]:
+                row["key"] = watch.iso(NOW + 1)
+                row["updated_at"] = watch.iso(NOW + 1)
+            rows[5]["key"] = watch.iso(NOW - 242)  # stamp unchanged
+            for _ in range(20):
+                batch, scan, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
+                events += batch
+                if scan is None:
+                    break
+            self.assertIsNone(scan)
+            self.assertEqual({e["object_id"] for e in events}, set(range(1, 13)))
+
     def test_index_lag_on_a_sparse_page_tail_cannot_skip_the_next_row(self):
         # #2955: same lag on a page sparse enough for the lag-margin seek. The
         # seek re-reads the lagged row and its successor out of updated order;
@@ -427,7 +493,7 @@ class CollectionTest(unittest.TestCase):
         api = Api([dict(row, id=n, number=n) for n in range(1, 1001)])
         events, scan, until = watch.collect_batch(api, SUB, NOW - 3600, NOW, None)
         self.assertEqual(len(events), 100)
-        self.assertEqual(len(api.calls), 1)
+        self.assertEqual(len(api.calls), 2)  # page 1 + its look-ahead
         self.assertEqual(scan["page"], 2)
         self.assertLessEqual(sum(len(e["body"]) + len(e["title"]) for e in events),
                              200 * (watch.MAX_BODY + watch.MAX_TITLE))
