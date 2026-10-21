@@ -847,6 +847,10 @@ class Member:
     #: references use `human:<id>`.
     deputies: list[str] | None = None
     superiors: list[str] | None = None
+    #: L77 (#286): local `user@host` accounts that prove this human on a host.
+    #: The declaration bounds the claim to this machine and this Unix user
+    #: (decision 0033 §9; OIDC is the v2 path, absent in v1).
+    local_accounts: list[str] | None = None
 
 
 @dataclass
@@ -1321,7 +1325,8 @@ class Canon:
             "untrusted": self.untrusted,
             "sources": [s.to_dict() for s in self.sources],
             "members": [dict(title=m.title, roles=m.roles, deputies=m.deputies,
-                             superiors=m.superiors, **fiche(m.fiche))
+                             superiors=m.superiors,
+                             local_accounts=m.local_accounts, **fiche(m.fiche))
                         for m in self.members],
             "hosts": [dict(title=h.title, responsible=h.responsible, tags=h.tags,
                            admins=h.admins, occupants=h.occupants,
@@ -2713,7 +2718,9 @@ class _Loader:
             authenticators=authenticators if isinstance(authenticators, list) else None,
             fiche=fiche,
             deputies=self._list(fiche, "deputies", where, "member-deputies-invalid"),
-            superiors=self._list(fiche, "superiors", where, "member-superiors-invalid")))
+            superiors=self._list(fiche, "superiors", where, "member-superiors-invalid"),
+            local_accounts=self._list(fiche, "local_accounts", where,
+                                      "member-local-accounts-invalid")))
 
     def _roles(self, fiche: Fiche, where: dict, subject: dict) -> list[str] | None:
         """L244 (#420) : les rôles déclarés d'une fiche Agent/Persona.

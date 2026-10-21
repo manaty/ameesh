@@ -1,0 +1,182 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""L77 (#286): trace L78 des messages humains servis — base réelle.
+
+Le journal ne porte aucun état servi/ack : l'entrée `human_message` est écrite
+à la REMISE, avec `event_id = mail:<id>` pour qu'une remise incertaine rejouée
+ne duplique pas la trace.
+"""
+from __future__ import annotations
+
+import dataclasses
+import os
+
+from ameesh import conversation, registry
+from ameesh.runner import AgentWorker, Runner
+
+from .support import PgTestCase
+
+
+def _make_worker(test, name, prompt=None):
+    cwd = os.path.join(test.tmp, "work", name)
+    os.makedirs(cwd, exist_ok=True)
+    kwargs = {"prompt": prompt} if prompt is not None else {}
+    test.register(name, "claude", cwd=cwd, **kwargs)
+    runner = Runner(dataclasses.replace(test.cfg), test.db, once=True)
+    lease = registry.claim(test.db, name, runner.runner_id, 3600)
+    test.assertIsNotNone(lease)
+    worker = AgentWorker(runner, registry.get(test.db, name), lease)
+    test.addCleanup(worker.watchdog_stop.set)
+    test.addCleanup(worker._close_peek)
+    return worker
+
+
+class HumanJournalTest(PgTestCase):
+    def _worker(self, name="worker"):
+        return _make_worker(self, name)
+
+    def _spec(self, mid=11, sender="human:alice", body="hello"):
+        return {"human": True,
+                "rows": [{"id": mid, "sender": sender, "body": body,
+                          "payload": {"human": True}, "created_ts": 1.0}]}
+
+    def _human_entries(self, name):
+        page = conversation.history(self.db, name, limit=50)
+        return [e for e in page["entries"] if e["kind"] == "human_message"]
+
+    def test_human_message_journaled_once_per_delivery(self):
+        name = "worker-once"
+        worker = self._worker(name)
+        worker._journal_humans(self._spec(), [11])
+        # Une remise incertaine rejouée ne duplique pas l'entrée.
+        worker._journal_humans(self._spec(), [11])
+        entries = self._human_entries(name)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["author"], "human:alice")
+        self.assertEqual(entries[0]["text"], "hello")
+        self.assertEqual(entries[0]["event_id"], "mail:11")
+
+    def test_bare_human_name_is_prefixed(self):
+        name = "worker-bare"
+        worker = self._worker(name)
+        worker._journal_humans(self._spec(mid=12, sender="alice"), [12])
+        entries = self._human_entries(name)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["author"], "human:alice")
+
+    def test_non_human_spec_writes_nothing(self):
+        name = "worker-plain"
+        worker = self._worker(name)
+        spec = self._spec()
+        spec["human"] = False
+        worker._journal_humans(spec, [11])
+        self.assertEqual(self._human_entries(name), [])
+
+
+class PickHumanFirstTest(PgTestCase):
+    """L77 : `_pick` sert l'humain d'abord et ne le consomme pas.
+
+    At-least-once : la construction du spec ne réserve ni ne remet rien ;
+    seule la remise (lancement du harnais) solde la réservation.
+    """
+
+    def test_pick_serves_human_first_without_delivering(self):
+        from ameesh import mail
+        name = "worker-pick"
+        worker = _make_worker(self, name)
+        mail.send(self.db, "human:alice", name, "from a human",
+                  payload={"human": True})
+        mail.send(self.db, "agent:bob", name, "from an agent", payload={})
+        spec = worker._pick()
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec["kind"], "mail")
+        self.assertTrue(spec.get("human"))
+        self.assertEqual(len(spec["ids"]), 1)
+        row = mail.get(self.db, spec["ids"][0])
+        self.assertEqual(row["sender"], "human:alice")
+        self.assertIsNone(row.get("delivered_at"))
+        # Re-pick : la construction du spec n'a rien consommé.
+        again = worker._pick()
+        self.assertIsNotNone(again)
+        self.assertEqual(again["ids"], spec["ids"])
+
+
+class EndOfTurnServiceTest(PgTestCase):
+    """L77 : le message humain n'est soldé qu'à la FIN du tour."""
+
+    def _reserve(self, worker, sender, payload):
+        from ameesh import mail
+        mail.send(self.db, sender, worker.name, "body of the message", payload=payload)
+        mid = int(self.db.query(
+            "SELECT id FROM agent_mailbox WHERE recipient = %s ORDER BY id DESC LIMIT 1",
+            (worker.name,))[0]["id"])
+        token = mail.new_token()
+        reserves = mail.reserve(self.db, worker.name, worker.runner.runner_id,
+                                worker.epoch, token, ids=[mid], porteur="consigne",
+                                ttl_seconds=mail.RESERVATION_TTL)
+        self.assertTrue(reserves)
+        return mid, token, reserves
+
+    def _delivered_at(self, mid):
+        return self.db.query("SELECT delivered_at FROM agent_mailbox WHERE id = %s",
+                             (mid,))[0]["delivered_at"]
+
+    def test_human_is_settled_only_at_the_end_of_the_turn(self):
+        from ameesh import conversation
+        name = "worker-serve"
+        worker = _make_worker(self, name)
+        mid, token, reserves = self._reserve(worker, "human:alice", {"human": True})
+        spec = {"human": True, "ids": [mid], "jeton": token, "rows": list(reserves)}
+        worker._livre_courrier(spec)
+        self.assertIsNone(self._delivered_at(mid))  # pas soldé au lancement
+        worker._solde_humains(spec)
+        self.assertIsNotNone(self._delivered_at(mid))  # soldé à la fin du tour
+        page = conversation.history(self.db, name, limit=10)
+        self.assertIn("human_message", [e["kind"] for e in page["entries"]])
+
+    def test_non_human_mail_is_still_settled_at_launch(self):
+        name = "worker-agent-mail"
+        worker = _make_worker(self, name)
+        mid, token, reserves = self._reserve(worker, "agent:bob", {})
+        spec = {"ids": [mid], "jeton": token, "rows": list(reserves)}
+        worker._livre_courrier(spec)
+        self.assertIsNotNone(self._delivered_at(mid))
+
+
+class HumanReservationTtlTest(PgTestCase):
+    """L77/B6 : la réservation humaine couvre tout le tour, pas 10 min."""
+
+    def test_the_human_reservation_outlives_the_turn(self):
+        from ameesh import mail
+        name = "worker-b6"
+        worker = _make_worker(self, name)
+        worker.agent = dict(worker.agent or {}, turn_max_seconds=1800)
+        self.assertEqual(worker._reservation_ttl({"human": True}),
+                         1800.0 + mail.RESERVATION_TTL)
+        self.assertEqual(worker._reservation_ttl({}), mail.RESERVATION_TTL)
+
+        mail.send(self.db, "human:alice", name, "a long turn",
+                  payload={"human": True})
+        mid = int(self.db.query(
+            "SELECT id FROM agent_mailbox WHERE recipient = %s ORDER BY id DESC LIMIT 1",
+            (name,))[0]["id"])
+        token = mail.new_token()
+        self.assertTrue(mail.reserve(
+            self.db, name, worker.runner.runner_id, worker.epoch, token,
+            ids=[mid], porteur="consigne",
+            ttl_seconds=worker._reservation_ttl({"human": True})))
+        row = self.db.query(
+            "SELECT (meta->'consigne'->>'expire')::float8"
+            "     - (meta->'consigne'->>'ts')::float8 AS ttl"
+            "  FROM agent_mailbox WHERE id = %s", (mid,))[0]
+        self.assertGreaterEqual(float(row["ttl"]),
+                                1800.0 + mail.RESERVATION_TTL - 1.0)
+        # Le hook (autre jeton, même bail) ne reprend pas un message actif :
+        # c'est l'expiration du TTL qui le lui permettait.
+        self.assertEqual(mail.reserve(
+            self.db, name, worker.runner.runner_id, worker.epoch,
+            mail.new_token(), ids=[mid], porteur="hook",
+            ttl_seconds=mail.HOOK_RESERVATION_TTL), [])
+
+        worker.agent = dict(worker.agent, turn_max_seconds=0)
+        self.assertEqual(worker._reservation_ttl({"human": True}),
+                         mail.HUMAN_RESERVATION_MAX)
