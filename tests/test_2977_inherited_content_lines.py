@@ -207,7 +207,53 @@ class CommitSurvivesTest(TestCase):
         self.assertTrue(self.survives(fix, fix, base))
         self.repo.write("a.py", "existing_call_here()\nremoved_by_fix()\n")
         head = self.repo.commit("impl: retrait annulé", agent="impl")
+        # la copie de b.py subsiste à son chemin : le correctif aussi
+        self.assertTrue(self.survives(head, fix, base))
+        self.repo.write("b.py", "")
+        head = self.repo.commit("impl: copie retirée", agent="impl")
         self.assertFalse(self.survives(head, fix, base))
+
+    def test_a_withdrawn_copy_of_a_base_line_is_not_carried(self):
+        # B1 (cx2) : le correctif ne fait que copier une ligne de la base ; la
+        # tête réécrit b.py sans elle. L'original de a.py ne prouve rien.
+        self.repo.write("a.py", "existing_call_here()\n")
+        base = self.repo.commit("base")
+        self.repo.write("b.py", "existing_call_here()\n")
+        fix = self.repo.commit("fix", agent="cx3")
+        self.repo.git("reset", "-q", "--hard", base)
+        self.repo.write("b.py", "rewritten_call_here()\n")
+        head = self.repo.commit("impl: b.py réécrit", agent="impl")
+        self.assertFalse(self.survives(head, fix, base))
+
+    def test_a_copy_still_at_its_path_keeps_the_corrector(self):
+        self.repo.write("a.py", "existing_call_here()\n")
+        base = self.repo.commit("base")
+        self.repo.write("b.py", "existing_call_here()\n")
+        fix = self.repo.commit("fix", agent="cx3")
+        self.repo.write("c.py", "unrelated_author_line()\n")
+        head = self.repo.commit("impl: autre fichier", agent="impl")
+        self.assertTrue(self.survives(head, fix, base))
+
+    def test_a_copy_whose_path_is_gone_keeps_the_corrector(self):
+        # Chemin absent : déplacement possible, le doute conserve l'auteur.
+        self.repo.write("a.py", "existing_call_here()\n")
+        base = self.repo.commit("base")
+        self.repo.write("b.py", "existing_call_here()\n")
+        fix = self.repo.commit("fix", agent="cx3")
+        self.repo.git("reset", "-q", "--hard", base)
+        self.repo.write("c.py", "rewritten_call_here()\n")
+        head = self.repo.commit("impl: b.py absent", agent="impl")
+        self.assertTrue(self.survives(head, fix, base))
+
+    def test_a_diff_without_meaningful_lines_keeps_the_corrector(self):
+        self.repo.write("a.py", "existing_call_here()\n")
+        base = self.repo.commit("base")
+        self.repo.write("b.py", "pass\n}\n")
+        fix = self.repo.commit("fix", agent="cx3")
+        self.repo.git("reset", "-q", "--hard", base)
+        self.repo.write("b.py", "rewritten_call_here()\n")
+        head = self.repo.commit("impl: b.py réécrit", agent="impl")
+        self.assertTrue(self.survives(head, fix, base))
 
     def test_an_unreadable_parent_excludes_nothing(self):
         # Un commit racine n'a pas de parent : rien n'est hérité, la ligne

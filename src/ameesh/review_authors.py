@@ -558,7 +558,10 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
     correcteur et ne prouve rien ; seules ses lignes propres sont cherchées,
     avec la même prudence (chemin d'origine, puis tout l'arbre, B8). Une ligne
     que le commit retire aussi ailleurs (un déplacement) reste une preuve,
-    comme avant. Sans ligne propre, la lecture passe aux lignes retirées."""
+    comme avant. Sans ligne propre, la lecture passe aux lignes retirées,
+    puis aux lignes copiées, cherchées à leur seul chemin (un chemin absent
+    conserve l'auteur) : une copie retirée ne garde pas son correcteur (B1).
+    Un diff sans ligne significative conserve l'auteur."""
     parsed = _commit_lines(repo, sha)
     if parsed is None:
         return True
@@ -567,11 +570,14 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
         return True
     added = [(path, row) for path, rows in adds.items() for row in rows
              if _meaningful_line(row)]
+    copied: list = []
     if added:
         moved = {row.strip() for rows in removes.values() for row in rows}
         inherited = _inherited_lines(
             repo, head, sha, base,
             [row for _path, row in added if row.strip() not in moved], cache)
+        copied = [(path, row) for path, row in added
+                  if row.strip() in inherited]
         added = [(path, row) for path, row in added
                  if row.strip() not in inherited]
     if added:
@@ -590,10 +596,20 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
         return missing_path
     removed = [(path, row) for path, rows in removes.items() for row in rows
                if _meaningful_line(row)]
-    if removed:
-        return any(row.strip() not in (_head_lines(repo, head, path, cache) or set())
-                   for path, row in removed)
-    return True
+    if removed and any(
+            row.strip() not in (_head_lines(repo, head, path, cache) or set())
+            for path, row in removed):
+        return True
+    if copied:
+        # #2977 B1 : des additions significatives, toutes héritées. La copie
+        # ne subsiste qu'à son propre chemin (pas de recherche dans l'arbre :
+        # l'original y est toujours) ; un chemin absent reste un doute.
+        for path, row in copied:
+            lines = _head_lines(repo, head, path, cache)
+            if lines is None or row.strip() in lines:
+                return True
+        return False
+    return not removed
 
 
 def _freeze_content_preserved(repo: str, freeze_sha: str, head_sha: str,
