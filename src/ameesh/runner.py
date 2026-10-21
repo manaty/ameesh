@@ -647,6 +647,9 @@ class AgentWorker(threading.Thread):
         self._budget_next_check = 0.0
         self._budget_paused = False
         self._budget_reason = ""
+        #: #2934 : nature de la pause (compte, fenêtre, échéance) — le fil ne
+        #: reçoit une note qu'à ce changement, pas à chaque point de jauge.
+        self._budget_nature = ""
         #: la comptabilité du dernier tour a échoué : plus de tour à l'aveugle.
         #: Un marqueur persistant rend la suspension durable au redémarrage (B5).
         #: L72 : base injoignable à la création — doute, donc suspension, mais
@@ -3658,6 +3661,7 @@ class AgentWorker(threading.Thread):
         self._budget_paused = bool(raison)
         if not raison:
             self._budget_reason = ""
+            self._budget_nature = ""
             self._leve_pause_budget()
             return True
         maintenant = time.monotonic()
@@ -3671,11 +3675,15 @@ class AgentWorker(threading.Thread):
             registry.set_status(self.db, self.name, "blocked",
                                 status_text="%s%s%s" % (budget_mod.PAUSE_PREFIX, marque,
                                                         raison))
-            if raison != self._budget_reason:
-                self._budget_reason = raison
+            # #2934 : une note par nature de pause (compte, fenêtre, échéance),
+            # pas à chaque variation du pourcentage, qui reste dans `status_text`.
+            nature = accounts_mod.pause_nature(raison)
+            if nature != self._budget_nature:
+                self._budget_nature = nature
                 self._fil_note("Budget pause: %s. No turn until the gauge goes back "
                                "down." % raison,
                                meta={"action": "budget", "raison": raison})
+            self._budget_reason = raison
         return False
 
     def _leve_pause_budget(self) -> None:
