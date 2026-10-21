@@ -245,6 +245,27 @@ class CommitSurvivesTest(TestCase):
         head = self.repo.commit("impl: b.py absent", agent="impl")
         self.assertTrue(self.survives(head, fix, base))
 
+    def test_a_duplicate_in_the_same_file_is_not_carried(self):
+        # B2 (impl-04) : seule addition, une ligne déjà dans le même fichier ;
+        # la tête retire la copie. L'original au même chemin ne prouve rien.
+        self.repo.write("a.py", "def test_a():\n" + LINE)
+        base = self.repo.commit("base")
+        self.repo.write("a.py", "def test_a():\n" + LINE + LINE)
+        fix = self.repo.commit("fix", agent="cx3")
+        self.repo.git("reset", "-q", "--hard", base)
+        self.repo.write("c.py", "rewritten_call_here()\n")
+        head = self.repo.commit("impl: autre fichier", agent="impl")
+        self.assertFalse(self.survives(head, fix, base))
+
+    def test_a_duplicate_still_in_the_same_file_keeps_the_corrector(self):
+        self.repo.write("a.py", "def test_a():\n" + LINE)
+        base = self.repo.commit("base")
+        self.repo.write("a.py", "def test_a():\n" + LINE + LINE)
+        fix = self.repo.commit("fix", agent="cx3")
+        self.repo.write("c.py", "unrelated_author_line()\n")
+        head = self.repo.commit("impl: autre fichier", agent="impl")
+        self.assertTrue(self.survives(head, fix, base))
+
     def test_a_diff_without_meaningful_lines_keeps_the_corrector(self):
         self.repo.write("a.py", "existing_call_here()\n")
         base = self.repo.commit("base")

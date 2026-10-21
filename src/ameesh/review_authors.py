@@ -470,6 +470,21 @@ def _head_lines(repo: str, head: str, path: str, cache: dict):
     return cache[path]
 
 
+def _path_line_counts(repo: str, rev: str, path: str, cache: dict):
+    """Le nombre d'occurrences de chaque ligne (dépouillée) de `path` dans
+    `rev`, ou None si le chemin y est absent ou illisible (#2977 B2)."""
+    key = ("counts", rev, path)
+    if key not in cache:
+        text = plan_git._out(repo, "show", "%s:%s" % (rev, path))
+        counts = None
+        if text is not None:
+            counts = {}
+            for line in str(text).splitlines():
+                counts[line.strip()] = counts.get(line.strip(), 0) + 1
+        cache[key] = counts
+    return cache[key]
+
+
 def _any_line_in_head(repo: str, head: str, lines: Sequence[str]) -> bool:
     """Une des lignes apparaît-elle **quelque part** dans l'arbre de la tête ?
 
@@ -603,10 +618,15 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
     if copied:
         # #2977 B1 : des additions significatives, toutes héritées. La copie
         # ne subsiste qu'à son propre chemin (pas de recherche dans l'arbre :
-        # l'original y est toujours) ; un chemin absent reste un doute.
+        # l'original y est toujours) ; un chemin absent reste un doute. B2 : au
+        # même chemin, l'original peut déjà y figurer ; seule une occurrence de
+        # plus que dans le parent prouve la copie (parent sans ce chemin : 0).
         for path, row in copied:
-            lines = _head_lines(repo, head, path, cache)
-            if lines is None or row.strip() in lines:
+            present = _path_line_counts(repo, head, path, cache)
+            if present is None:
+                return True
+            before = _path_line_counts(repo, str(sha) + "^", path, cache) or {}
+            if present.get(row.strip(), 0) > before.get(row.strip(), 0):
                 return True
         return False
     return not removed
