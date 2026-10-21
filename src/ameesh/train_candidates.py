@@ -10,7 +10,7 @@ from __future__ import annotations
 import copy
 from dataclasses import asdict
 
-from . import lot_class, merge_queue, storage
+from . import lot_class, merge_queue, packet_guard, storage
 from .train import TrainError
 from .train_admissions import Requirement
 
@@ -43,6 +43,11 @@ class Inventory:
             causes = list(candidate["causes"])
             if not item.get("branch"):
                 causes.append("missing-branch")
+            elif packet_guard.is_packet_branch(item["branch"]):
+                # #2908 : le porteur d'un paquet (`integration/**`) est le
+                # véhicule, jamais une unité d'un autre paquet (même refus
+                # que le composeur, packet_candidates).
+                causes.append("packet-vehicle")
             if target != self.target:
                 causes.append("target-mismatch")
             release = lot_class.release_reason(item, target)

@@ -276,20 +276,22 @@ def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping
 
 
 # --------------------------------------------------------------------------
-# the selection: two distinct families, excluding authors and fixers
+# the selection: two distinct families, excluding every author (correctors
+# included)
 # --------------------------------------------------------------------------
 
 def families_of(authors: Iterable) -> tuple[set, set]:
     """`(names, families)` forbidden, drawn from the authors of the frozen content.
 
-    An author is `{"name", "family"}`: the lot's assignee and each fixer who
-    pushed onto the head (exact evidence #1465). An unknown family is not
-    guessed: `select` then waits instead of designating (see
-    `unknown_families`).
+    An author is `{"name", "family"}`: the lot's assignee, each co-author and
+    each reviewer who pushed a correction onto the head (exact evidence #1465,
+    canon §2 and #2888). An unknown family is not guessed: `select` then waits
+    instead of designating (see `unknown_families`).
     """
     names, families = set(), set()
     for author in authors or ():
-        row = dict(author or {})
+        row = dict(author or {}) if isinstance(author, Mapping) \
+            else {"name": str(author or "").strip()}
         name = str(row.get("name") or "").strip()
         family = str(row.get("family") or "").strip().lower()
         if name:
@@ -312,9 +314,9 @@ def unknown_families(authors: Iterable) -> list[str]:
 def names_of(rows: Iterable) -> set:
     """The names carried by `{name, ...}` rows or bare strings, stripped.
 
-    The selection applies it to its `fixers` input: a corrector is a name, not
-    a family, and the same rows may be read from a journal mark (strings) or
-    from the frozen range (mappings).
+    The selection applies it to its `fixers` input: the same rows may be read
+    from a journal mark (strings) or from the frozen range (mappings). A
+    corrector's family comes from `families_of`, never from the name.
     """
     names = set()
     for row in rows or ():
@@ -335,12 +337,15 @@ def manual_seats(already: Iterable, *, authors: Iterable = (), fixers: Iterable 
     reviewers, and not an author itself. An unknown family, or the author's
     family, does not prove independence: the seat remains to designate.
 
-    `fixers` are the agents who pushed a designated reviewer's small
-    first-round correction (#2739): their family stays eligible (#2638), but
-    the agent itself cannot count a seat — it would be reviewing its own fix.
+    `fixers` are the designated reviewers who pushed a small first-round
+    correction (#2739). They are authors of the head (#2888): their family is
+    forbidden exactly like any author's, and the agent itself cannot count a
+    seat — it would be reviewing its own fix. The name list is kept as a
+    safety net when the caller's `authors` list is partial.
     """
     names, forbidden = families_of(authors)
     fixer_names = names_of(fixers)
+    forbidden = forbidden | families_of(fixers)[1]
     if unknown_families(authors):
         # An author of unknown family makes every reviewer's independence
         # unprovable: no manual reviewer can cover a seat either (#2627).
@@ -439,8 +444,9 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     - the family comes from the real session (`Candidate.family`), never from
       the name;
     - an unavailable candidate, without a known family, an author itself, or an
-      agent that pushed a reviewer's small correction is discarded: its family
-      stays eligible (#2638), the agent does not review its own fix (#2739);
+      agent that pushed a reviewer's correction is discarded: a reviewer's
+      correction makes its author an author of the head (#2888), so neither the
+      exact agent nor its family can review that head;
     - an author whose real family is unknown (empty or a label) makes the
       designation **wait**: without it, a reviewer's independence is not proven
       (canon §2);
@@ -459,10 +465,10 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     - `already` names the manual reviewers already designated (#2627). The ones
       that prove an independent family cover a seat; only the **missing** seats
       are designated, never a manual reviewer removed or overridden;
-    - `fixers` names the agents held out of the authors by #2638 (a designated
-      reviewer's small first-round correction). Their family stays a candidate
-      family, but the exact agent is never designated again: it would review
-      its own fix (#2739).
+    - `fixers` names the designated reviewers whose small first-round
+      correction is an authored commit of the head (#2739/#2888). Their family
+      is forbidden like any author's family; their exact name is excluded too,
+      as a safety net: they would review their own fix.
 
     Returns `{state, required, reviewers, missing, manual, why, forbidden,
     families, fixers}`: `waiting` when independent families are missing or an author
@@ -479,6 +485,7 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
         raise DesignationError("required reviews must be 0, 1 or 2, not %r" % (required,))
     names, forbidden = families_of(authors)
     fixer_names = names_of(fixers)
+    forbidden = forbidden | families_of(fixers)[1]
     seats = manual_seats(already, authors=authors, fixers=fixers, families=families)
     out = {"state": NONE, "required": required, "reviewers": [], "missing": 0,
            "manual": seats, "why": "no review required",
@@ -569,14 +576,16 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
 
     The SHA is written in full, with its `frozen` milestone: the verdict will
     have to cite it as-is (`ameesh work milestone <lot> verdict ok --sha <sha>`).
-    A first-round correction under the §2 threshold keeps the reviewer's family
-    eligible (#2638); a correction that makes the reviewer an author removes
-    that family from the next designation. `eligible_families` is the number of
-    independent families available on this head (automatic and manual seats):
-    if a correction that makes the reviewer an author would leave fewer than
-    `required` families, the mail tells the reviewer not to push it and to
-    return it to the author instead (canon §2, #2670). Without the count, the
-    mail states the rule alone.
+    Any correction makes the reviewer an author of the new head, whatever its
+    size (canon §2, #2888): their own opinion no longer counts and their family
+    is no longer eligible for the opinions on that head. `eligible_families` is
+    the number of independent families available on this head (automatic and
+    manual seats): if the correction would leave fewer than `required`
+    families, the mail tells the reviewer not to push it and to return it to
+    the author instead (canon §2, #2670). Without the count, the mail states
+    the rule alone. The `~50 lines` threshold only says whether a correction is
+    a first-round fix or goes back to the author; it never keeps a family
+    eligible.
     """
     sha = str((freeze or {}).get("sha") or "")
     fid = (freeze or {}).get("id")
@@ -607,38 +616,36 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
         "- render the verdict: `ameesh work milestone %s verdict ok|blocked --sha %s`;"
         % (row.get("id"), sha),
         "- fix a blocking defect yourself and push to the lot branch "
-        "(canon §2): a **first-round** correction under ~50 lines and without a "
-        "design change keeps your family eligible (#2638); otherwise you become "
-        "the author of your fix, your opinion on the new head no longer counts, "
-        "another reviewer takes over;",
-        "- a fix longer than ~50 lines, or a design change, goes back to the author;",
-        "- in a sensitive class, the second family reviews the lot **with** your fix, "
-        "in the same round, distinct from every author;",
+        "(canon §2): **any correction makes you an author of the new head**, "
+        "whatever its size — your own opinion no longer counts and your family "
+        "is no longer eligible for the opinions on that head; the second family "
+        "reviews the lot **with** your fix, in the same round;",
+        "- a fix longer than ~50 lines, or a design change, is not a first-round "
+        "correction: it goes back to the author;",
         "- your commits carry their exact origin (`ameesh provenance show --commit "
-        "<sha>`): the next designation reads it to tell a first-round fix from an "
-        "authored head;",
+        "<sha>`): the next designation reads it to establish who authored the "
+        "head;",
     ]
     if eligible_families is not None:
         available = max(int(eligible_families), 0)
         remaining = max(available - 1, 0)
         if remaining < required:
             lines.append(
-                "- **do not push a correction that makes you an author**: it "
-                "would leave %d independent famil%s for %d required opinion(s), "
-                "and the merge gate could not be satisfied — return the defect "
-                "to the author, who fixes it and freezes a new head (canon §2, "
-                "#2670);" % (remaining, "y" if remaining == 1 else "ies", required))
+                "- **do not push this correction**: it would leave %d "
+                "independent famil%s for %d required opinion(s), and the merge "
+                "gate could not be satisfied — return the defect to the author, "
+                "who fixes it and freezes a new head (canon §2, #2670/#2888);" % (remaining, "y" if remaining == 1 else "ies", required))
         else:
             lines.append(
-                "- a correction that makes you an author is allowed: %d "
-                "independent famil%s would remain for %d required opinion(s) "
-                "(canon §2, #2670);"
+                "- this correction is receivable: it leaves %d independent "
+                "famil%s for %d required opinion(s) (canon §2, #2670/#2888);"
                 % (remaining, "y" if remaining == 1 else "ies", required))
     else:
         lines.append(
-            "- do not push a correction that would leave fewer independent "
-            "families than required opinions (canon §2, #2670): return it to "
-            "the author, who fixes it and freezes a new head;")
+            "- any correction makes you an author of the new head: do not push "
+            "one that would leave fewer independent families than required "
+            "opinions (canon §2, #2670/#2888) — return it to the author, who "
+            "fixes it and freezes a new head;")
     lines += [
         "- a non-blocking defect goes to the backlog, it does not block the merge;",
         "- do not rerun the suites: targeted tests are the author's job, CI "
@@ -695,10 +702,11 @@ def manual_reviewer_message(lot: Mapping, *, freeze: Optional[Mapping] = None,
         "To do:",
         "- read the diff of the frozen head and check the edge cases;",
         "- a blocking defect: fix it yourself and push to the lot branch "
-        "(canon §2); a first-round fix under ~50 lines and without a design "
-        "change keeps your family eligible (#2638); a longer fix, a design "
-        "change, or a correction that would leave fewer independent families "
-        "than required opinions goes back to the author (canon §2, #2670);",
+        "(canon §2). Any correction makes you an author of the new head: your "
+        "own opinion no longer counts and your family is no longer eligible; "
+        "a fix longer than ~50 lines, a design change, or a correction that "
+        "would leave fewer independent families than required opinions goes "
+        "back to the author (canon §2, #2670/#2888);",
         "- a non-blocking defect goes to the backlog, it does not block the merge;",
         "- do not rerun the suites: targeted tests are the author's job, CI runs "
         "on the frozen head once the required opinions are acquired.",
@@ -860,9 +868,9 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     are selected. None is ever removed, and two manual reviewers of the same
     family count one seat.
 
-    `fixers` names the agents whose small first-round correction was held out
-    of the authors (#2638): their family stays eligible for the review, but the
-    exact agent is never designated again (#2739).
+    `fixers` names the designated reviewers whose small first-round correction
+    is an authored commit of the head (#2739/#2888): their family is forbidden
+    like any author's family, and the exact agent is never designated again.
 
     `advances` maps a family to its advance over the plan pace, in points
     (`review_pace`, #2668), or to a `{scope: advance}` mapping whose scoped
@@ -960,8 +968,8 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     if state == DESIGNATED:
         first_rank = len(selection.get("manual") or ()) + 1
         # The independent families available on this head: the manual seats and
-        # the automatic families. A reviewer's authoring correction removes its
-        # own family from the next designation (canon §2, #2670).
+        # the automatic families. Any reviewer correction authors the head and
+        # removes its own family from the opinions (canon §2, #2670/#2888).
         eligible_families = (len(selection.get("manual") or ())
                              + len(selection.get("families") or ()))
         for rank, reviewer in enumerate(selection["reviewers"], start=first_rank):

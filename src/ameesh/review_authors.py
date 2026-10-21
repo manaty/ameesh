@@ -15,17 +15,20 @@ auteurs, avec les mêmes exceptions du canon §2 :
   pas un auteur (#2803), et le commit de manifeste est écarté de la même
   lecture ;
 * chaque commit du contenu est attribué par son reçu exact (#1465) ;
-* un correctif de premier tour d'un **relecteur désigné** sous le seuil du §2
-  (`REVIEWER_FIX_LINES`, pas de conception) ne fait pas de son auteur un auteur
-  de la tête : sa famille reste éligible, et il peut être redésigné (#2638) ;
+* un correctif de premier tour d'un **relecteur désigné**, même sous le seuil
+  du §2 (`REVIEWER_FIX_LINES`, pas de conception), fait de son auteur un
+  auteur de la tête (#2888) : sa famille n'est plus éligible. Le seuil ne
+  décide que de la recevabilité process (une correction trop grosse revient à
+  l'auteur), jamais de l'indépendance. Le correcteur reste tenu hors des
+  relecteurs par son nom (#2739) ;
 * quand le reçu exact manque (commit restauré par rebase, correction poussée
   hors du hook), le commit est attribué à la famille de session de son
   committer, lue au journal des tours (`turn_costs`, `_turns_harness`) : un
-  commit du relecteur désigné sous le seuil reste une correction de relecteur,
-  un commit de l'assigné reste l'auteur. Un tiers non relecteur sans reçu reste
-  inconnu : aucun camp ne le suppose. #2721 : à la désignation, ce repli porte
-  sa trace (`proof: turn-journal`, `fallback_commits`), et un committer distinct
-  de la référence doit être au registre.
+  commit du relecteur désigné reste sa correction, un commit de l'assigné
+  reste l'auteur. Un tiers non relecteur sans reçu reste inconnu : aucun camp
+  ne le suppose. #2721 : à la désignation, ce repli porte sa trace
+  (`proof: turn-journal`, `fallback_commits`), et un committer distinct de la
+  référence doit être au registre.
 
 Le module ne devine jamais une famille depuis un nom Git seul : le committer
 doit porter l'adresse d'agent (`<nom>@ameesh.invalid`) et la famille vient du
@@ -340,15 +343,18 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     ambiguïté, et l'appelant qui doit les distinguer ne peut pas la deviner.
 
     Un commit sans reçu est attribué au committer d'adresse d'agent : un commit
-    du titulaire de référence reste le sien ; un relecteur désigné sous le
-    seuil reste un correctif de relecture ; un tiers non relecteur reste
-    inconnu. Au-delà du seuil (ou pour une conception), le relecteur devient
-    auteur de sa correction, avec sa famille de session.
+    du titulaire de référence reste le sien ; un relecteur désigné reste
+    l'auteur de sa correction, avec sa famille de session ; un tiers non
+    relecteur reste inconnu. Le seuil du §2 ne décide que de la trace « correctif
+    de premier tour », jamais de l'auteur (#2888).
 
     Les **correcteurs** (#2739) sont les relecteurs désignés dont le correctif
-    de premier tour reste sous le seuil : ils ne sont pas auteurs de la tête
-    (#2638), mais l'agent lui-même ne relit pas son propre correctif — la
-    désignation l'écarte et la porte refuse son avis, sans exclure sa famille.
+    de premier tour reste sous le seuil. Ce sont des **auteurs de la tête**
+    (#2888) : leur famille est exclue comme celle de tout auteur, et l'agent
+    lui-même ne relit pas son propre correctif. `correctors` garde leur trace
+    (provenance réelle) pour l'exclusion personnelle ; ce n'est plus une
+    éligibilité de famille. Un correctif au-delà du seuil ou de conception est
+    aussi un auteur, mais n'est pas un « correcteur » de premier tour.
 
     #2721 : la famille d'un commit sans reçu vient du journal des tours **à
     l'instant du commit** (le harnais qui a réellement tourné, harnais emprunté
@@ -436,7 +442,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         if actor == author_name:
             by_name.setdefault(actor, set()).add(proven)
         elif actor in reviewers:
-            # tenu jusqu'au seuil connu pour toute sa correction
+            # sa correction est un contenu de la tête (#2888) ; le seuil ne
+            # décide que de la trace « correcteur de premier tour »
             review_commits.setdefault(actor, []).append((sha, proven))
         else:
             by_name.setdefault(actor, set()).add(proven)
@@ -458,6 +465,11 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
                 by_name.setdefault(authored, set())
         if authored and author_family:
             by_name[authored].add(author_family)
+    # #2888 : toute correction d'un relecteur désigné fait de lui un auteur de
+    # la tête, quelle que soit sa taille. Le seuil du §2 ne décide que de la
+    # recevabilité process (une correction trop grosse revient à l'auteur),
+    # jamais de l'indépendance : sa famille n'est plus éligible.
+    small_correctors: set[str] = set()
     for actor, entries in sorted(review_commits.items()):
         total, design = 0, False
         for sha, _proven in entries:
@@ -466,12 +478,12 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
                 design = True
                 break
             total += measured[0]
-        if design or total > REVIEWER_FIX_LINES:
-            # au-delà du petit correctif : ils ont écrit cette tête
-            by_name.setdefault(actor, set())
-            for _sha, proven in entries:
-                if proven:
-                    by_name[actor].add(proven)
+        by_name.setdefault(actor, set())
+        for _sha, proven in entries:
+            if proven:
+                by_name[actor].add(proven)
+        if not design and total <= REVIEWER_FIX_LINES:
+            small_correctors.add(actor)
     out = []
     for actor in sorted(by_name):
         proven = {value for value in by_name[actor] if value}
@@ -487,9 +499,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             row["fallback_commits"] = sorted(proofs[actor])
         out.append(row)
     correctors = []
-    for actor in sorted(review_commits):
-        if actor in by_name:
-            continue
+    for actor in sorted(small_correctors):
         proven = {value for _sha, value in review_commits[actor] if value}
         if families_out is not None:
             families_out.setdefault(actor.lower(), set()).update(proven)

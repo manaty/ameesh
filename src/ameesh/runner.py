@@ -3734,12 +3734,11 @@ class AgentWorker(threading.Thread):
 
         Le marqueur est l'état **durable** : un worker de remplacement y
         retrouve l'événement et peut réparer le tour avant de le régler.
-        `created_ts` borne l'écriture au marqueur de CE tour, jamais celui
-        d'un remplaçant."""
+        L'identité exacte du marqueur (`created_at`, `spend_key`, #2166) borne
+        l'écriture à CE tour, jamais celui d'un remplaçant."""
         try:
             return registry.pending_spend_set_resident_usage(
-                self.db, self.name, usage,
-                None if travail is None else travail.get("created_ts"))
+                self.db, self.name, usage, travail)
         except db_mod.DbError as exc:
             log_async("[%s] resident usage marker not written (%s)"
                       % (self.name, db_mod.explain(exc)))
@@ -3865,6 +3864,14 @@ class AgentWorker(threading.Thread):
         except (TypeError, ValueError):
             self._compta_en_echec = True
             return False
+        if travail.get("ledger_ambiguous"):
+            # #2166/B1 : plusieurs clés candidates pour ce marqueur (un ancien
+            # worker a écrit une ligne que son identité ne distingue pas) :
+            # écrire au hasard réglerait le mauvais tour. On suspend.
+            self._compta_en_echec = True
+            log_async("[%s] accounting marker ambiguous: turn accounting "
+                      "suspended" % self.name)
+            return False
         try:
             from . import accounts as accounts_mod
             book = cost_mod.CostBook(
@@ -3882,9 +3889,10 @@ class AgentWorker(threading.Thread):
             if annonce:
                 modele = annonce
             # Clé du marqueur (L60) : la même pour l'écriture de fin de tour et
-            # pour sa réparation, qui ne double donc plus la ligne.
-            cree = travail.get("created_ts")
-            cle = self._spend_key(debut, cree)
+            # pour sa réparation, qui ne double donc plus la ligne. Exacte
+            # (#2166) quand le marqueur la porte ; les marqueurs d'avant 0471
+            # gardent la clé historique, pour dédoublonner leur ligne.
+            cle = self._spend_key(debut, travail)
             usage = book.record(self.name, start=debut, key=cle,
                                 turn=travail.get("turn") or None,
                                 session=travail.get("session") or None,
@@ -3912,7 +3920,7 @@ class AgentWorker(threading.Thread):
             # fournisseur est comptée au relais, pas sur l'appareil (L111).
             if not self.runner.mediated:
                 account_budget.settle(self.db, cle, state="kept" if incertain else "settled")
-            registry.pending_spend_clear(self.db, self.name, cree)
+            registry.pending_spend_clear(self.db, self.name, travail)
             self._compta_travail = None
             self._annonce_ram = ""
             self._compta_en_echec = False
@@ -3990,10 +3998,46 @@ class AgentWorker(threading.Thread):
             log_async("[%s] announced model not persisted (%s): turns suspended"
                       % (self.name, " ".join(str(exc).split())[:120]))
 
-    def _spend_key(self, debut: int, cree) -> str | None:
-        """La clé du tour (L60) : grand livre, marqueur et réservation #1469."""
+    def _spend_key(self, debut: int, marker) -> str | None:
+        """La clé du tour (L60) : grand livre, marqueur et réservation #1469.
+
+        Exacte quand le marqueur la porte (#2166 : `agent:index:created_at`,
+        texte UTC à la microseconde), jamais dérivée d'un float8 relu — une
+        connexion à précision réduite en perd les derniers chiffres. Un
+        marqueur d'avant 0471 (`spend_key` NULL) porte `ledger_key`, la clé
+        durable déjà écrite par son tour (ligne ou réservation, retrouvée par
+        l'identité du marqueur côté stockage) : sa réparation dédouble la
+        ligne existante et règle la réservation, quelle que soit la précision
+        de la connexion. Un float reste accepté pour les appelants
+        historiques (tests) et ne sert qu'à ce repli.
+        """
+        if isinstance(marker, dict):
+            if marker.get("ledger_ambiguous"):
+                return None       # B1 : ne jamais choisir une clé au hasard
+            key = marker.get("ledger_key") or marker.get("spend_key")
+            if key:
+                return str(key)
+            cree = marker.get("created_ts")
+        else:
+            cree = marker
         return ("%s:%d:%.6f" % (self.name, int(debut), float(cree))
                 if cree is not None else None)
+
+    @staticmethod
+    def _same_marker(left: dict | None, right: dict | None) -> bool:
+        """Le même marqueur comptable, par son identité exacte (#2166).
+
+        Deux lectures du même marqueur rendent le même `created_at` texte et
+        la même `spend_key` ; un remplaçant en diffère, même quand le float8
+        relu à précision réduite les confondrait."""
+        if not left or not right:
+            return False
+        if left.get("spend_key") or right.get("spend_key"):
+            return (left.get("spend_key") == right.get("spend_key")
+                    and left.get("created_at") == right.get("created_at"))
+        if left.get("created_at") or right.get("created_at"):
+            return left.get("created_at") == right.get("created_at")
+        return left.get("created_ts") == right.get("created_ts")
 
     def _compta_termine(self, model_annonce: str | None = None, *,
                         incertain: bool = False) -> None:
@@ -4006,7 +4050,7 @@ class AgentWorker(threading.Thread):
         # plutôt que d'être remise à une réparation ultérieure.
         travail = self._avec_reprise("turn accounting", self._compta_en_attente)
         propre = getattr(self, "_compta_travail", None)
-        if propre and (not travail or travail.get("created_ts") != propre.get("created_ts")):
+        if propre and (not travail or not self._same_marker(travail, propre)):
             # #1469 : le marqueur en base n'est plus celui de ce tour (reprise
             # par un remplaçant, ou déjà réparé) : on règle CE tour par sa propre
             # clé (la ligne est dédoublonnée par `spend_key`), sans toucher au
@@ -6288,10 +6332,10 @@ class AgentWorker(threading.Thread):
             marqueur = self._compta_travail or {}
             refus = account_budget.reserve(
                 self.db, self.name, compte,
-                self._spend_key(events_start, marqueur.get("created_ts")))
+                self._spend_key(events_start, marqueur))
             if refus:
                 registry.pending_spend_clear(self.db, self.name,
-                                             marqueur.get("created_ts"))  # rien n'est parti
+                                             marqueur)  # rien n'est parti
                 self._compta_travail = None
                 self.fail_turn(budget_mod.PAUSE_PREFIX + refus, refus)
                 return False

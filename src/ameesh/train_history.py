@@ -12,10 +12,11 @@ common gate refuses a co-author's own verdict and another agent of a
 co-author's family, not only the reference assignee (#2681 B, dev1/cx2).
 
 Authors are read once for the train and the designation (`review_authors`,
-#2681): exact commit receipts (#1465), the reference author at freeze, and a
-designated reviewer's first-round correction under the §2 threshold. A commit
-without a receipt is attributed to its agent committer's session family; a
-third party without a receipt stays unknown and refuses the admission.
+#2681): exact commit receipts (#1465), the reference author at freeze, and
+every designated reviewer's correction — a correction authors the head whatever
+its size (#2888), so the reviewer's family is excluded like any author's. A
+commit without a receipt is attributed to its agent committer's session family;
+a third party without a receipt stays unknown and refuses the admission.
 
 A blocked verdict on an earlier head is not read by the gate: only the frozen
 head's verdicts count (canon §2). The same-head rule is unchanged — a block on
