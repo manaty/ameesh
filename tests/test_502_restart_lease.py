@@ -11,8 +11,11 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
+
+from tests import support  # noqa: F401 — environnement isolé du poste
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "deploy", "mise-a-jour", "poste.sh")
@@ -234,11 +237,14 @@ class RestartLeaseTest(unittest.TestCase):
         self.state = os.path.join(self.tmp, "state")
         for path in (bin_dir, venv_bin, conf, self.state):
             os.makedirs(path)
+        os.symlink(sys.executable, os.path.join(bin_dir, "python3"))
         with open(os.path.join(conf, "bascule.env"), "w", encoding="utf-8") as fh:
             fh.write("VM=vm.invalid\n")
         with open(os.path.join(conf, "config.json"), "w", encoding="utf-8") as fh:
             fh.write('{"dsn": "postgresql://ameesh:%s@mesh.invalid/ameesh"}\n' % PASSWORD)
         for path, text in ((os.path.join(bin_dir, "systemctl"), FAKE_SYSTEMCTL),
+                           # Les faux services sont dans un terminal indépendant.
+                           (os.path.join(bin_dir, "cat"), '#!/bin/sh\ncase "$1" in /proc/*/cgroup) echo "0::/user.slice/session.scope" ;; *) exec /usr/bin/cat "$@" ;; esac\n'),
                            (os.path.join(bin_dir, "sleep"), "#!/bin/sh\nexit 0\n"),
                            (os.path.join(bin_dir, "ssh"), FAKE_SSH),
                            (os.path.join(bin_dir, "psql"), FAKE_LOGGED_CLOCK),

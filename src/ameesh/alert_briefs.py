@@ -96,6 +96,23 @@ def _of_project(orchestras, by_name: dict, project, teams: set) -> list:
     return _of_teams(orchestras, by_name, teams)
 
 
+def project_pilots(project: str, listing: list, *, cfg=None, db=None,
+                   canons=None) -> list:
+    """#2935 : les pilotes (orchestrateurs) d'un projet, ordre stable.
+
+    Un échec de CI sur une branche de base n'appartient à aucun lot : il doit
+    partir au pilote du projet, pas à personne. Le rôle vient du canon
+    (`orchestrateur`) ; `_of_project` le restreint au projet, avec le repli
+    « tous les orchestrateurs » quand aucun ne le déclare — mieux vaut un
+    pilote d'un autre projet qu'aucun destinataire pour une base rouge. Le
+    choix d'un seul destinataire est laissé à l'appelant (`[0]` : ordre
+    stable)."""
+    orchestras = sous_utilisation.alert_orchestrators(
+        cfg, db, listing, canons=canons)
+    by_name = {row["name"]: row for row in listing}
+    return sorted(_of_project(orchestras, by_name, project, set()))
+
+
 def _reviewer_missing(alert: dict) -> str:
     """#705 : un lot en qa SANS relecteur désigné n'attend personne ; le texte
     demande à l'orchestrateur du projet d'en désigner un (ou de relire lui-même)."""

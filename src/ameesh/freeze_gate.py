@@ -112,6 +112,16 @@ def _head_repos(db: Db, item: dict) -> list[str]:
         candidates.append(fire._repo_of(db, item))
     except Exception:  # noqa: BLE001 - registre illisible : pas de dépôt
         pass
+    # #2928 : une tête relue peut vivre dans le dépôt du canon (le cas des
+    # lots `canon/**`), pas dans le dépôt du projet. Elle s'y résout, et la
+    # preuve #1465 s'y écrit — sans cela le verdict s'écrivait sans reçu et
+    # la porte sensible ne pouvait plus le compter.
+    try:
+        from . import canon as canon_mod
+        for entry in canon_mod.configured(getattr(db, "cfg", None)):
+            candidates.append(getattr(entry, "path", ""))
+    except Exception:  # noqa: BLE001 - canon illisible : pas de dépôt
+        pass
     seen: list[str] = []
     for path in candidates:
         path = str(path or "").strip()
@@ -148,6 +158,26 @@ def _author_repos(db: Db, item: dict) -> list[str]:
         if where and where not in seen:
             seen.append(where)
     return seen
+
+
+def _proof_repo(db: Db, item: dict, sha: str,
+                repo: str | None = None) -> str | None:
+    """Le dépôt où `sha` se résout, pour la preuve exacte du jalon (#1465/#2928).
+
+    Le répertoire courant d'un relecteur n'est pas celui de la tête relue
+    quand elle vit dans un autre dépôt — le dépôt canon, par exemple. Sans ce
+    dépôt, `proof_for_current_turn` ne résout pas le commit, n'écrit aucun
+    reçu, et la porte sensible refuse désormais ce verdict : la preuve se
+    résout donc là où le commit existe. Rend None quand aucun dépôt ne le
+    connaît : le jalon s'écrit alors sans preuve, comme avant."""
+    text = str(sha or "").strip().lower()
+    if not text:
+        return None
+    from . import freeze_checks
+    for where in ([repo] if repo else []) + _head_repos(db, item):
+        if freeze_checks.commit_in(where, text):
+            return where
+    return None
 
 
 def _proposed_head(db: Db, item: dict, frozen: str, repo: str | None = None) -> str:
@@ -608,8 +638,11 @@ def milestone(
     # preuve exacte de son origine (acteur, session, tour, harnais, sha
     # complet). Hors tour (orchestrateur, humain), le jalon s'écrit sans
     # preuve : l'origine reste inconnue, jamais devinée par proximité.
+    # #2928 : la preuve se résout dans le dépôt qui porte la tête (le canon
+    # pour un lot `canon/**`), pas seulement dans le répertoire courant.
     from . import review_provenance
-    proof = review_provenance.proof_for_current_turn(db, actor=actor, sha=sha)
+    proof = review_provenance.proof_for_current_turn(
+        db, actor=actor, sha=sha, cwd=_proof_repo(db, item, sha, repo))
     if proof and not actor:
         actor = proof["actor"]
     row = storage.of(db).work.add_milestone(

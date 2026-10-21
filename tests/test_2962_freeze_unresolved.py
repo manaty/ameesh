@@ -131,8 +131,9 @@ class FreezeUnresolvedTest(PgTestCase):
         self.assertIn("written unverified", row["note"])
 
     def test_la_cli_refuse_le_sha_complet_absent(self):
+        # #2928 : une session sans identité liée ne nomme qu'un humain.
         proc = self.mesh("work", "milestone", str(self.author), "frozen",
-                         "--sha", UNKNOWN, "--actor", "auteur")
+                         "--sha", UNKNOWN, "--actor", "human:t")
         self.assertEqual(proc.returncode, 1, proc.stdout)
         self.assertIn("head-unresolved", proc.stderr)
         self.assertEqual(self.freezes(), [])
@@ -171,8 +172,9 @@ class FreezeUnpublishedTest(PgTestCase):
         self.assertIn("origin/lot/2962-local", row["note"])
 
     def test_la_sortie_de_la_cli_dit_freeze_unpublished(self):
+        # #2928 : une session sans identité liée ne nomme qu'un humain.
         proc = self.mesh("work", "milestone", str(self.lot), "frozen",
-                         "--sha", self.head, "--actor", "auteur")
+                         "--sha", self.head, "--actor", "human:t")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("warning: " + work.FREEZE_UNPUBLISHED_MARK, proc.stderr)
         self.assertIn("origin/lot/2962-local", proc.stderr)

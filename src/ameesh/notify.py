@@ -138,6 +138,8 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # #845 : la garde de la CI — runner busy sans job (panne) et
                  # file au-delà du SLO de 15 min (capacité)
                  "ci_runner_stuck", "ci_queue_saturated",
+                 # #2951: every notifier reports a silent GitHub observer
+                 "github_observation_stale",
                  # #246 : btrfs presque plein côté allocation (df ne le voit pas)
                  "host_disk_low",
                  # #2022 : un volume presque plein, ou au plancher de pause bientôt
@@ -255,6 +257,7 @@ TYPE_LABELS = {
     "ci_main_red": "CI red on main",
     "ci_runner_stuck": "CI runner busy with no job running",
     "ci_queue_saturated": "CI queue beyond its SLO",
+    "github_observation_stale": "GitHub observation missing or stale",
     "deep_analysis_overdue": "deep analysis without a report in time",
     "host_disk_low": "btrfs disk almost full",
     "host_disk_soon_full": "disk almost full, or filling up",
