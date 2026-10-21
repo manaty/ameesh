@@ -61,6 +61,12 @@ class Step(NamedTuple):
 #: La table du §9, dans l'ordre du canon. `measured` : ameesh sait la mesurer
 #: aujourd'hui depuis les événements du lot ; une étape non mesurée est
 #: déclarée ici pour que le trou soit visible, pas silencieux.
+#:
+#: #2919 : `verdict_merge` porte la ligne « hors paquet » du canon (incident ou
+#: déblocage de la CI, §11 bis : 30 min, 15 min en P1). Une unité d'un paquet
+#: ouvert a une cible dynamique, le p80 réel de la CI du paquet
+#: (`lot_steps(..., packet=True, packet_ci_s=...)`, canon §9, décision owner
+#: #103509 option a, home#147) ; elle n'a aucune cible d'escalade propre.
 STEPS: tuple = (
     Step("signal_assigned",
          "request or incident reported → lot assigned to an executor",
@@ -257,13 +263,17 @@ def last_event_ts(item: dict, events: Iterable[dict]) -> float | None:
     return max(stamps) if stamps else None
 
 
-def _row(step: Step, start, *, now: float, critical: bool, done_ts=None, **extra) -> dict:
+def _row(step: Step, start, *, now: float, critical: bool, done_ts=None,
+         target: float | None = None, escalate: bool = True, **extra) -> dict:
+    """Une ligne de mesure ; `target` remplace la cible de la table (p80 d'un
+    paquet) et `escalate=False` laisse la ligne mesurée mais sans escalade
+    propre (l'unité d'un paquet ouvert, #2919)."""
     start = float(start)
     # une étape terminée ne court plus : son délai est acquis, quel qu'il soit
     end = float(done_ts) if done_ts is not None else float(now)
     elapsed = max(0.0, end - start)
-    target = target_s(step, critical=critical)
-    lvl = 0 if done_ts is not None else level(elapsed, target)
+    target = target_s(step, critical=critical) if target is None else float(target)
+    lvl = 0 if (done_ts is not None or not escalate) else level(elapsed, target)
     row = {
         "step": step.key,
         "label": step.label,
@@ -279,13 +289,16 @@ def _row(step: Step, start, *, now: float, critical: bool, done_ts=None, **extra
     }
     if done_ts is not None:
         row["done_ts"] = round(float(done_ts), 3)
+    if not escalate:
+        row["escalation"] = False
     row.update(extra)
     return row
 
 
 def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
               now: float | None = None, packet_slot: float | None = None,
-              dependencies: Iterable[dict] = ()) -> list:
+              dependencies: Iterable[dict] = (), packet: bool = False,
+              packet_ci_s: float | None = None) -> list:
     """Les étapes mesurables d'un lot, une ligne par étape applicable.
 
     `jalons` vient de `progress._work_item_milestones` — le SEUL lecteur des
@@ -310,6 +323,17 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     ligne porte `handover_grace_s` (secondes restantes). La mesure reste
     visible (`elapsed_s`, `target_s`) ; après la grâce, l'escalade reprend au
     niveau que le retard justifie.
+
+    #2919 : `packet=True` marque une unité d'un paquet ouvert (attente
+    `packet` de `planned_waits`). Sa cible « GO → fusion » est le p80 réel de
+    la CI du paquet (`packet_ci_s`, lu dans `progress.ci_suite`, fenêtre de
+    7 jours ; repli sur la cible de la table sans mesure), et l'unité n'a
+    **aucune cible d'escalade propre** : `level` 0, `targets` vides,
+    `overdue_s` 0 — le composeur du paquet ou le pilote porte la fusion
+    (canon §9, décision owner #103509 option a, home#147). La mesure reste
+    lisible (`elapsed_s`, `target_s`, `packet`, `target_source`) pour le taux
+    de respect. Hors paquet (incident ou déblocage de la CI, §11 bis), la
+    cible de la table (30 min, 15 min en P1) et l'escalade sont inchangées.
 
     #2551 : `dependencies` sont les arêtes de prérequis du lot
     (`work_dependencies.grouped`, enrichies de `satisfied_ts` — fusion ou
@@ -369,19 +393,35 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     merged = jalons.get("merged")
     if kind == "ok" and verdict is not None and jalons.get("verdict_current", True):
         step = step_of("verdict_merge")
+        # #2919 : le p80 mesuré remplace la cible de la table pour une unité
+        # de paquet ; sans mesure, la cible hors paquet reste le repli.
+        p80 = None
+        if packet and packet_ci_s is not None:
+            try:
+                candidate = float(packet_ci_s)
+            except (TypeError, ValueError):
+                candidate = 0.0
+            if candidate > 0:
+                p80 = candidate
+        target = p80 if p80 is not None else (float(step.target_s) if packet else None)
+        extra = {}
+        if packet:
+            extra["packet"] = True
+            extra["target_source"] = "p80" if p80 is not None else "fallback"
         if merged is not None:
             out.append(_row(step, verdict, now=now, critical=critical,
                             done_ts=round(float(merged), 3),
-                            elapsed_s=int(max(0.0, float(merged) - float(verdict)))))
+                            elapsed_s=int(max(0.0, float(merged) - float(verdict))),
+                            target=target, escalate=not packet, **extra))
         elif state not in ("merged", "promoted", "closed"):
             start = float(verdict)
-            extra = {}
             if packet_slot is not None and float(packet_slot) > start:
                 # #2335/A2 : la fusion ne peut entrer qu'au prochain paquet ;
                 # l'horloge GO → fusion part de ce créneau, pas du GO.
                 start = float(packet_slot)
                 extra["packet_slot"] = round(start, 3)
-            out.append(_row(step, start, now=now, critical=critical, **extra))
+            out.append(_row(step, start, now=now, critical=critical,
+                            target=target, escalate=not packet, **extra))
 
     handover = handover_ts(item, events)
     if handover is not None and state not in ("merged", "promoted", "closed"):

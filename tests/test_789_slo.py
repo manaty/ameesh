@@ -345,6 +345,105 @@ class MesureTest(unittest.TestCase):
         self.assertEqual(got, ["b", "d", "a"])
 
 
+class PaquetTest(unittest.TestCase):
+    """#2919 : la cible « GO → fusion » d'une unité d'un paquet ouvert est le
+    p80 réel de la CI du paquet, et l'unité n'a aucune cible d'escalade propre
+    (canon §9, décision owner #103509 option a, home#147). Hors paquet
+    (incident ou déblocage de la CI), la cible de la table reste."""
+
+    def _qa(self, *, priority=None):
+        events = [_ev("intake", T0), _ev("build", T0 + 600), _ev("qa", T0 + 1200)]
+        item = _item(state="qa", assignee="executant", updated_ts=T0 + 1200)
+        if priority is not None:
+            item["priority"] = priority
+        jalons = _jalons(item, events)
+        jalons["verdict"], jalons["verdict_kind"] = T0 + 1800, "ok"
+        jalons["verdict_current"] = True
+        return item, jalons, events
+
+    def _row(self, rows, key):
+        got = [r for r in rows if r["step"] == key]
+        self.assertEqual(len(got), 1, "%s absent de %s" % (key, rows))
+        return got[0]
+
+    def test_cible_p80_et_aucune_escalade_propre(self):
+        item, jalons, events = self._qa()
+        # 45 min de CI de paquet (le p80 mesuré), dépassées d'une heure.
+        rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 3600,
+                             packet=True, packet_ci_s=2700)
+        row = self._row(rows, "verdict_merge")
+        self.assertEqual(row["target_s"], 2700)
+        self.assertEqual(row["elapsed_s"], 3600)
+        self.assertEqual(row["level"], 0)
+        self.assertEqual(row["targets"], ())
+        self.assertEqual(row["overdue_s"], 0)
+        self.assertTrue(row["packet"])
+        self.assertEqual(row["target_source"], "p80")
+        self.assertFalse(row["escalation"])
+        self.assertEqual(slo.breaches(rows), [])
+
+    def test_sans_mesure_repli_sur_la_cible_de_la_table(self):
+        # Aucun run de suite complète mesuré : la cible de la table (30 min)
+        # reste le repli, toujours sans escalade propre.
+        for measured in (None, 0, -1, "illisible"):
+            with self.subTest(measured=measured):
+                item, jalons, events = self._qa()
+                rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 3600,
+                                     packet=True, packet_ci_s=measured)
+                row = self._row(rows, "verdict_merge")
+                self.assertEqual(row["target_s"], 1800)
+                self.assertEqual(row["level"], 0)
+                self.assertEqual(row["targets"], ())
+                self.assertEqual(row["target_source"], "fallback")
+                self.assertEqual(slo.breaches(rows), [])
+
+    def test_paquet_p1_garde_le_p80_pas_la_cible_p1(self):
+        # La colonne P1 de la ligne « paquet » est « — » : un P1 ne reprend pas
+        # la cible de 15 min, il suit le p80 comme les autres.
+        item, jalons, events = self._qa(priority=1)
+        rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 1000,
+                             packet=True, packet_ci_s=2700)
+        row = self._row(rows, "verdict_merge")
+        self.assertEqual(row["target_s"], 2700)
+        self.assertEqual(row["level"], 0)
+        self.assertEqual(row["targets"], ())
+
+    def test_hors_paquet_p1_garde_15_min_et_l_escalade(self):
+        # Incident/déblocage CI déclaré : la cible de la table (15 min en P1)
+        # et la cible d'escalade restent.
+        item, jalons, events = self._qa(priority=1)
+        rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 1000)
+        row = self._row(rows, "verdict_merge")
+        self.assertEqual(row["target_s"], 900)
+        self.assertEqual(row["level"], 1)
+        self.assertEqual(row["targets"],
+                         ("assignee", "bureau", "auditeur"))
+        self.assertNotIn("packet", row)
+
+    def test_paquet_fusionne_garde_la_duree_et_le_p80(self):
+        item, jalons, events = self._qa()
+        jalons["merged"] = T0 + 1800 + 3000
+        rows = slo.lot_steps(item, jalons, events, now=T0 + 10_000,
+                             packet=True, packet_ci_s=2700)
+        row = self._row(rows, "verdict_merge")
+        self.assertEqual(row["elapsed_s"], 3000)
+        self.assertEqual(row["target_s"], 2700)
+        self.assertEqual(row["done_ts"], T0 + 4800)
+        self.assertFalse(row["escalation"])
+
+    def test_creneau_de_paquet_garde_le_report(self):
+        # #2335/A2 : l'horloge part du premier créneau après le GO ; la cible
+        # p80 ne change pas ce départ.
+        item, jalons, events = self._qa()
+        rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 5400,
+                             packet_slot=T0 + 7200,
+                             packet=True, packet_ci_s=2700)
+        row = self._row(rows, "verdict_merge")
+        self.assertEqual(row["started_ts"], T0 + 7200)
+        self.assertEqual(row["packet_slot"], T0 + 7200)
+        self.assertEqual(row["target_s"], 2700)
+
+
 class GracePriseTest(unittest.TestCase):
     """#2217 : une prise en charge récente suspend l'escalade, sans effacer la mesure.
 

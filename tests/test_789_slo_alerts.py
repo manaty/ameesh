@@ -20,8 +20,8 @@ import unittest
 from unittest import mock
 
 from ameesh import (alert_briefs, decisions, exploitation, lot_class, merge_queue,
-                    notify, planned_waits, registry, stagnation, storage, work,
-                    work_dependencies)
+                    notify, packet_guard, planned_waits, registry, slo, stagnation,
+                    storage, work, work_dependencies)
 from ameesh.storage.postgres.operations import Operations
 
 from .support import FAKEBIN, PgTestCase
@@ -562,6 +562,72 @@ class PaquetTest(_Base):
             None, self.GO, "ameesh", observed=True), self.GO + 55 * 60)
         self.assertIsNone(exploitation._packet_slot(
             None, self.GO, "ameesh", observed=False))
+
+    def _ci_run(self, minutes, *, run_id):
+        """Une suite complète conclue autour de `GO`, pour le p80 mesuré."""
+        self.db.execute(
+            "INSERT INTO ci_runs (repo, run_id, head_sha, branch, event, base,"
+            " status, url, first_seen_at, concluded_at)"
+            " VALUES ('manaty/ameesh', %s, %s, 'integration/paquet-test', 'push',"
+            " 'main', 'success', 'u', to_timestamp(%s), to_timestamp(%s))",
+            (run_id, "0" * 40, self.GO - 600.0,
+             self.GO - 600.0 + float(minutes) * 60.0))
+
+    def test_unite_de_paquet_mesuree_contre_le_p80_sans_alerte(self):
+        # #2919 : la cible est le p80 réel de la CI du paquet (7 jours) ; la
+        # ligne est mesurée, jamais alertée (aucune cible d'escalade propre).
+        self.qa_at(self.GO)
+        self.packet(body="unités : #%d @ abcdef0" % self.lot["id"])
+        for run_id, minutes in enumerate((10, 20, 30, 40), start=1):
+            self._ci_run(minutes, run_id=run_id)
+        self.now = self.GO + 75 * 60
+        calls = []
+        real = slo.lot_steps
+
+        def spy(*args, **kwargs):
+            calls.append(kwargs)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(exploitation, "_project_github",
+                               return_value="manaty/ameesh"), \
+                mock.patch.object(slo, "lot_steps", side_effect=spy):
+            self.assertEqual(self.slo(), [])
+        packet_calls = [kw for kw in calls if kw.get("packet")]
+        self.assertEqual(len(packet_calls), 1, calls)
+        # [600, 1200, 1800, 2400] : p80 interpolé à 2040 s.
+        self.assertEqual(packet_calls[0]["packet_ci_s"], 2040.0)
+
+    def test_exception_declaree_sort_du_paquet_et_alerte(self):
+        # #2919 : une exception `packet-exception incident` pour la tête
+        # courante ramène la cible de la table (30 min) et l'escalade.
+        self.qa_at(self.GO)
+        head = "a" * 40
+        self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                        (head, self.lot["id"]))
+        self.packet(body="unités : #%d @ %s" % (self.lot["id"], head))
+        packet_guard.declare(self.db, self.lot["id"], "incident",
+                             "cible rouge", head, actor="dev1")
+        self.now = self.GO + 50 * 60
+        alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"], a["targets"]) for a in alerts],
+                         [("verdict_merge", 1, ["assignee"])])
+        self.assertIsNone(alerts[0]["waiting"])
+        self.assertEqual(alerts[0]["threshold"], 1800)
+
+    def test_exception_d_une_autre_tete_ne_sort_pas_du_paquet(self):
+        # Une exception ne couvre que sa tête : le nouveau gel reste dans le
+        # paquet, mesuré au p80 et sans alerte.
+        self.qa_at(self.GO)
+        head = "b" * 40
+        self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                        (head, self.lot["id"]))
+        self.packet(body="unités : #%d @ %s" % (self.lot["id"], head))
+        packet_guard.declare(self.db, self.lot["id"], "incident",
+                             "ancienne tête", "a" * 40, actor="dev1")
+        self.now = self.GO + 125 * 60
+        with mock.patch.object(exploitation, "_project_github",
+                               return_value="manaty/ameesh"):
+            self.assertEqual(self.slo(), [])
 
 
 class BriefsTest(_Base):
