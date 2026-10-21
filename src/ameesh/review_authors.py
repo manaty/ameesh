@@ -610,6 +610,15 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
         written.setdefault(actor, []).append(sha)
         if actor != author_name and actor in reviewers:
             review_commits.setdefault(actor, []).append((sha, proven))
+    # #2924 B4 : la lecture courante promeut tout commit de relecteur en auteur
+    # (#2888). La lecture d'un gel antérieur doit faire de même, même quand le
+    # commit n'a pas de reçu exact et que la famille vient du journal des tours
+    # (#2721) : sinon un squash à contenu identique perdrait cette famille.
+    for actor, entries in review_commits.items():
+        by_name.setdefault(actor, set())
+        for _sha, proven in entries:
+            if proven:
+                by_name[actor].add(proven)
     return by_name, written, review_commits, unknown
 
 

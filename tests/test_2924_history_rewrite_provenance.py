@@ -283,6 +283,51 @@ class RealRewriteTest(_RewriteFixture):
         self.assertEqual({row["name"] for row in authors}, {"impl", "cx3"})
 
 
+class NoReceiptCorrectorTest(_RewriteFixture):
+    """#2924 B4 : sans reçu exact, le correcteur désigné reste auteur (#2721)."""
+
+    def squash_without_receipt(self, lines=0):
+        self.db.execute("DELETE FROM provenance_receipts WHERE actor = 'cx3'")
+        head = self.head_a
+        if lines:
+            self.repo.write(
+                "src/ameesh/runner.py",
+                "base\nlot\n"
+                "if not admitted:\n"
+                "    return deferred  # cx3 fix\n"
+                + "".join("guard %02d = %d\n" % (i, i) for i in range(lines)))
+            head = self.repo.commit("cx3: grosse correction", agent="cx3")
+            self.freeze(head)
+        # La famille du correcteur n'est plus dans un reçu : elle vient du
+        # journal des tours (#2721), comme pour la lecture courante.
+        self.db.execute("INSERT INTO turn_costs (agent, harness, session,"
+                        " recorded_at) VALUES ('cx3', 'codex', 's-codex', now())")
+        tree = self.repo.git("rev-parse", head + "^{tree}")
+        head_b = self.squash(tree, self.base, "contenu consolidé")
+        freeze_b = self.freeze(head_b)
+        milestone = {"id": int(freeze_b["id"]), "sha": head_b,
+                     "actor": "impl", "at_ts": freeze_b.get("at_ts")}
+        return milestone, head_b
+
+    def test_a_small_correction_without_a_receipt_stays_an_author(self):
+        milestone, head_b = self.squash_without_receipt()
+        authors, unknown, correctors = self.reading(
+            milestone, [head_b], self.base, head_b)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+        self.assertIn("cx3", {row["name"] for row in correctors})
+
+    def test_a_large_correction_without_a_receipt_stays_an_author(self):
+        milestone, head_b = self.squash_without_receipt(lines=60)
+        authors, unknown, correctors = self.reading(
+            milestone, [head_b], self.base, head_b)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+        self.assertNotIn("cx3", {row["name"] for row in correctors})
+
+
 class ParserTest(TestCase):
     """#2924 B1 : chaque fichier du diff garde ses propres lignes."""
 
