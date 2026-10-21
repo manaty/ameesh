@@ -111,6 +111,68 @@ class GitTest(PgTestCase):
             reviewed_head=self.head, repo=self.repo)
         self.assertEqual(untouched["neighbors"], [])
 
+    def _merged_lot(self, title):
+        lot = work.add(self.db, title=title, app="p")
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s",
+                        (lot["id"],))
+        return lot["id"]
+
+    def _patch(self, name, text):
+        with open(os.path.join(self.repo, name), "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def test_two_commits_touching_the_same_line_are_both_read(self):
+        # B1 (#2988) : le second commit qui touche la ligne était rejeté
+        # (chunk commençant par le patch précédent), et le lot qu'il citait
+        # disparaissait quand le commit le plus récent ne citait rien.
+        lot = self._merged_lot("correctif porté par le commit précédent")
+        self._patch("f.txt", "line1\nFIXED\nline3\n")
+        _git(self.repo, "commit", "-qam", "fix older\n\nameesh-work: %d" % lot)
+        self._patch("f.txt", "line1\nFIXED2\nline3\n")
+        _git(self.repo, "commit", "-qam", "tweak newer")
+        found = intake_neighbors.neighbors(
+            self.db, "p", title="f.txt:2", body="", reviewed_head=self.head,
+            repo=self.repo)
+        row = next(item for item in found["neighbors"] if item["id"] == lot)
+        self.assertTrue(any("peut-être corrigé par #%d" % lot in motif
+                            for motif in row["motifs"]), row["motifs"])
+
+    def test_line_cited_at_the_reviewed_head_is_followed_into_the_target(self):
+        # B2 (#2988) : une insertion en tête décale la ligne citée ; `-L` sur
+        # les coordonnées de la tête ne voyait pas le correctif de la cible.
+        self._patch("shifted.txt", "one\nbug\nthree\n")
+        _git(self.repo, "add", "shifted.txt")
+        _git(self.repo, "commit", "-qm", "base shifted")
+        head = _git(self.repo, "rev-parse", "HEAD").strip()
+        lot = self._merged_lot("correctif après insertion")
+        self._patch("shifted.txt", "inserted\none\nbug\nthree\n")
+        _git(self.repo, "commit", "-qam", "insert a line above")
+        self._patch("shifted.txt", "inserted\none\nFIXED\nthree\n")
+        _git(self.repo, "commit", "-qam", "fix bug\n\nameesh-work: %d" % lot)
+        found = intake_neighbors.neighbors(
+            self.db, "p", title="shifted.txt:2", body="le constat vise la ligne deux",
+            reviewed_head=head, repo=self.repo)
+        row = next(item for item in found["neighbors"] if item["id"] == lot)
+        self.assertTrue(any("peut-être corrigé par #%d" % lot in motif
+                            for motif in row["motifs"]), row["motifs"])
+
+    def test_real_git_path_case_is_preserved(self):
+        # B3 (#2988) : `Makefile` ne doit pas devenir `makefile` pour Git
+        # (deux noms distincts sous Linux).
+        self._patch("Makefile", "all:\n\techo bug\n")
+        _git(self.repo, "add", "Makefile")
+        _git(self.repo, "commit", "-qm", "add Makefile")
+        head = _git(self.repo, "rev-parse", "HEAD").strip()
+        lot = self._merged_lot("correctif du Makefile")
+        self._patch("Makefile", "all:\n\techo FIXED\n")
+        _git(self.repo, "commit", "-qam", "fix makefile\n\nameesh-work: %d" % lot)
+        found = intake_neighbors.neighbors(
+            self.db, "p", title="Makefile:2", body="", reviewed_head=head,
+            repo=self.repo)
+        row = next(item for item in found["neighbors"] if item["id"] == lot)
+        self.assertTrue(any("peut-être corrigé par #%d" % lot in motif
+                            for motif in row["motifs"]), row["motifs"])
+
     def test_without_clone_git_is_unverified(self):
         found = intake_neighbors.neighbors(
             self.db, "p", title="f.txt:2", body="", reviewed_head=self.head,

@@ -50,6 +50,8 @@ REVIEW_WORD_RE = re.compile(
     r"(?![\w-])")
 #: une ligne de `git log -L` : le hash puis les champs du format demandé
 _GIT_RECORD_SEP = "\x1e"
+#: un en-tête de hunk de diff (`@@ -a,b +c,d @@`)
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 #: extensions de fichier admises dans un constat (liste fermée : un constat
 #: qui cite `example.com` ou `1.2.3` n'est pas un chemin)
 _FILE_EXTENSIONS = frozenset("""
@@ -332,12 +334,13 @@ def default_target(repo: Optional[str]) -> str:
 # --------------------------------------------------------------------------
 
 def _clean_path(path: str) -> str:
+    """Le chemin débarrassé des préfixes de diff, casse conservée (Git Linux)."""
     value = str(path or "").strip()
     while value.startswith("./"):
         value = value[2:]
     if value.startswith(("a/", "b/")) and "/" in value[2:]:
         value = value[2:]
-    return value.casefold()
+    return value
 
 
 def _looks_like_host_path(path: str) -> bool:
@@ -349,11 +352,13 @@ def _looks_like_host_path(path: str) -> bool:
 
 
 def cited_paths(text: str) -> list[dict]:
-    """Les chemins cités par un texte : `{path, line, end, raw}`, sans doublon.
+    """Les chemins cités par un texte : `{path, git_path, line, end, raw}`, sans doublon.
 
-    Le chemin est normalisé (préfixes `./`, `a/`, `b/` retirés, minuscules) ;
-    la ligne sert au `git log -L`. Un même chemin cité deux fois n'est gardé
-    qu'une fois (première citation, avec sa ligne).
+    `path` est la clé de comparaison textuelle (minuscules) ; `git_path` garde
+    la casse réelle, celle du fichier dans le dépôt (`Makefile` n'est pas
+    `makefile` sous Linux) ; `display` est la citation d'origine. La ligne sert
+    au `git log -L`. Un même chemin cité deux fois n'est gardé qu'une fois
+    (première citation, avec sa ligne).
     """
     found: dict[tuple, dict] = {}
     for regex, with_ext in ((_PATH_RE, True), (_NAME_RE, False), (_DOTFILE_RE, False)):
@@ -373,10 +378,11 @@ def cited_paths(text: str) -> list[dict]:
             clean = _clean_path(path)
             if not clean:
                 continue
-            key = (clean, int(line) if line else None)
+            key = (clean.casefold(), int(line) if line else None)
             if key in found:
                 continue
-            found[key] = {"path": clean, "line": int(line) if line else None,
+            found[key] = {"path": clean.casefold(), "git_path": clean,
+                          "line": int(line) if line else None,
                           "end": int(end) if end else (int(line) if line else None),
                           "raw": raw, "display": path}
     return list(found.values())
@@ -429,8 +435,10 @@ def _resolve_git_path(repo: str, target: str, path: str,
 
     Un constat cite souvent le seul nom du fichier (`mobile-build.yml:121`)
     alors que le dépôt le porte sous `.github/workflows/`. Le chemin exact
-    est essayé d'abord ; sinon la liste de l'arbre (une fois par cible) rend
-    l'unique fichier de ce nom, ou rien si le nom est ambigu.
+    (casse comprise) est essayé d'abord ; sinon la liste de l'arbre (une fois
+    par cible) rend l'unique fichier de ce nom. Une casse fautive n'est
+    corrigée qu'en dernier recours, si elle ne désigne qu'un seul fichier :
+    `Makefile` et `makefile` sont deux noms distincts sous Linux.
     """
     try:
         proc = _git(repo, "rev-parse", "--verify", "--quiet", "%s:%s" % (target, path))
@@ -447,19 +455,33 @@ def _resolve_git_path(repo: str, target: str, path: str,
             listing = None
         trees[target] = (listing.stdout.decode("utf-8", "replace").splitlines()
                          if listing is not None and listing.returncode == 0 else [])
-    matches = [candidate for candidate in trees[target]
-               if candidate.rsplit("/", 1)[-1] == path]
-    return matches[0] if len(matches) == 1 else None
+    basename = path.rsplit("/", 1)[-1]
+    exact = [candidate for candidate in trees[target]
+             if candidate.rsplit("/", 1)[-1] == basename]
+    if len(exact) == 1:
+        return exact[0]
+    if exact:
+        return None
+    folded = [candidate for candidate in trees[target]
+              if candidate.rsplit("/", 1)[-1].casefold() == basename.casefold()]
+    return folded[0] if len(folded) == 1 else None
 
 
 def _commits_touching(repo: str, head: str, target: str, path: str,
                       line: int, end: int) -> list[dict]:
-    """Les commits de `head..target` qui touchent `path:line` (`git log -L`)."""
+    """Les commits de `head..target` qui touchent `path:line` (`git log -L`).
+
+    Le séparateur `%x1e` est placé **en tête** du format : le patch d'un
+    commit suit son en-tête, et le chunk suivant commence par l'en-tête du
+    commit suivant, jamais par le patch précédent (le défaut B1 de #2988 : le
+    second commit touchant la même ligne était rejeté, et le lot qu'il citait
+    disparaissait). Le `%x00` final ferme le message avant son patch.
+    """
     from . import canon
 
     span = "%d,%d:%s" % (line, max(int(end or line), int(line)), path)
     try:
-        proc = _git(repo, "log", "--format=%H%x00%s%x00%B%x1e",
+        proc = _git(repo, "log", "--format=%x1e%H%x00%s%x00%B%x00",
                     "%s..%s" % (head, target), "-L" + span)
     except canon.GitError:
         return []
@@ -468,23 +490,19 @@ def _commits_touching(repo: str, head: str, target: str, path: str,
     out = proc.stdout.decode("utf-8", "replace")
     commits = []
     for chunk in out.split(_GIT_RECORD_SEP):
-        chunk = chunk.strip("\n")
+        chunk = chunk.lstrip("\n")
         if not chunk:
             continue
-        fields = chunk.split("\x00", 2)
+        fields = chunk.split("\x00", 3)
         if len(fields) < 3:
             continue
         sha, subject = fields[0].strip(), fields[1].strip()
         if not re.fullmatch(r"[0-9a-f]{40,64}", sha):
             continue
-        message = fields[2]
-        # `git log -L` ajoute le diff après le message : un trailer recopié
-        # dans un ajout (`+ameesh-work: 999`) ne doit pas rattacher le commit.
-        cut = message.find("\ndiff --git ")
-        if cut != -1:
-            message = message[:cut]
+        # `%x00` ferme le message avant le patch : fields[2] est exactement
+        # `%B`, même si le message cite lui-même un diff.
         commits.append({"sha": sha, "subject": subject,
-                        "message": message, "path": path, "line": line})
+                        "message": fields[2], "path": path, "line": line})
     return commits
 
 
@@ -509,6 +527,54 @@ def _lots_of_commit(repo: str, commit: dict, hash_refs: Optional[bool] = None) -
     return lots
 
 
+def _diff_hunks(repo: str, head: str, target: str, path: str,
+                cache: dict[str, list[tuple]]) -> list[tuple]:
+    """Les hunks `--unified=0` de `head..target` pour ce chemin."""
+    if path in cache:
+        return cache[path]
+    hunks: list[tuple] = []
+    try:
+        proc = _git(repo, "diff", "--unified=0", "--no-color", "--no-ext-diff",
+                    head, target, "--", path)
+    except Exception:  # noqa: BLE001 - dépôt illisible
+        proc = None
+    if proc is not None and proc.returncode == 0:
+        for line in proc.stdout.decode("utf-8", "replace").splitlines():
+            match = _HUNK_RE.match(line)
+            if not match:
+                continue
+            hunks.append((int(match.group(1)), int(match.group(2) or 1),
+                          int(match.group(3)), int(match.group(4) or 1)))
+    cache[path] = hunks
+    return hunks
+
+
+def _map_line(hunks: list[tuple], line: int) -> Optional[int]:
+    """La ligne correspondante dans `target` pour une ligne de `head`.
+
+    Une insertion au-dessus décale la ligne ; une suppression la fait
+    disparaître (None). C'est le suivi que réclame le constat : il cite les
+    coordonnées de la tête relue, pas celles de la cible quelques commits plus
+    tard (B2 de #2988 : l'insertion en tête faisait lire `f.txt:3` au lieu de
+    `f.txt:2`).
+    """
+    offset = 0
+    for old_start, old_count, new_start, new_count in hunks:
+        if old_count == 0:
+            if old_start < line:
+                offset += new_count
+            continue
+        old_end = old_start + old_count - 1
+        if line < old_start:
+            break
+        if line <= old_end:
+            if new_count == 0:
+                return None
+            return new_start + min(line - old_start, new_count - 1)
+        offset += new_count - old_count
+    return line + offset
+
+
 def _git_hits(repo: str, head: str, target: str, refs: list[dict],
               candidates: set[int]) -> dict[int, dict]:
     """`{lot: {sha, subject, path, line, motif}}` des lignes déjà changées."""
@@ -521,24 +587,33 @@ def _git_hits(repo: str, head: str, target: str, refs: list[dict],
     hits: dict[int, dict] = {}
     seen_spans: set[tuple] = set()
     trees: dict[str, list[str]] = {}
+    diffs: dict[str, list[tuple]] = {}
     for ref in refs:
         if not ref.get("line"):
             continue
-        path = _resolve_git_path(repo, target, ref["path"], trees)
+        # B3 : le chemin Git garde sa casse ; la clé textuelle `path` ne sert
+        # qu'à rapprocher les constats.
+        path = _resolve_git_path(repo, target, ref.get("git_path") or ref["path"], trees)
         if not path:
             continue
-        key = (path, ref["line"], ref.get("end"))
+        hunks = _diff_hunks(repo, head, target, path, diffs)
+        line = _map_line(hunks, int(ref["line"]))
+        if line is None:
+            continue
+        end = _map_line(hunks, int(ref.get("end") or ref["line"]))
+        if end is None or end < line:
+            end = line
+        key = (path, line, end)
         if key in seen_spans:
             continue
         seen_spans.add(key)
-        for commit in _commits_touching(repo, head, target, path,
-                                        int(ref["line"]),
-                                        int(ref.get("end") or ref["line"])):
+        for commit in _commits_touching(repo, head, target, path, line, end):
             for lot in _lots_of_commit(repo, commit, hash_refs):
                 if lot not in candidates or lot in hits:
                     continue
                 hits[lot] = {"sha": commit["sha"], "subject": commit["subject"],
-                             "path": ref["path"], "line": ref["line"],
+                             "path": ref.get("display") or ref["git_path"],
+                             "line": ref["line"],
                              "motif": "peut-être corrigé par #%d (%s)"
                                       % (lot, commit["sha"][:9])}
     return hits
