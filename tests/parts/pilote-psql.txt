@@ -45,6 +45,7 @@ test_2845_github_watch  # stockage : curseur, déduplication et checkpoint de la
 test_2893_spend_pending_exact  # stockage : identité exacte du marqueur (created_at, clé 0471) sous extra_float_digits, réparation d'avant 0471 (#2166)
 test_2933_housekeeping_alert_identity  # stockage : première observation stable des orphelins et worktrees malgré les relevés (#2933)
 test_2905_stale_spend_key  # stockage : un spend_key périmé après retour arrière n'est jamais la clé du tour (#2905)
+test_2951_github_observation  # stockage : fraîcheur ci_queue_state, silence GitHub et résolution par tout notificateur (#2951)
 test_423_agent_aliases  # storage: alias namespace guards, audit, same fenced lease/session and canon sync (#423)
 test_1022_creneau_landed  # storage: une fusion lande le creneau de migration, une liberation sans atterrissage le libere (#1022)
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
