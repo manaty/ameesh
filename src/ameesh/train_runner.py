@@ -82,6 +82,10 @@ class HostLease:
 
 
 class Passage:
+    #: #2914: the canon watch; None (also for a passage built without
+    #: ``__init__`` on a bench) keeps the historical behaviour.
+    canon = None
+
     def __init__(self, cfg, project, *, owner, policy, policy_path,
                  policy_commit, workflows, provider, mechanics, notify, impact=None,
                  reservation=None, transports=None, candidate=None, initial=None,

@@ -146,6 +146,8 @@ class Passage:
     #: passage, and must not run the engine's effects for it.
     shadow = True
     reservation = None
+    #: #2914: the canon watch; None keeps the historical behaviour.
+    canon = None
 
     def __init__(self, cfg, project, *, policy_path, policy_commit, workflows,
                  provider, mechanics, repository, candidate=None, initial=None,
