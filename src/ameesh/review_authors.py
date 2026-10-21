@@ -523,6 +523,34 @@ def _path_line_counts(repo: str, rev: str, path: str, cache: dict):
     return cache[key]
 
 
+def _order_survives(repo: str, head: str, sha: str, path: str,
+                    rows: set, cache: dict) -> bool:
+    """Le réordre de `rows` par `sha` dans `path` subsiste-t-il dans la tête ?
+
+    La trace d'un réordre est un **voisinage** nouveau : une paire de lignes
+    consécutives (non vides, dépouillées) touchant une ligne réordonnée,
+    présente au commit et absente du parent. Le réordre subsiste si la tête
+    garde une de ces paires. Un chemin illisible dans la tête ou au commit est
+    un doute (#2994)."""
+    def pairs(rev):
+        key = ("pairs", rev, path)
+        if key not in cache:
+            text = plan_git._out(repo, "show", "%s:%s" % (rev, path))
+            if text is None:
+                cache[key] = None
+            else:
+                lines = [line.strip() for line in str(text).splitlines()
+                         if line.strip()]
+                cache[key] = set(zip(lines, lines[1:]))
+        return cache[key]
+    after, now = pairs(sha), pairs(head)
+    if after is None or now is None:
+        return True
+    created = {pair for pair in after - (pairs(str(sha) + "^") or set())
+               if pair[0] in rows or pair[1] in rows}
+    return bool(created & now)
+
+
 def _any_line_in_head(repo: str, head: str, lines: Sequence[str]) -> bool:
     """Une des lignes apparaît-elle **quelque part** dans l'arbre de la tête ?
 
@@ -618,10 +646,11 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
     que le commit retire aussi ailleurs (un déplacement) reste une preuve,
     comme avant. #2994 : seul un déplacement **entre chemins** est exempté ;
     une ligne retirée puis rajoutée dans le même fichier (un réordonnancement)
-    est une ligne héritée comme une autre. Sans ligne propre, la lecture passe aux lignes retirées,
-    puis aux lignes copiées, cherchées à leur seul chemin (un chemin absent
-    conserve l'auteur) : une copie retirée ne garde pas son correcteur (B1).
-    Un diff sans ligne significative conserve l'auteur."""
+    est une ligne héritée comme une autre. Sans ligne propre, la lecture passe
+    aux lignes retirées, puis aux lignes copiées, cherchées à leur seul chemin
+    (un chemin absent conserve l'auteur) : une copie retirée ne garde pas son
+    correcteur (B1) ; un réordre ne subsiste que si la tête garde un voisinage
+    de lignes qu'il a créé (#2994). Un diff sans ligne significative conserve l'auteur."""
     parsed = _commit_lines(repo, sha)
     if parsed is None:
         return True
@@ -631,8 +660,8 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
     added = [(path, row) for path, rows in adds.items() for row in rows
              if _meaningful_line(row)]
     copied: list = []
+    removed_from: dict = {}
     if added:
-        removed_from: dict = {}
         for path, rows in removes.items():
             for row in rows:
                 removed_from.setdefault(row.strip(), set()).add(path)
@@ -680,7 +709,14 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
             before = _path_line_counts(repo, str(sha) + "^", path, cache) or {}
             if present.get(row.strip(), 0) > before.get(row.strip(), 0):
                 return True
-        return False
+        # #2994 : un réordre dans le même fichier n'ajoute aucune occurrence ;
+        # sa trace est le voisinage nouveau qu'il a laissé, s'il subsiste.
+        reordered: dict = {}
+        for path, row in copied:
+            if path in removed_from.get(row.strip(), set()):
+                reordered.setdefault(path, set()).add(row.strip())
+        return any(_order_survives(repo, head, sha, path, rows, cache)
+                   for path, rows in reordered.items())
     return not removed
 
 
