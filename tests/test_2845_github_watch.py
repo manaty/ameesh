@@ -591,6 +591,39 @@ class CollectionTest(unittest.TestCase):
             events += more
             self.assertEqual({e["object_id"] for e in events}, set(range(1, 13)))
 
+    def test_b9_offset_suspension_without_anchor_cannot_hide_a_row(self):
+        # B9 #2955: 31 rows become recent during the first GET, keys old; #32
+        # is stable behind them. A checkpointed page offset could be invalidated
+        # when the keys catch up and #32 recedes to page 1. Without an accepted
+        # anchor the pass reads through to the end and delivers #32.
+        with mock.patch.object(watch, "PAGE_SIZE", 3):
+            rows = [issue(n) for n in range(1, 33)]
+            for n, row in enumerate(rows):
+                row["key"] = row["updated_at"] = watch.iso(NOW - 1000 + n)
+            api = LagApi(rows, [])
+            get = api.get
+            mutated = []
+
+            def mutate(path, **kw):
+                out = get(path, **kw)
+                if not mutated:
+                    mutated.append(True)
+                    for row in rows[:31]:
+                        row["updated_at"] = watch.iso(NOW + 1)
+                return out
+
+            with mock.patch.object(api, "get", side_effect=mutate):
+                events, scan, until = watch.collect_batch(
+                    api, SUB, NOW - 3600, NOW, None)
+                more, _ = self.finish(api, NOW, NOW, scan)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, {32})
+            for row in rows[:31]:
+                row["key"] = row["updated_at"]
+            more, _ = self.finish(api, until - watch.OVERLAP, NOW + 700, None)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, set(range(1, 33)))
+
     def test_b6_anchor_must_be_an_accepted_row(self):
         # B6 #2955: #6 is deferred (> U) but its old key sits at the end of the
         # page. When #1..#5 move and #6 catches up its key, the re-read page is
@@ -908,31 +941,30 @@ class DeliveryTest(PgTestCase):
         self.assertEqual(len(self.messages()), 1)
         self.assertIn("acme/app#1", self.messages()[0]["body"])
 
-    def test_recent_page_budget_suspends_without_moving_the_cursor(self):
-        # #2955: ten recent pages exhaust the pass budget. The scan is
-        # checkpointed without committing the cursor; the next tick resumes
-        # and reaches the settled row behind the recent burst.
-        rows = [issue(n) for n in range(1, 32)]
-        for n, row in enumerate(rows):
-            row["key"] = watch.iso(NOW - 2000 + n)
-            row["updated_at"] = watch.iso(NOW + 1)
-        rows.append(dict(issue(32), key=watch.iso(NOW - 1000),
-                         updated_at=watch.iso(NOW - 1000)))
-        api = LagApi(rows, [])
+    def test_long_settled_scan_alerts_and_holds_the_cursor(self):
+        # #2955: a scan open more than STALLED_TICKS logs
+        # `github-watch-stalled`, keeps the cursor until it really ends, then
+        # commits U. This is the progressive long-scan case; no page offset is
+        # trusted across a key catch-up.
+        api = Api([issue(n) for n in range(1, 32)])
         logs = []
-        watcher = self.watcher(api, log=logs.append, stalled_ticks=0)
-        with mock.patch.object(watch, "PAGE_SIZE", 3):
-            self.assertEqual(watcher.tick(self.db, NOW)[0]["events"], 0)
+        watcher = self.watcher(api, log=logs.append, stalled_ticks=6)
+        with mock.patch.object(watch, "PAGE_SIZE", 3), \
+                mock.patch.object(watch, "DIGEST_MAX_ITEMS", 100):
+            for _ in range(7):
+                watcher.tick(self.db, NOW)
             self.assertIsNotNone(storage.of(self.db).github_watch.scan(
                 "app", "acme/app"))
             self.assertEqual(storage.of(self.db).github_watch.cursor(
                 "app", "acme/app"), NOW - watch.INDEX_LAG - watch.BOOTSTRAP)
             self.assertTrue(any("github-watch-stalled" in line for line in logs))
-            self.assertEqual(watcher.tick(self.db, NOW)[0]["events"], 1)
+            for _ in range(10):
+                watcher.tick(self.db, NOW)
+                if storage.of(self.db).github_watch.scan("app", "acme/app") is None:
+                    break
         self.assertIsNone(storage.of(self.db).github_watch.scan("app", "acme/app"))
         self.assertEqual(storage.of(self.db).github_watch.cursor(
             "app", "acme/app"), NOW - watch.INDEX_LAG)
-        self.assertIn("acme/app#32", self.messages()[0]["body"])
 
     def test_committed_mail_is_written_and_indexed_in_the_thread(self):
         self.watcher(Api([issue()], [comment()])).tick(self.db, NOW)

@@ -36,8 +36,10 @@ PAGE_SIZE = 100
 #: ``test_latency_beyond_the_bound_is_outside_the_model``).
 INDEX_LAG = 300
 #: API-call budget for one pass (#2955): one page plus a backward re-read,
-#: and enough room to skip the recent pages whose index keys still lag.
-PAGES_PER_TICK = 10
+#: and enough room to skip recent pages. Without an accepted anchor (or
+#: without new settled rows in this pass) a pass reads to the end instead of
+#: suspending on an offset that later key catch-up could invalidate.
+PAGES_PER_TICK = 20
 #: #2955: after this many ticks on one open scan, `github-watch-stalled` is
 #: logged (the scan suspends without committing the cursor; no row is lost).
 STALLED_TICKS = 6
@@ -231,7 +233,9 @@ def collect_batch(api, sub, since, now, scan):
         state.pop("snap_prev", None)
     state.setdefault("window_since", state["since"])
     state.setdefault("blank", 0)
+    state.setdefault("last_settled", None)
     state["ticks"] = state.get("ticks", 0) + 1
+    settled_at_start = state.get("last_settled")
     events = []
     settled = state["settled"]  # rows after it may still move: deferred
     calls = 0
@@ -310,11 +314,23 @@ def collect_batch(api, sub, since, now, scan):
         # U or the end of the list terminates the stream.
         if (full and not settled_rows and not stop_after
                 and not state.get("snap_prev")):
-            # No accepted anchor to protect: blank pages are skipped within
-            # this pass, then the scan suspends without committing the cursor.
+            # No accepted anchor to protect: skip recent pages. Without a
+            # settled row there is no safe offset to resume from, so read on
+            # until an anchor/end. Once an anchor exists, suspend on the call
+            # budget at a safe timestamp position (never at a page offset,
+            # which keys that catch up can invalidate) and keep the cursor.
             state["blank"] = state.get("blank", 0) + 1
             state["page"] += 1
-            if calls >= PAGES_PER_TICK:
+            progressed = (state.get("last_settled") is not None
+                          and state["last_settled"] != settled_at_start)
+            if progressed and calls >= PAGES_PER_TICK:
+                # A settled row accepted in this pass is the proof needed to
+                # resume safely: keep it as a timestamp position, never a page
+                # offset that later key catch-up can invalidate.
+                state["since"] = max(state["since"],
+                                     state["last_settled"] - 1)
+                state["page"] = 1
+                state["blank"] = 0
                 return events, state, settled
             continue
 
@@ -365,11 +381,16 @@ def collect_batch(api, sub, since, now, scan):
         if fresh != sorted(fresh):
             raise plan_github.GithubError("GitHub watch: updated order is invalid")
         events.extend(events_from(sub, state["kind"], current))
+        for row in recovered + current:
+            ts = when(row)
+            if (state["last_settled"] is None
+                    or ts > state["last_settled"]):
+                state["last_settled"] = ts
 
         if stop_after or not full:
             if state["kind"] == "issue":
                 state.update(kind="comment", page=1, since=state["window_since"],
-                             blank=0)
+                             blank=0, last_settled=None)
                 state.pop("snap_prev", None)
                 if calls >= PAGES_PER_TICK:
                     return events, state, settled
