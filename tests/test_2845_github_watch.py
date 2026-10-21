@@ -190,6 +190,32 @@ class CollectionTest(unittest.TestCase):
         self.assertEqual({e["object_id"] for e in events}, set(range(101, 202)))
         self.assertEqual(scan["page"], 3)
 
+    def test_shifted_row_is_delivered_once_with_its_new_version(self):
+        # #2955: a row can move from page 2 into page 1 while it is edited
+        # between the two reads. The later read (page 1) is the new version;
+        # the copy read with page 2 must not be delivered after it.
+        with mock.patch.object(watch, "PAGE_SIZE", 2):
+            api = Api([issue(n) for n in range(1, 5)])
+            _, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, None)
+            get = api.get
+            mutated = []
+
+            def mutate(path, **kw):
+                if "page=2" in path and not mutated:
+                    out = [dict(row) for row in get(path, **kw)]
+                    api.issues.pop(0)
+                    api.issues[1]["body"] = "Edited"  # #3, now on page 1
+                    api.issues.append(dict(issue(1), body="Moved",
+                                           updated_at=watch.iso(NOW + 1)))
+                    mutated.append(True)
+                    return out
+                return get(path, **kw)
+
+            with mock.patch.object(api, "get", side_effect=mutate):
+                events, _, _ = watch.collect_batch(api, SUB, NOW, NOW + 5, scan)
+        self.assertEqual([(e["object_id"], e["body"]) for e in events],
+                         [(3, "Edited"), (4, "Please fix export")])
+
     def test_continuous_updates_finish_fixed_window_with_key_progress(self):
         for kind in ("issue", "comment"):
             with self.subTest(kind=kind):

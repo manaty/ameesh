@@ -232,6 +232,7 @@ def collect_batch(api, sub, since, now, scan):
         rows = read(state["page"])
         remaining -= cost
         previous = None
+        shifted_ids = set()
         if checking:
             previous = read(state["page"] - 1)
             old = state["boundary"]
@@ -247,6 +248,7 @@ def collect_batch(api, sub, since, now, scan):
                 known = {tuple(item) for item in old}
                 shifted = [row for row in previous
                            if (row["id"], row.get("updated_at")) not in known]
+                shifted_ids = {row["id"] for row in shifted}
                 shifted_times = [when(row) for row in shifted]
                 events.extend(events_from(sub, state["kind"],
                                           [row for row, ts in
@@ -262,13 +264,15 @@ def collect_batch(api, sub, since, now, scan):
         # rows prepended by a moved prefix — are excluded from the guard, which
         # then judges only the new rows.
         fresh = [ts for row, ts in zip(rows, times)
-                 if (row["id"], row.get("updated_at")) not in replayed]
+                 if row["id"] not in shifted_ids
+                 and (row["id"], row.get("updated_at")) not in replayed]
         inside = [ts for ts in fresh if ts <= until]
         if inside != sorted(inside) or (len(rows) == PAGE_SIZE and times[-1] > until
                                         and fresh != sorted(fresh)):
             raise plan_github.GithubError("GitHub watch: updated order is invalid")
         events.extend(events_from(sub, state["kind"],
-                                  [row for row, ts in zip(rows, times) if ts <= until]))
+                                  [row for row, ts in zip(rows, times)
+                                   if ts <= until and row["id"] not in shifted_ids]))
         if len(rows) == PAGE_SIZE and times[-1] <= until:
             # #2955: a row is filtered and sorted by its index key, which can
             # lag its updated_at. Seeking to updated_at - 1 skipped the rows
