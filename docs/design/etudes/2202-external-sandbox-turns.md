@@ -1,8 +1,8 @@
 ---
 type: Study
 title: "TPK #2202 — bounded external-sandbox reviewer turns: Job correlation, exactly-once result, sandbox limits and tranche admission"
-description: "Design note: a native sandbox execution mode of the runner; a restartable sandbox supervisor owns one Kubernetes Job; a durable turn↔Job correlation; an exactly-once application-bound result; admitted profile/placement with enforced limits; a shared tranche admission on top of the account envelopes."
-status: draft
+description: "Design note: a native sandbox execution mode of the runner; a restartable sandbox supervisor owns one Kubernetes Job; a durable turn↔Job correlation; an exactly-once application-bound result; admitted profile/placement with enforced limits; a shared tranche admission on top of the account envelopes. Owner decision #120571 (2026-10-21, option a) approved it as written."
+status: stable
 tags: [sandbox, kubernetes, tour, bail, exactly-once, budget, tranche, relecteur, tpk, limites]
 generated: { by: "ameesh-dev3", at: "2026-10-20T21:40:00Z" }
 sources:
@@ -89,7 +89,8 @@ The missing native pieces are exactly four:
    as spent.
 
 This note builds on #2167 (turn-context and observation API, lot #2894, note
-PR #2221, owner decision #120568 pending). The turn-context note comes first;
+PR #2221, owner decision #120568, approved 2026-10-21). The turn-context
+note comes first;
 the fields this note reuses are the turn id, owner, epoch, session, request
 ids, accounting marker/spend key and the open reservation. If #2167 changes
 those names, this note follows it rather than defining a second vocabulary.
@@ -213,7 +214,9 @@ After admission a cancel does **not** change the request's `request.state`: it
 does not become `withdrawn`, and presence in `requests[]` remains what
 authorizes the turn — the row's delivery bookkeeping (`pending`/`delivered`) is
 not the authorization and may still be `pending` in the admission window. A
-cancel sets `sandbox.state = cancelled` and `cancel_requested_at`.
+cancel sets `cancel_requested_at`; `sandbox.state` becomes `cancelling` when a
+Job may exist and reaches `cancelled` only after termination is observed (§5),
+while a turn with no Job goes straight to `cancelled` once its row is fenced.
 The `turn_id` is the one allocated before the first side effect of the turn
 (#2167), so `turn_resources`, `spend_pending`, `turn_costs` and
 `sandbox_turns` carry the same id. The `spend_key` is opaque: the adapter
@@ -250,6 +253,7 @@ numbers):
 ```sql
 create table sandbox_turns (
     turn_id          text primary key,             -- turn_resources.turn_id
+    spend_key        text not null unique,         -- one per turn; admission idempotency key
     agent            text not null,
     owner            text not null,
     lease_epoch      bigint not null,              -- agent_registry.lease_epoch is bigint
@@ -277,8 +281,8 @@ create table sandbox_turns (
     job_uid          text unique,                  -- bound once
     job_phase        text,
     state            text not null default 'intent'
-        check (state in ('intent','created','bound','running','succeeded',
-                         'failed','cancelled','expired','orphaned','lost')),
+        check (state in ('intent','created','bound','running','cancelling',
+                         'succeeded','failed','cancelled','expired','orphaned','lost')),
     result_id        text unique,
     result_sha256    text,
     refusal          text,
@@ -303,6 +307,19 @@ create table sandbox_results (
 );
 ```
 
+**State vocabulary.** `intent`, `created`, `bound` and `running` are live
+states; `cancelling` is a live Job being stopped; `orphaned` is a Job whose
+deletion or termination could not be observed and which may still be running.
+The **terminal** states are exactly `succeeded`, `failed`, `cancelled`,
+`expired` and `lost`; only a terminal row releases its concurrency slot and
+allows a new sandbox turn (invariants 1 and 7). `succeeded` carries the accepted
+result; `failed` is a Job that ended without one; `cancelled` is a cancel whose
+termination was observed; `expired` is a deadline or lease loss whose
+termination was observed. `lost` is a Job confirmed absent (UID not found, e.g.
+TTL deleted it) without a termination observation. `orphaned` is never silently
+treated as terminal: an operator finishes the observation and moves it to
+`cancelled`/`expired`/`lost`.
+
 `request_ids` is the subset of the requests shown to this turn (`requests[]`)
 whose payload carries `ameesh-sandbox-request/1`; it is not the full list.
 The public sandbox block exposes `request_ids`, never a second `requests[]`. The public
@@ -315,7 +332,8 @@ and `work_item_id` are internal.
 
 Invariants:
 
-1. `sandbox_turns` is 1:1 with a turn; `job_name` and `job_uid` are unique.
+1. `sandbox_turns` is 1:1 with a turn; `spend_key` is unique per turn (the
+   admission idempotency key); `job_name` and `job_uid` are unique.
 2. The row is written before the Job exists. If the row cannot be written, no
    Job is created.
 3. `scope`, `limits`, profile/placement/canon refs, `image_digest` and
@@ -410,7 +428,7 @@ for the real Job contract, a `kind` cluster:
 | cancel before create | `cancel_requested_at` | no Job; `state = 'cancelled'` after the row is fenced |
 | cancel after create | `cancel_requested_at` + `job_uid` | supervisor deletes the Job, observes termination, writes `cancel_observed_at`; result refused `revoked` |
 | cancel vs result | row lock | one wins; if the result wins, cancel returns `already-completed`; if cancel wins, the result is `revoked` |
-| runner dies | turn/epoch lost; row remains | existing turn-loss recovery; a startup sweep lists Jobs by label for dead turns, deletes and observes them, marks `orphaned`; no result can be accepted (stale epoch) and no new sandbox turn for that agent until the row is terminal |
+| runner dies | turn/epoch lost; row remains | existing turn-loss recovery; a startup sweep lists Jobs by label for dead turns, deletes and observes them, then marks `expired` (or `lost` when the Job is confirmed absent without a termination record); if observation fails it marks `orphaned`. No result can be accepted (stale epoch); `orphaned` counts as a live Job, so no new sandbox turn for that agent until an operator observes the deletion and the row becomes terminal |
 | database restarts | rows durable; lease TTL | the runner's renewals fail; it signals the supervisor, which deletes the Job; the turn is `expired`; a result is `late`/`stale` |
 
 A **supervisor restart does not change the lease**: the runner still holds it.
@@ -423,18 +441,33 @@ result would be fenced by the epoch anyway, and a new turn must be a new
 admission with a new reservation.
 
 `max_attempts` is counted per `retry_family`, the immutable scope without
-`attempt`. Admission takes a transaction-scoped advisory lock on `retry_family`,
-counts every `sandbox_turns` row of the family (terminal rows included), refuses
+`attempt`. **A replay is resolved before any new-admission gate.** Admission
+first looks up `sandbox_turns` by `spend_key` (unique) and reads the two
+reservation rows by the same key. If the row exists, it verifies the presented
+agent, tranche, `retry_family`, requested scope without `attempt`, limits snapshot
+and reserved bound against the stored admission; on a match it returns the
+stored `attempt`, exact `scope`/`scope_digest`, Job name and both reservation
+ids **without** counting the family, reserving again, or evaluating
+`max_attempts`/`tranche-exhausted`/`account-exhausted`. A mismatch is
+`replay-mismatch`; a matching replay is always the response-loss recovery path.
+Only when no row exists does admission take the `placement` and `retry_family`
+transaction-scoped advisory locks and look the replay up **again** (a
+same-family admission may have committed while it waited); it then counts every
+`sandbox_turns` row of the family (terminal rows included), refuses
 `limit-exceeded` when the count is at or above `max_attempts`, and assigns
-`attempt = count + 1` before it writes the row and the Job input. The lock is held
-to commit, with the fixed order `retry_family` → tranche row → account (§8), so
-two concurrent retries cannot both pass on the same count. The per-attempt
+`attempt = count + 1` before it writes the row and the Job input. A full
+placement (live count at `max_concurrent_jobs`) returns `queued` before any
+reservation or row is written. The locks are held to commit, with the fixed
+order `placement` → `retry_family` → tranche row → account (§8), so two
+concurrent retries cannot both pass on the same count. The per-attempt
 `scope_digest` still hashes the exact scope (attempt included) and is what the
 result must echo. A retry is a new turn, a new spend key and a new reservation;
-the previous turn's reservation is settled or kept. A new head or generation is a
-new `retry_family` with a fresh attempt budget; it is never a way to smuggle
-another attempt into the old one. The refusal happens **before** a Job can be
-created.
+the previous turn's reservation is settled or kept. A new head or generation is
+a new `retry_family` with a fresh attempt budget; it is never a way to smuggle
+another attempt into the old one. The unique `spend_key` on `sandbox_turns` and
+on the reservations is the last-resort backstop: a transaction that loses the
+insert race rolls back and replays, never doubling a reservation. The refusal
+happens **before** a Job can be created.
 
 ## 4. Exactly-once application-bound result
 
@@ -443,10 +476,11 @@ path for a sandbox turn. In one transaction:
 
 1. `SELECT … FROM sandbox_turns WHERE turn_id = $ FOR UPDATE`. Refuse
    `unknown-turn` if absent.
-2. Check `owner`/`epoch` against the row and the live lease
+2. Check revocation first: `cancel_requested_at`, `cancelling`/`cancelled` or a
+   revocation is `revoked` (§9 precedence).
+3. Check `owner`/`epoch` against the row and the live lease
    (`agent_registry` `FOR UPDATE`, `lease_expires_at > clock_timestamp()`):
    a mismatch, a replaced owner or an expired lease is `stale`.
-3. Check revocation: `cancelled`/`cancelling` or a revocation is `revoked`.
 4. Canonicalise the result (JCS) and compute its digest; bound its size. An
    envelope that cannot be canonicalised cannot be a replay and is `missing`.
 5. If a `sandbox_results` row already exists, compare digests **before** any
@@ -510,6 +544,9 @@ and sanitised:
 }
 ```
 
+`cost.usd` is informational for a sandbox turn: the relay ledger is the meter
+(invariant 8), so a Job that declares zero does not release its reservation.
+
 No credentials, raw transcripts, repository contents or private memory are
 stored. `findings` and `evidence` are bounded references; the trusted IMA
 candidate helper remains the judge of exact-head checks and of the verdict's
@@ -523,20 +560,24 @@ Job has stopped.
 
 * **Fence.** A cancel request sets `cancel_requested_at` in the authority
   (`ameesh sandbox cancel`, a work-item state, a lease loss, or a canon
-  revocation). From that instant, `ameesh_sandbox_complete()` refuses every
-  result with `revoked`. The relay rechecks the turn state on each request (and
-  the token expires at the deadline), so a cancelled turn gets no new model
-  call.
+  revocation) and moves the row to `cancelling` when a Job may exist (to
+  `cancelled` after the fence when none exists). From that instant,
+  `ameesh_sandbox_complete()` refuses every result with `revoked`. The relay
+  rechecks the turn state on each request (and the token expires at the
+  deadline), so a cancelled turn gets no new model call.
 * **Stop and observe.** The supervisor receives the cancel (the runner signals
   the process group and writes the cancel marker in the private turn file),
   deletes the Job (`foreground`/`background` per the provider), waits until the
   Job/pod is observed gone or terminated, and reports `cancel_observed_at` and
   the final phase; the runner records them.
 * **Recover.** Only after observation does the runner close the turn
-  (`cancelled`) and settle the reservation as `kept` (actual cost if known). If
-  observation fails, the turn stays `orphaned`/`cancelling`, the lease is **not**
-  released while the Job may still be live, an alert `sandbox_orphan` fires, and
-  a human/operator must finish the deletion. The result remains revoked.
+  (`cancelled`) and settle the reservation as `kept` (actual cost if known).
+  While the supervisor is still stopping/observing, the turn is `cancelling`.
+  If observation fails — the supervisor or runner is gone and the Job's fate is
+  unknown — the turn becomes `orphaned`: the lease is **not** released while
+  the Job may still be live, an alert `sandbox_orphan` fires, and a
+  human/operator must finish the deletion; an observed deletion then closes it
+  as `cancelled`/`expired`/`lost`. The result remains revoked.
 * **Crash.** If the supervisor dies during cancellation, the runner's recovery
   or the startup sweep lists Jobs by the turn labels, deletes and observes them.
   The sweep never launches a replacement Job for a cancelling/expired turn.
@@ -547,8 +588,9 @@ SIGKILL the process group before the supervisor can delete the Job. The
 reliable deletion path is then the **orphan sweep**: it lists Jobs by the lost
 turn's labels, deletes and observes them, and records the observation. Until
 it does, `sandbox_orphan` fires and the runner refuses a new sandbox turn for
-that agent while a non-terminal `sandbox_turns` row exists. A result from the
-old Job is `stale`/`revoked`.
+that agent while a non-terminal `sandbox_turns` row (including
+`cancelling`/`orphaned`) exists. A result from the old Job is
+`stale`/`revoked`.
 
 The `sandbox_turns` row keeps `cancel_requested_at`, `cancel_observed_at`,
 `job_phase`, `job_uid` and the final state, so the audit can always tell
@@ -630,13 +672,17 @@ any stored session for a sandbox turn; the declaration alone is not a
 guarantee.
 
 Admission is checked at turn start against the **pinned canon revision**:
-`canon_state.status = 'ok'`, `last_good_commit` equal to the profile/placement
-revision and `checked_at` fresh (the runner's 300 s sync window). The snapshot
-goes into `sandbox_turns`. At its 300 s canon sync the runner re-reads the
-revision; if the profile/placement became `revoked` (or the canon is now
-invalid over the grant), it requests cancellation. A stale canon refuses **new**
-turns (`profile-refused` / `canon-stale`); it does not silently change an
-in-flight turn's limits.
+`canon_state.status = 'ok'`, `checked_at` fresh (the runner's 300 s sync
+window), and the profile/placement **card digest read at `last_good_commit`**
+equal to the digest being admitted; `canon_ref = last_good_commit`, and
+`profile_digest`/`placement_digest` are that digest. An unrelated canon commit
+therefore does not refuse admission — only a change to the profile or placement
+card (or a revoked/invalid card) does. The snapshot goes into `sandbox_turns`.
+At its 300 s canon sync the runner re-reads the same cards at the new
+`last_good_commit`; if either card became `revoked`, or its digest changed in a
+way that invalidates the grant, it requests cancellation. A stale canon refuses
+**new** turns (`profile-refused` / `canon-stale`); it does not silently change
+an in-flight turn's limits.
 
 The bureau's admission evidence is the canon PR/decision and the `admitted_ref`
 recorded on the card; the runner does not invent a second signature. The
@@ -654,7 +700,7 @@ be stopped by an `UPDATE`.
 | tool calls | `tool_calls` | the sandbox tool broker allowlist; the Job reports monotonic counters; the server refuses a result over the limit (`limit-exceeded`) and a result without counters (`missing`) | result/heartbeat tests + broker test |
 | turns / attempts | `turns`, `max_attempts` | the server counts `sandbox_turns` per `retry_family` (scope without `attempt`) under the family lock before admission, then assigns `attempt`; over the limit is `limit-exceeded` | concurrent distinct-digest attempt tests |
 | budget | `usd_per_turn` | admission reserves the bound; the relay checks the remaining turn allowance and the account/tranche envelope on every call; token expiry stops the turn | relay + tranche tests |
-| concurrency | `max_concurrent_jobs`, `max_agents` | the runner checks live `sandbox_turns` for the placement before creating a Job; `queued` is visible (same style as #2814) | 4 waiters / 3 slots test |
+| concurrency | `max_concurrent_jobs`, `max_agents` | the live `sandbox_turns` count for the placement is read in the admission transaction under the placement lock, before any Job exists; a full placement returns `queued` visibly (same style as #2814); `cancelling`/`orphaned` rows count until resolved | 4 concurrent admissions / 3 slots test |
 | tools/capabilities | `tools`, `capabilities` | the tool broker; the Job has no kube token and no provider key; a result claiming an unadmitted tool is `profile-refused`; merge/fix/deploy/publish are false | placement qualification |
 | isolation | image digest, no kube token, read-only repo, network policy | the Job template and the placement admission; the supervisor binds the exact image digest into the receipt | `kind`/staging inspection |
 
@@ -705,35 +751,49 @@ create table tranche_reservations (
 `ameesh_admit_turn(agent, billing_account, reserve_usd, spend_key, tranche_id,
 path)` is the one boundary for a turn in the tranche scope. A sandbox caller also
 passes `retry_family`, `max_attempts` and its scope without `attempt`; the call
-takes the family lock, assigns the attempt, computes the exact `scope` /
-`scope_digest`, and returns them with both reservation ids.
+resolves a replay by `spend_key` first, then takes the locks, assigns the
+attempt, computes the exact `scope` / `scope_digest`, and returns them with both
+reservation ids.
 
-Before step 1 of a sandbox admission, the transaction takes the `retry_family`
-advisory lock, counts the family and assigns `attempt` (§3). The fixed order is
-`retry_family` → tranche row → account, and the family count, the reservations
-and the `sandbox_turns` intent row commit together. A non-sandbox turn has no
-retry family and starts at step 1.
+0. **Replay.** `SELECT … FROM sandbox_turns WHERE spend_key = $` (unique); read
+   the reservation rows by the same key. If a row exists, verify the presented
+   agent, tranche, `retry_family`, scope without `attempt`, limits snapshot and
+   reserved bound against the stored admission. On a match, return the same
+   `attempt`, exact `scope`/`scope_digest`, Job name and both reservation ids,
+   without counting, reserving or evaluating any new-admission gate (this is the
+   response-loss path, including on the last attempt and with the tranche or
+   account full). A mismatch is `replay-mismatch`. If no row exists, take the
+   `placement` then `retry_family` advisory locks, re-check the replay (a
+   same-family admission may have committed while waiting), and continue. The
+   fixed order is `placement` → `retry_family` → tranche row → account; the
+   family count, the reservations and the `sandbox_turns` intent row commit
+   together. A non-sandbox turn skips the placement/retry-family steps and starts
+   at step 1.
 
 1. `SELECT … FROM tranche_limits WHERE id = $ FOR UPDATE`; if absent, closed or
    outside `[starts_at, ends_at)`, refuse `tranche-unavailable`.
 2. Used = `settled + open + kept` for that tranche. If
    `used + reserve_usd > cap_usd`, refuse `tranche-exhausted`.
 3. Call the account reservation logic in the **same transaction**, under the
-   account's advisory lock, with the fixed order **tranche row, then account**.
-   If the account is exhausted, roll back and return `account-exhausted`. The
-   existing rule is kept: an open reservation of the same agent from an earlier
-   turn is marked `kept` before the new one; it is never reused.
+   account's advisory lock, continuing the fixed order **tranche row, then
+   account**. If the account is exhausted, roll back and return
+   `account-exhausted`. The existing rule is kept: an open reservation of the
+   same agent from an earlier turn is marked `kept` before the new one; it is
+   never reused.
 4. Insert the tranche reservation, the account reservation and (for a sandbox
    turn) the `sandbox_turns` intent row with the assigned attempt, all with the
-   same `spend_key`; return the ids, the admitted scope and its digest. A
-   duplicate `spend_key` is a replay, not a second reservation (the turn's
-   idempotency key).
+   same `spend_key`; return the ids, the admitted scope and its digest. The
+   unique `spend_key` on `sandbox_turns` and on the reservations is the backstop:
+   a transaction that loses an insert race rolls back and replays (step 0),
+   never a second reservation.
 
 Settlement is `ameesh_settle_turn(spend_key, actual_usd_or_null)`:
 
 * actual cost = the sum of `turn_costs` rows tagged with the turn and
-  `billing_account` (relay rows carry the turn id/spend key; see §9), or the
-  result's `cost.usd` when the relay is not the meter;
+  `billing_account` (relay rows carry the turn id/spend key; see §9). A sandbox
+  turn never settles from the Job's `cost.usd` (informational only): with no
+  turn-tagged relay row the reservation is `kept`, never zero. Other paths keep
+  their existing reported-cost rule;
 * `null`/unreadable/unsettled → `kept` in full, never zero;
 * actual < reserved → the difference is released;
 * actual > reserved → the actual is settled and an alert/overdraft flag blocks
@@ -741,9 +801,9 @@ Settlement is `ameesh_settle_turn(spend_key, actual_usd_or_null)`:
   turn spend the difference.
 
 Retries are new turns with a new `spend_key`; the previous reservation stays
-`settled` or `kept`. The retry-family count and `max_attempts` run before the
-tranche reservation in the same transaction (§3), so a retry cannot create a Job
-without passing both gates. A human release
+`settled` or `kept`. After the replay lookup, the retry-family count and
+`max_attempts` run before the tranche reservation in the same transaction (§3),
+so a retry cannot create a Job without passing both gates. A human release
 (`ameesh budget tranche release <id> --why …`) mirrors
 `account_release`; it is audited and never automatic.
 
@@ -808,8 +868,9 @@ sandbox view, composed with #2167's `ameesh-turn-observation/1`:
   `ameesh-sandbox-turn/1`; the block's `state` is the sandbox state above,
   while #2167's `turn.state` (`starting|running|ended|orphan|unknown`) is
   unchanged. `turn.state=orphan` is the resource ledger (a surviving
-  process/container); `sandbox.state=orphaned` is the correlation (a Job
-  whose turn is gone). They are different fields and can both be present;
+  process/container); `sandbox.state=orphaned` is the correlation (a Job whose
+  turn is gone and whose deletion has not been observed). They are different
+  fields and can both be present;
 * `GET /api/v1/sandbox/turns?agent=&state=&scope=&limit=` → schema
   `ameesh-sandbox-turns/1`, bounded, for adoption/reconciliation and for
   IMA's poll.
@@ -842,6 +903,7 @@ return them and the tests assert them:
 | `stale` | owner/epoch no longer current; lease expired; superseded generation/head | no (new turn) |
 | `late` | after `deadline_ts`, or on a terminal turn with no stored accepted result (a stored result is replay/duplicate first) | no |
 | `duplicate` | a stored accepted result exists and the submitted digest differs; checked before `late`, including after the turn became terminal or passed the deadline | no |
+| `replay-mismatch` | same `spend_key` replayed with a different agent, tranche, retry family/scope, limits snapshot or reserved bound; never a second admission | no |
 | `revoked` | cancel/revocation; result fenced | no |
 | `scope-mismatch` | result scope/digest ≠ admitted scope | no |
 | `job-conflict` | a different Job UID is already bound; ambiguous adoption | no (human) |
@@ -866,7 +928,12 @@ stale owner is `stale` even after the deadline. An envelope that cannot be
 canonicalised is `missing` before the stored-result lookup, since it cannot
 match a digest. Admission-time codes (`unauthorized-request`,
 `not-a-sandbox-request`, `profile-refused`, `tranche-exhausted`,
-`account-exhausted`, `missing`) are checked before a turn or a Job exists; the
+`account-exhausted`, `missing`) are checked before a new turn or Job exists;
+`replay-mismatch` is the analogous refusal when an existing `spend_key` is
+replayed with different parameters. An admission replay by `spend_key` is
+resolved before every new-admission gate — including `max_attempts`,
+`tranche-exhausted` and `account-exhausted` — so a lost admission response
+returns the stored attempt and reservations, never a new refusal. The
 precedence above is the result path only.
 
 ## 10. Observability
@@ -916,12 +983,17 @@ and no paid dispatch.
 
 * **Admission/concurrency**: N runners request the same agent → one lease,
   the others `busy`/`stale`; N requests for a tranche with a cap → at most
-  `floor(cap / reserve)` accepted, the rest `tranche-exhausted`; four waiters
-  and three slots; account exhausted vs tranche exhausted each tested
-  independently. Three concurrent retries of one `retry_family` with
+  `floor(cap / reserve)` accepted, the rest `tranche-exhausted`; four
+  concurrent admissions and three slots under the placement lock (the fourth is
+  `queued`, no Job, no reservation); account exhausted vs tranche exhausted each
+  tested independently. Three concurrent retries of one `retry_family` with
   `max_attempts = 2` and three distinct per-attempt `scope_digest`s admit
   exactly attempts 1 and 2; the third is `limit-exceeded` (the count is per
-  family, not per digest).
+  family, not per digest). A committed last-attempt admission whose response is
+  lost is replayed by `spend_key` after the family reached `max_attempts` and
+  after the tranche/account filled up: the replay returns the same attempt,
+  scope, digest and reservation ids, with no `limit-exceeded`,
+  `tranche-exhausted` or `account-exhausted` and no second reservation.
 * **Restart**: kill the supervisor before the Job, after the create response is
   lost, after the bind, after the Job completes and before the result is
   submitted; each time the same turn/epoch adopts exactly one Job and the
@@ -929,6 +1001,13 @@ and no paid dispatch.
 * **Runner restart**: the turn is lost, the Job is found by label, deleted and
   observed; no result is accepted; the reservation is kept; a retry is a new
   turn under the attempt limit.
+* **State machine**: a cancel before create → `cancelled` after the fence; a
+  cancel with a live Job → `cancelling`, then `cancelled` only after the
+  termination is observed; an unobserved deletion → `orphaned`, counted as a
+  live Job and blocking a new turn until an operator observes it; a Job
+  confirmed absent without a termination record (TTL) → `lost`. The terminal
+  set is exactly `succeeded`/`failed`/`cancelled`/`expired`/`lost`, and the
+  cancellation table and `max_concurrent_jobs` agree on it.
 * **Duplicate/late/stale/revoked**: two concurrent result submissions → one
   accepted, one `duplicate`; a same-digest replay → `replayed`, no second turn
   increment and no second settlement, including after the first result set
@@ -944,10 +1023,14 @@ and no paid dispatch.
   refused and the reservation is kept.
 * **Canon**: missing/stale/revoked profile/placement, a drifted model/harness,
   a wrong image digest, a tool/capability not admitted, a `session: none`
-  violation; each refuses before a Job.
+  violation; each refuses before a Job. An unrelated canon commit does not
+  refuse admission; a changed or revoked profile/placement does (the digest is
+  read at `last_good_commit`).
 * **Tranche**: concurrent reservations, restart between reservation and Job,
   unknown cost, actual > reserved (overdraft blocks the next admission), human
-  release, and a replayed `spend_key`.
+  release, and a replayed `spend_key` — including on the last attempt and with
+  the tranche/account full — returning the original reservation, never a second
+  one; a Job that declares `cost.usd = 0` with no relay rows settles `kept`.
 * **Contract**: golden job/result/receipt envelopes; an incompatible version
   is refused; the source/image digest is echoed and checked.
 * **Job (kind)**: deterministic name/labels, no service-account token, no
@@ -1000,24 +1083,34 @@ target is posted on #2202 after the design is agreed, as the issue says.
   canon change. If the blocks grow into a second lifecycle, a dedicated card
   type is the natural v2.
 
-# Decisions requested
+# Decision taken
 
-1. Approve the **native supervisor** model: the runner owns the turn, the
-   supervisor owns the Job, IMA only sends the request and reads the receipt.
-2. Approve the **profile/placement blocks** on the existing `Agent`/`Host`
-   cards (rather than new card types), with the bureau canon PR + `admitted_ref`
-   as the admission evidence.
-3. Require **relay-only** model access for an admitted sandbox, so the deadline
-   and the tranche are hard stops; confirm that a direct-provider path is not
-   admitted in the pilot.
-4. Approve the **tranche table** and the human set/release path
+Owner decision #120571 (2026-10-21, option a) approved the design **as
+written**, after #2167's decision #120568 (2026-10-21, option a):
+
+1. The **native supervisor** model: the runner owns the turn, the supervisor
+   owns the Job, IMA only sends the request and reads the receipt.
+2. The **profile/placement blocks** on the existing `Agent`/`Host` cards
+   (rather than new card types), with the bureau canon PR + `admitted_ref` as
+   the admission evidence.
+3. **Relay-only** model access for an admitted sandbox, so the deadline and the
+   tranche are hard stops; a direct-provider path is not admitted in the pilot.
+4. The **tranche table** and the human set/release path
    (`ameesh budget tranche …`), with the USD 50 first tranche and the
    "unknown = kept" rule.
-5. Confirm the **result retention** (proposed: receipt/metadata with the turn
-   ledger, bounded result payload 90 days, no raw transcripts or secrets).
-6. Confirm the **order**: #2167 note first (#2221 / decision #120568), then
-   this note's sign-off, then S1–S6; no implementation, staging or production
-   action before sign-off.
+5. The **result retention**: receipt/metadata with the turn ledger, bounded
+   result payload 90 days, no raw transcripts or secrets.
+6. The **order**: #2167 note first (#2221 / decision #120568), then this note's
+   sign-off, then S1–S6; no implementation, staging or production action before
+   sign-off.
+
+Post-sign-off review (blocked verdicts on `c8a7dbde`, 2026-10-21) tightened the
+note within option a: an explicit state machine (`cancelling`, `orphaned`, and
+the terminal set), revocation before stale, replay of an existing admission by
+`spend_key` before every new-admission gate (including the last attempt and a
+full tranche), relay-only settlement (the Job's `cost.usd` is informational),
+the profile/placement digest read at `last_good_commit`, and the live-Job count
+under the placement lock.
 
 # Sources
 
