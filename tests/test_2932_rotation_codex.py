@@ -119,12 +119,25 @@ class RotationCodexTest(PgTestCase):
         self.assertEqual(worker.last_turn_context_reread(), (450_000, FIL))
         self.assertTrue(worker.context_rotation_due())
 
-    def test_journal_illisible_repli_sur_le_grand_livre(self):
-        """Sans journal, la mesure reste celle d'avant (grand livre)."""
+    def test_journal_illisible_ne_tourne_pas_sur_la_somme(self):
+        """Sans journal, le grand livre garde la somme (alerte), mais la
+        rotation ne tourne pas sur elle."""
         worker = self._worker("cx-sans")
         self.assertTrue(self._tour(worker))
         self.assertIsNone(worker.last_turn_context)
-        self.assertEqual(worker.last_turn_context_reread(), (600_000, FIL))
+        self.assertGreaterEqual(worker.last_turn_reread, 600_000)
+        self.assertEqual(worker.current_session(), FIL)
+        self.assertFalse(worker.context_rotation_due())
+
+    def test_worker_relance_ne_tourne_pas_sur_la_somme(self):
+        """Worker relancé : plus de relevé d'appel en mémoire, le grand livre
+        seul ne fait pas tourner une session Codex."""
+        _journal(self.sessions, FIL, [60_000] * 10)
+        worker = self._worker("cx-relance")
+        self.assertTrue(self._tour(worker))
+        worker.last_turn_context = worker.last_turn_context_session = None
+        self.assertGreaterEqual(worker.last_turn_reread, 600_000)
+        self.assertFalse(worker.context_rotation_due())
 
 
 if __name__ == "__main__":

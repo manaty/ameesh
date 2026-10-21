@@ -698,7 +698,7 @@ class AgentWorker(threading.Thread):
         #: session) —, et sa session ; Codex : lu dans le journal de session du
         #: fil (#2932) ; None = pas de relevé d'appel (journal illisible, tour
         #: de résumé, worker relancé) : repli sur le grand livre (somme des
-        #: relectures du tour)
+        #: relectures du tour), jamais pour la rotation d'un tour Codex
         self.last_turn_context: int | None = None
         self.last_turn_context_session: str | None = None
         #: L81 (étude §6.3) : instant monotone du dernier message humain en
@@ -1762,8 +1762,9 @@ class AgentWorker(threading.Thread):
         dernier appel du fil principal, relevé dans le flux, ou pour Codex,
         qui ne publie son usage qu'en fin de tour, dans le journal de session
         du fil (#2932) ; à défaut, celle de l'alerte `session_too_big` (entrée
-        + entrée relue en cache du dernier tour inscrit au grand livre).
-        Chaque étape d'un tour relit
+        + entrée relue en cache du dernier tour inscrit au grand livre), sauf
+        pour Codex : sans relevé d'appel (journal illisible, worker relancé),
+        il ne tourne pas sur cette somme (#2932). Chaque étape d'un tour relit
         tout le contexte : une session qui grossit coûte de plus en plus cher
         à chaque tour, et l'alerte seule n'y changeait rien. La somme des
         appels d'un tour n'est pas la taille de la session (#2336).
@@ -1772,6 +1773,8 @@ class AgentWorker(threading.Thread):
         relevé soit bien celui de cette session.
         """
         if self.proc is not None or self.session_policy() == "jamais":
+            return False
+        if self.last_turn_context is None and self._ledger_harness() == "codex":
             return False
         plafond = self.context_max_tokens()
         relus, relus_session = self.last_turn_context_reread()
