@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-# #987 — relance d'un job hébergé annulé faute de runner.
+# #987 — relance d'un job hébergé annulé faute de runner, ou d'un job
+# auto-hébergé ayant perdu son runner (#2954).
 #
 # GitHub annule un job hébergé quand aucun runner ne l'a pris après plusieurs
 # tentatives (« The job was not acquired by Runner of type hosted », contrainte
@@ -11,13 +12,20 @@
 # APRÈS la conclusion — d'où le déclencheur `workflow_run`, et non une étape de
 # « tests ».
 #
+# Un groupe de runners auto-hébergés peut aussi disparaître en cours de part
+# (incident du 21/10/2026, run 39554271532 : huit parts de `ameesh-ci-1`
+# interrompues, aucun test rouge). Le job conclut `failure`, l'étape utile
+# `cancelled`, aucune étape `failure` : la garde reconnaît cette signature
+# (#2954), jamais une annulation de concurrence (job `cancelled`).
+#
 # La garde relit les jobs de l'exécution terminée (scripts/ci-relance-hosted.py)
 # et, si les seuls jobs en échec sont des jobs hébergés annulés avant leur
-# premier pas, rejoue les jobs en échec et leurs dépendants
+# premier pas ou des jobs auto-hébergés ayant perdu leur runner, rejoue les
+# jobs en échec et leurs dépendants
 # (`rerun-failed-jobs`), une seule fois : la tentative suivante prouve si la
-# capacité est revenue. Un échec réel, une deuxième annulation ou une tentative
-# déjà relancée ne sont jamais masqués — le check reste rouge, un humain
-# tranche.
+# capacité ou la flotte est revenue. Un échec réel, une annulation de
+# concurrence, une deuxième annulation ou une tentative déjà relancée ne sont
+# jamais masqués — le check reste rouge, un humain tranche.
 #
 # #1002 : un événement `workflow_run` peut être rejoué à la main ; la garde
 # relit alors `run_attempt` courant et refuse un événement périmé. Le groupe de

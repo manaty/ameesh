@@ -123,6 +123,15 @@ PRIORITIES = (1, 2, 3)
 PRIORITY_LABELS = {1: "high", 2: "normal", 3: "low"}
 #: L157b : taille déclarée du changement d'un lot (petit, moyen, gros)
 SIZES = ("s", "m", "l")
+#: #2954 : les types de lot que porte la base (mêmes valeurs que la projection
+#: GitHub, `plan_github.LOT_TYPES`). Un lot `improvement` est un panier, avec
+#: ses champs de valeur ; `bug` et `evolution` suivent le chemin de correction.
+LOT_TYPES = ("bug", "evolution", "improvement")
+#: #2954 : les cibles de `work set-type` — `bug` ↔ `evolution`. Un
+#: `improvement` est créé par la file d'amélioration (il exige `expected_value`
+#: et `value_score`, contrainte 0049) ; on peut en sortir, pas y entrer par ce
+#: geste.
+RETYPE_TARGETS = ("bug", "evolution")
 #: L233: a lot enters `waiting_human` only while an owner decision request
 #: (`ameesh decide ask`) is open for it; a decision written in prose in mail
 #: never counts (the owner was shown lots "waiting for them" with no question)
@@ -383,6 +392,7 @@ def add(
     parent_lot: int | None = None,
     mark_item_id: int | None = None,
     mark_note: str = "",
+    unique_ref: bool = False,
 ) -> dict:
     """Crée un lot en `intake`. Un assigné passe par l'attribution gardée
     (`check_assignee`, L37) : un agent non réveillable est refusé (WorkError).
@@ -402,6 +412,10 @@ def add(
     with --new-project). L539 : `mark_item_id` et `mark_note` écrivent la
     marque d'idempotence du lot de relecture au journal de ce lot, dans la
     même transaction que la création (`{lot}` y vaut l'identifiant créé).
+    `unique_ref` (#2954) : une seule création par `issue_ref`, toutes états
+    confondus — le verrou consultatif (repo, run) sérialise deux hôtes
+    concurrents et le second reçoit `DbError` ; l'appelant relit le gagnant
+    (`open_incident`).
 
     #540 : un agent qui a déjà un lot non démarré ne reçoit pas celui-ci : il
     va dans la file d'équipe (`queued_behind`, `queue_warning`). `force` : la
@@ -429,7 +443,8 @@ def add(
                    cfg=cfg, branch=branch, branch_target=branch_target, priority=priority,
                    estimate=estimate, estimate_source=estimate_source, size=size,
                    note=note, force=force, parent_lot=parent_lot,
-                   mark_item_id=mark_item_id, mark_note=mark_note, team_queue=True)
+                   mark_item_id=mark_item_id, mark_note=mark_note,
+                   unique_ref=unique_ref, team_queue=True)
 
 
 def _decision_lot(db: Db, *, title: str, requester: str, app: str, cfg=None) -> dict:
@@ -445,7 +460,7 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
             actor="", package=None, externe=False, cfg=None, branch=None,
             branch_target=None, priority=None, estimate=None, estimate_source=None,
             size=None, note="", force=None, parent_lot=None, mark_item_id=None,
-            mark_note="", team_queue: bool) -> dict:
+            mark_note="", unique_ref: bool = False, team_queue: bool) -> dict:
     """`add`, et `_decision_lot` (`team_queue=False`)."""
     minutes = None
     if estimate not in (None, ""):
@@ -496,7 +511,8 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
         if minutes else None, change_size=size or None,
         queued_note=queued and _queued_note(queued, created),
         forced_note=queued and _forced_note(queued, created, force, actor),
-        mark_item_id=mark_item_id, mark_note=mark_note, parent_lot=parent_lot)
+        mark_item_id=mark_item_id, mark_note=mark_note, parent_lot=parent_lot,
+        unique_ref=unique_ref)
     if item.get("queued_behind") is not None:
         item["queue_warning"] = queue_warning(db, item, assignee)
     # L317c : un bug de priorité 1 ouvert par un humain (ou son chat) réveille
@@ -1035,6 +1051,39 @@ def set_issue_ref(db: Db, item_id: int, ref: str | None, *, actor: str = "", cfg
         raise WorkError("lot %s: issue reference changed meanwhile, retry" % item_id)
     note(db, item_id, "issue_ref %s → %s" % (current or "—", clean or "—"), actor=actor)
     return get(db, item_id) or item
+
+
+def set_type(db: Db, item_id: int, type: str, *, actor: str = "", cfg=None) -> dict:  # noqa: A002
+    """#2954 : corrige le type d'un lot (`bug` ↔ `evolution`).
+
+    Un lot mal typé à sa création (cas de #2988, `bug` au lieu d'`evolution`)
+    se corrige par un geste journalé, comme `work set-app` et `work
+    issue-ref` : réservé aux correcteurs (humain, orchestrateur ou agent de
+    conception), compare-and-set sur le type lu, ligne de journal
+    `type 'bug' → 'evolution'`. Le tableau de référence des estimations et le
+    libellé du ticket miroir suivent à la prochaine lecture/projection : ils
+    lisent le type du lot, jamais une copie.
+
+    `improvement` (panier) reste possible comme type **lu** — on peut en
+    sortir — mais pas comme cible : la contrainte 0049 exige
+    `expected_value` et `value_score`, que la file d'amélioration pose à la
+    création.
+    """
+    item = get(db, item_id)
+    if item is None:
+        raise WorkError("lot %s not found" % item_id)
+    if type not in RETYPE_TARGETS:
+        raise WorkError("unknown target type %r: %s (an `improvement` basket is "
+                        "created by the backlog with its value fields)"
+                        % (type, ", ".join(RETYPE_TARGETS)))
+    actor = corrector(cfg, db, actor, what="type correction")
+    current = str(item.get("type") or "")
+    if current == type:
+        return item
+    updated = storage.of(db).work.set_type(item_id, type, current=current, actor=actor)
+    if updated is None:
+        raise WorkError("lot %s: type changed meanwhile, retry" % item_id)
+    return updated
 
 
 def open_lots(db: Db, assignee: str) -> list[dict]:

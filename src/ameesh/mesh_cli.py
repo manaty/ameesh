@@ -23,6 +23,7 @@
   agent-mesh work merged <id> --sha S | --pr owner/repo#N [--note …]   merge done outside a PR: any open state → merged
   agent-mesh work migration <id> [--number N] [--release [--number N]] [--skip-branch B]   reserve one of the work item's migration numbers (L122, #2481)
   agent-mesh work issue-ref <id> owner/repo#N | --none   correct the issue reference, journaled (#1603)
+  agent-mesh work set-type <id> bug|evolution   retype a lot, journaled (#2954)
   agent-mesh work resolve <id> --with <other> [--done | --abort]   prepared conflict resolution (L160d)
   agent-mesh work queue add|remove <id> | show [--target T]   merge queue per target (L160e)
   agent-mesh work land <id> [--project P]   land the queue head now (L160e2)
@@ -1516,7 +1517,7 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
                   "\"%s\"; pass --actor human:<id>" % work.UNKNOWN_ACTOR,
                   file=sys.stderr)
         return
-    if args.work_command in (*_OWN_ACTOR, "set-app", "issue-ref", "backfill-app") or getattr(args, "actor", None) is None:
+    if args.work_command in (*_OWN_ACTOR, "set-app", "set-type", "issue-ref", "backfill-app") or getattr(args, "actor", None) is None:
         return
     args.actor, warning = work.resolve_actor(cfg, db, args.actor)
     if warning:
@@ -2197,6 +2198,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             from . import work_projects
             item = work_projects.set_app(cfg, db, args.id, args.project, actor=args.actor)
             print("lot #%d: project %s" % (item["id"], item["app"]))
+            return 0
+        if args.work_command == "set-type":
+            item = work.set_type(db, args.id, args.lot_type, actor=args.actor, cfg=cfg)
+            if args.json:
+                print(json.dumps(item, ensure_ascii=False, indent=2))
+            else:
+                print("lot #%d: type %s" % (item["id"], item["type"]))
             return 0
         if args.work_command == "issue-ref":
             if bool(args.ref) == bool(args.none):
@@ -3412,6 +3420,15 @@ def build_parser() -> argparse.ArgumentParser:
     pw_app.add_argument("--actor", default="",
                         help="human, orchestrator or design agent; default: bound session")
     pw_app.set_defaults(func=cmd_work)
+    pw_type = work_sub.add_parser(
+        "set-type", help="retype a lot (bug/evolution), with a journal entry")
+    pw_type.add_argument("id", type=int)
+    pw_type.add_argument("lot_type", choices=work.RETYPE_TARGETS,
+                         help="the new lot type; a basket `improvement` can only be left")
+    pw_type.add_argument("--json", action="store_true")
+    pw_type.add_argument("--actor", default="",
+                         help="human, orchestrator or design agent; default: bound session")
+    pw_type.set_defaults(func=cmd_work)
     pw_iref = work_sub.add_parser(
         "issue-ref", help="correct a lot's issue reference (owner/repo#N), with a journal entry")
     pw_iref.add_argument("id", type=int)

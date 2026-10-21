@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
 """#987 : relancer une exécution « tests » (ou « paquet », #2119) dont un job
-hébergé a été annulé faute de runner.
+hébergé a été annulé faute de runner, ou dont un job auto-hébergé a perdu son
+runner (#2954).
 
 GitHub annule un job hébergé quand aucun runner ne l'a pris après plusieurs
 tentatives — annotation « The job was not acquired by Runner of type hosted »,
@@ -12,16 +13,27 @@ exécutée. L'agrégat requis `tests` (.github/workflows/tests.yml) exige
 aucun défaut de code ; et l'API refuse de rejouer le job tant que l'exécution
 tourne (« workflow run containing this job is already running »).
 
+Un job **auto-hébergé** perd aussi son runner quand un groupe de la flotte
+disparaît (incident du 21/10/2026, run 39554271532 : huit parts de
+`ameesh-ci-1` interrompues à 06:26:52Z, aucun test en échec). La signature de
+première source est distincte de l'échec réel : conclusion du **job**
+`failure`, `runner_name` renseigné, l'étape utile (`part N`) conclut
+`cancelled`, les étapes suivantes sont `skipped`, et **aucune** étape ne
+conclut `failure` (relevé des jobs 119070444804, 119070444803,
+119070444901). Une annulation de concurrence, elle, conclut le job
+`cancelled` (pas `failure`) : elle reste refusée, comme tout échec réel.
+
 `.github/workflows/relance-hosted.yml` se déclenche à la conclusion de
 « tests » et de « paquet » (#2119 : `paquet.yml` appelle `tests.yml` par
 `workflow_call`, et GitHub n'émet pas d'événement `workflow_run` pour le
 workflow réutilisable appelé — l'exécution terminée est celle du portier) et
 appelle ce script après la fin de l'exécution. Si les seuls jobs
-en échec sont des jobs hébergés annulés avant leur premier pas, il relance les
-jobs en échec (`rerun-failed-jobs`), une seule fois : la tentative suivante
-prouve si la capacité est revenue. Un échec réel ailleurs, ou une deuxième
-annulation, n'est jamais masqué — la garde ne relance pas, le check reste
-rouge et un humain tranche.
+en échec sont des jobs hébergés annulés avant leur premier pas ou des jobs
+auto-hébergés ayant perdu leur runner, il relance les jobs en échec
+(`rerun-failed-jobs`), une seule fois : la tentative suivante prouve si la
+capacité ou la flotte est revenue. Un échec réel ailleurs, une annulation de
+concurrence ou une deuxième annulation n'est jamais masqué — la garde ne
+relance pas, le check reste rouge et un humain tranche.
 
 #1002 : en mode `--run-id`, l'état de l'exécution est relu avant toute
 décision. `GET actions/runs/<id>/jobs` lit en effet la **dernière** tentative
@@ -89,31 +101,58 @@ def jamais_pris(job: dict) -> bool:
             and "self-hosted" not in job["labels"])
 
 
+def perdu_par_son_runner(job: dict) -> bool:
+    """Vrai pour un job auto-hébergé dont le runner a disparu en cours de route.
+
+    Signature relevée de première source (run 39554271532, incident du
+    21/10/2026, jobs 119070444804 / 119070444803 / 119070444901) : GitHub
+    conclut le **job** `failure` alors que l'étape utile (`part N`) est
+    `cancelled` et qu'aucune étape ne conclut `failure` ; `runner_name` est
+    renseigné (le runner a bien pris le job) et les étapes suivantes sont
+    `skipped`. C'est une perte de runner, pas un test rouge.
+
+    Une annulation de concurrence conclut le job `cancelled`, pas `failure` :
+    elle n'entre pas ici. Un job auto-hébergé annulé avant d'être pris
+    (`cancelled`, sans étape) non plus : sa file est la nôtre (#824).
+    """
+    steps = job.get("steps") or []
+    return (job_reel(job)
+            and "self-hosted" in (job.get("labels") or ())
+            and job.get("conclusion") == "failure"
+            and bool(job.get("runner_name"))
+            and any(step.get("conclusion") == "cancelled" for step in steps)
+            and not any(step.get("conclusion") == "failure" for step in steps))
+
+
 def decision(jobs: list[dict], tentative: int,
              max_tentatives: int = MAX_TENTATIVES) -> tuple[bool, str]:
     """(relancer, raison) — pure, sans réseau.
 
     On ne relance que si TOUS les jobs en échec sont des jobs hébergés
-    annulés avant leur premier pas (hors agrégat non requis) : un échec réel
-    ne doit jamais être noyé dans une relance, et une relance ne doit pas
-    consommer la file sans espoir.
+    annulés avant leur premier pas ou des jobs auto-hébergés ayant perdu leur
+    runner (hors agrégat non requis) : un échec réel ne doit jamais être noyé
+    dans une relance, et une relance ne doit pas consommer la file sans
+    espoir.
     """
     if tentative >= max_tentatives:
         return False, ("tentative %d ≥ %d : une annulation qui se répète est un "
                        "incident de capacité, pas un aléa" % (tentative, max_tentatives))
     echecs = [j for j in jobs
               if job_reel(j) and j.get("conclusion") in CONCLUSIONS_ECHEC]
-    bloques = [j for j in echecs if jamais_pris(j)]
-    if not bloques:
-        return False, "aucun job hébergé annulé faute de runner"
+    bloques = [j for j in echecs if jamais_pris(j) or perdu_par_son_runner(j)]
     ids = {id(j) for j in bloques}
     autres = [j for j in echecs
               if id(j) not in ids and j.get("name") not in NON_REQUIS]
+    if not bloques:
+        if autres:
+            return False, ("échec réel à côté : %s"
+                           % ", ".join(sorted(str(j.get("name")) for j in autres)))
+        return False, "aucun job annulé faute de runner (hébergé ou auto-hébergé perdu)"
     if autres:
         return False, ("échec réel à côté : %s"
                        % ", ".join(sorted(str(j.get("name")) for j in autres)))
     noms = ", ".join(sorted(str(j.get("name")) for j in bloques))
-    return True, "job(s) hébergé(s) annulé(s) faute de runner : %s" % noms
+    return True, "job(s) annulé(s) faute de runner : %s" % noms
 
 
 def evenement_perime(tentative: int, etat: dict) -> str | None:
