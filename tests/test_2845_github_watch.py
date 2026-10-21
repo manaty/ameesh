@@ -132,7 +132,7 @@ class CollectionTest(unittest.TestCase):
         # Legacy offset without a boundary must be replayed safely.
         events, scan, until = watch.collect_batch(api, SUB, NOW, NOW + 500, scan)
         self.assertEqual(events[0]["object_id"], 1)
-        self.assertEqual(until, NOW)
+        self.assertEqual(until, NOW - watch.INDEX_LAG)
         for _ in range(110):
             api.calls.clear()
             more, scan, _ = watch.collect_batch(api, SUB, NOW, NOW + 500, scan)
@@ -246,7 +246,7 @@ class CollectionTest(unittest.TestCase):
                         row["updated_at"] = watch.iso(NOW + tick + 1)
                         source.append(row)
                 self.assertIsNone(scan, "continuous updates must not restart the full scan forever")
-                self.assertEqual(until, NOW)
+                self.assertEqual(until, NOW - watch.INDEX_LAG)
                 self.assertTrue(set(range(1, 601)) <= {e["object_id"] for e in events})
                 self.assertLess(tick, 10)
 
@@ -290,9 +290,9 @@ class CollectionTest(unittest.TestCase):
         events, done, until = watch.collect_batch(api, SUB, NOW - 3600, NOW, None)
         self.assertEqual(events, [])
         self.assertIsNone(done)
-        self.assertEqual(until, NOW)
-        # The next window starts OVERLAP before the settled bound, so the row
-        # stamped inside the latency window is read then.
+        self.assertEqual(until, NOW - watch.INDEX_LAG)
+        # The next window starts OVERLAP before the committed settled bound,
+        # so the row stamped inside the latency window is read then.
         events, done, _ = watch.collect_batch(
             api, SUB, NOW - watch.OVERLAP, NOW + watch.INDEX_LAG + 1, None)
         self.assertEqual([e["object_id"] for e in events], [1])
@@ -313,7 +313,7 @@ class CollectionTest(unittest.TestCase):
             first, until = self.finish(api, NOW - 3600, NOW)
             self.assertEqual({e["object_id"] for e in first}, {1, 2, 4})
             rows[2]["key"] = watch.iso(NOW - 250)  # index caught up
-            more, _ = self.finish(api, until - watch.INDEX_LAG - watch.OVERLAP,
+            more, _ = self.finish(api, until - watch.OVERLAP,
                                   NOW + watch.INDEX_LAG + 1)
             self.assertEqual({e["object_id"] for e in first + more}, {1, 2, 3, 4})
 
@@ -404,7 +404,7 @@ class CollectionTest(unittest.TestCase):
             more, _ = self.finish(api, start, start, scan)
             events += more
             self.assertEqual({e["object_id"] for e in events}, set(range(1, 8)))
-            more, _ = self.finish(api, until - watch.INDEX_LAG - watch.OVERLAP,
+            more, _ = self.finish(api, until - watch.OVERLAP,
                                   NOW + 60, None)
             events += more
             self.assertEqual({e["object_id"] for e in events}, set(range(1, 13)))
@@ -423,7 +423,7 @@ class CollectionTest(unittest.TestCase):
             first, until = self.finish(api, NOW - 3600, NOW)
             self.assertEqual({e["object_id"] for e in first}, {1, 2, 4})
             rows[2]["key"] = watch.iso(NOW - 250)
-            more, _ = self.finish(api, until - watch.INDEX_LAG - watch.OVERLAP,
+            more, _ = self.finish(api, until - watch.OVERLAP,
                                   NOW + watch.INDEX_LAG + 1)
             self.assertEqual({e["object_id"] for e in first + more}, {1, 2, 3, 4})
 
@@ -447,7 +447,7 @@ class CollectionTest(unittest.TestCase):
                                  set(range(2, size + 1)))
                 del rows[0]["key"]  # the index caught up
                 events, _, _ = watch.collect_batch(
-                    api, SUB, until - watch.INDEX_LAG - watch.OVERLAP, NOW + 400, None)
+                    api, SUB, until - watch.OVERLAP, NOW + 400, None)
                 self.assertEqual([e["object_id"] for e in events if e["kind"] == "issue"], [1])
 
     def test_edit_on_the_delivered_page_is_deferred_then_delivered(self):
@@ -464,7 +464,7 @@ class CollectionTest(unittest.TestCase):
             batch, _, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
             self.assertNotIn(3, {e["object_id"] for e in batch})
             self.assertIn(5, {e["object_id"] for e in batch})
-            batch, _ = self.finish(api, until - watch.INDEX_LAG - watch.OVERLAP,
+            batch, _ = self.finish(api, until - watch.OVERLAP,
                                    NOW + watch.INDEX_LAG + 1)
             self.assertIn((3, "Edited"),
                           [(e["object_id"], e["body"]) for e in batch])
@@ -678,18 +678,20 @@ class DeliveryTest(PgTestCase):
         self.assertEqual(len(self.messages()), 2)
         self.assertEqual(self.messages()[-1]["payload"]["github_watch"]["items"][0]["issue_ref"],
                          "acme/app#1")
-        self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW + 1802)
+        self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"),
+                         NOW + 1802 - watch.INDEX_LAG)
 
     def test_latency_window_defers_then_delivers_on_the_next_tick(self):
         # #2955: a write inside INDEX_LAG is ignored by the first window; the
-        # watcher's next read starts INDEX_LAG + OVERLAP before the cursor, so
-        # the row is delivered then.
+        # committed cursor stops at the settled bound U, so the next tick
+        # starts OVERLAP before U and delivers the row.
         api = UpdatedApi(issues=[dict(issue(), updated_at=watch.iso(NOW - 100))])
         watcher = self.watcher(api)
         self.assertEqual(watcher.tick(self.db, NOW), [dict(project="app",
                                                           repo="acme/app", events=0)])
         self.assertEqual(self.messages(), [])
-        self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW)
+        self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"),
+                         NOW - watch.INDEX_LAG)
         self.assertEqual(watcher.tick(self.db, NOW + 901)[0]["events"], 1)
         self.assertEqual(len(self.messages()), 1)
         self.assertIn("acme/app#1", self.messages()[0]["body"])
@@ -740,17 +742,19 @@ class DeliveryTest(PgTestCase):
             # The bootstrap cursor row exists, but it has not advanced: the
             # remaining inputs will be re-read and delivered by the next pass.
             self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"),
-                             NOW - watch.BOOTSTRAP)
+                             NOW - watch.INDEX_LAG - watch.BOOTSTRAP)
             # A leftover digest continues on the next notifier tick, without
             # waiting for the repository cadence.
             watcher.tick(self.db, NOW)
             messages = self.messages()
             self.assertEqual(len(messages), 2)
             self.assertIn("2 input(s)", messages[-1]["body"])
-            self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW)
+            self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"),
+                             NOW - watch.INDEX_LAG)
             watcher.tick(self.db, NOW + 901)
             self.assertEqual(len(self.messages()), 2)
-            self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW + 901)
+            self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"),
+                             NOW + 901 - watch.INDEX_LAG)
 
     def test_leftover_digest_holds_the_scan_checkpoint(self):
         api = Api([issue(n) for n in range(1, 26)])
@@ -766,13 +770,13 @@ class DeliveryTest(PgTestCase):
                     scan_before=None, scan_after=progress), expected)
                 self.assertIsNone(storage.of(self.db).github_watch.scan("app", "acme/app"))
                 self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"),
-                                 NOW - watch.BOOTSTRAP)
+                                 NOW - watch.INDEX_LAG - watch.BOOTSTRAP)
             self.assertEqual(watch.deliver(
                 self.db, SUB, events, until, [], self.cfg.host, partial=True,
                 scan_before=None, scan_after=progress), 1)
         self.assertEqual(storage.of(self.db).github_watch.scan("app", "acme/app"), progress)
         self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"),
-                         NOW - watch.BOOTSTRAP)
+                         NOW - watch.INDEX_LAG - watch.BOOTSTRAP)
         messages = self.messages()
         self.assertEqual(len(messages), 4)
         text = "\n".join(message["body"] for message in messages)
@@ -786,7 +790,8 @@ class DeliveryTest(PgTestCase):
         self.assertEqual(len(messages), 1)
         self.assertIn("not reproduced", messages[0]["body"])
         self.assertIn("acme/app#1", messages[0]["body"])
-        self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW)
+        self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"),
+                         NOW - watch.INDEX_LAG)
         self.watcher(api).tick(self.db, NOW + 901)
         self.assertEqual(len(self.messages()), 1)
 
@@ -800,7 +805,8 @@ class DeliveryTest(PgTestCase):
         for message in self.messages():
             self.assertIn("external content truncated", message["body"])
             self.assertIn("https://github.com/acme/app/issues/1#issuecomment-10", message["body"])
-        self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW + 901)
+        self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"),
+                         NOW + 901 - watch.INDEX_LAG)
 
     def test_partial_scan_survives_restart_without_duplicate_or_skipped_input(self):
         api = Api(comments=[comment(n) for n in range(10, 15)])
@@ -827,7 +833,8 @@ class DeliveryTest(PgTestCase):
             self.assertNotIn("#issuecomment-%d" % n, messages[1]["body"])
             self.assertNotIn("#issuecomment-%d" % n, messages[2]["body"])
         self.assertIsNone(storage.of(self.db).github_watch.scan("app", "acme/app"))
-        self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW)
+        self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"),
+                         NOW - watch.INDEX_LAG)
         self.assertIn("page=2", api.calls[2])
 
     def test_drift_checkpoint_replays_without_duplicate_mail_or_early_advance(self):
@@ -848,7 +855,8 @@ class DeliveryTest(PgTestCase):
                 watcher.tick(self.db, NOW + delta)
         self.assertEqual(len(self.messages()), 3)
         self.assertIsNone(storage.of(self.db).github_watch.scan("app", "acme/app"))
-        self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW)
+        self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"),
+                         NOW - watch.INDEX_LAG)
 
     def test_partial_scan_continues_on_next_tick_even_with_hourly_interval(self):
         api = Api(comments=[comment(n) for n in range(10, 15)])
@@ -925,7 +933,8 @@ class DeliveryTest(PgTestCase):
         self.watcher(api).tick(self.db, NOW)
         with mock.patch.object(api, "get", side_effect=RuntimeError("GitHub unavailable")):
             self.assertEqual(self.watcher(api).tick(self.db, NOW + 901), [])
-        self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW)
+        self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"),
+                         NOW - watch.INDEX_LAG)
         self.watcher(api).tick(self.db, NOW + 1802)
         self.assertEqual(len(self.messages()), 1)
 

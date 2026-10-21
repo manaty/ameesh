@@ -309,12 +309,12 @@ def collect_batch(api, sub, since, now, scan):
                         # next pass resumes just after the found anchor page.
                         state["page"] -= 1
                         state["snap_prev"] = stamps(back)
-                        return events, state, until
+                        return events, state, settled
                 # Anchor absent: only a full restart from the window start is
                 # safe. Durable digests make the replay harmless.
                 state["page"] = 1
                 state.pop("snap_prev", None)
-                return events, state, until
+                return events, state, settled
             recovered = recovered_rows(previous, snapshot, position)
             events.extend(events_from(sub, state["kind"], recovered))
 
@@ -337,12 +337,12 @@ def collect_batch(api, sub, since, now, scan):
                 state.update(kind="comment", page=1, since=state["window_since"])
                 state.pop("snap_prev", None)
                 if calls >= PAGES_PER_TICK:
-                    return events, state, until
+                    return events, state, settled
                 continue
-            return events, None, until
+            return events, None, settled
         state["page"] += 1
         state["snap_prev"] = stamps(rows)
-        return events, state, until
+        return events, state, settled
 
 
 def instruction(sub, event, lots, *, quote=True):
@@ -533,12 +533,9 @@ class Watcher:
                     self.api = plan_github.client(cache_dir=self.cfg.state_dir)
                 if self.api is None:
                     raise plan_github.GithubError("GitHub watch: no token or gh")
-                # The committed cursor is the window end. The scan only trusts
-                # rows older than INDEX_LAG, so the next window starts OVERLAP
-                # before that settled bound, not before the cursor.
+                # The committed cursor is the settled bound U: the next window
+                # starts OVERLAP before it, so latency-deferred rows are read.
                 start = (since if since is not None else now - BOOTSTRAP) - OVERLAP
-                if since is not None:
-                    start -= getattr(sub, "index_lag", INDEX_LAG)
                 events, next_scan, until = collect_batch(
                     self.api, sub, start, now, scan)
                 count = len(events) if self.dry_run else deliver(
