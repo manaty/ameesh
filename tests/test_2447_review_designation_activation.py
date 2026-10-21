@@ -427,6 +427,10 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.repo.git("checkout", "-q", self.base)
         self.repo.git("commit", "-q", "--allow-empty", "-m", "gel vide")
         self.frozen = self.repo.git("rev-parse", "HEAD")
+        # #2924 : le gel suivant relit la provenance des gels antérieurs ; ce
+        # commit porte donc son reçu comme tout commit du lot, même si un gel
+        # sans chemin ne lit pas ses propres auteurs.
+        self.receipts(commits=[self.frozen])
         first, light = self.freeze()
         self.assertEqual(light["state"], rd.NONE, light)
         self.repo.git("checkout", "-q", branch)

@@ -50,13 +50,22 @@ lot et son SHA, et il porte un trailer `ameesh-work: <lot>`.
 
 Aucune : 10 fusions propres.
 
-## Adaptations de composition (3, témoins seulement)
+## Adaptations de composition (12, témoins seulement)
 
 | source | changement | preuve |
 |---|---|---|
 | `tests/test_2931_packet_target.py` | le helper `verdict` pose le reçu exact du jalon (`provenance_receipts`, sujet `milestone:<id>`) | #2928 exige un reçu exact en classe sensible ; les 2 témoins `test_2931_packet_target` redeviennent verts |
 | `tests/test_2924_history_rewrite_provenance.py` | helper `self.verdict(actor, sha)` avec reçu exact pour les verdicts synthétiques des 3 témoins concernés | #2928, classe sensible ; les 3 témoins #2924 verts |
 | `tests/test_1374_fire.py` | le témoin synthétique passe `db=None` à `review_gate` (aucune base à lire, la règle #2928 ne s'applique pas) | les 3 témoins `test_1374_fire` verts ; le chemin avec reçu reste couvert par `test_2928_verdict_provenance` |
+| `tests/test_2447_review_designation_activation.py` | le commit technique du gel léger (diff vide) porte son reçu de provenance (`self.receipts(commits=[...])`) | #2924 relit la provenance des gels antérieurs : sans reçu, l'auteur `t` du témoin est inconnu et le gel suivant attend ; `test_a_stale_light_freeze_does_not_clear_the_new_freeze` rouge en CI h-0600, vert après l'adaptation |
+| `tests/test_1003_merge_pr.py` | `_exact_verdict_receipt` simulé (reçu synthétique des avis de `ready_marks`) | #2928 : le banc simule tout le stockage, ses verdicts n'ont pas de reçu en base et ne comptaient plus en classe sensible (23 témoins `test_1003_merge_pr` rouges en CI h-0600) |
+| `tests/test_1467_train_admissions.py` | le gel d'attente du banc (SHA factice) est supprimé au profit du gel réel, et les avis du train portent leur reçu exact en base | #2924 refusait le gel antérieur absent du dépôt (SHA `b*40`) ; #2928 exige le reçu lu en base pour les avis sensibles (13 témoins `test_1467_train_admissions` rouges en CI h-0600) |
+| `tests/test_1467_train_runner.py` | les avis des deux fixtures (`setUp` et paquet indépendant) portent leur reçu exact en base | #2928 : sans reçu, l'admission refuse et `step` rend `idle` au lieu d'un plan (23 témoins `test_1467_train_runner` rouges en CI h-0600) |
+| `tests/test_2888_reviewer_fix_independence.py` | reçu exact des trois verdicts (`cx2`, `cx3`, `dev1`) posés dans `setUp` | #2928 : sans reçu, la porte sensible ne compte aucun avis et `dev1` disparaît des acceptés ; le témoin reste sur l'indépendance des familles |
+| `tests/test_2812_superseded_corrector.py` | le gel antérieur pointe un commit réel (`author_commit`) déjà couvert par la plage courante, au lieu du SHA factice `b*40` | #2924 refuse un gel antérieur absent du dépôt ; l'ancien gel reste le support des blocages supersédés |
+| `tests/test_789_slo_alerts.py` | le verdict du banc est posé en base (vrai jalon) et porte son reçu exact ; le jalon en mémoire garde son id | #2928 exige un reçu exact lu sur le jalon ; un id inventé ne résout aucun jalon |
+| `tests/test_progress_serve.py` | l'expéditeur attendu de la fiche est `human:<id>` (forme normalisée) | #286 L77/B1 : `serve_actions.mail_name` écrit désormais la forme que `resident_queue.identity_for` vérifie |
+| `tests/test_l26_exploitation.py` | le courrier humain du témoin porte sa preuve d'entrée (`human_account`) et la fiche déclare le compte local (patch `member_declaration`) | #286 L77/B1 : un `human:*` sans preuve vérifiée ne préempte plus le tour |
 
 Aucune adaptation de code produit : les 10 fusions sont propres et les
 comportements relus sont inchangés.
@@ -94,4 +103,13 @@ comportements relus sont inchangés.
 - Contrôle d'inclusion `scripts/paquet-inclusion.py` sur `b9dade7f` : 10
   entrées (10 compositions, 0 retrait), 10 lots attendus, 10 prêts,
   verdicts présents 10/10, aucun contenu à lire ni défaut (rc 0).
-- CI complète : à demander sur la tête gelée (une seule suite).
+- CI complète n°1 (`ci-full-fa407ae3e`, run 39545215454) : rouge, 13 parts ;
+  toutes les causes relevées sont des témoins des bancs qui posaient des gels,
+  des avis ou un expéditeur humain sans la preuve désormais exigée par #2924
+  (gel antérieur lisible), #2928 (reçu exact des verdicts sensibles) et #286
+  (`human:<id>` normalisé) — aucune n'est un code produit. Les 11 adaptations
+  ci-dessus couvrent les 11 fichiers relevés ; reprises ciblées vertes :
+  test_1003 66, test_1467_train_admissions 42, test_2888 7, test_2812 3,
+  test_789 57, test_progress_serve 27, test_l26 1, test_1656 1,
+  test_2447 1, test_1467_train_runner (classe complète en reprise).
+- CI complète n°2 : à demander sur la nouvelle tête gelée (une seule suite).
