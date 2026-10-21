@@ -37,6 +37,12 @@ PAGE_SIZE = 100
 INDEX_LAG = 300
 #: One page plus one backward re-read per pass (#2955).
 PAGES_PER_TICK = 3
+#: #2955: a full page with no settled row is recent (its keys may still lag).
+#: Do not end the stream on one such page: the next page can still carry a
+#: settled row. Four in a row end this stream; the next window reads them
+#: again. A longer run of lagging pages is outside the bounded re-read budget
+#: and would need a longer confirmation (like INDEX_LAG, it is observable).
+EMPTY_PAGES = 4
 #: One digest per repository and pass; a larger burst waits for the next pass.
 DIGEST_MAX_ITEMS = 25
 #: Quoted GitHub text in one digest (the rest stays behind the links).
@@ -205,9 +211,10 @@ def collect_batch(api, sub, since, now, scan):
     it is delivered with its new version. If the anchor is gone from the
     previous page, one earlier page is read; if it is still absent, the scan
     restarts at page 1 with the same ``since`` (durable digests make replay
-    harmless). The scan stops when the stream ends or when a full page lies
-    entirely past the fixed window end: those recent writes are read by the
-    next scan, so continuous updates cannot extend this scan forever.
+    harmless). The scan stops when the stream ends or after EMPTY_PAGES full
+    pages in a row with no settled row: a recent page whose index keys still
+    lag must not end the stream, while the continuous tail is deferred to the
+    next scan.
     """
     lag = getattr(sub, "index_lag", INDEX_LAG)
     if scan is not None:
@@ -227,8 +234,8 @@ def collect_batch(api, sub, since, now, scan):
     if state["page"] <= 1:
         state.pop("snap_prev", None)
     state.setdefault("window_since", state["since"])
+    state.setdefault("blank", 0)
     events = []
-    until = state["until"]      # fixed end of this scan's wall-clock window
     settled = state["settled"]  # rows after it may still move: deferred
     calls = 0
 
@@ -291,31 +298,58 @@ def collect_batch(api, sub, since, now, scan):
 
     while True:
         rows = read(state["page"])
+        full = len(rows) == PAGE_SIZE
+        settled_rows = [row for row in rows if inside(row)]
+        state["blank"] = (0 if settled_rows or not full
+                          else state.get("blank", 0) + 1)
+
+        # #2955: a full page with no settled row is recent; its keys may still
+        # lag and a settled row can follow. Several such pages in a row defer
+        # this stream to the next window instead of chasing its moving tail.
+        if full and not settled_rows and state["blank"] >= EMPTY_PAGES:
+            if state["kind"] == "issue":
+                state.update(kind="comment", page=1, since=state["window_since"],
+                             blank=0)
+                state.pop("snap_prev", None)
+                if calls >= PAGES_PER_TICK:
+                    return events, state, settled
+                continue
+            return events, None, settled
+
         previous = read(state["page"] - 1) if state["page"] > 1 else None
         recovered = []
         if previous is not None:
             snapshot = state.get("snap_prev") or []
-            position, _key = anchor_position(previous, snapshot)
-            if position is None:
-                # The last accepted page is gone, or moved back more than one
-                # page. Read one more page backwards before giving up.
-                if calls < PAGES_PER_TICK and state["page"] >= 3:
-                    back = read(state["page"] - 2)
-                    back_position, _back_key = anchor_position(back, snapshot)
-                    if back_position is not None:
-                        recovered = recovered_rows(back, snapshot, back_position)
-                        events.extend(events_from(sub, state["kind"], recovered))
-                        # The page read before `back` stays unaccepted: the
-                        # next pass resumes just after the found anchor page.
-                        state["page"] -= 1
-                        state["snap_prev"] = stamps(back)
-                        return events, state, settled
-                # Anchor absent: only a full restart from the window start is
-                # safe. Durable digests make the replay harmless.
-                state["page"] = 1
-                state.pop("snap_prev", None)
-                return events, state, settled
-            recovered = recovered_rows(previous, snapshot, position)
+            if snapshot:
+                position, _key = anchor_position(previous, snapshot)
+                if position is None:
+                    # The last accepted page is gone, or moved back more than
+                    # one page. Read one more page backwards before giving up.
+                    if calls < PAGES_PER_TICK and state["page"] >= 3:
+                        back = read(state["page"] - 2)
+                        back_position, _back_key = anchor_position(back, snapshot)
+                        if back_position is not None:
+                            recovered = recovered_rows(back, snapshot, back_position)
+                            events.extend(events_from(sub, state["kind"], recovered))
+                            # The page read before `back` stays unaccepted: the
+                            # next pass resumes just after the found anchor page.
+                            state["page"] -= 1
+                            state["snap_prev"] = stamps(
+                                [row for row in back if inside(row)])
+                            state["blank"] = 0
+                            return events, state, settled
+                    # Anchor absent: only a full restart from the window start
+                    # is safe. Durable digests make the replay harmless.
+                    state["page"] = 1
+                    state.pop("snap_prev", None)
+                    state["blank"] = 0
+                    return events, state, settled
+                recovered = recovered_rows(previous, snapshot, position)
+            else:
+                # No accepted row on the previous page (all its rows were
+                # deferred): any settled row there moved backwards and is
+                # delivered; it cannot be an anchor used to skip a shift.
+                recovered = [row for row in previous if inside(row)]
             events.extend(events_from(sub, state["kind"], recovered))
 
         replayed = {(row["id"], row.get("updated_at")) for row in recovered}
@@ -327,21 +361,19 @@ def collect_batch(api, sub, since, now, scan):
             raise plan_github.GithubError("GitHub watch: updated order is invalid")
         events.extend(events_from(sub, state["kind"], current))
 
-        # #2955: a full page entirely past the fixed window closes this
-        # stream; the next window reads those recent rows again. A page that
-        # mixes the window and later rows is still read: the index can put a
-        # lagged row before a row of the window.
-        past_window = all(when(row) > until for row in rows)
-        if len(rows) < PAGE_SIZE or past_window:
+        if not full:
             if state["kind"] == "issue":
-                state.update(kind="comment", page=1, since=state["window_since"])
+                state.update(kind="comment", page=1, since=state["window_since"],
+                             blank=0)
                 state.pop("snap_prev", None)
                 if calls >= PAGES_PER_TICK:
                     return events, state, settled
                 continue
             return events, None, settled
         state["page"] += 1
-        state["snap_prev"] = stamps(rows)
+        # Only settled rows are accepted: a deferred row is not an anchor and
+        # must never hide a multi-page shift (B6).
+        state["snap_prev"] = stamps(settled_rows)
         return events, state, settled
 
 

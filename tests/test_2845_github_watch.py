@@ -445,6 +445,70 @@ class CollectionTest(unittest.TestCase):
             events += more
             self.assertEqual({e["object_id"] for e in events}, set(range(1, 13)))
 
+    def test_b5_recent_page_must_not_end_the_stream(self):
+        # B5 #2955: while the first page is read, #1..#3 get updated_at > until
+        # but keep their old keys. That page has no settled row, yet #4 on the
+        # next page is settled. The scan must not stop on the first recent
+        # page; it reads #4 now and #1..#3 in the next window.
+        with mock.patch.object(watch, "PAGE_SIZE", 3):
+            rows = [issue(n) for n in range(1, 5)]
+            for n, row in enumerate(rows):
+                row["key"] = row["updated_at"] = watch.iso(NOW - 1000 + n)
+            api = LagApi(rows, [])
+            get = api.get
+            mutated = []
+
+            def mutate(path, **kw):
+                out = get(path, **kw)
+                if not mutated:
+                    mutated.append(True)
+                    for row in rows[:3]:
+                        row["updated_at"] = watch.iso(NOW + 1)
+                return out
+
+            with mock.patch.object(api, "get", side_effect=mutate):
+                events, scan, until = watch.collect_batch(
+                    api, SUB, NOW - 3600, NOW, None)
+                more, _ = self.finish(api, NOW, NOW, scan)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, {4})
+            self.assertEqual(until, NOW - watch.INDEX_LAG)
+            for row in rows[:3]:
+                row["key"] = row["updated_at"]
+            more, _ = self.finish(api, until - watch.OVERLAP, NOW + 400, None)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, {1, 2, 3, 4})
+
+    def test_b6_anchor_must_be_an_accepted_row(self):
+        # B6 #2955: #6 is deferred (> U) but its old key sits at the end of the
+        # page. When #1..#5 move and #6 catches up its key, the re-read page is
+        # [6,1,2]. An anchor taken from #6 (never accepted) would hide the
+        # multi-page shift and lose #7..#9. The snapshot keeps settled rows
+        # only, so the scan restarts and delivers them.
+        with mock.patch.object(watch, "PAGE_SIZE", 3):
+            rows = [issue(n) for n in range(1, 10)]
+            for n, row in enumerate(rows):
+                row["key"] = row["updated_at"] = watch.iso(NOW - 1000 + n)
+            rows[5]["updated_at"] = watch.iso(NOW - 250)  # key still -995
+            api = LagApi(rows, [])
+            events, scan, until = watch.collect_batch(
+                api, SUB, NOW - 3600, NOW, None)
+            more, scan, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, set(range(1, 6)))
+            self.assertEqual(scan["page"], 3)
+            self.assertNotIn(6, [stamp[0] for stamp in scan["snap_prev"]])
+            for row in rows[:5]:
+                row["key"] = row["updated_at"] = watch.iso(NOW + 1)
+            rows[5]["key"] = watch.iso(NOW - 250)  # key catches up, stamp same
+            more, _ = self.finish(api, NOW, NOW, scan)
+            events += more
+            self.assertEqual({e["object_id"] for e in events},
+                             set(range(1, 10)) - {6})
+            more, _ = self.finish(api, until - watch.OVERLAP, NOW + 400, None)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, set(range(1, 10)))
+
     def test_index_lag_with_latency_inside_the_bound_is_deferred_then_read(self):
         # A row written 250 s before the scan is still inside the 300 s latency
         # window: it is ignored, then delivered by the next window when its key
