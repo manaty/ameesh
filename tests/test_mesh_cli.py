@@ -360,6 +360,20 @@ class DelaysCliTest(MeshCliTest):
         proc = self.mesh("list", "--json")
         self.assertIsInstance(json.loads(proc.stdout), list)
 
+    def test_un_jalon_d_agent_ne_se_signe_pas_au_nom_d_un_autre(self):
+        """#2928 : `--actor` d'un autre agent est refusé au chemin d'écriture."""
+        self.mesh("work", "add", "--title", "Jalon étranger", "--assignee", AGENT)
+        self.mesh("work", "move", "1", "build")
+        proc = self.mesh("work", "milestone", "1", "verdict", "ok",
+                         "--sha", "a" * 40, "--actor", OWNER,
+                         env=self.env(AGENT_MAIL_NAME=AGENT))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("milestone refused", proc.stderr)
+        self.assertIn(OWNER, proc.stderr)
+        item = json.loads(self.mesh("work", "show", "1", "--json").stdout)
+        self.assertEqual([m for m in item["milestones"]
+                          if m["kind"] == "verdict"], [])
+
     def test_gel_effectif_derive_dans_work_show_et_list(self):
         """#1756 : `show`/`list --freeze` exposent le gel effectif et sa provenance."""
         self.mesh("work", "add", "--title", "Gel dérivé", "--assignee", AGENT)
