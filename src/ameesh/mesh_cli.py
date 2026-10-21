@@ -2278,8 +2278,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 item = work.get(db, args.id)
                 if item is None:
                     raise work.WorkError("lot %s not found" % args.id)
-                sha = work.freeze_head(db, item, sha, repo=args.repo,
-                                       require_present=True)
+                sha = work.freeze_head(db, item, sha, repo=args.repo)
                 # #2542 : un contrôle statique rouge refuse le gel, avant le paquet
                 from . import freeze_checks
                 note = freeze_checks.before_freeze(
@@ -3475,9 +3474,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_ms.add_argument("--supersedes", type=int, action="append", default=[],
                        metavar="FROZEN_ID",
                        help="#2989: frozen only: a prior freeze of the same lot this "
-                            "freeze replaces (repeatable); a replaced freeze whose commit "
-                            "is absent from the repository no longer blocks provenance, "
-                            "and the note keeps the machine trace")
+                            "freeze replaces (repeatable); only a freeze whose commit "
+                            "is absent from every known repository (a proven ghost) can "
+                            "be replaced, and the note keeps the machine trace")
     pw_ms.set_defaults(func=cmd_work)
     from . import plan_cli
     plan_cli.add_parsers(work_sub, cmd_work)  # plan de travail (L29)

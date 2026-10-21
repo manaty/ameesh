@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from ameesh import plan_git, registry, review_designation as rd
 from ameesh import review_designation_activation as act
@@ -99,6 +100,39 @@ class FreezeHeadWriteTest(PgTestCase):
         self.assertNotIn(work.FREEZE_ABSENT_MARK, row["note"])
         self.assertIn("revue demandée", row["note"])
 
+    def test_un_blanc_de_tete_ne_forge_pas_la_marque_apres_le_strip(self):
+        # #2989 B (revue cx2) : `add_milestone` strippe la note après les
+        # filtres. Un blanc de tête (`\v`, espace Unicode) disparaissait donc au
+        # strip et laissait une ligne machine valide, sans que le garde #2786
+        # ne l'ait vue.
+        for blank in ("\v", "\u00a0"):
+            with self.subTest(blank=repr(blank)):
+                row = self.freeze(HEAD, note=blank + "ameesh-freeze-absent: main")
+                self.assertNotIn(work.FREEZE_ABSENT_MARK, row["note"] or "")
+
+    def test_un_depot_du_cwd_ne_prouve_pas_absent(self):
+        # #2989 N2 (revue dev2) : un clone du cwd non fetché ne prouve pas
+        # qu'un commit n'existe nulle part. Seuls les dépôts de l'auteur
+        # (projet, dossier de l'assigné) font preuve d'absence.
+        from ameesh import freeze_gate
+        ghost = "c" * 40
+        repo = tempfile.mkdtemp(prefix="ameesh-2989-cwd-")
+        self.addCleanup(shutil.rmtree, repo, True)
+        repo_with_commit(repo)
+        item = work.get(self.db, self.lot)
+        with mock.patch.object(freeze_gate, "_head_repos",
+                               return_value=[repo]), \
+                mock.patch.object(freeze_gate, "_author_repos",
+                                  return_value=[]):
+            self.assertEqual(work.freeze_head(self.db, item, ghost), ghost)
+        with mock.patch.object(freeze_gate, "_head_repos",
+                               return_value=[repo]), \
+                mock.patch.object(freeze_gate, "_author_repos",
+                                  return_value=[repo]):
+            with self.assertRaises(work.WorkError) as caught:
+                work.freeze_head(self.db, item, ghost)
+        self.assertIn("head-unresolved", str(caught.exception))
+
     def test_une_abreviation_est_resolue_dans_le_depot_de_l_auteur(self):
         repo = tempfile.mkdtemp(prefix="ameesh-2786-")
         self.addCleanup(shutil.rmtree, repo, True)
@@ -168,7 +202,7 @@ class FreezeHeadWriteTest(PgTestCase):
         repo_with_commit(repo)
         item = work.get(self.db, self.lot)
         with self.assertRaises(work.WorkError) as caught:
-            work.freeze_head(self.db, item, ghost, repo=repo, require_present=True)
+            work.freeze_head(self.db, item, ghost, repo=repo)
         self.assertIn("head-unresolved", str(caught.exception))
         self.assertIn(ghost[:12], str(caught.exception))
         proc = self.mesh("work", "milestone", str(self.lot), "frozen",

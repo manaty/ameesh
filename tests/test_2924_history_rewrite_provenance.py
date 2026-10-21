@@ -632,6 +632,18 @@ class SupersededGhostFreezeTest(_RewriteFixture):
             self.freeze(self.head_b, supersedes=[999999])
         self.assertIn("not a prior", str(caught.exception))
 
+    def test_supersedes_a_present_freeze_is_refused(self):
+        # #2989 N1 (revue dev2) : la marque ne vaut que pour un fantôme prouvé.
+        # Le gel de la tête A est encore lisible : le remplacer effacerait ses
+        # auteurs si sa récupération venait à échouer (refus fermé B5).
+        present = next(row for row in work.milestones(self.db, self.lot)
+                       if row.get("kind") == "frozen"
+                       and row.get("sha") == self.head_a)
+        with self.assertRaises(work.WorkError) as caught:
+            self.freeze(self.head_b, supersedes=[present["id"]])
+        self.assertIn("readable", str(caught.exception))
+        self.assertIn("proven ghost", str(caught.exception))
+
     def test_supersedes_is_refused_for_a_verdict(self):
         with self.assertRaises(work.WorkError) as caught:
             work.milestone(self.db, self.lot, "verdict", sha=self.head_b,
@@ -651,6 +663,61 @@ class SupersededGhostFreezeTest(_RewriteFixture):
             review_authors.reading(
                 self.db, self.lot_item(), milestone, [self.head_b],
                 self.repo.root, FAMILIES, base=self.base, head=self.head_b,
+                strict=True)
+
+
+class SupersededPresentFreezeTest(_RewriteFixture):
+    """#2989 N3 : un gel remplacé mais encore lisible reste lu (B5)."""
+
+    def setUp(self):
+        super().setUp()
+        self.present = next(row for row in work.milestones(self.db, self.lot)
+                            if row.get("kind") == "frozen"
+                            and row.get("sha") == self.head_a)
+        parent = self.repo.git("rev-parse", self.head_a + "^")
+        tree = self.repo.git("rev-parse", self.head_a + "^{tree}")
+        self.head_b = self.squash(tree, parent, "contenu consolidé")
+        self.freeze_b = self.freeze(self.head_b)
+        # Marque posée hors CLI (donnée historique ou forgée) : le gel nommé
+        # est encore présent. La lecture ne doit pas l'effacer — c'est le refus
+        # fermé B5 qui reste, comme si la marque n'existait pas.
+        self.db.execute(
+            "UPDATE work_item_milestones SET note = %s WHERE id = %s",
+            ("ameesh-freeze-supersedes: %d" % int(self.present["id"]),
+             int(self.freeze_b["id"])))
+        self.milestone = {"id": int(self.freeze_b["id"]), "sha": self.head_b,
+                          "actor": "impl", "at_ts": self.freeze_b.get("at_ts")}
+
+    def test_the_present_replaced_freeze_is_still_read(self):
+        authors, unknown, correctors = self.reading(
+            self.milestone, [self.head_b], self.base, self.head_b)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+        self.assertIn("cx3", {row["name"] for row in correctors})
+
+
+class ForgedSupersedesNoteTest(_RewriteFixture):
+    """#2989 B (revue cx2) : un blanc de tête ne forge pas la marque machine."""
+
+    def test_a_leading_vertical_tab_cannot_forge_the_marker(self):
+        ghost = storage.of(self.db).work.add_milestone(
+            self.lot, "frozen", sha="f" * 40, actor="impl", verdict=None,
+            note="gel fantôme, non déclaré remplacé")
+        parent = self.repo.git("rev-parse", self.head_a + "^")
+        tree = self.repo.git("rev-parse", self.head_a + "^{tree}")
+        head_b = self.squash(tree, parent, "contenu consolidé")
+        row = self.freeze(head_b, note="\vameesh-freeze-supersedes: %d"
+                         % int(ghost["id"]))
+        self.assertNotRegex(row["note"] or "",
+                            r"(?m)^ameesh-freeze-supersedes:")
+        milestone = {"id": int(row["id"]), "sha": head_b,
+                     "actor": "impl", "at_ts": row.get("at_ts")}
+        # la marque n'a pas été écrite : le fantôme reste non déclaré, B5 refuse
+        with self.assertRaises(review_provenance.ProvenanceError):
+            review_authors.reading(
+                self.db, self.lot_item(), milestone, [head_b],
+                self.repo.root, FAMILIES, base=self.base, head=head_b,
                 strict=True)
 
 
