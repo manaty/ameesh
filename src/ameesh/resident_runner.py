@@ -240,7 +240,7 @@ NATIVE_USAGE = ("claude-stream-json",)
 
 
 def usage_event(protocol: str, result: "resident.TurnResult", *,
-                turn: str = "") -> dict | None:
+                turn: str = "", inputs=()) -> dict | None:
     """The ledger event of a finished resident turn (L80a), or None when the
     stream itself already carries the usage (Claude).
 
@@ -250,7 +250,11 @@ def usage_event(protocol: str, result: "resident.TurnResult", *,
     `usage_update.cost`, cumulative for `cost_total`). The event is written
     once per logical turn, so two turns served by the same process each carry
     their own measure, never a cumulative one that the ledger would subtract
-    twice."""
+    twice.
+
+    `inputs` (L80b) are the message ids the turn actually served — the spec's
+    messages and the accepted steers, never a correlation uuid: the ledger
+    line then answers "what did this turn cost, for which messages?"."""
     if protocol in NATIVE_USAGE:
         return None
     event = {
@@ -261,6 +265,8 @@ def usage_event(protocol: str, result: "resident.TurnResult", *,
         "turn": turn or "",
         "status": result.status,
     }
+    if inputs:
+        event["inputs"] = [str(i) for i in inputs if i is not None]
     if result.usage_total:
         event["usage_total"] = dict(result.usage_total)
     if result.cost is not None:

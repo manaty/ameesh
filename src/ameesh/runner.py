@@ -6298,7 +6298,31 @@ class AgentWorker(threading.Thread):
                 return
         self.stop_group_now(raison, group=False)
 
-    def _resident_result(self, rp, tour, voulu: bool) -> tuple[int, str | None, str | None]:
+    def _served_message_ids(self, initial_ids=()) -> tuple[str, ...]:
+        """L80b : les messages que ce tour résident a réellement servis.
+
+        Les messages de la consigne (`initial_ids`, ceux du spec) et les
+        remises steer acceptées — même condition que `_solde_steers` : tour
+        achevé et `input_id` présent dans le `TurnResult`. Les uuids de
+        corrélation ne sortent jamais : le grand livre reçoit des identifiants
+        de messages (mail id / human_message id), pas des jetons internes."""
+        from . import resident as resident_mod
+        ids = {str(i) for i in (initial_ids or ()) if i is not None}
+        with self.lock:
+            generation = self._turn_generation
+            pending = list(self._steer_pending)
+        for _jeton, mail_ids, gen, turn, input_id in pending:
+            if gen != generation or turn is None:
+                continue
+            result = getattr(turn, "result", None)
+            if getattr(result, "status", "") != resident_mod.COMPLETED \
+                    or input_id not in (getattr(result, "inputs", ()) or ()):
+                continue
+            ids.update(str(i) for i in (mail_ids or ()) if i is not None)
+        return tuple(sorted(ids))
+
+    def _resident_result(self, rp, tour, voulu: bool,
+                         served_ids=()) -> tuple[int, str | None, str | None]:
         """Code, erreur et session d'un tour résident fini (`voulu` : clos par
         l'exécuteur, une interruption n'est pas un échec).
 
@@ -6307,7 +6331,10 @@ class AgentWorker(threading.Thread):
         est écrit une fois dans `events.jsonl` (L80a), avant la comptabilité.
         Si le flux refuse l'écriture, l'événement est d'abord confié au
         marqueur comptable : un worker de remplacement pourra réparer le tour
-        sans dépendre de la mémoire de celui-ci."""
+        sans dépendre de la mémoire de celui-ci.
+
+        `served_ids` (L80b) : les messages que la consigne de ce tour porte
+        déjà ; les steers acceptés sont ajoutés par `_served_message_ids`."""
         from . import resident, resident_runner
         if tour is None:
             return 1, None, rp.session  # pas lancé : l'erreur est déjà notée
@@ -6319,7 +6346,8 @@ class AgentWorker(threading.Thread):
         rp.record_turn(fin)
         self._resident_reread_keep(rp)
         evenement = resident_runner.usage_event(
-            rp.driver.protocol, fin, turn=self._turn_id or "")
+            rp.driver.protocol, fin, turn=self._turn_id or "",
+            inputs=self._served_message_ids(served_ids))
         session = fin.session or rp.session
         if evenement is not None and not resident_runner.write_usage_event(
                 self._path("events.jsonl"), evenement):
@@ -7255,7 +7283,8 @@ class AgentWorker(threading.Thread):
                 result_code = proc.wait()
             else:
                 result_code, erreur_resident, session_resident = self._resident_result(
-                    rp, tour_resident, clos or self.host_yield is not None)
+                    rp, tour_resident, clos or self.host_yield is not None,
+                    served_ids=spec.get("ids") or ())
                 error = error or erreur_resident
                 # L80a : un tour résident Codex/ACP n'annonce sa session que
                 # dans son `TurnResult` (le flux brut est du JSON-RPC) ; sans

@@ -1733,6 +1733,12 @@ class CostBook:
         row = usage.row()
         row["turn"] = turn or usage.turn
         row["session"] = session_id
+        # L80b : les messages servis par ce tour, quand le flux résident les
+        # porte (`resident.turn.inputs`). Aucun autre chemin n'en produit : les
+        # tours non résidents gardent la colonne non écrite.
+        inputs = None
+        if resident is not None and isinstance(resident.get("inputs"), (list, tuple)):
+            inputs = tuple(str(i) for i in resident["inputs"] if i is not None)
         storage.of(self.db).turn_costs.insert(
             agent=row["agent"], harness=row["harness"], turn=row["turn"],
             model=row["model"], session=row["session"], usd=row["usd"],
@@ -1742,6 +1748,7 @@ class CostBook:
             account=account, spend_key=key, void_reason=usage.void_reason,
             price_fallback=usage.price_fallback,
             cache_write_tokens=usage.cache_write_tokens,
+            inputs=inputs,
             # #796 (0423) : le lot du tour et son début, portés par le marqueur
             work_item_id=None if work_item_id is None else int(work_item_id),
             started_at=None if started_at is None else float(started_at),
