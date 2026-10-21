@@ -16,6 +16,11 @@ projet du lot et demande d'en désigner un (`ameesh work reviewer <id>
 <agent>` — le lot est déjà en qa). La désignation à l'entrée en qa se fait,
 elle, par `ameesh work move <id> qa --reviewer <agent>`.
 
+#3007 : `notify_undeliverable` ne demande pas un geste sur un lot — elle dit
+qu'aucune route de notification ne joint l'humain qui a des décisions en
+attente sur cet hôte. Elle part aux orchestrateurs de l'alerte et à
+l'auditeur, avec le repli (canal de secours ou retour du notificateur).
+
 Chaque courrier dit l'action attendue, avec la commande exacte. Une alerte
 part une fois à sa levée, puis une seule relance si elle dure encore
 `REMIND_AFTER_S` (6 h) plus tard ; les SLO ne repartent qu'au palier suivant
@@ -36,7 +41,10 @@ BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias"
                  # #1466 : une pause qui dure est un plafond périmé, un compte
                  # retiré ou une configuration que l'exécuteur ne lit pas ; les
                  # orchestrateurs peuvent vérifier, l'auditeur suit
-                 "budget_pause_long")
+                 "budget_pause_long",
+                 # #3007 : aucune route de notification vers l'humain qui a des
+                 # décisions en attente — les agents doivent le savoir
+                 "notify_undeliverable")
 #: une relance, si l'alerte dure encore 6 h après le premier courrier
 REMIND_AFTER_S = 6 * 3600.0
 #: rôles d'une fiche Agent du canon qui désignent l'auditeur
@@ -407,6 +415,19 @@ def _budget_pause_long(alert: dict) -> str:
             % (alert.get("detail") or "?"))
 
 
+def _notify_undeliverable(alert: dict) -> str:
+    """#3007 : cet hôte ne joint pas l'humain qui a des décisions en attente.
+    Aux orchestrateurs et à l'auditeur : la poussée n'a pas eu lieu, le geste
+    de repli est un canal de secours ou le retour du notificateur."""
+    return ("Human not reachable by the notifier from this host: %s. Expected action: "
+            "restore ameesh-notify (and its routes) on the host that holds them, or "
+            "have a fallback route configured on a healthy host and started there; "
+            "keep the pending requests visible in the lot threads meanwhile — no agent "
+            "can push them without a channel. This alert resolves by itself when a "
+            "route exists on the host or when nothing is pending."
+            % (alert.get("detail") or "no notification channel"))
+
+
 def _for_auditor(alert: dict) -> str:
     """`idle_capacity` à l'auditeur : le constat et l'action de l'alerte ; avec
     des lots démarrables ouverts sans agent, l'écart est le sien (L165b,
@@ -526,6 +547,11 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         elif kind == "budget_pause_long":
             text = _budget_pause_long(alert)
             teams = _projects(by_name, alert.get("agent"))
+        elif kind == "notify_undeliverable":
+            # #3007 : l'absence de route est mesh-wide (hôte + humain) ; tous
+            # les orchestrateurs de l'alerte et l'auditeur la reçoivent.
+            text = _notify_undeliverable(alert)
+            teams = set()
         else:
             text = _plan_underused(alert)
             teams = {p for n in alert.get("idle_agents") or ()

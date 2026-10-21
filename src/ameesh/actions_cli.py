@@ -514,6 +514,7 @@ def decisions_view(db, *, human: str | None = None, include_closed: bool = False
 
 def cmd_decisions(cfg: Config, args: argparse.Namespace) -> int:
     from . import decisions as decisions_mod
+    from . import notify_gap
     now = time.time()
     # whose mail may be shown: --for, and in the owner's chat (L123) its human
     # by default — a chat never shows excerpts of mail addressed to another
@@ -525,6 +526,11 @@ def cmd_decisions(cfg: Config, args: argparse.Namespace) -> int:
                                viewer=viewer)
     finally:
         db.close()
+    # #3007 : la file ne prouve pas que l'humain a été joint. Si cet hôte n'a
+    # aucune route pour lui, le dire ici — c'est là qu'un agent regarde les
+    # demandes en attente, et `ameesh notify --test` ne le dit qu'à qui pense
+    # à le lancer.
+    gaps = [] if args.json else notify_gap.gaps(cfg, queue["requests"], now=now)
     if args.json:
         _dump(queue)
         return 0
@@ -540,6 +546,8 @@ def cmd_decisions(cfg: Config, args: argparse.Namespace) -> int:
         print("no pending decision%s" % who)
     else:
         print("%d pending decision(s)%s" % (total, who))
+    for gap in gaps:
+        print("warning: %s" % gap["detail"])
     if queue["requests"]:
         print("\nrequests from agents (oldest first):")
         for view in queue["requests"]:

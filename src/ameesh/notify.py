@@ -243,6 +243,8 @@ TYPE_LABELS = {
     "host_power_low": "host battery low",
     "backlog_empty": "improvement backlog empty",
     "mail_undeliverable": "undeliverable mail",
+    # #3007: cet hôte n'a aucune route pour l'humain — rien ne lui est poussé
+    "notify_undeliverable": "human not reachable by the notifier",
     "decision_pending": "decision pending",
     "decision_overdue": "decision unanswered by its deadline",
     "host_unavailable": "host unavailable",
@@ -2617,8 +2619,11 @@ def cmd_test(cfg: Config, ncfg: NotifyConfig, args) -> int:
         print("ameesh notify --test: `human:<id>` expected", file=sys.stderr)
         return 2
     if not ncfg.channels_for(human):
-        print("ameesh notify --test: no channel for %s (notify.routes, notify.default)"
-              % human, file=sys.stderr)
+        print("ameesh notify --test: no channel for %s (notify.routes, notify.default) — "
+              "this host cannot push anything to that human (no decision, no alert); "
+              "restore the notifier on the host that holds the routes, or configure a "
+              "fallback route on a healthy host (docs/EXPLOITATION.md, "
+              "\"Alertes poussées\")" % human, file=sys.stderr)
         return 2
     results = send_test(ncfg, human, cfg.host)
     for name, error in results:
