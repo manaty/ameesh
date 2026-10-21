@@ -7,13 +7,14 @@ en vol va au bout. L'épingle ne suit jamais la porte d'elle-même (#1467).
 """
 from __future__ import annotations
 
-import os
+import contextlib
 import tempfile
 import types
 import unittest
 from unittest import mock
 
-from ameesh import train, train_canon, train_runner, train_shadow
+from ameesh import mechanics, review, train, train_canon, train_runner, train_shadow
+from ameesh import review_designation_activation as rda
 
 PIN = "a" * 40
 GATE = "b" * 40
@@ -32,61 +33,146 @@ class CompareTest(unittest.TestCase):
 
 
 class GateCommitTest(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.here = os.path.join(self.tmp.name, "canon")
-        self.other = os.path.join(self.tmp.name, "other")
-        self.cfg = types.SimpleNamespace(canon=self.here, host="h")
+    """The gate's commit is the designation's own source selection (cx3, B/P1)."""
 
-    @staticmethod
-    def canon(repo, commit="c" * 40, prefix=""):
-        source = types.SimpleNamespace(mode="git", repo=repo, commit=commit, prefix=prefix)
+    def setUp(self):
+        self.cfg = types.SimpleNamespace(canon="/canon-gate", host="h")
+        self.audited = {}
+        self.applicable = set()
+
+    def canon(self, repo, audited, applicable=True, prefix=""):
+        source = types.SimpleNamespace(mode="git", repo=repo, commit="c" * 40,
+                                       prefix=prefix)
+        self.audited[repo] = audited
+        if applicable:
+            self.applicable.add(repo)
         return types.SimpleNamespace(root=repo, sources=[source])
 
-    def read(self, canons, audited=lambda db, cfg, canon, source: GATE, path=None):
-        with mock.patch("ameesh.canon.load_configured", return_value=canons), \
-                mock.patch("ameesh.canon_sync.audited_commit", side_effect=audited):
-            return train_canon.gate_commit(object(), self.cfg, path or self.here)
+    def load(self, repo, commit, project):
+        if repo not in self.applicable:
+            raise mechanics.MechanicsError("project %r not declared" % project)
+        return types.SimpleNamespace(
+            reviews_for=lambda paths: types.SimpleNamespace(reviews=1, risk="light"),
+            review_policy=None, rules=(), families=("claude", "codex"),
+            source="%s@%s" % (repo, commit))
 
-    def test_the_canon_at_the_train_path_gives_the_audited_commit(self):
-        seen = []
-
+    def patched(self, canons):
         def audited(db, cfg, canon, source):
-            seen.append(source.repo)
-            return GATE.upper()
-        self.assertEqual(self.read([self.canon(self.other), self.canon(self.here)],
-                                   audited), (GATE, ""))
-        self.assertEqual(seen, [self.here])
+            value = self.audited[source.repo]
+            if isinstance(value, Exception):
+                raise value
+            return value
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch("ameesh.canon.load_configured",
+                                       return_value=canons))
+        stack.enter_context(mock.patch("ameesh.canon_sync.audited_commit",
+                                       side_effect=audited))
+        stack.enter_context(mock.patch.object(mechanics, "load", side_effect=self.load))
+        stack.enter_context(mock.patch.object(review, "classify",
+                                              return_value={"class": "light"}))
+        return stack
 
-    def test_a_single_configured_canon_elsewhere_is_the_gate(self):
-        self.assertEqual(self.read([self.canon(self.other)]), (GATE, ""))
+    def gate(self, canons):
+        with self.patched(canons):
+            return train_canon.gate_commit(object(), self.cfg, "ameesh")
 
-    def test_several_canons_elsewhere_are_ambiguous(self):
-        commit, why = self.read([self.canon(self.other),
-                                 self.canon(os.path.join(self.tmp.name, "third"))])
+    def designation(self, canons):
+        with self.patched(canons):
+            return rda._policy(self.cfg, object(), "ameesh", ["src/x.py"])
+
+    def test_cx3_probe_two_applicable_canons_at_different_commits_are_ambiguous(self):
+        canons = [self.canon("/canon-gate", GATE), self.canon("/canon-train", PIN)]
+        self.assertEqual(self.designation(canons).commit, GATE)
+        commit, why = self.gate(canons)
         self.assertEqual(commit, "")
         self.assertIn("ambiguous", why)
+        watch = train_canon.Watch("ameesh", PIN, lambda db: self.gate(canons))
+        self.assertEqual(watch.read(None).state, train_canon.UNKNOWN)
 
-    def test_no_canon_configured_or_unreadable_state_is_named(self):
+    def test_a_canon_that_does_not_apply_is_skipped_like_the_designation(self):
+        canons = [self.canon("/canon-gate", GATE, applicable=False),
+                  self.canon("/canon-train", PIN)]
+        self.assertEqual(self.designation(canons).commit, PIN)
+        self.assertEqual(self.gate(canons), (PIN, ""))
+
+    def test_applicable_canons_at_one_commit_give_it(self):
+        canons = [self.canon("/canon-gate", GATE.upper()), self.canon("/canon-b", GATE)]
+        self.assertEqual(self.designation(canons).commit.lower(), GATE)
+        self.assertEqual(self.gate(canons), (GATE, ""))
+
+    def test_no_canon_or_no_applicable_canon_is_named(self):
         self.cfg.canon = ""
-        self.assertIn("no canon configured", self.read([])[1])
-        self.cfg.canon = self.here
-
-        def broken(db, cfg, canon, source):
-            raise RuntimeError("pg down")
-        commit, why = self.read([self.canon(self.here)], broken)
+        commit, why = self.gate([])
+        self.assertEqual(commit, "")
+        self.assertIn("no canon configured", why)
+        self.cfg.canon = "/canon-gate"
+        canons = [self.canon("/canon-gate", RuntimeError("pg down")),
+                  self.canon("/canon-sub", GATE, prefix="canon/"),
+                  self.canon("/canon-train", PIN, applicable=False)]
+        commit, why = self.gate(canons)
         self.assertEqual(commit, "")
         self.assertIn("pg down", why)
-        commit, why = self.read([self.canon(self.here)],
-                                lambda db, cfg, canon, source: "")
-        self.assertEqual(commit, "")
-        self.assertIn("no exact audited commit", why)
+        self.assertIn("sub-directory", why)
+        self.assertIn("not declared", why)
 
-    def test_a_sub_directory_canon_is_not_the_gate(self):
-        commit, why = self.read([self.canon(self.here, prefix="canon/")])
-        self.assertEqual(commit, "")
-        self.assertIn("exact Git commit", why)
+
+class GateRulesGapTest(unittest.TestCase):
+    """qa-01: the gate's floor/flags are the strictest over ALL canons."""
+
+    def setUp(self):
+        self.cfg = types.SimpleNamespace(canon="/canon-gate", host="h")
+        self.flags = {}
+
+    @staticmethod
+    def canon(repo, commit):
+        source = types.SimpleNamespace(mode="git", repo=repo, commit=commit, prefix="")
+        return types.SimpleNamespace(root=repo, sources=[source])
+
+    def gap(self, canons, pin_repo="/canon-train", pin=PIN):
+        def light(repo, commit):
+            value = self.flags[(repo, commit)]
+            if isinstance(value, Exception):
+                raise value
+            return value[0]
+
+        def flags(repo, commit):
+            value = self.flags[(repo, commit)]
+            if isinstance(value, Exception):
+                raise value
+            return value[1:]
+        with mock.patch("ameesh.canon.load_configured", return_value=canons), \
+                mock.patch.object(mechanics, "light_reviews_at", side_effect=light), \
+                mock.patch.object(mechanics, "review_flags_at", side_effect=flags):
+            return train_canon.gate_rules_gap(self.cfg, pin_repo, pin)
+
+    def test_equal_rules_are_no_gap(self):
+        self.flags = {("/canon-train", PIN): (1, True, True)}
+        self.assertEqual(self.gap([self.canon("/canon-train", PIN)]), "")
+
+    def test_a_non_applicable_canon_raising_the_floor_is_a_gap(self):
+        self.flags = {("/canon-train", PIN): (0, True, True),
+                      ("/canon-other", GATE): (1, False, True)}
+        gap = self.gap([self.canon("/canon-train", PIN), self.canon("/canon-other", GATE)])
+        self.assertIn("light_reviews porte 1 / train 0", gap)
+        self.assertNotIn("exclude_author_family", gap)
+
+    def test_unreadable_document_is_a_gap_never_zero(self):
+        self.flags = {("/canon-train", PIN): mechanics.MechanicsError("bad yaml")}
+        self.assertIn("bad yaml", self.gap([self.canon("/canon-train", PIN)]))
+
+    def test_watch_turns_a_rule_gap_into_a_named_drift(self):
+        watch = train_canon.Watch("ameesh", PIN, lambda db: (PIN, ""),
+                                  rules=lambda db: "light_reviews porte 1 / train 0")
+        reading = watch.read(None)
+        self.assertEqual((reading.state, reading.gate), (train_canon.DRIFT, PIN))
+        self.assertIn("règles d'avis", reading.describe())
+        watch.rules = lambda db: ""
+        self.assertTrue(watch.read(None).aligned)
+
+        def broken(db):
+            raise OSError("canon unreadable")
+        watch.rules = broken
+        self.assertEqual(watch.read(None).state, train_canon.UNKNOWN)
 
 
 class WatchTest(unittest.TestCase):
@@ -122,6 +208,14 @@ class WatchTest(unittest.TestCase):
         reading = self.watch.read(None)
         self.assertEqual(reading.state, train_canon.UNKNOWN)
         self.assertIn("no state", reading.why)
+
+    def test_no_pilot_known_retries_at_the_next_passage(self):
+        self.watch.pilot = lambda db: ""
+        reading = self.watch.read(None)
+        self.assertEqual(self.watch.alert(None, reading, "shadow"), "")
+        self.watch.pilot = lambda db: "mesh-design"
+        self.assertEqual(self.watch.alert(None, reading, "shadow"), "mesh-design")
+        self.assertEqual(len(self.sent), 1)
 
     def test_mail_failure_does_not_raise_and_retries(self):
         def failing(db, recipient, body, reading):

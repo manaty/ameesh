@@ -163,8 +163,15 @@ agents) et journalise le premier refus :
 
 À chaque passage, le train compare `canon_commit` au commit de canon que lisent
 la porte de fusion et la désignation sur l'hôte (`canon_state.last_good_commit`,
-`canon_sync.audited_commit`) ; sinon les deux ne demandent pas le même nombre
-d'avis pour un même lot. Un écart, ou un canon de la porte illisible :
+`canon_sync.audited_commit`), choisi comme la désignation le choisit : premier
+canon configuré dont la politique du projet se charge
+(`review_designation_activation.policy_sources`) ; sinon les deux ne demandent
+pas le même nombre d'avis pour un même lot. Un écart, un canon de la porte
+illisible, plusieurs canons applicables à des commits différents (le choix
+dépendrait alors des chemins du lot), ou, à commit égal, un plancher léger ou
+des drapeaux de famille de la porte différents de ceux du commit épinglé (la
+porte prend le plus strict de **tous** les canons configurés, applicables au
+projet ou non : `lot_class._light_reviews`, `_review_flags`) :
 
 - `shadow` : le plan porte la lecture (`plan.canon` : `pin`, `gate`, `state`) ;
   le journal la nomme et l'orchestrateur du projet reçoit un courrier, une fois

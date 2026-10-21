@@ -308,7 +308,9 @@ def _passage(cfg, spec: ProjectConfig, mode, report):
     # gate reads on this host; never followed automatically (#1467).
     canon = train_canon.Watch(spec.name, commit,
                               partial(train_canon.gate_commit, cfg=cfg,
-                                      canon_path=spec.canon),
+                                      project=spec.name),
+                              rules=lambda db: train_canon.gate_rules_gap(
+                                  cfg, spec.canon, commit),
                               pilot=train_canon.pilot_of(cfg, spec.name))
     if mode == "shadow":
         return train_shadow.Passage(
