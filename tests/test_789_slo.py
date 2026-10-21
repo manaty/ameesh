@@ -370,7 +370,7 @@ class PaquetTest(unittest.TestCase):
         item, jalons, events = self._qa()
         # 45 min de CI de paquet (le p80 mesuré), dépassées d'une heure.
         rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 3600,
-                             packet=True, packet_ci_s=2700)
+                             packet=True, p80_s=2700)
         row = self._row(rows, "verdict_merge")
         self.assertEqual(row["target_s"], 2700)
         self.assertEqual(row["elapsed_s"], 3600)
@@ -382,27 +382,66 @@ class PaquetTest(unittest.TestCase):
         self.assertFalse(row["escalation"])
         self.assertEqual(slo.breaches(rows), [])
 
+    def test_chemin_normal_p80_garde_l_escalade(self):
+        # #2919 : un lot à GO courant hors paquet ouvert est mesuré contre le
+        # p80 ; l'escalade ×2/×3 reste (le pilote porte la fusion).
+        item, jalons, events = self._qa()
+        rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 3600,
+                             p80_s=2700)
+        row = self._row(rows, "verdict_merge")
+        self.assertEqual(row["target_s"], 2700)
+        self.assertEqual(row["elapsed_s"], 3600)
+        self.assertEqual(row["level"], 1)
+        self.assertEqual(row["overdue_s"], 900)
+        self.assertEqual(row["targets"], ("assignee",))
+        self.assertEqual(row["target_source"], "p80")
+        self.assertNotIn("packet", row)
+        self.assertNotIn("escalation", row)
+
+    def test_chemin_normal_p1_p80_40_min(self):
+        # Témoin du N auditeur : P1, GO courant hors paquet, p80 40 min ;
+        # 20 min après le créneau → tenu, 41 min → niveau 1.
+        item, jalons, events = self._qa(priority=1)
+        for offset, level in ((20 * 60, 0), (41 * 60, 1)):
+            with self.subTest(offset=offset):
+                rows = slo.lot_steps(item, jalons, events,
+                                     now=T0 + 1800 + offset, p80_s=2400)
+                row = self._row(rows, "verdict_merge")
+                self.assertEqual(row["target_s"], 2400)
+                self.assertEqual(row["level"], level)
+
     def test_sans_mesure_repli_sur_la_cible_de_la_table(self):
         # Aucun run de suite complète mesuré : la cible de la table (30 min)
-        # reste le repli, toujours sans escalade propre.
+        # reste le repli. L'unité de paquet garde ses cibles vides ; le
+        # chemin normal garde l'escalade de la table.
         for measured in (None, 0, -1, "illisible"):
-            with self.subTest(measured=measured):
+            with self.subTest(measured=measured, packet=True):
                 item, jalons, events = self._qa()
                 rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 3600,
-                                     packet=True, packet_ci_s=measured)
+                                     packet=True, p80_s=measured)
                 row = self._row(rows, "verdict_merge")
                 self.assertEqual(row["target_s"], 1800)
                 self.assertEqual(row["level"], 0)
                 self.assertEqual(row["targets"], ())
                 self.assertEqual(row["target_source"], "fallback")
                 self.assertEqual(slo.breaches(rows), [])
+            with self.subTest(measured=measured, packet=False):
+                item, jalons, events = self._qa()
+                rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 1900,
+                                     p80_s=measured)
+                row = self._row(rows, "verdict_merge")
+                self.assertEqual(row["target_s"], 1800)
+                self.assertEqual(row["level"], 1)
+                self.assertEqual(row["overdue_s"], 100)
+                self.assertEqual(row["targets"], ("assignee",))
+                self.assertNotIn("target_source", row)
 
     def test_paquet_p1_garde_le_p80_pas_la_cible_p1(self):
         # La colonne P1 de la ligne « paquet » est « — » : un P1 ne reprend pas
         # la cible de 15 min, il suit le p80 comme les autres.
         item, jalons, events = self._qa(priority=1)
         rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 1000,
-                             packet=True, packet_ci_s=2700)
+                             packet=True, p80_s=2700)
         row = self._row(rows, "verdict_merge")
         self.assertEqual(row["target_s"], 2700)
         self.assertEqual(row["level"], 0)
@@ -424,7 +463,7 @@ class PaquetTest(unittest.TestCase):
         item, jalons, events = self._qa()
         jalons["merged"] = T0 + 1800 + 3000
         rows = slo.lot_steps(item, jalons, events, now=T0 + 10_000,
-                             packet=True, packet_ci_s=2700)
+                             packet=True, p80_s=2700)
         row = self._row(rows, "verdict_merge")
         self.assertEqual(row["elapsed_s"], 3000)
         self.assertEqual(row["target_s"], 2700)
@@ -437,7 +476,7 @@ class PaquetTest(unittest.TestCase):
         item, jalons, events = self._qa()
         rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 5400,
                              packet_slot=T0 + 7200,
-                             packet=True, packet_ci_s=2700)
+                             packet=True, p80_s=2700)
         row = self._row(rows, "verdict_merge")
         self.assertEqual(row["started_ts"], T0 + 7200)
         self.assertEqual(row["packet_slot"], T0 + 7200)

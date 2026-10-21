@@ -171,14 +171,15 @@ head wait for the packet merge, not for a lot executor, so `stale` and
 lot starts at the first packet slot after its GO (`mechanics.next_packet` as
 soon as the canon declares a cadence, even between two packets; otherwise the
 observed hourly UTC cut-off): the time before that slot is not a delay under
-canon §11 bis. For such a unit the target is the real p80 of the packet CI
-(`progress.ci_suite`, 7-day window, #2919), with the table's 30-minute target
-as the fallback when no suite is measured; the unit has no escalation target
-of its own — the packet composer or the pilot carries the merge (canon §9,
-owner decision #103509 option a, home#147). A
-`packet-exception incident|unblock sha=… reason=…` declared for the current
+canon §11 bis. On the normal path — any lot with a current GO and no declared
+exception — the target is the real p80 of the packet CI (`progress.ci_suite`,
+7-day window, #2919), with the table's 30-minute target as the fallback when
+no suite is measured; the ×2/×3 thresholds apply to it. A unit declared by an
+open packet has no escalation target of its own — the packet composer or the
+pilot carries the merge (canon §9, owner decision #103509 option a, home#147).
+A `packet-exception incident|unblock sha=… reason=…` declared for the current
 head takes the lot out of the packet: the table target (30 min; 15 min in P1)
-and the escalation apply again.
+runs from the GO and the escalation applies.
 
 `planned_wait` is null when no explicit wait applies. While it applies,
 `stale` is null and no `stale_lot` is raised, so the notifier also stops its
