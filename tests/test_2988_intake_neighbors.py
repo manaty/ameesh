@@ -224,6 +224,46 @@ class GitTest(PgTestCase):
         self.assertTrue(any("peut-être corrigé par #%d" % lot in motif
                             for motif in row["motifs"]), row["motifs"])
 
+    def test_insert_at_head_and_deleted_line_in_one_commit(self):
+        # B2 troisième tour : les hunks d'un commit sont tous relatifs au même
+        # parent. Témoin [(0,0,1,1),(5,1,5,0)] : la position passait de 5 à 6
+        # au premier hunk et ne voyait plus la suppression de la ligne 5.
+        self._patch("f.txt", "one\ntwo\nthree\nfour\nbug\nsix\nseven\n")
+        _git(self.repo, "commit", "-qam", "base witness")
+        head = _git(self.repo, "rev-parse", "HEAD").strip()
+        lot = self._merged_lot("insertion et suppression dans le même commit")
+        self._patch("f.txt", "insert\none\ntwo\nthree\nfour\nsix\nseven\n")
+        _git(self.repo, "commit", "-qam",
+             "insert head and delete bug\n\nameesh-work: %d" % lot)
+        found = intake_neighbors.neighbors(
+            self.db, "p", title="f.txt:5", body="", reviewed_head=head,
+            repo=self.repo)
+        ids = [item["id"] for item in found["neighbors"]]
+        self.assertIn(lot, ids)
+        row = next(item for item in found["neighbors"] if item["id"] == lot)
+        self.assertTrue(any("peut-être corrigé par #%d" % lot in motif
+                            for motif in row["motifs"]), row["motifs"])
+
+    def test_negative_shift_above_the_deleted_line(self):
+        # B2 troisième tour : une suppression au-dessus décale la position vers
+        # le haut ; comparée au hunk suivant, elle manquait la suppression de
+        # la ligne citée, pourtant relative au parent fixe.
+        self._patch("f.txt", "one\ntwo\nthree\nfour\nbug\nsix\nseven\n")
+        _git(self.repo, "commit", "-qam", "base negative shift")
+        head = _git(self.repo, "rev-parse", "HEAD").strip()
+        lot = self._merged_lot("deux suppressions dans le même commit")
+        self._patch("f.txt", "one\nthree\nfour\nsix\nseven\n")
+        _git(self.repo, "commit", "-qam",
+             "delete two and bug\n\nameesh-work: %d" % lot)
+        found = intake_neighbors.neighbors(
+            self.db, "p", title="f.txt:5", body="", reviewed_head=head,
+            repo=self.repo)
+        ids = [item["id"] for item in found["neighbors"]]
+        self.assertIn(lot, ids)
+        row = next(item for item in found["neighbors"] if item["id"] == lot)
+        self.assertTrue(any("peut-être corrigé par #%d" % lot in motif
+                            for motif in row["motifs"]), row["motifs"])
+
     def test_real_git_path_case_is_preserved(self):
         # B3 (#2988) : `Makefile` ne doit pas devenir `makefile` pour Git
         # (deux noms distincts sous Linux).
