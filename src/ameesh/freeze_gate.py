@@ -57,6 +57,14 @@ FREEZE_ABSENT_MARK = "ameesh-freeze-absent:"
 #: ligne fournie par `--note` est retirée avant que le gel n'écrive la sienne
 #: (sinon `--note "ameesh-freeze-absent: main"` contournerait le garde #2784).
 FREEZE_ABSENT_LINE = re.compile(r"(?m)^[ \t]*ameesh-freeze-absent:[^\n]*(?:\n|$)")
+#: #2971 : toute marque machine de la note de gel (`ameesh-freeze-absent`,
+#: `ameesh-freeze-unverified`, `ameesh-freeze-unpublished`,
+#: `ameesh-freeze-supersedes`, ...) est une preuve du gate, jamais une note
+#: d'appelant. Le motif est générique pour couvrir aussi les marques des
+#: branches #2962/#2989 : une ligne fournie par `--note` est retirée avant
+#: l'écriture, comme `FREEZE_ABSENT_LINE` le fait pour `absent`.
+FREEZE_MACHINE_LINE = re.compile(
+    r"(?m)^[ \t]*ameesh-freeze-[a-z0-9-]+:[^\n]*(?:\n|$)")
 
 
 def milestones(db: Db, item_id: int, limit: int = 100) -> list[dict]:
@@ -471,6 +479,11 @@ def milestone(
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
+    # #2971 : `--note` ne fournit aucune preuve machine de gel. Le retrait est
+    # fait ici, avant les marques que le gate ajoute lui-même, pour que
+    # `unverified`/`unpublished` (#2962) et `supersedes` (#2989) restent
+    # écrites par le gate et ne soient jamais effacées par un appelant.
+    note = FREEZE_MACHINE_LINE.sub("", note).rstrip()
     if kind == "verdict":
         # #2674 : refuser à l'écriture un avis qui ne nomme pas la tête relue.
         sha = reviewed_head(db, item, sha, repo=repo)
