@@ -1269,6 +1269,136 @@ class ActivationTest(_ActivationFixture, PgTestCase):
                             for call in log.call_args_list))
 
 
+class PendingLoadTest(_ActivationFixture, PgTestCase):
+    """#3004: the load of a reviewer counts the reviews they still owe.
+
+    The witness of the lot: a reviewer with no assigned lot but five pending
+    reviews looked free, so every freeze of their family picked them again.
+    The charge is read in one query, a verdict on the frozen head discharges
+    it, a closed lot no longer counts, and an unreadable read is zero.
+    """
+
+    def pending_lot(self, reviewer: str, sha: str) -> int:
+        """An open lot whose last freeze designates `reviewer`, no verdict yet.
+
+        The freeze hook writes the journal mark and the `reviewers` column in
+        the same transaction; the benchmark writes the same state directly.
+        """
+        item = work.add(self.db, title="pending %s" % sha[:8], app="ameesh",
+                        assignee="author")
+        lot = int(item["id"])
+        work.move(self.db, lot, "build")
+        work.move(self.db, lot, "qa")
+        row = work.milestone(self.db, lot, "frozen", sha=sha, actor="author",
+                             on_frozen=lambda tx, milestone, threads: None,
+                             after_commit=[])
+        note = pg._mark_note(lot, int(row["id"]), state=rd.DESIGNATED,
+                             required=1,
+                             reviewers=[{"name": reviewer, "family": "claude"}],
+                             missing=0, why="test: pending review",
+                             authors=[], policy_ref="", sha=sha)
+        storage.of(self.db).work.note(lot, "qa", note, "test")
+        self.db.execute("UPDATE work_items SET reviewers = ARRAY[%s] WHERE id = %s",
+                        (reviewer, lot))
+        return lot
+
+    def test_pending_designations_are_the_reviewer_load(self):
+        shas = ["%040x" % index for index in range(1, 6)]
+        lots = [self.pending_lot("r1", sha) for sha in shas]
+        loads = act._loads(self.db)
+        # témoin (a), first half: five pending reviews, no assigned lot
+        self.assertEqual(loads.get("r1"), 5, loads)
+        self.assertNotIn("r2", loads)
+        # témoin (b): a verdict naming the frozen head discharges its review,
+        # even abbreviated (the same `_same_freeze` rule as the designation)
+        work.milestone(self.db, lots[0], "verdict", sha=shas[0], actor="r1",
+                       verdict="ok", after_commit=[])
+        self.assertEqual(act._loads(self.db).get("r1"), 4)
+        work.milestone(self.db, lots[1], "verdict", sha=shas[1][:12], actor="r1",
+                       verdict="blocked", after_commit=[])
+        self.assertEqual(act._loads(self.db).get("r1"), 3)
+        # a verdict on another head, or from another agent, discharges nothing
+        work.milestone(self.db, lots[2], "verdict", sha="%040x" % 99, actor="r1",
+                       verdict="ok", after_commit=[])
+        work.milestone(self.db, lots[3], "verdict", sha=shas[3], actor="r2",
+                       verdict="ok", after_commit=[])
+        self.assertEqual(act._loads(self.db).get("r1"), 3)
+        # témoin (c): a closed lot is no longer a charge
+        work.close(self.db, lots[4], abandoned=True, actor="pilot")
+        self.assertEqual(act._loads(self.db).get("r1"), 2)
+
+    def test_only_the_designation_of_the_last_freeze_counts(self):
+        # A new freeze is another head: the designation of the previous one is
+        # not a pending review until the new head is designated. The journal
+        # mark carries its freeze, the `reviewers` column does not (it is
+        # synced after the selection), so the mark is the source.
+        lot = self.pending_lot("r1", "%040x" % 7)
+        self.assertEqual(act._loads(self.db).get("r1"), 1)
+        sha = "%040x" % 8
+        row = work.milestone(self.db, lot, "frozen", sha=sha, actor="author",
+                             on_frozen=lambda tx, milestone, threads: None,
+                             after_commit=[])
+        self.assertNotIn("r1", act._loads(self.db))
+        note = pg._mark_note(lot, int(row["id"]), state=rd.DESIGNATED, required=1,
+                             reviewers=[{"name": "r1", "family": "claude"}],
+                             missing=0, why="test: new head", authors=[],
+                             policy_ref="", sha=sha)
+        storage.of(self.db).work.note(lot, "qa", note, "test")
+        self.assertEqual(act._loads(self.db).get("r1"), 1)
+
+    def test_an_unreadable_load_is_zero_without_an_exception(self):
+        # témoin (d): the read fails, the selection keeps its other criteria
+        with mock.patch.object(self.db, "query", side_effect=RuntimeError("boom")):
+            self.assertEqual(act._loads(self.db), {})
+
+    def test_the_freeze_prefers_the_reviewer_with_the_smaller_real_queue(self):
+        # témoin (a), end to end: r1 has five pending reviews and no assigned
+        # lot, r1b has two assigned lots and no pending review. Same family
+        # (claude), no plan pace reading: r1b must be designated, and the
+        # journal mark names the retained load.
+        shas = ["%040x" % index for index in range(11, 16)]
+        for sha in shas:
+            self.pending_lot("r1", sha)
+        registry.upsert(self.db, "r1b", harness="claude", host=self.cfg.host,
+                        cwd=self.repo.root, status="idle")
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = 'r1b'")
+        self.db.execute("UPDATE agent_registry SET status = 'stopped' WHERE name = 'r2'")
+        for index in range(2):
+            extra = work.add(self.db, title="assigned %d" % index, app="ameesh",
+                             assignee="r1b")
+            work.move(self.db, extra["id"], "build")
+        # a light lot (one opinion due) whose only eligible family is claude
+        self.repo.write("docs/guide.md", "base\n")
+        self.base = self.repo.commit("docs base")
+        self.repo.write("docs/guide.md", "lot\n")
+        self.frozen = self.repo.commit("docs lot")
+        item = work.add(self.db, title="light load witness", app="ameesh",
+                        assignee="author")
+        lot = int(item["id"])
+        work.move(self.db, lot, "build")
+        self.db.execute("UPDATE work_items SET branch_target = %s WHERE id = %s",
+                        (self.base, lot))
+        self.receipts()
+        text = MECHANICS.replace("  distinct_families: true",
+                                 "  distinct_families: true\n  light_reviews: 1")
+        self.canon = _Canon(os.path.join(self.tmp, "canon-light-load"), mechanics=text)
+        self.cfg = dataclasses.replace(self.cfg, canon=self.canon.root, canon_ref="HEAD")
+        outcome: dict = {}
+        threads: list = []
+        work.milestone(self.db, lot, "frozen", sha=self.frozen, actor="author",
+                       on_frozen=act.hook(self.cfg, outcome), after_commit=threads)
+        for record in threads:
+            record(self.db.cfg, self.db)
+        self.assertEqual(outcome["state"], rd.DESIGNATED, outcome)
+        self.assertEqual([r["name"] for r in outcome["reviewers"]], ["r1b"])
+        self.assertEqual([r["family"] for r in outcome["reviewers"]], ["claude"])
+        self.assertIn("load: r1b 2", outcome["why"])
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["r1b"])
+        mark = act._marks(self.db, lot)[-1][2]
+        self.assertEqual(mark["state"], rd.DESIGNATED, mark)
+        self.assertIn("load: r1b 2", mark["why"])
+
+
 class ActivationCliTest(_ActivationFixture, PgTestCase):
     """The production caller: `ameesh work milestone <lot> frozen`."""
 
