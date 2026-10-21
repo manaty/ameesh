@@ -82,6 +82,26 @@ class TrainAdmissionsTest(PgTestCase):
         with self.assertRaisesRegex(train.TrainError, "requeued"):
             self.qualify()
 
+    def test_cutoff_dates_train_enrollment_by_its_admission_not_the_insertion(self):
+        """#2965: the queue instant the train wrote after the cutoff is skipped.
+
+        A manual insertion keeps its own instant, so a hand-queued admission
+        after the cutoff stays late even when its freeze and verdicts are old.
+        """
+        slot = 1000.0
+        packet = dict(self.entry, queued_ts=2000.0)
+        manual = dict(packet)
+        proofs = {"admitted": [dict(entry=packet, proof={"members": [dict(
+            history={"reviews": {"admitted_ts": 900.0}})]})], "deferred": []}
+        self.assertEqual(self.admissions.admitted([packet], slot, BASE, proofs=proofs),
+                         [packet])
+        self.assertEqual(self.admissions.admitted([manual], slot, BASE), [])
+        # An unreadable instant never borrows the other one.
+        proofs["admitted"][0]["proof"]["members"][0]["history"]["reviews"]["admitted_ts"] = None
+        self.assertEqual(self.admissions.admitted([packet], slot, BASE, proofs=proofs), [])
+        proofs["admitted"][0]["proof"]["members"][0]["history"]["reviews"]["admitted_ts"] = 3000.0
+        self.assertEqual(self.admissions.admitted([packet], slot, BASE, proofs=proofs), [])
+
     def test_waiting_lot_and_changed_project_target_or_branch_refuse(self):
         item = self.entry["work_item_id"]
         for field, value in (("state", "blocked"), ("state", "waiting_human"),

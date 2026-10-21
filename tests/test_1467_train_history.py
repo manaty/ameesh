@@ -13,6 +13,7 @@ import os
 import subprocess
 import tempfile
 import types
+import unittest
 
 from ameesh import (registry, review_authors, review_provenance, storage, train,
                     train_history, work)
@@ -413,3 +414,28 @@ class CompleteMilestonesTest(PgTestCase):
         marks = ops.milestones(item["id"], None)
         self.assertEqual(len(marks), before + 110)
         self.assertEqual(sum(m["verdict"] == "blocked" for m in marks), 1)
+
+
+class AdmittedInstantTest(unittest.TestCase):
+    """#2965 : l'instant d'admissibilité, lu sur la porte d'admission."""
+
+    def test_latest_of_freeze_and_gate_completing_verdicts(self):
+        freeze = {"at_ts": 100.0}
+        gate = {"required": 2, "waived": False,
+                "accepted": [{"at_ts": 90.0, "id": 1}, {"at_ts": 120.0, "id": 2}]}
+        self.assertEqual(train_history.admitted_ts(freeze, gate, []), 120.0)
+        gate["required"] = 0
+        self.assertEqual(train_history.admitted_ts(freeze, gate, []), 100.0)
+
+    def test_a_lifted_block_counts_from_its_lift(self):
+        freeze = {"at_ts": 100.0}
+        gate = {"required": 1, "waived": False,
+                "accepted": [{"at_ts": 90.0, "id": 1}]}
+        marks = [dict(kind="verdict", actor="r2", verdict="blocked", at_ts=95.0, id=2),
+                 dict(kind="verdict", actor="r2", verdict="ok", at_ts=110.0, id=3)]
+        self.assertEqual(train_history.admitted_ts(freeze, gate, marks), 110.0)
+
+    def test_a_gate_never_completed_is_refused(self):
+        with self.assertRaises(train.TrainError):
+            train_history.admitted_ts({"at_ts": 100.0},
+                {"required": 2, "accepted": [{"at_ts": 120.0, "id": 1}]}, [])
