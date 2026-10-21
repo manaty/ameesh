@@ -10,7 +10,7 @@ Composeur : mty-amh-impl-01, pour le pilote mesh-design (courrier #123224 du
 parallèle. Composition faite directement sur `main` `60a3ac972` après la
 fusion de h-0900.
 
-## Admissions (7 unités, 7 lots portés)
+## Admissions (8 unités, 8 lots portés)
 
 | lot | source | classe | avis (familles) | auteur | objet |
 |---|---|---|---|---|---|
@@ -22,7 +22,7 @@ fusion de h-0900.
 | #288 | `a21a52f13ac6` (gel #15421) | sensitive | ameesh-cx2 (codex) + ameesh-dev2 (claude) | mty-amh-impl-03 | L80b : cost per resident message — contrat 1.7 `turn_costs.inputs`, compatibilité 1.6, migration 0472 additive |
 | #2895 | `31b40fc899db` | light | avis d'une autre famille | ameesh-dev3 | TPK #2202 : tours relecteur bornés en bac à sable externe (conception) |
 
-## Composition (7 unités)
+## Composition (8 unités)
 
 | unité | lot | source | commit | note |
 |---|---|---|---|---|
@@ -33,21 +33,22 @@ fusion de h-0900.
 | 5 | #2988 | `e435d81a253b` | `a0c3cecc7` | fusion de la tête gelée, 0 conflit |
 | 6 | #288 | `a21a52f13ac6` | `b59b237b9` | fusion de la tête gelée, 0 conflit |
 | 7 | #2895 | `31b40fc899db` | `f8079fb25` | fusion de la tête gelée, 0 conflit |
+| 8 | #2938 | `58be92c88080` | `88b913dbf` | fusion de la tête gelée, 0 conflit (prêt après le premier calcul) |
 
 Chaque commit de composition a le lot en second parent, son sujet nomme le lot
 et son SHA, et il porte un trailer `ameesh-work: <lot>`.
 
 ## Résolutions de composition
 
-Aucune : les sept fusions sont propres.
+Aucune : les huit fusions sont propres.
 
 ## Écartés (ce véhicule)
 
 | lot | source | motif |
 |---|---|---|
 | #2914 | `2df95bee4d8b` | **retiré** : gel antérieur #14991 fantôme `66a06cf09d5c`, la porte de fusion refuse la lecture de la plage gelée (« author provenance unknown ») ; défaut suivi en **#2989** (P1). Repassera dans un paquet après correctif/regel. |
-| #2962 | `71ada71d1396` | **postposé avec #2989** (pilote, courrier #123224 09:32) : sa résolution avec #2989 vit dans la tête de #2989 (`820137b5e`) ; composé sans #2989 il romprait la paire. Inclus avec #2989 dès que ses deux avis sont posés sur `d090b398`. |
-| #2989 | `d090b3984933` | **postposé** : avis dev1 (claude) et cx2 (codex) attendus sur le gel #15484 `d090b398` à l'heure de composition. Inclus avec #2962 dans ce véhicule dès que les deux avis sont posés, sans re-résoudre. |
+| #2962 | `71ada71d1396` | **postposé avec #2989** (pilote, courrier #123224 09:32) : sa résolution avec #2989 vit dans la tête de #2989 (`820137b5e`) ; composé sans #2989 il romprait la paire. La tête de #2989 a bougé après le gel #15484 (`d2e057ac`, nouveau gel à venir) ; la paire attend un nouveau gel et ses deux avis. |
+| #2989 | `d090b3984933` | **postposé** : avis dev1 (claude) et cx2 (codex) attendus sur le gel #15484 `d090b398` à l'heure de composition. Sa tête a bougé après le gel #15484 (`d2e057ac`) : nouveau gel et deux avis à venir ; la paire #2962+#2989 passera ensemble dans un prochain véhicule, sans re-résoudre. |
 
 ## En attente au calcul (non admis)
 
@@ -57,22 +58,24 @@ Aucune : les sept fusions sont propres.
 | #480 | `verdicts-missing` (aucun avis) |
 | #2614 | `verdicts-missing` (un avis codex) |
 | #2771 | `verdicts-missing` (un avis deepseek) |
-| #2938 | `verdicts-missing` (un avis codex) |
 | #2940 | `verdicts-missing` (aucun avis) |
 | #2954 | `verdicts-missing` (aucun avis) |
 | #2955 | `blocked-verdict` |
 | #2957 | `verdicts-missing` (un avis codex) |
 | #2965 | `verdicts-missing` (aucun avis) |
 | #2971 | `verdicts-missing` (aucun avis) |
-| #2994 | `verdicts-missing` (aucun avis) |
+| #2989 | `blocked-verdict` (tête bougée après le gel #15484, nouveau gel à venir) |
+| #2994 | `blocked-verdict` (dépend de #2977, relecture en cours) |
 
 ## Contrôles
 
 - Liste calculée `scripts/paquet-candidats.py --repo . --app ameesh --target
   main` (21/10 09:41) : 8 lots prêts (#2895, #2916, #2962, #2968, #2973,
   #2977, #2988, #288), 13 en attente, 1 erreur (#2914, gel fantôme, écarté
-  ci-dessus). Aucun lot prêt omis : 7 composés, #2962 écarté avec motif (paire
-  #2989) ; #2989 n'était pas prêt (verdicts-missing/blocked-verdict).
+  ci-dessus). Recalcul à 09:47 : 9 lots prêts (ajout de #2938, verdicts posés
+  entre-temps), #2614 toujours en attente (un avis codex), #2989 tête bougée,
+  #2994 en relecture. Aucun lot prêt omis : 8 composés, #2962 écarté avec
+  motif (paire #2989) ; #2989 n'était pas prêt.
 - Contrôle d'inclusion : `scripts/paquet-inclusion.py` sur la tête composée.
 - Tests ciblés sur l'arbre composé (local, sans CI).
 - CI complète : à demander une fois sur la tête finale gelée (une seule
