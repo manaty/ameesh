@@ -153,8 +153,9 @@ compris — et sa famille au journal des tours (`turn_costs`) **à l'instant du
 commit**, pas le harnais déclaré au registre : un harnais emprunté reste le
 harnais qui a réellement tourné. Un committer distinct de l'auteur de référence
 doit être un agent du registre ; un tiers sans reçu reste inconnu. Pour un
-relecteur désigné, le seuil du §2 s'applique : sous ~50 lignes et sans
-conception, c'est une correction de relecture, pas un nouvel auteur.
+relecteur désigné, un commit sans reçu reste **sa** correction, avec sa famille
+de session : le seuil du §2 ne décide que de la recevabilité process (retour à
+l'auteur), jamais de l'indépendance (#2888).
 
 Le repli est une **trace**, pas un reçu : la marque de désignation porte
 `proof: turn-journal` et `fallback_commits` (les SHA admis par ce chemin), et
@@ -166,3 +167,59 @@ par un relecteur le compte comme auteur
 (`test_an_inter_agent_amend_counts_the_committer_as_author`), et un harnais
 emprunté est lu au tour, pas au registre
 (`test_a_borrowed_harness_uses_the_commit_turn_family`).
+
+## 7. Réécriture d'historique : les auteurs des gels antérieurs (#2924, 21/10)
+
+Une consolidation (squash, commit unique sur une cible avancée) crée un objet
+neuf : les reçus restent sur les anciens commits et le nouveau ne les porte
+pas. Une réécriture **à contenu identique** effaçait donc la provenance des
+correcteurs — cas réel #286, `40192bd5ff4a`, arbre identique à `1f827402b`
+fusionné avec main — et leurs familles redevenaient « indépendantes ».
+
+`review_authors.reading` relit les gels antérieurs du même lot et reprend leurs
+auteurs tant que leur contenu subsiste :
+
+- gel ancêtre de la tête et absent de la base : son contenu est dans l'histoire ;
+- arbre de la tête égal à celui du gel, ou à la fusion du gel avec la base ;
+- sinon un commit n'est tenu pour réécrit que si **aucune** de ses lignes
+  significatives ne subsiste : une ligne ou un commentaire modifié ne suffit
+  jamais à retirer l'auteur (choix prudent, canon §2) ;
+- un chemin absent de la tête n'est pas une preuve de suppression (#2924 B8) :
+  si la ligne n'est plus à son ancien chemin, elle est cherchée dans tout
+  l'arbre (`git grep` sur la tête) ; un fichier déplacé ou un contenu regroupé
+  ailleurs garde donc son auteur. Seul un chemin encore présent, dont aucune
+  ligne significative ne subsiste, prouve la réécriture.
+
+Un correctif réellement réécrit n'est pas repris (cas admissible, décision
+documentée) ; une réécriture partielle reste attribuée et une lecture illisible
+ou ambiguë conserve l'auteur. Un journal de jalons illisible ne rend jamais une
+liste vide : la lecture stricte refuse, la désignation attend (unknown).
+
+Un acteur peut avoir écrit sous **plusieurs familles** dans un gel antérieur
+(même agent historiquement Codex puis DeepSeek, squash signé DeepSeek). Le
+lecteur transporte tout l'ensemble prouvé, pas la seule réduction ambiguë à
+une chaîne vide : `families_out` garde les deux familles, `authors` rend une
+famille vide (ambiguë), la désignation attend, la porte refuse de deviner et
+le train refuse une famille inconnue. Une preuve courante ne doit jamais
+effacer une famille historique.
+
+Un gel antérieur absent du dépôt de lecture — le clone scratch de `merge-pr`
+ne récupère que la cible et `refs/pull/N/head` — n'est plus un refus
+systématique : la porte tente de le rapatrier **par SHA** depuis le dépôt de
+l'agent puis l'origine du projet, sans déplacer aucune ref, et ne refuse que si
+la récupération échoue (le refus fermé de B5 reste la règle quand les objets
+manquent réellement). Le cas #286 (sept gels non ancêtres de la tête
+`a8da5f82`, lus depuis un dépôt qui ne porte que la cible et la tête) est
+ainsi lisible sans `ProvenanceError`. Consigner au gel la lecture de ses
+auteurs reste une suite utile (elle éviterait le réseau), mais n'est plus
+nécessaire pour qu'un lot regelé après rebase passe la lecture stricte.
+
+La même lecture sert la désignation, la porte et le train (`base`/`head`
+passés par chaque appelant) ; les correcteurs antérieurs restent tracés pour
+l'exclusion personnelle. Un lot porteur de paquet reste hors de la reprise
+(#2803 : seule son delta propre est relu). Témoins :
+`tests/test_2924_history_rewrite_provenance.py` (squash à arbre identique,
+consolidation sur cible avancée, réécriture réelle, changement sans rapport,
+ensembles de familles ambigus, correctif déplacé vers un autre chemin,
+gel absent récupéré par SHA — avec et sans correcteur — et absence non
+récupérable refusée).

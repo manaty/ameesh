@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import getpass
+import hashlib
 import json
 import math
 import os
@@ -52,7 +53,7 @@ import uuid
 
 from . import account_budget, account_turn, adapters, auth_failure, canon as canon_mod, canon_sync
 from . import cost as cost_mod
-from . import budget as budget_mod, db as db_mod, fil, harnesses, identity, mail, registry, sentinel, storage
+from . import budget as budget_mod, db as db_mod, device_state, fil, harnesses, identity, mail, registry, sentinel, storage
 from . import rate_limit as rate_limit_mod
 from . import persona_memory as memory_mod
 from . import train_events
@@ -215,6 +216,15 @@ RESIDENT_RETRY_MIN_S = 60.0
 RESIDENT_RETRY_MAX_S = 3600.0
 #: L76 : attente de la fin d'un tour résident après son flux (harnais tué)
 RESIDENT_END_WAIT_S = 5.0
+#: L77/B8 : borne de jonction du moniteur de préemption avant de solder les
+#: steers en fin de tour. Un `driver.steer` accepté après le solde laisserait
+#: une réservation orpheline ; la jonction ferme ce cycle.
+PREEMPT_JOIN_S = 10.0
+#: L77/B8 : barrière de steer. Le pilote borne une requête `turn/steer` à
+#: `resident.CONTROL_TIMEOUT` (15 s), avec une attente préalable possible du
+#: `turn/start` : la fin de tour attend le steer en cours au-delà de la simple
+#: jonction du moniteur, puis vérifie le `TurnResult` effectif.
+PREEMPT_STEER_WAIT_S = 35.0
 #: #339: this host's rows whose group is gone are settled at start and then
 #: every LIVE_REVIEW_EVERY_S (L147's rule, with a liveness check in place of
 #: the boot time); a `running` row only once its turn (or grace period) is
@@ -626,6 +636,17 @@ class AgentWorker(threading.Thread):
         self.watchdog_stop = threading.Event()
         #: message prioritaire : préempte le tour en cours (0018, R19)
         self.preempting = threading.Event()
+        #: L77/B10 : génération des demandes de préemption, pour ne pas effacer
+        #: un signal arrivé pendant le traitement du précédent.
+        self._preempt_seq = 0
+        #: L77/B8 : remises steer réservées, rattachées à la génération et au
+        #: `Turn` effectif : (jeton, ids, génération, Turn, input_id).
+        self._steer_pending: list[tuple[str, list[int], int, object | None, str]] = []
+        #: L77/B8 : barrière du steer en cours. Le tour ne se solde pas tant
+        #: qu'une remise steer peut encore être acceptée par le pilote.
+        self._steer_lock = threading.Lock()
+        self._turn_generation = 0
+        self._turn_live = False
         #: #2729 : génération des demandes de préemption. `pick()` fige la
         #: frontière du tour qu'il sélectionne ; `request_preempt` incrémente
         #: et pose le drapeau sous le même verrou. Au début du tour, seule une
@@ -640,6 +661,9 @@ class AgentWorker(threading.Thread):
         #: critique (le NOTIFY d'un message déjà servi n'arrête pas son tour).
         self._turn_mail_ids: frozenset[int] = frozenset()
         self._refus_vus: set[int] = set()
+        #: contrat 1.5 absent (ancien serveur médié) : recherche profonde des
+        #: humains indisponible, dite une fois sans tuer le fil.
+        self._humains_profonds_indisponibles = False
         #: arrêt demandé avant la publication du Popen (point de passage unique)
         self.stop_requested = threading.Event()
         self._stop_reason = ""
@@ -647,6 +671,9 @@ class AgentWorker(threading.Thread):
         self._budget_next_check = 0.0
         self._budget_paused = False
         self._budget_reason = ""
+        #: #2934 : nature de la pause (compte, fenêtre, échéance) — le fil ne
+        #: reçoit une note qu'à ce changement, pas à chaque point de jauge.
+        self._budget_nature = ""
         #: la comptabilité du dernier tour a échoué : plus de tour à l'aveugle.
         #: Un marqueur persistant rend la suspension durable au redémarrage (B5).
         #: L72 : base injoignable à la création — doute, donc suspension, mais
@@ -695,9 +722,10 @@ class AgentWorker(threading.Thread):
         self.last_turn_subagent_reread = 0
         #: L217b/#2336 : la mesure de la rotation entre deux tours, celle du
         #: plafond — le contexte du dernier appel du fil principal (taille de
-        #: session) —, et sa session ; None = pas de relevé d'appel dans le
-        #: flux (harnais sans usage par appel, tour de résumé, worker relancé) :
-        #: repli sur le grand livre (somme des relectures du tour)
+        #: session) —, et sa session ; Codex : lu dans le journal de session du
+        #: fil (#2932) ; None = pas de relevé d'appel (journal illisible, tour
+        #: de résumé, worker relancé) : repli sur le grand livre (somme des
+        #: relectures du tour), jamais pour la rotation d'un tour Codex
         self.last_turn_context: int | None = None
         self.last_turn_context_session: str | None = None
         #: L81 (étude §6.3) : instant monotone du dernier message humain en
@@ -1258,6 +1286,29 @@ class AgentWorker(threading.Thread):
                     or self.restarting.is_set())
         if not en_cause:
             return False
+        # L77/B5 : une préemption seule ne tue jamais un résident vivant. Elle
+        # a pu arriver entre la sélection du tour et la publication du
+        # `Popen` (ou après que le moniteur a rendu la main) : le message est
+        # remis au point sûr, sinon gardé pour le tour suivant. Les autres
+        # déclencheurs (bail, échéance, arrêt, redémarrage, retrait d'hôte)
+        # gardent leur arrêt dur, y compris pour un résident.
+        if self.stop_requested.is_set():
+            # Le latch vient d'un `stop_group_now` : sa raison nomme la cause.
+            # Une préemption qui se serait ajoutée ne doit pas masquer un arrêt
+            # d'une autre classe.
+            preemption = self._stop_reason == "preemption"
+        else:
+            preemption = self.preempting.is_set()
+        autre_cause = (self.lease_lost.is_set() or self.deadline_passed()
+                       or self.stopping.is_set() or self.watchdog_stop.is_set()
+                       or self.restarting.is_set()
+                       or getattr(self, "host_yield", None) is not None
+                       or (getattr(self, "runner", None) is not None
+                           and self.runner.stop.is_set())
+                       or bool(self._power_texte))
+        if preemption and not autre_cause and self._preempt_resident():
+            self.stop_requested.clear()
+            return False
         if (self.deadline_passed() or self.stopping.is_set()
                 or self.watchdog_stop.is_set()):
             # Arrêt de classe « bail » : le tour ne doit pas être clos ni compté.
@@ -1500,12 +1551,18 @@ class AgentWorker(threading.Thread):
         with verrou:
             return int(message_id) in self._turn_mail_ids
 
-    def request_preempt(self, message_id: int | None = None) -> bool:
+    def request_preempt(self, message: int | dict | None = None) -> bool:
         """Un message prioritaire préempte le tour en cours (0018, R19).
 
         Le tour est arrêté (SIGTERM bref puis SIGKILL), sa consigne repart en
         attente, et `pick()` sert le message prioritaire en tête au tour suivant,
         sur la même session.
+
+        L77 : pour un tour **résident**, la ligne (`message`, dict) est remise
+        au point sûr (`steer`) si le pilote l'accepte ; sinon le tour résident
+        est interrompu sans tuer le process. Le message non remis est servi au
+        tour suivant, sur la même session. Un id seul (NOTIFY) suffit à
+        interrompre, sans contenu à steerer.
 
         #2729 : la génération et le drapeau sont posés sous le même verrou que
         la consommation du début de tour — une demande ne peut donc pas tomber
@@ -1517,23 +1574,257 @@ class AgentWorker(threading.Thread):
         tour. Rend True si la demande a été posée, False si elle était déjà
         servie.
         """
+        row = message if isinstance(message, dict) else None
+        try:
+            message_id = int(row.get("id")) if row is not None else (
+                int(message) if message is not None else None)
+        except (TypeError, ValueError):
+            message_id = None
         with self._preempt_lock:
-            if message_id is not None and int(message_id) in self._turn_mail_ids:
+            if message_id is not None and message_id in self._turn_mail_ids:
                 return False
             self.preempt_gen += 1
+            with self.lock:
+                self._preempt_row = row
+                self._preempt_seq += 1
             self.preempting.set()
         self.wake.set()
         return True
+
+    def _interrupt_admitted(self, rp, driver, generation: int) -> bool:
+        """Interrompt le résident si c'est encore le tour de `generation`.
+
+        `_steer_lock` reste tenu de la revalidation à l'admission de
+        l'interruption : la génération suivante ne peut pas être publiée entre
+        les deux, donc un repli de steer tardif n'interrompt jamais le tour
+        suivant. Un verrou non obtenu dans la borne rend False : le message
+        reste en file plutôt que d'interrompre un tour inconnu.
+        """
+        if not self._steer_lock.acquire(timeout=PREEMPT_STEER_WAIT_S):
+            log_async("[%s] interrupt admission barrier not reached within %.0fs"
+                      % (self.name, PREEMPT_STEER_WAIT_S))
+            return False
+        try:
+            with self.lock:
+                if (not self._turn_live or self._turn_generation != generation
+                        or self.resident is not rp):
+                    return False
+            try:
+                return bool(driver.interrupt())
+            except Exception as exc:
+                log_async("[%s] resident interrupt failed (%s)"
+                          % (self.name, " ".join(str(exc).split())[:120]))
+                return False
+        finally:
+            self._steer_lock.release()
+
+    def _preempt_resident(self, generation: int | None = None) -> str:
+        """L77 : préempte un tour résident sans tuer le process.
+
+        Rang 1 humain : `steer` au point sûr, la remise restant réservée jusqu'à
+        la fin effective du tour (B8) ; rang 3 agent/système : `interrupt()`
+        seulement, jamais `steer` (étude §2). Rend "" quand aucun résident ne
+        porte le tour (chemin 0018 « un tour par événement »), sinon
+        "steered", "interrupted" ou "deferred" — le moniteur continue après un
+        steer et s'arrête après une interruption.
+        """
+        with self.lock:
+            rp = self.resident
+        if rp is None or not getattr(rp, "alive", False) \
+                or getattr(rp, "closing", False):
+            return ""
+        driver = getattr(rp, "driver", None)
+        if driver is None:
+            # Un résident vivant sans pilote reste vivant : le message attend
+            # le tour suivant, jamais un `stop_group_now` de préemption (B5).
+            log_async("[%s] preemption: resident alive without driver; message "
+                      "kept for the next turn" % self.name)
+            return "deferred"
+        if not getattr(driver, "busy", False):
+            # Course avant `send`/après la fin du tour : le résident est vivant,
+            # le message reste en file ; on ne le tue pas pour préempter.
+            log_async("[%s] preemption: resident alive between turns; message "
+                      "kept for the next turn" % self.name)
+            return "deferred"
+        with self.lock:
+            if generation is None:
+                generation = getattr(self, "_turn_generation", 0)
+            row = self._preempt_row
+            seq = self._preempt_seq
+            self._preempt_row = None
+        if row is not None and self._from_human(row):
+            if self._steer_human(row, driver, generation):
+                # B10 : ne retombe le latch que si aucune nouvelle demande n'est
+                # arrivée pendant le steer ; sinon le moniteur doit la servir.
+                with self.lock:
+                    if self._preempt_seq == seq:
+                        self.preempting.clear()
+                return "steered"
+        if self._interrupt_admitted(rp, driver, generation):
+            log_async("[%s] resident turn interrupted (preemption)" % self.name)
+            return "interrupted"
+        # Aucune remise immédiate possible : le message reste en file, le
+        # résident vivant est conservé (le tuer pour préempter est exclu).
+        log_async("[%s] resident preemption deferred: message kept for the next "
+                  "turn" % self.name)
+        return "deferred"
+
+    def _steer_human(self, row: dict, driver, generation: int) -> bool:
+        """L77/B8 : réserve un message humain et le remet au point sûr.
+
+        La réservation n'est **pas** soldée ici : elle est rattachée au `Turn`
+        effectif et à la génération du tour, puis soldée par `_solde_steers` si
+        ce `Turn` l'a réellement servi. Le steer ne démarre jamais un nouveau
+        tour (`steer_running`) : si le tour s'achève pendant la requête, le
+        message reste en file pour le tour suivant. La barrière `_steer_lock`
+        couvre la réservation et la requête : `_solde_steers` attend qu'elles
+        soient finies, ce qui ferme la course de l'ACK tardif.
+        """
+        try:
+            ident = int(row.get("id"))
+        except (KeyError, TypeError, ValueError):
+            return False
+        from . import resident as resident_mod
+        with self._steer_lock:
+            with self.lock:
+                if not self._turn_live or self._turn_generation != generation:
+                    return False
+            jeton = mail.new_token()
+            try:
+                reserves = mail.reserve(
+                    self.db, self.name, self.runner.runner_id, self.epoch, jeton,
+                    ids=[ident], porteur="consigne",
+                    ttl_seconds=mail.human_reservation_ttl(self.turn_max_seconds()))
+            except db_mod.DbError as exc:
+                log_async("[%s] steer reservation failed (%s)" % (self.name, exc))
+                return False
+            if not reserves:
+                return False
+            with self.lock:
+                if not self._turn_live or self._turn_generation != generation:
+                    # Le tour s'est clos pendant la réservation : ne pas
+                    # steerer un tour qui n'existe plus.
+                    try:
+                        mail.release(self.db, self.name, jeton, [ident])
+                    except db_mod.DbError as exc:
+                        log_async("[%s] steer reservation not released (%s)"
+                                  % (self.name, exc))
+                    return False
+            try:
+                texte = self._urgent_steer_text(row)
+                input_id = resident_mod.new_id()
+                turn = (driver.steer_running(texte, input_id=input_id)
+                        if texte and hasattr(driver, "steer_running") else None)
+                if turn is not None:
+                    with self.lock:
+                        if self._turn_live and self._turn_generation == generation:
+                            self._steer_pending.append(
+                                (jeton, [ident], generation, turn, input_id))
+                            log_async("[%s] priority message steered into the "
+                                      "resident turn" % self.name)
+                            return True
+                    # L77/B8 : ACK accepté après la clôture de la génération :
+                    # jamais attribué au tour suivant, la remise est libérée.
+                    log_async("[%s] late steer acknowledged after the turn: "
+                              "released" % self.name)
+            except Exception as exc:  # InputRefused, ResidentBusy, protocole muet
+                log_async("[%s] resident steer refused (%s): interrupting"
+                          % (self.name, " ".join(str(exc).split())[:120]))
+            try:
+                mail.release(self.db, self.name, jeton, [ident])
+            except db_mod.DbError as exc:
+                log_async("[%s] steer reservation not released (%s)"
+                          % (self.name, exc))
+            return False
+
+    def _begin_turn_generation(self) -> int:
+        """L77/B8 : ouvre la génération du tour qui va être servi."""
+        with self._steer_lock:
+            with self.lock:
+                self._turn_generation += 1
+                self._turn_live = True
+                return self._turn_generation
+
+    def _solde_steers(self, result: bool, generation: int | None = None) -> None:
+        """L77/B8 : solde les remises steer sur la fin effective du tour.
+
+        La barrière `_steer_lock` attend le steer en cours (réservation et
+        requête) ; la génération rattache chaque remise à son tour, pour qu'un
+        ACK tardif ne soit jamais soldé par le tour suivant. Une remise n'est
+        soldée que si le `TurnResult` effectif est achevé et contient son
+        `input_id` ; sinon elle est libérée (au moins une fois).
+        """
+        with self.lock:
+            if generation is None:
+                generation = self._turn_generation
+        acquired = self._steer_lock.acquire(timeout=PREEMPT_STEER_WAIT_S)
+        try:
+            with self.lock:
+                pending = self._steer_pending
+                self._steer_pending = []
+                self._turn_live = False
+                self._turn_generation += 1
+        finally:
+            if acquired:
+                self._steer_lock.release()
+        if not acquired:
+            log_async("[%s] steer barrier not reached within %.0fs: a late "
+                      "steer will release itself" % (self.name, PREEMPT_STEER_WAIT_S))
+        from . import resident as resident_mod
+        for jeton, ids, gen, turn, input_id in pending:
+            fin = getattr(turn, "result", None) if turn is not None else None
+            served = (gen == generation and fin is not None
+                      and getattr(fin, "status", "") == resident_mod.COMPLETED
+                      and input_id in (getattr(fin, "inputs", ()) or ()))
+            if served:
+                try:
+                    livres = mail.deliver(self.db, self.name, self.runner.runner_id,
+                                          self.epoch, jeton, ids)
+                except db_mod.DbError as exc:
+                    livres = []
+                    log_async("[%s] steered message not settled (%s)"
+                              % (self.name, exc))
+                self._remise_incertaine(ids, livres)
+            else:
+                if turn is not None and gen != generation:
+                    log_async("[%s] late steer from an earlier turn released"
+                              % self.name)
+                try:
+                    mail.release(self.db, self.name, jeton, ids)
+                except db_mod.DbError as exc:
+                    log_async("[%s] steer reservation not released (%s)"
+                              % (self.name, exc))
+
+    def _urgent_steer_text(self, row: dict) -> str:
+        """Le texte remis au point sûr : l'enveloppe ameesh, puis le corps
+        neutralisé — jamais un en-tête fourni par l'expéditeur."""
+        from . import resident_queue
+        ident = resident_queue.identity_for(
+            row.get("sender") or "", cfg=getattr(self, "cfg", None),
+            canon_id=self._canon_id(),
+            proof=mail.human_account(row), human=self._from_human(row))
+        return "%s\n%s" % (resident_queue.envelope(ident, self._envelope_token()),
+                           resident_queue.neutralise(row.get("body") or ""))
 
     def _preempt_monitor(self, done: threading.Event) -> None:
         """Arrête le harnais dès qu'un message prioritaire arrive (0018).
 
         Passe par le point de passage unique : signal d'abord, journal borné
         ensuite ; une préemption arrivée avant la publication du `Popen` est
-        rattrapée par `kill_if_stop_requested()`.
+        rattrapée par `kill_if_stop_requested()`. L77 : un tour résident est
+        interrompu à son point sûr, sans tuer le process.
         """
+        with self.lock:
+            generation = self._turn_generation
         while not done.wait(0.1):
             if self.preempting.is_set():
+                status = self._preempt_resident(generation)
+                if status == "steered":
+                    # Un steer accepté n'arrête pas le tour : le moniteur
+                    # continue de veiller sur les urgents suivants et `restart`.
+                    continue
+                if status:
+                    return
                 self.stop_group_now("preemption", grace=1.0)
                 return
             if self.restarting.is_set():
@@ -1732,20 +2023,38 @@ class AgentWorker(threading.Thread):
     def last_turn_context_reread(self) -> tuple[int, str | None]:
         """Contexte du dernier appel au dernier tour, et sa session (L217b) :
         le fil principal relevé dans le flux, sans les sous-agents, ni pour un
-        tour clos avant son `result` ; sans relevé dans le flux, les jetons
-        relus par le dernier tour inscrit au grand livre (L60)."""
+        tour clos avant son `result` — pour Codex, dans le journal de session
+        du fil (#2932) ; sans relevé, les jetons relus par le dernier tour
+        inscrit au grand livre (L60)."""
         if self.last_turn_context is not None:
             return self.last_turn_context, self.last_turn_context_session
         return self.last_turn_reread, self.last_turn_reread_session
+
+    def _codex_last_call_context(self, thread: str | None) -> int | None:
+        """#2932 : le contexte du dernier appel d'un fil Codex, lu dans son
+        journal de session (dossiers des comptes déclarés compris, L95), ou
+        None s'il est illisible."""
+        try:
+            book = cost_mod.CostBook(
+                state_dir=self.cfg.state_dir,
+                codex_homes=accounts_mod.homes(self.cfg, "codex"))
+            usage = book.codex_last_call_usage(thread)
+        except Exception as exc:  # mesure seulement : jamais fatale au tour
+            log_async("[%s] codex call context not read (%s)"
+                      % (self.name, " ".join(str(exc).split())[:160]))
+            return None
+        return adapters.context_tokens("codex", usage) if usage is not None else None
 
     def context_rotation_due(self) -> bool:
         """Le contexte de la session dépasse-t-il le plafond ? (L60)
 
         La mesure est celle du plafond du tour (L217b) : le contexte du
-        dernier appel du fil principal, relevé dans le flux ; à défaut, celle
-        de l'alerte `session_too_big` (entrée + entrée relue en cache du
-        dernier tour inscrit au grand livre — un harnais qui ne publie son
-        usage qu'en fin de tour, comme Codex). Chaque étape d'un tour relit
+        dernier appel du fil principal, relevé dans le flux, ou pour Codex,
+        qui ne publie son usage qu'en fin de tour, dans le journal de session
+        du fil (#2932) ; à défaut, celle de l'alerte `session_too_big` (entrée
+        + entrée relue en cache du dernier tour inscrit au grand livre), sauf
+        pour Codex : sans relevé d'appel (journal illisible, worker relancé),
+        il ne tourne pas sur cette somme (#2932). Chaque étape d'un tour relit
         tout le contexte : une session qui grossit coûte de plus en plus cher
         à chaque tour, et l'alerte seule n'y changeait rien. La somme des
         appels d'un tour n'est pas la taille de la session (#2336).
@@ -1754,6 +2063,8 @@ class AgentWorker(threading.Thread):
         relevé soit bien celui de cette session.
         """
         if self.proc is not None or self.session_policy() == "jamais":
+            return False
+        if self.last_turn_context is None and self._ledger_harness() == "codex":
             return False
         plafond = self.context_max_tokens()
         relus, relus_session = self.last_turn_context_reread()
@@ -3512,9 +3823,27 @@ class AgentWorker(threading.Thread):
         sender = (row.get("sender") or row.get("from") or "").strip()
         if not sender:
             return False
-        from . import work
-        if sender.startswith(work.HUMAN_PREFIX):
-            return True
+        from . import resident_queue, work
+        # L77/B1 : toute entrée humaine est vérifiée AVANT la liste des agents.
+        # Un nom nu déposé par un humain (forme d'`agent-mail send`) est une
+        # entrée humaine dès que le message porte le marqueur `payload.human`
+        # ou une preuve d'entrée ; `human:<id>` l'est toujours. Sans cette
+        # normalisation, un nom nu déclaré dans `AMEESH_INTERRUPT_SENDERS`
+        # préemptait sans preuve.
+        humaine = (sender.startswith(work.HUMAN_PREFIX) or mail.is_human(row)
+                   or bool(mail.human_account(row)))
+        if humaine:
+            # L77/B1 : un humain ne préempte que si la preuve d'entrée portée
+            # par le message correspond à un local_account déclaré de sa fiche.
+            # Le compte du runner/hook ne prouve jamais l'émetteur.
+            ident = resident_queue.identity_for(
+                sender, cfg=getattr(self, "cfg", None),
+                canon_id=self._canon_id() if hasattr(self, "_canon_id") else None,
+                proof=mail.human_account(row), human=True)
+            if not ident.verified:
+                log("[%s] urgent from %s without a verified local account: no "
+                    "interruption" % (self.name, sender))
+            return ident.verified
         if sender in self.cfg.interrupt_senders:
             return True
         return (self._system_event_interrupt(sender, row)
@@ -3658,6 +3987,7 @@ class AgentWorker(threading.Thread):
         self._budget_paused = bool(raison)
         if not raison:
             self._budget_reason = ""
+            self._budget_nature = ""
             self._leve_pause_budget()
             return True
         maintenant = time.monotonic()
@@ -3671,11 +4001,15 @@ class AgentWorker(threading.Thread):
             registry.set_status(self.db, self.name, "blocked",
                                 status_text="%s%s%s" % (budget_mod.PAUSE_PREFIX, marque,
                                                         raison))
-            if raison != self._budget_reason:
-                self._budget_reason = raison
+            # #2934 : une note par nature de pause (compte, fenêtre, échéance),
+            # pas à chaque variation du pourcentage, qui reste dans `status_text`.
+            nature = accounts_mod.pause_nature(raison)
+            if nature != self._budget_nature:
+                self._budget_nature = nature
                 self._fil_note("Budget pause: %s. No turn until the gauge goes back "
                                "down." % raison,
                                meta={"action": "budget", "raison": raison})
+            self._budget_reason = raison
         return False
 
     def _leve_pause_budget(self) -> None:
@@ -3734,12 +4068,11 @@ class AgentWorker(threading.Thread):
 
         Le marqueur est l'état **durable** : un worker de remplacement y
         retrouve l'événement et peut réparer le tour avant de le régler.
-        `created_ts` borne l'écriture au marqueur de CE tour, jamais celui
-        d'un remplaçant."""
+        L'identité exacte du marqueur (`created_at`, `spend_key`, #2166) borne
+        l'écriture à CE tour, jamais celui d'un remplaçant."""
         try:
             return registry.pending_spend_set_resident_usage(
-                self.db, self.name, usage,
-                None if travail is None else travail.get("created_ts"))
+                self.db, self.name, usage, travail)
         except db_mod.DbError as exc:
             log_async("[%s] resident usage marker not written (%s)"
                       % (self.name, db_mod.explain(exc)))
@@ -3865,6 +4198,14 @@ class AgentWorker(threading.Thread):
         except (TypeError, ValueError):
             self._compta_en_echec = True
             return False
+        if travail.get("ledger_ambiguous"):
+            # #2166/B1 : plusieurs clés candidates pour ce marqueur (un ancien
+            # worker a écrit une ligne que son identité ne distingue pas) :
+            # écrire au hasard réglerait le mauvais tour. On suspend.
+            self._compta_en_echec = True
+            log_async("[%s] accounting marker ambiguous: turn accounting "
+                      "suspended" % self.name)
+            return False
         try:
             from . import accounts as accounts_mod
             book = cost_mod.CostBook(
@@ -3882,9 +4223,10 @@ class AgentWorker(threading.Thread):
             if annonce:
                 modele = annonce
             # Clé du marqueur (L60) : la même pour l'écriture de fin de tour et
-            # pour sa réparation, qui ne double donc plus la ligne.
-            cree = travail.get("created_ts")
-            cle = self._spend_key(debut, cree)
+            # pour sa réparation, qui ne double donc plus la ligne. Exacte
+            # (#2166) quand le marqueur la porte ; les marqueurs d'avant 0471
+            # gardent la clé historique, pour dédoublonner leur ligne.
+            cle = self._spend_key(debut, travail)
             usage = book.record(self.name, start=debut, key=cle,
                                 turn=travail.get("turn") or None,
                                 session=travail.get("session") or None,
@@ -3912,7 +4254,7 @@ class AgentWorker(threading.Thread):
             # fournisseur est comptée au relais, pas sur l'appareil (L111).
             if not self.runner.mediated:
                 account_budget.settle(self.db, cle, state="kept" if incertain else "settled")
-            registry.pending_spend_clear(self.db, self.name, cree)
+            registry.pending_spend_clear(self.db, self.name, travail)
             self._compta_travail = None
             self._annonce_ram = ""
             self._compta_en_echec = False
@@ -3990,10 +4332,46 @@ class AgentWorker(threading.Thread):
             log_async("[%s] announced model not persisted (%s): turns suspended"
                       % (self.name, " ".join(str(exc).split())[:120]))
 
-    def _spend_key(self, debut: int, cree) -> str | None:
-        """La clé du tour (L60) : grand livre, marqueur et réservation #1469."""
+    def _spend_key(self, debut: int, marker) -> str | None:
+        """La clé du tour (L60) : grand livre, marqueur et réservation #1469.
+
+        Exacte quand le marqueur la porte (#2166 : `agent:index:created_at`,
+        texte UTC à la microseconde), jamais dérivée d'un float8 relu — une
+        connexion à précision réduite en perd les derniers chiffres. Un
+        marqueur d'avant 0471 (`spend_key` NULL) porte `ledger_key`, la clé
+        durable déjà écrite par son tour (ligne ou réservation, retrouvée par
+        l'identité du marqueur côté stockage) : sa réparation dédouble la
+        ligne existante et règle la réservation, quelle que soit la précision
+        de la connexion. Un float reste accepté pour les appelants
+        historiques (tests) et ne sert qu'à ce repli.
+        """
+        if isinstance(marker, dict):
+            if marker.get("ledger_ambiguous"):
+                return None       # B1 : ne jamais choisir une clé au hasard
+            key = marker.get("ledger_key") or marker.get("spend_key")
+            if key:
+                return str(key)
+            cree = marker.get("created_ts")
+        else:
+            cree = marker
         return ("%s:%d:%.6f" % (self.name, int(debut), float(cree))
                 if cree is not None else None)
+
+    @staticmethod
+    def _same_marker(left: dict | None, right: dict | None) -> bool:
+        """Le même marqueur comptable, par son identité exacte (#2166).
+
+        Deux lectures du même marqueur rendent le même `created_at` texte et
+        la même `spend_key` ; un remplaçant en diffère, même quand le float8
+        relu à précision réduite les confondrait."""
+        if not left or not right:
+            return False
+        if left.get("spend_key") or right.get("spend_key"):
+            return (left.get("spend_key") == right.get("spend_key")
+                    and left.get("created_at") == right.get("created_at"))
+        if left.get("created_at") or right.get("created_at"):
+            return left.get("created_at") == right.get("created_at")
+        return left.get("created_ts") == right.get("created_ts")
 
     def _compta_termine(self, model_annonce: str | None = None, *,
                         incertain: bool = False) -> None:
@@ -4006,7 +4384,7 @@ class AgentWorker(threading.Thread):
         # plutôt que d'être remise à une réparation ultérieure.
         travail = self._avec_reprise("turn accounting", self._compta_en_attente)
         propre = getattr(self, "_compta_travail", None)
-        if propre and (not travail or travail.get("created_ts") != propre.get("created_ts")):
+        if propre and (not travail or not self._same_marker(travail, propre)):
             # #1469 : le marqueur en base n'est plus celui de ce tour (reprise
             # par un remplaçant, ou déjà réparé) : on règle CE tour par sa propre
             # clé (la ligne est dédoublonnée par `spend_key`), sans toucher au
@@ -4602,8 +4980,70 @@ class AgentWorker(threading.Thread):
                 log("[%s] urgent from %s without interruption: sender not allowed "
                     "to interrupt" % (self.name, refuse.get("sender") or "?"))
         if autorises:
-            # Le prioritaire passe devant la consigne en attente : c'est lui qui
-            # ouvre le tour, la consigne interrompue suivra (0018).
+            # L77 rang 1 : un message humain vérifié et urgent ne se mélange
+            # jamais au courrier ; il passe avant tout le reste et porte
+            # l'enveloppe. Les humains non vérifiés restent au rang 2.
+            humans_urgent = [m for m in autorises if self._from_human(m)]
+            if humans_urgent:
+                self.nudged = False
+                return self._human_spec("urgent", humans_urgent)
+        # Rang 2 (#286/B4) : les messages d'humains ordinaires passent AVANT
+        # le courrier urgent (rang 3), la suite et la consigne en attente
+        # (rang 4). On lit tout le courrier ici pour les trouver, y compris
+        # derrière un préfixe retenu ; les rangs suivants réutilisent la lecture.
+        page, page_tronquee = lot_workdir.deliverable_unread(
+            cfg, self.db, self.agent, besoin=mail.UNREAD_LIMIT,
+            deferred=self._lot_deferred, troncature=True)
+        # L77/B13 : le déclencheur porte sur la page LUE, avant `_live_mail` —
+        # une requête expirée retirée de la page ne doit pas refermer la
+        # recherche humaine (200 lus, 199 vivants : le préfixe était plein).
+        # L77/B14 : une lecture tronquée par la borne du backend (médié :
+        # 200 lignes sans décalage) laisse peut-être un humain au-delà du
+        # préfixe, même si peu de lignes y sont remisables (lots retenus).
+        page_pleine = page_tronquee or len(page) >= mail.UNREAD_LIMIT
+        messages = self._live_mail(page)
+        if page_pleine and all(mail.passive_reason(m) for m in messages):
+            # L125 : boîte pleine de courrier passif — les messages qui
+            # réveillent, plus récents, ne doivent pas y rester invisibles
+            reveil_page = lot_workdir.deliverable_unread(
+                cfg, self.db, self.agent, besoin=mail.UNREAD_LIMIT,
+                mode="active", deferred=self._lot_deferred)
+            page_pleine = page_pleine or len(reveil_page) >= mail.UNREAD_LIMIT
+            reveil = self._live_mail(reveil_page)
+            messages = reveil + messages
+        humans = [m for m in messages
+                  if self._from_human(m) and not mail.passive_reason(m)]
+        if not humans and page_pleine:
+            # L77/B13 : le préfixe de `UNREAD_LIMIT` peut être saturé par du
+            # courrier ordinaire actif devant un humain. Recherche dédiée,
+            # filtrée dans la requête et soumise aux mêmes lots retenus
+            # (`deferred`), AVANT les rangs 3 à 5 : un humain ne se cache ni
+            # derrière un urgent d'agent, ni derrière la suite ou la consigne
+            # en attente.
+            from .mediated_executor.contract import NotSupportedRemotely
+            try:
+                humains_profonds = self._live_mail(lot_workdir.deliverable_unread(
+                    cfg, self.db, self.agent, besoin=mail.UNREAD_LIMIT,
+                    mode="human", deferred=self._lot_deferred,
+                    human_names=getattr(cfg, "human_names", None)))
+            except NotSupportedRemotely as exc:
+                # Contrat 1.5 absent (ancien serveur) : lire comme avant 1.5,
+                # journalisé une fois, sans tuer le fil de l'agent à chaque
+                # page pleine (déploiement serveur d'abord, documenté).
+                if not getattr(self, "_humains_profonds_indisponibles", False):
+                    self._humains_profonds_indisponibles = True
+                    log("[%s] deep human search unavailable (%s): old executor "
+                        "server, reading without it" % (self.name, exc))
+                humains_profonds = []
+            humans = [m for m in humains_profonds
+                      if self._from_human(m) and not mail.passive_reason(m)]
+        if humans:
+            self.nudged = False
+            self._reprise_attach = False
+            return self._human_spec("mail", humans)
+        if autorises:
+            # Rang 3 : le courrier urgent d'un expéditeur habilité (agent,
+            # système vérifié) passe avant la suite et la consigne en attente.
             self.nudged = False
             return self._courrier_spec("urgent", autorises)
         if self.suite:
@@ -4627,26 +5067,16 @@ class AgentWorker(threading.Thread):
                 self.nudged = False
                 self._reprise_attach = False
                 return {"kind": "prompt", "prompt": prompt, "ids": [], "lot": lot}
+        # #2466 : un rendez-vous explicite passe avant la fenêtre de
+        # regroupement du courrier ordinaire (le hook livrera le reste).
         reveil = self._scheduled_wake_spec()
         if reveil is not None:
-            # #2466 : un rendez-vous explicite passe avant la fenêtre de
-            # regroupement du courrier ordinaire (le hook livrera le reste).
             self.nudged = False
             self._reprise_attach = False
             return reveil
-        # #811 (B1/R3) : le courrier d'un lot retenu attend, les autres
-        # messages du tour passent — et la lecture franchit un préfixe retenu
-        # qui masquerait un message remisable plus récent.
-        messages = self._live_mail(lot_workdir.deliverable_unread(
-            cfg, self.db, self.agent, besoin=mail.UNREAD_LIMIT,
-            deferred=self._lot_deferred))
-        if len(messages) >= mail.UNREAD_LIMIT and all(mail.passive_reason(m) for m in messages):
-            # L125 : boîte pleine de courrier passif — les messages qui
-            # réveillent, plus récents, ne doivent pas y rester invisibles
-            reveil = self._live_mail(lot_workdir.deliverable_unread(
-                cfg, self.db, self.agent, besoin=mail.UNREAD_LIMIT,
-                mode="active", deferred=self._lot_deferred))
-            messages = reveil + messages
+        # #2814 (fusionné) : l'unique lecture du lot (plus haut, rang 2) porte
+        # déjà `_live_mail` ; ce bloc d'origine de `_pick` est supprimé par
+        # #286, qui l'a déplacé avant les rangs 3/4 — aucun doublon.
         if messages:
             spec = self._mail_spec(messages)
             if spec is not None:
@@ -4882,9 +5312,10 @@ class AgentWorker(threading.Thread):
         return float(getattr(self.runner, "mail_batch", self.cfg.mail_batch))
 
     def _from_human(self, row: dict) -> bool:
-        """L125 : message d'un humain — marqué à l'envoi, ou expéditeur déclaré
-        humain sur cet hôte (`AMEESH_HUMANS`)."""
-        return mail.is_human(row) or (row.get("sender") or "") in self.cfg.human_names
+        """L125 : message d'un humain — marqué à l'envoi, expéditeur qualifié
+        `human:<id>`, ou nom déclaré humain sur cet hôte (`AMEESH_HUMANS`)."""
+        return (mail.is_human(row)
+                or (row.get("sender") or "") in getattr(self.cfg, "human_names", ()))
 
     def _mail_due(self, rows: list[dict]) -> bool:
         """L125 : le courrier ordinaire en attente ouvre-t-il un tour ?
@@ -5021,6 +5452,54 @@ class AgentWorker(threading.Thread):
             "rows": retenus,
             "candidats": list(messages),
             "remaining": reste,
+        }
+
+    def _envelope_token(self) -> str:
+        """Le nonce public de session écrit dans l'enveloppe L77.
+
+        Ce n'est **jamais** le bearer d'authentification (`session_token_for`) :
+        l'enveloppe part dans la consigne, l'historique et les journaux. Nonce
+        stable pour le bail (agent, runner, epoch), sans aucune autorité.
+        """
+        graine = "ameesh-l77-envelope|%s|%s|%s" % (
+            self.name, self.runner.runner_id, self.epoch)
+        return hashlib.sha256(graine.encode("utf-8")).hexdigest()[:32]
+
+    def _human_spec(self, kind: str, messages: list[dict]) -> dict:
+        """L77 : un tour dédié aux messages d'humains, avec l'enveloppe ameesh.
+
+        Les humains ne se mélangent jamais au courrier dans la même entrée ;
+        `envelopes` est conservé dans le spec pour que `run_turn` rende la
+        consigne réservée avec la même enveloppe, dans le même budget.
+        """
+        from . import resident_queue
+
+        token = self._envelope_token()
+        canon_id = self._canon_id()
+        envelopes: dict[int, str] = {}
+        for row in messages:
+            try:
+                key = int(row["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            ident = resident_queue.identity_for(row.get("sender") or "",
+                                                cfg=getattr(self, "cfg", None),
+                                                canon_id=canon_id,
+                                                proof=mail.human_account(row),
+                                                human=True)
+            envelopes[key] = resident_queue.envelope(ident, token)
+        prompt, retenus, reste = mail.prompt_for(
+            self.db, messages, kind=kind, budget=self._budget_courrier(),
+            envelopes=envelopes)
+        return {
+            "kind": kind,
+            "prompt": prompt,
+            "ids": [int(m["id"]) for m in retenus if m.get("id") is not None],
+            "rows": retenus,
+            "candidats": list(messages),
+            "remaining": reste,
+            "envelopes": envelopes,
+            "human": True,
         }
 
     def _release_session_lock(self) -> None:
@@ -5210,6 +5689,54 @@ class AgentWorker(threading.Thread):
         except Exception as exc:  # une mesure ratée ne défait pas le tour
             log_async("[%s] turn memory not released (%s)" % (self.name, exc))
 
+    def _reservation_ttl(self, spec: dict) -> float:
+        """L77/B6 : durée de la réservation qui porte la consigne du tour.
+
+        Un message humain n'est soldé qu'à la fin du tour : sa réservation
+        couvre tout le tour, plus la marge de livraison. Les autres messages
+        sont soldés au lancement et gardent le TTL ordinaire.
+        """
+        if not spec.get("human"):
+            return mail.RESERVATION_TTL
+        return mail.human_reservation_ttl(self.turn_max_seconds())
+
+    def _run_turn_settled(self, spec: dict, *, close_mail=None) -> bool:
+        """Exécute un tour et solde les remises steer sur sa fin effective.
+
+        Le `finally` couvre les tours sans courrier (consigne, suite, relance)
+        comme les tours de courrier : `close_mail(result)` solde la réservation
+        du tour quand elle existe, puis `_solde_steers` clôt les steers.
+        """
+        self._solde_steers(False)  # restes d'un tour précédent, jamais réservés
+        generation = self._begin_turn_generation()
+        result = False
+        try:
+            result = self._run_turn(spec)
+            return result
+        finally:
+            if close_mail is not None:
+                close_mail(result)
+            self._solde_steers(result, generation)
+
+    def _close_turn_mail(self, spec: dict, jeton: str, ids: list[int],
+                         result: bool) -> None:
+        """Solde ou libère la réservation de courrier d'un tour."""
+        if spec.get("human") and self._courrier_lance and result:
+            # L77/B9 : le message humain n'est soldé que sur une fin
+            # EFFECTIVE du tour. Une mort du harnais après `send` laisse la
+            # réservation repartir en livraison (au moins une fois).
+            self._solde_humains(spec)
+        elif not self._courrier_lance or not result:
+            # Pas lancé, ou lancé puis mort/échec avant la fin : rien n'est
+            # tenu pour servi ; la réservation est libérée et sera reprise.
+            try:
+                mail.release(self.db, self.name, jeton, ids)
+            except db_mod.DbError as exc:
+                # La réservation reste jusqu'à son échéance : le message sera
+                # re-livré, signalé (aucune perte).
+                log("[%s] could not cancel the reservation (%s)"
+                    % (self.name, exc))
+
     def _run_guarded_turn(self, spec: dict) -> bool:
         """Un tour. Pour un tour de courrier, protocole de remise unique :
         réservation sous un jeton (registre verrouillé, bail contrôlé), consigne
@@ -5268,17 +5795,20 @@ class AgentWorker(threading.Thread):
         if pression.get("blocked"):
             self.runner.pressure_bypassed(self.name)  # orchestrateur ou auditeur
         if not candidats or self.runner.dry_run:
-            return self._run_turn(spec)
+            # L77/B8 : un steer humain reçu pendant un tour sans courrier
+            # (consigne, suite, relance) est soldé à sa fin effective lui aussi.
+            return self._run_turn_settled(spec)
         kind = spec["kind"]
         budget = self._budget_courrier()
+        envelopes = spec.get("envelopes")
         _texte, retenus, reste = mail.prompt_for(self.db, candidats, kind=kind,
-                                                 budget=budget)
+                                                 budget=budget, envelopes=envelopes)
         jeton = mail.new_token()
         try:
             reserves = mail.reserve(
                 self.db, self.name, self.runner.runner_id, self.epoch, jeton,
                 ids=[int(m["id"]) for m in retenus], porteur="consigne",
-                ttl_seconds=mail.RESERVATION_TTL)
+                ttl_seconds=self._reservation_ttl(spec))
         except db_mod.DbError as exc:
             log("[%s] mail reservation failed (%s): turn postponed"
                 % (self.name, exc))
@@ -5291,7 +5821,7 @@ class AgentWorker(threading.Thread):
         # La consigne est rendue sur les messages RÉSERVÉS (leur état exact :
         # « re-livré » compris), dans le même budget.
         prompt, inclus, _ = mail.prompt_for(self.db, reserves, kind=kind, budget=budget,
-                                            extra_remaining=reste)
+                                            extra_remaining=reste, envelopes=envelopes)
         ids = [int(m["id"]) for m in inclus]
         # #2810 : ce tour sert exactement ces messages (la réservation peut
         # différer de la sélection).
@@ -5301,18 +5831,9 @@ class AgentWorker(threading.Thread):
             mail.release(self.db, self.name, jeton, hors)
         spec = dict(spec, prompt=prompt, rows=inclus, ids=ids, jeton=jeton)
         self._courrier_lance = False
-        try:
-            return self._run_turn(spec)
-        finally:
-            if not self._courrier_lance:
-                # Le harnais n'a pas été lancé : rien n'a été vu, rien n'est livré.
-                try:
-                    mail.release(self.db, self.name, jeton, ids)
-                except db_mod.DbError as exc:
-                    # La réservation reste jusqu'à son échéance : le message sera
-                    # re-livré, signalé (aucune perte).
-                    log("[%s] could not cancel the reservation (%s)"
-                        % (self.name, exc))
+        return self._run_turn_settled(
+            spec,
+            close_mail=lambda result: self._close_turn_mail(spec, jeton, ids, result))
 
     def _livre_courrier(self, spec: dict) -> None:
         """Le harnais est lancé avec la consigne : la réservation est soldée.
@@ -5324,6 +5845,12 @@ class AgentWorker(threading.Thread):
         if not spec.get("jeton"):
             return
         self._courrier_lance = True
+        if spec.get("human"):
+            # L77 : un message humain n'est soldé qu'à la FIN du tour
+            # (`_solde_humains`), jamais au lancement. Un plantage en cours de
+            # tour laisse la réservation expirer : le message est re-livré,
+            # signalé comme peut-être déjà remis (au moins une fois).
+            return
         ids = list(spec["ids"])
         try:
             livres = mail.deliver(self.db, self.name, self.runner.runner_id, self.epoch,
@@ -5331,17 +5858,88 @@ class AgentWorker(threading.Thread):
         except db_mod.DbError as exc:
             livres = []
             log("[%s] mail delivery not settled (%s)" % (self.name, exc))
+        self._remise_incertaine(ids, livres)
+
+    def _remise_incertaine(self, ids, livres) -> None:
+        """Signale les messages montrés au harnais mais non soldés (bail perdu,
+        base indisponible) : ils seront re-livrés en le disant."""
         incertains = sorted(set(ids) - set(livres))
-        if incertains:
-            log("[%s] uncertain delivery: message(s) %s shown to the harness but not "
-                "settled (lease lost or database unavailable); they will be redelivered, "
-                "flagged as possibly redelivered" % (self.name, ", ".join(map(str, incertains))))
-            self._fil_note(
-                "Uncertain delivery: %d message(s) put in the instruction of a started "
-                "turn could not be marked delivered (lease lost or database "
-                "unavailable). They will be delivered again, flagged as possibly redelivered."
-                % len(incertains),
-                meta={"action": "remise-incertaine", "messages": incertains})
+        if not incertains:
+            return
+        log("[%s] uncertain delivery: message(s) %s shown to the harness but not "
+            "settled (lease lost or database unavailable); they will be redelivered, "
+            "flagged as possibly redelivered" % (self.name, ", ".join(map(str, incertains))))
+        self._fil_note(
+            "Uncertain delivery: %d message(s) put in the instruction of a started "
+            "turn could not be marked delivered (lease lost or database "
+            "unavailable). They will be delivered again, flagged as possibly redelivered."
+            % len(incertains),
+            meta={"action": "remise-incertaine", "messages": incertains})
+
+    def _solde_humains(self, spec: dict) -> None:
+        """L77 : solde la réservation humaine à la FIN du tour (servi).
+
+        Appelé par `run_turn` dans son `finally`, que le tour réussisse ou
+        échoue : le harnais a lu sa consigne. Si le bail est perdu ou la base
+        indisponible, rien n'est soldé et le message sera re-livré. Le journal
+        L78 n'est écrit qu'ici, avec la remise effective (idempotent).
+        """
+        jeton = spec.get("jeton")
+        ids = list(spec.get("ids") or ())
+        self._courrier_lance = False
+        if not jeton or not ids:
+            return
+        try:
+            livres = mail.deliver(self.db, self.name, self.runner.runner_id, self.epoch,
+                                  jeton, ids)
+        except db_mod.DbError as exc:
+            log("[%s] human delivery not settled at the end of the turn (%s)"
+                % (self.name, exc))
+            return
+        self._remise_incertaine(ids, livres)
+        if livres:
+            # L77/L78 : la trace lisible des messages humains servis. Idempotente
+            # (`event_id = mail:<id>`) : une remise incertaine rejouée ne duplique
+            # pas l'entrée ; le journal ne porte aucun état servi/ack.
+            self._journal_humans(spec, livres)
+
+    def _journal_humans(self, spec: dict, delivered) -> None:
+        """Écrit une entrée `human_message` par message humain remis (L78)."""
+        if not spec.get("human") or not delivered:
+            return
+        from . import conversation
+
+        rows = {}
+        for row in spec.get("rows") or ():
+            try:
+                rows[int(row["id"])] = row
+            except (KeyError, TypeError, ValueError):
+                continue
+        cfg = getattr(self, "cfg", None)
+        first = None
+        for mid in delivered:
+            row = rows.get(int(mid))
+            if row is None:
+                continue
+            sender = str(row.get("sender") or "human:?")
+            author = sender if sender.startswith(("human:", "chat-")) \
+                else "human:" + sender
+            try:
+                entry = conversation.Log(self.db, cfg, agent=self.name,
+                                         lot=row.get("lot_id"))
+                entry.append("human_message", text=row.get("body") or "",
+                             author=author, event_id="mail:%d" % int(mid),
+                             meta={"messages": [int(mid)]})
+                first = first or entry
+            except Exception as exc:  # le tour part quand même, la trace est signalée
+                log("[%s] conversation journal: human message #%s not recorded (%s)"
+                    % (self.name, mid, exc))
+        if first is not None:
+            try:
+                first.drain_threads()
+            except Exception as exc:
+                log("[%s] conversation journal: readable thread not delivered (%s)"
+                    % (self.name, exc))
 
     def _github_env(self, env: dict, lot) -> None:
         """#1645 : journal des gestes gh et identité GitHub par rôle. Jamais
@@ -5760,9 +6358,37 @@ class AgentWorker(threading.Thread):
         rp.turns += 1
         rp.last_used = time.monotonic()
         rp.mark_alive()          # T3 : le tour qui vient de finir est une preuve de vie
+        # L77/B8 : un steer est peut-être encore en vol (barrière `_steer_lock`) ;
+        # attendre sa fin avant de juger le résident occupé, puis fermer la
+        # génération pour qu'un ACK tardif ne soit pas attribué au tour suivant.
+        lock = getattr(self, "_steer_lock", None)
+        if lock is not None:
+            acquired = lock.acquire(timeout=PREEMPT_STEER_WAIT_S)
+            try:
+                with self.lock:
+                    self._turn_live = False
+            finally:
+                if acquired:
+                    lock.release()
+            if not acquired:
+                log_async("[%s] steer barrier not reached at turn end within "
+                          "%.0fs" % (self.name, PREEMPT_STEER_WAIT_S))
         urgence = self._urgent_end() or (
             "the host is withdrawing" if self.host_yield is not None else
             "stopping" if self.stopping.is_set() else "")
+        if urgence == "preemption" and rp.alive and not rp.driver.busy:
+            # L77/B5 : une préemption ne ferme pas un résident vivant. Les
+            # autres causes d'arrêt gardent la priorité.
+            if self.restarting.is_set():
+                urgence = "restart requested"
+            elif self.host_yield is not None and self.host_yield != self.HOST_SAFE_POINT:
+                urgence = "the host is withdrawing"
+            elif self.stopping.is_set():
+                urgence = "stopping"
+            elif self._power_texte:
+                urgence = "critical battery"
+            else:
+                urgence = ""
         raison = ("exited" if not rp.alive else
                   "its turn did not end" if rp.driver.busy else urgence)
         if raison and not urgence:
@@ -6288,15 +6914,18 @@ class AgentWorker(threading.Thread):
             marqueur = self._compta_travail or {}
             refus = account_budget.reserve(
                 self.db, self.name, compte,
-                self._spend_key(events_start, marqueur.get("created_ts")))
+                self._spend_key(events_start, marqueur))
             if refus:
                 registry.pending_spend_clear(self.db, self.name,
-                                             marqueur.get("created_ts"))  # rien n'est parti
+                                             marqueur)  # rien n'est parti
                 self._compta_travail = None
                 self.fail_turn(budget_mod.PAUSE_PREFIX + refus, refus)
                 return False
 
         preempt_done = threading.Event()
+        preempt_thread = threading.Thread(
+            target=self._preempt_monitor, args=(preempt_done,),
+            daemon=True, name="preempt-monitor")
         # Un nouveau tour remet à zéro le latch de publication : il ne concerne
         # que la course du tour précédent, et les autres déclencheurs (bail,
         # arrêt, préemption) sont revérifiés à la publication (verdict B5).
@@ -6319,8 +6948,7 @@ class AgentWorker(threading.Thread):
         with self._preempt_lock:
             if self.preempt_gen <= frontiere:
                 self.preempting.clear()
-        threading.Thread(target=self._preempt_monitor, args=(preempt_done,),
-                         daemon=True).start()
+        preempt_thread.start()
         from .platform import audit_guard
         audit_exempt = (self.runner.is_auditor(self.name, self.agent)
                         and self.runner.host_pressure().get("blocked"))
@@ -6475,9 +7103,10 @@ class AgentWorker(threading.Thread):
             if rp is None:
                 self._turn_launched = True
                 self._consume_scheduled_wake(spec)
-            # Lancé (et publié, pour que l'arrêt le trouve) : les messages de la
-            # consigne sont livrés, et seulement eux.
-            self._livre_courrier(spec)
+            # Lancé (et publié, pour que l'arrêt le trouve). La remise n'est
+            # constatée qu'APRÈS l'acceptation de la consigne par le harnais
+            # (L77/B2) : un `driver.send` en échec ne solde jamais un message
+            # jamais présenté ; il repart en réservation/livraison.
             if fond_dits:  # la note du travail de fond a été montrée
                 self.runner.background.mark_reported(fond_dits)
             # Course de publication : un déclencheur d'arrêt (bail perdu,
@@ -6497,12 +7126,14 @@ class AgentWorker(threading.Thread):
                     # sera délivré de nouveau.
                     self._turn_launched = True
                     self._consume_scheduled_wake(spec)
+                    self._livre_courrier(spec)  # consigne acceptée : remise
                     flux = (json.dumps(raw, ensure_ascii=False)
                             for raw, _parsed in rp.stream(tour_resident))
                 except resident_mod.ResidentError as exc:
                     error = "resident turn not started: %s" % exc
                     flux = ()
             else:
+                self._livre_courrier(spec)
                 log("[%s] %s turn: %s" % (self.name, shown, " ".join(argv[:6]) + " …"))
                 flux = proc.stdout or ()
             # L78: the writer owns its connection; harness output never waits
@@ -6639,6 +7270,12 @@ class AgentWorker(threading.Thread):
             result_code = 127
         finally:
             preempt_done.set()
+            # L77/B8 : jonction AVANT tout solde de steer — un ACK de
+            # `driver.steer` arrivé après le solde laisserait le message réservé.
+            preempt_thread.join(PREEMPT_JOIN_S)
+            if preempt_thread.is_alive():
+                log_async("[%s] preemption monitor still alive %.0fs after the turn"
+                          % (self.name, PREEMPT_JOIN_S))
             pgid = self.pgid
             if rp is not None:
                 self._resident_turn_end(rp)
@@ -6727,6 +7364,11 @@ class AgentWorker(threading.Thread):
         # la somme des relectures du tour.
         self.last_turn_context = contexte_appel if relus_mesures else None
         self.last_turn_context_session = session_new or session or None
+        if self.last_turn_context is None and plafonne and harness == "codex":
+            # #2932 : `codex exec --json` ne publie que l'usage cumulé du tour ;
+            # le contexte du dernier appel se lit dans le journal de session
+            self.last_turn_context = self._codex_last_call_context(
+                self.last_turn_context_session)
         if resume and not session_new and not result_code and not error:
             self._resume_drop()  # tour achevé sans id de session : livré
         if relus_sous_agents:
@@ -7534,6 +8176,8 @@ class Runner:
         self.stop = threading.Event()
         self.wake_all = threading.Event()
         self.workers: dict[str, AgentWorker] = {}
+        #: L93 : canaux locaux « mon poste » (état en lecture seule, arrêt propre)
+        self.device_channels: list = []
         self.lock = threading.Lock()
         self.listener = None          # écouteur LISTEN/NOTIFY courant
         self.listener_thread = None
@@ -8491,14 +9135,13 @@ class Runner:
                         log_async("urgent from %s without interruption: sender not "
                                   "allowed to interrupt" % (row.get("sender") or "?"))
             if worker and prioritaire:
-                mid = int(row["id"])
                 if row.get("delivered_ts") is not None:
                     # #2810 : le message est déjà remis (hook mi-tour, ou tour
                     # précédent) — il n'y a plus de tour à interrompre pour lui.
                     worker.wake.set()
                     log_async("priority message for %s already delivered: no "
                               "interruption" % target)
-                elif worker.request_preempt(mid):  # le signal d'abord
+                elif worker.request_preempt(row):  # le signal d'abord ; L77 : point sûr
                     log_async("priority message for %s: interrupting the turn" % target)
                 else:
                     # #2810 : son propre NOTIFY, traité après `_pick` (ou après
@@ -8660,9 +9303,76 @@ class Runner:
             return True
         return False
 
+    def start_device_channels(self) -> None:
+        """L93 : sert l'état local et l'arrêt propre sur des sockets Unix.
+
+        Un canal par exécuteur (les unités sont par agent) ; le client réunit
+        les canaux de la machine. Sans base joignable, sans droits sur le
+        dossier ou hors service (`--once`, médié), le canal est simplement
+        absent — il ne fait jamais tomber l'exécuteur.
+        """
+        if self.once or self.dry_run or getattr(self, "mediated", False):
+            return
+        if (os.environ.get("AMEESH_DEVICE") or "").strip().lower() in (
+                "0", "off", "false", "no"):
+            return
+        control_enabled = (os.environ.get("AMEESH_DEVICE_CONTROL") or "").strip().lower() \
+            not in ("0", "off", "false", "no")
+        state_path = control_path = ""
+        channels: list = []
+        try:
+            state_path, control_path = device_state.paths(self.runner_id)
+
+            def gate_state():
+                gate = getattr(self, "host_gate", None)
+                if gate is None:
+                    return None
+                try:
+                    return gate.current.to_json()
+                except Exception:
+                    return None
+
+            def build_state():
+                return device_state.snapshot(
+                    self.cfg, self.db, names=self.agents_filter,
+                    runner_id=self.runner_id, socket_path=state_path,
+                    control_socket=control_path, gate=gate_state())
+
+            state = device_state.StateChannel(
+                state_path, build_state,
+                log=lambda msg: log_async("device state: %s" % msg))
+            channels.append(state)
+            if control_enabled:
+                control = device_state.ControlChannel(
+                    control_path,
+                    lambda agent: device_state.stop_agent(self.cfg, self.db, agent, strict=True),
+                    allowed=self.agents_filter,
+                    log=lambda msg: log_async("device control: %s" % msg))
+                channels.append(control)
+            for channel in channels:
+                channel.start()
+        except Exception as exc:
+            for channel in channels:
+                try:
+                    channel.stop()
+                except Exception:
+                    pass
+            log_async("device channel unavailable (%s): continuing without it" % exc)
+            return
+        self.device_channels = channels
+        log_async("device channel: %s (control %s)" % (
+            state_path, control_path if control_enabled else "disabled"))
+
     def shutdown(self) -> None:
         self.stop.set()
         self.wake_all.set()
+        # L93 : les canaux locaux s'arrêtent avant que la base ne se ferme
+        for channel in getattr(self, "device_channels", ()):
+            try:
+                channel.stop()
+            except Exception:
+                pass
+        self.device_channels = []
         train_service = getattr(self, "train_service", None)
         if train_service is not None:
             train_service.shutdown()
@@ -10561,6 +11271,7 @@ class Runner:
         self.start_housekeeping_poll()
         self.start_branch_sweep_poll()
         self.start_train_service()
+        self.start_device_channels()
         if self.once:
             try:
                 self.sweep()
@@ -10771,22 +11482,13 @@ def cmd_stop(cfg: Config, db: db_mod.Db, args: list[str]) -> int:
         print("usage: agent-runner stop <name>", file=sys.stderr)
         return 2
     # L37 (0030) : raison structurée — un arrêt manuel ne lève pas
-    # `stopped_with_mail` (l'humain sait qu'il l'a arrêté)
-    registry.set_status(db, args[0], "stopped", status_text="stopped by hand",
-                        stop_reason="manuel")
-    # #753 : un agent arrêté ne garde pas ses lots — ses lots ouverts
-    # retournent à la file d'équipe (assignee = NULL, journal avec la raison),
-    # et ses lots promus dont la mesure reste à refaire vont à l'auditeur.
-    # `stopped_with` referme la course avec une reprise simultanée (B1/N3).
-    from . import work as work_mod
-    measure_actor = work_mod.measurement_actor(db, cfg)
-    returned = work_mod.release_lots(
-        db, args[0],
-        reason="stopped by hand: returned to the team queue (#753)",
-        actor="stop", measure_actor=measure_actor,
-        measure_reason=("promoted lot whose measurement is still to be redone: "
-                        "handed to %s (#753)" % measure_actor) if measure_actor else "",
-        stopped_with=work_mod.RELEASABLE_STOP_REASONS)
+    # `stopped_with_mail` (l'humain sait qu'il l'a arrêté). L93 : le même
+    # geste sert le canal local « mon poste » (`device_state.stop_agent`).
+    try:
+        returned = device_state.stop_agent(cfg, db, args[0])
+    except ValueError as exc:
+        print("agent-runner stop: %s" % exc, file=sys.stderr)
+        return 2
     for row in returned:
         to = row.get("assigned_to")
         if to:

@@ -27,6 +27,15 @@ Dans la VM de l'appareil :
         le défi à faire signer par la clé d'appareil Nexlink (facultatif) ;
   ameesh device show [--json]           état de l'appareil (sans secret).
 
+Sur le poste (L93, « mon poste ») :
+
+  ameesh device view [--json] [--socket S | --dir D]
+        l'état local des exécuteurs de cette machine, lu sur leurs sockets
+        Unix, sans API ni jeton (canaux fusionnés) ;
+  ameesh device stop <agent> [--socket S | --dir D]
+        arrêt propre d'un agent par son canal de contrôle local (le même
+        geste que `agent-runner stop` ; l'arrêt immédiat est celui de Compute).
+
 Le code d'enrôlement se passe de préférence par `--code-file` (ou `-` pour
 l'entrée standard) : `--code` le laisse dans /proc/<pid>/cmdline.
 
@@ -297,8 +306,118 @@ def _read_code(args) -> str:
     return code
 
 
+def _device_channels(args) -> tuple[list[dict], list[str]]:
+    """Les canaux demandés (ou découverts) et les erreurs de lecture."""
+    from . import device_state
+    explicit = getattr(args, "socket", None)
+    if explicit:
+        paths = [explicit] if isinstance(explicit, str) else list(explicit)
+    else:
+        paths = device_state.discover(getattr(args, "dir", None))
+    states, errors = [], []
+    for path in paths:
+        try:
+            states.append(device_state.query(path))
+        except device_state.DeviceError as exc:
+            errors.append(str(exc))
+    return states, errors
+
+
+def _gib(value) -> str:
+    try:
+        return "%.1f GiB" % (float(value) / 2 ** 30)
+    except (TypeError, ValueError):
+        return "?"
+
+
+def cmd_device_view(args) -> int:
+    """« Mon poste » : l'état local des exécuteurs, sans API ni jeton."""
+    from . import device_state
+    states, errors = _device_channels(args)
+    for error in errors:
+        print("canal ignoré : %s" % error, file=sys.stderr)
+    if not states:
+        print("aucun canal local lisible (dossier %s)"
+              % (getattr(args, "dir", None) or device_state.runtime_dir()), file=sys.stderr)
+        return 1
+    body = device_state.merge(states)
+    if args.json:
+        print(json.dumps(body, ensure_ascii=False, indent=2))
+        return 0
+    print("poste %s · %d exécuteur(s) · relevé %s" % (
+        body.get("host") or "?", len(body.get("runners") or []),
+        time.strftime("%H:%M:%S", time.localtime(body.get("generated_ts") or time.time()))))
+    resources = body.get("resources") or {}
+    if resources:
+        print("ressources : %s CPU, charge %s, mémoire libre %s" % (
+            resources.get("cpu_count") if resources.get("cpu_count") is not None else "?",
+            resources.get("load1") if resources.get("load1") is not None else "?",
+            _gib(resources.get("mem_available_bytes"))))
+    for mesh in body.get("meshes") or []:
+        print("mesh %s (%s)" % (mesh.get("mesh"), mesh.get("organisation")))
+        for agent in mesh.get("agents") or []:
+            lot = agent.get("lot") or {}
+            turn = agent.get("turn") or {}
+            print("  %-24s %-8s %-9s %s%s" % (
+                agent.get("name"), agent.get("harness") or "?",
+                agent.get("status") or "?",
+                ("lot #%s %s" % (lot.get("id"), lot.get("title") or ""))
+                if lot.get("id") else (agent.get("project") or "—"),
+                (" · tour depuis %s" % time.strftime(
+                    "%H:%M", time.localtime(turn["started_ts"])))
+                if turn.get("active") and turn.get("started_ts") else ""))
+    return 0
+
+
+def cmd_device_stop(args) -> int:
+    """Arrêt propre d'un agent par le canal local (même geste que
+    `agent-runner stop`). Ne touche ni au Compute ni à une approbation."""
+    from . import device_state
+    agent = args.agent
+    control = getattr(args, "socket", None)
+    states, errors = ([], []) if control else _device_channels(args)
+    if not control:
+        for state in states:
+            for mesh in state.get("meshes") or []:
+                for row in mesh.get("agents") or []:
+                    if row.get("name") != agent:
+                        continue
+                    runner = row.get("runner")
+                    for item in state.get("runners") or []:
+                        if item.get("id") == runner and item.get("control_socket"):
+                            control = item["control_socket"]
+                            break
+                    if control:
+                        break
+                if control:
+                    break
+            if control:
+                break
+    if not control:
+        for error in errors:
+            print("canal ignoré : %s" % error, file=sys.stderr)
+        print("agent %s introuvable sur un canal local : aucun arrêt" % agent,
+              file=sys.stderr)
+        return 1
+    reply = device_state.stop(control, agent)
+    if args.json:
+        print(json.dumps(reply, ensure_ascii=False, indent=2))
+    elif reply.get("ok"):
+        returned = ", ".join("#%s" % i for i in reply.get("returned") or [])
+        print("agent %s arrêté proprement%s" % (
+            agent, (", lots rendus : %s" % returned) if returned else ""))
+    else:
+        print("arrêt refusé : %s" % reply.get("error"), file=sys.stderr)
+        return 1
+    return 0 if reply.get("ok") else 1
+
+
 def cmd_device(args) -> int:
     from .mediated_executor import device
+    if args.device_command == "view":
+        return cmd_device_view(args)
+    if args.device_command == "stop":
+        return cmd_device_stop(args)
     directory = args.home
     if args.device_command in ("challenge", "enroll"):
         args.code = _read_code(args)
@@ -371,7 +490,7 @@ def _parser() -> argparse.ArgumentParser:
     s = sub.add_parser("show", help="un hôte")
     s.add_argument("host")
     s.add_argument("--json", action="store_true")
-    dev = top.add_parser("device", help="l'appareil (dans la VM)")
+    dev = top.add_parser("device", help="l'appareil (VM) et mon poste (L93)")
     dsub = dev.add_subparsers(dest="device_command", required=True)
     for name in ("enroll", "challenge"):
         d = dsub.add_parser(name)
@@ -390,6 +509,17 @@ def _parser() -> argparse.ArgumentParser:
     d = dsub.add_parser("show")
     d.add_argument("--home", default=None)
     d.add_argument("--json", action="store_true")
+    v = dsub.add_parser("view", help="l'état local des exécuteurs (mon poste)")
+    v.add_argument("--socket", action="append", default=None,
+                   help="canal d'état à lire (répétable ; défaut : découverte)")
+    v.add_argument("--dir", default=None,
+                   help="dossier des canaux (défaut AMEESH_DEVICE_DIR ou XDG_RUNTIME_DIR)")
+    v.add_argument("--json", action="store_true")
+    st = dsub.add_parser("stop", help="arrêt propre d'un agent par le canal local")
+    st.add_argument("agent")
+    st.add_argument("--socket", default=None, help="canal de contrôle")
+    st.add_argument("--dir", default=None, help="dossier des canaux")
+    st.add_argument("--json", action="store_true")
     return p
 
 
@@ -397,10 +527,11 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(sys.argv[1:] if argv is None else argv)
     if args.group == "device":
         from .db import DbError
+        from .device_state import DeviceError as LocalDeviceError
         from .mediated_executor.device import DeviceError
         try:
             return cmd_device(args)
-        except (DeviceError, DbError, OSError, ValueError) as exc:
+        except (DeviceError, LocalDeviceError, DbError, OSError, ValueError) as exc:
             print("erreur : %s" % exc, file=sys.stderr)
             return 1
     if getattr(args, "host", None) and not NAME_RE.match(args.host):

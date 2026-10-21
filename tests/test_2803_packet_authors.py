@@ -14,7 +14,7 @@ import os
 import tempfile
 from unittest import TestCase, mock
 
-from ameesh import merge_queue, registry, review_authors, work
+from ameesh import merge_queue, registry, review_authors, storage, work
 
 from .support import PgTestCase
 from .test_2447_review_designation_activation import _Repo
@@ -96,10 +96,12 @@ class VehicleDeltaTest(PgTestCase):
 
     def setUp(self):
         super().setUp()
+        self.harnesses: dict[str, str] = {}
         for name, harness in (("composer", "claude"), ("impl", "codex"),
                               ("resolver", "deepseek"), ("r_claude", "claude"),
                               ("r_codex", "codex"), ("r_other", "codex"),
                               ("r_deepseek", "deepseek")):
+            self.harnesses[name] = harness
             registry.upsert(self.db, name, harness=harness, host=self.cfg.host,
                             cwd=self.tmp, status="idle")
             self.db.execute("UPDATE agent_registry SET team = 'ameesh'"
@@ -143,6 +145,26 @@ class VehicleDeltaTest(PgTestCase):
     def gate(self, commits, marks, *, required=1, head=None, item=None,
              authors=None):
         head = head or self.resolution
+        item = item or self.item()
+        lot = int(item["id"])
+        # #2928 : la porte sensible ne compte que les verdicts à reçu exact ;
+        # les témoins écrivent donc le jalon et sa preuve dans la base.
+        proven: list[dict] = []
+        for mark_ in (m for m in marks if m.get("kind") == "verdict"):
+            actor = str(mark_["actor"])
+            row = storage.of(self.db).work.add_milestone(
+                lot, "verdict", sha=head, actor=actor,
+                verdict=mark_.get("verdict") or "ok", note="")
+            harness = self.harnesses[actor]
+            self.db.execute(
+                "INSERT INTO provenance_receipts"
+                " (subject, sha, actor, session, turn, harness, work_item_id)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                " ON CONFLICT (subject) DO NOTHING",
+                ("milestone:%d" % int(row["id"]), head, actor, "s-" + harness,
+                 "t", harness, lot))
+            proven.append(dict(row))
+        marks = [m for m in marks if m.get("kind") == "frozen"] + proven
         vehicle = {"ok": None, "required": required,
                    "klass": {"class": "sensitive",
                              "files": [{"path": "src/ameesh/vehicle.py"}]},
@@ -153,7 +175,7 @@ class VehicleDeltaTest(PgTestCase):
             klass={"class": "sensitive", "project": "ameesh",
                    "base_sha": self.base,
                    "files": [{"path": "src/ameesh/vehicle.py"}]},
-            item=item or self.item(), families=FAMILIES, vehicle=vehicle,
+            item=item, families=FAMILIES, vehicle=vehicle,
             authors=authors)
 
     def test_a_member_author_family_is_eligible_for_the_vehicle_delta(self):
@@ -220,7 +242,8 @@ class VehicleDeltaTest(PgTestCase):
         # Auditeur #2766 : le klass d'un véhicule (class_of_paths) ne porte ni
         # base_sha ni target ; la lecture du delta (vehicle["commits"]) doit
         # quand même rendre le correcteur du relecteur (#2739), sans dépendre
-        # de la plage gelée complète.
+        # de la plage gelée complète. #2888 : ce correcteur est un auteur du
+        # delta, sa famille (codex) est donc exclue elle aussi.
         item = self.item()
         self.db.execute(
             "UPDATE work_items SET reviewers = ARRAY['r_codex'] WHERE id = %s",
@@ -237,10 +260,11 @@ class VehicleDeltaTest(PgTestCase):
                         self.marks("r_codex", "r_other", "r_claude", head=fix),
                         required=2, head=fix, item=item)
         self.assertEqual(out["corrections"], ["r_codex"], out)
-        self.assertTrue(out["ok"], out["why"])
+        self.assertFalse(out["ok"], out["why"])
         accepted = [row["actor"] for row in out["accepted"]]
         self.assertNotIn("r_codex", accepted)
-        self.assertEqual(accepted, ["r_other", "r_claude"])
+        self.assertNotIn("r_other", accepted)   # same codex family, author now
+        self.assertEqual(accepted, ["r_claude"])
 
 
 class NoExactReadingTest(TestCase):

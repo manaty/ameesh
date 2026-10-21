@@ -12,10 +12,11 @@ common gate refuses a co-author's own verdict and another agent of a
 co-author's family, not only the reference assignee (#2681 B, dev1/cx2).
 
 Authors are read once for the train and the designation (`review_authors`,
-#2681): exact commit receipts (#1465), the reference author at freeze, and a
-designated reviewer's first-round correction under the §2 threshold. A commit
-without a receipt is attributed to its agent committer's session family; a
-third party without a receipt stays unknown and refuses the admission.
+#2681): exact commit receipts (#1465), the reference author at freeze, and
+every designated reviewer's correction — a correction authors the head whatever
+its size (#2888), so the reviewer's family is excluded like any author's. A
+commit without a receipt is attributed to its agent committer's session family;
+a third party without a receipt stays unknown and refuses the admission.
 
 A blocked verdict on an earlier head is not read by the gate: only the frozen
 head's verdicts count (canon §2). The same-head rule is unchanged — a block on
@@ -98,7 +99,8 @@ class Recorded:
                 provider=self.provider, strict=True)
             authors, unknown = review_authors.authors(
                 self.db, item, freeze, commits, self.path, self.families,
-                reference=reference, provider=self.provider, strict=True)
+                reference=reference, provider=self.provider, strict=True,
+                base=base, head=head)
             if unknown:
                 raise TrainError("unknown historical author for commit %s" % unknown[0])
             missing_family = [entry for entry in authors if not entry["family"]]
@@ -109,8 +111,14 @@ class Recorded:
             # d'une tête antérieure ne peut pas refuser l'admission.
             on_freeze = [mark for mark in marks if mark.get("kind") == "verdict"
                          and merge_queue._same_sha(mark.get("sha"), head, self.path)]
+            # #2928 : en classe sensible, un verdict sans reçu exact ne compte
+            # pas — la famille historique ne doit pas venir du journal des
+            # tours pour un avis qui ne prouve pas son origine.
+            sensitive = str((klass or {}).get("class") or "") == "sensitive" \
+                or bool((klass or {}).get("doubt"))
             family_of = review_authors.verdict_families(
-                self.db, on_freeze, self.families, provider=self.provider, strict=True)
+                self.db, on_freeze, self.families, provider=self.provider,
+                strict=True, require_receipt=sensitive)
         except review_provenance.ProvenanceError as exc:
             raise TrainError(str(exc)) from exc
         # Le train lit l'auteur **au gel** (la même référence que la

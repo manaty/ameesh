@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#2638 — a reviewer's first-round correction does not make their family an author.
+"""#2638/#2888 — a reviewer's correction authors the head, whatever its size.
 
 Witnesses of observation #2602: the frozen range carries the three families
-(the lot author and the two designated reviewers), but the small corrections
-pushed by the reviewers must not remove their families from the designation.
-Above the §2 threshold (~50 changed lines) or for a design change, the reviewer
-becomes an author of the head; a third party's commit always does.
+(the lot author and the two designated reviewers). Canon §2 (home#127) has no
+size exception: every reviewer correction makes its author an author of the
+head, even under the ~50-line threshold. The threshold only says whether the
+reviewer should have pushed the correction or returned it to the author; it
+never keeps a family eligible. A design change or a third party's commit also
+makes its family an author's family.
 """
 from __future__ import annotations
 
@@ -40,7 +42,7 @@ class DesignPathTest(TestCase):
 
 
 class ReviewerFixFamilyTest(_ActivationFixture, PgTestCase):
-    """The reference author is the assignee; a small reviewer fix keeps its family."""
+    """The reference author is the assignee; a reviewer fix authors the head."""
 
     # -- helpers ----------------------------------------------------------
     def commit(self, actor, harness, text, path="src/ameesh/mail.py"):
@@ -86,10 +88,11 @@ class ReviewerFixFamilyTest(_ActivationFixture, PgTestCase):
 
     # -- witnesses --------------------------------------------------------
     def test_2602_chain_keeps_a_reviewer_retired_by_a_later_freeze(self):
-        # The exact #2602 sequence with one review: dev1 (Claude) reviews,
-        # pushes its small fix, then a later freeze designates dev5 (DeepSeek)
-        # and retires dev1 from the column. Both corrections are in the range
-        # of the third freeze, where the old code forbade all three families.
+        # The exact #2602 sequence with one review: dev1 (Claude) reviews and
+        # pushes its small fix. The next freeze treats dev1 as an author of the
+        # head (its family is excluded), so dev5 (DeepSeek) takes the other
+        # family's seat. Both corrections are in the range of the third freeze:
+        # the three families are authors and no seat can be proven independent.
         self.one_review_canon()
         _, first = self.freeze()
         self.assertEqual([r["name"] for r in first["reviewers"]], ["r1"])
@@ -98,35 +101,38 @@ class ReviewerFixFamilyTest(_ActivationFixture, PgTestCase):
         _, second = self.freeze()
         self.assertEqual(second["state"], rd.DESIGNATED, second)
         self.assertEqual([r["name"] for r in second["reviewers"]], ["r2"])
+        # #2888: r1 is an author of the head even for a small correction.
+        self.assertEqual(self.authors(), {"author": "deepseek", "r1": "claude"})
         self.commit("r2", "codex", "lot\nr1 small fix\nr2 small fix\n")
         self.status("r1", "idle")              # dev1 is back for the third freeze
-        # #2739: r1 and r2 are both correctors now. Their families stay
-        # eligible, but another Claude agent takes the seat, not r1 itself.
+        # #2739/#2888: r1 and r2 are both authors now; no independent family
+        # remains, even for another Claude agent: the correction was not
+        # receivable and must go back to the author.
         self.agent("r1b", "claude")
         _, third = self.freeze()
-        self.assertEqual(third["state"], rd.DESIGNATED, third)
-        self.assertEqual([r["name"] for r in third["reviewers"]], ["r1b"])
-        self.assertEqual(self.authors(), {"author": "deepseek"})
+        self.assertEqual(third["state"], rd.WAITING, third)
+        self.assertEqual(third["reviewers"], [])
+        self.assertIn("0 eligible families", third["why"])
+        self.assertIn("forbidden claude, codex, deepseek", third["why"])
+        self.assertEqual(self.authors(),
+                         {"author": "deepseek", "r1": "claude", "r2": "codex"})
 
     def test_2602_three_families_with_small_reviewer_fixes_still_designate(self):
         # #2602: cx2 (Codex) authors, dev1 (Claude) then dev5 (DeepSeek) push
-        # their first-round correction; the next freeze must still designate.
+        # their first-round correction. Canon §2 has no size exception: the
+        # three families are authors of the head and no independent seat
+        # remains for two required opinions. The correction is not receivable.
         self.first_freeze()
         self.commit("r1", "claude", "lot\nr1 small fix\n")
         self.commit("r2", "codex", "lot\nr1 small fix\nr2 small fix\n")
-        # #2739: the exact correctors are no longer designated (they would
-        # review their own fix); their families remain eligible, so one
-        # substitute per family covers the two required opinions.
         self.agent("r1b", "claude")
         self.agent("r2b", "codex")
         _, out = self.freeze()
-        self.assertEqual(out["state"], rd.DESIGNATED, out)
-        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1b", "r2b"])
-        # the three families are in the range, but only the lot author is one
-        self.assertEqual(self.authors(), {"author": "deepseek"})
-        # the families of the reviewer-correctors are still designated
-        self.assertEqual([r["family"] for r in out["reviewers"]],
-                         ["claude", "codex"])
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.assertEqual(out["reviewers"], [])
+        self.assertIn("forbidden claude, codex, deepseek", out["why"])
+        self.assertEqual(self.authors(),
+                         {"author": "deepseek", "r1": "claude", "r2": "codex"})
 
     def test_a_reviewer_fix_over_fifty_lines_makes_that_family_an_author(self):
         self.first_freeze()

@@ -344,13 +344,13 @@ class AccountBudgetTest(PgTestCase):
         try:
             self.assertTrue(old._compta_marque(0, "old", "m"))
             marker = registry.pending_spend_get(self.db, "takeover")
-            old_key = old._spend_key(0, marker["created_ts"])
+            old_key = old._spend_key(0, marker)
             self.assertEqual(account_budget.reserve(
                 self.db, "takeover", _profile(OPENAI), old_key), "")
             # the replacement repaired the old marker, then launched its turn
             self.assertTrue(registry.pending_spend_put(self.db, "takeover", 1, "new", "m"))
             marker = registry.pending_spend_get(self.db, "takeover")
-            new_key = old._spend_key(1, marker["created_ts"])
+            new_key = old._spend_key(1, marker)
             self.assertEqual(account_budget.reserve(
                 self.db, "takeover", _profile(DEEPSEEK), new_key), "")
 
@@ -386,7 +386,7 @@ class AccountBudgetTest(PgTestCase):
             registry.pending_spend_put(self.db, "capture", 1, "new", "m")
             marker = get(self.db, "capture")
             self.assertEqual(account_budget.reserve(self.db, "capture", _profile(DEEPSEEK),
-                old._spend_key(1, marker["created_ts"])), "")
+                old._spend_key(1, marker)), "")
             return marker
         try:
             with mock.patch("ameesh.storage.postgres.registry.PendingSpend.put_get",
@@ -399,7 +399,7 @@ class AccountBudgetTest(PgTestCase):
             if not replaced:
                 takeover()
             self.assertEqual(account_budget.reserve(self.db, "capture", _profile(OPENAI),
-                old._spend_key(0, own["created_ts"])), "")
+                old._spend_key(0, own)), "")
             def record(*args, **kwargs):
                 self._spend("capture", 40., key=kwargs["key"])
                 return types.SimpleNamespace(reread_tokens=0, session=None)

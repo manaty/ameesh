@@ -17,8 +17,6 @@ from ameesh import registry, review_designation_activation as act, storage, work
 from .support import PgTestCase
 from .test_2447_review_designation_activation import _Repo
 
-OLD = "b" * 40
-
 
 class SupersededCorrectorTest(PgTestCase):
     def receipt(self, actor, harness, commits):
@@ -67,10 +65,14 @@ class SupersededCorrectorTest(PgTestCase):
         self.receipt("author", "deepseek", [self.author_commit])
         self.receipt("cx2", "codex", [self.corrector_commit])
         self.receipt("dev1", "claude", [self.coauthor_commit])
-        self.old = self.ops.add_milestone(self.lot, "frozen", sha=OLD,
+        # #2924 : le gel antérieur doit être un commit réel du dépôt (sinon la
+        # lecture stricte refuse) ; il est ici déjà couvert par la plage du gel
+        # courant, donc sa provenance n'ajoute rien.
+        self.old_sha = self.author_commit
+        self.old = self.ops.add_milestone(self.lot, "frozen", sha=self.old_sha,
                                           actor="author", verdict=None, note="")
         for actor in ("cx2", "cx3", "dev1"):
-            self.ops.add_milestone(self.lot, "verdict", sha=OLD, actor=actor,
+            self.ops.add_milestone(self.lot, "verdict", sha=self.old_sha, actor=actor,
                                    verdict="blocked", note="")
         self.new = self.ops.add_milestone(self.lot, "frozen", sha=self.frozen,
                                           actor="author", verdict=None, note="")

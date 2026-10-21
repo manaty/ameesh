@@ -549,7 +549,7 @@ class ReadyTest(unittest.TestCase):
                 mock.patch.object(merge_queue, "actor_family", side_effect=_family), \
                 mock.patch.object(merge_queue, "_complete_authors",
                                   return_value=(list(authors), ())):
-            return fire.ready_verdicts(None, object(), self.ROW, marks, repo=repo,
+            return fire.ready_verdicts(None, None, self.ROW, marks, repo=repo,
                                        project=project, target=target)
 
     def test_light_passes_without_a_pr(self):
@@ -584,7 +584,7 @@ class ReadyTest(unittest.TestCase):
                 mock.patch.object(merge_queue, "_complete_authors",
                                   side_effect=AssertionError(
                                       "the packet range must not be pre-read")):
-            ok, why, _ = fire.ready_verdicts(None, object(), self.ROW,
+            ok, why, _ = fire.ready_verdicts(None, None, self.ROW,
                                             _marks(_mark("frozen", A)),
                                             repo=None, project=None, target="main")
         self.assertFalse(ok)
@@ -1421,6 +1421,17 @@ class DeltaBaseTest(unittest.TestCase):
                 merge_queue._delta_base(tmp, {}, "nope")
 
 
+class _EmptyHistoryDb:
+    """Magasin factice de ces bancs : aucun jalon, donc aucun gel antérieur.
+
+    `_complete_authors` lit désormais l'historique des gels (#2924) ; ces
+    témoins-ci n'en ont pas et ne doivent pas toucher la base de production.
+    """
+
+    def query(self, *_args, **_kwargs):
+        return []
+
+
 class CompleteAuthorsTest(unittest.TestCase):
     """#1515 N1/#2808 : la porte lit les auteurs du delta gelé ; un détenteur
     du journal n'est auteur que par un commit, la référence au gel n'est pas
@@ -1469,7 +1480,7 @@ class CompleteAuthorsTest(unittest.TestCase):
                 mock.patch.object(review_authors, "reference_author",
                                   return_value={"name": "author",
                                                 "family": "deepseek"}):
-            return merge_queue._complete_authors(object(), item, frozen, tmp, "main")
+            return merge_queue._complete_authors(_EmptyHistoryDb(), item, frozen, tmp, "main")
 
     def test_a_holder_without_a_commit_is_not_an_author(self):
         # #2808 : un détenteur du journal n'est auteur que par un commit de la
@@ -1500,12 +1511,11 @@ class CompleteAuthorsTest(unittest.TestCase):
             authors, _families = self._authors(tmp, frozen)
         self.assertEqual([entry["name"] for entry in authors], ["rev1"])
 
-    def test_a_small_reviewer_correction_is_not_an_author(self):
-        # #2638/#2739 : l'auteur d'un petit correctif de relecteur n'est pas un
-        # auteur de la tête ; sa famille reste éligible, la porte écartant son
-        # nom de son propre correctif. Le lecteur partagé le reconnaît par son
-        # reçu exact et son petit diff, pas par le nom Git. #2808 : la
-        # référence n'est pas semée, elle n'a signé que la base.
+    def test_a_small_reviewer_correction_is_an_author(self):
+        # #2888 : l'auteur d'un petit correctif de relecteur est un auteur de
+        # la tête, exactement comme au-delà du seuil ; sa famille est exclue.
+        # Le lecteur partagé le reconnaît par son reçu exact, pas par le nom
+        # Git. #2808 : la référence n'est pas semée, elle n'a signé que la base.
         with tempfile.TemporaryDirectory() as tmp:
             git = self._git(tmp)
             base, frozen = self._repo(tmp, git, "rev1")
@@ -1515,15 +1525,16 @@ class CompleteAuthorsTest(unittest.TestCase):
             item = {"id": 7, "assignee": "author", "branch_target": "main"}
             with mock.patch.object(merge_queue, "actor_family",
                                       side_effect=_family), \
-                    mock.patch.object(review_lot, "compiled_families", return_value=()), \
+                    mock.patch.object(review_lot, "compiled_families",
+                                      return_value=("claude", "codex", "deepseek")), \
                     mock.patch.object(review_authors, "_commit_receipt",
                                       return_value=receipt), \
                     mock.patch.object(review_authors, "designated_reviewers",
                                       return_value={"rev1"}):
                 authors, _families = merge_queue._complete_authors(
-                    object(), item, frozen, tmp, "main",
+                    _EmptyHistoryDb(), item, frozen, tmp, "main",
                     klass={"class": "sensitive", "base_sha": base}, marks=[])
-        self.assertEqual(authors, [])
+        self.assertEqual(authors, [{"name": "rev1", "family": "codex"}])
 
     def test_a_big_reviewer_fix_is_an_author_despite_the_preserved_git_author(self):
         # #1515 R7 (B ameesh-cx2) : le reçu exact nomme rev1/Codex, mais le
@@ -1559,7 +1570,7 @@ class CompleteAuthorsTest(unittest.TestCase):
                     mock.patch.object(review_authors, "designated_reviewers",
                                       return_value={"rev1"}):
                 authors, families = merge_queue._complete_authors(
-                    object(), item, frozen, tmp, "main",
+                    _EmptyHistoryDb(), item, frozen, tmp, "main",
                     klass={"class": "sensitive", "base_sha": base}, marks=[])
             got = {entry["name"]: entry["family"] for entry in authors}
             self.assertEqual(got.get("author"), "deepseek")
@@ -1606,7 +1617,7 @@ class CompleteAuthorsTest(unittest.TestCase):
                                       return_value={"name": "author",
                                                     "family": "deepseek"}):
                 authors, _families = merge_queue._complete_authors(
-                    object(), item, frozen, tmp, "main",
+                    _EmptyHistoryDb(), item, frozen, tmp, "main",
                     klass={"class": "sensitive", "base_sha": base}, marks=[])
         got = {entry["name"]: entry["family"] for entry in authors}
         self.assertEqual(got.get("rev1"), "codex",
@@ -1642,7 +1653,7 @@ class CompleteAuthorsTest(unittest.TestCase):
                                       return_value={"name": "author",
                                                     "family": "deepseek"}):
                 authors, _families = merge_queue._complete_authors(
-                    object(), item, frozen, tmp, "main",
+                    _EmptyHistoryDb(), item, frozen, tmp, "main",
                     klass={"class": "sensitive", "base_sha": base}, marks=[])
         got = {entry["name"]: entry["family"] for entry in authors}
         self.assertNotIn("author", got,
@@ -1689,7 +1700,7 @@ class CompleteAuthorsTest(unittest.TestCase):
                                       side_effect=providers):
                 with self.assertRaises(merge_queue._ProvenanceError):
                     merge_queue._complete_authors(
-                        object(), item, second, tmp, "main",
+                        _EmptyHistoryDb(), item, second, tmp, "main",
                         klass={"class": "sensitive", "base_sha": base}, marks=[])
 
     def test_a_malformed_receipt_refuses_instead_of_the_git_fallback(self):
@@ -1701,13 +1712,14 @@ class CompleteAuthorsTest(unittest.TestCase):
             item = {"id": 7, "assignee": "author", "branch_target": "main"}
             with mock.patch.object(merge_queue, "actor_family",
                                       side_effect=_family), \
-                    mock.patch.object(review_lot, "compiled_families", return_value=()), \
+                    mock.patch.object(review_lot, "compiled_families",
+                                      return_value=("claude", "codex", "deepseek")), \
                     mock.patch.object(review_authors, "_commit_receipt",
                                       side_effect=review_provenance.ProvenanceError(
                                           "contradictory provenance")):
                 with self.assertRaises(merge_queue._ProvenanceError):
                     merge_queue._complete_authors(
-                        object(), item, frozen, tmp, "main",
+                        _EmptyHistoryDb(), item, frozen, tmp, "main",
                         klass={"class": "sensitive", "base_sha": base}, marks=[])
 
     def test_two_historical_families_for_the_reference_refuse(self):
@@ -1747,7 +1759,7 @@ class CompleteAuthorsTest(unittest.TestCase):
                                       side_effect=providers):
                 with self.assertRaises(merge_queue._ProvenanceError):
                     merge_queue._complete_authors(
-                        object(), item, second, tmp, "main",
+                        _EmptyHistoryDb(), item, second, tmp, "main",
                         klass={"class": "sensitive", "base_sha": base}, marks=[])
 
     def test_an_unreadable_author_range_refuses(self):
@@ -1759,12 +1771,13 @@ class CompleteAuthorsTest(unittest.TestCase):
             item = {"id": 7, "assignee": "author", "branch_target": "main"}
             with mock.patch.object(merge_queue, "actor_family",
                                       side_effect=_family), \
-                    mock.patch.object(review_lot, "compiled_families", return_value=()), \
+                    mock.patch.object(review_lot, "compiled_families",
+                                      return_value=("claude", "codex", "deepseek")), \
                     mock.patch.object(review_authors, "reading",
                                       side_effect=RuntimeError("range down")):
                 with self.assertRaises(merge_queue._ProvenanceError):
                     merge_queue._complete_authors(
-                        object(), item, frozen, tmp, "main",
+                        _EmptyHistoryDb(), item, frozen, tmp, "main",
                         klass={"class": "sensitive", "base_sha": base}, marks=[])
 
 

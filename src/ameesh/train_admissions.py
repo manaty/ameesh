@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
-from . import land, lot_class, merge_queue, review, storage, work
+from . import land, lot_class, merge_queue, packet_guard, review, storage, work
 from .train import MemberDeferred, TrainError, identity
 from .train_review import SHA
 
@@ -119,6 +119,10 @@ class Admissions:
             raise TrainError("lot target changed since admission")
         if lot_class.release_reason(item, row["target"]):
             raise TrainError("release lots cannot enter an automatic train")
+        if packet_guard.is_packet_branch(item["branch"]):
+            # #2908 : un paquet en file est un véhicule, jamais un membre.
+            raise TrainError("packet-vehicle: branch %s is itself a package, never a unit"
+                             % item["branch"])
         return item
 
     def qualify(self, rows, base, mode):

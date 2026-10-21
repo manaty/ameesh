@@ -124,9 +124,11 @@ class GateTitularTest(PgTestCase):
         self.base = self.repo.commit("base")
         self.repo.write("src/ameesh/chat.py", "lot\n")
         self.impl = self.repo.commit("impl: lot", agent="impl")
+        self.harnesses: dict[str, str] = {}
         for name, harness in (("titular", "claude"), ("impl", "deepseek"),
                               ("r_claude", "claude"), ("r_codex", "codex"),
                               ("r_deepseek", "deepseek"), ("ghost", "codex")):
+            self.harnesses[name] = harness
             registry.upsert(self.db, name, harness=harness, host=self.cfg.host,
                             cwd=self.repo.root, status="idle")
             self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
@@ -164,10 +166,20 @@ class GateTitularTest(PgTestCase):
         marks = self.ops.milestones(self.lot, None)
         marks = [dict(row, kind=row["kind"], at_ts=float(row["at_ts"]))
                  for row in marks if row["kind"] in ("frozen", "verdict")]
-        for index, actor in enumerate(verdicts):
-            marks.append({"kind": "verdict", "id": 1000 + index, "actor": actor,
-                          "verdict": "ok", "sha": head,
-                          "at_ts": 2000.0 + index})
+        for actor in verdicts:
+            # #2928 : en classe sensible, un verdict ne compte que sur son reçu
+            # exact — les témoins écrivent donc le jalon et sa preuve.
+            row = self.ops.add_milestone(self.lot, "verdict", sha=head, actor=actor,
+                                         verdict="ok", note="")
+            harness = self.harnesses[actor]
+            self.db.execute(
+                "INSERT INTO provenance_receipts"
+                " (subject, sha, actor, session, turn, harness, work_item_id)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                " ON CONFLICT (subject) DO NOTHING",
+                ("milestone:%d" % int(row["id"]), head, actor, "s-" + harness,
+                 "t", harness, self.lot))
+            marks.append(dict(row, kind="verdict", at_ts=float(row["at_ts"])))
         return merge_queue.review_gate(
             self.db, marks, head, repo=self.repo.root,
             klass=klass or self.klass(), item=work.get(self.db, self.lot),

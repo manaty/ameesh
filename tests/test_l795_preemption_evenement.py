@@ -23,6 +23,7 @@ Règles vérifiées ici :
 from __future__ import annotations
 
 import types
+from unittest import mock
 
 from ameesh import mail, registry, runner, storage, work
 
@@ -79,16 +80,47 @@ class _Base(PgTestCase):
 
 
 class AutorisationTest(_Base):
-    def test_l_owner_interrompt_toujours(self):
+    def test_l_owner_interrompt_avec_sa_preuve(self):
+        # B1 : la preuve d'entrée (compte local de l'émetteur) est transportée.
+        row = self.urgent("dev-a", "human:alice", {"human_account": "alice@pc"})
+        with mock.patch("ameesh.resident_queue.member_declaration",
+                        return_value=(["alice@pc"], "")):
+            self.assertTrue(self.allowed(row))
+            # même sans être dans la config des expéditeurs habilités
+            self.assertTrue(self.allowed(row, senders=()))
+
+    def test_l_owner_sans_preuve_n_interrompt_pas(self):
         row = self.urgent("dev-a", "human:alice", {})
-        self.assertTrue(self.allowed(row))
-        # même sans être dans la config des expéditeurs habilités
-        self.assertTrue(self.allowed(row, senders=()))
+        with mock.patch("ameesh.resident_queue.member_declaration",
+                        return_value=(["alice@pc"], "")):
+            self.assertFalse(self.allowed(row))
+
+    def test_une_preuve_du_lecteur_ne_prouve_pas_l_emetteur(self):
+        # le runner tourne sous ameesh@vm ; cela ne prouve pas human:alice.
+        row = self.urgent("dev-a", "human:alice", {"human_account": "ameesh@vm"})
+        with mock.patch("ameesh.resident_queue.member_declaration",
+                        return_value=(["alice@pc"], "")):
+            self.assertFalse(self.allowed(row))
 
     def test_un_agent_n_interrompt_que_s_il_est_declare(self):
         row = self.urgent("dev-a", "dev-b", {})
         self.assertFalse(self.allowed(row))
         self.assertTrue(self.allowed(row, senders=("dev-b",)))
+
+    def test_un_nom_nu_humain_dans_la_liste_est_verifie(self):
+        """B1 : `alice` dans interrupt_senders ne contourne pas la preuve."""
+        row = self.urgent("dev-a", "alice",
+                          {"human": True, "human_account": "alice@pc"})
+        with mock.patch("ameesh.resident_queue.member_declaration",
+                        return_value=(["alice@pc"], "")):
+            self.assertTrue(self.allowed(row, senders=("alice",)))
+
+    def test_un_nom_nu_humain_non_verifie_ne_preempte_pas(self):
+        row = self.urgent("dev-a", "alice",
+                          {"human": True, "human_account": "ameesh@vm"})
+        with mock.patch("ameesh.resident_queue.member_declaration",
+                        return_value=(["alice@pc"], "")):
+            self.assertFalse(self.allowed(row, senders=("alice",)))
 
     def test_un_expediteur_vide_n_interrompt_pas(self):
         self.assertFalse(self.allowed({"sender": "", "payload": {"urgent": True}}))

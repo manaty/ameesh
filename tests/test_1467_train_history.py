@@ -5,8 +5,9 @@ Le train ne tient plus sa propre règle d'avis : il lit la tête gelée avec
 `merge_queue.review_gate`, en lui donnant les familles **historiques** (reçus
 exacts puis journal des tours). Les auteurs viennent de `review_authors`, la
 même lecture que la désignation au gel. Témoins #2602/#879 (blocage d'une tête
-antérieure ignoré), #2498 (commit de l'assigné sans reçu) et #2638 (correction
-de relecteur sous le seuil) : admis ; tiers non relecteur sans reçu : refusé.
+antérieure ignoré), #2498 (commit de l'assigné sans reçu) et #2888 (une
+correction de relecteur, même sous le seuil, est un auteur de la tête) :
+la famille du correcteur est exclue ; tiers non relecteur sans reçu : refusé.
 """
 import os
 import subprocess
@@ -101,12 +102,11 @@ class HistoryFixture:
                         " WHERE id = %s", (self.lot,))
         self.item = work.get(self.db, self.lot)
         self.ops = storage.of(self.db).work
-        # #2498 : commit de l'assigné avec reçu ; puis correction de r1 sans
-        # reçu (#2638), puis tête de l'assigné avec reçu.
+        # #2498 : commit de l'assigné avec reçu, puis tête de l'assigné avec
+        # reçu. La correction de r1 (#2888) vit sur une tête latérale : elle ne
+        # fait pas partie de la tête gelée de référence.
         self.first = self.commit("author work", actor="author")
         self.receipt_commit(self.first, "author", "deepseek")
-        self.review_fix = self.commit("r1 small fix\n", actor="r1")
-        self.turn("r1", "claude")
         self.head = self.commit("author correction", actor="author")
         self.receipt_commit(self.head, "author", "deepseek")
         self.turn("author", "deepseek")
@@ -114,6 +114,12 @@ class HistoryFixture:
         self.turn("author", "deepseek")
         self.r1 = self.verdict(self.head, "r1", "claude")
         self.r2 = self.verdict(self.head, "r2", "codex")
+        # #2888 : la correction de r1, sans reçu et sous le seuil, est un
+        # commit de la tête ; on la garde sur une branche latérale pour ne pas
+        # changer le témoin de base ci-dessus.
+        self.review_fix = self.commit("r1 small fix\n", actor="r1")
+        self.turn("r1", "claude")
+        self.git("checkout", "-q", "-B", "fixture", self.head)
         self.history = train_history.Recorded(
             self.db, self.repo, provider=review_provenance,
             review_rules=types.SimpleNamespace(
@@ -209,16 +215,38 @@ class RecordedHistoryTest(HistoryFixture, PgTestCase):
         proof = self.qualify()
         self.assertTrue(proof["reviews"]["gate"]["ok"], proof["reviews"]["gate"])
 
-    def test_missing_receipt_of_a_designated_reviewer_small_fix_is_not_an_author(self):
-        # #2638 : correction de premier tour de r1 (sans reçu) : sa famille
-        # reste éligible, le train ne la traite pas comme un auteur inconnu.
+    def test_missing_receipt_of_a_designated_reviewer_small_fix_is_an_author(self):
+        # #2888 : correction de premier tour de r1 (sans reçu) : sa famille
+        # (claude) vient du journal des tours et devient une famille d'auteur,
+        # pas une provenance inconnue. Son propre avis ne compte pas ; r2
+        # (codex) couvre l'unique avis indépendant.
+        frozen = self.freeze(self.review_fix)
+        entry = dict(self.entry, frozen_id=frozen["id"],
+                     frozen_sha=self.review_fix)
+        self.verdict(self.review_fix, "r1", "claude")
+        self.verdict(self.review_fix, "r2", "codex")
         authors, unknown = review_authors.authors(
-            self.db, self.item, self.frozen,
-            [self.first, self.review_fix, self.head], self.repo,
+            self.db, self.item, frozen,
+            [self.first, self.head, self.review_fix], self.repo,
             ("claude", "codex", "deepseek"))
         self.assertEqual(unknown, [])
-        self.assertEqual({row["name"] for row in authors}, {"author"})
-        self.assertTrue(self.qualify()["reviews"]["gate"]["ok"])
+        self.assertIn({"name": "r1", "family": "claude"}, authors)
+        proof = self.qualify(entry=entry, required=1)
+        gate = proof["reviews"]["gate"]
+        self.assertTrue(gate["ok"], gate["why"])
+        self.assertEqual([row["actor"] for row in gate["accepted"]], ["r2"])
+
+    def test_a_reviewer_fix_family_cannot_cover_the_second_opinion(self):
+        # #2888 : auteur DeepSeek, correcteur r1/Claude ; les avis r2/Codex et
+        # third/Claude ne laissent que Codex indépendant. Le train refuse deux
+        # avis requis, comme la porte et la désignation.
+        frozen = self.freeze(self.review_fix)
+        entry = dict(self.entry, frozen_id=frozen["id"],
+                     frozen_sha=self.review_fix)
+        self.verdict(self.review_fix, "r2", "codex")
+        self.verdict(self.review_fix, "third", "claude")
+        with self.assertRaisesRegex(train.TrainError, "two independent"):
+            self.qualify(entry=entry, required=2)
 
     def test_a_coauthor_cannot_admit_its_own_verdict_with_one_review(self):
         # #2681 B (dev1/cx2) : un tiers avec reçu exact est un auteur de la
@@ -349,6 +377,12 @@ class ReviewerThresholdTest(HistoryFixture, PgTestCase):
         return review_authors.authors(
             self.db, self.item, self.frozen, [self.first, self.review_fix, sha],
             self.repo, ("claude", "codex", "deepseek"))
+
+    def test_a_reviewer_small_fix_makes_their_family_an_author(self):
+        # #2888 : le seuil du §2 ne protège plus la famille du correcteur.
+        authors, unknown = self.authors_for(self.review_fix)
+        self.assertEqual(unknown, [])
+        self.assertIn({"name": "r1", "family": "claude"}, authors)
 
     def test_a_reviewer_fix_over_the_threshold_makes_their_family_an_author(self):
         large = self.commit("r1\n" + "".join("line %02d\n" % index

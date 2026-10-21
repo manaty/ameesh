@@ -202,7 +202,13 @@ La séquence de staging écrit chaque événement en JSONL (`date`, `hôte`, `é
 l’étape `sante` est le **rapport JSON** de `sante-courrier.py` (hôte, commit,
 verdict, et pour une remise réelle le message de sonde, son destinataire,
 l’hôte de ce destinataire et son délai) : c’est la preuve structurée que le
-signal ci-dessous exige. L’événement porte aussi ce rapport comme objet
+signal ci-dessous exige. Le rapport sépare les causes de courrier non remis :
+`souffrance` (courrier actif chez une persona **menée** et libre, donc retard
+de remise), `sans_executeur` (courrier actif chez une persona opérationnelle
+sans bail vivant : aucun exécuteur ne peut ouvrir son tour), `boites_mortes`
+(personas opérationnelles arrêtées, non bloquant) et `canal_humain` (sessions
+humaines sans exécuteur, porte-clé compris, non bloquant). L’événement porte
+aussi ce rapport comme objet
 `rapport`, et une notification d’échec le reprend en clair : un KO de sonde
 garde son message, son destinataire et son motif, jamais un simple « santé en
 échec » (#2190). Un verdict `sans-sonde` — `SONDE_<HOTE>=jamais`, `auto` sans
@@ -218,6 +224,20 @@ nomme les personas occupées ou en pause ; le délai de 300 s ne s’applique qu
 une remise partie vers une persona libre, et exige toujours la réponse outil et
 la fin propre du tour (#2190). Le courrier actif en attente chez une persona
 en pause n’est pas compté comme bloqué : son tour est refusé par construction.
+Le courrier actif d’une persona **opérationnelle sans bail vivant** n’est pas
+une souffrance de la chaîne : aucun exécuteur ne peut ouvrir son tour. Il est
+néanmoins un KO, dans `sans_executeur`, parce qu’un courrier opérationnel doit
+avoir un destinataire actif ; le rapport nomme le statut, l’âge du plus ancien
+message et le temps depuis le dernier tour, et la sortie est de démarrer
+l’exécuteur ou de relancer l’agent (`ameesh resume <agent>`), jamais d’élargir
+le délai ni de retirer la garde. Un agent `blocked` sans bail vivant et hors
+pause budget est nommé avec son erreur, jamais silencieusement omis. Une
+session humaine sans exécuteur (`mode=externe`, dont le propriétaire porte-clé
+`key_role=owner` ou la ligne de secours `harness=none`) ne compte ni comme
+boîte morte ni comme souffrance : son courrier est listé dans `canal_humain`,
+avec l’humain responsable, l’alerte poussée (`stopped_with_mail` ou
+`idle_with_mail`) et la lecture sans marquage (`agent-mail inbox <nom>`) ; ce
+courrier ne bloque pas la séquence.
 
 ## Signal « staging actif » (#1323)
 

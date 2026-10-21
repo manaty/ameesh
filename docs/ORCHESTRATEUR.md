@@ -876,12 +876,16 @@ restée 4 h fusionnée sans être déployée, actualisées selon le
    exécuteur (SIGTERM : le tour en cours draine, borné) avant de le relancer.
    Un agent qui tourne lui-même sous une unité d'exécuteur du poste le lance
    donc dans une unité systemd distincte :
-   `systemd-run --user --unit=ameesh-redemarrer-$(date +%s) bash
+   `systemd-run --user --collect --slice=app.slice --unit=poste-maj-$(date +%s) bash
    deploy/mise-a-jour/poste.sh redemarrer <REF>`. Un `setsid` ou un `nohup`
    ne suffit pas : le script reste dans le groupe de contrôle de l'unité de
    l'agent, et il est tué quand le script redémarre cette unité, avant
    d'avoir traité les exécuteurs suivants. Une session humaine attachée
    (`ameesh attach`) bloque le redémarrage de son exécuteur jusqu'à sa sortie.
+   Le script refuse désormais `redemarrer` et `retour` depuis une unité
+   `ameesh-*`, avant tout arrêt ; terminer le tour après le lancement détaché,
+   puis suivre le journal de l'unité `poste-maj-*`. `controler` refuse aussi
+   un notify actif dont le MainPID garde un ancien venv.
 5. **Réserver les migrations** (L122). Le 2026-10-10, quatre lots
    développés en parallèle ont pris les mêmes numéros (0048 à 0050) : trois
    renumérotations en cascade. Un lot qui ajoute une migration réserve son

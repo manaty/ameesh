@@ -395,7 +395,7 @@ class MessageTest(unittest.TestCase):
         self.assertIn("ameesh work milestone 1617 verdict ok|blocked --sha " + SHA_A, text)
         self.assertIn("git diff %s..%s" % (SHA_B[:12], SHA_A[:12]), text)
         self.assertIn("canon@deadbeef", text)
-        self.assertIn("you become the author of your fix", text)
+        self.assertIn("any correction makes you an author of the new head", text)
         # #1534 N6 : le courrier de désignation couvre la règle home#81 entière
         self.assertIn("~50 lines", text)
         self.assertIn("second family", text)
@@ -410,7 +410,7 @@ class MessageTest(unittest.TestCase):
             reviewer={"name": "rev-codex", "family": "codex"},
             authors=[{"name": "mty-amh-impl-02", "family": "deepseek"}],
             eligible_families=2)
-        self.assertIn("do not push a correction that makes you an author", text)
+        self.assertIn("do not push this correction", text)
         self.assertIn("1 independent family", text)
         self.assertIn("2 required opinion", text)
         self.assertIn("#2670", text)
@@ -422,7 +422,7 @@ class MessageTest(unittest.TestCase):
             reviewer={"name": "rev-codex", "family": "codex"},
             authors=[{"name": "mty-amh-impl-02", "family": "deepseek"}],
             eligible_families=3)
-        self.assertIn("is allowed", text)
+        self.assertIn("is receivable", text)
         self.assertIn("2 independent families", text)
         self.assertIn("#2670", text)
 
@@ -439,7 +439,7 @@ class MessageTest(unittest.TestCase):
         text = rd.manual_reviewer_message({"id": 7, "title": "t"})
         self.assertIn("fewer independent families", text)
         self.assertIn("#2670", text)
-        self.assertIn("#2638", text)
+        self.assertIn("#2888", text)
 
     def test_capacity_message_refuses_implicit_admission(self):
         text = rd.capacity_message(LOT, freeze={"id": 42, "sha": SHA_A}, required=2,
@@ -494,7 +494,7 @@ class ApplyTest(unittest.TestCase):
             self.assertIn(SHA_A, body)
             # #2670 : deux familles pour deux avis, une correction qui fait du
             # relecteur un auteur laisserait la porte insatisfaisable.
-            self.assertIn("do not push a correction that makes you an author", body)
+            self.assertIn("do not push this correction", body)
             self.assertIn("1 independent family", body)
         self.assertEqual(len(self.port.commits), 1)
 
