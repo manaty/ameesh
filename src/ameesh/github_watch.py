@@ -38,6 +38,9 @@ INDEX_LAG = 300
 #: API-call budget for one pass (#2955): one page plus a backward re-read,
 #: and enough room to skip the recent pages whose index keys still lag.
 PAGES_PER_TICK = 10
+#: #2955: after this many ticks on one open scan, `github-watch-stalled` is
+#: logged (the scan suspends without committing the cursor; no row is lost).
+STALLED_TICKS = 6
 #: One digest per repository and pass; a larger burst waits for the next pass.
 DIGEST_MAX_ITEMS = 25
 #: Quoted GitHub text in one digest (the rest stays behind the links).
@@ -228,6 +231,7 @@ def collect_batch(api, sub, since, now, scan):
         state.pop("snap_prev", None)
     state.setdefault("window_since", state["since"])
     state.setdefault("blank", 0)
+    state["ticks"] = state.get("ticks", 0) + 1
     events = []
     settled = state["settled"]  # rows after it may still move: deferred
     calls = 0
@@ -316,12 +320,10 @@ def collect_batch(api, sub, since, now, scan):
 
         skipped = state.get("blank", 0) > 0
         state["blank"] = 0
-        previous = (None if skipped or stop_after or state["page"] <= 1
+        previous = (None if skipped or state["page"] <= 1
                     else read(state["page"] - 1))
         recovered = []
-        if previous is not None and stop_after:
-            recovered = [row for row in previous if inside(row)]
-        elif previous is not None:
+        if previous is not None:
             snapshot = state.get("snap_prev") or []
             if snapshot:
                 position, _key = anchor_position(previous, snapshot)
@@ -531,13 +533,16 @@ def deliver(db, sub, events, until, feed, host, *, partial=False,
 
 
 class Watcher:
-    def __init__(self, cfg, *, dry_run=False, log=None, api=None, declarations=None):
+    def __init__(self, cfg, *, dry_run=False, log=None, api=None, declarations=None,
+                 stalled_ticks=STALLED_TICKS):
         self.cfg, self.dry_run = cfg, dry_run
         self.log = log or (lambda text: None)
         self.api = api
         self.declarations = declarations
+        self.stalled_ticks = int(stalled_ticks)
         self.next = {}
         self._warned = set()
+        self._stalled = set()
 
     def _warn(self, text):
         """Journal an ignored declaration once, not on every notifier pass."""
@@ -573,6 +578,15 @@ class Watcher:
                 start = (since if since is not None else now - BOOTSTRAP) - OVERLAP
                 events, next_scan, until = collect_batch(
                     self.api, sub, start, now, scan)
+                key = (sub.project, sub.repo)
+                if next_scan is None:
+                    self._stalled.discard(key)
+                elif (next_scan.get("ticks", 0) > self.stalled_ticks
+                      and key not in self._stalled):
+                    self._stalled.add(key)
+                    self.log("github-watch-stalled: %s/%s still scanning after %d "
+                             "tick(s), cursor retained"
+                             % (sub.project, sub.repo, next_scan["ticks"]))
                 count = len(events) if self.dry_run else deliver(
                     db, sub, events, until, storage.of(db).work.issue_feed(plan_github.FEED_LIMIT),
                     self.cfg.host, partial=True, scan_before=scan, scan_after=next_scan)

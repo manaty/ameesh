@@ -518,6 +518,79 @@ class CollectionTest(unittest.TestCase):
             events += more
             self.assertEqual({e["object_id"] for e in events}, set(range(1, 15)))
 
+    def test_b7_recent_burst_bounded_by_pages_does_not_conclude(self):
+        # B7 #2955: 13 rows updated during the first GET, keys still old, and
+        # #14 settled behind them. The pass must read through the recent pages
+        # (within the budget) and deliver #14; no cursor U is committed on a
+        # page count.
+        with mock.patch.object(watch, "PAGE_SIZE", 3):
+            rows = [issue(n) for n in range(1, 15)]
+            for n, row in enumerate(rows):
+                row["key"] = row["updated_at"] = watch.iso(NOW - 1000 + n)
+            api = LagApi(rows, [])
+            get = api.get
+            mutated = []
+
+            def mutate(path, **kw):
+                out = get(path, **kw)
+                if not mutated:
+                    mutated.append(True)
+                    for row in rows[:13]:
+                        row["updated_at"] = watch.iso(NOW + 1)
+                return out
+
+            with mock.patch.object(api, "get", side_effect=mutate):
+                events, scan, until = watch.collect_batch(
+                    api, SUB, NOW - 3600, NOW, None)
+                more, _ = self.finish(api, NOW, NOW, scan)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, {14})
+            for row in rows[:13]:
+                row["key"] = row["updated_at"]
+            more, _ = self.finish(api, until - watch.OVERLAP, NOW + 400, None)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, set(range(1, 15)))
+
+    def test_b8a_safe_stop_still_delivers_the_anchor_successor(self):
+        # B8a #2955: #1 moves to the tail; the page is surely indexed. The
+        # previous page is [2,3,4] and the anchor [1,2,3] proves #4 follows
+        # the accepted prefix. #4 must be delivered before the stream stops.
+        with mock.patch.object(watch, "PAGE_SIZE", 3):
+            rows = [issue(n) for n in range(1, 7)]
+            for n, row in enumerate(rows):
+                row["key"] = row["updated_at"] = watch.iso(NOW - 1000 + n)
+            api = LagApi(rows, [])
+            events, scan, until = watch.collect_batch(
+                api, SUB, NOW - 3600, NOW, None)
+            self.assertEqual({e["object_id"] for e in events}, {1, 2, 3})
+            rows[0]["key"] = rows[0]["updated_at"] = watch.iso(NOW + 1)
+            more, scan, _ = watch.collect_batch(
+                api, SUB, NOW, NOW + 302, scan)
+            events += more
+            self.assertIsNone(scan)
+            self.assertEqual({e["object_id"] for e in events}, {1, 2, 3, 4, 5, 6})
+
+    def test_b8b_safe_stop_checks_the_anchor_before_concluding(self):
+        # B8b #2955: #1..#6 move to the tail; page 3 is surely indexed and the
+        # previous page is [10,11,12]. The anchor [4,5,6] is not there; the
+        # scan must read back and restart, delivering #7..#12 instead of
+        # concluding on the recent page.
+        with mock.patch.object(watch, "PAGE_SIZE", 3):
+            rows = [issue(n) for n in range(1, 13)]
+            for n, row in enumerate(rows):
+                row["key"] = row["updated_at"] = watch.iso(NOW - 1000 + n)
+            api = LagApi(rows, [])
+            events, scan, _ = watch.collect_batch(
+                api, SUB, NOW - 3600, NOW, None)
+            more, scan, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, set(range(1, 7)))
+            for row in rows[:6]:
+                row["key"] = row["updated_at"] = watch.iso(NOW + 1)
+            more, _ = self.finish(api, NOW, NOW + 302, scan)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, set(range(1, 13)))
+
     def test_b6_anchor_must_be_an_accepted_row(self):
         # B6 #2955: #6 is deferred (> U) but its old key sits at the end of the
         # page. When #1..#5 move and #6 catches up its key, the re-read page is
@@ -846,13 +919,15 @@ class DeliveryTest(PgTestCase):
         rows.append(dict(issue(32), key=watch.iso(NOW - 1000),
                          updated_at=watch.iso(NOW - 1000)))
         api = LagApi(rows, [])
-        watcher = self.watcher(api)
+        logs = []
+        watcher = self.watcher(api, log=logs.append, stalled_ticks=0)
         with mock.patch.object(watch, "PAGE_SIZE", 3):
             self.assertEqual(watcher.tick(self.db, NOW)[0]["events"], 0)
             self.assertIsNotNone(storage.of(self.db).github_watch.scan(
                 "app", "acme/app"))
             self.assertEqual(storage.of(self.db).github_watch.cursor(
                 "app", "acme/app"), NOW - watch.INDEX_LAG - watch.BOOTSTRAP)
+            self.assertTrue(any("github-watch-stalled" in line for line in logs))
             self.assertEqual(watcher.tick(self.db, NOW)[0]["events"], 1)
         self.assertIsNone(storage.of(self.db).github_watch.scan("app", "acme/app"))
         self.assertEqual(storage.of(self.db).github_watch.cursor(
