@@ -522,12 +522,13 @@ jobs:
         run: &deps_venv |
           # Les deux besoins du venv : `coverage` pour les témoins de
           # scripts/map.py (#1257), `yaml` pour la CI pyyaml (#1511).
-          if .venv-ci/bin/python -c 'import psycopg, cryptography, psutil, coverage, yaml' >/dev/null 2>&1; then
+          # #2907 : un cache importable peut encore contenir psycopg 3.1.
+          if .venv-ci/bin/python -c 'import psycopg, cryptography, psutil, coverage, yaml; raise SystemExit(tuple(map(int, psycopg.__version__.split(".")[:2])) < (3, 2))' >/dev/null 2>&1; then
             echo "venv restauré du cache : valide"
           else
             rm -rf .venv-ci
             python -m venv .venv-ci
-            .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9' 'coverage>=7.10' 'pyyaml>=6'
+            .venv-ci/bin/pip install 'psycopg[binary]>=3.2' 'cryptography>=41' 'psutil>=5.9' 'coverage>=7.10' 'pyyaml>=6'
             echo "reconstruit=1" >> "$GITHUB_OUTPUT"
           fi
       # #1293 : le venv reconstruit est sauvé sous la clé du run, que la

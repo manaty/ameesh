@@ -2288,7 +2288,11 @@ def orphan_pass(db, host: str, policy: Policy, *, registered, protected: set,
                 and now - float(row.get("at_ts") or 0) >= UNATTRIBUTED_REFRESH_S:
             # #222: never deleted, an unattributed entry stays signaled, with
             # its current size, for as long as it is on disk (alerts read 24 h)
-            entries.append(dict(base_item, action="signaled", bytes=size, data=data,
+            # #2933: retain the first observation, including legacy signals
+            # whose data predates first_seen; at_ts is only the latest reading.
+            entries.append(dict(base_item, action="signaled", bytes=size,
+                                data=dict(data, first_seen=data.get("first_seen")
+                                          or row.get("at_ts")),
                                 detail=row.get("detail") or UNATTRIBUTED))
         item = {"path": path, "bytes": size, "agent": row.get("agent"),
                 "at_ts": row.get("at_ts"), "status": action, "detail": why,
@@ -2919,7 +2923,8 @@ class Turn:
                           "the host (other turns, other meshes, processes outside turns): "
                           "never deleted automatically" % (UNATTRIBUTED, turn_id[:8],
                                                                  self.agent),
-                "data": {"command": found["command"], "turn": turn_id, "witness": self.agent,
+                "data": {"first_seen": time.time(),
+                         "command": found["command"], "turn": turn_id, "witness": self.agent,
                          "lot": lot, "ino": found["ino"], "dev": found["dev"]}})
         return self.entries
 

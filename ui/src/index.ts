@@ -6,6 +6,7 @@ import { AmeeshProjects, AmeeshTimeline, AmeeshAgent, AmeeshAlerts, AmeeshHosts,
 import { AmeeshDecisions, idempotencyKey } from "./components/decision-screens";
 import { AmeeshChat } from "./components/chat-screen";
 import { AmeeshConfig } from "./components/ameesh-config";
+import { AmeeshThisDevice } from "./components/this-device";
 
 export { ApiError, createClient, expand } from "./api/client";
 export type { Body, Client, ClientOptions, PostOptions, ReadPath, Schemas, TokenProvider,
@@ -15,12 +16,14 @@ export type { StreamEvent, StreamOptions } from "./sse";
 export { LANGUAGES, translate } from "./i18n/index";
 export { HOST_EVENTS, connectHost } from "./host";
 export type { AmeeshHost, AmeeshHostAlert, AmeeshHostTarget, AmeeshMesh, ConnectHostOptions, HostRow } from "./host";
-export { AmeeshApp, AmeeshChat, AmeeshConfig, AmeeshDecisions, AmeeshProjects, AmeeshTimeline, AmeeshAgent, AmeeshAlerts, AmeeshHosts, AmeeshBudget, AmeeshThread, idempotencyKey };
+export { AmeeshApp, AmeeshChat, AmeeshConfig, AmeeshDecisions, AmeeshProjects, AmeeshTimeline, AmeeshAgent, AmeeshAlerts, AmeeshHosts, AmeeshBudget, AmeeshThread, AmeeshThisDevice, idempotencyKey };
+export type { DeviceAgent, DeviceLot, DeviceMesh, DeviceProvider, DeviceRunner, DeviceState } from "./components/this-device";
 export { configOf } from "./components/ameesh-config";
 
 for (const [name, element] of [["ameesh-config", AmeeshConfig], ["ameesh-app", AmeeshApp],
   ["ameesh-projects", AmeeshProjects], ["ameesh-timeline", AmeeshTimeline], ["ameesh-agent", AmeeshAgent],
   ["ameesh-alerts", AmeeshAlerts], ["ameesh-hosts", AmeeshHosts], ["ameesh-budget", AmeeshBudget],
-  ["ameesh-thread", AmeeshThread], ["ameesh-decisions", AmeeshDecisions], ["ameesh-chat", AmeeshChat]] as const) {
+  ["ameesh-thread", AmeeshThread], ["ameesh-decisions", AmeeshDecisions], ["ameesh-chat", AmeeshChat],
+  ["ameesh-this-device", AmeeshThisDevice]] as const) {
   if (!customElements.get(name)) customElements.define(name, element);
 }

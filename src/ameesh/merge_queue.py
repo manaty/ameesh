@@ -376,16 +376,19 @@ def _waiver(db, item) -> tuple:
 
 def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=None,
                            commits=None):
-    """Les auteurs et correcteurs de la tête gelée (#2681/#2739/#2726).
+    """Les auteurs et correcteurs de la tête gelée (#2681/#2739/#2888).
 
     Lecture des commits exacts de la plage gelée et de leur provenance, la même
-    que la désignation : l'auteur de référence et les coauteurs sont des
-    auteurs, un correctif de premier tour de relecteur sous le seuil (#2638)
-    est un correcteur. Rend `(auteurs, correcteurs)`, ou `None` quand aucune
-    lecture n'est possible (pas de base, pas de dépôt, pas de ligne de lot) :
-    la porte garde alors son comportement historique. Lève quand une lecture
-    était possible et a échoué : une porte qui ne peut pas prouver qui a écrit
-    la tête ne compte pas un avis non prouvé (l'indépendance ne se suppose pas).
+    que la désignation : l'auteur de référence, les coauteurs et tout relecteur
+    qui a poussé une correction sont des auteurs. Un petit correctif de
+    premier tour reste listé comme correcteur (#2739), mais il est **auteur de
+    la tête** (#2888) : sa famille est exclue comme celle de tout auteur ; seul
+    son nom sert encore à l'exclusion personnelle. Rend `(auteurs,
+    correcteurs)`, ou `None` quand aucune lecture n'est possible (pas de base,
+    pas de dépôt, pas de ligne de lot) : la porte garde alors son comportement
+    historique. Lève quand une lecture était possible et a échoué : une porte
+    qui ne peut pas prouver qui a écrit la tête ne compte pas un avis non
+    prouvé (l'indépendance ne se suppose pas).
 
     #2803 : `commits` est la liste déjà calculée du delta propre d'un véhicule
     (`packet_reviews.need`) ; la lecture porte alors sur ce seul contenu relu,
@@ -409,7 +412,7 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
 
 
 def _corrections_on_freeze(db, marks, frozen, *, repo, klass, item, families=None):
-    """Les seuls correcteurs de la tête (#2739), pour les lecteurs historiques."""
+    """Les seuls correcteurs de la tête (#2739), auteurs comme les autres (#2888)."""
     attribution = _attribution_on_freeze(db, marks, frozen, repo=repo, klass=klass,
                                          item=item, families=families)
     if attribution is None:
@@ -449,12 +452,11 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     `authors` (#2681) est l'ensemble des auteurs **reconnus** de la tête, tel
     que l'appelant l'a lu (`review_authors.authors`) : `{name, family}`. La
     porte ne compare plus seulement à l'assigné : un coauteur — tiers avec
-    reçu exact, correcteur de relecteur au-delà du seuil du §2 — ne relit ni
-    lui-même ni sa famille. Un petit correctif de relecteur n'est pas un auteur
-    (#2638) et sa famille reste éligible. La famille de l'assigné historique
-    reste celle de la trace du gel (`family_of`) : le reçu d'un autre commit du
-    même nom ne la remplace pas. Sans `authors`, la porte garde son
-    comportement historique : seul l'assigné est connu.
+    reçu exact — et tout relecteur qui a poussé une correction, même petite
+    (#2888), ne relit ni lui-même ni sa famille. La famille de l'assigné
+    historique reste celle de la trace du gel (`family_of`) : le reçu d'un
+    autre commit du même nom ne la remplace pas. Sans `authors`, la porte garde
+    son comportement historique : seul l'assigné est connu.
 
     #2808 : l'assigné **titulaire** n'est auteur que s'il a écrit un commit de
     la plage gelée. Quand la porte lit la plage, son nom absent des auteurs
@@ -487,12 +489,11 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     (`packet_reviews._is_review_free`) ; la lecture le filtre encore par
     sûreté. Sans delta propre, aucun avis n'est dû (`required == 0`).
 
-    #2739 : l'auteur d'un petit correctif de relecteur tenu hors des auteurs
-    (#2638) ne relit pas son propre correctif. La porte lit les commits exacts
-    de la plage gelée (`corrections_of_head`) et écarte son avis **par son
-    nom**, sans exclure sa famille : un autre agent de la même famille reste
-    éligible. Quand la plage ne peut pas être lue, la porte échoue fermé si la
-    lecture était possible (dépôt, base et ligne de lot connus).
+    #2739/#2888 : le relecteur qui a poussé un correctif est un auteur de la
+    tête. Son avis est écarté **par son nom** (la lecture exacte de la plage,
+    `corrections_of_head`) et sa famille est exclue comme celle de tout auteur.
+    Quand la plage ne peut pas être lue, la porte échoue fermé si la lecture
+    était possible (dépôt, base et ligne de lot connus).
 
     #2664 : les familles viennent du canon compilé (`families`, sinon lues par
     `review_lot.compiled_families` au dernier commit audité). Un canon
@@ -573,7 +574,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             # `class_of_paths` et ne porte ni `base_sha` ni `target`. La base
             # de provenance reste celle de la plage gelée du lot : sans elle,
             # `_corrections_on_freeze` rend None et le correcteur d'un petit
-            # correctif compterait sur son propre delta (#2739).
+            # correctif compterait sur son propre delta (#2739/#2888).
             outer = klass or {}
             provenance = {key: outer[key] for key in ("base_sha", "target")
                           if outer.get(key)}
@@ -727,10 +728,10 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             range_authors)
     else:
         reference_is_author = True
-    # #2681/#2808 : les auteurs **reconnus** de la tête, quand l'appelant les a
-    # lus (`review_authors.authors`). Un tiers avec reçu exact ou un correcteur
-    # au-delà du seuil du §2 s'y ajoute. Un petit correctif de relecteur n'y est
-    # pas (#2638) : sa famille reste éligible.
+    # #2681/#2808/#2888 : les auteurs **reconnus** de la tête, quand l'appelant
+    # les a lus (`review_authors.authors`). Un tiers avec reçu exact et tout
+    # relecteur qui a poussé un correctif, même petit, s'y ajoutent : leur
+    # famille est exclue.
     recognized: dict = {}
     if author and not exact and reference_is_author:
         recognized[author.lower()] = {"name": author, "family": author_family}
@@ -1137,12 +1138,12 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
 
     Les auteurs de **contenu** sont ceux du lecteur partagé (#2681,
     `review_authors.reading`) : reçus exacts, familles **historiques** du
-    harnais qui a réellement tourné, coauteurs et correcteurs de relecteur
-    au-delà du seuil du §2. Un commit que le lecteur n'attribue pas garde son
-    auteur Git, relu au registre courant : la porte n'oublie pas un auteur
-    parce que sa preuve manque, et ne suppose jamais une famille. S'y ajoutent
-    les **auteurs des fusions** : une fusion peut ajouter du contenu et ne
-    peut pas compter comme relecteur indépendant.
+    harnais qui a réellement tourné, coauteurs et correcteurs de relecteur,
+    quelle que soit la taille de leur correction (#2888). Un commit que le
+    lecteur n'attribue pas garde son auteur Git, relu au registre courant : la
+    porte n'oublie pas un auteur parce que sa preuve manque, et ne suppose
+    jamais une famille. S'y ajoutent les **auteurs des fusions** : une fusion
+    peut ajouter du contenu et ne peut pas compter comme relecteur indépendant.
 
     #2808 : le titulaire n'est **pas semé** dans les auteurs par sa seule
     qualité d'assigné ; les détenteurs du journal non plus. Un détenteur
@@ -1153,10 +1154,10 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
     auteur pour autant.
 
     Un auteur hors registre (outil, humain non préfixé) n'a pas de famille de
-    modèle à comparer : il est omis de la liste, jamais supposé. Un petit
-    correctif de relecteur (#2638) ne fait pas de son auteur un auteur de la
-    tête : sa famille reste éligible (#2739), la porte écartant son nom de son
-    propre correctif. Sans magasin (`db is None`, banc ou dry-run), la
+    modèle à comparer : il est omis de la liste, jamais supposé. Un correctif
+    de relecteur, même petit (#2739), fait de son auteur un auteur de la tête :
+    sa famille est exclue, et la porte écarte aussi son nom de son propre
+    correctif (#2888). Sans magasin (`db is None`, banc ou dry-run), la
     provenance n'est pas lisible : les auteurs Git du delta restent la source,
     comme la porte historique. Toute lecture illisible — lecteur partagé,
     cible, gel, `git log`, registre — lève `_ProvenanceError` : la porte
@@ -1756,9 +1757,9 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     # (familles), et aucun blocage non levé ; un `ok` récent ne masque plus le
     # `blocked` d'un autre relecteur (P1-1). #2281 : la dispense de re-verdict
     # du pilote (#1979) lève l'exigence d'avis sur cette tête gelée. #1515 :
-    # la porte lit tous les auteurs du lot — détenteurs du journal et auteurs
-    # du delta gelé (petit correctif de relecteur excepté, #2739) —, pas
-    # seulement l'assigné courant.
+    # la porte lit tous les auteurs du lot — détenteurs du journal, auteurs
+    # du delta gelé et correcteurs de relecteur (#2739/#2888) —, pas seulement
+    # l'assigné courant.
     gate_authors = {}
     if required_verdicts(klass) > 0:
         # #2803/#2766 (B cx1) : sur un véhicule de paquet, la porte borne

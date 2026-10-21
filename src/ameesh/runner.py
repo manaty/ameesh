@@ -52,7 +52,7 @@ import uuid
 
 from . import account_budget, account_turn, adapters, auth_failure, canon as canon_mod, canon_sync
 from . import cost as cost_mod
-from . import budget as budget_mod, db as db_mod, fil, harnesses, identity, mail, registry, sentinel, storage
+from . import budget as budget_mod, db as db_mod, device_state, fil, harnesses, identity, mail, registry, sentinel, storage
 from . import rate_limit as rate_limit_mod
 from . import persona_memory as memory_mod
 from . import train_events
@@ -647,6 +647,9 @@ class AgentWorker(threading.Thread):
         self._budget_next_check = 0.0
         self._budget_paused = False
         self._budget_reason = ""
+        #: #2934 : nature de la pause (compte, fenêtre, échéance) — le fil ne
+        #: reçoit une note qu'à ce changement, pas à chaque point de jauge.
+        self._budget_nature = ""
         #: la comptabilité du dernier tour a échoué : plus de tour à l'aveugle.
         #: Un marqueur persistant rend la suspension durable au redémarrage (B5).
         #: L72 : base injoignable à la création — doute, donc suspension, mais
@@ -3658,6 +3661,7 @@ class AgentWorker(threading.Thread):
         self._budget_paused = bool(raison)
         if not raison:
             self._budget_reason = ""
+            self._budget_nature = ""
             self._leve_pause_budget()
             return True
         maintenant = time.monotonic()
@@ -3671,11 +3675,15 @@ class AgentWorker(threading.Thread):
             registry.set_status(self.db, self.name, "blocked",
                                 status_text="%s%s%s" % (budget_mod.PAUSE_PREFIX, marque,
                                                         raison))
-            if raison != self._budget_reason:
-                self._budget_reason = raison
+            # #2934 : une note par nature de pause (compte, fenêtre, échéance),
+            # pas à chaque variation du pourcentage, qui reste dans `status_text`.
+            nature = accounts_mod.pause_nature(raison)
+            if nature != self._budget_nature:
+                self._budget_nature = nature
                 self._fil_note("Budget pause: %s. No turn until the gauge goes back "
                                "down." % raison,
                                meta={"action": "budget", "raison": raison})
+            self._budget_reason = raison
         return False
 
     def _leve_pause_budget(self) -> None:
@@ -3734,12 +3742,11 @@ class AgentWorker(threading.Thread):
 
         Le marqueur est l'état **durable** : un worker de remplacement y
         retrouve l'événement et peut réparer le tour avant de le régler.
-        `created_ts` borne l'écriture au marqueur de CE tour, jamais celui
-        d'un remplaçant."""
+        L'identité exacte du marqueur (`created_at`, `spend_key`, #2166) borne
+        l'écriture à CE tour, jamais celui d'un remplaçant."""
         try:
             return registry.pending_spend_set_resident_usage(
-                self.db, self.name, usage,
-                None if travail is None else travail.get("created_ts"))
+                self.db, self.name, usage, travail)
         except db_mod.DbError as exc:
             log_async("[%s] resident usage marker not written (%s)"
                       % (self.name, db_mod.explain(exc)))
@@ -3865,6 +3872,14 @@ class AgentWorker(threading.Thread):
         except (TypeError, ValueError):
             self._compta_en_echec = True
             return False
+        if travail.get("ledger_ambiguous"):
+            # #2166/B1 : plusieurs clés candidates pour ce marqueur (un ancien
+            # worker a écrit une ligne que son identité ne distingue pas) :
+            # écrire au hasard réglerait le mauvais tour. On suspend.
+            self._compta_en_echec = True
+            log_async("[%s] accounting marker ambiguous: turn accounting "
+                      "suspended" % self.name)
+            return False
         try:
             from . import accounts as accounts_mod
             book = cost_mod.CostBook(
@@ -3882,9 +3897,10 @@ class AgentWorker(threading.Thread):
             if annonce:
                 modele = annonce
             # Clé du marqueur (L60) : la même pour l'écriture de fin de tour et
-            # pour sa réparation, qui ne double donc plus la ligne.
-            cree = travail.get("created_ts")
-            cle = self._spend_key(debut, cree)
+            # pour sa réparation, qui ne double donc plus la ligne. Exacte
+            # (#2166) quand le marqueur la porte ; les marqueurs d'avant 0471
+            # gardent la clé historique, pour dédoublonner leur ligne.
+            cle = self._spend_key(debut, travail)
             usage = book.record(self.name, start=debut, key=cle,
                                 turn=travail.get("turn") or None,
                                 session=travail.get("session") or None,
@@ -3912,7 +3928,7 @@ class AgentWorker(threading.Thread):
             # fournisseur est comptée au relais, pas sur l'appareil (L111).
             if not self.runner.mediated:
                 account_budget.settle(self.db, cle, state="kept" if incertain else "settled")
-            registry.pending_spend_clear(self.db, self.name, cree)
+            registry.pending_spend_clear(self.db, self.name, travail)
             self._compta_travail = None
             self._annonce_ram = ""
             self._compta_en_echec = False
@@ -3990,10 +4006,46 @@ class AgentWorker(threading.Thread):
             log_async("[%s] announced model not persisted (%s): turns suspended"
                       % (self.name, " ".join(str(exc).split())[:120]))
 
-    def _spend_key(self, debut: int, cree) -> str | None:
-        """La clé du tour (L60) : grand livre, marqueur et réservation #1469."""
+    def _spend_key(self, debut: int, marker) -> str | None:
+        """La clé du tour (L60) : grand livre, marqueur et réservation #1469.
+
+        Exacte quand le marqueur la porte (#2166 : `agent:index:created_at`,
+        texte UTC à la microseconde), jamais dérivée d'un float8 relu — une
+        connexion à précision réduite en perd les derniers chiffres. Un
+        marqueur d'avant 0471 (`spend_key` NULL) porte `ledger_key`, la clé
+        durable déjà écrite par son tour (ligne ou réservation, retrouvée par
+        l'identité du marqueur côté stockage) : sa réparation dédouble la
+        ligne existante et règle la réservation, quelle que soit la précision
+        de la connexion. Un float reste accepté pour les appelants
+        historiques (tests) et ne sert qu'à ce repli.
+        """
+        if isinstance(marker, dict):
+            if marker.get("ledger_ambiguous"):
+                return None       # B1 : ne jamais choisir une clé au hasard
+            key = marker.get("ledger_key") or marker.get("spend_key")
+            if key:
+                return str(key)
+            cree = marker.get("created_ts")
+        else:
+            cree = marker
         return ("%s:%d:%.6f" % (self.name, int(debut), float(cree))
                 if cree is not None else None)
+
+    @staticmethod
+    def _same_marker(left: dict | None, right: dict | None) -> bool:
+        """Le même marqueur comptable, par son identité exacte (#2166).
+
+        Deux lectures du même marqueur rendent le même `created_at` texte et
+        la même `spend_key` ; un remplaçant en diffère, même quand le float8
+        relu à précision réduite les confondrait."""
+        if not left or not right:
+            return False
+        if left.get("spend_key") or right.get("spend_key"):
+            return (left.get("spend_key") == right.get("spend_key")
+                    and left.get("created_at") == right.get("created_at"))
+        if left.get("created_at") or right.get("created_at"):
+            return left.get("created_at") == right.get("created_at")
+        return left.get("created_ts") == right.get("created_ts")
 
     def _compta_termine(self, model_annonce: str | None = None, *,
                         incertain: bool = False) -> None:
@@ -4006,7 +4058,7 @@ class AgentWorker(threading.Thread):
         # plutôt que d'être remise à une réparation ultérieure.
         travail = self._avec_reprise("turn accounting", self._compta_en_attente)
         propre = getattr(self, "_compta_travail", None)
-        if propre and (not travail or travail.get("created_ts") != propre.get("created_ts")):
+        if propre and (not travail or not self._same_marker(travail, propre)):
             # #1469 : le marqueur en base n'est plus celui de ce tour (reprise
             # par un remplaçant, ou déjà réparé) : on règle CE tour par sa propre
             # clé (la ligne est dédoublonnée par `spend_key`), sans toucher au
@@ -6288,10 +6340,10 @@ class AgentWorker(threading.Thread):
             marqueur = self._compta_travail or {}
             refus = account_budget.reserve(
                 self.db, self.name, compte,
-                self._spend_key(events_start, marqueur.get("created_ts")))
+                self._spend_key(events_start, marqueur))
             if refus:
                 registry.pending_spend_clear(self.db, self.name,
-                                             marqueur.get("created_ts"))  # rien n'est parti
+                                             marqueur)  # rien n'est parti
                 self._compta_travail = None
                 self.fail_turn(budget_mod.PAUSE_PREFIX + refus, refus)
                 return False
@@ -7534,6 +7586,8 @@ class Runner:
         self.stop = threading.Event()
         self.wake_all = threading.Event()
         self.workers: dict[str, AgentWorker] = {}
+        #: L93 : canaux locaux « mon poste » (état en lecture seule, arrêt propre)
+        self.device_channels: list = []
         self.lock = threading.Lock()
         self.listener = None          # écouteur LISTEN/NOTIFY courant
         self.listener_thread = None
@@ -8660,9 +8714,76 @@ class Runner:
             return True
         return False
 
+    def start_device_channels(self) -> None:
+        """L93 : sert l'état local et l'arrêt propre sur des sockets Unix.
+
+        Un canal par exécuteur (les unités sont par agent) ; le client réunit
+        les canaux de la machine. Sans base joignable, sans droits sur le
+        dossier ou hors service (`--once`, médié), le canal est simplement
+        absent — il ne fait jamais tomber l'exécuteur.
+        """
+        if self.once or self.dry_run or getattr(self, "mediated", False):
+            return
+        if (os.environ.get("AMEESH_DEVICE") or "").strip().lower() in (
+                "0", "off", "false", "no"):
+            return
+        control_enabled = (os.environ.get("AMEESH_DEVICE_CONTROL") or "").strip().lower() \
+            not in ("0", "off", "false", "no")
+        state_path = control_path = ""
+        channels: list = []
+        try:
+            state_path, control_path = device_state.paths(self.runner_id)
+
+            def gate_state():
+                gate = getattr(self, "host_gate", None)
+                if gate is None:
+                    return None
+                try:
+                    return gate.current.to_json()
+                except Exception:
+                    return None
+
+            def build_state():
+                return device_state.snapshot(
+                    self.cfg, self.db, names=self.agents_filter,
+                    runner_id=self.runner_id, socket_path=state_path,
+                    control_socket=control_path, gate=gate_state())
+
+            state = device_state.StateChannel(
+                state_path, build_state,
+                log=lambda msg: log_async("device state: %s" % msg))
+            channels.append(state)
+            if control_enabled:
+                control = device_state.ControlChannel(
+                    control_path,
+                    lambda agent: device_state.stop_agent(self.cfg, self.db, agent, strict=True),
+                    allowed=self.agents_filter,
+                    log=lambda msg: log_async("device control: %s" % msg))
+                channels.append(control)
+            for channel in channels:
+                channel.start()
+        except Exception as exc:
+            for channel in channels:
+                try:
+                    channel.stop()
+                except Exception:
+                    pass
+            log_async("device channel unavailable (%s): continuing without it" % exc)
+            return
+        self.device_channels = channels
+        log_async("device channel: %s (control %s)" % (
+            state_path, control_path if control_enabled else "disabled"))
+
     def shutdown(self) -> None:
         self.stop.set()
         self.wake_all.set()
+        # L93 : les canaux locaux s'arrêtent avant que la base ne se ferme
+        for channel in getattr(self, "device_channels", ()):
+            try:
+                channel.stop()
+            except Exception:
+                pass
+        self.device_channels = []
         train_service = getattr(self, "train_service", None)
         if train_service is not None:
             train_service.shutdown()
@@ -10561,6 +10682,7 @@ class Runner:
         self.start_housekeeping_poll()
         self.start_branch_sweep_poll()
         self.start_train_service()
+        self.start_device_channels()
         if self.once:
             try:
                 self.sweep()
@@ -10771,22 +10893,13 @@ def cmd_stop(cfg: Config, db: db_mod.Db, args: list[str]) -> int:
         print("usage: agent-runner stop <name>", file=sys.stderr)
         return 2
     # L37 (0030) : raison structurée — un arrêt manuel ne lève pas
-    # `stopped_with_mail` (l'humain sait qu'il l'a arrêté)
-    registry.set_status(db, args[0], "stopped", status_text="stopped by hand",
-                        stop_reason="manuel")
-    # #753 : un agent arrêté ne garde pas ses lots — ses lots ouverts
-    # retournent à la file d'équipe (assignee = NULL, journal avec la raison),
-    # et ses lots promus dont la mesure reste à refaire vont à l'auditeur.
-    # `stopped_with` referme la course avec une reprise simultanée (B1/N3).
-    from . import work as work_mod
-    measure_actor = work_mod.measurement_actor(db, cfg)
-    returned = work_mod.release_lots(
-        db, args[0],
-        reason="stopped by hand: returned to the team queue (#753)",
-        actor="stop", measure_actor=measure_actor,
-        measure_reason=("promoted lot whose measurement is still to be redone: "
-                        "handed to %s (#753)" % measure_actor) if measure_actor else "",
-        stopped_with=work_mod.RELEASABLE_STOP_REASONS)
+    # `stopped_with_mail` (l'humain sait qu'il l'a arrêté). L93 : le même
+    # geste sert le canal local « mon poste » (`device_state.stop_agent`).
+    try:
+        returned = device_state.stop_agent(cfg, db, args[0])
+    except ValueError as exc:
+        print("agent-runner stop: %s" % exc, file=sys.stderr)
+        return 2
     for row in returned:
         to = row.get("assigned_to")
         if to:

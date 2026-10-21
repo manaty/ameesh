@@ -1,15 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#2739 — the corrector of a small reviewer fix does not review its own fix.
+"""#2739/#2888 — the corrector of a reviewer fix does not review its own fix.
 
 Canon §2 lets a designated reviewer fix a blocking defect in the first round.
-#2638 keeps that small correction out of the frozen authors, so the reviewer's
-**family** stays eligible for the next review. The agent itself did author the
-correction: the automatic designation must not pick it again (#2739), and the
-merge gate must not count its verdict on that head.
-
-The witnesses below also fix the observation of 19/10: the provenance is read
-on the **final** SHA of the correction (after a refused push rewrote it), not
-on the first pushed SHA; and the family stays eligible through another agent.
+That correction is an authored commit of the head whatever its size (#2888):
+the reviewer's **family** is no longer eligible for the opinions on that head,
+and the exact agent is never designated again (#2739). The witnesses below
+also fix the observation of 19/10: the provenance is read on the **final** SHA
+of the correction (after a refused push rewrote it), not on the first pushed
+SHA; and no other agent of the corrector's family can cover the seat.
 """
 from __future__ import annotations
 
@@ -26,9 +24,9 @@ FAMILIES = ("claude", "codex", "deepseek")
 
 
 class SelectFixerTest(TestCase):
-    """The selection: the corrector's name is excluded, its family is not."""
+    """The selection: a corrector's name and family are excluded as authors."""
 
-    def test_a_fixer_name_is_excluded_but_its_family_stays_eligible(self):
+    def test_a_fixer_name_and_family_are_excluded(self):
         candidates = [
             rd.Candidate("cx2", "codex", True, 0),
             rd.Candidate("cx3", "codex", True, 0),
@@ -39,15 +37,16 @@ class SelectFixerTest(TestCase):
                         candidates=candidates, families=FAMILIES,
                         fixers=[{"name": "cx2", "family": "codex"}])
         self.assertEqual(out["state"], rd.DESIGNATED, out)
-        # cx3 is less loaded, but the rule is first the exact agent: cx2 can
-        # never be designated, whatever its family or its load.
-        self.assertEqual([row["name"] for row in out["reviewers"]], ["cx3"])
-        self.assertEqual(out["reviewers"][0]["family"], "codex")
+        # #2888: the corrector is an author of the head; its family is
+        # forbidden, so neither cx2 nor cx3 (same codex family) can review it.
+        self.assertEqual([row["name"] for row in out["reviewers"]], ["dev1"])
+        self.assertEqual(out["reviewers"][0]["family"], "claude")
         self.assertEqual(out["fixers"], ["cx2"])
 
     def test_a_fixer_never_covers_a_manual_seat(self):
         out = rd.select(required=1,
-                        authors=[{"name": "author", "family": "deepseek"}],
+                        authors=[{"name": "author", "family": "deepseek"},
+                                 {"name": "cx2", "family": "codex"}],
                         candidates=[rd.Candidate("cx2", "codex", True, 0)],
                         families=FAMILIES,
                         already=[{"name": "cx2", "family": "codex"}],
@@ -55,17 +54,19 @@ class SelectFixerTest(TestCase):
         self.assertEqual(out["state"], rd.WAITING, out)
         self.assertEqual(out["manual"], [])
 
-    def test_a_fixer_does_not_exclude_another_agent_of_its_family(self):
+    def test_a_fixer_family_cannot_cover_the_second_opinion(self):
         out = rd.select(required=2,
                         authors=[{"name": "author", "family": "deepseek"}],
                         candidates=[rd.Candidate("cx2", "codex", True, 0),
                                     rd.Candidate("cx3", "codex", True, 0),
                                     rd.Candidate("dev1", "claude", True, 0)],
                         families=FAMILIES,
-                        fixers=["cx2"])
-        self.assertEqual(out["state"], rd.DESIGNATED, out)
-        self.assertEqual([row["family"] for row in out["reviewers"]],
-                         ["codex", "claude"])
+                        fixers=[{"name": "cx2", "family": "codex"}])
+        # #2888: codex is the corrector's family, an author's family; only
+        # claude remains and cannot cover two distinct-family opinions.
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.assertEqual(out["reviewers"], [])
+        self.assertIn("forbidden codex, deepseek", out["why"])
 
 
 class GateCorrectorTest(PgTestCase):
@@ -157,21 +158,24 @@ class GateCorrectorTest(PgTestCase):
         out = self.vehicle_gate()
         self.assertFalse(out.get("error"), out)
         self.assertEqual(out["corrections"], ["cx2"])
-        self.assertTrue(out["ok"], out["why"])
-        # cx2 (the corrector) is out; cx3, same codex family, stays eligible.
+        # #2888: cx2's correction authors the codex family on the delta; cx3
+        # is excluded with that family. Only dev1 (claude) remains.
+        self.assertFalse(out["ok"], out["why"])
         self.assertEqual([entry["actor"] for entry in out["accepted"]],
-                         ["cx3", "dev1"])
+                         ["dev1"])
         self.assertNotIn("cx2", [entry["actor"] for entry in out["accepted"]])
 
-    def test_the_corrector_verdict_does_not_count_and_its_family_does(self):
+    def test_the_corrector_verdict_does_not_count_and_neither_does_its_family(self):
         out = self.gate()
         self.assertFalse(out.get("error"), out)
         self.assertEqual(out["corrections"], ["cx2"])
-        self.assertTrue(out["ok"], out["why"])
-        # cx3 (codex) proves the family stays eligible; cx2 is not accepted.
+        # #2888: cx2/Codex authored the head. cx3 (same codex family) is out
+        # and dev1 is the only other family, so one independent opinion remains.
+        self.assertFalse(out["ok"], out["why"])
         self.assertEqual([entry["actor"] for entry in out["accepted"]],
-                         ["cx3", "dev1"])
+                         ["dev1"])
         self.assertNotIn("cx2", [entry["actor"] for entry in out["accepted"]])
+        self.assertNotIn("cx3", [entry["actor"] for entry in out["accepted"]])
 
     def test_the_correction_is_read_on_the_final_sha(self):
         # The first object of the correction has no receipt; the frozen head
@@ -215,6 +219,8 @@ class GateCorrectorTest(PgTestCase):
         self.assertFalse(out.get("error"), out)
         self.assertIn("third", {entry["name"] for entry in out["authors"]})
         self.assertNotIn("third", [entry["actor"] for entry in out["accepted"]])
+        # The gate stays historical for a normal class with one review: the
+        # co-author's own verdict is out, an independent verdict still counts.
         self.assertEqual([entry["actor"] for entry in out["accepted"]], ["cx3"])
 
     def test_unreadable_correction_provenance_refuses_the_gate(self):
@@ -264,9 +270,10 @@ class GateCorrectorTest(PgTestCase):
             out = self.gate()
         self.assertFalse(out.get("error"), out)
         self.assertEqual(out["corrections"], ["cx2"])
-        self.assertTrue(out["ok"], out["why"])
+        # #2888: cx2's correction authors its family; only dev1 remains.
+        self.assertFalse(out["ok"], out["why"])
         self.assertEqual([entry["actor"] for entry in out["accepted"]],
-                         ["cx3", "dev1"])
+                         ["dev1"])
 
     def test_a_free_note_is_not_a_designation(self):
         # #2739: the line is only a text. A free note by an ordinary agent is

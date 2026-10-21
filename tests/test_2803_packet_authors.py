@@ -220,7 +220,8 @@ class VehicleDeltaTest(PgTestCase):
         # Auditeur #2766 : le klass d'un véhicule (class_of_paths) ne porte ni
         # base_sha ni target ; la lecture du delta (vehicle["commits"]) doit
         # quand même rendre le correcteur du relecteur (#2739), sans dépendre
-        # de la plage gelée complète.
+        # de la plage gelée complète. #2888 : ce correcteur est un auteur du
+        # delta, sa famille (codex) est donc exclue elle aussi.
         item = self.item()
         self.db.execute(
             "UPDATE work_items SET reviewers = ARRAY['r_codex'] WHERE id = %s",
@@ -237,10 +238,11 @@ class VehicleDeltaTest(PgTestCase):
                         self.marks("r_codex", "r_other", "r_claude", head=fix),
                         required=2, head=fix, item=item)
         self.assertEqual(out["corrections"], ["r_codex"], out)
-        self.assertTrue(out["ok"], out["why"])
+        self.assertFalse(out["ok"], out["why"])
         accepted = [row["actor"] for row in out["accepted"]]
         self.assertNotIn("r_codex", accepted)
-        self.assertEqual(accepted, ["r_other", "r_claude"])
+        self.assertNotIn("r_other", accepted)   # same codex family, author now
+        self.assertEqual(accepted, ["r_claude"])
 
 
 class NoExactReadingTest(TestCase):
