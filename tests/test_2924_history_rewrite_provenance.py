@@ -721,6 +721,28 @@ class ForgedSupersedesNoteTest(_RewriteFixture):
                 strict=True)
 
 
+class RemovedLineCannotExposeMarkerTest(_RewriteFixture):
+    """#2989 B (revue dev1) : un filtre ne découvre pas la ligne suivante."""
+
+    def test_a_removed_absent_line_cannot_expose_the_supersedes_marker(self):
+        # Retirer `ameesh-freeze-absent:` exposait `\vameesh-freeze-supersedes:`,
+        # que `[ \t]*` ne couvrait pas ; le strip final de `milestone` la
+        # rendait valide, sans `--supersedes` ni contrôle du gel remplacé.
+        ghost = storage.of(self.db).work.add_milestone(
+            self.lot, "frozen", sha="e" * 40, actor="impl", verdict=None,
+            note="autre gel fantôme, non déclaré remplacé")
+        parent = self.repo.git("rev-parse", self.head_a + "^")
+        tree = self.repo.git("rev-parse", self.head_a + "^{tree}")
+        head_b = self.squash(tree, parent, "contenu consolidé")
+        for blank in ("\v", "\f", "\u00a0"):
+            with self.subTest(blank=repr(blank)):
+                row = self.freeze(
+                    head_b, note="ameesh-freeze-absent: master\n" + blank
+                    + "ameesh-freeze-supersedes: %d" % int(ghost["id"]))
+                self.assertNotRegex(row["note"] or "",
+                                    r"(?m)^ameesh-freeze-supersedes:")
+
+
 class FreezeReadFailureTest(TestCase):
     """#2924 B3 : un journal de jalons illisible ne rend jamais une liste vide."""
 

@@ -651,15 +651,18 @@ def milestone(
         # balayage ne confonde pas une livraison (avance rapide) avec un gel
         # déjà dans la cible. C'est une preuve machine : une ligne fournie par
         # l'appelant (`--note`) est ignorée et refaite ici (#2786, avis dev4).
-        # #2989 (B de la revue cx2) : `add_milestone` fait un `strip()` final
-        # sur la note. Filtrer avant ce strip laisserait une ligne machine
-        # précédée d'un blanc non `[ \t]` (`\vameesh-freeze-supersedes: …`)
-        # devenir valide après le strip, sans `--supersedes` ni validation du
-        # gel remplacé. On strippe donc d'abord : ce que la lecture verra est
-        # exactement ce que ces filtres ont vu.
-        note = str(note or "").strip()
-        note = FREEZE_ABSENT_LINE.sub("", note)
-        note = FREEZE_SUPERSEDES_LINE.sub("", note).rstrip()
+        # #2989 (B des revues cx2 et dev1) : `milestone` fait un `strip()`
+        # final sur la note. Un filtre ligne à ligne sur `^[ \t]*` laissait
+        # passer une ligne machine précédée d'un blanc Unicode (`\v`, `\f`,
+        # espace insécable) ; retirer une autre ligne pouvait aussi l'exposer.
+        # On juge donc chaque ligne sur sa forme strippée — exactement celle
+        # que la lecture verra — puis on strippe l'ensemble : aucune ligne
+        # machine (absence, remplacement) fournie par `--note` ne survit,
+        # quel que soit le blanc.
+        note = "\n".join(
+            line for line in str(note or "").splitlines()
+            if not line.strip().startswith(
+                (FREEZE_ABSENT_MARK, FREEZE_SUPERSEDES_MARK))).strip()
         if replaced:
             # #2989 : la déclaration ne vaut que pour un gel antérieur du même
             # lot (la ligne machine est écrite ici, jamais recopiée).

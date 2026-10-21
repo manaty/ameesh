@@ -110,6 +110,18 @@ class FreezeHeadWriteTest(PgTestCase):
                 row = self.freeze(HEAD, note=blank + "ameesh-freeze-absent: main")
                 self.assertNotIn(work.FREEZE_ABSENT_MARK, row["note"] or "")
 
+    def test_une_ligne_retiree_n_expose_pas_la_marque_suivante(self):
+        # #2989 B (revue dev1) : retirer la première ligne machine exposait la
+        # suivante, précédée d'un blanc que `[ \t]*` ne couvre pas ; le strip
+        # final de `milestone` la rendait alors valide. `\v`, `\f` et l'espace
+        # insécable sont tous blanchis par `str.strip()`.
+        for blank in ("\v", "\f", "\u00a0"):
+            with self.subTest(blank=repr(blank)):
+                row = self.freeze(
+                    HEAD, note="ameesh-freeze-supersedes: 1\n" + blank
+                    + "ameesh-freeze-absent: main")
+                self.assertNotIn(work.FREEZE_ABSENT_MARK, row["note"] or "")
+
     def test_un_depot_du_cwd_ne_prouve_pas_absent(self):
         # #2989 N2 (revue dev2) : un clone du cwd non fetché ne prouve pas
         # qu'un commit n'existe nulle part. Seuls les dépôts de l'auteur
