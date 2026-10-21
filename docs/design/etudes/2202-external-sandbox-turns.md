@@ -257,10 +257,12 @@ create table sandbox_turns (
     request_ids      bigint[] not null default '{}',
     work_item_id     bigint,
     scope            jsonb not null,               -- repo, pr, head, base, generation, attempt
-    scope_digest     text not null,                -- sha256(JCS(scope))
+    scope_digest     text not null,                -- sha256(JCS(scope)), exact per attempt
+    retry_family     text not null,                -- sha256(JCS(scope without attempt))
     scope_generation integer not null,
-    attempt          integer not null,
+    attempt          integer not null,             -- server-assigned: family count + 1
     max_attempts     integer not null,
+    unique (retry_family, attempt),
     profile_ref      text not null,
     profile_digest   text not null,
     placement_ref    text not null,
@@ -326,6 +328,10 @@ Invariants:
    either a replay (same digest) or a `duplicate` refusal (different digest).
 6. `turn_resources` remains the generic resource ledger. `sandbox_turns` adds
    the external-unit correlation and the result; both are joined by `turn_id`.
+7. `retry_family` excludes `attempt` and is immutable; attempts of one family
+   are numbered `1..max_attempts` by the admission transaction under the family
+   lock. `scope_digest` still hashes the exact scope including `attempt` and is
+   what the result echoes.
 
 The `scope` object is application-bound and generic:
 
@@ -345,6 +351,12 @@ The `scope` object is application-bound and generic:
 The digest is `sha256(JCS(scope))` with the same canonicalisation as the rest of
 ameesh (`jcs`). The result must echo the exact scope and digest. A new head or
 generation is a **new turn**; it is never smuggled into an existing grant.
+
+`retry_family = sha256(JCS(scope without attempt))` is the immutable retry-family
+key: it covers application, repository, pr, head, base and generation, never
+`attempt`. `attempt` is assigned by the admission transaction (family count + 1,
+§3), not supplied by the caller; the stored `scope`/`scope_digest` include it, but
+two retries of the same review share one `retry_family`.
 
 ## 3. Correlation and adoption protocol
 
@@ -394,7 +406,7 @@ for the real Job contract, a `kind` cluster:
 | Job created, response lost | Job exists, row still `intent`/`created` | `GET` by name; bind the observed UID |
 | Job bound, supervisor dies | `job_uid` | restart the supervisor with the same turn/epoch; adopt by UID, never create a second Job |
 | Job completed, result file not written | Job's termination message/log | adopted supervisor reads the bounded result and exits |
-| result validated, submit response lost | `sandbox_results` row | replay: same digest → receipt with `replayed`; no second turn increment, no second settlement |
+| result validated, submit response lost | `sandbox_results` row | replay: same digest → stored receipt with `replayed` even though the turn is `succeeded`; different digest → `duplicate`; no second turn increment, no second settlement |
 | cancel before create | `cancel_requested_at` | no Job; `state = 'cancelled'` after the row is fenced |
 | cancel after create | `cancel_requested_at` + `job_uid` | supervisor deletes the Job, observes termination, writes `cancel_observed_at`; result refused `revoked` |
 | cancel vs result | row lock | one wins; if the result wins, cancel returns `already-completed`; if cancel wins, the result is `revoked` |
@@ -410,11 +422,19 @@ find and delete it. The design never adopts a Job under a new epoch: the old
 result would be fenced by the epoch anyway, and a new turn must be a new
 admission with a new reservation.
 
-`max_attempts` is counted per `scope_digest` + `scope_generation` (the
-application's fence). A retry is a new turn, a new spend key and a new
-reservation; the previous turn's reservation is settled or kept. The server
-refuses an attempt beyond `max_attempts` with `limit-exceeded` **before** a Job
-can be created.
+`max_attempts` is counted per `retry_family`, the immutable scope without
+`attempt`. Admission takes a transaction-scoped advisory lock on `retry_family`,
+counts every `sandbox_turns` row of the family (terminal rows included), refuses
+`limit-exceeded` when the count is at or above `max_attempts`, and assigns
+`attempt = count + 1` before it writes the row and the Job input. The lock is held
+to commit, with the fixed order `retry_family` → tranche row → account (§8), so
+two concurrent retries cannot both pass on the same count. The per-attempt
+`scope_digest` still hashes the exact scope (attempt included) and is what the
+result must echo. A retry is a new turn, a new spend key and a new reservation;
+the previous turn's reservation is settled or kept. A new head or generation is a
+new `retry_family` with a fresh attempt budget; it is never a way to smuggle
+another attempt into the old one. The refusal happens **before** a Job can be
+created.
 
 ## 4. Exactly-once application-bound result
 
@@ -426,32 +446,38 @@ path for a sandbox turn. In one transaction:
 2. Check `owner`/`epoch` against the row and the live lease
    (`agent_registry` `FOR UPDATE`, `lease_expires_at > clock_timestamp()`):
    a mismatch, a replaced owner or an expired lease is `stale`.
-3. Check the state: `cancelled`/`cancelling` or a revocation is `revoked`;
-   `deadline_ts <= clock_timestamp()` or an already terminal turn is `late`;
-   a different `scope_digest` (or generation/head) is `scope-mismatch`.
-4. Canonicalise the result (JCS), bound its size, validate its schema, the
-   echoed scope, the declared tools and the counters; a missing required field
-   is `missing`; too many tool calls/turns is `limit-exceeded`; a result that
-   claims an unadmitted tool or capability is `profile-refused`.
-5. If a `sandbox_results` row already exists: same digest → return the stored
-   receipt with `replayed = true`; different digest → `duplicate` (rollback).
-6. Insert `sandbox_results` and set `sandbox_turns.state = 'succeeded'`,
+3. Check revocation: `cancelled`/`cancelling` or a revocation is `revoked`.
+4. Canonicalise the result (JCS) and compute its digest; bound its size. An
+   envelope that cannot be canonicalised cannot be a replay and is `missing`.
+5. If a `sandbox_results` row already exists, compare digests **before** any
+   terminal/deadline refusal: same digest → return the stored receipt with
+   `replayed = true` (no state change, no second close, no second settlement),
+   even when the turn is `succeeded` or the deadline has passed; different
+   digest → `duplicate` (rollback). This ordering is the response-loss recovery
+   path.
+6. Only without a stored result: `deadline_ts <= clock_timestamp()` or an
+   already terminal state is `late`; a different `scope_digest` (or
+   generation/head) is `scope-mismatch`; validate the schema, the echoed scope,
+   the declared tools and the counters; a missing required field is `missing`;
+   too many tool calls/turns is `limit-exceeded`; a result that claims an
+   unadmitted tool or capability is `profile-refused`.
+7. Insert `sandbox_results` and set `sandbox_turns.state = 'succeeded'`,
    `result_id`, `result_sha256`, `completed_at`.
-7. Close the turn **once**, by a shared internal `ameesh_turn_close()` factored
+8. Close the turn **once**, by a shared internal `ameesh_turn_close()` factored
    out of `end_turn()`: `turns = turns + 1`, status `idle`/`queued`, clear the
    prompt, set `last_turn_at`/`last_seen`. Do **not** write
    `agent_registry.session_id` from the sandbox: the sandbox session (if any)
    stays in `sandbox_turns.sandbox_session` and the result; `session: none`
    leaves it null and the agent's own session unchanged.
-8. Settle the account reservation by `spend_key` (actual cost from the relay
+9. Settle the account reservation by `spend_key` (actual cost from the relay
    rows tagged with the turn, or `kept` when the cost is unknown) and the
    tranche reservation in the same fixed lock order used by admission.
-9. Clear the `spend_pending` marker **by `turn_id`** (the exact storage method),
-   never by a re-read `created_at` float: the float `created_ts` path is #2166,
-   and #2893 carries the exact fix. This is a declared dependency; the sandbox
-   close does not use `created_ts` alone. Then mark the `turn_resources` row
-   `done`.
-10. Emit `sandbox.result` and the journal/event; return
+10. Clear the `spend_pending` marker **by `turn_id`** (the exact storage
+    method), never by a re-read `created_at` float: the float `created_ts` path
+    is #2166, and #2893 carries the exact fix. This is a declared dependency;
+    the sandbox close does not use `created_ts` alone. Then mark the
+    `turn_resources` row `done`.
+11. Emit `sandbox.result` and the journal/event; return
     `ameesh-sandbox-receipt/1`.
 
 The unique `sandbox_results.turn_id` is the last-resort backstop: even if two
@@ -626,7 +652,7 @@ be stopped by an `UPDATE`.
 |---|---|---|---|
 | absolute time | `turn_seconds`, `deadline_ts` (DB clock at admission) | supervisor deletes the Job at the deadline; Job `activeDeadlineSeconds = job_seconds`; relay token expires at the deadline; a later result is `late` | real Postgres clock test + `kind` Job deadline test |
 | tool calls | `tool_calls` | the sandbox tool broker allowlist; the Job reports monotonic counters; the server refuses a result over the limit (`limit-exceeded`) and a result without counters (`missing`) | result/heartbeat tests + broker test |
-| turns / attempts | `turns`, `max_attempts` | the server counts `sandbox_turns` per `scope_digest` + generation before admission; a new attempt over the limit is `limit-exceeded` | concurrent attempt tests |
+| turns / attempts | `turns`, `max_attempts` | the server counts `sandbox_turns` per `retry_family` (scope without `attempt`) under the family lock before admission, then assigns `attempt`; over the limit is `limit-exceeded` | concurrent distinct-digest attempt tests |
 | budget | `usd_per_turn` | admission reserves the bound; the relay checks the remaining turn allowance and the account/tranche envelope on every call; token expiry stops the turn | relay + tranche tests |
 | concurrency | `max_concurrent_jobs`, `max_agents` | the runner checks live `sandbox_turns` for the placement before creating a Job; `queued` is visible (same style as #2814) | 4 waiters / 3 slots test |
 | tools/capabilities | `tools`, `capabilities` | the tool broker; the Job has no kube token and no provider key; a result claiming an unadmitted tool is `profile-refused`; merge/fix/deploy/publish are false | placement qualification |
@@ -677,7 +703,16 @@ create table tranche_reservations (
 ```
 
 `ameesh_admit_turn(agent, billing_account, reserve_usd, spend_key, tranche_id,
-path, scope_digest)` is the one boundary for a turn in the tranche scope:
+path)` is the one boundary for a turn in the tranche scope. A sandbox caller also
+passes `retry_family`, `max_attempts` and its scope without `attempt`; the call
+takes the family lock, assigns the attempt, computes the exact `scope` /
+`scope_digest`, and returns them with both reservation ids.
+
+Before step 1 of a sandbox admission, the transaction takes the `retry_family`
+advisory lock, counts the family and assigns `attempt` (§3). The fixed order is
+`retry_family` → tranche row → account, and the family count, the reservations
+and the `sandbox_turns` intent row commit together. A non-sandbox turn has no
+retry family and starts at step 1.
 
 1. `SELECT … FROM tranche_limits WHERE id = $ FOR UPDATE`; if absent, closed or
    outside `[starts_at, ends_at)`, refuse `tranche-unavailable`.
@@ -688,9 +723,11 @@ path, scope_digest)` is the one boundary for a turn in the tranche scope:
    If the account is exhausted, roll back and return `account-exhausted`. The
    existing rule is kept: an open reservation of the same agent from an earlier
    turn is marked `kept` before the new one; it is never reused.
-4. Insert the tranche reservation and the account reservation with the same
-   `spend_key`; return both ids. A duplicate `spend_key` is a replay, not a
-   second reservation (the turn's idempotency key).
+4. Insert the tranche reservation, the account reservation and (for a sandbox
+   turn) the `sandbox_turns` intent row with the assigned attempt, all with the
+   same `spend_key`; return the ids, the admitted scope and its digest. A
+   duplicate `spend_key` is a replay, not a second reservation (the turn's
+   idempotency key).
 
 Settlement is `ameesh_settle_turn(spend_key, actual_usd_or_null)`:
 
@@ -704,8 +741,9 @@ Settlement is `ameesh_settle_turn(spend_key, actual_usd_or_null)`:
   turn spend the difference.
 
 Retries are new turns with a new `spend_key`; the previous reservation stays
-`settled` or `kept`. `max_attempts` is enforced before the tranche reservation,
-so a retry cannot create a new Job without passing both gates. A human release
+`settled` or `kept`. The retry-family count and `max_attempts` run before the
+tranche reservation in the same transaction (§3), so a retry cannot create a Job
+without passing both gates. A human release
 (`ameesh budget tranche release <id> --why …`) mirrors
 `account_release`; it is audited and never automatic.
 
@@ -797,13 +835,13 @@ return them and the tests assert them:
 
 | Code | When | Retry |
 |---|---|---|
-| `missing` | required field, scope, Job UID or counter absent | no |
+| `missing` | required field, scope, Job UID or counter absent; envelope not canonicalisable | no |
 | `unauthorized-request` | request id not in the turn's `requests[]` (not reserved for this turn, including a message withdrawn before the reservation) | no |
 | `not-a-sandbox-request` | request in `requests[]` without an `ameesh-sandbox-request/1` payload; skipped, not a sandbox trigger | n/a |
 | `unknown-turn` | no `sandbox_turns` row | no |
-| `stale` | owner/epoch no longer current; lease expired; superseded generation/head; attempt behind | no (new turn) |
-| `late` | after `deadline_ts`, or on a terminal turn that was not cancelled | no |
-| `duplicate` | another result already accepted for this turn/epoch (different digest) | no |
+| `stale` | owner/epoch no longer current; lease expired; superseded generation/head | no (new turn) |
+| `late` | after `deadline_ts`, or on a terminal turn with no stored accepted result (a stored result is replay/duplicate first) | no |
+| `duplicate` | a stored accepted result exists and the submitted digest differs; checked before `late`, including after the turn became terminal or passed the deadline | no |
 | `revoked` | cancel/revocation; result fenced | no |
 | `scope-mismatch` | result scope/digest ≠ admitted scope | no |
 | `job-conflict` | a different Job UID is already bound; ambiguous adoption | no (human) |
@@ -815,16 +853,21 @@ return them and the tests assert them:
 | `wrong-completion` | `end_turn()` reached for a sandbox turn | no |
 | `not-cancellable` | terminal/completed; cancel is a no-op | no |
 | `already-completed` | cancel lost the race to an accepted result | no |
-| `replayed` (not an error) | same result digest re-submitted | n/a |
+| `replayed` (not an error) | same result digest re-submitted, including after the turn is terminal or past the deadline (response-loss recovery); returns the stored receipt | n/a |
 
 Precedence is fixed and tested: `unknown-turn` → `revoked` → `stale` →
-`late` → `duplicate`/`replayed` → `scope-mismatch` → `limit-exceeded` →
-insert. A late result on a revoked turn is `revoked` (the most specific
-authority), never `late`; a stale owner is `stale` even after the deadline.
-Admission-time codes (`unauthorized-request`, `not-a-sandbox-request`,
-`profile-refused`, `tranche-exhausted`, `account-exhausted`, `missing`) are
-checked before a turn or a Job exists; the precedence above is the result
-path only.
+`replayed`/`duplicate` (stored accepted result) → `late` → `scope-mismatch` →
+`missing`/`limit-exceeded`/`profile-refused` → insert. A replay of the stored
+result is `replayed` even after the turn is terminal or past the deadline; a
+different digest is `duplicate`, not `late`. Revocation and a stale owner/epoch
+still win over the stored-result path: they are the authority. A late result on
+a revoked turn is `revoked` (the most specific authority), never `late`; a
+stale owner is `stale` even after the deadline. An envelope that cannot be
+canonicalised is `missing` before the stored-result lookup, since it cannot
+match a digest. Admission-time codes (`unauthorized-request`,
+`not-a-sandbox-request`, `profile-refused`, `tranche-exhausted`,
+`account-exhausted`, `missing`) are checked before a turn or a Job exists; the
+precedence above is the result path only.
 
 ## 10. Observability
 
@@ -845,8 +888,10 @@ stored or logged.
 
 1. One turn, one `sandbox_turns` row, one Job identity, one accepted result.
 2. A Job is created only after the durable intent and both reservations exist.
-3. A result is accepted only under the live owner/epoch, before the deadline,
-   with the exact scope digest and within the admitted limits.
+3. A **new** result is accepted only under the live owner/epoch, before the
+   deadline, with the exact scope digest and within the admitted limits; a
+   same-digest replay returns the stored receipt even after the turn is terminal
+   or past the deadline and never accepts a second result.
 4. `end_turn()` is never the completion path of a sandbox turn.
 5. A cancel/revocation fences the result before the Job is asked to stop; the
    reservation is `kept` if the cost is unknown, never zero.
@@ -859,6 +904,9 @@ stored or logged.
 9. The contract/source/image are pinned and checked; an incompatible change is
    a new contract version.
 10. There is no external lifecycle write API in the pilot; IMA reads receipts.
+11. Attempts are numbered per immutable `retry_family` under one admission lock;
+    `attempt` never enters the family key, and the exact per-attempt
+    `scope_digest` still binds the result.
 
 # Qualification
 
@@ -870,7 +918,10 @@ and no paid dispatch.
   the others `busy`/`stale`; N requests for a tranche with a cap → at most
   `floor(cap / reserve)` accepted, the rest `tranche-exhausted`; four waiters
   and three slots; account exhausted vs tranche exhausted each tested
-  independently.
+  independently. Three concurrent retries of one `retry_family` with
+  `max_attempts = 2` and three distinct per-attempt `scope_digest`s admit
+  exactly attempts 1 and 2; the third is `limit-exceeded` (the count is per
+  family, not per digest).
 * **Restart**: kill the supervisor before the Job, after the create response is
   lost, after the bind, after the Job completes and before the result is
   submitted; each time the same turn/epoch adopts exactly one Job and the
@@ -880,13 +931,17 @@ and no paid dispatch.
   turn under the attempt limit.
 * **Duplicate/late/stale/revoked**: two concurrent result submissions → one
   accepted, one `duplicate`; a same-digest replay → `replayed`, no second turn
-  increment and no second settlement; a result after the deadline → `late`; an
-  old owner/epoch → `stale`; a cancel before the result → `revoked`; cancel vs
+  increment and no second settlement, including after the first result set
+  `state = succeeded` and after the deadline (response-loss recovery); a
+  different digest submitted after that stored result → `duplicate`, not
+  `late`; a result after the deadline with no stored result → `late`; an old
+  owner/epoch → `stale`; a cancel before the result → `revoked`; cancel vs
   result → one winner and `already-completed` on the cancel side if the result
   won.
 * **Limits**: a result over `tool_calls`, a result without counters, a
-  `max_attempts` overrun, a relay call after the deadline, a Job that exceeds
-  `activeDeadlineSeconds`; each is refused and the reservation is kept.
+  `max_attempts` overrun (per retry family, all states counted), a relay call
+  after the deadline, a Job that exceeds `activeDeadlineSeconds`; each is
+  refused and the reservation is kept.
 * **Canon**: missing/stale/revoked profile/placement, a drifted model/harness,
   a wrong image digest, a tool/capability not admitted, a `session: none`
   violation; each refuses before a Job.
