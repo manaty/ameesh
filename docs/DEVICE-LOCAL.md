@@ -126,8 +126,10 @@ is mediated or `--once`.
 ### Discovery and merge
 
 Read every `device-*.sock` in the directory and merge their states: the
-`ameesh-device/1` schema keeps `runners[]` and one row per agent. From the
-command line:
+`ameesh-device/1` schema keeps `runners[]` and one row per agent. For a
+duplicate (same mesh, same name), the newest report wins by `generated_ts`,
+never the one whose turn started earliest: a stale `running` row does not
+hide a newer `idle` or `stopped` one. From the command line:
 
 ```sh
 ameesh device view              # human summary
@@ -167,11 +169,16 @@ function readState(socket) {
 
 function mergeDeviceStates(states) {
   const runners = new Map(), meshes = new Map();
-  for (const state of states) {
+  const ordered = [...states].sort((a, b) => (a.generated_ts ?? 0) - (b.generated_ts ?? 0));
+  for (const state of ordered) {
     for (const runner of state.runners ?? []) runners.set(runner.id, runner);
     for (const mesh of state.meshes ?? []) {
       const target = meshes.get(mesh.mesh) ?? { ...mesh, agents: [] };
-      for (const agent of mesh.agents ?? []) target.agents.push(agent);
+      for (const agent of mesh.agents ?? []) {
+        // même mesh, même nom : le relevé le plus récent remplace l'ancien
+        target.agents = target.agents.filter((a) => a.name !== agent.name);
+        target.agents.push(agent);
+      }
       meshes.set(mesh.mesh, target);
     }
   }

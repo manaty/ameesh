@@ -1135,6 +1135,14 @@ class PendingSpend(interface.PendingSpend):
         l'appelant suspend au lieu de deviner. Un ancien worker peut écrire sa
         ligne APRÈS le marqueur de son remplaçant (#1469) : la première ligne
         après `created_at` n'est pas forcément celle du marqueur.
+
+        La colonne `spend_key` n'est crue que si elle EST l'identité exacte du
+        marqueur (`agent:index:created_at`, le format de `put`, #2905). Après un
+        retour arrière de version (§14), l'ancien `put` réécrit l'identité du
+        marqueur sans la clé : la colonne garde celle du tour précédent, et
+        l'écrire ferait perdre le coût du tour (conflit `turn_costs.spend_key`).
+        Toute autre valeur est traitée comme NULL : le repli par `turn_id`/
+        `started_at` décide.
         """
         return f"""
 WITH marqueur_brut AS (
@@ -1146,6 +1154,15 @@ WITH marqueur_brut AS (
       FROM spend_pending WHERE agent = %s
 ), marqueur AS (
     SELECT m.*,
+           -- #2905 : la clé du marqueur n'est crue que si elle EST l'identité
+           -- de ce marqueur (`agent:index:created_at`, le format de `put`).
+           -- Après un retour arrière (§14), l'ancien `put` réécrit l'identité
+           -- sans la clé : la colonne garde celle du tour précédent, qui
+           -- ferait perdre le coût du tour (conflit `turn_costs.spend_key`).
+           -- Toute autre valeur est traitée comme NULL : le repli décide.
+           CASE WHEN m.spend_key = m.agent || ':' || m.start_index || ':'
+                     || m.created_at
+                THEN m.spend_key END AS cle_exacte,
            ARRAY(SELECT v
                    FROM generate_series(0, {self._HISTORICAL_ROUNDINGS}) AS g(d)
                    CROSS JOIN LATERAL (
@@ -1173,7 +1190,7 @@ WITH marqueur_brut AS (
                   length(m.agent || ':' || m.start_index || ':') + 1) AS suffixe
       FROM turn_costs tc
       JOIN marqueur m ON tc.agent = m.agent
-     WHERE m.spend_key IS NULL
+     WHERE m.cle_exacte IS NULL
 ), lignes AS (
     SELECT *,
            CASE WHEN suffixe ~ '^[0-9]+([.][0-9]+)?$'
@@ -1231,7 +1248,7 @@ WITH marqueur_brut AS (
            m.epoques AS epoques
       FROM account_reservations ar
       JOIN marqueur m ON ar.agent = m.agent
-     WHERE m.spend_key IS NULL
+     WHERE m.cle_exacte IS NULL
 ), reservations_identifiees AS (
     SELECT *,
            CASE WHEN suffixe ~ '^[0-9]+([.][0-9]+)?$'
@@ -1270,7 +1287,7 @@ WITH marqueur_brut AS (
 SELECT m.agent, m.start_index, m.turn, m.model, m.work_item_id, m.turn_id,
        m.resident_usage, m.spend_key, m.created_at, m.created_ts,
        CASE
-         WHEN m.spend_key IS NOT NULL THEN m.spend_key
+         WHEN m.cle_exacte IS NOT NULL THEN m.cle_exacte
          WHEN c.n_candidats = 1 AND NOT c.sans_cle
               AND NOT c.ligne_etrangere AND NOT c.contradictoire
               AND NOT c.ouverte_etrangere
@@ -1282,7 +1299,7 @@ SELECT m.agent, m.start_index, m.turn, m.model, m.work_item_id, m.turn_id,
            THEN m.agent || ':' || m.start_index || ':' || m.created_at
          ELSE NULL
        END AS ledger_key,
-       (m.spend_key IS NULL
+       (m.cle_exacte IS NULL
         AND (c.n_candidats > 1 OR c.sans_cle OR c.ligne_etrangere
              OR c.contradictoire OR c.ouverte_etrangere
              OR (c.reservation_etrangere AND c.n_candidats = 0)))

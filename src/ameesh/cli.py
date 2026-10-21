@@ -129,15 +129,47 @@ def verdicts_for(bk, msgs: list[dict]) -> dict:
     return out
 
 
-def render(msgs: list[dict], verdicts: dict | None = None) -> str:
+def human_envelopes(msgs: list[dict], *, cfg, token: str = "") -> dict[int, str]:
+    """L77 : l'enveloppe ameesh des messages humains remis par le hook.
+
+    Le hook remet au point sûr, pendant un tour : un message humain y porte la
+    même enveloppe que dans la consigne d'un tour (`render` l'affiche avant sa
+    ligne, comme le bloc de courrier). Fail closed pour l'identité.
+    """
+    from . import resident_queue
+
+    out: dict[int, str] = {}
+    for msg in msgs:
+        try:
+            mid = int(msg.get("id"))
+        except (TypeError, ValueError):
+            continue
+        sender = str(msg.get("from") or "")
+        if not (mail.is_human(msg) or sender.startswith("human:")):
+            continue
+        ident = resident_queue.identity_for(sender, cfg=cfg,
+                                             proof=mail.human_account(msg),
+                                             human=True)
+        out[mid] = resident_queue.envelope(ident, token)
+    return out
+
+
+def render(msgs: list[dict], verdicts: dict | None = None,
+           envelopes: dict[int, str] | None = None) -> str:
     """Le texte injecté par les hooks. Sans signature, il est identique à la v0.
 
     Trois états distincts, parce qu'une signature d'agent n'est pas l'autorité
     du propriétaire : non signé (message d'agent, comme en v0), signé par un
     agent (authentique, sans autorité), signé par le propriétaire (autorité
     prouvée) — plus le cas signature invalide ou expirée, toujours signalé.
+
+    `envelopes` (L77) : l'enveloppe écrite par ameesh pour un message humain,
+    placée sur sa propre ligne AVANT la ligne du message — jamais issue du corps.
     """
+    from . import resident_queue
+
     verdicts = verdicts or {}
+    envelopes = envelopes or {}
     prouves = sum(1 for msg in msgs
                   if (verdicts.get(msg.get("id")) or _NO_PROOF).authority)
     agents_signes = sum(1 for msg in msgs
@@ -183,9 +215,15 @@ def render(msgs: list[dict], verdicts: dict | None = None) -> str:
         # L125 : un message passif (copie, accusé, diffusion) le dit ; un
         # message ordinaire garde la ligne de la v0, traduite (L156c)
         passif = mail.passive_label(msg)
+        try:
+            env = envelopes.get(int(msg.get("id")))
+        except (TypeError, ValueError):
+            env = None
+        if env:
+            lines.append(env)
         lines.append("— from %s at %s%s: %s%s" % (
             msg.get("from", "?"), moment, " (%s)" % passif if passif else "",
-            msg.get("text", ""), suffixe))
+            resident_queue.neutralise(msg.get("text", "")), suffixe))
     lines.append("(to reply: agent-mail send <name> \"…\")")
     return "\n".join(lines)
 
@@ -381,9 +419,12 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             return 2
         parent_lot = int(number)
     dest, text = args[0], " ".join(args[1:]).strip()
+    # L77 : la liaison est lue même avec --from — un processus lié à un agent
+    # ne produit JAMAIS de preuve humaine, quel que soit l'expéditeur nommé.
+    entry_binding = identity.resolve_binding(cfg, bk.db if bk.kind == "pg" else None)
     binding = None
     if not sender:
-        binding = identity.resolve_binding(cfg, bk.db if bk.kind == "pg" else None)
+        binding = entry_binding
         if not binding.ok:
             # la raison quand une identité est annoncée (ex. « agent arrêté »)
             print("unbound sender%s: set AGENT_MAIL_NAME (the runner does it) "
@@ -425,6 +466,19 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 print("copy refused: unknown agent: %s (nothing delivered)" % name,
                       file=sys.stderr)
                 return 2
+    # L77/B1 : l'identité humaine est normalisée à la frontière (`human:<id>`,
+    # la forme que les décisions écrivent déjà), avant la signature, le fil et
+    # le dépôt : `identity_for` ne reconnaît que cette forme.
+    human = _sender_is_human(bk, cfg, sender, explicit_sender)
+    human_proof = ""
+    if human:
+        from . import resident_queue
+        sender = resident_queue.human_ref(sender) or sender
+        if entry_binding.source == "none":
+            # Entrée humaine interactive, sans liaison d'agent : la preuve
+            # user@host de CE processus est transportée avec le message.
+            user, host = resident_queue.local_account(cfg)
+            human_proof = "%s@%s" % (user or "?", host or "?")
     # R12 : le fil est lu par des humains ; un corps illisible n'est pas déposé.
     if not allow_structured:
         reason = fil.unreadable_reason(text)
@@ -481,8 +535,9 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     # (jamais d'accusé reconnu pour lui) ; un accusé de réception — `--ack`, ou
     # un texte très court qui n'est QUE cela (`mail.looks_like_ack`) — attend
     # son prochain tour sans le réveiller.
-    human = _sender_is_human(bk, cfg, sender, explicit_sender)
     payload: dict = {"human": True} if human else {}
+    if human_proof:
+        payload["human_account"] = human_proof
     payload.update((key, True) for key in marks)
     if ack or (not urgent and not sign and not human and not marks and dest != "all"
                and lot is None and new_lot is None and kind in ("notify", "reply")
@@ -757,9 +812,13 @@ class _Remise:
     l'annuler si rien n'a été montré. Repli fichier : lecture et marquage v0.
     """
 
-    def __init__(self, cfg, bk, name: str, binding) -> None:
+    def __init__(self, cfg, bk, name: str, binding, *,
+                 resident: bool = False) -> None:
         self.cfg, self.bk, self.name = cfg, bk, name
         self.pg = getattr(bk, "kind", None) == "pg"
+        #: L77/B11 : un hook de tour résident ne remet pas les messages
+        #: humains ; la file du tour les réserve et les solde à sa fin.
+        self.include_human = not resident
         self.owner = binding.runner_id if binding.bound_to_lease else None
         self.epoch = binding.epoch if self.owner else None
         #: #811 : projets de l'agent lus avec le bail (`None` = inconnus). Un
@@ -786,6 +845,8 @@ class _Remise:
         qui pouvait masquer un message remisable plus récent."""
         if not self.pg:
             tous = self.bk.unread(self.name)
+            if not self.include_human:
+                tous = [m for m in tous if not mail.is_human(m)]
             self.msgs = tous if limite is None else tous[:max(0, limite)]
             self.reste = len(tous) - len(self.msgs)
             return self.msgs
@@ -831,14 +892,47 @@ class _Remise:
 
     def _reserver_simple(self, borne: int) -> list[dict]:
         """#811 : réservation sans filtre de lot (mono-projet, ou règle du lot
-        retenu indécidable) — le chemin d'origine du hook, budget L61 gardé."""
-        rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
-                            porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
-                            limit=borne)
+        retenu indécidable) — le chemin d'origine du hook, budget L61 gardé.
+
+        L77/B11 : en tour résident, les messages humains sont écartés de la
+        réservation ; ils restent à la file du tour. On lit donc les non-lus
+        non humains (lots retenus écartés si la règle est décidable) avant de
+        réserver leurs ids.
+        """
+        if not self.include_human:
+            rows = self._non_human_unread(borne)
+            ids = [int(row["id"]) for row in rows if row.get("id") is not None]
+            if not ids:
+                self.ouverte = False
+                self.msgs = []
+                self.reste = 0
+                return []
+            rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
+                                ids=ids, porteur="hook",
+                                ttl_seconds=mail.HOOK_RESERVATION_TTL, limit=borne)
+        else:
+            rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
+                                porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
+                                limit=borne)
         self.ouverte = bool(rows)
         self.msgs = [mail.normalize(row) for row in rows]
         self.reste = 1 if len(self.msgs) >= borne else 0
         return self.msgs
+
+    def _non_human_unread(self, borne: int) -> list[dict]:
+        """L77/B11 : les non-lus non humains d'un tour résident, lots retenus
+        écartés quand la règle est visible du hook (sinon lecture simple)."""
+        from . import lot_workdir, registry
+        from .mediated_executor.contract import NotSupportedRemotely
+        besoin = max(int(borne), mail.UNREAD_LIMIT)
+        try:
+            agent = registry.get(self.bk.db, self.name) or {"name": self.name}
+            rows = lot_workdir.deliverable_unread(
+                self.cfg, self.bk.db, agent, besoin=besoin,
+                include_human=False)
+        except NotSupportedRemotely:
+            rows = mail.unread(self.bk.db, self.name, limit=besoin)
+        return [row for row in rows if not mail.is_human(row)][:int(borne)]
 
     def _deliverable(self, borne: int) -> list[int] | None:
         """#811 B1/R3 : les ids à réserver, les lots retenus laissés en place.
@@ -854,7 +948,9 @@ class _Remise:
             agent = registry.get(self.bk.db, self.name) or {"name": self.name}
         except NotSupportedRemotely:
             return None
-        rows = lot_workdir.deliverable_unread(self.cfg, self.bk.db, agent, besoin=borne)
+        rows = lot_workdir.deliverable_unread(
+            self.cfg, self.bk.db, agent, besoin=borne,
+            include_human=self.include_human)
         return [int(row["id"]) for row in rows if row.get("id") is not None]
 
     def prendre_mi_tour(self, limite: int | None = None) -> list[dict]:
@@ -868,7 +964,8 @@ class _Remise:
         non-lus est vu au prochain point sûr, pas à la fin du tour."""
         if not self.pg:
             tous = self.bk.unread(self.name)
-            gardes = [m for m in tous if mail.mid_turn(m)]
+            gardes = [m for m in tous
+                      if mail.mid_turn(m) and (self.include_human or not mail.is_human(m))]
             self.msgs = gardes if limite is None else gardes[:max(0, limite)]
             self.reste = len(gardes) - len(self.msgs)
             return self.msgs
@@ -879,7 +976,8 @@ class _Remise:
             self.reste = 0
             return []
         taille = mail.UNREAD_LIMIT if limite is None else limite
-        voulus = mail.unread_mid_turn(self.bk.db, self.name, taille)
+        voulus = mail.unread_mid_turn(self.bk.db, self.name, taille,
+                                      include_human=self.include_human)
         ids = [int(m["id"]) for m in voulus if m.get("id") is not None]
         if not ids:
             self.msgs = []
@@ -1286,7 +1384,14 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             # pour que le chemin rapide ne conclue pas « rien à faire ».
             _marque_boite(cfg, name, attente)
             return 0
-        remise = _Remise(cfg, bk, name, binding)
+        #: L77/B11 : un tour résident (fichier de tour posé) ne remet pas les
+        #: messages humains par le hook ; la file du tour les possède. Le seul
+        #: indice fiable est `AMEESH_TURN_ID_FILE` : `AMEESH_TURN_ID` existe
+        #: aussi pour un tour par événement, et un hook de test peut hériter
+        #: celui de son propre exécuteur.
+        resident_turn = bool(tour and binding.bound_to_lease
+                             and os.environ.get(resident_runner.TURN_FILE_ENV))
+        remise = _Remise(cfg, bk, name, binding, resident=resident_turn)
         #: #1628 : un drapeau local, pas `sys.exc_info()` — un `cmd_hook` appelé
         #: depuis un `except` verrait l'exception extérieure et ne marquerait
         #: jamais la boîte.
@@ -1301,6 +1406,8 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                 msgs = remise.prendre_mi_tour(limite)
             else:
                 msgs = remise.prendre(limite)
+            # L77 : l'enveloppe ameesh des messages humains remis au point sûr.
+            envelopes = human_envelopes(msgs, cfg=cfg, token=remise.jeton)
             avis = ""
             if etat is not None and borne and msgs and etat["remis"] + len(msgs) >= borne:
                 attente = _attente(bk, name, msgs)
@@ -1327,7 +1434,7 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                 # Écrire d'abord : si le harnais a fermé son entrée, on ne
                 # consomme pas les messages pour autant.
                 if not _emit({"decision": "block",
-                              "reason": render(msgs, verdicts_for(bk, msgs)) + avis}):
+                              "reason": render(msgs, verdicts_for(bk, msgs), envelopes) + avis}):
                     return 0
                 remise.solder()
                 if etat is not None:
@@ -1339,7 +1446,7 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             if not _emit({
                 "hookSpecificOutput": {
                     "hookEventName": event,
-                    "additionalContext": render(msgs, verdicts_for(bk, msgs)) + avis,
+                    "additionalContext": render(msgs, verdicts_for(bk, msgs), envelopes) + avis,
                 }
             }):
                 return 0

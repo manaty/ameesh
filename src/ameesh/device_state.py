@@ -723,7 +723,8 @@ def merge(snapshots: Iterable[Mapping[str, Any]]) -> dict:
     """Fusionne les états de plusieurs exécuteurs d'une même machine.
 
     Chaque exécuteur ne sert que ses agents ; la vue « mon poste » les réunit.
-    Un doublon (même mesh, même nom) garde le relevé le plus récent.
+    Un doublon (même mesh, même nom) garde le relevé le plus récent
+    (``generated_ts``), jamais celui dont le tour a commencé le plus tôt.
     """
     bodies = [body for body in snapshots if isinstance(body, Mapping)
               and body.get("schema") == SCHEMA and body.get("host")]
@@ -738,6 +739,7 @@ def merge(snapshots: Iterable[Mapping[str, Any]]) -> dict:
     compute: dict = {"gate": None, "lease": None}
     unmeasured: set = set()
     for body in bodies:
+        report_ts = _number(body.get("generated_ts")) or 0.0
         for runner in body.get("runners") or []:
             if isinstance(runner, Mapping) and runner.get("id"):
                 runners[str(runner["id"])] = dict(runner)
@@ -768,14 +770,17 @@ def merge(snapshots: Iterable[Mapping[str, Any]]) -> dict:
                 name = str(agent.get("name") or "")
                 if not name:
                     continue
-                stamp = _number((agent.get("turn") or {}).get("started_ts")) or 0.0
-                if agents_seen.get((key, name), -1.0) > stamp:
+                # N1 (#382) : la fraîcheur d'un doublon est celle du relevé,
+                # pas celle du tour. Un running ancien (generated_ts=100,
+                # started_ts=90) ne doit pas masquer un idle plus récent
+                # (generated_ts=110, started_ts=null).
+                if agents_seen.get((key, name), -1.0) > report_ts:
                     continue
                 if agents_seen.get((key, name)) is not None:
                     target["agents"] = [a for a in target["agents"]
                                         if not (isinstance(a, Mapping)
                                                 and a.get("name") == name)]
-                agents_seen[(key, name)] = stamp
+                agents_seen[(key, name)] = report_ts
                 target["agents"].append(dict(agent))
     for mesh in meshes.values():
         mesh["agents"].sort(key=lambda a: str(a.get("name") or ""))
