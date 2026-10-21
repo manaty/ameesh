@@ -6344,7 +6344,8 @@ class AgentWorker(threading.Thread):
         self._resident_reread_keep(rp)
         session = fin.session or rp.session
         if fin.status == resident.COMPLETED:
-            self._resident_failures = 0     # T2 : la série d'échecs est close
+            # N1 (#288) : la série est close par `_resident_usage_final`, une
+            # fois la mesure écrite — pas ici, avant l'écriture.
             return 0, None, session, fin
         if fin.status == resident.INTERRUPTED:
             return ((0, None, session, fin) if voulu
@@ -6361,7 +6362,7 @@ class AgentWorker(threading.Thread):
         `resident.turn` ; leurs entrées partent dans `resident.inputs`, dont
         l'échec ne fait jamais échouer le tour (le coût est déjà dans le flux).
         """
-        from . import resident_runner
+        from . import resident, resident_runner
         inputs = self._served_message_ids(served_ids)
         evenement = resident_runner.usage_event(
             rp.driver.protocol, fin, turn=self._turn_id or "", inputs=inputs)
@@ -6380,13 +6381,18 @@ class AgentWorker(threading.Thread):
                     self._resident_usage_pending.append(evenement)
                     self._compta_en_echec = True
                 return False, "resident usage event not written"
-            return True, None
-        attribution = resident_runner.inputs_event(
-            rp.driver.protocol, fin, turn=self._turn_id or "", inputs=inputs)
-        if attribution is not None and not resident_runner.write_usage_event(
-                self._path("events.jsonl"), attribution):
-            log_async("[%s] resident inputs event not written: message "
-                      "attribution lost for this turn" % self.name)
+        else:
+            attribution = resident_runner.inputs_event(
+                rp.driver.protocol, fin, turn=self._turn_id or "", inputs=inputs)
+            if attribution is not None and not resident_runner.write_usage_event(
+                    self._path("events.jsonl"), attribution):
+                log_async("[%s] resident inputs event not written: message "
+                          "attribution lost for this turn" % self.name)
+        # N1 (#288) : la série d'échecs n'est close qu'une fois la mesure
+        # ÉCRITE ; un échec d'écriture garde la série (avant, `_resident_result`
+        # la remettait à zéro avant même de tenter l'écriture).
+        if getattr(fin, "status", "") == resident.COMPLETED:
+            self._resident_failures = 0
         return True, None
 
     def _resident_turn_end(self, rp) -> None:

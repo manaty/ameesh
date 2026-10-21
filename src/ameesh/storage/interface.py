@@ -655,7 +655,7 @@ class TurnCosts(Domain):
                work_item_id: int | None = None,
                started_at: float | None = None,
                turn_id: str | None = None,
-               inputs: tuple[str, ...] | None = None) -> bool:
+               inputs: Sequence[str] | None = None) -> bool:
         """Écrit la ligne du tour (une instruction) ; une erreur de base remonte
         telle quelle et n'a rien écrit. `account` (L30, migration 0028) : le
         compte qui a porté le tour ; None = colonne non écrite. `spend_key`

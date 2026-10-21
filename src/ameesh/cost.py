@@ -48,6 +48,7 @@ import json
 import os
 import re
 import math
+import sys
 import time
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Sequence
@@ -58,6 +59,16 @@ from . import storage
 from .gauge_cache import CLAUDE_GAUGES
 from .resident import INPUTS_EVENT as RESIDENT_INPUTS_EVENT
 from .resident import USAGE_EVENT as RESIDENT_USAGE_EVENT
+
+
+def log(message: str) -> None:
+    """Journal de la comptabilité : un échec d'écriture ne lève jamais."""
+    try:
+        sys.stderr.write("[cost] %s\n" % message)
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
+
 
 #: Barème par défaut du poste de travail (reprise de l'outil de comptage
 #: existant). USD par million de jetons : [entrée, entrée en cache, sortie].
@@ -1664,6 +1675,30 @@ class CostBook:
                          input_tokens=tin, cached_input_tokens=tcache, output_tokens=tout,
                          **(marque if tin or tcache or tout else {}))
 
+    def _insert_turn_cost(self, *, inputs=None, **kwargs) -> None:
+        """Écrit la ligne du tour ; l'attribution de messages est facultative.
+
+        L80b : un exécuteur médié peut parler à un serveur **1.6**, dont la
+        table ne connaît pas `inputs`. Le refus (`bad_args`) ne doit jamais
+        suspendre la comptabilité : on réessaie sans l'attribution — le coût du
+        tour reste compté, l'attribution est perdue et journalisée. Sans
+        `inputs`, le paramètre n'est pas transmis du tout (compatible 1.6)."""
+        insert = dict(kwargs)
+        if inputs is not None:
+            insert["inputs"] = inputs
+        try:
+            storage.of(self.db).turn_costs.insert(**insert)
+        except Exception as exc:  # noqa: BLE001 - réessai limité au refus 1.6
+            from . import db as db_mod
+            texte = str(exc)
+            if inputs is None or not isinstance(exc, db_mod.DbError) \
+                    or ("bad_args" not in texte and "paramètre inconnu" not in texte):
+                raise
+            log("serveur médié sans `inputs` (%s) : tour compté sans attribution "
+                "de messages" % texte[:160])
+            insert.pop("inputs", None)
+            storage.of(self.db).turn_costs.insert(**insert)
+
     def record(self, agent: str, start: int = 0, turn: str | None = None,
                session: str | None = None, model: str | None = None,
                key: str | None = None, ended: float | None = None,
@@ -1745,7 +1780,8 @@ class CostBook:
         if attribution is not None \
                 and isinstance(attribution.get("inputs"), (list, tuple)):
             inputs = tuple(str(i) for i in attribution["inputs"] if i is not None)
-        storage.of(self.db).turn_costs.insert(
+        self._insert_turn_cost(
+            inputs=inputs,
             agent=row["agent"], harness=row["harness"], turn=row["turn"],
             model=row["model"], session=row["session"], usd=row["usd"],
             input_tokens=row["input_tokens"], cached_input_tokens=row["cached_input_tokens"],
@@ -1754,7 +1790,6 @@ class CostBook:
             account=account, spend_key=key, void_reason=usage.void_reason,
             price_fallback=usage.price_fallback,
             cache_write_tokens=usage.cache_write_tokens,
-            inputs=inputs,
             # #796 (0423) : le lot du tour et son début, portés par le marqueur
             work_item_id=None if work_item_id is None else int(work_item_id),
             started_at=None if started_at is None else float(started_at),

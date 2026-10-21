@@ -15,7 +15,10 @@ import tempfile
 import threading
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
+from ameesh import cost as cost_mod
+from ameesh import db as db_mod
 from ameesh import resident, resident_runner, storage
 
 from .support import PgTestCase
@@ -247,3 +250,45 @@ class TurnCostsInputsTest(Sandbox, PgTestCase):
         text = self.mesh("cost", "turns", "--message", "12")
         self.assertEqual(text.returncode, 0, text.stderr)
         self.assertIn("turns serving message 12", text.stdout)
+
+class MediatedInsertCompatTest(unittest.TestCase):
+    """Contrat 1.7 : `inputs` facultatif ; serveur 1.6 → réessai sans attribution."""
+
+    def _book(self):
+        return cost_mod.CostBook(
+            state_dir=tempfile.mkdtemp(prefix="ameesh-288-"), db=object())
+
+    def test_inputs_omitted_when_none(self):
+        calls = []
+        fake = SimpleNamespace(turn_costs=SimpleNamespace(
+            insert=lambda **kw: calls.append(dict(kw))))
+        with mock.patch.object(cost_mod.storage, "of", return_value=fake):
+            self._book()._insert_turn_cost(agent="a1", spend_key="k")
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("inputs", calls[0])
+
+    def test_server_16_bad_args_retries_without_inputs(self):
+        calls = []
+
+        def insert(**kw):
+            calls.append(dict(kw))
+            if "inputs" in kw:
+                raise db_mod.DbError(
+                    "bad_args (400) : turn_costs.insert : paramètre inconnu inputs")
+
+        fake = SimpleNamespace(turn_costs=SimpleNamespace(insert=insert))
+        with mock.patch.object(cost_mod.storage, "of", return_value=fake):
+            self._book()._insert_turn_cost(
+                agent="a1", spend_key="k", inputs=("12", "human:7"))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["inputs"], ("12", "human:7"))
+        self.assertNotIn("inputs", calls[1])
+
+    def test_a_real_failure_is_not_swallowed(self):
+        def insert(**kw):
+            raise db_mod.DbError("connexion perdue")
+
+        fake = SimpleNamespace(turn_costs=SimpleNamespace(insert=insert))
+        with mock.patch.object(cost_mod.storage, "of", return_value=fake):
+            with self.assertRaises(db_mod.DbError):
+                self._book()._insert_turn_cost(agent="a1", inputs=("12",))
