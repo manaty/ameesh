@@ -1449,8 +1449,14 @@ class QueueWithoutRadarTest(PgTestCase):
         # (`rev1`, `rev2`), comme les bancs sans base plus haut.
         self.db.execute("UPDATE work_items SET assignee = 'a1' WHERE id = %d" % lot)
         work.milestone(self.db, lot, "frozen", sha=fresh, actor="a1")
-        work.milestone(self.db, lot, "verdict", verdict="ok", sha=fresh, actor="rev1")
-        work.milestone(self.db, lot, "verdict", verdict="ok", sha=fresh, actor="rev2")
+        for actor, harness in (("rev1", "codex"), ("rev2", "claude")):
+            mark = work.milestone(self.db, lot, "verdict", verdict="ok", sha=fresh,
+                                  actor=actor)
+            # #2928 : la porte sensible ne compte un verdict que sur son reçu
+            # exact ; ces avis sont réels, ils portent leur preuve.
+            storage.of(self.db).provenance.add(
+                "milestone:%d" % int(mark["id"]), fresh, actor, "s-" + harness,
+                "t", harness, work_item_id=lot)
         # #2333 : `queue add` refuse une tête de lot hors paquet ; ce banc
         # éprouve le clone jetable et la tête fraîche, pas la garde : une
         # exception déclarée sur cette tête exacte autorise l'admission.

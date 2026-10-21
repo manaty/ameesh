@@ -309,7 +309,8 @@ class DelaysCliTest(MeshCliTest):
         proc = self.mesh("work", "move", "1", "build")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         proc = self.mesh("work", "milestone", "1", "frozen", "--sha", "a" * 40,
-                         "--actor", AGENT)
+                         "--actor", AGENT,
+                         env=self.env(AGENT_MAIL_NAME=AGENT))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("milestone frozen", proc.stdout)
 
@@ -319,7 +320,8 @@ class DelaysCliTest(MeshCliTest):
         self.assertIn(": 1 (freeze 1)", proc.stdout)
         self.assertIn("oldest freeze", proc.stdout)
 
-        proc = self.mesh("work", "milestone", "1", "verdict", "ok", "--sha", "b" * 40)
+        proc = self.mesh("work", "milestone", "1", "verdict", "ok", "--sha", "b" * 40,
+                         env=self.env(AGENT_MAIL_NAME=AGENT))
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
         proc = self.mesh("work", "list")
@@ -363,7 +365,8 @@ class DelaysCliTest(MeshCliTest):
         self.mesh("work", "add", "--title", "Gel dérivé", "--assignee", AGENT)
         self.mesh("work", "move", "1", "build")
         # avis favorable sans gel déclaré : le candidat vient de l'avis
-        proc = self.mesh("work", "milestone", "1", "verdict", "ok", "--sha", "a" * 40)
+        proc = self.mesh("work", "milestone", "1", "verdict", "ok", "--sha", "a" * 40,
+                         env=self.env(AGENT_MAIL_NAME=AGENT))
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
         item = json.loads(self.mesh("work", "show", "1", "--json").stdout)
@@ -381,7 +384,8 @@ class DelaysCliTest(MeshCliTest):
         self.assertNotIn("freeze", rows[0])
 
         # un gel déclaré sur le même commit l'emporte, en forme complète
-        proc = self.mesh("work", "milestone", "1", "frozen", "--sha", "a" * 40)
+        proc = self.mesh("work", "milestone", "1", "frozen", "--sha", "a" * 40,
+                         env=self.env(AGENT_MAIL_NAME=AGENT))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         item = json.loads(self.mesh("work", "show", "1", "--json").stdout)
         self.assertEqual(item["freeze"]["origin"], "frozen")
@@ -397,7 +401,8 @@ class DelaysCliTest(MeshCliTest):
         proc = self.mesh("work", "add", "--title", "ancien", "--assignee", AGENT)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.mesh("work", "move", "1", "build")
-        proc = self.mesh("work", "milestone", "1", "frozen", "--sha", "a" * 40)
+        proc = self.mesh("work", "milestone", "1", "frozen", "--sha", "a" * 40,
+                         env=self.env(AGENT_MAIL_NAME=AGENT))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.db.execute(
             "INSERT INTO work_items(title, state, assignee) "

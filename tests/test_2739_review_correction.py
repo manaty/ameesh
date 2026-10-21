@@ -81,6 +81,16 @@ class GateCorrectorTest(PgTestCase):
                 ("commit:" + sha, sha, actor, "s-" + harness, "t", harness,
                  self.lot))
 
+    def verdict_receipt(self, mark, harness):
+        """#2928 : la porte sensible ne compte un verdict que sur son reçu exact."""
+        self.db.execute(
+            "INSERT INTO provenance_receipts"
+            " (subject, sha, actor, session, turn, harness, work_item_id)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            " ON CONFLICT (subject) DO NOTHING",
+            ("milestone:%d" % int(mark["id"]), self.frozen, mark["actor"],
+             "s-" + harness, "t", harness, self.lot))
+
     def setUp(self):
         super().setUp()
         for table in ("turn_costs", "provenance_receipts", "canon_state",
@@ -119,9 +129,11 @@ class GateCorrectorTest(PgTestCase):
         self.frozen = self.repo.git("rev-parse", "HEAD")
         self.receipt("cx2", "codex", [self.frozen])
         work.milestone(self.db, self.lot, "frozen", sha=self.frozen, actor="author")
+        harnesses = {"cx2": "codex", "cx3": "codex", "dev1": "claude"}
         for actor in ("cx2", "cx3", "dev1"):
-            work.milestone(self.db, self.lot, "verdict", sha=self.frozen,
-                           actor=actor, verdict="ok")
+            mark = work.milestone(self.db, self.lot, "verdict", sha=self.frozen,
+                                  actor=actor, verdict="ok")
+            self.verdict_receipt(mark, harnesses[actor])
 
     def gate(self):
         klass = {"class": "sensitive", "doubt": False,

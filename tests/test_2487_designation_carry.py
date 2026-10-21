@@ -209,8 +209,18 @@ class _Fixture(PgTestCase):
         return row, outcome
 
     def verdict(self, actor: str, sha: str, verdict: str = "ok") -> None:
-        work.milestone(self.db, self.lot, "verdict", sha=sha, actor=actor,
-                       verdict=verdict)
+        mark = work.milestone(self.db, self.lot, "verdict", sha=sha, actor=actor,
+                              verdict=verdict)
+        # #2928 : la porte sensible ne compte que les verdicts à reçu exact.
+        full = _git(self.repo.root, "rev-parse", sha)
+        harness = str((registry.get(self.db, actor) or {}).get("harness") or "")
+        self.db.execute(
+            "INSERT INTO provenance_receipts"
+            " (subject, sha, actor, session, turn, harness, work_item_id)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            " ON CONFLICT (subject) DO NOTHING",
+            ("milestone:%d" % int(mark["id"]), full, actor, "s-" + harness,
+             "t", harness, self.lot))
 
     def mailbox(self):
         return self.db.query(
@@ -322,7 +332,8 @@ class CarriedFreezeTest(_Fixture):
         proc = self.mesh(
             "work", "milestone", str(self.lot), "frozen", "--sha", frozen,
             "--actor", "author",
-            env=self.env(AMEESH_CONFIG=self.config_file()))
+            env=self.env(AMEESH_CONFIG=self.config_file(),
+                         AGENT_MAIL_NAME="author"))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("reviewers: kept from carried verdicts (rev1, rev2)",
                       proc.stdout)

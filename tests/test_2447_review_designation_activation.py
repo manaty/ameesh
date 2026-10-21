@@ -1272,7 +1272,8 @@ class ActivationCliTest(_ActivationFixture, PgTestCase):
         proc = self.mesh(
             "work", "milestone", str(self.lot), "frozen", "--sha", self.frozen,
             "--actor", "author",
-            env=self.env(AMEESH_CANON=self.canon.root, AMEESH_CANON_REF="HEAD"))
+            env=self.env(AMEESH_CANON=self.canon.root, AMEESH_CANON_REF="HEAD",
+                         AGENT_MAIL_NAME="author"))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("reviewers: r1 (claude), r2 (codex)", proc.stdout)
         self.assertEqual([m["recipient"] for m in self.mailbox()], ["r1", "r2"])
@@ -1288,7 +1289,8 @@ class ActivationCliTest(_ActivationFixture, PgTestCase):
         proc = self.mesh(
             "work", "milestone", str(self.lot), "frozen", "--sha", self.frozen,
             "--actor", "author",
-            env=self.env(AMEESH_CANON=self.canon.root, AMEESH_CANON_REF="HEAD"))
+            env=self.env(AMEESH_CANON=self.canon.root, AMEESH_CANON_REF="HEAD",
+                         AGENT_MAIL_NAME="author"))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("review: none", proc.stdout)
         self.assertIn("no pre-merge reviewer", proc.stdout)

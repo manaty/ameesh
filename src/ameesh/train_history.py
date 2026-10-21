@@ -109,8 +109,14 @@ class Recorded:
             # d'une tête antérieure ne peut pas refuser l'admission.
             on_freeze = [mark for mark in marks if mark.get("kind") == "verdict"
                          and merge_queue._same_sha(mark.get("sha"), head, self.path)]
+            # #2928 : en classe sensible, un verdict sans reçu exact ne compte
+            # pas — la famille historique ne doit pas venir du journal des
+            # tours pour un avis qui ne prouve pas son origine.
+            sensitive = str((klass or {}).get("class") or "") == "sensitive" \
+                or bool((klass or {}).get("doubt"))
             family_of = review_authors.verdict_families(
-                self.db, on_freeze, self.families, provider=self.provider, strict=True)
+                self.db, on_freeze, self.families, provider=self.provider,
+                strict=True, require_receipt=sensitive)
         except review_provenance.ProvenanceError as exc:
             raise TrainError(str(exc)) from exc
         # Le train lit l'auteur **au gel** (la même référence que la
