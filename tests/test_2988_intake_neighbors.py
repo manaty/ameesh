@@ -170,6 +170,46 @@ class GitTest(PgTestCase):
         self.assertTrue(any("peut-être corrigé par #%d" % lot in motif
                             for motif in row["motifs"]), row["motifs"])
 
+    def test_deleted_line_is_followed_across_hunks_of_one_commit(self):
+        # Relecture claude de #2988 : un commit à plusieurs hunks compare
+        # chaque hunk en coordonnées d'avant ce commit ; décaler la position
+        # dès le premier hunk ratait la suppression (et voyait une ligne
+        # voisine touchée).
+        self._patch("many.txt", "".join("l%d\n" % i for i in range(1, 21)))
+        _git(self.repo, "add", "many.txt")
+        _git(self.repo, "commit", "-qm", "base many")
+        head = _git(self.repo, "rev-parse", "HEAD").strip()
+        lot = self._merged_lot("suppression après un autre hunk")
+        kept = [i for i in range(1, 21) if not (2 <= i <= 6 or i == 10)]
+        self._patch("many.txt", "".join("l%d\n" % i for i in kept))
+        _git(self.repo, "commit", "-qam", "drop 2-6 and 10\n\nameesh-work: %d" % lot)
+        found = intake_neighbors.neighbors(
+            self.db, "p", title="many.txt:10", body="", reviewed_head=head,
+            repo=self.repo)
+        row = next(item for item in found["neighbors"] if item["id"] == lot)
+        self.assertTrue(any("peut-être corrigé par #%d" % lot in motif
+                            for motif in row["motifs"]), row["motifs"])
+        # l'inverse : insertion au-dessus puis suppression plus bas dans le
+        # même commit ; la ligne 10 n'est pas touchée et suit sa route
+        self._patch("other.txt", "".join("o%d\n" % i for i in range(1, 21)))
+        _git(self.repo, "add", "other.txt")
+        _git(self.repo, "commit", "-qm", "base other")
+        head = _git(self.repo, "rev-parse", "HEAD").strip()
+        wrong = self._merged_lot("insertion haute et suppression basse")
+        lines = ["o%d\n" % i for i in range(1, 21) if i != 15]
+        lines[2:2] = ["new%d\n" % i for i in range(5)]
+        self._patch("other.txt", "".join(lines))
+        _git(self.repo, "commit", "-qam", "insert and drop 15\n\nameesh-work: %d" % wrong)
+        later = self._merged_lot("suppression de la ligne suivie")
+        lines.remove("o10\n")
+        self._patch("other.txt", "".join(lines))
+        _git(self.repo, "commit", "-qam", "drop 10\n\nameesh-work: %d" % later)
+        found = intake_neighbors.neighbors(
+            self.db, "p", title="other.txt:10", body="", reviewed_head=head,
+            repo=self.repo)
+        hits = {item["id"] for item in found["neighbors"] if item["git"]}
+        self.assertEqual(hits, {later})
+
     def test_deleted_file_names_the_lot_that_deleted_it(self):
         # B2 second tour : le fichier entier disparaît ; le chemin est résolu
         # dans la tête, pas seulement dans la cible.

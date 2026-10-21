@@ -601,10 +601,14 @@ def _forward_line_commits(history: list[dict], line: int) -> list[dict]:
     position = max(1, int(line))
     touched: list[dict] = []
     for commit in history:
+        # Les hunks d'un commit sont en coordonnées d'avant ce commit : la
+        # position n'est décalée qu'après le dernier hunk (comme `_map_line`).
+        offset = 0
+        moved = None
         for old_start, old_count, new_start, new_count in commit["hunks"]:
             if old_count == 0:
                 if old_start < position:
-                    position += new_count
+                    offset += new_count
                 continue
             old_end = old_start + old_count - 1
             if position < old_start:
@@ -614,9 +618,10 @@ def _forward_line_commits(history: list[dict], line: int) -> list[dict]:
                 if new_count == 0:
                     # ligne supprimée : plus rien à suivre ensuite
                     return list(reversed(touched))
-                position = new_start + min(position - old_start, new_count - 1)
+                moved = new_start + min(position - old_start, new_count - 1)
                 break
-            position += new_count - old_count
+            offset += new_count - old_count
+        position = moved if moved is not None else position + offset
     return list(reversed(touched))
 
 
