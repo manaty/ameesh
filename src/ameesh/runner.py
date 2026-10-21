@@ -698,9 +698,10 @@ class AgentWorker(threading.Thread):
         self.last_turn_subagent_reread = 0
         #: L217b/#2336 : la mesure de la rotation entre deux tours, celle du
         #: plafond — le contexte du dernier appel du fil principal (taille de
-        #: session) —, et sa session ; None = pas de relevé d'appel dans le
-        #: flux (harnais sans usage par appel, tour de résumé, worker relancé) :
-        #: repli sur le grand livre (somme des relectures du tour)
+        #: session) —, et sa session ; Codex : lu dans le journal de session du
+        #: fil (#2932) ; None = pas de relevé d'appel (journal illisible, tour
+        #: de résumé, worker relancé) : repli sur le grand livre (somme des
+        #: relectures du tour), jamais pour la rotation d'un tour Codex
         self.last_turn_context: int | None = None
         self.last_turn_context_session: str | None = None
         #: L81 (étude §6.3) : instant monotone du dernier message humain en
@@ -1735,20 +1736,38 @@ class AgentWorker(threading.Thread):
     def last_turn_context_reread(self) -> tuple[int, str | None]:
         """Contexte du dernier appel au dernier tour, et sa session (L217b) :
         le fil principal relevé dans le flux, sans les sous-agents, ni pour un
-        tour clos avant son `result` ; sans relevé dans le flux, les jetons
-        relus par le dernier tour inscrit au grand livre (L60)."""
+        tour clos avant son `result` — pour Codex, dans le journal de session
+        du fil (#2932) ; sans relevé, les jetons relus par le dernier tour
+        inscrit au grand livre (L60)."""
         if self.last_turn_context is not None:
             return self.last_turn_context, self.last_turn_context_session
         return self.last_turn_reread, self.last_turn_reread_session
+
+    def _codex_last_call_context(self, thread: str | None) -> int | None:
+        """#2932 : le contexte du dernier appel d'un fil Codex, lu dans son
+        journal de session (dossiers des comptes déclarés compris, L95), ou
+        None s'il est illisible."""
+        try:
+            book = cost_mod.CostBook(
+                state_dir=self.cfg.state_dir,
+                codex_homes=accounts_mod.homes(self.cfg, "codex"))
+            usage = book.codex_last_call_usage(thread)
+        except Exception as exc:  # mesure seulement : jamais fatale au tour
+            log_async("[%s] codex call context not read (%s)"
+                      % (self.name, " ".join(str(exc).split())[:160]))
+            return None
+        return adapters.context_tokens("codex", usage) if usage is not None else None
 
     def context_rotation_due(self) -> bool:
         """Le contexte de la session dépasse-t-il le plafond ? (L60)
 
         La mesure est celle du plafond du tour (L217b) : le contexte du
-        dernier appel du fil principal, relevé dans le flux ; à défaut, celle
-        de l'alerte `session_too_big` (entrée + entrée relue en cache du
-        dernier tour inscrit au grand livre — un harnais qui ne publie son
-        usage qu'en fin de tour, comme Codex). Chaque étape d'un tour relit
+        dernier appel du fil principal, relevé dans le flux, ou pour Codex,
+        qui ne publie son usage qu'en fin de tour, dans le journal de session
+        du fil (#2932) ; à défaut, celle de l'alerte `session_too_big` (entrée
+        + entrée relue en cache du dernier tour inscrit au grand livre), sauf
+        pour Codex : sans relevé d'appel (journal illisible, worker relancé),
+        il ne tourne pas sur cette somme (#2932). Chaque étape d'un tour relit
         tout le contexte : une session qui grossit coûte de plus en plus cher
         à chaque tour, et l'alerte seule n'y changeait rien. La somme des
         appels d'un tour n'est pas la taille de la session (#2336).
@@ -1757,6 +1776,8 @@ class AgentWorker(threading.Thread):
         relevé soit bien celui de cette session.
         """
         if self.proc is not None or self.session_policy() == "jamais":
+            return False
+        if self.last_turn_context is None and self._ledger_harness() == "codex":
             return False
         plafond = self.context_max_tokens()
         relus, relus_session = self.last_turn_context_reread()
@@ -6779,6 +6800,11 @@ class AgentWorker(threading.Thread):
         # la somme des relectures du tour.
         self.last_turn_context = contexte_appel if relus_mesures else None
         self.last_turn_context_session = session_new or session or None
+        if self.last_turn_context is None and plafonne and harness == "codex":
+            # #2932 : `codex exec --json` ne publie que l'usage cumulé du tour ;
+            # le contexte du dernier appel se lit dans le journal de session
+            self.last_turn_context = self._codex_last_call_context(
+                self.last_turn_context_session)
         if resume and not session_new and not result_code and not error:
             self._resume_drop()  # tour achevé sans id de session : livré
         if relus_sous_agents:
