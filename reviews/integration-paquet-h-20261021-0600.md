@@ -50,9 +50,16 @@ lot et son SHA, et il porte un trailer `ameesh-work: <lot>`.
 
 Aucune : 10 fusions propres.
 
-## Adaptations de composition
+## Adaptations de composition (3, témoins seulement)
 
-Aucune : 10 fusions propres, arbre composé sans adaptation.
+| source | changement | preuve |
+|---|---|---|
+| `tests/test_2931_packet_target.py` | le helper `verdict` pose le reçu exact du jalon (`provenance_receipts`, sujet `milestone:<id>`) | #2928 exige un reçu exact en classe sensible ; les 2 témoins `test_2931_packet_target` redeviennent verts |
+| `tests/test_2924_history_rewrite_provenance.py` | helper `self.verdict(actor, sha)` avec reçu exact pour les verdicts synthétiques des 3 témoins concernés | #2928, classe sensible ; les 3 témoins #2924 verts |
+| `tests/test_1374_fire.py` | le témoin synthétique passe `db=None` à `review_gate` (aucune base à lire, la règle #2928 ne s'applique pas) | les 3 témoins `test_1374_fire` verts ; le chemin avec reçu reste couvert par `test_2928_verdict_provenance` |
+
+Aucune adaptation de code produit : les 10 fusions sont propres et les
+comportements relus sont inchangés.
 
 ## Écartés (ce véhicule)
 
@@ -80,7 +87,10 @@ Aucune : 10 fusions propres, arbre composé sans adaptation.
   `b4ae6da91f19` : **10 prêts, 10 en attente, 0 erreur** ; aucun lot prêt omis.
 - Contenu : 82 fichiers, +7121/−290 hors manifeste ; aucune migration SQL ;
   `git diff --check` propre ; aucun fichier `.github/workflows/**` modifié.
-- Ciblés sur l'arbre composé (local, sans CI) : à compléter.
+- Ciblés sur l'arbre composé (local, sans CI) : 266 tests, 8 rouges de la
+  première passe tous dus à #2928 (reçu exact en classe sensible) ; témoins
+  adaptés ci-dessus, reprise des 3 modules : **134 tests, OK**. Aucune suite
+  complète locale (une seule, en CI).
 - Contrôle d'inclusion `scripts/paquet-inclusion.py` sur `b9dade7f` : 10
   entrées (10 compositions, 0 retrait), 10 lots attendus, 10 prêts,
   verdicts présents 10/10, aucun contenu à lire ni défaut (rc 0).

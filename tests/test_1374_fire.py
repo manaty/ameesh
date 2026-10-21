@@ -549,7 +549,7 @@ class ReadyTest(unittest.TestCase):
                 mock.patch.object(merge_queue, "actor_family", side_effect=_family), \
                 mock.patch.object(merge_queue, "_complete_authors",
                                   return_value=(list(authors), ())):
-            return fire.ready_verdicts(None, object(), self.ROW, marks, repo=repo,
+            return fire.ready_verdicts(None, None, self.ROW, marks, repo=repo,
                                        project=project, target=target)
 
     def test_light_passes_without_a_pr(self):
@@ -584,7 +584,7 @@ class ReadyTest(unittest.TestCase):
                 mock.patch.object(merge_queue, "_complete_authors",
                                   side_effect=AssertionError(
                                       "the packet range must not be pre-read")):
-            ok, why, _ = fire.ready_verdicts(None, object(), self.ROW,
+            ok, why, _ = fire.ready_verdicts(None, None, self.ROW,
                                             _marks(_mark("frozen", A)),
                                             repo=None, project=None, target="main")
         self.assertFalse(ok)

@@ -77,9 +77,20 @@ class PacketTargetTest(PgTestCase):
         return self.lot
 
     def verdict(self, actor, sha=None):
-        storage.of(self.db).work.add_milestone(
+        # #2928 : en classe sensible, un verdict ne compte qu'avec son reçu
+        # exact (acteur, tête) ; le témoin pose le jalon comme le fait
+        # `ameesh work milestone`.
+        mark = storage.of(self.db).work.add_milestone(
             self.lot, "verdict", sha=sha or self.head, actor=actor,
             verdict="ok", note="")
+        harness = {"author": "deepseek", "r_codex": "codex",
+                   "r_claude": "claude"}.get(actor, "deepseek")
+        self.db.execute(
+            "INSERT INTO provenance_receipts"
+            " (subject, sha, actor, session, turn, harness)"
+            " VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (subject) DO NOTHING",
+            ("milestone:%d" % int(mark["id"]), sha or self.head, actor,
+             "s-" + harness, "t", harness))
 
     def need(self):
         """La lecture du véhicule, avec la cible déjà résolue (`self.base`)."""

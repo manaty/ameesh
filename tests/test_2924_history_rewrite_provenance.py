@@ -77,6 +77,21 @@ class _RewriteFixture(PgTestCase):
         return work.milestone(self.db, self.lot, "frozen", sha=sha,
                               actor="impl", repo=self.repo.root)
 
+    def verdict(self, actor, sha, verdict="ok"):
+        """Pose un verdict avec son reçu exact (#2928, classe sensible)."""
+        mark = work.milestone(self.db, self.lot, "verdict", sha=sha,
+                              actor=actor, verdict=verdict)
+        harness = {"impl": "deepseek", "cx3": "codex",
+                   "dev1": "claude"}.get(actor, "deepseek")
+        self.db.execute(
+            "INSERT INTO provenance_receipts"
+            " (subject, sha, actor, session, turn, harness, work_item_id)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            " ON CONFLICT (subject) DO NOTHING",
+            ("milestone:%d" % int(mark["id"]), sha, actor, "s-" + harness,
+             "t", harness, self.lot))
+        return mark
+
     def _build_head_a(self):
         """Base, commit de l'auteur (deepseek), deux correctifs codex."""
         self.repo.write("src/ameesh/runner.py", "base\n")
@@ -156,8 +171,7 @@ class IdenticalRewriteTest(_RewriteFixture):
                  "repo": self.repo.root, "target": self.base,
                  "base_sha": self.base}
         for actor in ("impl", "cx3", "dev1"):
-            work.milestone(self.db, self.lot, "verdict", sha=self.head_b,
-                           actor=actor, verdict="ok")
+            self.verdict(actor, self.head_b)
         out = merge_queue.review_gate(
             self.db, work.milestones(self.db, self.lot), self.head_b,
             repo=self.repo.root, klass=klass, item=self.lot_item(), required=2)
@@ -229,8 +243,7 @@ class RealRewriteTest(_RewriteFixture):
                  "repo": self.repo.root, "target": self.base,
                  "base_sha": self.base}
         for actor in ("cx3", "dev1"):
-            work.milestone(self.db, self.lot, "verdict", sha=self.head_c,
-                           actor=actor, verdict="ok")
+            self.verdict(actor, self.head_c)
         out = merge_queue.review_gate(
             self.db, work.milestones(self.db, self.lot), self.head_c,
             repo=self.repo.root, klass=klass, item=self.lot_item(), required=2)
@@ -324,8 +337,7 @@ class MovedCorrectionTest(_RewriteFixture):
                  "repo": self.repo.root, "target": self.base,
                  "base_sha": self.base}
         for actor in ("impl", "cx3", "dev1"):
-            work.milestone(self.db, self.lot, "verdict", sha=self.head_b,
-                           actor=actor, verdict="ok")
+            self.verdict(actor, self.head_b)
         out = merge_queue.review_gate(
             self.db, work.milestones(self.db, self.lot), self.head_b,
             repo=self.repo.root, klass=klass, item=self.lot_item(), required=2)
