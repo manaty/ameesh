@@ -5,8 +5,24 @@
 Read-only checks, then one real delivery probe:
 
 * stuck mail: an ACTIVE message (one that would open a turn) still undelivered
-  past ``--souffrance`` while its recipient is idle and not paused by the
-  operator on the host -> KO;
+  past ``--souffrance`` while a DRIVEN recipient (live lease) is idle and not
+  paused by the operator on the host -> KO. The live lease is required: no
+  runner can open the turn of an unleased persona, so its pile is not a
+  delivery-chain failure — it is named separately in ``sans_executeur``;
+* operational recipient without executor: an ACTIVE message older than
+  ``--souffrance`` at an executable persona (``mode=execute``) that has no
+  live lease and is not deliberately paused (idle, queued, or a stale
+  ``running``) -> KO too, because operational mail must reach an active
+  recipient; the reason is the missing runner, never a delivery delay. The
+  fix named is to start the runner or resume the agent, not to widen the
+  bound. A ``blocked`` agent without a live lease and outside a budget pause
+  is named with its error, never silently left out (#2899);
+* human profile without executor (``mode=externe`` human sessions, owner key
+  holder: ``key_role=owner`` or ``harness=none``, by construction never run):
+  its pending mail is reported in ``canal_humain`` with the human it belongs
+  to and the read-only command that shows it (``agent-mail inbox <name>``),
+  never as an agent dead letter, and never blocking: the human channel is the
+  owner alert/decision channel, not the agent mailbox (#2899);
 * probe: a system message is dropped to one DRIVEN and FREE persona of the host
   (live lease, not in a turn, not paused by the operator); within ``--attente``
   the persona must answer it with a tool call (``agent-mail send <self> --ack
@@ -121,14 +137,18 @@ def cible_occupee(row: dict, nommee: bool = False) -> str:
 
 
 def stuck(db, rows: list[dict], souffrance: float, now: float) -> list[dict]:
-    """Active undelivered messages older than the bound, idle recipients.
+    """Active undelivered messages older than the bound, driven idle recipients.
 
     A persona paused by the operator is idle but deliberately takes no turn:
-    its waiting mail is expected, not a delivery failure (#2190).
+    its waiting mail is expected, not a delivery failure (#2190). A persona
+    without a live lease cannot open a turn at all: its pile belongs to
+    ``sans_executeur``, not to the delivery chain (#2899).
     """
     out = []
     for row in rows:
         if (row.get("status") or "idle") != "idle" or row.get("operator_paused"):
+            continue
+        if not driven(row, now):
             continue
         for message in mail.unread_active(db, row["name"]):
             if mail.maybe_redelivered(message):
@@ -140,20 +160,115 @@ def stuck(db, rows: list[dict], souffrance: float, now: float) -> list[dict]:
     return out
 
 
+def sans_executeur(db, rows: list[dict], souffrance: float, now: float) -> list[dict]:
+    """Active mail at an operational persona that no live lease serves.
+
+    The recipient is an executable agent (``personas`` already filtered the
+    mode and the stopped ones) and is not deliberately paused. Its mail cannot
+    be delivered, not because the chain is slow but because no runner opens
+    its turn: the report must name that cause and the fix (start the runner or
+    ``ameesh resume`` the agent), never let it pass for a delivery delay
+    (#2899). ``operator_paused`` and a budget pause are deliberate waits: their
+    mail is expected to wait. A ``blocked`` agent without a live lease and
+    without a budget pause is an operational failure: its mail is named too,
+    with its error (never silently dropped from the report).
+    """
+    out = []
+    for row in rows:
+        statut = row.get("status") or "idle"
+        if row.get("operator_paused") or statut in ("stopped", "dead"):
+            continue
+        if statut == "blocked" and (row.get("status_text") or "").startswith("budget : "):
+            continue
+        if driven(row, now):
+            continue
+        messages = [m for m in mail.unread_active(db, row["name"])
+                    if not mail.maybe_redelivered(m)
+                    and now - float(m.get("created_ts") or now) >= souffrance]
+        if not messages:
+            continue
+        oldest = max(now - float(m.get("created_ts") or now) for m in messages)
+        dernier_tour = float(row.get("last_turn_ts") or 0)
+        motif = "aucun bail vivant"
+        if statut == "blocked":
+            motif = "bloqué : %s" % ((row.get("last_error") or row.get("status_text")
+                                      or "sans bail")[:200])
+        out.append({"destinataire": row["name"], "n": len(messages),
+                    "plus_ancien_s": round(oldest, 1),
+                    "statut": statut,
+                    "dernier_tour_s": (round(now - dernier_tour, 1)
+                                       if dernier_tour else None),
+                    "motif": motif})
+    return out
+
+
+def humain_sans_executeur(row: dict) -> bool:
+    """A human identity with no executor (never claimed by a runner).
+
+    ``mode=externe`` is a human session (the chat, the operator's agents);
+    ``key_role=owner`` is the owner's key row and ``harness=none`` the stopgap
+    row the key was first registered on (#330). Such a row is never claimed by
+    a runner: its mailbox is not a delivery target, and its mail must be
+    surfaced on the human channel, not counted as an agent dead letter
+    (#2899).
+    """
+    return ((row.get("mode") or "execute") != "execute"
+            or (row.get("key_role") or "") == "owner"
+            or (row.get("harness") or "") == "none")
+
+
 def toutes_personas(db, hote: str) -> list[dict]:
     """Toutes les personas placees sur ``hote``, meme arretees : une boite
     morte d'une persona arretee doit apparaitre (avis R1 N1)."""
     return [r for r in registry.overview(db) if r.get("host") == hote]
 
 
-def dead_letters(db, hote: str) -> list[dict]:
-    """Dead mailboxes among this host's personas, stopped ones included."""
-    noms = {r["name"] for r in toutes_personas(db, hote)}
+def dead_letters(db, hote: str, rows: list[dict] | None = None) -> list[dict]:
+    """Dead mailboxes of this host's operational personas.
+
+    Human profiles without executor are excluded: their pending mail is an
+    explicit human channel (``canal_humain``), not a dead agent mailbox
+    (#2899)."""
+    rows = toutes_personas(db, hote) if rows is None else rows
+    noms = {r["name"] for r in rows if not humain_sans_executeur(r)}
     out = []
     for letter in storage.of(db).mailbox.dead_letters():
         if letter.get("recipient") in noms:
             out.append({"destinataire": letter["recipient"],
                         "n": int(letter.get("n") or 0)})
+    return out
+
+
+def canal_humain(db, hote: str, now: float,
+                 rows: list[dict] | None = None) -> list[dict]:
+    """Pending mail of this host's human profiles without executor.
+
+    Non-blocking, but never hidden: the report names the human, the age, and
+    the read-only command that shows the mail without marking it read. The
+    owner alert (``stopped_with_mail``) is the pushed channel; this section is
+    the structured, explicit one (#2899)."""
+    rows = toutes_personas(db, hote) if rows is None else rows
+    out = []
+    for row in rows:
+        if not humain_sans_executeur(row):
+            continue
+        messages = mail.unread_active(db, row["name"])
+        if not messages:
+            continue
+        oldest = max(now - float(m.get("created_ts") or now) for m in messages)
+        responsable = row.get("responsible") or None
+        entry = {"destinataire": row["name"], "n": len(messages),
+                 "plus_ancien_s": round(oldest, 1),
+                 "responsable": responsable,
+                 "canal": responsable or "human:?",
+                 "alerte": ("stopped_with_mail"
+                            if (row.get("status") or "") == "stopped"
+                            else "idle_with_mail"),
+                 "lecture": "agent-mail inbox %s" % row["name"]}
+        if len(messages) >= mail.UNREAD_LIMIT:
+            # la lecture est bornee : le compte est un plancher, pas un total
+            entry["tronque"] = True
+        out.append(entry)
     return out
 
 
@@ -294,7 +409,8 @@ def main(argv: list[str] | None = None) -> int:
     # le rapport existe des le depart : toute erreur (base, sonde, courrier)
     # sort en JSON KO, jamais en trace vide (#2190).
     rapport = {"hote": args.hote, "verdict": "ko", "personas": 0,
-               "sha": args.sha, "souffrance": [], "boites_mortes": [],
+               "sha": args.sha, "souffrance": [], "sans_executeur": [],
+               "boites_mortes": [], "canal_humain": [],
                "sonde": None, "pourquoi": None, "attente_s": args.attente,
                "souffrance_s": args.souffrance}
     conn = None
@@ -304,7 +420,10 @@ def main(argv: list[str] | None = None) -> int:
         rows = personas(conn, args.hote)
         rapport["personas"] = len(rows)
         souffrance = stuck(conn, rows, args.souffrance, now)
-        mortes = dead_letters(conn, args.hote)
+        sans = sans_executeur(conn, rows, args.souffrance, now)
+        toutes = toutes_personas(conn, args.hote)
+        mortes = dead_letters(conn, args.hote, toutes)
+        canal = canal_humain(conn, args.hote, now, toutes)
         try:
             if args.serveur and not rows:
                 # le serveur sans executant n'a aucune persona locale : sa chaine
@@ -334,12 +453,13 @@ def main(argv: list[str] | None = None) -> int:
         resultat = (probe(conn, cible, args.sha, args.attente, args.hote)
                     if cible is not None else None)
         verdict = "ok"
-        if souffrance or (resultat is not None and resultat["delai_s"] is None):
+        if souffrance or sans or (resultat is not None and resultat["delai_s"] is None):
             verdict = "ko"
         elif resultat is None:
             verdict = "sans-sonde"
         rapport.update(verdict=verdict, souffrance=souffrance,
-                       boites_mortes=mortes, sonde=resultat, pourquoi=pourquoi)
+                       sans_executeur=sans, boites_mortes=mortes,
+                       canal_humain=canal, sonde=resultat, pourquoi=pourquoi)
     except SystemExit:
         raise
     except Exception as exc:  # noqa: BLE001 — le rapport KO porte l'erreur
@@ -356,9 +476,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(rapport, ensure_ascii=False))
     else:
-        print("courrier %s : %d persona(s), souffrance %s, boites mortes %s"
+        print("courrier %s : %d persona(s), souffrance %s, sans executant %s, "
+              "boites mortes %s, canal humain %s"
               % (args.hote, rapport["personas"], rapport["souffrance"] or "aucune",
-                 rapport["boites_mortes"] or "aucune"))
+                 rapport["sans_executeur"] or "aucun",
+                 rapport["boites_mortes"] or "aucune",
+                 rapport["canal_humain"] or "aucun"))
         if rapport.get("erreur"):
             print("courrier %s : KO sonde (%s)" % (args.hote, rapport["erreur"]))
         elif resultat is None:

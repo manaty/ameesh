@@ -25,14 +25,18 @@ Inputs, all from machine sources (never a note, an assignment or a name):
 - **authors**: the lot's assignee at freeze (`review_lot._author_at_freeze`,
   the historical turn trace, the same reference family as the merge gate) and
   every commit of the frozen range through its exact provenance receipt
-  (#1465), except a designated reviewer's first-round correction under the §2
-  threshold (#2638: ≤ ~50 changed lines, no design). A commit without a
-  receipt is attributed by its agent committer's session family in the turn
-  journal (`review_authors`, #2681): the reference author stays the author, a
-  designated reviewer's small fix stays a correction; any other commit makes
-  the designation wait, because an unknown family cannot prove independence.
-  #2721 names that fallback in the mark (`proof: turn-journal`,
-  `fallback_commits`), never as an exact receipt;
+  (#1465). A designated reviewer's correction is an authored commit of the
+  head, whatever its size (#2888): it makes their family an author, and the
+  §2 threshold only decides whether the correction should have been pushed at
+  all (too big or a design change returns to the author). The authors of the
+  lot's earlier freezes whose content subsists stay authors (#2924): an
+  identical-content history rewrite does not make their families independent.
+  A commit without a receipt is attributed by its agent committer's session
+  family in the turn journal (`review_authors`, #2681): the reference author
+  stays the author, a designated reviewer's fix remains their correction and an
+  author; any other commit makes the designation wait, because an unknown
+  family cannot prove independence. #2721 names that fallback in the mark
+  (`proof: turn-journal`, `fallback_commits`), never as an exact receipt;
 - **candidates**: the registry rows of the lot's project, real session family
   only (`registry.live_harness`), availability and open-lot load;
 - **pilot**: the project's `orchestrateur` in the canon, when registered; an
@@ -157,8 +161,9 @@ class Inputs:
     policy: Policy
     authors: list
     unknown_authors: list
-    #: designated reviewers' small first-round corrections (#2638): never
-    #: designated again, their family stays eligible (#2739)
+    #: designated reviewers' small first-round corrections (#2739): they are
+    #: authors of the head (#2888), so their family is excluded; the list keeps
+    #: their exact names for the personal exclusion and the trace
     correctors: list
     candidates: list
     notify: str
@@ -683,7 +688,8 @@ def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
 
 def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
                         repo: str, base: str, head: str, *, families=(),
-                        commits=None) -> tuple[list, list, list]:
+                        commits=None, strict: bool = False,
+                        families_out: Optional[dict] = None) -> tuple[list, list, list]:
     """`(auteurs, inconnus, correcteurs)` de la plage gelée `base..head` (#2681/#2739).
 
     La même lecture partagée que la désignation (`review_authors.reading`),
@@ -694,6 +700,12 @@ def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
     un correcteur retiré par une désignation ultérieure. Ne lève pas sur un
     inconnu : l'appelant décide (la porte refuse fermé, le train lève).
 
+    #2961 : `strict=True` (la porte) fait d'un reçu de provenance contradictoire
+    une erreur au lieu d'une absence — la famille de la référence ne se
+    remplace alors pas au registre courant. `families_out` reçoit les familles
+    prouvées par acteur : une famille vide est une absence **ou** une
+    ambiguïté, et la porte distingue les deux.
+
     #2803 : `commits` remplace la plage `base..head` quand l'appelant l'a
     déjà calculée — le delta propre d'un véhicule de paquet, seul contenu que
     sa porte relit (`packet_reviews.need`). La lecture des auteurs et des
@@ -703,7 +715,9 @@ def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
     if commits is None:
         _start, _paths, commits = _range(repo, base, head)
     return review_authors.reading(db, item, milestone, commits, repo,
-                                  families=families)
+                                  families=families, strict=strict,
+                                  families_out=families_out,
+                                  base=base, head=head)
 
 
 def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
@@ -712,10 +726,12 @@ def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
 
     Read from the exact frozen commits and their provenance receipts, never
     from a designation mark: a head re-integrated under a new SHA is read as it
-    stands (#2739). `milestone` is the lot's freeze when it is this head; it
-    lets `_designated_reviewers` recognise a corrector retired by a later
-    designation. The caller (the merge gate) handles an unreadable range as it
-    must; this reader invents no name.
+    stands (#2739). A corrector is an author of this head (#2888): the caller
+    excludes their family like any author's, and this list keeps their exact
+    names for the personal exclusion. `milestone` is the lot's freeze when it
+    is this head; it lets `_designated_reviewers` recognise a corrector retired
+    by a later designation. The caller (the merge gate) handles an unreadable
+    range as it must; this reader invents no name.
     """
     _authors, unknown, correctors = attribution_of_head(
         db, item, milestone, repo, base, head, families=families)
@@ -841,10 +857,13 @@ def _manual_seats(manual: Sequence[str], listing: Sequence[Mapping],
     family and from the other manual reviewers. An unknown family, or the
     author's family, does not prove independence: the seat remains missing and
     is designated automatically. A corrector cannot count its own seat either
-    (#2739): its family stays eligible, its name does not. The list is ordered
-    like the column.
+    (#2739/#2888): a corrector is an author of this head, so its family is
+    forbidden like any author's and its name does not cover a seat. The list is
+    ordered like the column.
     """
     forbidden_names, forbidden_families = rd.families_of(authors)
+    _names, corrector_families = rd.families_of(correctors)
+    forbidden_families = forbidden_families | corrector_families
     forbidden_names = forbidden_names | rd.names_of(correctors)
     rows = {str((row or {}).get("name") or ""): row for row in listing or ()}
     covered = set(forbidden_families)
@@ -965,7 +984,8 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         candidates = [candidate for candidate in candidates
                       if candidate.name != notify]
     authors, unknown, correctors = review_authors.reading(
-        db, item, freeze, commits, repo, families=policy.families, trace=True)
+        db, item, freeze, commits, repo, families=policy.families, trace=True,
+        base=start, head=frozen_sha)
     return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=paths,
                   commits=commits, policy=policy, authors=authors,
                   unknown_authors=unknown, correctors=correctors,
@@ -1684,11 +1704,11 @@ def _excluded_on_freeze(cfg, db, item: Mapping, freeze: Mapping) -> set[str]:
     """Les noms que la porte écarte sur cette tête gelée (#2812).
 
     Même lecture que la porte et la désignation (`review_authors.reading`) :
-    les auteurs de la plage gelée et les petits correctifs de premier tour des
-    relecteurs désignés. Le gel n'envoie donc pas l'invitation à un agent qui
-    ne peut pas rendre un avis indépendant. Une lecture impossible rend
-    l'ensemble vide : la notification garde son comportement historique et ne
-    perd jamais un gel.
+    les auteurs de la plage gelée, correcteurs de relecteur compris (ils sont
+    auteurs de la tête, #2888). Le gel n'envoie donc pas l'invitation à un
+    agent qui ne peut pas rendre un avis indépendant. Une lecture impossible
+    rend l'ensemble vide : la notification garde son comportement historique et
+    ne perd jamais un gel.
     """
     sha = str((freeze or {}).get("sha") or "").strip().lower()
     if cfg is None or db is None or not sha:
@@ -1703,7 +1723,8 @@ def _excluded_on_freeze(cfg, db, item: Mapping, freeze: Mapping) -> set[str]:
             return set()
         _start, _paths, commits = _range(repo, base, sha)
         authors, _unknown, correctors = review_authors.reading(
-            db, item, dict(freeze or {}), commits, repo, families=())
+            db, item, dict(freeze or {}), commits, repo, families=(),
+            base=base, head=sha)
     except Exception:  # noqa: BLE001 - plage illisible : comportement historique
         return set()
     return {str(row.get("name") or "").strip().lower()
@@ -1724,10 +1745,10 @@ def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mappi
     perd jamais un gel : la notification est au mieux.
 
     #2812 : on n'invite pas un agent que la porte écarte sur cette tête — un
-    auteur de la plage gelée ou un relecteur dont le petit correctif de premier
-    tour est lu par `review_authors.reading`. `excluded` est la lecture déjà
-    faite par la désignation ; à défaut (`None`), elle est refaite ici, et son
-    échec laisse le courrier historique."""
+    auteur de la plage gelée, y compris un relecteur dont la correction est un
+    commit de la tête (#2888). `excluded` est la lecture déjà faite par la
+    désignation ; à défaut (`None`), elle est refaite ici, et son échec laisse
+    le courrier historique."""
     lot = int((item or {}).get("id") or 0)
     freeze_id = int((freeze or {}).get("id") or 0)
     sha = str((freeze or {}).get("sha") or "").strip().lower()
@@ -1769,7 +1790,7 @@ def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mappi
         excluded = _excluded_on_freeze(cfg, db, item, freeze)
     for key, row, mark_sha in candidates:
         if key in excluded:
-            # #2812 : auteur de la tête ou auteur d'un petit correctif, son
+            # #2812/#2888 : auteur de la tête ou correcteur de relecteur, son
             # avis ne compterait pas sur cette tête ; ne pas l'inviter.
             continue
         prefix = "%s%d:%d:%s:" % (SUPERSEDED_PREFIX, lot, freeze_id, key)

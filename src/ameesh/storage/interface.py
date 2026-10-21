@@ -55,7 +55,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    leases          claim attach_claim state renew release turn_in_progress
                    reap clear_session take_pending_prompt begin_turn
                    restore_prompt end_turn adopt_session_origin
-   pending_spend   put set_model get clear (Postgres optional: put_get clear_if)
+   pending_spend   put set_model set_resident_usage get clear
+                   (Postgres optional: put_get clear_if)
    turn_costs      last_reading insert spent ledger correct last_before first_after
    mailbox         send unread unread_active unread_urgent get mark_delivered reserve
                    deliver release unread_counts history pending_recipients
@@ -533,11 +534,29 @@ class Catalog(Domain):
 class PendingSpend(Domain):
     """Marqueur comptable d'un tour (`spend_pending`) : une ligne par agent.
 
+    Le marqueur porte son identité **exacte** (#2166) : `created_at`, texte
+    UTC à la microseconde, et `spend_key`, la clé du grand livre
+    (`turn_costs.spend_key`, L60) et de la réservation #1469. Une écriture
+    conditionnelle s'y compare, jamais à un `extract(epoch)::float8` relu —
+    une connexion à précision réduite (`extra_float_digits=0`) en perd les
+    derniers chiffres. `spend_key` est NULL sur les marqueurs d'avant 0471 :
+    leur réparation retrouve la clé déjà écrite par leur tour (ligne ou
+    réservation) par l'identité du tour, jamais par un float8 recalculé ni
+    par l'ordre des écritures ; plusieurs candidats incohérents suspendent
+    (`ledger_ambiguous`).
+
+    #2905 : la colonne `spend_key` n'est crue que si elle est l'identité
+    exacte du marqueur. Après un retour arrière de version (§14), l'ancien
+    `put` réécrit cette identité sans la clé : la colonne garde alors celle du
+    tour précédent, que `get` traite comme NULL (repli par l'identité du tour)
+    — l'écrire ferait perdre le coût du tour au conflit de
+    `turn_costs.spend_key`.
+
     Extensions PostgreSQL optionnelles (#1469), détectées par `hasattr` :
     `put_get(name, start_index, turn, model)` écrit et rend le marqueur comme
-    `get`, dans la même instruction ; `clear_if(name, created_ts)` ne retire
-    que ce marqueur. Absentes de l'interface distante : elle garde les
-    opérations de base, avec le contrôle du bail côté serveur.
+    `get`, dans la même instruction ; `clear_if(name, created_at, spend_key)`
+    ne retire que ce marqueur. Absentes de l'interface distante : elle garde
+    les opérations de base, avec le contrôle du bail côté serveur.
     """
 
     @abc.abstractmethod
@@ -556,16 +575,33 @@ class PendingSpend(Domain):
 
     @abc.abstractmethod
     def set_resident_usage(self, name: str, usage: dict | None,
-                           created_ts: float | None = None) -> bool:
+                           created_at: str | None = None,
+                           spend_key: str | None = None) -> bool:
         """Pose (ou efface avec None) l'événement `resident.turn` du marqueur
-        (L80a) ; faux s'il n'y a pas de marqueur, ou si `created_ts` désigne
-        un autre marqueur. Cet état durable permet à un worker de remplacement
-        de réparer un tour résident dont l'événement n'a pas été écrit."""
+        (L80a) ; faux s'il n'y a pas de marqueur, ou si `created_at`/`spend_key`
+        désignent un autre marqueur. `created_at` est le texte exact rendu par
+        `get`/`put_get` (#2166), jamais un float8 relu. Cet état durable permet
+        à un worker de remplacement de réparer un tour résident dont
+        l'événement n'a pas été écrit."""
 
     @abc.abstractmethod
     def get(self, name: str) -> dict | None:
-        """Le marqueur (agent, start_index, turn, model, created_ts,
-        work_item_id, turn_id, resident_usage), ou None."""
+        """Le marqueur (agent, start_index, turn, model, created_at,
+        created_ts, spend_key, ledger_key, ledger_ambiguous, work_item_id,
+        turn_id, resident_usage), ou None. `created_at` est l'identité exacte
+        (#2166) ; `spend_key` est l'identité brute portée par la colonne (NULL
+        avant 0471 ; elle borne `clear_if`/`set_resident_usage` et peut être
+        périmée après un retour arrière, #2905) ; `ledger_key` est la clé fiable
+        déjà écrite par ce tour — celle du marqueur seulement si la colonne EST
+        son identité (`agent:index:created_at`, le format de `put`), ou celle
+        l'identité du tour (`turn_id`, instant de pose, époque de la clé égale
+        à un arrondi historique exact du marqueur, jamais une fenêtre), et la
+        ligne/réservation doit suivre le marqueur — jamais par le seul index
+        de début ni par ordre temporel ;
+        `ledger_ambiguous` vrai interdit de deviner et suspend la comptabilité
+        (B1, notamment une réservation étrangère au même index) ;
+        `created_ts` reste l'epoch float8 pour le début du tour
+        (`turn_costs.started_at`)."""
 
     @abc.abstractmethod
     def clear(self, name: str) -> bool:
@@ -1070,12 +1106,45 @@ class Mailbox(Domain):
         """Messages non remis marqués `payload.urgent`."""
 
     @abc.abstractmethod
-    def unread_mid_turn(self, recipient: str, limit: int) -> list[dict]:
+    def unread_human(self, recipient: str, limit: int, *,
+                     names: Sequence[str] | None = None) -> list[dict]:
+        """L77/B13 : messages non remis d'un humain ACTIF, filtrés DANS la requête.
+
+        Un humain (`payload.human`, ancien expéditeur `human:*`, ou nom
+        déclaré de l'hôte dans `names`, None = aucun) ne doit pas rester
+        invisible derrière plus de `UNREAD_LIMIT` non-lus ordinaires : le rang 2
+        le sert avant la suite et la consigne en attente. Du plus ancien au
+        plus récent.
+
+        L77/B14 : les passifs (copie `cc`, accusé…) sont écartés par la
+        requête, comme par `mail.passive_reason` — une copie humaine ne
+        remplit pas la fenêtre devant un humain actif.
+        """
+
+    @abc.abstractmethod
+    def unread_human_page(self, recipient: str, limit: int, *,
+                          after_id: int | None = None,
+                          names: Sequence[str] | None = None) -> list[dict]:
+        """L77/B14 : les humains actifs d'APRÈS `after_id`, du plus ancien au
+        plus récent.
+
+        Le serveur médié borne chaque page à 200 et `unread_human` n'a pas de
+        décalage : un préfixe de plus de 200 humains retenus (lots retenus)
+        ne se franchit qu'avec un curseur. `after_id` est l'id du dernier
+        message de la page précédente ; None lit depuis le début. Les passifs
+        sont écartés comme dans `unread_human`.
+        """
+
+    @abc.abstractmethod
+    def unread_mid_turn(self, recipient: str, limit: int, *,
+                        include_human: bool = True) -> list[dict]:
         """L514/#885 : les messages non remis qu'une remise mi-tour peut
         livrer — verdict, arbitrage, message d'un humain, urgent
         (`mail.mid_turn`) —, du plus ancien au plus récent, sans s'arrêter
         aux `UNREAD_LIMIT` premiers non-lus : un verdict derrière plus de 200
-        non-lus est vu au prochain point sûr, pas à la fin du tour."""
+        non-lus est vu au prochain point sûr, pas à la fin du tour.
+        `include_human=False` (L77/B11) : les messages humains sont laissés à
+        la file du tour résident."""
 
     @abc.abstractmethod
     def get(self, message_id: int) -> dict | None:

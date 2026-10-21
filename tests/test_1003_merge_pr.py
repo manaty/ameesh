@@ -146,7 +146,12 @@ class _Base(unittest.TestCase):
                                             str(item.get("assignee") or ""), "")}],
                                       ())),
                 mock.patch.object(merge_queue, "_attribution_on_freeze",
-                                  return_value=None)):
+                                  return_value=None),
+                # #2928 : en classe sensible, un verdict ne compte que sur son
+                # reçu exact. Ce banc simule tout le stockage (pas de base
+                # réelle) : les avis de `ready_marks` portent leur reçu.
+                mock.patch.object(merge_queue, "_exact_verdict_receipt",
+                                  side_effect=self._verdict_receipt)):
             patch.start()
             self.addCleanup(patch.stop)
 
@@ -156,6 +161,18 @@ class _Base(unittest.TestCase):
 
     def _events(self, db, item_id, limit=100):
         return list(reversed(self.journal))
+
+    def _verdict_receipt(self, db, mark):
+        """#2928 : le reçu exact synthétique d'un avis de `ready_marks`."""
+        marker = int((mark or {}).get("id") or 0)
+        for known in self.lot_marks:
+            if int(known.get("id") or 0) != marker:
+                continue
+            actor = str(known.get("actor") or "")
+            return {"subject": "milestone:%d" % marker, "actor": actor,
+                    "session": "s-" + self.FAMILIES.get(actor, ""),
+                    "turn": "t", "harness": self.FAMILIES.get(actor, "")}
+        return None
 
     def _lot_row(self, db, lot, *a, **kw):
         row = {"id": int(lot), "state": "build", "branch": self.lot_branch,

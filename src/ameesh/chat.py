@@ -205,8 +205,9 @@ def post_human_message(cfg: Config, db, *, human: str, sender: str, agent: str,
 
     Le serveur écrit : l'appelant a authentifié `human` (`human:<id>`, le
     rédacteur) et vérifié son droit de parler à `agent` (0033 §7/§9 ; L86
-    vérifie le jeton OIDC et le lien au canon, jamais ici) ; `sender` est le
-    nom de boîte nu, tel que `agent-mail send` l'écrit. Le message part
+    vérifie le jeton OIDC et le lien au canon, jamais ici) ; `sender` est
+    l'identité de boîte de l'humain, normalisée en `human:<id>` (L77/B1) —
+    un nom nu est accepté et normalisé. Le message part
     d'abord dans la boîte (il réveille l'agent, `payload human`), puis il est
     reflété par une entrée `human_message` : `mail.send` écrit la copie
     lisible (R12), l'entrée ne porte donc pas de seconde sortie. Un échec
@@ -223,6 +224,8 @@ def post_human_message(cfg: Config, db, *, human: str, sender: str, agent: str,
         raise ValueError("invalid agent name: %r" % (agent,))
     row = registry.get(db, agent)
     work_item_id = None if lot is None else str(lot)
+    from . import resident_queue
+    sender = resident_queue.human_ref(sender) or sender
     message_id = mail.send(db, sender, agent, text, host=cfg.host, kind="notify",
                            payload={"human": True}, work_item_id=work_item_id)
     log = conversation.Log(db, cfg, agent=agent,
@@ -424,12 +427,27 @@ class TerminalClient:
     # -- identité ----------------------------------------------------------
 
     def _identity(self, work):
-        """L'expéditeur des messages : l'humain local s'il est connu, sinon son identité de chat."""
+        """L'expéditeur des messages : l'humain local s'il est connu, sinon son identité de chat.
+
+        L77/B1 : l'humain est déposé sous sa forme normalisée `human:<id>` (la
+        même que les décisions) ; le nom nu reste celui du chat `chat-…`.
+        """
         from . import decisions
         user = decisions.unix_user()
-        if work.known_human(self.db, user, self.cfg):
-            return user, True
+        human = work.known_human(self.db, user, self.cfg)
+        if human:
+            return human, True
         return default_name(user), False
+
+    def _may_interrupt(self) -> bool:
+        """L77/B1 : `AMEESH_INTERRUPT_SENDERS` se lit sur le nom nu de
+        l'humain (`human:<id>` est sa forme de boîte)."""
+        allowed = tuple(getattr(self.cfg, "interrupt_senders", ()) or ())
+        if self.sender in allowed:
+            return True
+        if self.human and self.sender.startswith("human:"):
+            return self.sender.split(":", 1)[1] in allowed
+        return False
 
     # -- lecture -----------------------------------------------------------
 
@@ -541,7 +559,13 @@ class TerminalClient:
         if not text:
             return True
         payload: dict = {"human": True} if self.human else {}
-        if urgent and self.sender in self.cfg.interrupt_senders:
+        if payload:
+            from . import identity, resident_queue
+            binding = identity.resolve_binding(self.cfg, getattr(self, "db", None))
+            if binding.source == "none":
+                user, host = resident_queue.local_account(self.cfg)
+                payload["human_account"] = "%s@%s" % (user or "?", host or "?")
+        if urgent and self._may_interrupt():
             payload["urgent"] = True
         elif urgent:
             self.view.line("  ! %s may not interrupt a turn (AMEESH_INTERRUPT_SENDERS): "
@@ -562,7 +586,7 @@ class TerminalClient:
         if self.read_only:
             self.view.line("  ! read-only: %s" % self.read_only)
             return True
-        if self.sender not in self.cfg.interrupt_senders:
+        if not self._may_interrupt():
             self.view.line("  ! !stop refused: %s is not allowed to interrupt a turn "
                            "(AMEESH_INTERRUPT_SENDERS)" % self.sender)
             return True
@@ -604,7 +628,8 @@ class TerminalClient:
             self.view.line("  read-only: %s" % self.read_only)
         else:
             self.view.line("  typing as %s; type !help for the commands"
-                           % ("human %s" % self.sender if self.human else self.sender))
+                           % ("human %s" % self.sender.split(":", 1)[-1]
+                              if self.human else self.sender))
         try:
             return self.loop(cursor)
         except KeyboardInterrupt:

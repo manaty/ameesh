@@ -1095,6 +1095,218 @@ class Leases(interface.Leases):
 
 class PendingSpend(interface.PendingSpend):
 
+    #: #2166 : identité exacte du marqueur, en texte UTC à la microseconde.
+    #: Jamais `extract(epoch ...)::float8` relu : une connexion qui l'imprime
+    #: à précision réduite (`extra_float_digits=0`, pools, production) en perd
+    #: les derniers chiffres, et la comparaison échouait après le règlement.
+    _EXACT_CREATED_AT = (
+        "to_char(created_at at time zone 'UTC',"
+        " 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')")
+
+    #: #2166/B1 : l'instant de pose du marqueur vit aussi dans `started_at`
+    #: et dans l'époque de la clé historique (`agent:index:epoch`). Cette clé
+    #: a été écrite par une connexion dont `extra_float_digits` pouvait être
+    #: réduit : à -5, PostgreSQL n'imprime que 10 chiffres significatifs, soit
+    #: la seconde entière pour une époque actuelle (~1,8e9 s) — un arrondi
+    #: pouvant atteindre 0,5 s, pas 123 ms. On ne compare donc pas à une
+    #: fenêtre : l'époque de la clé doit être EXACTEMENT l'un des arrondis que
+    #: l'ancienne connexion a pu produire (0 à 6 décimales, les deux voisins
+    #: en cas d'égalité car PostgreSQL arrondit au pair). Un tour étranger
+    #: à un autre instant n'en fait pas partie, même à 0,2 s ; une clé ISO
+    #: (repli exact) est lue comme son époque. La ligne ou la réservation doit
+    #: aussi suivre le marqueur : au même arrondi d'une seconde, celle d'un
+    #: tour antérieur reste étrangère.
+    _HISTORICAL_ROUNDINGS = 6
+
+    def _get_sql(self) -> str:
+        """`get` en UNE instruction : marqueur et clé durable du MÊME état.
+
+        La clé se retrouve par l'identité du tour, jamais par ordre temporel :
+        `turn_id` exact ; sinon `started_at` (instant de pose du marqueur) ;
+        sinon, pour une ligne d'avant 0423, l'époque portée par sa clé, qui
+        doit être un arrondi historique exact de l'instant du marqueur. Une
+        ligne ou une réservation antérieure au marqueur est étrangère, même
+        quand son arrondi tombe dans la même seconde. L'index de début seul ne
+        prouve rien : il est réutilisé après une rotation du flux, donc une
+        réservation (ou une ligne) au même index mais à un autre instant est
+        étrangère. Elle n'est jamais retenue ; une réservation étrangère sans
+        candidat, une réservation étrangère encore ouverte, ou une ligne
+        étrangère au repli rendent la clé indémontrable (`ledger_ambiguous`), et
+        l'appelant suspend au lieu de deviner. Un ancien worker peut écrire sa
+        ligne APRÈS le marqueur de son remplaçant (#1469) : la première ligne
+        après `created_at` n'est pas forcément celle du marqueur.
+
+        La colonne `spend_key` n'est crue que si elle EST l'identité exacte du
+        marqueur (`agent:index:created_at`, le format de `put`, #2905). Après un
+        retour arrière de version (§14), l'ancien `put` réécrit l'identité du
+        marqueur sans la clé : la colonne garde celle du tour précédent, et
+        l'écrire ferait perdre le coût du tour (conflit `turn_costs.spend_key`).
+        Toute autre valeur est traitée comme NULL : le repli par `turn_id`/
+        `started_at` décide.
+        """
+        return f"""
+WITH marqueur_brut AS (
+    SELECT agent, start_index, turn, model, work_item_id, turn_id,
+           resident_usage, spend_key,
+           {self._EXACT_CREATED_AT} AS created_at,
+           extract(epoch from created_at)::float8 AS created_ts,
+           extract(epoch from created_at)::numeric AS epoch
+      FROM spend_pending WHERE agent = %s
+), marqueur AS (
+    SELECT m.*,
+           -- #2905 : la clé du marqueur n'est crue que si elle EST l'identité
+           -- de ce marqueur (`agent:index:created_at`, le format de `put`).
+           -- Après un retour arrière (§14), l'ancien `put` réécrit l'identité
+           -- sans la clé : la colonne garde celle du tour précédent, qui
+           -- ferait perdre le coût du tour (conflit `turn_costs.spend_key`).
+           -- Toute autre valeur est traitée comme NULL : le repli décide.
+           CASE WHEN m.spend_key = m.agent || ':' || m.start_index || ':'
+                     || m.created_at
+                THEN m.spend_key END AS cle_exacte,
+           ARRAY(SELECT v
+                   FROM generate_series(0, {self._HISTORICAL_ROUNDINGS}) AS g(d)
+                   CROSS JOIN LATERAL (
+                       SELECT round(m.epoch, d) AS v
+                       UNION
+                       -- égalité exacte : PostgreSQL arrondit au pair, donc
+                       -- les deux voisins sont des sorties possibles
+                       SELECT floor(m.epoch * power(10::numeric, d))
+                              / power(10::numeric, d)
+                        WHERE mod(m.epoch * power(10::numeric, d), 1) = 0.5
+                   ) AS candidat
+                  ORDER BY v) AS epoques
+      FROM marqueur_brut m
+), lignes_lues AS (
+    SELECT tc.spend_key, tc.turn_id, tc.started_at, tc.recorded_at,
+           m.turn_id AS marqueur_turn_id,
+           m.epoques AS epoques,
+           (left(tc.spend_key,
+                 length(m.agent || ':' || m.start_index || ':'))
+                = m.agent || ':' || m.start_index || ':') AS meme_index,
+           -- une ligne du tour ne peut pas précéder son marqueur : celle d'un
+           -- index réutilisé, même au même arrondi, est étrangère.
+           (tc.recorded_at >= m.created_at::timestamptz) AS posterieure,
+           substr(tc.spend_key,
+                  length(m.agent || ':' || m.start_index || ':') + 1) AS suffixe
+      FROM turn_costs tc
+      JOIN marqueur m ON tc.agent = m.agent
+     WHERE m.cle_exacte IS NULL
+), lignes AS (
+    SELECT *,
+           CASE WHEN suffixe ~ '^[0-9]+([.][0-9]+)?$'
+                THEN suffixe::numeric
+                WHEN suffixe ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T'
+                              '[0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}}[.][0-9]{{6}}Z$'
+                THEN extract(epoch from suffixe::timestamptz)::numeric
+           END AS cle_epoch
+      FROM lignes_lues
+), lignes_identifiees AS (
+    SELECT *,
+           coalesce(cle_epoch = ANY(epoques), false) AS epoque_historique,
+           coalesce(extract(epoch from started_at)::numeric = ANY(epoques),
+                    false) AS debut_historique
+      FROM lignes
+), lignes_retenues AS (
+    SELECT DISTINCT spend_key,
+           CASE
+             WHEN marqueur_turn_id IS NOT NULL
+                  AND turn_id = marqueur_turn_id THEN 1
+             WHEN turn_id IS NULL AND started_at IS NOT NULL AND meme_index
+                  AND posterieure AND debut_historique THEN 2
+             WHEN turn_id IS NULL AND started_at IS NULL AND meme_index
+                  AND posterieure AND epoque_historique THEN 3
+           END AS rang
+      FROM lignes_identifiees
+), meilleur AS (
+    SELECT min(rang) AS rang FROM lignes_retenues
+), retenues AS (
+    SELECT DISTINCT spend_key FROM lignes_retenues
+     WHERE rang = (SELECT rang FROM meilleur)
+), lignes_etrangeres AS (
+    -- repli sans turn_id ni started_at : l'époque de la clé doit être un
+    -- arrondi historique exact du marqueur et la ligne le suivre, sinon c'est
+    -- la ligne d'un index réutilisé.
+    SELECT 1 FROM lignes_identifiees
+     WHERE turn_id IS NULL AND started_at IS NULL AND meme_index
+       AND (NOT posterieure OR NOT epoque_historique)
+), lignes_contradictoires AS (
+    -- l'instant de début et l'époque de la clé désignent deux arrondis
+    -- différents : aucune identité démontrable, même si un seul candidat sort.
+    SELECT 1 FROM lignes_identifiees
+     WHERE turn_id IS NULL AND started_at IS NOT NULL AND meme_index
+       AND posterieure AND debut_historique <> epoque_historique
+), reservations_lues AS (
+    SELECT ar.spend_key, ar.state, ar.created_at AS pose,
+           (left(ar.spend_key,
+                 length(m.agent || ':' || m.start_index || ':'))
+                = m.agent || ':' || m.start_index || ':') AS meme_index,
+           -- une réservation du tour est prise APRÈS son marqueur : celle
+           -- d'un tour antérieur, même au même arrondi, est étrangère.
+           (ar.created_at >= m.created_at::timestamptz) AS posterieure,
+           substr(ar.spend_key,
+                  length(m.agent || ':' || m.start_index || ':') + 1) AS suffixe,
+           m.epoques AS epoques
+      FROM account_reservations ar
+      JOIN marqueur m ON ar.agent = m.agent
+     WHERE m.cle_exacte IS NULL
+), reservations_identifiees AS (
+    SELECT *,
+           CASE WHEN suffixe ~ '^[0-9]+([.][0-9]+)?$'
+                THEN suffixe::numeric
+                WHEN suffixe ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T'
+                              '[0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}}[.][0-9]{{6}}Z$'
+                THEN extract(epoch from suffixe::timestamptz)::numeric
+           END AS cle_epoch
+      FROM reservations_lues
+), reservations AS (
+    -- la réservation du tour porte un arrondi historique de l'époque du
+    -- marqueur dans sa clé et le suit : au même index, une réservation d'un
+    -- autre instant est étrangère.
+    SELECT DISTINCT spend_key FROM reservations_identifiees
+     WHERE meme_index AND posterieure
+       AND coalesce(cle_epoch = ANY(epoques), false)
+), reservations_etrangeres AS (
+    SELECT DISTINCT state FROM reservations_identifiees
+     WHERE meme_index
+       AND (NOT posterieure
+            OR NOT coalesce(cle_epoch = ANY(epoques), false))
+), candidats AS (
+    SELECT spend_key FROM retenues WHERE spend_key IS NOT NULL
+    UNION
+    SELECT spend_key FROM reservations
+), constat AS (
+    SELECT
+      (SELECT count(*) FROM candidats) AS n_candidats,
+      EXISTS (SELECT 1 FROM retenues WHERE spend_key IS NULL) AS sans_cle,
+      EXISTS (SELECT 1 FROM lignes_etrangeres) AS ligne_etrangere,
+      EXISTS (SELECT 1 FROM lignes_contradictoires) AS contradictoire,
+      EXISTS (SELECT 1 FROM reservations_etrangeres
+               WHERE state = 'open') AS ouverte_etrangere,
+      EXISTS (SELECT 1 FROM reservations_etrangeres) AS reservation_etrangere
+)
+SELECT m.agent, m.start_index, m.turn, m.model, m.work_item_id, m.turn_id,
+       m.resident_usage, m.spend_key, m.created_at, m.created_ts,
+       CASE
+         WHEN m.cle_exacte IS NOT NULL THEN m.cle_exacte
+         WHEN c.n_candidats = 1 AND NOT c.sans_cle
+              AND NOT c.ligne_etrangere AND NOT c.contradictoire
+              AND NOT c.ouverte_etrangere
+              AND NOT (c.reservation_etrangere AND c.n_candidats = 0)
+           THEN (SELECT min(spend_key) FROM candidats)
+         WHEN c.n_candidats = 0 AND NOT c.sans_cle
+              AND NOT c.ligne_etrangere AND NOT c.contradictoire
+              AND NOT c.reservation_etrangere
+           THEN m.agent || ':' || m.start_index || ':' || m.created_at
+         ELSE NULL
+       END AS ledger_key,
+       (m.cle_exacte IS NULL
+        AND (c.n_candidats > 1 OR c.sans_cle OR c.ligne_etrangere
+             OR c.contradictoire OR c.ouverte_etrangere
+             OR (c.reservation_etrangere AND c.n_candidats = 0)))
+         AS ledger_ambiguous
+  FROM marqueur m CROSS JOIN constat c
+"""
+
     def put(self, name, start_index, turn, model, work_item_id=None, turn_id=None) -> bool:
         return self.put_get(name, start_index, turn, model,
                             work_item_id=work_item_id, turn_id=turn_id) is not None
@@ -1105,25 +1317,36 @@ class PendingSpend(interface.PendingSpend):
         rows = self.db.query(
             """
             INSERT INTO spend_pending (agent, start_index, turn, model, work_item_id,
-                                       turn_id, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, now())
+                                       turn_id, spend_key, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s,
+                    %s || ':' || %s || ':' ||
+                    to_char(now() at time zone 'UTC',
+                            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+                    now())
             ON CONFLICT (agent) DO UPDATE SET
                 start_index  = excluded.start_index,
                 turn         = excluded.turn,
                 model        = excluded.model,
                 work_item_id = excluded.work_item_id,
                 turn_id      = excluded.turn_id,
+                spend_key    = excluded.spend_key,
                 resident_usage = null,
                 created_at   = now()
             RETURNING agent, start_index, turn, model, work_item_id, turn_id,
-                      resident_usage,
+                      resident_usage, spend_key,
+                      """ + self._EXACT_CREATED_AT + """ as created_at,
                       extract(epoch from created_at)::float8 as created_ts
             """,
             (name, int(start_index), turn, model,
              None if work_item_id is None else int(work_item_id),
-             turn_id or None),
+             turn_id or None, name, int(start_index)),
         )
-        return rows[0] if rows else None
+        if not rows:
+            return None
+        row = rows[0]
+        row["ledger_key"] = row.get("spend_key")
+        row["ledger_ambiguous"] = False
+        return row
 
     def set_model(self, name, model) -> bool:
         rows = self.db.query(
@@ -1132,11 +1355,12 @@ class PendingSpend(interface.PendingSpend):
         )
         return bool(rows)
 
-    def set_resident_usage(self, name, usage, created_ts=None) -> bool:
+    def set_resident_usage(self, name, usage, created_at=None, spend_key=None) -> bool:
         """L80a : l'événement `resident.turn` d'un tour non réglé, dans le
-        marqueur ; `created_ts` borne l'écriture au marqueur de ce tour."""
+        marqueur ; `created_at`/`spend_key` (#2166) bornent l'écriture au
+        marqueur de CE tour, comparés en texte/timestamptz exacts."""
         value = None if usage is None else json.dumps(usage, ensure_ascii=False)
-        if created_ts is None:
+        if created_at is None:
             rows = self.db.query(
                 "UPDATE spend_pending SET resident_usage = %s::jsonb"
                 " WHERE agent = %s RETURNING agent", (value, name))
@@ -1144,32 +1368,54 @@ class PendingSpend(interface.PendingSpend):
             rows = self.db.query(
                 "UPDATE spend_pending SET resident_usage = %s::jsonb"
                 " WHERE agent = %s"
-                " AND abs(extract(epoch from created_at)::float8 - %s) < 0.0000005"
-                " RETURNING agent", (value, name, float(created_ts)))
+                " AND created_at = %s::timestamptz"
+                " AND spend_key IS NOT DISTINCT FROM %s"
+                " RETURNING agent",
+                (value, name, str(created_at), spend_key))
         return bool(rows)
 
     def get(self, name) -> dict | None:
+        """Le marqueur et la clé durable de SON tour, en une seule lecture.
+
+        `ledger_key` est la clé exacte du marqueur s'il la porte ; sinon celle
+        de la ligne `turn_costs` ou de la réservation #1469 de ce tour,
+        retrouvée par son identité (`turn_id`, `started_at`, époque de la clé),
+        jamais par le seul index de début (réutilisé après une rotation) ni
+        par ordre temporel : un ancien worker peut écrire sa ligne après le
+        marqueur de son remplaçant (#1469). L'époque d'une clé historique est
+        un arrondi float8 de l'instant du marqueur : elle est comparée aux
+        arrondis exacts possibles (0 à 6 décimales), jamais à une fenêtre ; la
+        ligne ou la réservation doit aussi suivre le marqueur, sinon elle est
+        étrangère même au même arrondi d'une seconde. Aucun candidat : la clé
+        exacte du marqueur. Candidats incohérents, réservation étrangère sans
+        candidat ou encore ouverte, ligne étrangère au repli : `ledger_key`
+        NULL et `ledger_ambiguous` vrai — l'appelant suspend, il ne devine pas.
+
+        Une seule instruction : le marqueur lu et la clé résolue voient le
+        même état, même si un remplaçant écrit entre-temps.
+        """
         rows = self.db.query(
-            """
-            SELECT agent, start_index, turn, model, work_item_id, turn_id,
-                   resident_usage,
-                   extract(epoch from created_at)::float8 as created_ts
-              FROM spend_pending WHERE agent = %s
-            """,
+            self._get_sql(),
             (name,),
         )
-        return rows[0] if rows else None
+        if not rows:
+            return None
+        row = rows[0]
+        row["ledger_ambiguous"] = bool(row.get("ledger_ambiguous"))
+        return row
 
     def clear(self, name) -> bool:
         rows = self.db.query("DELETE FROM spend_pending WHERE agent = %s RETURNING agent",
                              (name,))
         return bool(rows)
 
-    def clear_if(self, name, created_ts) -> bool:
+    def clear_if(self, name, created_at, spend_key=None) -> bool:
         """#1469 : efface le marqueur seulement s'il est encore celui de ce tour
-        (même `created_ts`) — jamais celui d'un remplaçant, en une instruction."""
+        — même `created_at` exact et même `spend_key` (#2166), jamais celui
+        d'un remplaçant, en une instruction."""
         rows = self.db.query(
             "DELETE FROM spend_pending WHERE agent = %s"
-            " AND abs(extract(epoch from created_at)::float8 - %s) < 0.0000005"
-            " RETURNING agent", (name, float(created_ts)))
+            " AND created_at = %s::timestamptz"
+            " AND spend_key IS NOT DISTINCT FROM %s"
+            " RETURNING agent", (name, str(created_at), spend_key))
         return bool(rows)

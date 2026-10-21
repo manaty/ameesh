@@ -55,6 +55,18 @@ class UpdatedApi(Api):
         return eligible[(page - 1) * size:page * size]
 
 
+class LagApi(Api):
+    """GitHub filters and sorts by an index key that can lag behind updated_at."""
+    def get(self, path, **kw):
+        self.calls.append(path)
+        query = parse_qs(urlsplit(path).query)
+        source = self.comments if urlsplit(path).path.endswith("/comments") else self.issues
+        key = lambda r: r.get("key", r["updated_at"])
+        eligible = sorted([r for r in source if key(r) > query["since"][0]], key=key)
+        page, size = int(query["page"][0]), int(query["per_page"][0])
+        return eligible[(page - 1) * size:page * size]
+
+
 class CollectionTest(unittest.TestCase):
     def test_shared_owner_account_without_marker_is_delivered(self):
         row = dict(comment(), user={"login": "smichea"})
@@ -228,6 +240,42 @@ class CollectionTest(unittest.TestCase):
         events, done, _ = watch.collect_batch(api, SUB, NOW - watch.OVERLAP, NOW + 2, None)
         self.assertEqual([e["object_id"] for e in events], [1])
         self.assertIsNone(done)
+
+    def test_index_lag_after_a_write_past_the_window_is_read_next_window(self):
+        # #2925: just after the projection wrote, GitHub still sorts and filters
+        # the issue by its old key while the row carries the new updated_at.
+        for size in (3, watch.PAGE_SIZE + 5):
+            with self.subTest(full=size > watch.PAGE_SIZE):
+                rows = [issue(n) for n in range(1, size + 1)]
+                for n, row in enumerate(rows):
+                    row["updated_at"] = row["key"] = watch.iso(NOW - 1000 + n)
+                rows[0]["updated_at"] = watch.iso(NOW + 30)
+                api, scan, events = LagApi(rows, [comment()]), None, []
+                for _ in range(10):
+                    batch, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, scan)
+                    events += batch
+                    if scan is None:
+                        break
+                self.assertIsNone(scan)
+                self.assertEqual({e["object_id"] for e in events if e["kind"] == "issue"},
+                                 set(range(2, size + 1)))
+                del rows[0]["key"]  # the index caught up
+                events, _, _ = watch.collect_batch(api, SUB, NOW - watch.OVERLAP, NOW + 60, None)
+                self.assertEqual([e["object_id"] for e in events if e["kind"] == "issue"], [1])
+
+    def test_disorder_inside_the_window_or_on_a_full_page_tail_fails_closed(self):
+        inside = [issue(n) for n in range(1, 4)]
+        for n, row in enumerate(inside):
+            row["updated_at"] = watch.iso(NOW - 1000 - n)
+        tail = [issue(n) for n in range(1, watch.PAGE_SIZE + 1)]
+        for n, row in enumerate(tail):
+            row["updated_at"] = watch.iso(NOW + 30 if n == watch.PAGE_SIZE - 2 else
+                                          NOW + 10 if n == watch.PAGE_SIZE - 1 else
+                                          NOW - 1000 + n)
+        for rows in (inside, tail):
+            with self.subTest(full=len(rows) == watch.PAGE_SIZE):
+                with self.assertRaisesRegex(plan_github.GithubError, "updated order is invalid"):
+                    watch.collect_batch(Api(rows), SUB, NOW - 3600, NOW, None)
 
     def test_collection_bounds_every_excerpt_and_hashes_the_complete_content(self):
         body = "Long request. " * 5000
@@ -617,6 +665,18 @@ class DeliveryTest(PgTestCase):
             self.assertEqual(self.watcher(api).tick(self.db, NOW + 901), [])
         self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW)
         self.watcher(api).tick(self.db, NOW + 1802)
+        self.assertEqual(len(self.messages()), 1)
+
+    def test_failed_pass_is_retried_before_an_hourly_cadence(self):
+        api = Api([issue()])
+        watcher = watch.Watcher(self.cfg, api=api,
+                                declarations=[dataclasses.replace(SUB, interval=3600)])
+        with mock.patch.object(api, "get", side_effect=RuntimeError("GitHub unavailable")):
+            self.assertEqual(watcher.tick(self.db, NOW), [])
+        api.calls.clear()
+        watcher.tick(self.db, NOW + watch.RETRY - 1)
+        self.assertEqual(api.calls, [])
+        watcher.tick(self.db, NOW + watch.RETRY)
         self.assertEqual(len(self.messages()), 1)
 
     def test_dry_run_does_not_advance_or_deposit(self):

@@ -375,17 +375,25 @@ def _waiver(db, item) -> tuple:
 
 
 def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=None,
-                           commits=None):
-    """Les auteurs et correcteurs de la tête gelée (#2681/#2739/#2726).
+                           commits=None, strict=False, families_out=None):
+    """Les auteurs et correcteurs de la tête gelée (#2681/#2739/#2888).
 
     Lecture des commits exacts de la plage gelée et de leur provenance, la même
-    que la désignation : l'auteur de référence et les coauteurs sont des
-    auteurs, un correctif de premier tour de relecteur sous le seuil (#2638)
-    est un correcteur. Rend `(auteurs, correcteurs)`, ou `None` quand aucune
-    lecture n'est possible (pas de base, pas de dépôt, pas de ligne de lot) :
-    la porte garde alors son comportement historique. Lève quand une lecture
-    était possible et a échoué : une porte qui ne peut pas prouver qui a écrit
-    la tête ne compte pas un avis non prouvé (l'indépendance ne se suppose pas).
+    que la désignation : l'auteur de référence, les coauteurs et tout relecteur
+    qui a poussé une correction sont des auteurs. Un petit correctif de
+    premier tour reste listé comme correcteur (#2739), mais il est **auteur de
+    la tête** (#2888) : sa famille est exclue comme celle de tout auteur ; seul
+    son nom sert encore à l'exclusion personnelle. Rend `(auteurs,
+    correcteurs)`, ou `None` quand aucune lecture n'est possible (pas de base,
+    pas de dépôt, pas de ligne de lot) : la porte garde alors son comportement
+    historique. Lève quand une lecture était possible et a échoué : une porte
+    qui ne peut pas prouver qui a écrit la tête ne compte pas un avis non
+    prouvé (l'indépendance ne se suppose pas).
+
+    #2961 : `strict=True` (la porte) refuse un reçu de provenance
+    contradictoire au lieu de le lire comme une absence. `families_out` reçoit
+    les familles prouvées par acteur : une famille vide est une absence ou une
+    ambiguïté, et la porte doit pouvoir les distinguer.
 
     #2803 : `commits` est la liste déjà calculée du delta propre d'un véhicule
     (`packet_reviews.need`) ; la lecture porte alors sur ce seul contenu relu,
@@ -401,7 +409,7 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
     milestone = _freeze_milestone(marks, frozen, repo)
     authors, unknown, correctors = act.attribution_of_head(
         db, item, milestone, repo, base, frozen, families=families or (),
-        commits=commits)
+        commits=commits, strict=strict, families_out=families_out)
     if unknown:
         raise ValueError("author provenance unknown for frozen commit(s): %s"
                          % ", ".join(unknown))
@@ -409,7 +417,7 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
 
 
 def _corrections_on_freeze(db, marks, frozen, *, repo, klass, item, families=None):
-    """Les seuls correcteurs de la tête (#2739), pour les lecteurs historiques."""
+    """Les seuls correcteurs de la tête (#2739), auteurs comme les autres (#2888)."""
     attribution = _attribution_on_freeze(db, marks, frozen, repo=repo, klass=klass,
                                          item=item, families=families)
     if attribution is None:
@@ -417,6 +425,26 @@ def _corrections_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
     _authors, correctors = attribution
     return {str((row or {}).get("name") or "").strip().lower()
             for row in correctors or () if str((row or {}).get("name") or "").strip()}
+
+
+def _exact_verdict_receipt(db, mark) -> dict | None:
+    """Le reçu exact (#1465) d'un verdict, ou None (#2928).
+
+    En classe sensible, un verdict ne compte que s'il porte son reçu de
+    provenance (acteur, session, tour, harnais). Une preuve contradictoire
+    (acteur ou tête discordants) n'est pas une preuve : elle est traitée comme
+    une absence, jamais comme un avis valable. Sans base, il n'y a rien à
+    lire : l'appelant qui passe `family_of` porte alors sa propre preuve
+    historique (le train)."""
+    if db is None:
+        return None
+    from . import review_provenance
+    try:
+        return review_provenance.receipt_for_milestone(db, int((mark or {}).get("id")))
+    except (review_provenance.ProvenanceError, KeyError, TypeError, ValueError):
+        return None
+    except Exception:  # noqa: BLE001 - lecture impossible : aucune preuve
+        return None
 
 
 def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
@@ -449,12 +477,12 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     `authors` (#2681) est l'ensemble des auteurs **reconnus** de la tête, tel
     que l'appelant l'a lu (`review_authors.authors`) : `{name, family}`. La
     porte ne compare plus seulement à l'assigné : un coauteur — tiers avec
-    reçu exact, correcteur de relecteur au-delà du seuil du §2 — ne relit ni
-    lui-même ni sa famille. Un petit correctif de relecteur n'est pas un auteur
-    (#2638) et sa famille reste éligible. La famille de l'assigné historique
-    reste celle de la trace du gel (`family_of`) : le reçu d'un autre commit du
-    même nom ne la remplace pas. Sans `authors`, la porte garde son
-    comportement historique : seul l'assigné est connu.
+    reçu exact —, tout relecteur qui a poussé une correction, même petite
+    (#2888), et les auteurs d'un gel antérieur dont le contenu subsiste (#2924)
+    ne relisent ni eux-mêmes ni leur famille. La famille de l'assigné
+    historique reste celle de la trace du gel (`family_of`) : le reçu d'un
+    autre commit du même nom ne la remplace pas. Sans `authors`, la porte garde
+    son comportement historique : seul l'assigné est connu.
 
     #2808 : l'assigné **titulaire** n'est auteur que s'il a écrit un commit de
     la plage gelée. Quand la porte lit la plage, son nom absent des auteurs
@@ -469,6 +497,13 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     code de porte, mais les familles des reçus/tours à la date des faits au
     lieu du registre courant. Un appelant qui le fournit ne lit ni le registre
     ni le canon compilé.
+
+    #2961 : sans `family_of`, la famille de la référence se lit sur la même
+    trace du gel que la désignation (`review_authors.reference_author`) : reçu
+    du commit, journal des tours, sinon reçu du jalon de gel. Le registre
+    courant ne remplace pas une famille historique prouvée — un auteur gelé en
+    codex puis rouvert en claude au registre garde codex (#2892) ; un reçu de
+    provenance contradictoire refuse la porte (lecture `strict`).
 
     #2726 : sans `authors`, la porte lit elle-même les auteurs reconnus de la
     plage gelée quand le dépôt, la base et la ligne du lot sont connus
@@ -487,12 +522,11 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     (`packet_reviews._is_review_free`) ; la lecture le filtre encore par
     sûreté. Sans delta propre, aucun avis n'est dû (`required == 0`).
 
-    #2739 : l'auteur d'un petit correctif de relecteur tenu hors des auteurs
-    (#2638) ne relit pas son propre correctif. La porte lit les commits exacts
-    de la plage gelée (`corrections_of_head`) et écarte son avis **par son
-    nom**, sans exclure sa famille : un autre agent de la même famille reste
-    éligible. Quand la plage ne peut pas être lue, la porte échoue fermé si la
-    lecture était possible (dépôt, base et ligne de lot connus).
+    #2739/#2888 : le relecteur qui a poussé un correctif est un auteur de la
+    tête. Son avis est écarté **par son nom** (la lecture exacte de la plage,
+    `corrections_of_head`) et sa famille est exclue comme celle de tout auteur.
+    Quand la plage ne peut pas être lue, la porte échoue fermé si la lecture
+    était possible (dépôt, base et ligne de lot connus).
 
     #2664 : les familles viennent du canon compilé (`families`, sinon lues par
     `review_lot.compiled_families` au dernier commit audité). Un canon
@@ -516,8 +550,15 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     ici quand `cfg` et `target` sont fournis. Un véhicule sans membre lisible
     garde la lecture historique, jamais un passage à zéro avis.
 
+    #2928 : en classe sensible, un verdict sans reçu exact de provenance
+    (#1465) ne compte pas — même s'il nomme la bonne tête. Le filtre précède
+    le « dernier de chaque relecteur » : un faux `ok` ne masque plus un vrai
+    `blocked`, et sa famille ne peut plus faire passer la porte. Les verdicts
+    écartés sont rendus dans `unproven`.
+
     Rend `{ok, why, class, required, accepted, blocked, waived, author,
-    author_family, authors, corrections, on_freeze, vehicle}` ; ne lève jamais.
+    author_family, authors, corrections, on_freeze, unproven, vehicle}` ; ne
+    lève jamais.
     """
     from . import lot_class
     klass = klass or {}
@@ -543,7 +584,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     out = {"ok": False, "why": "", "error": "", "class": cls, "required": 0,
            "accepted": [], "blocked": [], "waived": waived, "waived_by": waived_by,
            "author": author, "author_family": "", "authors": [],
-           "corrections": [], "on_freeze": 0, "vehicle": None,
+           "corrections": [], "on_freeze": 0, "unproven": [], "vehicle": None,
            "exclude_author_family": exclude_author_family,
            "distinct_families": distinct_families}
     if not frozen:
@@ -573,7 +614,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             # `class_of_paths` et ne porte ni `base_sha` ni `target`. La base
             # de provenance reste celle de la plage gelée du lot : sans elle,
             # `_corrections_on_freeze` rend None et le correcteur d'un petit
-            # correctif compterait sur son propre delta (#2739).
+            # correctif compterait sur son propre delta (#2739/#2888).
             outer = klass or {}
             provenance = {key: outer[key] for key in ("base_sha", "target")
                           if outer.get(key)}
@@ -608,6 +649,31 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     on_freeze = [m for m in (marks or ()) if m.get("kind") == "verdict"
                  and _same_sha(m.get("sha"), frozen, repo)]
     out["on_freeze"] = len(on_freeze)
+    # #2928 : en classe sensible, seul un verdict qui porte son reçu exact
+    # (#1465) compte. Sans cette preuve, un verdict fabriqué au nom d'un
+    # relecteur pendant son tour était compté par le journal, et pouvait
+    # masquer son vrai dernier avis. Le filtre précède le « dernier de chaque
+    # relecteur » : un faux ok ne masque plus un vrai block, et un faux block
+    # ne bloque plus une tête.
+    unproven: list[dict] = []
+    if cls == lot_class.SENSITIVE and db is not None:
+        proven: list = []
+        for mark in on_freeze:
+            actor = str(mark.get("actor") or "").strip()
+            if actor.startswith(work.HUMAN_PREFIX):
+                # la règle vise un **verdict d'agent** sans reçu : un humain
+                # n'a pas de tour managé (sa signature est un autre contrôle).
+                proven.append(mark)
+                continue
+            if _exact_verdict_receipt(db, mark) is None:
+                unproven.append({"id": mark.get("id"),
+                                 "actor": mark.get("actor") or "",
+                                 "verdict": mark.get("verdict") or "",
+                                 "at_ts": mark.get("at_ts")})
+            else:
+                proven.append(mark)
+        on_freeze = proven
+    out["unproven"] = unproven
     latest: dict = {}
     for mark in on_freeze:
         key = str(mark.get("actor") or "").strip().lower() or "?"
@@ -658,37 +724,20 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             name, family = str(entry or "").strip(), ""
         if name and family:
             provided.setdefault(name.lower(), family)
-    try:
-        if family_of is not None:
-            author_family = _family_of(author)
-            if not author_family and author.lower() in provided:
-                author_family = provided[author.lower()]
-        elif author.lower() in provided:
-            author_family = provided[author.lower()]
-        else:
-            author_family = _family_of(author)
-    except RegistryReadError as exc:
-        # #2521 : le registre est illisible, ce n'est pas « famille inconnue ».
-        # La porte refuse toujours (l'indépendance ne se suppose pas) mais le
-        # diagnostic doit dire la lecture impossible, pas un verdict manquant.
-        out["error"] = str(exc)
-        out["why"] = ("no review verdict ok on the freeze %s (class: %s): the agent "
-                      "registry cannot be read (%s), so no verdict can be proven "
-                      "independent (canon §2: independence is never assumed)"
-                      % (frozen[:12], cls, exc))
-        return out
-    out["author_family"] = author_family
     # #2726 : la porte lit elle-même la plage gelée quand l'appelant ne passe
     # pas les auteurs — le feu, la file et le paquet, qui ne les lisaient pas.
     # La même lecture rend les correcteurs (#2739) et échoue fermé quand la
     # provenance manque : une porte qui ne peut pas prouver qui a écrit la tête
     # ne compte pas un avis non prouvé (l'indépendance ne se suppose pas).
     corrections: set = set()
+    proven_families: dict = {}
     try:
         attribution = _attribution_on_freeze(db, marks, frozen, repo=repo,
                                              klass=klass, item=item,
                                              families=families,
-                                             commits=own_commits if vehicle_delta else None)
+                                             commits=own_commits if vehicle_delta else None,
+                                             strict=True,
+                                             families_out=proven_families)
     except Exception as exc:  # noqa: BLE001 - une plage illisible ne conclut pas
         out["error"] = str(exc)
         out["why"] = ("no review verdict ok on the freeze %s (class: %s): the frozen "
@@ -708,6 +757,20 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                        for row in range_correctors or ()
                        if str((row or {}).get("name") or "").strip()}
     out["corrections"] = sorted(corrections)
+    # #2961 : la famille de la référence est celle de la **trace du gel**,
+    # lue avec la plage gelée (`review_authors.reading` : reçu exact du commit,
+    # journal des tours du commit, sinon famille de référence du gel par
+    # `reference_author` en `strict=True` ci-dessus). Le registre courant ne
+    # remplace plus une famille historique prouvée : un auteur gelé en codex
+    # puis rouvert en claude au registre garde codex comme référence (#2892).
+    # `proven_families` distingue une famille vide par absence de preuve d'une
+    # famille vide par ambiguïté (B1) : seule l'absence garde le repli
+    # historique, l'ambiguïté refuse plus bas.
+    reference_entry = next(
+        (row for row in range_authors or ()
+         if isinstance(row, Mapping) and author
+         and str(row.get("name") or "").strip().lower() == author.lower()),
+        None)
 
     def _author_names(rows) -> set:
         return {str((row or {}).get("name") or "").strip().lower()
@@ -727,10 +790,76 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             range_authors)
     else:
         reference_is_author = True
-    # #2681/#2808 : les auteurs **reconnus** de la tête, quand l'appelant les a
-    # lus (`review_authors.authors`). Un tiers avec reçu exact ou un correcteur
-    # au-delà du seuil du §2 s'y ajoute. Un petit correctif de relecteur n'y est
-    # pas (#2638) : sa famille reste éligible.
+    # #2961 B1 : une famille vide n'est pas toujours une absence de preuve.
+    # `families_out` porte les familles réellement prouvées : >1 pour la
+    # référence est une **ambiguïté** (journal du gel codex + reçu de commit
+    # claude, par exemple), jamais un choix à faire au registre courant
+    # (#2755). L'absence de preuve garde, elle, le repli historique.
+    reference_proven: set = set()
+    if attribution is not None and author and reference_is_author:
+        reference_proven = set(proven_families.get(author.lower()) or ())
+        if len(reference_proven) > 1:
+            out["error"] = ("ambiguous historical author family for %s: %s"
+                            % (author, ", ".join(sorted(reference_proven))))
+            out["why"] = (
+                "no review verdict ok on the freeze %s (class: %s): the reference "
+                "author %s has %d proven model families (%s), so no verdict can be "
+                "proven independent (canon §2: independence is never assumed)"
+                % (frozen[:12], cls, author, len(reference_proven),
+                   ", ".join(sorted(reference_proven))))
+            return out
+    try:
+        if family_of is not None:
+            author_family = _family_of(author)
+            if not author_family and author.lower() in provided:
+                author_family = provided[author.lower()]
+        elif reference_is_author and len(reference_proven) == 1:
+            author_family = next(iter(reference_proven))
+        elif reference_entry is not None and not exact:
+            author_family = str(reference_entry.get("family") or "")
+            if not author_family:
+                author_family = (provided.get(author.lower(), "")
+                                 or _family_of(author))
+        elif author.lower() in provided:
+            author_family = provided[author.lower()]
+        else:
+            author_family = _family_of(author)
+    except RegistryReadError as exc:
+        # #2521 : le registre est illisible, ce n'est pas « famille inconnue ».
+        # La porte refuse toujours (l'indépendance ne se suppose pas) mais le
+        # diagnostic doit dire la lecture impossible, pas un verdict manquant.
+        out["error"] = str(exc)
+        out["why"] = ("no review verdict ok on the freeze %s (class: %s): the agent "
+                      "registry cannot be read (%s), so no verdict can be proven "
+                      "independent (canon §2: independence is never assumed)"
+                      % (frozen[:12], cls, exc))
+        return out
+    out["author_family"] = author_family
+    # #2961 (auditeur) : la même distinction pour les autres auteurs lus. Une
+    # entrée sans famille peut cacher deux familles prouvées ; `_complete_authors`
+    # refuse déjà ce cas (R9 B cx2), la porte du composeur doit faire de même.
+    for entry in authors or ():
+        if not isinstance(entry, Mapping):
+            continue
+        name = str(entry.get("name") or "").strip()
+        if not name or str(entry.get("family") or "").strip():
+            continue
+        if author and name.lower() == author.lower():
+            continue
+        proven = set(proven_families.get(name.lower()) or ())
+        if len(proven) > 1:
+            out["error"] = ("ambiguous historical author family for %s: %s"
+                            % (name, ", ".join(sorted(proven))))
+            out["why"] = (
+                "no review verdict ok on the freeze %s (class: %s): the author %s "
+                "has %d proven model families (%s), so no verdict can be proven "
+                "independent (canon §2: independence is never assumed)"
+                % (frozen[:12], cls, name, len(proven), ", ".join(sorted(proven))))
+            return out
+    # #2681/#2808/#2888 : les auteurs **reconnus** de la tête, quand l'appelant
+    # les a lus (`review_authors.authors`). Un tiers avec reçu exact et tout
+    # relecteur qui a poussé un correctif, même petit, s'y ajoutent : leur
+    # famille est exclue.
     recognized: dict = {}
     if author and not exact and reference_is_author:
         recognized[author.lower()] = {"name": author, "family": author_family}
@@ -848,6 +977,9 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     out["why"] = ("no review verdict ok on the freeze %s (class: %s): %d independent review "
                   "verdict(s) required, %s; got %s"
                   % (frozen[:12], cls, required, need, got))
+    if unproven:
+        out["why"] += ("; %d verdict(s) without an exact provenance receipt were not "
+                       "counted (sensitive class, #2928)" % len(unproven))
     return out
 
 
@@ -1115,6 +1247,49 @@ def _commit_author(places, sha: str) -> str:
     return ""
 
 
+def _object_recoverer(where: str, sources):
+    """Rapatrie par SHA un commit historique absent du dépôt de lecture (#2924 B7).
+
+    Le clone scratch de `merge-pr` ne contient que la cible et la tête ; les
+    commits d'un gel antérieur réécrit n'y sont pas. On les demande au dépôt de
+    l'agent ou à l'origine du projet, puis on vérifie que l'objet est bien
+    lisible localement. Aucun ref n'est déplacé et aucune tête n'est changée :
+    seule la preuve manquante est réparée. Rend False (jamais une exception)
+    quand la récupération échoue, pour que l'appelant strict refuse fermé."""
+    def recover(sha: str) -> bool:
+        text = str(sha or "").strip().lower()
+        if not _HEX.fullmatch(text):
+            return False
+        try:
+            if plan_git.local_commit(where, text):
+                return True
+        except Exception:  # noqa: BLE001 - dépôt illisible : on tente les sources
+            pass
+        # Un objet non complet ne se demande pas par SHA ; il a déjà été résolu
+        # localement s'il était lisible.
+        if len(text) not in (40, 64):
+            return False
+        for source in sources or ():
+            source = str(source or "").strip()
+            if not source:
+                continue
+            try:
+                proc = plan_git._git(where, "fetch", "--quiet", "--no-tags",
+                                     "--no-write-fetch-head", "--", source, text,
+                                     timeout=FETCH_TIMEOUT)
+            except Exception:  # noqa: BLE001 - source injoignable : suivante
+                continue
+            if proc.returncode != 0:
+                continue
+            try:
+                if plan_git.local_commit(where, text):
+                    return True
+            except Exception:  # noqa: BLE001 - lecture impossible : source suivante
+                continue
+        return False
+    return recover
+
+
 def _freeze_milestone(marks, frozen, repo: str | None = None):
     """Le jalon de gel quand il nomme cette tête, forme du lecteur partagé.
 
@@ -1137,12 +1312,15 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
 
     Les auteurs de **contenu** sont ceux du lecteur partagé (#2681,
     `review_authors.reading`) : reçus exacts, familles **historiques** du
-    harnais qui a réellement tourné, coauteurs et correcteurs de relecteur
-    au-delà du seuil du §2. Un commit que le lecteur n'attribue pas garde son
-    auteur Git, relu au registre courant : la porte n'oublie pas un auteur
-    parce que sa preuve manque, et ne suppose jamais une famille. S'y ajoutent
-    les **auteurs des fusions** : une fusion peut ajouter du contenu et ne
-    peut pas compter comme relecteur indépendant.
+    harnais qui a réellement tourné, coauteurs et correcteurs de relecteur,
+    quelle que soit la taille de leur correction (#2888). S'y ajoutent les
+    auteurs des gels antérieurs du lot dont le contenu subsiste (#2924) : une
+    réécriture d'historique à contenu identique ne rend pas une famille
+    indépendante. Un commit que le lecteur n'attribue pas garde son auteur Git,
+    relu au registre courant : la porte n'oublie pas un auteur parce que sa
+    preuve manque, et ne suppose jamais une famille. S'y ajoutent les
+    **auteurs des fusions** : une fusion peut ajouter du contenu et ne peut pas
+    compter comme relecteur indépendant.
 
     #2808 : le titulaire n'est **pas semé** dans les auteurs par sa seule
     qualité d'assigné ; les détenteurs du journal non plus. Un détenteur
@@ -1152,11 +1330,18 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
     famille pour attribuer les commits sans reçu ; elle ne devient pas un
     auteur pour autant.
 
+    #2924 B7 : le clone scratch de `merge-pr` ne contient que la cible et la
+    tête. Un gel antérieur réécrit y est absent ; la porte tente de le
+    rapatrier par SHA depuis le dépôt de l'agent puis l'origine du projet
+    (`recover`), et ne refuse que si cette récupération échoue. Les familles
+    ambiguës d'un même acteur (`families_out`) refusent la porte, jamais une
+    famille devinée.
+
     Un auteur hors registre (outil, humain non préfixé) n'a pas de famille de
-    modèle à comparer : il est omis de la liste, jamais supposé. Un petit
-    correctif de relecteur (#2638) ne fait pas de son auteur un auteur de la
-    tête : sa famille reste éligible (#2739), la porte écartant son nom de son
-    propre correctif. Sans magasin (`db is None`, banc ou dry-run), la
+    modèle à comparer : il est omis de la liste, jamais supposé. Un correctif
+    de relecteur, même petit (#2739), fait de son auteur un auteur de la tête :
+    sa famille est exclue, et la porte écarte aussi son nom de son propre
+    correctif (#2888). Sans magasin (`db is None`, banc ou dry-run), la
     provenance n'est pas lisible : les auteurs Git du delta restent la source,
     comme la porte historique. Toute lecture illisible — lecteur partagé,
     cible, gel, `git log`, registre — lève `_ProvenanceError` : la porte
@@ -1174,6 +1359,25 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
     for place in (target_repo, base_repo):
         if place and place not in places:
             places.append(place)
+    # #2924 B7 : les objets d'un gel antérieur réécrit ne sont pas dans le
+    # clone scratch de `merge-pr`. On tente de les rapatrier par SHA depuis le
+    # dépôt de l'agent puis l'origine du projet, avant tout refus.
+    sources: list[str] = []
+    for place in (target_repo, repo, base_repo):
+        text = str(place or "").strip()
+        if text and text != repo and text not in sources:
+            sources.append(text)
+    for place in (target_repo, repo, base_repo):
+        text = str(place or "").strip()
+        if not text:
+            continue
+        try:
+            url = (plan_git._out(text, "remote", "get-url", "origin") or "").strip()
+        except Exception:  # noqa: BLE001 - remote illisible : pas de source
+            url = ""
+        if url and url not in sources:
+            sources.append(url)
+    recover = _object_recoverer(repo, sources)
     reference_name = ""
     reader_names: set[str] = set()
     proven_families: dict[str, set] = {}
@@ -1201,12 +1405,16 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
         commits = _delta_commits(repo, item, frozen, base=base, base_repo=base_repo,
                                  target=target, target_repo=target_repo, queue=queue)
         milestone = _freeze_milestone(marks, frozen, repo)
+        reference_families: dict = {}
         try:
             # #2808 : la référence est l'assigné **au gel**, pas le titulaire
             # courant ; elle n'est auteur que par un commit de la plage. Le
             # repli de famille ne vaut que pour attribuer un commit sans reçu.
+            # #2961 : ses familles prouvées passent à la lecture pour que deux
+            # preuves différentes (journal du gel + reçu) restent ambiguës.
             reference = review_authors.reference_author(
-                db, item, milestone, families, strict=True)
+                db, item, milestone, families, strict=True,
+                families_out=reference_families)
         except Exception as exc:  # noqa: BLE001 - référence illisible : refus
             raise _ProvenanceError(
                 "the reference author of the frozen head cannot be read (%s)"
@@ -1218,7 +1426,8 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
             read, unknown, _correctors = review_authors.reading(
                 db, item, milestone, commits, repo,
                 families=families, strict=True, families_out=proven_families,
-                reference=reference)
+                reference=reference, reference_families=reference_families,
+                base=base, head=frozen, recover=recover)
         except Exception as exc:  # noqa: BLE001 - une lecture illisible ne conclut pas
             raise _ProvenanceError(
                 "the authors of the frozen range cannot be read (%s)" % exc) from exc
@@ -1229,7 +1438,14 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
                 reader_names.add(name.lower())
             add(name, entry.get("family"))
         for sha in unknown or ():
-            add(_commit_author(places, sha))
+            # #2924 B5 : un inconnu qui n'est même pas un commit lisible (un gel
+            # antérieur absent du dépôt scratch, un marqueur « freeze:N ») ne
+            # doit pas être silencieusement ignoré : la porte refuse fermé.
+            fallback = _commit_author(places, sha)
+            if not fallback:
+                raise _ProvenanceError(
+                    "historical author unreadable for the unknown %s" % sha)
+            add(fallback)
     for name in _merge_authors(repo, item, frozen, base=base, base_repo=base_repo,
                                target=target, target_repo=target_repo, queue=queue):
         add(name)
@@ -1756,9 +1972,9 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     # (familles), et aucun blocage non levé ; un `ok` récent ne masque plus le
     # `blocked` d'un autre relecteur (P1-1). #2281 : la dispense de re-verdict
     # du pilote (#1979) lève l'exigence d'avis sur cette tête gelée. #1515 :
-    # la porte lit tous les auteurs du lot — détenteurs du journal et auteurs
-    # du delta gelé (petit correctif de relecteur excepté, #2739) —, pas
-    # seulement l'assigné courant.
+    # la porte lit tous les auteurs du lot — détenteurs du journal, auteurs
+    # du delta gelé et correcteurs de relecteur (#2739/#2888) —, pas seulement
+    # l'assigné courant.
     gate_authors = {}
     if required_verdicts(klass) > 0:
         # #2803/#2766 (B cx1) : sur un véhicule de paquet, la porte borne

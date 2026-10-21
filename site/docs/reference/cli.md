@@ -600,6 +600,7 @@ ameesh placement check [--canon DIR] [--ref REV] [--fetch] [--json] [--agent A]
 ameesh agent name  --role R [--project P …] [--canon DIR] [--ref REV] [--fetch] [--json]
 ameesh agent spawn [name] --by CREATOR --ttl TTL [--role R] [--project P …] [--cwd DIR] [--prompt TEXT] [--json]
 ameesh review-class [FILE …] [--diff REF] [--canon DIR] [--ref REV] [--fetch] [--json]
+ameesh process check FILE [--ref REF] [--version N] [--json]
 ```
 
 | Option | Meaning |
@@ -612,6 +613,13 @@ ameesh review-class [FILE …] [--diff REF] [--canon DIR] [--ref REV] [--fetch] 
 | `--ttl` (spawn) | expiry: `30m`, `2h`, `1d` (max `7d`) |
 | `--role`, `--project` (name, spawn) | role and projects of a generated name; `--project` repeats, several projects drop the repo segment (`<org>-<role>-<seq>`). Segments come from `extensions.ameesh.naming`; a role without a short name is refused, and a name already used by a card or any registry row (stopped agents included) is never reused. Two repos never share a segment and one repo keeps the same segment in every canon (a divergent mesh is refused); a configured canon that cannot be read also refuses generation, naming the canon and its ref |
 | `--diff` (review-class) | files changed since REF (`REF..HEAD` + working tree) |
+
+`ameesh process check` compiles the `workflow:` block of a Process card
+(`processus/*.md`, see [Write a Process card](../guides/write-a-process.md));
+it reads no database and writes nothing. `--ref` and `--version` label the
+checked revision (default `file:<path>` and `0`), `--json` prints the encoded
+native document and labels. Exit 0 when the block compiles (or the card has no
+workflow), 1 on a named refusal, 2 when the file cannot be read.
 
 ## Hosts, capacity and enrolment
 

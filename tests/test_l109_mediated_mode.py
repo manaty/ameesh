@@ -225,15 +225,18 @@ class BailEtPanneTest(MedieBase):
         """#1469 : le backend médié n'a pas d'enveloppe de compte locale."""
         worker = self._worker()
         # r2 : le marqueur n'est effacé que s'il est encore celui de ce tour
+        created_at = "2026-10-20T21:00:00.000000Z"
+        spend_key = "inge-front:0:" + created_at
         self.responder.script["pending_spend.get"] = {
             "agent": "inge-front", "start_index": 0, "turn": "prompt", "model": "m",
-            "created_ts": 123.0}
+            "created_at": created_at, "created_ts": 123.0, "spend_key": spend_key}
         self.responder.script["pending_spend.clear"] = True
         usage = types.SimpleNamespace(reread_tokens=0, session=None)
         with mock.patch("ameesh.cost.CostBook") as book:
             book.return_value.record.return_value = usage
             self.assertTrue(worker._compta_ecrit({
-                "start": 0, "created_ts": 123.0, "turn": "prompt", "model": "m"}))
+                "start": 0, "created_at": created_at, "created_ts": 123.0,
+                "spend_key": spend_key, "turn": "prompt", "model": "m"}))
         self.assertFalse(worker._compta_en_echec)
         self.assertIn("pending_spend.clear", self.transport.ops())
         self.assertFalse(any(op.startswith("budgets.") for op in self.transport.ops()))

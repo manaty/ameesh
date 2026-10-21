@@ -298,6 +298,53 @@ def forcer(cfg, db, explicit: str | None = None) -> str:
         "own bound session, a human terminal says --actor human:<id>" % text)
 
 
+def milestone_actor(cfg, db, explicit: str | None = None, *, kind: str = "") -> str:
+    """#2928 : l'auteur d'un jalon `frozen`/`verdict`, vérifié au chemin d'écriture.
+
+    Même garde que `forcer` (#540), pour la même raison : un jalon est une
+    preuve de relecture, et `--actor` ne doit pas permettre à une session de
+    signer à la place d'un autre agent. Une session qui porte une identité
+    d'agent ne pose le jalon qu'en son propre nom (`--actor` différent :
+    refus) ; une identité refusée ne retombe pas sur le terminal humain. Une
+    session sans identité (un humain à son terminal) nomme un humain
+    (`--actor human:<id>`) — un nom d'agent sans liaison est refusé, sinon
+    n'importe quelle session poserait un verdict au nom d'un relecteur.
+
+    La provenance exacte (#1465) est ensuite écrite dans la même transaction
+    que le jalon ; un tour managé ne peut signer que sa propre preuve.
+    """
+    from . import identity
+
+    text = (explicit or "").strip()
+    if text and not text.startswith(HUMAN_PREFIX):
+        # une graphie d'alias désigne le même agent ; le nom écrit reste le
+        # primaire, comme pour l'acteur ordinaire d'une commande `work`.
+        from .agent_names import resolve
+        text = resolve(text, db=db, cfg=cfg, operation="work.milestone")
+    binding = identity.resolve_binding(cfg, db)
+    if not binding.ok and (binding.name or binding.source != "none"
+                           or os.environ.get("AGENT_MAIL_NAME")):
+        raise WorkError("milestone refused: invalid session identity (%s)"
+                        % (binding.reason or "unbound identity"))
+    if binding.name:
+        if text and text != binding.name:
+            raise WorkError(
+                "milestone refused: this session belongs to %s, it does not post a "
+                "%s milestone on behalf of %s"
+                % (binding.name, kind or "work", text))
+        return binding.name
+    if not text:
+        # aucun nom : le jalon reste anonyme (« inconnu », origine inconnue),
+        # comme avant ; il ne peut pas compter pour un agent à la porte.
+        return UNKNOWN_ACTOR
+    if text.startswith(HUMAN_PREFIX) and len(text) > len(HUMAN_PREFIX):
+        return text
+    raise WorkError(
+        "milestone refused: %s is not a human and this session has no bound agent "
+        "identity (runner lease or `ameesh mail bind`); an agent posts a milestone "
+        "from its own bound session, a human terminal says --actor human:<id>" % text)
+
+
 def pin_authority(cfg, db, actor: str | None = None) -> str | None:
     """#740: who may protect a date from the schedule (`work plan`, `work
     schedule --pin`): the actor `corrector` accepts on a declared role (a
@@ -490,21 +537,32 @@ def _branch_args(branch, target) -> tuple:
 
 
 def set_branch(db: Db, item_id: int, branch: str, target: str | None = None, *,
-               actor: str = "", source: str = "") -> dict:
+               actor: str = "", source: str = "", clear_target: bool = False) -> dict:
     """L118 : la branche (et la cible) d'un lot ouvert ; journalisée. Rend
-    le lot. Une branche identique (et la même cible) ne réécrit rien."""
+    le lot. Une branche identique (et la même cible) ne réécrit rien.
+    `clear_target` (#2931) efface la cible explicite — le lot retombe sur la
+    cible de son projet ou du dépôt ; `target=None` la conserve."""
     branch, target = _branch_args(branch, target)
     if not branch:
         raise WorkError("empty branch")
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
-    if item.get("branch") == branch and (target is None or item.get("branch_target") == target):
+    same = (item.get("branch") == branch
+            and ((clear_target and not item.get("branch_target"))
+                 or (not clear_target
+                     and (target is None or item.get("branch_target") == target))))
+    if same:
         return item
-    target = target if target is not None else (
-        item.get("branch_target") if item.get("branch") == branch else None)
+    if clear_target:
+        target = None
+    else:
+        target = target if target is not None else (
+            item.get("branch_target") if item.get("branch") == branch else None)
     note = "branch %s%s%s (before: %s)" % (
-        branch, " to %s" % target if target else "",
+        branch,
+        " to %s" % target if target else (
+            " (target cleared)" if clear_target else ""),
         " — %s" % source if source else "", item.get("branch") or "none")
     row = storage.of(db).work.set_branch(item_id, branch, target, note=note, actor=actor)
     if row is None:

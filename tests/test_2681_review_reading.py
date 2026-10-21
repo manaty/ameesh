@@ -101,14 +101,19 @@ class GateReadingTest(unittest.TestCase):
         self.assertFalse(same_two["ok"], same_two)
         self.assertEqual([entry["actor"] for entry in same_two["accepted"]], ["r2"])
 
-    def test_a_small_reviewer_fix_keeps_its_family_eligible(self):
-        # #2638 : `review_authors.authors` n'inscrit pas un correctif de
-        # relecteur sous le seuil ; la porte ne voit que les auteurs reconnus
-        # et l'avis de ce relecteur reste recevable.
-        out = self.gate([mark(1, "r1")], required=1,
-                        authors=[{"name": "author", "family": "deepseek"}])
-        self.assertTrue(out["ok"], out["why"])
-        self.assertEqual([entry["actor"] for entry in out["accepted"]], ["r1"])
+    def test_a_small_reviewer_fix_is_an_author_of_the_head(self):
+        # #2888 : un correctif de relecteur, même sous le seuil, est un commit
+        # de la tête ; sa famille est exclue. Un autre agent de la même famille
+        # (r1/claude) ne compte pas non plus.
+        authors = [{"name": "author", "family": "deepseek"},
+                   {"name": "r1", "family": "claude"}]
+        own = self.gate([mark(1, "r1")], required=1, authors=authors)
+        self.assertFalse(own["ok"], own["why"])
+        self.assertEqual(own["accepted"], [])
+        other = self.gate([mark(1, "r2")], required=1, authors=authors)
+        self.assertTrue(other["ok"], other["why"])
+        self.assertEqual([entry["actor"] for entry in other["accepted"]],
+                         ["r2"])
 
     def test_an_unknown_coauthor_family_refuses_closed(self):
         # L'indépendance ne se suppose jamais : une famille d'auteur inconnue

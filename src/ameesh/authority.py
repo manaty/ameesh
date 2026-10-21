@@ -176,6 +176,11 @@ def unb64(text: str) -> bytes:
 def key_info(db: Db, agent: str) -> dict | None:
     from .agent_names import resolve as resolve_agent_name
     agent = resolve_agent_name(agent, db=db, operation="authority.key_info")
+    # L77/B1 : une clé humaine est rangée sous le nom NU (`alice`), alors que
+    # le courrier humain circule sous `human:alice` ; les deux désignent la
+    # même identité pour la vérification.
+    if agent.startswith("human:"):
+        agent = agent.split(":", 1)[1]
     return storage.of(db).keys.info(agent)
 
 

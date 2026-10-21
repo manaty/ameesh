@@ -152,10 +152,70 @@ class Mailbox(interface.Mailbox):
             (recipient, int(limit)),
         )
 
-    def unread_mid_turn(self, recipient, limit) -> list[dict]:
+    def unread_human(self, recipient, limit, *, names=None) -> list[dict]:
+        """L77/B13 : les non-lus d'un humain ACTIF, filtrés DANS la requête —
+        le préfixe des `UNREAD_LIMIT` non-lus ordinaires ne les masque plus.
+
+        `names` (None = aucun) couvre les noms déclarés humains sur l'hôte
+        (ancien `AMEESH_HUMANS`) ; `payload.human` et l'ancien
+        `sender human:*` restent reconnus, comme `mail.is_human`.
+
+        L77/B14 : les passifs (copie `cc`, accusé…) sont écartés par la même
+        règle que `mail.passive_reason` (`PASSIVE_SQL`). Sans ce filtre, 200
+        copies humaines passives remplissaient la fenêtre devant un humain
+        actif et le rang 2 le manquait encore.
+        """
+        return self._unread_human(recipient, limit, names=names, after_id=None)
+
+    def unread_human_page(self, recipient, limit, *, after_id=None, names=None) -> list[dict]:
+        """L77/B14 : la page suivante des humains actifs, après `after_id`.
+
+        Le serveur médié borne chaque page à 200 : un préfixe de plus de 200
+        humains retenus se franchit par curseur (`id > after_id`), sans
+        livrer les retenus."""
+        return self._unread_human(recipient, limit, names=names, after_id=after_id)
+
+    def _unread_human(self, recipient, limit, *, names, after_id) -> list[dict]:
+        names = [str(name) for name in (names or ()) if str(name)]
+        # `IN` explicite plutôt qu'un tableau lié : le pilote psql rend les
+        # listes Python en littéral texte, pas en `text[]` (#286).
+        declares = ""
+        params = [recipient]
+        apres = ""
+        if after_id is not None:
+            apres = " AND id > %s"
+            params.append(int(after_id))
+        if names:
+            declares = " OR sender IN (" + ", ".join(["%s"] * len(names)) + ")"
+            params.extend(names)
+        params.append(int(limit))
+        return self.db.query(
+            """
+            SELECT %s
+            FROM agent_mailbox
+            WHERE recipient = %%s AND delivered_at IS NULL%s
+              AND (payload @> '{"human": true}'::jsonb
+                   OR starts_with(sender, 'human:')%s)
+              AND NOT %s
+            ORDER BY id
+            LIMIT %%s
+            """ % (MAIL_COLUMNS, apres, declares,
+                   PASSIVE_SQL.format(t="agent_mailbox")),
+            params,
+        )
+
+    def unread_mid_turn(self, recipient, limit, *, include_human=True) -> list[dict]:
         """L514/#885 : le filtre de `mail.mid_turn` DANS la requête — un
         verdict, un arbitrage, un message humain ou urgent, sans borne sur les
-        autres non-lus (les 200 premiers ne sont pas un plafond de lecture)."""
+        autres non-lus (les 200 premiers ne sont pas un plafond de lecture).
+
+        L77/B11 : `include_human=False` écarte tout message humain au sens de
+        `mail.is_human` — `payload.human` (même urgent) ou ancien
+        `sender human:*` — ; la file du tour résident les réserve et les solde.
+        """
+        humains = "" if include_human else (
+            " AND NOT (m.payload @> '{\"human\": true}'::jsonb"
+            " OR starts_with(m.sender, 'human:'))")
         return self.db.query(
             """
             SELECT %s
@@ -164,14 +224,14 @@ class Mailbox(interface.Mailbox):
               AND (payload @> '{"urgent": true}'::jsonb
                    OR payload @> '{"human": true}'::jsonb
                    OR payload @> '{"verdict": true}'::jsonb
-                   OR payload @> '{"arbitration": true}'::jsonb)
+                   OR payload @> '{"arbitration": true}'::jsonb)%s
               AND NOT EXISTS (
                   SELECT 1 FROM agent_registry v
                   WHERE v.name = m.recipient AND (%s)
               )
             ORDER BY id
             LIMIT %%s
-            """ % (MAIL_COLUMNS, self.ACTIVE_SQL),
+            """ % (MAIL_COLUMNS, humains, self.ACTIVE_SQL),
             (recipient, int(limit)),
         )
 

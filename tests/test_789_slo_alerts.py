@@ -20,8 +20,8 @@ import unittest
 from unittest import mock
 
 from ameesh import (alert_briefs, decisions, exploitation, lot_class, merge_queue,
-                    notify, planned_waits, registry, stagnation, storage, work,
-                    work_dependencies)
+                    notify, packet_guard, planned_waits, registry, slo, stagnation,
+                    storage, work, work_dependencies)
 from ameesh.storage.postgres.operations import Operations
 
 from .support import FAKEBIN, PgTestCase
@@ -400,9 +400,20 @@ class ReviewGateRepositoryTest(_Base):
                         cwd=repo)
         registry.upsert(self.db, "cx", harness="codex", host=self.cfg.host)
         row = dict(work.get(self.db, self.lot["id"]), branch_target="main")
+        # #2928 : un avis sensible ne compte que sur son reçu exact, lu sur le
+        # vrai jalon ; l'avis est donc posé en base avant d'être relu.
+        mark = work.milestone(self.db, self.lot["id"], "verdict", sha=sha,
+                              actor="cx", verdict="ok")
+        self.db.execute(
+            "INSERT INTO provenance_receipts"
+            " (subject, sha, actor, session, turn, harness, work_item_id)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            " ON CONFLICT (subject) DO NOTHING",
+            ("milestone:%d" % int(mark["id"]), sha, "cx", "s-codex", "t",
+             "codex", self.lot["id"]))
         marks = [{"kind": "frozen", "sha": sha, "actor": "dev1", "at_ts": 1},
-                 {"kind": "verdict", "sha": sha, "actor": "cx", "verdict": "ok",
-                  "at_ts": 2}]
+                 {"kind": "verdict", "id": int(mark["id"]), "sha": sha,
+                  "actor": "cx", "verdict": "ok", "at_ts": 2}]
         gate = merge_queue.review_gate_for_item(self.db, self.cfg, row, marks)
         self.assertIsNotNone(gate)
         self.assertEqual(gate["required"], 1)
@@ -411,9 +422,17 @@ class ReviewGateRepositoryTest(_Base):
 
 class PaquetTest(_Base):
     """#2335 : un paquet en cours est une attente planifiée, et l'horloge
-    GO → fusion ne part qu'au premier créneau de paquet après le GO."""
+    GO → fusion ne part qu'au premier créneau de paquet après le GO. #2919 :
+    cible p80 du paquet sur le chemin normal, aucune escalade propre pour une
+    unité de paquet ouvert."""
 
     GO = datetime.datetime(2026, 10, 17, 23, 5, tzinfo=datetime.timezone.utc).timestamp()
+
+    def setUp(self):
+        super().setUp()
+        # Le banc ne vide pas `ci_runs` ; chaque témoin de p80 part d'une
+        # mesure propre (les runs d'un test ne comptent pas dans le suivant).
+        self.db.execute("TRUNCATE ci_test_failures, ci_runs")
 
     def test_lot_dans_un_paquet_ouvert_est_une_attente_planifiee(self):
         self.qa_at(self.GO)
@@ -562,6 +581,128 @@ class PaquetTest(_Base):
             None, self.GO, "ameesh", observed=True), self.GO + 55 * 60)
         self.assertIsNone(exploitation._packet_slot(
             None, self.GO, "ameesh", observed=False))
+
+    def _ci_run(self, minutes, *, run_id):
+        """Une suite complète conclue autour de `GO`, pour le p80 mesuré."""
+        self.db.execute(
+            "INSERT INTO ci_runs (repo, run_id, head_sha, branch, event, base,"
+            " status, url, first_seen_at, concluded_at)"
+            " VALUES ('manaty/ameesh', %s, %s, 'integration/paquet-test', 'push',"
+            " 'main', 'success', 'u', to_timestamp(%s), to_timestamp(%s))",
+            (run_id, "0" * 40, self.GO - 600.0,
+             self.GO - 600.0 + float(minutes) * 60.0))
+
+    def test_unite_de_paquet_mesuree_contre_le_p80_sans_alerte(self):
+        # #2919 : la cible est le p80 réel de la CI du paquet (7 jours) ; la
+        # ligne est mesurée, jamais alertée (aucune cible d'escalade propre).
+        self.qa_at(self.GO)
+        self.packet(body="unités : #%d @ abcdef0" % self.lot["id"])
+        for run_id, minutes in enumerate((10, 20, 30, 40), start=1):
+            self._ci_run(minutes, run_id=run_id)
+        self.now = self.GO + 75 * 60
+        calls = []
+        real = slo.lot_steps
+
+        def spy(*args, **kwargs):
+            calls.append(kwargs)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(exploitation, "_project_github",
+                               return_value="manaty/ameesh"), \
+                mock.patch.object(slo, "lot_steps", side_effect=spy):
+            self.assertEqual(self.slo(), [])
+        packet_calls = [kw for kw in calls if kw.get("packet")]
+        self.assertEqual(len(packet_calls), 1, calls)
+        # [600, 1200, 1800, 2400] : p80 interpolé à 2040 s.
+        self.assertEqual(packet_calls[0]["p80_s"], 2040.0)
+
+    def test_chemin_normal_p1_p80_40_min_pas_d_alerte_puis_niveau_1(self):
+        # Témoin du N auditeur (#2919) : P1, GO courant hors paquet ouvert,
+        # p80 40 min ; 20 min après le créneau → tenu, 41 min → niveau 1.
+        self.qa_at(self.GO)
+        self.db.execute("UPDATE work_items SET priority = 1 WHERE id = %s",
+                        (self.lot["id"],))
+        # Un porteur ouvert observe la cadence : le créneau est 00:00 ; le lot
+        # n'y est pas, il garde donc l'escalade du chemin normal.
+        self.packet(body="unités : #999999 @ cafebabe")
+        for run_id, minutes in enumerate((20, 40, 40, 40), start=1):
+            self._ci_run(minutes, run_id=run_id)
+        with mock.patch.object(exploitation, "_project_github",
+                               return_value="manaty/ameesh"):
+            self.now = self.GO + 75 * 60          # 00:20, 20 min après le créneau
+            self.assertEqual(self.slo(), [])
+            self.now = self.GO + 96 * 60          # 00:41, 41 min après le créneau
+            alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"], a["threshold"]) for a in alerts],
+                         [("verdict_merge", 1, 2400)])
+        self.assertIn("pilot", alerts[0]["targets"])
+
+    def test_chemin_normal_p1_sans_mesure_garde_le_repli_30_min(self):
+        # Témoin cx2 (#15024) : P1 normal sans mesure CI → repli 30 min, pas
+        # la cible P1 de 15 min (réservée à une exception déclarée).
+        self.qa_at(self.GO)
+        self.db.execute("UPDATE work_items SET priority = 1 WHERE id = %s",
+                        (self.lot["id"],))
+        self.packet(body="unités : #999999 @ cafebabe")
+        with mock.patch.object(exploitation, "_project_github",
+                               return_value="manaty/ameesh"):
+            self.now = self.GO + 75 * 60          # 00:20, 20 min après le créneau
+            self.assertEqual(self.slo(), [])
+            self.now = self.GO + 96 * 60          # 00:41, 41 min après le créneau
+            alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"], a["threshold"]) for a in alerts],
+                         [("verdict_merge", 1, 1800)])
+        self.assertIn("pilot", alerts[0]["targets"])
+
+    def test_exception_p1_garde_15_min_depuis_le_go(self):
+        # Hors paquet déclaré : la cible de table (15 min en P1) court depuis
+        # le GO, sans le report au créneau de paquet.
+        self.qa_at(self.GO)
+        self.db.execute("UPDATE work_items SET priority = 1 WHERE id = %s",
+                        (self.lot["id"],))
+        head = "c" * 40
+        self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                        (head, self.lot["id"]))
+        packet_guard.declare(self.db, self.lot["id"], "unblock",
+                             "CI bloquée", head, actor="dev1")
+        self.now = self.GO + 16 * 60
+        alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"], a["threshold"]) for a in alerts],
+                         [("verdict_merge", 1, 900)])
+        self.assertEqual(alerts[0]["since"], self.GO)
+        self.assertEqual(alerts[0]["value"], 60)
+
+    def test_exception_declaree_sort_du_paquet_et_alerte(self):
+        # #2919 : une exception `packet-exception incident` pour la tête
+        # courante ramène la cible de la table (30 min) et l'escalade.
+        self.qa_at(self.GO)
+        head = "a" * 40
+        self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                        (head, self.lot["id"]))
+        self.packet(body="unités : #%d @ %s" % (self.lot["id"], head))
+        packet_guard.declare(self.db, self.lot["id"], "incident",
+                             "cible rouge", head, actor="dev1")
+        self.now = self.GO + 50 * 60
+        alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"], a["targets"]) for a in alerts],
+                         [("verdict_merge", 1, ["assignee"])])
+        self.assertIsNone(alerts[0]["waiting"])
+        self.assertEqual(alerts[0]["threshold"], 1800)
+
+    def test_exception_d_une_autre_tete_ne_sort_pas_du_paquet(self):
+        # Une exception ne couvre que sa tête : le nouveau gel reste dans le
+        # paquet, mesuré au p80 et sans alerte.
+        self.qa_at(self.GO)
+        head = "b" * 40
+        self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                        (head, self.lot["id"]))
+        self.packet(body="unités : #%d @ %s" % (self.lot["id"], head))
+        packet_guard.declare(self.db, self.lot["id"], "incident",
+                             "ancienne tête", "a" * 40, actor="dev1")
+        self.now = self.GO + 125 * 60
+        with mock.patch.object(exploitation, "_project_github",
+                               return_value="manaty/ameesh"):
+            self.assertEqual(self.slo(), [])
 
 
 class BriefsTest(_Base):
