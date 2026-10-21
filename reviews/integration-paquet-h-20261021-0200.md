@@ -66,3 +66,7 @@ Aucun lot prêt écarté : les 4 lots prêts de la liste calculée sont composé
 - Contenu : 30 fichiers, +2340/−331 hors manifeste ; `git diff --check`
   propre ; une seule migration nouvelle (`0471_spend_pending_exact_key.sql`,
   additive).
+- Ciblés sur l'arbre composé (14 modules : #2888, #2908, #2893, #2899 et
+  témoins de désignation/porte/train) : **428 tests, OK**, rc 0 (986 s, local,
+  sans CI) ; aucune migration hors `0471` (additive, `add column if not
+  exists`).
