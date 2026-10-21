@@ -1,8 +1,8 @@
 ---
 type: Study
 title: "Study — a supported turn-context and turn-observation API for integrations"
-description: "TPK #2167 (lot #2894): the runner hands every turn a versioned, lease-fenced context (delivered requests, turn identity, accounting marker and reservation); `ameesh turn current --json` reads it inside the turn; `ameesh turn observe` and the read API expose execution, delivery and accounting state to supervisors; versioning guarantees and implementation lots."
-status: draft
+description: "TPK #2167 (lot #2894): the runner hands every turn a versioned, lease-fenced context (delivered requests, turn identity, accounting marker and reservation); `ameesh turn current --json` reads it inside the turn; `ameesh turn observe` and the read API expose execution, delivery and accounting state to supervisors; versioning guarantees and implementation lots. Owner decision #120568 (2026-10-21, option a) approved it as written."
+status: stable
 tags: [api, tour, bail, comptabilite, integrations, versioning]
 generated: { by: "mty-amh-impl-08/deepseek", at: "2026-10-20T21:45:00+00:00" }
 sources:
@@ -392,7 +392,7 @@ process lifetime.
   file is written by the runner, but its supported read path needs the
   mediated backend's own contract; out of scope here.
 
-# Implementation lots to open after sign-off
+# Implementation lots (after the owner decision)
 
 | Lot | Content | Notes |
 |---|---|---|
@@ -401,18 +401,10 @@ process lifetime.
 | C | IMA bridge migration (TPK): read the context file, use `turn observe`; drop the direct reads it can drop | outside ameesh; acceptance on the document path (#819) |
 | D (optional) | generic `mail send --idempotency-key`; `mail show` | companion, separate sensitive review |
 
-# Decision requested
+# Decision taken
 
-The owner is asked to sign the shape above, not the implementation:
-
-- **a (recommended)**: the file + `ameesh turn current` + observation CLI/read
-  API, with the two versioned schemas and the guarantees above; lots A and B,
-  then the IMA migration C.
-- **b**: CLI/read API only (no document handed to the harness). Simpler, but
-  every tool call is back to Python + a database connection; it does not meet
-  #819's non-model overhead.
-- **c**: document only (no read API). Fastest inside the turn, but a
-  supervisor outside the turn still needs database access; it does not answer
-  the observation half of #2167.
-- **d**: amend — the owner states the change; the note and lots are revised
-  before any implementation.
+Owner decision #120568 (2026-10-21, option a): the shape above is **approved
+as written** — the file + `ameesh turn current` + observation CLI/read API,
+with the two versioned schemas and the guarantees; implementation lots A and
+B, then the IMA migration C. The alternatives (b: CLI/read API only; c:
+document only; d: amend) were not retained.
