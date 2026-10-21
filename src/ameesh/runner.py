@@ -4915,19 +4915,26 @@ class AgentWorker(threading.Thread):
         # le courrier urgent (rang 3), la suite et la consigne en attente
         # (rang 4). On lit tout le courrier ici pour les trouver, y compris
         # derrière un préfixe retenu ; les rangs suivants réutilisent la lecture.
-        messages = self._live_mail(lot_workdir.deliverable_unread(
+        page = lot_workdir.deliverable_unread(
             cfg, self.db, self.agent, besoin=mail.UNREAD_LIMIT,
-            deferred=self._lot_deferred))
-        if len(messages) >= mail.UNREAD_LIMIT and all(mail.passive_reason(m) for m in messages):
+            deferred=self._lot_deferred)
+        # L77/B13 : le déclencheur porte sur la page LUE, avant `_live_mail` —
+        # une requête expirée retirée de la page ne doit pas refermer la
+        # recherche humaine (200 lus, 199 vivants : le préfixe était plein).
+        page_pleine = len(page) >= mail.UNREAD_LIMIT
+        messages = self._live_mail(page)
+        if page_pleine and all(mail.passive_reason(m) for m in messages):
             # L125 : boîte pleine de courrier passif — les messages qui
             # réveillent, plus récents, ne doivent pas y rester invisibles
-            reveil = self._live_mail(lot_workdir.deliverable_unread(
+            reveil_page = lot_workdir.deliverable_unread(
                 cfg, self.db, self.agent, besoin=mail.UNREAD_LIMIT,
-                mode="active", deferred=self._lot_deferred))
+                mode="active", deferred=self._lot_deferred)
+            page_pleine = page_pleine or len(reveil_page) >= mail.UNREAD_LIMIT
+            reveil = self._live_mail(reveil_page)
             messages = reveil + messages
         humans = [m for m in messages
                   if self._from_human(m) and not mail.passive_reason(m)]
-        if not humans and len(messages) >= mail.UNREAD_LIMIT:
+        if not humans and page_pleine:
             # L77/B13 : le préfixe de `UNREAD_LIMIT` peut être saturé par du
             # courrier ordinaire actif devant un humain. Recherche dédiée,
             # filtrée dans la requête et soumise aux mêmes lots retenus
@@ -4937,7 +4944,7 @@ class AgentWorker(threading.Thread):
             humains_profonds = self._live_mail(lot_workdir.deliverable_unread(
                 cfg, self.db, self.agent, besoin=mail.UNREAD_LIMIT,
                 mode="human", deferred=self._lot_deferred,
-                human_names=getattr(cfg, "human_names", ())))
+                human_names=getattr(cfg, "human_names", None)))
             humans = [m for m in humains_profonds
                       if self._from_human(m) and not mail.passive_reason(m)]
         if humans:

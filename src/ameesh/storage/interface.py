@@ -1071,13 +1071,14 @@ class Mailbox(Domain):
 
     @abc.abstractmethod
     def unread_human(self, recipient: str, limit: int, *,
-                     names: Sequence[str] = ()) -> list[dict]:
+                     names: Sequence[str] | None = None) -> list[dict]:
         """L77/B13 : messages non remis d'un humain, filtrés DANS la requête.
 
         Un humain (`payload.human`, ancien expéditeur `human:*`, ou nom
-        déclaré de l'hôte dans `names`) ne doit pas rester invisible derrière
-        plus de `UNREAD_LIMIT` non-lus ordinaires : le rang 2 le sert avant la
-        suite et la consigne en attente. Du plus ancien au plus récent.
+        déclaré de l'hôte dans `names`, None = aucun) ne doit pas rester
+        invisible derrière plus de `UNREAD_LIMIT` non-lus ordinaires : le rang 2
+        le sert avant la suite et la consigne en attente. Du plus ancien au
+        plus récent.
         """
 
     @abc.abstractmethod

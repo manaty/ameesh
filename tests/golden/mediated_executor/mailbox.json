@@ -89,6 +89,100 @@
    }
   },
   {
+   "name": "mailbox.unread_human/ok",
+   "op": "mailbox.unread_human",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "mailbox.unread_human",
+     "args": [
+      "inge-front",
+      50
+     ],
+     "kwargs": {
+      "names": [
+       "alice"
+      ]
+     }
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": [
+      {
+       "id": 812,
+       "sender": "coord",
+       "recipient": "inge-front",
+       "body": "Lot 812 : relis la PR.",
+       "kind": "notify",
+       "payload": {},
+       "work_item_id": "812",
+       "created_ts": 1791639990.5,
+       "delivered_ts": null
+      }
+     ],
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "name": "mailbox.unread_human/session",
+   "op": "mailbox.unread_human",
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/session/op",
+    "headers": {
+     "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+     "Content-Type": "application/json"
+    },
+    "body": {
+     "schema": "ameesh-exec-op/1",
+     "op": "mailbox.unread_human",
+     "args": [
+      "inge-front",
+      50
+     ],
+     "kwargs": {
+      "names": [
+       "alice"
+      ]
+     }
+    }
+   },
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": [
+      {
+       "id": 812,
+       "sender": "coord",
+       "recipient": "inge-front",
+       "body": "Lot 812 : relis la PR.",
+       "kind": "notify",
+       "payload": {},
+       "work_item_id": "812",
+       "created_ts": 1791639990.5,
+       "delivered_ts": null
+      }
+     ],
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
    "name": "mailbox.unread_urgent/ok",
    "op": "mailbox.unread_urgent",
    "request": {

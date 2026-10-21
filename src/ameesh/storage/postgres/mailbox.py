@@ -152,13 +152,13 @@ class Mailbox(interface.Mailbox):
             (recipient, int(limit)),
         )
 
-    def unread_human(self, recipient, limit, *, names=()) -> list[dict]:
+    def unread_human(self, recipient, limit, *, names=None) -> list[dict]:
         """L77/B13 : les non-lus d'un humain, filtrés DANS la requête — le
         préfixe des `UNREAD_LIMIT` non-lus ordinaires ne les masque plus.
 
-        `names` couvre les noms déclarés humains sur l'hôte (ancien
-        `AMEESH_HUMANS`) ; `payload.human` et l'ancien `sender human:*`
-        restent reconnus, comme `mail.is_human`.
+        `names` (None = aucun) couvre les noms déclarés humains sur l'hôte
+        (ancien `AMEESH_HUMANS`) ; `payload.human` et l'ancien
+        `sender human:*` restent reconnus, comme `mail.is_human`.
         """
         names = [str(name) for name in (names or ()) if str(name)]
         return self.db.query(

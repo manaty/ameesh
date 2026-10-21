@@ -7,7 +7,9 @@ qui porte deux ajouts — l'expiration médiée des fils (#499, voir « Contrat 
 et l'aperçu d'activité (#1349, voir « Aperçu d'activité ») — puis par la
 résolution d'alias des agents (#423, version `1.3.0`, compatible : voir
 « Contrat 1.3 »), puis par le réveil programmé médié (#2613, version
-`1.4.0`, compatible : voir « Contrat 1.4 »).
+`1.4.0`, compatible : voir « Contrat 1.4 »), puis par la recherche des
+humains du rang 2 au-delà du préfixe (#286/B13, version `1.5.0`, compatible :
+voir « Contrat 1.5 »).
 Étude et décision : `docs/design/etudes/executeur-mediee.md`,
 `docs/design/decisions/00xx-executeur-mediee.md`.
 
@@ -20,7 +22,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 70 opérations et la liste des 411 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 71 opérations et la liste des 411 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -63,12 +65,12 @@ Les portées :
 - **S** : l'agent et l'epoch sont tirés du jeton de session.
 - **aggregate** : une donnée agrégée.
 
-Comptes : 70 opérations, dont 27 lectures et 43 écritures. 60 passent par
-`op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Sept
-lignes de `op` sont marquées `session: true` (contrats 1.1, 1.2 et 1.3) :
+Comptes : 71 opérations, dont 28 lectures et 43 écritures. 61 passent par
+`op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Huit
+lignes de `op` sont marquées `session: true` (contrats 1.1, 1.2, 1.3 et 1.5) :
 elles sont servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (481
+signature et les mêmes types. Il vérifie aussi que l'interface entière (482
 opérations) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
@@ -393,6 +395,24 @@ nouveaux exécuteurs : un ancien serveur refuse les trois opérations, le
 runner journalise la lecture impossible et le réveil reste armé, sans perte
 ni blocage du harnais.
 
+## Contrat 1.5 : humains du rang 2, au-delà du préfixe (#286/B13)
+
+La file résidente sert les messages humains ordinaires (rang 2) avant le
+courrier urgent d'agent, la suite et la consigne en attente. Sur Postgres, une
+requête filtrée (`payload.human`, ancien `sender human:*`, noms déclarés)
+trouvait déjà l'humain derrière plus de 200 non-lus ordinaires. Sur un
+exécuteur médié, `mailbox.unread` est borné à 200 lignes et n'a pas de
+décalage : un humain en position 201 restait invisible, et la consigne
+passait devant lui. L'opération `mailbox.unread_human(recipient, limit,
+names=None)` applique le même filtre dans la requête du serveur ; le client
+la sert sans repli de pagination. `names` porte les noms déclarés humains de
+l'hôte (`AMEESH_HUMANS` historique) et peut être nul.
+
+L'ajout est compatible : la version passe à `1.5.0`, aucune opération n'est
+retirée ni modifiée. Déployer le serveur avant les nouveaux exécuteurs : un
+ancien serveur refuse l'opération, et le runner médié ne peut alors pas
+trouver un humain au-delà du préfixe.
+
 ## Porte d'hôte
 
 Le runner Compute écrit `ameesh-host-state/1`. Ce message porte `state`
@@ -580,7 +600,7 @@ Le client vit dans `src/ameesh/storage/remote/` :
 
 | Fichier | Rôle |
 |---|---|
-| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 70 opérations), `LeaseBook` (carnet des baux) |
+| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 71 opérations), `LeaseBook` (carnet des baux) |
 | `http.py` | `HttpTransport(ExecTransport)`, `StaticTokenSource`, `FileTokenSource` |
 | `events.py` | `RemoteSubscription` : SSE, repli en attente longue, curseur gardé |
 | `__init__.py` | `connect(cfg)`, `set_token_source_factory` (point d'attache de L110) |

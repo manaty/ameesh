@@ -152,26 +152,20 @@ def unread_urgent(db: Db, recipient: str, limit: int = 50) -> list[dict]:
 
 
 def unread_human(db: Db, recipient: str, limit: int = UNREAD_LIMIT, *,
-                 names: Sequence[str] = ()) -> list[dict]:
+                 names: Sequence[str] | None = None) -> list[dict]:
     """L77/B13 : les non-lus d'un humain, filtrés DANS la requête — rang 2.
 
     Un humain (`payload.human`, ancien expéditeur `human:*`, ou nom déclaré de
-    l'hôte dans `names`) derrière plus de `UNREAD_LIMIT` non-lus ordinaires
-    n'est plus masqué par le préfixe : `_pick` le sert avant la suite et la
-    consigne en attente.
+    l'hôte dans `names`, None = aucun) derrière plus de `UNREAD_LIMIT` non-lus
+    ordinaires n'est plus masqué par le préfixe : `_pick` le sert avant la
+    suite et la consigne en attente.
 
-    Chemin médié : `mailbox.unread_human` n'est pas dans le contrat 1.1, il
-    lit `mailbox.unread` (admis) et filtre ici, comme `unread_active` — au plus
-    les `UNREAD_LIMIT` premiers non-lus, la limite du contrat."""
+    Médié : `mailbox.unread_human` est au contrat (1.5) — le serveur filtre
+    dans sa requête, il n'y a plus de lecture bornée aux 200 premiers non-lus
+    pour trouver un humain."""
     from .agent_names import resolve as resolve_agent_name
     recipient = resolve_agent_name(recipient, db=db, operation="mail.unread_human")
-    st = storage.of(db)
-    if getattr(st, "driver", None) == "mediated":
-        rows = st.mailbox.unread(recipient, max(int(limit), UNREAD_LIMIT))
-        declared = set(names or ())
-        return [row for row in rows
-                if is_human(row) or str(row.get("sender") or "") in declared][:int(limit)]
-    return st.mailbox.unread_human(recipient, limit, names=names)
+    return storage.of(db).mailbox.unread_human(recipient, limit, names=names)
 
 
 def unread_mid_turn(db: Db, recipient: str, limit: int = UNREAD_LIMIT, *,

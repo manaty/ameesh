@@ -147,7 +147,7 @@ MAIL_PAGE = mail.UNREAD_LIMIT
 
 
 def deliverable_unread(cfg, db, agent, *, besoin, mode="unread", deferred=None,
-                       include_human=True, human_names=()) -> list[dict]:
+                       include_human=True, human_names=None) -> list[dict]:
     """#811 R3 : les non-lus remisables, au-delà d'un préfixe qui les masquait.
 
     `mail.unread` — et ses variantes — borne la lecture aux plus anciens : un

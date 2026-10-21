@@ -129,6 +129,32 @@ class PickHumanFirstTest(PgTestCase):
                 "      OR starts_with(sender, 'human:'))", (name,))))
         self.assertIn(legacy, spec["ids"])
 
+    def test_human_survives_a_full_page_shrunk_by_an_expired_request(self):
+        """B13/cx2 : la page LUE est pleine, `_live_mail` retire l'expirée.
+
+        200 non-lus dont une requête expirée : `_live_mail` n'en laisse que
+        199 vivants. Le déclencheur de la recherche humaine doit porter sur la
+        page lue (200), pas sur le reste filtré (199), sinon la consigne en
+        attente passe encore devant l'humain de la position 201.
+        """
+        from ameesh import mail, registry
+        name = "worker-pick-expired"
+        worker = _make_worker(self, name)
+        for index in range(mail.UNREAD_LIMIT - 1):
+            mail.send(self.db, "agent:bob", name,
+                      "ordinary active %d" % index, payload={})
+        mail.send(self.db, "agent:bob", name, "expired request",
+                  payload={"request_expires_ts": 1.0})
+        human = mail.send(self.db, "human:alice", name, "from a human",
+                          payload={"human": True})
+        registry.set_pending_prompt(self.db, name, "a queued instruction")
+        spec = worker._pick()
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec["kind"], "mail",
+                         "the expired request shrank the page and hid the human")
+        self.assertTrue(spec.get("human"))
+        self.assertEqual(spec["ids"], [human])
+
 
 class EndOfTurnServiceTest(PgTestCase):
     """L77 : le message humain n'est soldé qu'à la FIN du tour."""
