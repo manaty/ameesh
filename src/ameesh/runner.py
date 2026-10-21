@@ -611,6 +611,9 @@ class AgentWorker(threading.Thread):
         self._lot_wake_checked = float("-inf")
         #: #2466 : dernière lecture des réveils programmés échus
         self._scheduled_wake_checked = float("-inf")
+        #: #2614 : réveil programmé réclamé, pas encore consommé ({lot,
+        #: wake_ts, done}) — un fil en renouvelle le bail jusqu'à son oubli
+        self._wake_claim: dict | None = None
         self.state_dir = self.cfg.agent_dir(self.name)
         self.renew_failures = 0
         #: #2600 : horloge du bail, injectable par les tests de course. Elle
@@ -1487,6 +1490,20 @@ class AgentWorker(threading.Thread):
         return (not self.nudged) and (time.monotonic() - self.last_activity >= self.runner.idle_nudge)
 
     def _moved_before_turn(self, spec: dict) -> bool:
+        """L147b : `_placed_before_turn`, et #2614 : un tour qui ne part pas
+        d'ici (agent placé ailleurs, ou base tombée pendant le contrôle —
+        `placed_elsewhere` lit le registre) oublie le réveil programmé
+        réclamé pour lui. Sinon le claim resterait tenu, renouvelé sans fin,
+        et le réveil ne serait plus jamais délivré."""
+        parti = True
+        try:
+            parti = self._placed_before_turn(spec)
+            return parti
+        finally:
+            if parti:
+                self._forget_wake_claim()
+
+    def _placed_before_turn(self, spec: dict) -> bool:
         """L147b (codex r4 de #220, r1 de #283) : le placement est relu après
         `pick()`, juste avant le tour de travail — une rotation (taille, lot,
         bascule de compte dans `pick()`) a pu y faire un tour de résumé, pendant
@@ -4861,6 +4878,22 @@ class AgentWorker(threading.Thread):
         self.last_activity = time.monotonic()
         return True
 
+    def _pick_for_turn(self) -> dict | None:
+        """Le tour choisi (`pick`), passé dans la session de son lot
+        (`rotate_for_lot`).
+
+        #2614 : un réveil programmé réclamé par `pick` mais qui ne part pas
+        dans ce tour — écarté après le choix (dossier du lot), bascule de
+        session abandonnée, base tombée pendant la bascule — est oublié ici :
+        le claim n'est plus renouvelé, expire, et le réveil revient (#2466 B1)."""
+        spec = None
+        try:
+            spec = self.rotate_for_lot(self.pick())
+            return spec
+        finally:
+            if not (spec and spec.get("scheduled_wake")):
+                self._forget_wake_claim()
+
     def pick(self) -> dict | None:
         """Le prochain tour à faire, ou None. Consomme la consigne en attente.
 
@@ -5138,8 +5171,62 @@ class AgentWorker(threading.Thread):
     #: #2466 : intervalle minimal entre deux lectures des réveils programmés
     SCHEDULED_WAKE_CHECK_S = 10.0
     #: #2466 : bail de livraison d'un réveil ; non consommé (drainage, arrêt,
-    #: panne avant lancement), il expire et le réveil est délivré de nouveau
+    #: panne avant lancement), il expire et le réveil est délivré de nouveau.
+    #: #2614 : renouvelé tant que le claim est tenu — un lancement plus long
+    #: que le bail ne le laisse plus expirer.
     WAKE_CLAIM_TTL = 120.0
+    #: #2614 : pas du renouvellement, un quart de bail
+    WAKE_CLAIM_RENEW_S = WAKE_CLAIM_TTL / 4.0
+
+    def _hold_wake_claim(self, taken: dict) -> None:
+        """#2614 : tient le bail du réveil réclamé, jusqu'à son oubli.
+
+        Le bail de 120 s couvrait le choix du tour, pas la suite : bascule de
+        session du lot (dossier, brief), contrôle du placement, puis
+        préparation du tour (READY, résident). Au-delà, le claim expirait et
+        le réveil pouvait être délivré une seconde fois avant la consommation
+        du premier. Un fil le renouvelle (`claim_wake`, `claim_ttl_s=0`) tous
+        les quarts de bail, de la réclamation jusqu'à `_forget_wake_claim` :
+        consommation, fin du tour qui le porte, ou abandon avant le tour
+        (`_pick_for_turn`, `_moved_before_turn`). Un claim oublié sans
+        consommation expire et le réveil revient (#2466 B1)."""
+        self._forget_wake_claim()
+        claim = {"lot": int(taken["id"]), "wake_ts": float(taken["wake_ts"]),
+                 "done": threading.Event()}
+        self._wake_claim = claim
+        threading.Thread(target=self._keep_wake_claim, args=(claim,), daemon=True,
+                         name="wake-claim-%s" % self.name).start()
+
+    def _forget_wake_claim(self) -> None:
+        """#2614 : le claim tenu n'est plus renouvelé (son fil s'arrête)."""
+        claim, self._wake_claim = getattr(self, "_wake_claim", None), None
+        if claim is not None:
+            claim["done"].set()
+
+    def _keep_wake_claim(self, claim: dict) -> None:
+        """#2614 : fil de `_hold_wake_claim`. Il s'arrête à l'oubli du claim,
+        à l'arrêt du worker ou à la perte de son bail (seul le détenteur
+        renouvelle), et dès que l'échéance n'est plus la sienne."""
+        while not claim["done"].wait(self.WAKE_CLAIM_RENEW_S):
+            if (self.stopping.is_set() or self.lease_lost.is_set()
+                    or not self._renew_wake_claim(claim)):
+                break
+        if self._wake_claim is claim:
+            self._forget_wake_claim()
+
+    def _renew_wake_claim(self, claim: dict) -> bool:
+        """#2614 : un renouvellement du bail de `claim`. Faux quand il n'y a
+        plus rien à tenir (échéance consommée, annulée ou reposée, lot
+        réassigné ou fini) ; une base en panne laisse le claim tel quel, le
+        quart de bail suivant réessaie."""
+        try:
+            taken = storage.of(self.db).lot_sessions.claim_wake(
+                self.name, int(claim["lot"]), time.time(), 0.0)
+        except db_mod.DbError as exc:
+            log_async("[%s] scheduled wake claim for lot #%s not renewed (%s)"
+                      % (self.name, claim["lot"], exc))
+            return True
+        return bool(taken) and abs(float(taken["wake_ts"]) - claim["wake_ts"]) < 0.001
 
     def _scheduled_wake_spec(self) -> dict | None:
         """#2466 : réveil programmé échu d'un lot de l'agent.
@@ -5152,8 +5239,9 @@ class AgentWorker(threading.Thread):
         reste armée jusqu'au lancement effectif du harnais, et un claim non
         consommé expire puis est délivré de nouveau — un drainage ou un arrêt
         entre le choix du tour et son lancement ne perd plus le rendez-vous
-        (#2466 B1). Le lot reçoit une ligne `wake:` au journal par délivrance,
-        témoin. Le réglage `lot_wake=off` ne l'éteint pas : c'est un geste
+        (#2466 B1). Le claim est tenu jusqu'au lancement (`_hold_wake_claim`,
+        #2614) ; le lot reçoit une ligne `wake:` au journal à la consommation,
+        témoin d'un réveil réellement délivré. Le réglage `lot_wake=off` ne l'éteint pas : c'est un geste
         posé, pas une relance d'inactivité. Les gardes de `_pick` (arrêt,
         budget, porte et pression d'hôte, authentification) sont déjà passées ;
         un lot sans dossier reste armé (#811). Sur un exécuteur médié, les
@@ -5173,6 +5261,7 @@ class AgentWorker(threading.Thread):
                                       self.WAKE_CLAIM_TTL)
                 if not taken:
                     continue
+                self._hold_wake_claim(taken)
                 when = time.strftime("%Y-%m-%d %H:%M %Z",
                                      time.localtime(float(taken["wake_ts"])))
                 log_async("[%s] scheduled wake for lot #%s claimed (due %s)"
@@ -5198,6 +5287,7 @@ class AgentWorker(threading.Thread):
         reveil = spec.get("scheduled_wake")
         if not reveil or not getattr(self, "_turn_launched", False):
             return
+        self._forget_wake_claim()  # #2614 : plus de bail à renouveler
         lot = int(reveil["lot"])
         try:
             if storage.of(self.db).lot_sessions.consume_wake(
@@ -5609,6 +5699,18 @@ class AgentWorker(threading.Thread):
                       % (self.name, db_mod.explain(exc)))
 
     def run_turn(self, spec: dict) -> bool | None:
+        """Un tour (voir `_run_turn_or_defer`).
+
+        #2614 : le tour qui porte un réveil programmé oublie son claim en
+        sortant, lancé ou non : non consommé, le bail n'est plus renouvelé,
+        expire, et le réveil est délivré de nouveau."""
+        try:
+            return self._run_turn_or_defer(spec)
+        finally:
+            if spec.get("scheduled_wake"):
+                self._forget_wake_claim()
+
+    def _run_turn_or_defer(self, spec: dict) -> bool | None:
         """Exclude attach for the whole turn and life of its resident.
 
         Rend `True` (tour lancé), `False` (échec) ou `None` quand le tour est
@@ -7909,7 +8011,7 @@ class AgentWorker(threading.Thread):
                 continue
             self.apply_restart_if_requested()
             self.maybe_rotate()
-            spec = self.rotate_for_lot(self.pick())
+            spec = self._pick_for_turn()
             if spec:
                 # #283 r2 : la même garde que `run()` — une rotation a pu
                 # déplacer l'agent ; la consigne reste alors en attente
@@ -7968,7 +8070,7 @@ class AgentWorker(threading.Thread):
                     if attente_reprise > 0:
                         self._attendre_reprise(attente_reprise)
                         continue
-                    spec = self.rotate_for_lot(self.pick())
+                    spec = self._pick_for_turn()
                     if spec is not None and self._moved_before_turn(spec):
                         break
                 except db_mod.Unavailable as exc:
