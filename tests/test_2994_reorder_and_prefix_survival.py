@@ -11,8 +11,9 @@ ligne plus longue qui contient la ligne cherchée.
 Témoins : (1) réordre dans le même fichier + lignes propres retirées : non
 survivant ; (2) ligne propre retrouvée seulement comme préfixe : non
 survivant ; (3) ligne propre exacte reportée ailleurs : survivant (B8) ;
-(4) déplacement entre chemins : toujours une preuve ; (5) diff binaire ou
-arbre illisible : survivant.
+(4) déplacement entre chemins : toujours une preuve ; (5) réordre seul :
+survivant tant que la tête garde le voisinage qu'il a créé ; (6) diff
+binaire ou arbre illisible : survivant.
 """
 from __future__ import annotations
 
@@ -98,13 +99,26 @@ class CommitSurvivesTest(TestCase):
         self.assertTrue(self.survives(fix, fix, base))
 
     def test_a_same_file_reorder_alone_keeps_the_corrector(self):
-        # Sans ligne propre, le réordre seul reste un doute : ses lignes sont
-        # toujours à leur chemin, l'auteur est conservé.
+        # Sans ligne propre, le réordre se prouve par le voisinage qu'il a
+        # créé : tant que la tête le garde, l'auteur est conservé.
         self.repo.write("tests/test_pick.py", FIXTURE)
         base = self.repo.commit("base")
         self.repo.write("tests/test_pick.py", REORDERED)
         fix = self.repo.commit("fix", agent="dev3")
         self.assertTrue(self.survives(fix, fix, base))
+        self.repo.write("tests/test_other.py", "unrelated_author_line()\n")
+        head = self.repo.commit("impl: autre fichier", agent="dev4")
+        self.assertTrue(self.survives(head, fix, base))
+
+    def test_a_reverted_reorder_does_not_keep_the_corrector(self):
+        # La tête rétablit l'ordre d'origine : le réordre n'y subsiste plus.
+        self.repo.write("tests/test_pick.py", FIXTURE)
+        base = self.repo.commit("base")
+        self.repo.write("tests/test_pick.py", REORDERED)
+        fix = self.repo.commit("fix", agent="dev3")
+        self.repo.write("tests/test_pick.py", FIXTURE)
+        head = self.repo.commit("impl: ordre rétabli", agent="dev4")
+        self.assertFalse(self.survives(head, fix, base))
 
     def test_a_binary_diff_keeps_the_corrector(self):
         self.repo.write("a.py", "base_line_here()\n")
