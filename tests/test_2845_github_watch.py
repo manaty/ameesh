@@ -409,6 +409,42 @@ class CollectionTest(unittest.TestCase):
             events += more
             self.assertEqual({e["object_id"] for e in events}, set(range(1, 13)))
 
+    def test_b4_lag_api_variant_does_not_lose_the_shifted_tail(self):
+        # B4 #2955, LagApi variant: the writes of #4..#6 happen before the
+        # reads, so the previous page carries exactly the same stamps on both
+        # reads and an id/stamp shift check sees nothing. The bounded window
+        # still defers those rows (> U) and reads #8..#12 in the next window;
+        # #7 is stamped exactly at U and stays inside.
+        with mock.patch.object(watch, "PAGE_SIZE", 3):
+            start = NOW + 30  # U = NOW - 270
+            rows = [issue(n) for n in range(1, 13)]
+            for n, row in enumerate(rows):
+                row["key"] = row["updated_at"] = watch.iso(NOW - 300 + 5 * n)
+            api = LagApi(rows, [])
+            for row in rows[:3]:
+                row["updated_at"] = watch.iso(NOW + 1)
+            for row, stamp in zip(rows[3:6], (NOW - 259, NOW - 258, NOW - 257)):
+                row["updated_at"] = watch.iso(stamp)
+            events, scan, until = watch.collect_batch(
+                api, SUB, start - 3600, start, None)
+            more, _ = self.finish(api, start, start, scan)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, {7})
+            # The index catches up for the deferred rows before the next window.
+            for row in rows:
+                if row["updated_at"] <= watch.iso(NOW + 60 - watch.INDEX_LAG):
+                    row["key"] = row["updated_at"]
+            more, until = self.finish(api, until - watch.OVERLAP, NOW + 60, None)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, set(range(4, 13)))
+            # #1..#3 were moved to NOW+1 before the scan: they are deferred
+            # too, then read once their own stamp is inside the bound.
+            for row in rows[:3]:
+                row["key"] = row["updated_at"]
+            more, _ = self.finish(api, until - watch.OVERLAP, NOW + 301, None)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, set(range(1, 13)))
+
     def test_index_lag_with_latency_inside_the_bound_is_deferred_then_read(self):
         # A row written 250 s before the scan is still inside the 300 s latency
         # window: it is ignored, then delivered by the next window when its key
