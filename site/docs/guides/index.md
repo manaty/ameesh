@@ -8,6 +8,9 @@ Task-oriented pages. Each one uses only commands that exist in the CLI; see the
   WSL2, and the platform state of v1.10.0.
 - [Write a canon](write-a-canon.md): declare humans, hosts, agents and
   placements, check and sync them; add a second canon on the same host.
+- [Write a Process card](write-a-process.md): the working rules injected into
+  briefs, and the executable `workflow:` block (stages, grouped transitions,
+  guards, work types, projection, admission pin, check command).
 - [Run the demo](run-the-demo.md): the v1 scenario on the bench, step by step.
 - [Switch from a v0 setup](switch-from-v0.md): move a running team of agents to
   ameesh, one reversible step at a time; upgrade an existing installation.

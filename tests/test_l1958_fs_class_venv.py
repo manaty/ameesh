@@ -77,7 +77,7 @@ class FsClassVenvTest(unittest.TestCase):
         # l'étape partagée installe et contrôle la même liste
         self.assertIn("import psycopg, cryptography, psutil", corps)
         self.assertIn("'coverage>=7.10'", corps)
-        self.assertIn("'psycopg[binary]>=3.1'", corps)
+        self.assertIn("'psycopg[binary]>=3.2'", corps)
         fs = _job("fs-class")
         self.assertIn("run: *%s" % nom, fs,
                       "fs-class doit reprendre l'étape ancrée, pas sa propre liste")

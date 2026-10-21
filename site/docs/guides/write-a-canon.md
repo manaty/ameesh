@@ -39,6 +39,11 @@ ignored like `index.md`. The example
 has no `federation.yaml`; add one when you need federation members or review
 policies (section 6).
 
+A `processus/` folder holds **Process cards** (`type: Process`): the working
+rules injected into each agent's brief. A card may also carry an executable
+`workflow:` block, whose data is compiled to the native
+`process-workflow/1` schema; see [Write a Process card](write-a-process.md).
+
 ## 2. Humans
 
 ```yaml title="membres/alice.md"

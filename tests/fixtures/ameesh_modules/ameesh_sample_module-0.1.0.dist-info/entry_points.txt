@@ -1,0 +1,2 @@
+[ameesh.modules]
+sample = sample_module

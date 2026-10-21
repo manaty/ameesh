@@ -1781,14 +1781,27 @@ def cmd_probe(cfg: Config) -> int:
 def driver_warnings(driver: str, remote: bool) -> list[str]:
     """L61 : le pilote psql ouvre une connexion (TLS compris) par requête ;
     sur une base distante, c'est 1 à 2 s par requête. psycopg est la voie
-    normale (dépendance du paquet) : son absence se corrige ici."""
+    normale (dépendance du paquet) : son absence se corrige ici. Un lancement
+    par PYTHONPATH peut contourner la borne de version du paquet (#2907)."""
+    if driver == "psycopg":
+        import psycopg
+        import re
+        version = re.match(r"(\d+)\.(\d+)", psycopg.__version__)
+        if version and tuple(map(int, version.groups())) < (3, 2):
+            return [
+                "warning    : psycopg %s is too old — Connection.notifies(timeout=) "
+                "requires psycopg >=3.2;" % psycopg.__version__,
+                "             upgrade psycopg in ameesh's environment: %s -m pip install "
+                "'psycopg[binary]>=3.2'" % sys.executable,
+            ]
+        return []
     if driver != "psql" or not remote:
         return []
     return [
         "warning    : psql driver with a REMOTE database — one subprocess and one "
         "TLS connection per query (~1.5 s each at 180 ms round trip);",
         "             install psycopg in ameesh's environment: %s -m pip install "
-        "'psycopg[binary]>=3.1'" % sys.executable,
+        "'psycopg[binary]>=3.2'" % sys.executable,
     ]
 
 

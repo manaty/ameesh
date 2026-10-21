@@ -149,6 +149,24 @@ def declared(db, lot, sha) -> dict | None:
     return None
 
 
+def declared_in(events, sha) -> dict | None:
+    """#2919 : l'exception déclarée pour cette tête exacte, lue dans un journal
+    déjà chargé (la passe SLO lit celui de tous les lots ouverts en une fois).
+
+    Même règle que `declared` : une exception d'une autre tête ne couvre
+    jamais un nouveau gel ; la dernière déclaration de cette tête l'emporte."""
+    wanted = (sha or "").strip().lower()
+    if not _SHA.fullmatch(wanted):
+        return None
+    found = None
+    for event in events or ():
+        parsed = _parse(event.get("note") or "")
+        if parsed is not None and parsed["sha"] == wanted:
+            parsed["id"] = int(event.get("id") or 0)
+            found = parsed
+    return found
+
+
 def declare(db, lot, exception: str, reason: str, sha: str, *, actor: str = "") -> dict:
     """Écrit la déclaration d'exception au journal du lot et la rend.
 
