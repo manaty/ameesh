@@ -260,24 +260,14 @@ class Passage:
         # Every queued admission is already in the queue: the candidate
         # inventory must not present it again, even when it is deferred here.
         prepared_ids = {row["work_item_id"] for row in rows}
-        if rows:
-            # The active engine drops a late admission before ordering: its
-            # dependents wait with it, so ordering must see the same rows.
-            late = [row for row in rows
-                    if float(row.get("queued_ts") or 0) > slot]
-            eligible = [row for row in rows
-                        if float(row.get("queued_ts") or 0) <= slot]
-            for row in late:
+        # The active engine drops a late admission before ordering: its
+        # dependents wait with it, so the combined ordering must not see it.
+        for row in rows:
+            if float(row.get("queued_ts") or 0) > slot:
                 deferred.append(_deferred(row["work_item_id"], "queued",
                                           "late admission: queued after the cutoff"))
-            ordered = train.ordered(eligible, admissions.dependencies(eligible))
-            visible = {train.identity(row) for row in ordered}
-            for row in eligible:
-                if train.identity(row) not in visible:
-                    deferred.append(_deferred(row["work_item_id"], "queued",
-                                              "open prerequisite or dependency cycle"))
-            entries.extend(dict(row=row, origin="queued", proof=None)
-                           for row in ordered)
+                continue
+            entries.append(dict(row=row, origin="queued", proof=None))
         if self.candidate is not None:
             inventory = train_candidates.Inventory(
                 db, self.project, candidate=self.candidate).read()
@@ -286,6 +276,7 @@ class Passage:
                 policy=requirement)
             enrollment = train_candidates.Enrollment(preparation, admissions,
                                                      initial=self.initial)
+            enrolled = 0
             for candidate in inventory["candidates"]:
                 lot = candidate["work_item_id"]
                 if lot in prepared_ids:
@@ -309,25 +300,25 @@ class Passage:
                         "active enrollment would refuse"))
                     continue
                 prepared = decision["prepared"]
-                # A candidate is not queued yet: the engine would enroll it
-                # after the queued admissions. ``generation`` is part of the
-                # admission identity used by compose; the shadow fabricates
-                # no queue row, so it uses the same neutral value throughout.
-                subject = dict(prepared["subject"], generation=0, priority=2,
-                               rank=len(entries), queued_ts=0)
+                # Active enrollment inserts the candidate at this cutoff with
+                # rank NULL and an increasing queued_ts, after the admissions
+                # already queued. The synthetic timestamp reproduces that
+                # order. ``generation`` is part of the admission identity used
+                # by compose, and the shadow fabricates no queue row, so it
+                # uses one neutral value throughout.
+                item = admissions.ops.get(lot)
+                subject = dict(
+                    prepared["subject"], generation=0,
+                    priority=int((item or {}).get("priority") or 2),
+                    rank=None, queued_ts=float(slot) + 1 + enrolled)
                 entries.append(dict(row=subject, origin="candidate",
                                     proof=prepared))
                 prepared_ids.add(lot)
+                enrolled += 1
         if entries:
-            # Same members, same engine order: dependencies first. Candidates
-            # sort after the queued admissions, in inventory order.
-            candidate_priority = 1 + max(
-                (int(entry["row"].get("priority") or 2) for entry in entries),
-                default=2)
-            for index, entry in enumerate(entries):
-                if entry["origin"] == "candidate":
-                    entry["row"]["priority"] = candidate_priority
-                    entry["row"]["rank"] = index
+            # One ordering pass over the queued admissions and the candidates,
+            # as the engine does after enrollment: a queued dependent of a
+            # candidate is not dropped before that candidate is considered.
             members_rows = [entry["row"] for entry in entries]
             ordered = train.ordered(members_rows,
                                     admissions.dependencies(members_rows))

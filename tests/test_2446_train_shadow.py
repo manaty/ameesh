@@ -21,7 +21,8 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from ameesh import (mechanics, merge_queue, plan_git, radar, storage,
-                    train_incidents, train_initial, train_shadow, work)
+                    train_candidates, train_incidents, train_initial,
+                    train_shadow, work)
 from .support import PgTestCase
 from .test_1467_train_review import author
 from .test_2446_train_assembly import MECHANICS, _Repo
@@ -356,15 +357,62 @@ class ShadowPassageTest(PgTestCase):
         first = self.add_candidate("lot/first")[0]
         self.project_repo.branch("lot/second", path="shared.py", text="two\n")
         second = self.add_candidate("lot/second")[0]
+        inventory = train_candidates.Inventory(
+            self.db, self.project, candidate=self.shadow.candidate).read()
+        order = [row["work_item_id"] for row in inventory["candidates"]
+                 if row["work_item_id"] in (first["id"], second["id"])]
+        keeper, loser = order
         result, _ = self.shadow.scheduled_step(self.db, self.now)
         plan = result["plan"]
         members = {row["work_item_id"] for row in plan["members"]}
         reasons = {row["work_item_id"]: row["reason"]
                    for row in plan["deferred"]}
-        self.assertIn(first["id"], members)
-        self.assertNotIn(second["id"], members)
-        self.assertIn("train conflict needs a reviewed delta", reasons[second["id"]])
-        self.assertIn("state=conflict", reasons[second["id"]])
+        self.assertIn(keeper, members)
+        self.assertNotIn(loser, members)
+        self.assertIn("train conflict needs a reviewed delta", reasons[loser])
+        self.assertIn("state=conflict", reasons[loser])
+
+    def test_candidates_are_composed_in_inventory_order(self):
+        """B1 cx2 : un rang 0 ne doit pas passer après ses suivants."""
+        self.db.execute("UPDATE work_items SET state = 'build' WHERE id = %s",
+                        (self.item["id"],))
+        self.project_repo.branch("lot/first", path="shared.py", text="one\n")
+        first = self.add_candidate("lot/first")[0]
+        self.project_repo.branch("lot/second", path="shared.py", text="two\n")
+        second = self.add_candidate("lot/second")[0]
+        # Same inventory the plan reads: the first candidate enrolled by the
+        # active train keeps its content, the second conflicts with it.
+        inventory = train_candidates.Inventory(
+            self.db, self.project, candidate=self.shadow.candidate).read()
+        order = [row["work_item_id"] for row in inventory["candidates"]
+                 if row["work_item_id"] in (first["id"], second["id"])]
+        self.assertEqual(sorted(order), sorted([first["id"], second["id"]]))
+        keeper, loser = order
+        result, _ = self.shadow.scheduled_step(self.db, self.now)
+        plan = result["plan"]
+        self.assertEqual([row["work_item_id"] for row in plan["members"]],
+                         [keeper])
+        reasons = {row["work_item_id"]: row["reason"]
+                   for row in plan["deferred"]}
+        self.assertIn("train conflict needs a reviewed delta", reasons[loser])
+
+    def test_a_queued_dependent_of_a_candidate_is_composed_after_it(self):
+        """B2 cx2 : un dépendant déjà en file n'est pas retiré avant son candidat."""
+        self.db.execute("UPDATE work_items SET state = 'build' WHERE id = %s",
+                        (self.item["id"],))
+        self.project_repo.branch("lot/candidate", path="one.txt", text="one\n")
+        candidate = self.add_candidate("lot/candidate")[0]
+        self.project_repo.branch("lot/queued-dependent", path="two.txt",
+                                 text="two\n")
+        queued, mark, head = self.add_candidate("lot/queued-dependent")
+        self.queue_item(queued, mark, head)
+        storage.of(self.db).work_dependencies.add(
+            queued["id"], candidate["id"], actor="fixture")
+        result, _ = self.shadow.scheduled_step(self.db, self.now)
+        plan = result["plan"]
+        self.assertEqual([row["work_item_id"] for row in plan["members"]],
+                         [candidate["id"], queued["id"]])
+        self.assertEqual(plan["deferred"], [])
 
     def test_a_generated_file_conflict_follows_land_merge(self):
         """#2963 (3) : un conflit sur un fichier généré est celui de land.merge."""
