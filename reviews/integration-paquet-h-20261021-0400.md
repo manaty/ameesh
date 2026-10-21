@@ -46,11 +46,12 @@ et son SHA, et il porte un trailer `ameesh-work: <lot>`.
 
 Aucune : 9 fusions propres.
 
-## Adaptation de contrat CI (1)
+## Adaptations de composition (2)
 
 | source | changement | preuve |
 |---|---|---|
 | `src/ameesh/train_contracts.py` | blob épinglé de `.github/workflows/tests.yml` : `8403f902…` → `6a420c0d…` | #2907 (`16f5ead34455`) modifie `tests.yml`, relu par auditeur (claude) + mty-amh-qa-01 (deepseek) sur ce gel ; le changement ne touche que l'installation du venv (psycopg ≥ 3.2, cache 3.1 invalidé), pas les jobs ni les modules exécutés. Le contrat #2446 exige le blob audité : `tests.test_2446_train_contract` est vert après la mise à jour. Précédents identiques : `f88fcf338` (h-0000), `85fad987b` |
+| `src/ameesh/main.py` | entrée `process check` de l'aide racine déplacée à son rang alphabétique (avant `progress`) | #2922 (`ed78cb936f22`) l'insère après `canon` ; `tests.test_2179_roadmap_cli` exige l'aide racine triée (rouge de la première CI, run 39532579770, part psycopg 4/8) ; texte inchangé, déplacement seul, **3 tests OK** |
 
 ## Écartés (ce véhicule)
 
@@ -92,3 +93,7 @@ Aucune : 9 fusions propres.
   épinglé (rouge de la première CI, run 39532579770, part psycopg 6/8) ;
   adaptation mécanique du blob seul dans `train_contracts.py` (voir
   ci-dessus), **2 tests OK**, puis suite complète relancée sur la nouvelle tête.
+- Aide racine : `process check` (#2922) hors de l'ordre alphabétique exigé
+  par `test_2179_roadmap_cli` (même run, part psycopg 4/8) ; entrée déplacée
+  sans changer son texte, `RoadmapHelpTest` et `test_l230_build_artifacts`
+  verts.

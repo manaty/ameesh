@@ -24,8 +24,6 @@
         | unset [--per-hour] [--per-day] [--agent A]
         mesh budget caps, stored in the database, reloaded live (L70);
   ameesh canon check|show|sync          OKF canon: validation, cards, registry;
-  ameesh process check <page.md> [--ref REF] [--version N] [--json]
-        compile the workflow block of a canon Process card (#2225);
   ameesh chat [--harness claude|codex] [--instruction] [--dry-run]
         the owner's conversation agent: decisions of all projects, answers,
         requests forwarded to orchestrators; never takes another agent's
@@ -116,6 +114,8 @@
         roadmap: dated commitments, proposals drawn from decisions,
         text Gantt (schema ameesh-roadmap/1, L96); planned dates of a
         task or a card: `ameesh work plan <id> --start DATE --end DATE --delivery DATE`;
+  ameesh process check <page.md> [--ref REF] [--version N] [--json]
+        compile the workflow block of a canon Process card (#2225);
   ameesh progress [--json] [--html FILE | --serve [--port 8765]] [--project P] [--since 24h]
         progress: work items, agents, milestones, budget (schema ameesh-progress/1);
         --serve: the page served locally, read-only, with a Refresh button (L304);
