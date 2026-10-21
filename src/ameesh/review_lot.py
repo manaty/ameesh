@@ -1234,68 +1234,106 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
     (`lot_measures.lot_diff_range`, #2374 / #2340), jamais conclue « light »
     sur le vide.
 
-    `repo` est le dépôt où la fusion a été constatée (le relevé des branches
-    le connaît), sinon le dossier de travail de l'assigné au registre, sinon
-    le dépôt du projet (`lot_class.repository`) — toujours pour y lire le diff
-    du lot. `target` la cible déjà résolue.
+    Les dépôts candidats sont essayés dans l'ordre : `repo` explicite
+    (autoritaire, sans repli), sinon le dossier de travail de l'assigné au
+    registre, puis le dépôt du projet (`lot_class.repository`) — toujours pour
+    y lire le diff du lot. On retient le premier qui porte le commit de fusion
+    ou le gel **et** dont le delta est lisible : un répertoire qui n'est pas un
+    dépôt git, un clone partiel ou un diff illisible laisse la place au
+    suivant (#2968). `target` la cible déjà résolue.
 
-    Sans intervalle **prouvé** (diff illisible, commit de fusion absent du
-    dépôt, ni gel ni commit), la classe n'est pas demandée à `of_lot` : son
+    Sans intervalle **prouvé** (aucun candidat ne contient le commit, diff
+    illisible, ni gel ni commit), la classe n'est pas demandée à `of_lot` : son
     repli gel/cible rendrait `cible..gel`, vide dès que le gel est un ancêtre
     de la cible — « light » sur un lot SQL fusionné (R1 #1104 P2-1). On rend un
-    doute conservateur, et d'une classe inconnue on n'ouvre pas de relecture."""
+    doute conservateur, qui nomme les dépôts essayés, et d'une classe inconnue
+    on n'ouvre pas de relecture."""
     from . import lot_measures, plan_git
     if item is None:
         item = work.get(db, lot)
     if item is None:
         return {"class": "", "why": "lot #%d introuvable" % int(lot), "doubt": True}
-    where = repo or _repo_of_agent(db, str(item.get("assignee") or ""))
-    if not where:
-        where = lot_class.repository(getattr(db, "cfg", None), item) or ""
+    # Le répertoire de l'assigné peut n'être qu'un dossier de travail (pas un
+    # dépôt git) ou un clone partiel sans le commit : on essaie les candidats
+    # dans l'ordre (--repo explicite, dépôt de l'assigné, dépôt du projet) et
+    # on retient le premier qui prouve l'intervalle. --repo explicite reste
+    # autoritaire, sans repli (#2968).
+    candidates: list[str] = []
+    if repo:
+        candidates = [repo]
+    else:
+        for path in (_repo_of_agent(db, str(item.get("assignee") or "")),
+                     lot_class.repository(getattr(db, "cfg", None), item) or ""):
+            path = str(path or "").strip()
+            if path and path not in candidates:
+                candidates.append(path)
+    where = candidates[0] if candidates else ""
     base = head = ""
     proven = False
     why = "aucun intervalle de fusion lisible"
+    tried: list[tuple[str, str]] = []
     try:
         frozen = ""
-        if where:
+        if candidates:
             freeze = plan_git.latest_freeze(work.milestones(db, int(lot)))
             frozen = str((freeze or {}).get("sha") or "").strip()
         tips = list(dict.fromkeys(t for t in ((sha or "").strip(), frozen) if t))
-        if not where:
+        if not candidates:
             why = "dépôt inconnu : aucun intervalle de fusion lisible"
         elif not tips:
             why = "ni commit de fusion ni gel : aucun intervalle de fusion lisible"
-        # le commit de la fusion constatée d'abord ; à défaut le gel (fusion
-        # déclarée sans commit lisible, `ameesh work merged` à la main)
-        for tip in tips:
-            # #2702 : lire le delta **du lot** d'abord — une fusion de paquet
-            # ne classe pas ses lots sur le diff du paquet, et une cible
-            # locale périmée n'élargit pas le diff à l'historique entre les
-            # deux ; l'intervalle de la fusion reste le repli (#2374).
-            # UnprovenLotDiff (#2823) interrompt aussi ce repli et l'essai
-            # du gel seul : le paquet ne prouve pas le delta du lot.
-            rng = lot_measures.lot_diff_range(where, tip, target or None,
-                                              frozen=frozen or None)
-            if rng is None:
-                rng = lot_measures.diff_range(where, tip, target or None)
-            if not rng:
-                why = "le dépôt %s ne contient pas le commit %s" % (where, tip[:12])
-                continue
-            paths = lot_measures.diff_paths(where, *rng)
-            if paths is None:
-                why = "diff de fusion illisible pour %s" % tip[:12]
+        for candidate in candidates:
+            reason = ""
+            # le commit de la fusion constatée d'abord ; à défaut le gel (fusion
+            # déclarée sans commit lisible, `ameesh work merged` à la main)
+            for tip in tips:
+                # #2702 : lire le delta **du lot** d'abord — une fusion de paquet
+                # ne classe pas ses lots sur le diff du paquet, et une cible
+                # locale périmée n'élargit pas le diff à l'historique entre les
+                # deux ; l'intervalle de la fusion reste le repli (#2374).
+                # UnprovenLotDiff (#2823) interrompt aussi ce repli et l'essai
+                # du gel seul : le paquet ne prouve pas le delta du lot.
+                try:
+                    rng = lot_measures.lot_diff_range(candidate, tip, target or None,
+                                                      frozen=frozen or None)
+                    if rng is None:
+                        rng = lot_measures.diff_range(candidate, tip, target or None)
+                    if not rng:
+                        reason = "le dépôt %s ne contient pas le commit %s" % (
+                            candidate, tip[:12])
+                        continue
+                    paths = lot_measures.diff_paths(candidate, *rng)
+                except Exception as exc:  # noqa: BLE001 - candidat illisible : le suivant
+                    reason = "lecture du diff impossible : %s: %s" % (
+                        type(exc).__name__, str(exc)[:160])
+                    break
+                if paths is None:
+                    reason = "diff de fusion illisible pour %s" % tip[:12]
+                    break
+                if paths:
+                    where = candidate
+                    base, head = rng
+                    proven = True
+                    break
+                # #2374 (2e cas, #2340) : un intervalle vide — arbre du merge égal
+                # à son premier parent, ou gel déjà porté par la cible — n'est pas
+                # une preuve. Classer ce vide dirait « light » sans jamais lire le
+                # lot : on doute.
+                reason = ("diff de fusion vide et aucun delta du lot lisible pour %s"
+                          % tip[:12])
                 break
-            if paths:
-                base, head = rng
-                proven = True
+            tried.append((candidate, reason or "aucun intervalle lisible"))
+            if proven:
                 break
-            # #2374 (2e cas, #2340) : un intervalle vide — arbre du merge égal
-            # à son premier parent, ou gel déjà porté par la cible — n'est pas
-            # une preuve. Classer ce vide dirait « light » sans jamais lire le
-            # lot : on doute.
-            why = ("diff de fusion vide et aucun delta du lot lisible pour %s"
-                   % tip[:12])
-            break
+        if not proven and tips and tried:
+            if len(tried) == 1:
+                why = tried[0][1]
+            else:
+                why = ("aucun dépôt candidat ne contient le commit %s : %s"
+                       % (tips[0][:12], "; ".join(
+                           "%s: %s" % (path, reason) for path, reason in tried)))
+        # ni commit ni gel : `why` garde le motif posé plus haut, sans nommer
+        # des dépôts qui n'ont rien eu à essayer.
     except Exception as exc:  # noqa: BLE001 - pas d'intervalle : doute, jamais de classe
         proven = False
         why = "lecture du diff impossible : %s: %s" % (type(exc).__name__, str(exc)[:160])
