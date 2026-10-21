@@ -30,7 +30,7 @@ FIVE_DOCUMENTARY = ("docs", "investigation", "governance-tracking",
 
 
 class FakeDistribution:
-    def __init__(self, name="tpk-ameesh-lifecycle", version="0.1.0"):
+    def __init__(self, name="ameesh-sample-module", version="0.1.0"):
         self.name = name
         self.version = version
 
@@ -38,10 +38,10 @@ class FakeDistribution:
 class FakeEntryPoint:
     group = "ameesh.modules"
 
-    def __init__(self, module, name="lifecycle", dist=None):
+    def __init__(self, module, name="sample", dist=None):
         self.name = name
         self.module = module
-        self.value = "tpk_lifecycle"
+        self.value = "sample_module"
         self.dist = dist if dist is not None else FakeDistribution()
 
     def load(self):
@@ -55,9 +55,9 @@ class FakeEntryPoints(list):
         return [point for point in self if group in (None, point.group)]
 
 
-def external_lifecycle(types=None, name="lifecycle", descriptor=None):
+def external_sample(types=None, name="sample", descriptor=None):
     """Un descripteur externe de test, installé hors du dépôt public."""
-    module = types_mod.ModuleType("tpk_lifecycle")
+    module = types_mod.ModuleType("sample_module")
     declared = tuple(types or FIVE_DOCUMENTARY)
     module.NAME = name
     module.TYPES = declared
@@ -67,7 +67,7 @@ def external_lifecycle(types=None, name="lifecycle", descriptor=None):
         def compile_descriptor(options=None):
             options = dict(options or {})
             if options:
-                raise ValueError("unknown lifecycle module option(s): %s"
+                raise ValueError("unknown sample module option(s): %s"
                                  % ", ".join(sorted(options)))
             return {"types": list(declared), "schemas": {}, "rules": []}
         module.descriptor = compile_descriptor
@@ -126,38 +126,38 @@ class ModuleConfigurationTest(unittest.TestCase):
                 modules.declarations(raw)
 
     def test_external_descriptor_is_discovered_and_compiled(self):
-        fake = external_lifecycle()
+        fake = external_sample()
         with external_points(FakeEntryPoint(fake)):
-            self.assertIs(modules.installed()["lifecycle"], fake)
-            entries = modules.declarations(federation(names=["lifecycle"]))
+            self.assertIs(modules.installed()["sample"], fake)
+            entries = modules.declarations(federation(names=["sample"]))
         self.assertEqual([(e["project"], e["module"]) for e in entries],
-                         [("acme", "lifecycle")])
+                         [("acme", "sample")])
         self.assertEqual(entries[0]["types"], list(FIVE_DOCUMENTARY))
         # Q1 #1915 : aucun schéma ni règle métier inventé pour ces types.
         self.assertEqual(entries[0]["schemas"], {})
         self.assertEqual(entries[0]["rules"], [])
-        with self.assertRaisesRegex(ValueError, "unknown lifecycle module option"):
+        with self.assertRaisesRegex(ValueError, "unknown sample module option"):
             fake.descriptor({"require_qa": ["promoted"]})
 
     def test_external_descriptor_and_it_coexist_with_disjoint_types(self):
-        fake = external_lifecycle()
+        fake = external_sample()
         with external_points(FakeEntryPoint(fake)):
-            entries = modules.declarations(federation(names=["it", "lifecycle"]))
+            entries = modules.declarations(federation(names=["it", "sample"]))
         self.assertEqual([(e["project"], e["module"]) for e in entries],
-                         [("acme", "it"), ("acme", "lifecycle")])
+                         [("acme", "it"), ("acme", "sample")])
         it_types = set(next(e["types"] for e in entries if e["module"] == "it"))
         self.assertEqual(set(fake.TYPES), set(FIVE_DOCUMENTARY))
         self.assertFalse(it_types & set(fake.TYPES))
 
     def test_external_module_refusals(self):
-        mismatch = external_lifecycle(name="other")
-        no_descriptor = types_mod.ModuleType("tpk_broken")
-        no_descriptor.NAME = "lifecycle"
-        malformed = external_lifecycle(
+        mismatch = external_sample(name="other")
+        no_descriptor = types_mod.ModuleType("broken_module")
+        no_descriptor.NAME = "sample"
+        malformed = external_sample(
             descriptor=lambda options=None: {"types": [], "schemas": {}, "rules": []})
-        wrong_keys = external_lifecycle(
+        wrong_keys = external_sample(
             descriptor=lambda options=None: {"types": ["docs"], "schemas": {}})
-        bad_types = external_lifecycle(types=["docs", "docs"])
+        bad_types = external_sample(types=["docs", "docs"])
         cases = (
             ("load", (FakeEntryPoint(RuntimeError("boom")),), "cannot be loaded"),
             ("name", (FakeEntryPoint(mismatch),), "declares NAME"),
@@ -165,8 +165,8 @@ class ModuleConfigurationTest(unittest.TestCase):
             ("types", (FakeEntryPoint(malformed),), "types must be unique"),
             ("duplicate-types", (FakeEntryPoint(bad_types),), "types must be unique"),
             ("keys", (FakeEntryPoint(wrong_keys),), "descriptor keys"),
-            ("duplicates", (FakeEntryPoint(external_lifecycle()),
-                            FakeEntryPoint(external_lifecycle())),
+            ("duplicates", (FakeEntryPoint(external_sample()),
+                            FakeEntryPoint(external_sample())),
              "duplicate installed module"),
             ("builtin", (FakeEntryPoint(it, name="it"),), "duplicate installed module"),
         )
@@ -174,33 +174,33 @@ class ModuleConfigurationTest(unittest.TestCase):
             with self.subTest(label=label), external_points(*points), \
                     self.assertRaisesRegex(ValueError, message):
                 modules.installed()
-        inconsistent = external_lifecycle()
+        inconsistent = external_sample()
         inconsistent.TYPES = ("docs",)
         with external_points(FakeEntryPoint(inconsistent)), \
                 self.assertRaisesRegex(ValueError, "TYPES differ"):
             modules.installed()
 
     def test_external_evidence_exposes_installation_proof(self):
-        with external_points(FakeEntryPoint(external_lifecycle())):
+        with external_points(FakeEntryPoint(external_sample())):
             rows = modules.evidence()
-        row = next(item for item in rows if item["name"] == "lifecycle")
+        row = next(item for item in rows if item["name"] == "sample")
         self.assertTrue(row["ok"])
         self.assertEqual(row["source"], "external")
-        self.assertEqual(row["distribution"], "tpk-ameesh-lifecycle")
+        self.assertEqual(row["distribution"], "ameesh-sample-module")
         self.assertEqual(row["version"], "0.1.0")
         self.assertEqual(len(row["descriptor_sha256"]), 64)
-        broken = external_lifecycle(name="other")
+        broken = external_sample(name="other")
         with external_points(FakeEntryPoint(broken)):
             row = next(item for item in modules.evidence()
-                       if item["name"] == "lifecycle")
+                       if item["name"] == "sample")
         self.assertFalse(row["ok"])
         self.assertIn("declares NAME", row["error"])
 
     def test_external_evidence_reports_duplicates_as_unusable(self):
-        points = (FakeEntryPoint(external_lifecycle()),
-                  FakeEntryPoint(external_lifecycle()))
+        points = (FakeEntryPoint(external_sample()),
+                  FakeEntryPoint(external_sample()))
         with external_points(*points):
-            rows = [row for row in modules.evidence() if row["name"] == "lifecycle"]
+            rows = [row for row in modules.evidence() if row["name"] == "sample"]
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(not row["ok"] for row in rows))
         self.assertTrue(all("duplicate installed module" in row["error"]
@@ -220,15 +220,15 @@ class ModuleConfigurationTest(unittest.TestCase):
             return {"types": ["promotion"] if options else ["docs"],
                     "schemas": {}, "rules": []}
 
-        declared = external_lifecycle(types=["docs"], descriptor=descriptor)
+        declared = external_sample(types=["docs"], descriptor=descriptor)
         with external_points(FakeEntryPoint(declared)), \
                 self.assertRaisesRegex(ValueError, "TYPES differ"):
-            modules.declarations(federation(names={"lifecycle": {"typed": True}}))
-        flexible = external_lifecycle(types=["docs"], descriptor=descriptor)
+            modules.declarations(federation(names={"sample": {"typed": True}}))
+        flexible = external_sample(types=["docs"], descriptor=descriptor)
         del flexible.TYPES
         with external_points(FakeEntryPoint(flexible)):
             entries = modules.declarations(
-                federation(names={"lifecycle": {"typed": True}}))
+                federation(names={"sample": {"typed": True}}))
         self.assertEqual(entries[0]["types"], ["promotion"])
 
     def test_external_types_cover_the_five_non_code_process_types(self):
@@ -243,11 +243,11 @@ class ModuleConfigurationTest(unittest.TestCase):
                 self.assertTrue(policy.requires_review)
 
     def test_module_cli_list_prints_installation_evidence(self):
-        with external_points(FakeEntryPoint(external_lifecycle())), \
+        with external_points(FakeEntryPoint(external_sample())), \
                 mock.patch("sys.stdout", new_callable=io.StringIO) as out:
             self.assertEqual(modules.main(["--list"]), 0)
         rows = json.loads(out.getvalue())
-        self.assertTrue(any(row["name"] == "lifecycle" and row["ok"]
+        self.assertTrue(any(row["name"] == "sample" and row["ok"]
                             for row in rows))
 
     def test_canon_check_reports_module_errors(self):
@@ -287,13 +287,13 @@ class ModuleConfigurationTest(unittest.TestCase):
 class ExternalDiscoveryTest(unittest.TestCase):
     """Un paquet réellement présent dans l'environnement est découvert."""
 
-    module_name = "tpk_lifecycle_2847"
+    module_name = "ameesh_sample_module_2847"
 
     def test_a_real_installed_distribution_is_discovered(self):
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder, "%s.py" % self.module_name)
             source.write_text(
-                "NAME = 'lifecycle'\n"
+                "NAME = 'sample'\n"
                 "TYPES = ('docs', 'investigation', 'governance-tracking',\n"
                 "         'promotion', 'human_operation')\n"
                 "def descriptor(options=None):\n"
@@ -301,12 +301,12 @@ class ExternalDiscoveryTest(unittest.TestCase):
                 "    if options:\n"
                 "        raise ValueError('unknown option')\n"
                 "    return {'types': list(TYPES), 'schemas': {}, 'rules': []}\n")
-            info = Path(folder, "tpk_ameesh_lifecycle-0.1.0.dist-info")
+            info = Path(folder, "ameesh_sample_module-0.1.0.dist-info")
             info.mkdir()
             (info / "METADATA").write_text(
-                "Metadata-Version: 2.1\nName: tpk-ameesh-lifecycle\nVersion: 0.1.0\n")
+                "Metadata-Version: 2.1\nName: ameesh-sample-module\nVersion: 0.1.0\n")
             (info / "entry_points.txt").write_text(
-                "[ameesh.modules]\nlifecycle = %s\n" % self.module_name)
+                "[ameesh.modules]\nsample = %s\n" % self.module_name)
             sys.path.insert(0, folder)
             try:
                 registry = modules.installed()
@@ -314,12 +314,28 @@ class ExternalDiscoveryTest(unittest.TestCase):
             finally:
                 sys.path.remove(folder)
                 sys.modules.pop(self.module_name, None)
-        self.assertEqual(registry["lifecycle"].NAME, "lifecycle")
-        row = next(item for item in rows if item["name"] == "lifecycle")
+        self.assertEqual(registry["sample"].NAME, "sample")
+        row = next(item for item in rows if item["name"] == "sample")
         self.assertTrue(row["ok"])
-        self.assertEqual(row["distribution"], "tpk-ameesh-lifecycle")
+        self.assertEqual(row["distribution"], "ameesh-sample-module")
         self.assertEqual(row["version"], "0.1.0")
         self.assertEqual(len(row["descriptor_sha256"]), 64)
+
+    def test_the_repository_test_module_is_discovered(self):
+        folder = str(Path(__file__).resolve().parent / "fixtures" / "ameesh_modules")
+        sys.path.insert(0, folder)
+        try:
+            registry = modules.installed()
+            rows = modules.evidence()
+        finally:
+            sys.path.remove(folder)
+            sys.modules.pop("sample_module", None)
+        self.assertEqual(registry["sample"].NAME, "sample")
+        self.assertEqual(set(registry["sample"].TYPES), set(FIVE_DOCUMENTARY))
+        row = next(item for item in rows if item["name"] == "sample")
+        self.assertTrue(row["ok"])
+        self.assertEqual(row["distribution"], "ameesh-sample-module")
+        self.assertEqual(row["version"], "0.1.0")
 
 
 class ExecutionTest(unittest.TestCase):
@@ -615,9 +631,9 @@ class DocumentaryTypesGateTest(PgTestCase):
 
     def setUp(self):
         super().setUp()
-        self.external = external_lifecycle()
+        self.external = external_sample()
         with external_points(FakeEntryPoint(self.external)):
-            declarations = modules.declarations(federation(names=["lifecycle"]))
+            declarations = modules.declarations(federation(names=["sample"]))
         with self.db.transaction() as tx:
             ModuleStore(tx).replace("", declarations)
 
