@@ -1747,7 +1747,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # L157 : durée estimée, obligatoire pour un agent (refus AVANT la
             # création), avertissement pour un humain
             from . import estimates
-            from . import identity, work_projects
+            from . import identity, intake_neighbors, work_projects
             binding = identity.resolve_binding(cfg, db)
             creator = binding.name if binding.ok else args.actor
             if args.new_project and args.app is None:
@@ -1761,6 +1761,19 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             warn_estimate = estimates.check(db, args.actor, minutes)
             check = (work.check_assignee(db, args.assignee, externe=args.externe, cfg=cfg)
                      if args.assignee else None)
+            # #2988 : tête relue, détection d'une revue et voisins calculés
+            # AVANT `work.add` — la recherche git ne doit pas tourner dans
+            # `work._create`, appelé aussi par incident.py, assignments.py et
+            # review_lot.py. Le segment est préfixé à la note de création.
+            try:
+                segment, infos = intake_neighbors.creation_note(
+                    db, cfg, app=args.app or "", title=args.title,
+                    body=args.body or "", source=args.source or "",
+                    issue_ref=args.issue_ref or "",
+                    reviewed_head=args.reviewed_head)
+            except intake_neighbors.IntakeNeighborsError as exc:
+                raise work.WorkError(str(exc)) from None
+            note = "; ".join(part for part in (segment, introduced) if part)
             item = work.add(
                 db, title=args.title, type=args.type, source=args.source, app=args.app,
                 body=args.body or "", issue_ref=args.issue_ref, workstream=args.workstream,
@@ -1768,10 +1781,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 package=args.package, externe=args.externe, cfg=cfg,
                 branch=args.branch, branch_target=args.target, priority=args.priority,
                 estimate=minutes, estimate_source=args.estimate_source, size=args.size,
-                note=introduced,
+                note=note,
                 force=args.force,
-                parent_lot=args.parent_lot,
-                reviewed_head=args.reviewed_head)
+                parent_lot=args.parent_lot)
             print("lot #%d created in %s: %s%s%s%s" % (
                 item["id"], item["state"], item["title"],
                 " (plan: %s)" % item["package_id"] if item.get("package_id") else "",
@@ -1801,19 +1813,17 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("warning: %s" % item["queue_warning"], file=sys.stderr)
             # #2988 : la tête relue manquante, les voisins trouvés et l'état du
             # contrôle git sont dits au rédacteur (stderr), jamais refusés.
-            if item.get("reviewed_warning"):
-                print("warning: %s" % item["reviewed_warning"], file=sys.stderr)
-            if item.get("neighbors_error"):
-                print("warning: voisins non recherchés: %s" % item["neighbors_error"],
+            if infos.get("reviewed_warning"):
+                print("warning: %s" % infos["reviewed_warning"], file=sys.stderr)
+            if infos.get("neighbors_error"):
+                print("warning: voisins non recherchés: %s" % infos["neighbors_error"],
                       file=sys.stderr)
-            if item.get("neighbors_git") == "non vérifié":
+            if infos.get("neighbors_git") == "non vérifié":
                 print("warning: git non vérifié (aucun clone local du dépôt du projet)",
                       file=sys.stderr)
-            if item.get("neighbors"):
-                from . import intake_neighbors
-                for neighbor in item["neighbors"]:
-                    print("neighbor: %s" % intake_neighbors.format_neighbor(neighbor),
-                          file=sys.stderr)
+            for neighbor in infos.get("neighbors") or ():
+                print("neighbor: %s" % intake_neighbors.format_neighbor(neighbor),
+                      file=sys.stderr)
             return 0
         if args.work_command == "assign":
             out = work.assign(db, args.id, args.agent, externe=args.externe,

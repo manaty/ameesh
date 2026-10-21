@@ -14,6 +14,11 @@ Ce module fournit :
   exclus de la détection automatique) ;
 * `reviewed_head_of` : la tête relue écrite dans la note de création
   (`reviewed head: <sha>`, ou `absent`), relue par `work show` ;
+* `creation_note` : le fragment à préfixer à la note de création et les
+  informations rendues à la CLI (tête relue, voisins, avertissements),
+  appelé avant `work.add` pour que `work._create` ne lance pas la recherche
+  git (il est aussi appelé par `incident.py`, `assignments.py` et
+  `review_lot.py`) ;
 * `neighbors` : les lots du même projet, ouverts ou terminés depuis moins de
   sept jours, qui citent le même chemin, partagent au moins trois mots
   significatifs de titre, ou dont un commit `tête..cible` touche la ligne
@@ -935,3 +940,57 @@ def note_line(result: dict) -> str:
     if result.get("git") == "non vérifié":
         parts.append("git non vérifié")
     return "; ".join(parts)
+
+
+def creation_note(db, cfg, app: str, title: str = "", body: str = "",
+                  source: str = "", issue_ref: str = "",
+                  reviewed_head: Optional[str] = None) -> tuple[str, dict]:
+    """Le fragment de note et les informations d'un lot créé (#2988).
+
+    Appelé par la CLI **avant** `work.add` : la tête relue, la détection d'un
+    lot né d'une revue et la recherche des voisins (dont le `git log` local)
+    ne doivent pas tourner dans `work._create`, appelé aussi par
+    `incident.py`, `assignments.py` et `review_lot.py`.
+
+    Rend `(segment, infos)` : `segment` est préfixé à la note de création
+    (`reviewed head: …; neighbors: …`) ; `infos` porte les valeurs lues par
+    l'appelant (`reviewed_head`, `reviewed_from_review`, `neighbors`,
+    `neighbors_git`, `neighbors_error`, `reviewed_warning`). Une tête non
+    hexadécimale lève `IntakeNeighborsError` ; une recherche en échec
+    n'empêche jamais la création (L130) et se dit dans `neighbors_error`.
+    """
+    head = normalize_head(reviewed_head)
+    born = review_born(title=title or "", source=source or "",
+                       issue_ref=issue_ref or "", reviewed_head=head)
+    if head:
+        try:
+            clone = resolve_clone(cfg, app)
+            resolved = resolve_head(clone, head)
+        except Exception:  # noqa: BLE001 - un clone illisible ne refuse rien
+            resolved = None
+        if resolved:
+            head = resolved
+    try:
+        found = neighbors(db, app or "", title=title or "", body=body or "",
+                          reviewed_head=head, cfg=cfg)
+    except Exception as exc:  # noqa: BLE001 - la recherche ne refuse jamais (L130)
+        found = {"neighbors": [], "git": "", "error": str(exc)}
+    segments = []
+    if born:
+        segments.append("reviewed head: %s" % (head or "absent"))
+    if found.get("error"):
+        segments.append("neighbors: recherche indisponible")
+    line = note_line(found)
+    if line:
+        segments.append(line)
+    infos = {
+        "reviewed_head": head or ("absent" if born else None),
+        "reviewed_from_review": born,
+        "neighbors": found.get("neighbors") or [],
+        "neighbors_git": found.get("git") or "",
+        "neighbors_error": found.get("error") or "",
+        "reviewed_warning": (
+            "lot né d'une revue sans tête relue : --reviewed-head <sha>"
+            if born and not head else ""),
+    }
+    return "; ".join(segments), infos

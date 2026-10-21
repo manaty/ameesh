@@ -383,7 +383,6 @@ def add(
     parent_lot: int | None = None,
     mark_item_id: int | None = None,
     mark_note: str = "",
-    reviewed_head: str | None = None,
 ) -> dict:
     """Crée un lot en `intake`. Un assigné passe par l'attribution gardée
     (`check_assignee`, L37) : un agent non réveillable est refusé (WorkError).
@@ -421,16 +420,7 @@ def add(
     title or the source looks like a non-blocking follow-up (N, P2, P3) — the
     route to the backlog, to be shown by the caller. Nothing is ever refused:
     a human request, a blocking defect and the review-after-merge lot pass
-    unchanged.
-
-    #2988 : `reviewed_head` est la tête que la revue (ultrareview, verdict,
-    relecture) a lue, d'où naît le lot. Elle est écrite dans la note de
-    création (`reviewed head: <sha>`, ou `absent` pour un lot né d'une revue
-    sans tête) et affichée par `work show`. Avant l'écriture, les lots du
-    même projet, ouverts ou terminés depuis sept jours, sont recherchés
-    (`intake_neighbors`) : le journal porte leurs motifs (même fichier,
-    titre proche, commit qui touche la ligne citée) et l'appelant les montre
-    au rédacteur. Aucune création n'est refusée pour cela (L130)."""
+    unchanged."""
     from .agent_names import resolve as resolve_agent_name
     assignee = resolve_agent_name(assignee, db=db, operation="work.add")
     return _create(db, title=title, type=type, source=source, app=app, body=body,
@@ -439,8 +429,7 @@ def add(
                    cfg=cfg, branch=branch, branch_target=branch_target, priority=priority,
                    estimate=estimate, estimate_source=estimate_source, size=size,
                    note=note, force=force, parent_lot=parent_lot,
-                   mark_item_id=mark_item_id, mark_note=mark_note, team_queue=True,
-                   reviewed_head=reviewed_head)
+                   mark_item_id=mark_item_id, mark_note=mark_note, team_queue=True)
 
 
 def _decision_lot(db: Db, *, title: str, requester: str, app: str, cfg=None) -> dict:
@@ -456,7 +445,7 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
             actor="", package=None, externe=False, cfg=None, branch=None,
             branch_target=None, priority=None, estimate=None, estimate_source=None,
             size=None, note="", force=None, parent_lot=None, mark_item_id=None,
-            mark_note="", team_queue: bool, reviewed_head=None) -> dict:
+            mark_note="", team_queue: bool) -> dict:
     """`add`, et `_decision_lot` (`team_queue=False`)."""
     minutes = None
     if estimate not in (None, ""):
@@ -492,39 +481,8 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
         raise WorkError("--externe without assignee: nothing to force")
     fiche = _package(db, package) if package else None
     branch, branch_target = _branch_args(branch, branch_target)
-    # #2988 : la tête relue et les voisins du lot, écrits dans la note de
-    # création ; la recherche ne refuse jamais la création (L130).
-    from . import intake_neighbors
-    try:
-        head = intake_neighbors.normalize_head(reviewed_head)
-    except intake_neighbors.IntakeNeighborsError as exc:
-        raise WorkError(str(exc)) from None
-    born = intake_neighbors.review_born(title=title or "", source=source or "",
-                                        issue_ref=issue_ref or "",
-                                        reviewed_head=head)
-    if head:
-        try:
-            clone = intake_neighbors.resolve_clone(cfg, app)
-            resolved = intake_neighbors.resolve_head(clone, head)
-        except Exception:  # noqa: BLE001 - un clone illisible ne refuse rien
-            resolved = None
-        if resolved:
-            head = resolved
-    try:
-        found = intake_neighbors.neighbors(db, app or "", title=title or "",
-                                           body=body or "", reviewed_head=head, cfg=cfg)
-    except Exception as exc:  # noqa: BLE001 - la recherche ne refuse jamais (L130)
-        found = {"neighbors": [], "git": "", "error": str(exc)}
-    segments = []
-    if born:
-        segments.append("reviewed head: %s" % (head or "absent"))
-    if found.get("error"):
-        segments.append("neighbors: recherche indisponible")
-    segments.append(intake_neighbors.note_line(found))
-    creation_segments = "; ".join(segment for segment in segments if segment)
     created = ("created" + (" (plan: %s)" % package if package else "")
                + ("; estimate: %s" % span(minutes * 60) if minutes else "")
-               + ("; %s" % creation_segments if creation_segments else "")
                + ("; %s" % note if note else ""))
     item = storage.of(db).work.add(
         type=type, source=source, app=app, title=title.strip(), body=body,
@@ -539,14 +497,6 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
         queued_note=queued and _queued_note(queued, created),
         forced_note=queued and _forced_note(queued, created, force, actor),
         mark_item_id=mark_item_id, mark_note=mark_note, parent_lot=parent_lot)
-    item["reviewed_head"] = head or ("absent" if born else None)
-    item["reviewed_from_review"] = born
-    item["neighbors"] = found.get("neighbors") or []
-    item["neighbors_git"] = found.get("git") or ""
-    item["neighbors_error"] = found.get("error") or ""
-    if born and not head:
-        item["reviewed_warning"] = (
-            "lot né d'une revue sans tête relue : --reviewed-head <sha>")
     if item.get("queued_behind") is not None:
         item["queue_warning"] = queue_warning(db, item, assignee)
     # L317c : un bug de priorité 1 ouvert par un humain (ou son chat) réveille
