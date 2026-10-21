@@ -166,8 +166,18 @@ class GateMandatoryWitnessTest(PgTestCase):
         work.milestone(self.db, self.lot, "frozen", sha=self.frozen,
                        actor="author")
         for actor in ("cx2", "cx3", "dev1"):
-            work.milestone(self.db, self.lot, "verdict", sha=self.frozen,
-                           actor=actor, verdict="ok")
+            mark = work.milestone(self.db, self.lot, "verdict", sha=self.frozen,
+                                  actor=actor, verdict="ok")
+            # #2928 : la porte sensible ne compte un avis que sur son reçu
+            # exact ; ces avis sont réels, ils portent leur preuve.
+            harness = {"cx2": "codex", "cx3": "codex", "dev1": "deepseek"}[actor]
+            self.db.execute(
+                "INSERT INTO provenance_receipts"
+                " (subject, sha, actor, session, turn, harness, work_item_id)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                " ON CONFLICT (subject) DO NOTHING",
+                ("milestone:%d" % int(mark["id"]), self.frozen, actor,
+                 "s-" + harness, "t", harness, self.lot))
 
     def gate(self):
         klass = {"class": "sensitive", "doubt": False,

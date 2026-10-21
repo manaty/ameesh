@@ -115,6 +115,14 @@ class TrainRunnerTest(PgTestCase):
             receipt = dataclasses.replace(receipt, milestone={key: mark[key]
                 for key in ("id", "actor", "at_ts", "sha", "verdict")})
             self.receipts[receipt.subject] = dataclasses.asdict(receipt)
+            # #2928 : la porte sensible lit le reçu exact dans la base.
+            self.db.execute(
+                "INSERT INTO provenance_receipts"
+                " (subject, sha, actor, session, turn, harness, work_item_id)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                " ON CONFLICT (subject) DO NOTHING",
+                (receipt.subject, self.head, reader, "s-" + family, "t", family,
+                 item["id"]))
         self.provider = types.SimpleNamespace(ProvenanceError=RuntimeError,
             receipt_for_commit=lambda db, sha: self.receipts.get("commit:" + sha),
             receipt_for_milestone=lambda db, mid: self.receipts.get("milestone:%d" % mid))
@@ -446,6 +454,14 @@ class TrainRunnerTest(PgTestCase):
                 receipt = dataclasses.replace(receipt, milestone={key: mark[key]
                     for key in ("id", "actor", "at_ts", "sha", "verdict")})
                 self.receipts[receipt.subject] = dataclasses.asdict(receipt)
+                # #2928 : la porte sensible lit le reçu exact dans la base.
+                self.db.execute(
+                    "INSERT INTO provenance_receipts"
+                    " (subject, sha, actor, session, turn, harness, work_item_id)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                    " ON CONFLICT (subject) DO NOTHING",
+                    (receipt.subject, head, reader, "s-" + family, "t", family,
+                     item["id"]))
             added.append(member)
         dependent, independent = added
         storage.of(self.db).work_dependencies.add(dependent["work_item_id"],

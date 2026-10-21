@@ -730,6 +730,37 @@ class CodexAppServerTest(DriverCase):
         self.assertEqual(self.methods("turn/steer")[0]["expectedTurnId"], "turn-1")
         self.assertEqual(len(self.methods("turn/start")), 1)
 
+    def test_steer_running_joins_the_turn(self):
+        """L77/B8 : le steer du runner rejoint le tour en cours."""
+        driver = self.driver()
+        driver.start()
+        turn = driver.send("SLOW first", input_id="a")
+        self.assertIs(driver.steer_running("steered", input_id="b"), turn)
+        result = self.wait(turn)
+        self.assertEqual(result.inputs, ("a", "b"))
+        self.assertEqual(result.final, "ECHO:SLOW first\nECHO:steered")
+        self.assertEqual(len(self.methods("turn/start")), 1)
+
+    def test_steer_running_without_a_turn_starts_none(self):
+        driver = self.driver()
+        driver.start()
+        self.assertIsNone(driver.steer_running("late", input_id="b"))
+        self.assertEqual(self.methods("turn/start"), [])
+
+    def test_steer_running_never_opens_a_new_turn_after_the_end(self):
+        """L77/B8 : un steer qui arrive après la fin ne crée pas de tour."""
+        driver = self.driver()
+        driver.start()
+        turns = self.steer_racing_the_end(driver)
+        turns.append(driver.send("SLOW first", input_id="a"))
+        second = driver.steer_running("late", input_id="b")
+        first = self.wait(turns[0])
+        self.assertIsNone(second)
+        self.assertEqual(first.inputs, ("a",))
+        self.assertEqual([p["input"][0]["text"] for p in self.methods("turn/start")],
+                         ["SLOW first"])
+        self.assertFalse(driver.busy)
+
     def test_refused_steer_follows_in_the_same_logical_turn(self):
         driver = self.driver(env={"FAKE_CODEX_STEER_REFUSE": "1"})
         driver.start()
