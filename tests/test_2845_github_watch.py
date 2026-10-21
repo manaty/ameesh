@@ -479,6 +479,24 @@ class CollectionTest(unittest.TestCase):
             events += more
             self.assertEqual({e["object_id"] for e in events}, {1, 2, 3, 4})
 
+    def test_surely_indexed_row_past_the_window_stops_the_stream(self):
+        # Contract #2955: once a row is older than INDEX_LAG at the read, its
+        # key is its stamp. A surely indexed row past U proves every following
+        # key is past U too: the stream can stop, after delivering the settled
+        # rows of the page.
+        with mock.patch.object(watch, "PAGE_SIZE", 2):
+            rows = [issue(n) for n in range(1, 5)]
+            rows[2]["updated_at"] = watch.iso(NOW - 250)  # > U at scan start
+            api = Api(rows, [])
+            events, scan, _ = watch.collect_batch(
+                api, SUB, NOW - 3600, NOW, None)
+            more, scan, _ = watch.collect_batch(
+                api, SUB, NOW, NOW + 100, scan)
+            events += more
+        self.assertEqual({e["object_id"] for e in events}, {1, 2, 4})
+        self.assertIsNone(scan)
+        self.assertFalse(any("page=3" in call for call in api.calls))
+
     def test_b6_anchor_must_be_an_accepted_row(self):
         # B6 #2955: #6 is deferred (> U) but its old key sits at the end of the
         # page. When #1..#5 move and #6 catches up its key, the re-read page is

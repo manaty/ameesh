@@ -316,9 +316,15 @@ def collect_batch(api, sub, since, now, scan):
                 continue
             return events, None, settled
 
+        # A row is surely indexed once its stamp is at least INDEX_LAG old at
+        # this read: its key is then its stamp. If such a row is past U, every
+        # following key is > U too, so no settled row can follow it.
+        stop_after = any(not inside(row) and when(row) <= now - lag for row in rows)
         previous = read(state["page"] - 1) if state["page"] > 1 else None
         recovered = []
-        if previous is not None:
+        if previous is not None and stop_after:
+            recovered = [row for row in previous if inside(row)]
+        elif previous is not None:
             snapshot = state.get("snap_prev") or []
             if snapshot:
                 position, _key = anchor_position(previous, snapshot)
@@ -361,7 +367,7 @@ def collect_batch(api, sub, since, now, scan):
             raise plan_github.GithubError("GitHub watch: updated order is invalid")
         events.extend(events_from(sub, state["kind"], current))
 
-        if not full:
+        if stop_after or not full:
             if state["kind"] == "issue":
                 state.update(kind="comment", page=1, since=state["window_since"],
                              blank=0)
