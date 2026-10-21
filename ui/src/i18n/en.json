@@ -169,6 +169,10 @@
   "device.stop.clean.help": "The turn ends at its safe point, the lease is released, the lots return to the queue.",
   "device.stop.immediate": "Stop immediately",
   "device.stop.immediate.help": "The Compute runner destroys the sandbox; ameesh sees the lease expire.",
+  "device.stop.confirm.title": "Confirm immediate stop",
+  "device.stop.confirm": "Stop {agent} immediately? The sandbox will be destroyed and unfinished work may be lost.",
+  "device.stop.confirm.action": "Confirm immediate stop",
+  "device.stop.cancel": "Cancel",
   "device.provider.missing": "Local state is readable only by the host application, which queries the runner's socket; a web page cannot open it.",
   "device.error": "Local state unreadable: {message}",
   "device.compute.lease": "Compute lease: {id}, until {at}"
