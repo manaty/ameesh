@@ -46,6 +46,12 @@ et son SHA, et il porte un trailer `ameesh-work: <lot>`.
 
 Aucune : 9 fusions propres.
 
+## Adaptation de contrat CI (1)
+
+| source | changement | preuve |
+|---|---|---|
+| `src/ameesh/train_contracts.py` | blob épinglé de `.github/workflows/tests.yml` : `8403f902…` → `6a420c0d…` | #2907 (`16f5ead34455`) modifie `tests.yml`, relu par auditeur (claude) + mty-amh-qa-01 (deepseek) sur ce gel ; le changement ne touche que l'installation du venv (psycopg ≥ 3.2, cache 3.1 invalidé), pas les jobs ni les modules exécutés. Le contrat #2446 exige le blob audité : `tests.test_2446_train_contract` est vert après la mise à jour. Précédents identiques : `f88fcf338` (h-0000), `85fad987b` |
+
 ## Écartés (ce véhicule)
 
 | lot | source | motif |
@@ -82,3 +88,7 @@ Aucune : 9 fusions propres.
   témoins merge-pr, désignation, preuve de fusion) : **350 tests, OK** ;
   puis, sur la tête finale avec #2933 : `test_2933`, `test_789_slo*` et
   8 modules de ménage : **260 tests, OK** (1 ignoré).
+- Contrat CI #2446 : `tests.yml` modifié par #2907 sans mise à jour du blob
+  épinglé (rouge de la première CI, run 39532579770, part psycopg 6/8) ;
+  adaptation mécanique du blob seul dans `train_contracts.py` (voir
+  ci-dessus), **2 tests OK**, puis suite complète relancée sur la nouvelle tête.
