@@ -77,3 +77,8 @@ Aucune : 9 fusions propres.
 - Contenu : 56 fichiers, +5576/−193 hors manifeste ; aucune migration SQL.
   `git diff --check` ne signale que `src/ameesh/ui/static/ameesh-ui.js`
   (bundle généré par #382, espaces dans des gabarits littéraux).
+- Ciblés sur l'arbre composé (local, sans CI), tous verts :
+  13 modules (unités #2847, #2931, #2919, #382, #2934, #2907, #2922, #2894,
+  témoins merge-pr, désignation, preuve de fusion) : **350 tests, OK** ;
+  puis, sur la tête finale avec #2933 : `test_2933`, `test_789_slo*` et
+  8 modules de ménage : **260 tests, OK** (1 ignoré).
