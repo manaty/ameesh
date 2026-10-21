@@ -81,5 +81,7 @@ Aucune : 10 fusions propres, arbre composé sans adaptation.
 - Contenu : 82 fichiers, +7121/−290 hors manifeste ; aucune migration SQL ;
   `git diff --check` propre ; aucun fichier `.github/workflows/**` modifié.
 - Ciblés sur l'arbre composé (local, sans CI) : à compléter.
-- Contrôle d'inclusion `scripts/paquet-inclusion.py` : à compléter.
-- CI complète : à compléter (une seule suite sur la tête gelée).
+- Contrôle d'inclusion `scripts/paquet-inclusion.py` sur `b9dade7f` : 10
+  entrées (10 compositions, 0 retrait), 10 lots attendus, 10 prêts,
+  verdicts présents 10/10, aucun contenu à lire ni défaut (rc 0).
+- CI complète : à demander sur la tête gelée (une seule suite).
