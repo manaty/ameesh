@@ -64,10 +64,26 @@ class GithubObservationTest(PgTestCase):
         self.assertEqual([a["repo"] for a in self.alerts(cfg)], ["acme/another"])
         self.assertEqual(len(self.alerts(cfg, now=NOW + FRESH_S + 1)), 2)
 
-    def test_no_projects_is_disabled(self):
-        with mock.patch.object(github_observation.storage, "of") as store:
-            self.assertEqual(self.alerts(self.cfg), [])
-        store.assert_not_called()
+    def test_no_projects_and_no_shared_readings_is_quiet(self):
+        self.assertEqual(self.alerts(self.cfg), [])
+
+    def test_no_github_config_falls_back_to_shared_repositories(self):
+        self.reading(seen=NOW - FRESH_S - 1)
+        self.reading(repo="acme/fresh")
+        cfg = dataclasses.replace(self.cfg, github=None)
+        (alert,) = self.alerts(cfg)
+        self.assertEqual(alert["repo"], REPO)
+        self.assertEqual(alert["last_seen_ts"], NOW - FRESH_S - 1)
+        self.assertIn("github.host (not designated)", alert["detail"])
+        self.reading()
+        self.assertEqual(self.alerts(cfg), [])
+
+    def test_empty_projects_fall_back_and_deduplicate_without_case(self):
+        self.reading(seen=NOW - FRESH_S - 1)
+        self.reading(repo="ACME/WIDGET", seen=NOW - FRESH_S - 1)
+        cfg = dataclasses.replace(self.cfg, github={"projects": {}})
+        (alert,) = self.alerts(cfg)
+        self.assertEqual(alert["repo"].casefold(), REPO.casefold())
 
     def test_any_notifier_raises_deduplicates_and_resolves(self):
         """Exercise the real alerts→notify path, with no network or real sends."""
@@ -76,10 +92,10 @@ class GithubObservationTest(PgTestCase):
         ncfg = notify.parse_config({"default_human": "human:owner",
                                    "default": ["desktop"]})
         state = notify.empty_state()
-        for host in (None, "observer-host"):
-            with self.subTest(designated_host=host):
-                cfg = dataclasses.replace(self.github_cfg, github={
-                    "projects": {"widget": REPO}, "host": host})
+        for github in (None, {"projects": {"widget": REPO},
+                              "host": "observer-host"}):
+            with self.subTest(github=github):
+                cfg = dataclasses.replace(self.cfg, github=github)
                 notifier = notify.Notifier(cfg, ncfg, state, sender=sender,
                                            clock=lambda: NOW, log=lambda _: None)
                 # The designated observer's periodic jobs stay out of this
@@ -90,10 +106,13 @@ class GithubObservationTest(PgTestCase):
                     records = notifier.run_pass(self.db)
                 own = [r for r in records if r["type"] == "github_observation_stale"]
                 self.assertEqual([r["event"] for r in own],
-                                 ["raised"] if host is None else [])
+                                 ["raised"] if github is None else [])
         self.assertEqual(len(sender.sent), 1)
         self.assertIn(REPO, sender.sent[0][1].body)
         self.reading()
+        notifier = notify.Notifier(
+            dataclasses.replace(self.cfg, github=None), ncfg, state,
+            sender=sender, clock=lambda: NOW, log=lambda _: None)
         with mock.patch.object(notifier, "_github_issues"), \
                 mock.patch.object(notifier, "_github_inputs"), \
                 mock.patch.object(notifier, "_ci_failures"):

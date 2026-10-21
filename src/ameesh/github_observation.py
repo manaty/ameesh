@@ -11,6 +11,8 @@ def alerts(cfg, db, now: float, *, fresh_s: float) -> list[dict]:
     No GitHub call, designated-host check or local startup timer: restarting
     a notifier must not hide a missing reading. Never-observed repositories
     are reported on the first pass, without inventing a last-reading time.
+    Without local projects, monitor repositories already in the shared state
+    so a notifier on another host can detect the observer's silence.
     """
     from .exploitation import _alert, _stamp
 
@@ -19,10 +21,10 @@ def alerts(cfg, db, now: float, *, fresh_s: float) -> list[dict]:
     except plan_github.SettingsError:
         return []  # The GitHub projector reports invalid configuration.
     repos = {repo.casefold(): repo for repo in settings.projects.values()}
-    if not repos:
-        return []
     readings = {row["repo"].casefold(): row
                 for row in storage.of(db).ci.queued_oldest()}
+    if not repos:
+        repos = {key: row["repo"] for key, row in readings.items()}
     out = []
     for key, repo in sorted(repos.items()):
         seen = readings.get(key, {}).get("seen_ts")
