@@ -169,6 +169,11 @@ def reference_author(db, item: Mapping, milestone: Optional[Mapping], families,
     registre. C'est exactement la référence de la porte (`assignee`) ; le
     registre courant ne prouve une famille que lorsque le gel ne la donne pas.
 
+    `strict=True` (le train) refuse un reçu de jalon contradictoire ou
+    malformé (`ProvenanceError`) au lieu de lire son absence et de retomber
+    sur le registre ; la porte de fusion lit la même trace avec la même
+    exigence (#2961).
+
     #2803 : sur un lot porteur de paquet (`integration/**`), l'assigné est le
     **composeur** — un geste mécanique (canon §2/§11 bis), pas un auteur du
     contenu relu. La référence est vide : les auteurs sont ceux des lots du
@@ -186,11 +191,28 @@ def reference_author(db, item: Mapping, milestone: Optional[Mapping], families,
         author = {}
     name = str(author.get("name") or assignee).strip()
     family = _family(author.get("harness"), families)
-    if not family and milestone is not None:
+    # Un jalon sans identifiant positif n'est pas un reçu lisible : ce n'est
+    # pas une preuve contradictoire, seulement une trace absente (#2961).
+    try:
+        milestone_id = int((milestone or {}).get("id") or 0)
+    except (TypeError, ValueError):
+        milestone_id = 0
+    if not family and milestone is not None and milestone_id > 0:
         try:
-            proof = _milestone_receipt(provider, db, int(milestone["id"]),
+            proof = _milestone_receipt(provider, db, milestone_id,
                                        strict=strict)
-        except (review_provenance.ProvenanceError, KeyError, TypeError, ValueError):
+        except review_provenance.ProvenanceError:
+            # #2961 : en mode strict (train, porte), un reçu contradictoire
+            # n'est pas une absence. La famille de la référence ne se remplace
+            # pas par le registre courant quand la preuve du gel dit autre
+            # chose : l'indépendance ne se suppose jamais.
+            if strict:
+                raise
+            proof = None
+        except (KeyError, TypeError, ValueError) as exc:
+            if strict:
+                raise review_provenance.ProvenanceError(
+                    "malformed freeze milestone for the reference author") from exc
             proof = None
         if proof and str(proof.get("actor") or "").strip() == name:
             family = _family(proof.get("harness"), families)

@@ -686,7 +686,7 @@ def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
 
 def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
                         repo: str, base: str, head: str, *, families=(),
-                        commits=None) -> tuple[list, list, list]:
+                        commits=None, strict: bool = False) -> tuple[list, list, list]:
     """`(auteurs, inconnus, correcteurs)` de la plage gelée `base..head` (#2681/#2739).
 
     La même lecture partagée que la désignation (`review_authors.reading`),
@@ -697,6 +697,10 @@ def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
     un correcteur retiré par une désignation ultérieure. Ne lève pas sur un
     inconnu : l'appelant décide (la porte refuse fermé, le train lève).
 
+    #2961 : `strict=True` (la porte) fait d'un reçu de provenance contradictoire
+    une erreur au lieu d'une absence — la famille de la référence ne se
+    remplace alors pas au registre courant.
+
     #2803 : `commits` remplace la plage `base..head` quand l'appelant l'a
     déjà calculée — le delta propre d'un véhicule de paquet, seul contenu que
     sa porte relit (`packet_reviews.need`). La lecture des auteurs et des
@@ -706,7 +710,7 @@ def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
     if commits is None:
         _start, _paths, commits = _range(repo, base, head)
     return review_authors.reading(db, item, milestone, commits, repo,
-                                  families=families)
+                                  families=families, strict=strict)
 
 
 def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],

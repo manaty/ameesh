@@ -209,6 +209,11 @@ class GateTitularTest(PgTestCase):
         amended = self.repo.git("rev-parse", "HEAD")
         self.receipt("impl", "deepseek", [amended])
         self.freeze(amended)
+        # #2961 : la famille de la référence se lit sur la trace du gel (le
+        # tour qui a posé le gel), plus au harnais déclaré du registre.
+        self.db.execute(
+            "INSERT INTO turn_costs (agent, harness, session, recorded_at)"
+            " VALUES ('titular', 'claude', 's-claude', now() + interval '1 second')")
         out = self.gate(amended, ["r_claude"])
         self.assertFalse(out["ok"], out)
         self.assertIn({"name": "titular", "family": "claude"}, out["authors"])

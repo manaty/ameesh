@@ -375,7 +375,7 @@ def _waiver(db, item) -> tuple:
 
 
 def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=None,
-                           commits=None):
+                           commits=None, strict=False):
     """Les auteurs et correcteurs de la tête gelée (#2681/#2739/#2888).
 
     Lecture des commits exacts de la plage gelée et de leur provenance, la même
@@ -389,6 +389,9 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
     historique. Lève quand une lecture était possible et a échoué : une porte
     qui ne peut pas prouver qui a écrit la tête ne compte pas un avis non
     prouvé (l'indépendance ne se suppose pas).
+
+    #2961 : `strict=True` (la porte) refuse un reçu de provenance
+    contradictoire au lieu de le lire comme une absence.
 
     #2803 : `commits` est la liste déjà calculée du delta propre d'un véhicule
     (`packet_reviews.need`) ; la lecture porte alors sur ce seul contenu relu,
@@ -404,7 +407,7 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
     milestone = _freeze_milestone(marks, frozen, repo)
     authors, unknown, correctors = act.attribution_of_head(
         db, item, milestone, repo, base, frozen, families=families or (),
-        commits=commits)
+        commits=commits, strict=strict)
     if unknown:
         raise ValueError("author provenance unknown for frozen commit(s): %s"
                          % ", ".join(unknown))
@@ -471,6 +474,13 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     code de porte, mais les familles des reçus/tours à la date des faits au
     lieu du registre courant. Un appelant qui le fournit ne lit ni le registre
     ni le canon compilé.
+
+    #2961 : sans `family_of`, la famille de la référence se lit sur la même
+    trace du gel que la désignation (`review_authors.reference_author`) : reçu
+    du commit, journal des tours, sinon reçu du jalon de gel. Le registre
+    courant ne remplace pas une famille historique prouvée — un auteur gelé en
+    codex puis rouvert en claude au registre garde codex (#2892) ; un reçu de
+    provenance contradictoire refuse la porte (lecture `strict`).
 
     #2726 : sans `authors`, la porte lit elle-même les auteurs reconnus de la
     plage gelée quand le dépôt, la base et la ligne du lot sont connus
@@ -659,26 +669,6 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             name, family = str(entry or "").strip(), ""
         if name and family:
             provided.setdefault(name.lower(), family)
-    try:
-        if family_of is not None:
-            author_family = _family_of(author)
-            if not author_family and author.lower() in provided:
-                author_family = provided[author.lower()]
-        elif author.lower() in provided:
-            author_family = provided[author.lower()]
-        else:
-            author_family = _family_of(author)
-    except RegistryReadError as exc:
-        # #2521 : le registre est illisible, ce n'est pas « famille inconnue ».
-        # La porte refuse toujours (l'indépendance ne se suppose pas) mais le
-        # diagnostic doit dire la lecture impossible, pas un verdict manquant.
-        out["error"] = str(exc)
-        out["why"] = ("no review verdict ok on the freeze %s (class: %s): the agent "
-                      "registry cannot be read (%s), so no verdict can be proven "
-                      "independent (canon §2: independence is never assumed)"
-                      % (frozen[:12], cls, exc))
-        return out
-    out["author_family"] = author_family
     # #2726 : la porte lit elle-même la plage gelée quand l'appelant ne passe
     # pas les auteurs — le feu, la file et le paquet, qui ne les lisaient pas.
     # La même lecture rend les correcteurs (#2739) et échoue fermé quand la
@@ -689,7 +679,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         attribution = _attribution_on_freeze(db, marks, frozen, repo=repo,
                                              klass=klass, item=item,
                                              families=families,
-                                             commits=own_commits if vehicle_delta else None)
+                                             commits=own_commits if vehicle_delta else None,
+                                             strict=True)
     except Exception as exc:  # noqa: BLE001 - une plage illisible ne conclut pas
         out["error"] = str(exc)
         out["why"] = ("no review verdict ok on the freeze %s (class: %s): the frozen "
@@ -709,6 +700,45 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                        for row in range_correctors or ()
                        if str((row or {}).get("name") or "").strip()}
     out["corrections"] = sorted(corrections)
+    # #2961 : la famille de la référence est celle de la **trace du gel**,
+    # lue avec la plage gelée (`review_authors.reading` : reçu exact du commit,
+    # journal des tours du commit, sinon famille de référence du gel par
+    # `reference_author` en `strict=True` ci-dessus). Le registre courant ne
+    # remplace plus une famille historique prouvée : un auteur gelé en codex
+    # puis rouvert en claude au registre garde codex comme référence (#2892).
+    # Sans aucune famille historique prouvée, le repli historique (registre
+    # courant) est conservé ; une provenance contradictoire, elle, a déjà
+    # refusé la porte plus haut.
+    reference_entry = next(
+        (row for row in range_authors or ()
+         if isinstance(row, Mapping) and author
+         and str(row.get("name") or "").strip().lower() == author.lower()),
+        None)
+    try:
+        if family_of is not None:
+            author_family = _family_of(author)
+            if not author_family and author.lower() in provided:
+                author_family = provided[author.lower()]
+        elif reference_entry is not None and not exact:
+            author_family = str(reference_entry.get("family") or "")
+            if not author_family:
+                author_family = (provided.get(author.lower(), "")
+                                 or _family_of(author))
+        elif author.lower() in provided:
+            author_family = provided[author.lower()]
+        else:
+            author_family = _family_of(author)
+    except RegistryReadError as exc:
+        # #2521 : le registre est illisible, ce n'est pas « famille inconnue ».
+        # La porte refuse toujours (l'indépendance ne se suppose pas) mais le
+        # diagnostic doit dire la lecture impossible, pas un verdict manquant.
+        out["error"] = str(exc)
+        out["why"] = ("no review verdict ok on the freeze %s (class: %s): the agent "
+                      "registry cannot be read (%s), so no verdict can be proven "
+                      "independent (canon §2: independence is never assumed)"
+                      % (frozen[:12], cls, exc))
+        return out
+    out["author_family"] = author_family
 
     def _author_names(rows) -> set:
         return {str((row or {}).get("name") or "").strip().lower()
