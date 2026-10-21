@@ -1503,6 +1503,19 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
         # #540 : l'auteur d'un forçage est l'identité de la session
         args.actor = work.forcer(cfg, db, args.actor)
         return
+    if args.work_command == "milestone" and getattr(args, "kind", "") in ("frozen", "verdict"):
+        # #2928 : une session liée ne pose un gel ou un verdict qu'en son nom.
+        # Sans cette garde, `--actor <autre agent>` signait un avis au nom d'un
+        # relecteur d'une autre famille ; le jalon restait sans reçu (#1465) et
+        # la porte le comptait par le journal des tours.
+        explicit = (args.actor or "").strip()
+        args.actor = work.milestone_actor(cfg, db, args.actor, kind=args.kind)
+        if not explicit and args.actor == work.UNKNOWN_ACTOR:
+            print("warning: unknown actor: no identity bound to this session "
+                  "(AGENT_MAIL_NAME, ameesh mail bind); the lot journal will say "
+                  "\"%s\"; pass --actor human:<id>" % work.UNKNOWN_ACTOR,
+                  file=sys.stderr)
+        return
     if args.work_command in (*_OWN_ACTOR, "set-app", "issue-ref", "backfill-app") or getattr(args, "actor", None) is None:
         return
     args.actor, warning = work.resolve_actor(cfg, db, args.actor)

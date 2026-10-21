@@ -474,17 +474,23 @@ def _pending_spend_row(row: dict | None) -> dict | None:
         "start": int(row["start_index"]),
         "turn": row.get("turn") or "",
         "model": row.get("model"),
-        # #2166 : l'identité exacte du marqueur (texte UTC à la microseconde),
+        # #2166 : l'identité brute du marqueur (texte UTC à la microseconde),
         # jamais un float8 relu ; `created_ts` reste l'epoch pour `started_at`.
         "created_at": row.get("created_at"),
         "created_ts": row.get("created_ts"),
-        # #2166 : la clé exacte du grand livre et de la réservation #1469 ;
-        # None sur un marqueur d'avant 0471 (clé historique dérivée du float8).
+        # #2166/#2905 : l'identité brute portée par la colonne ; elle borne
+        # `clear_if`/`set_resident_usage`. None sur un marqueur d'avant 0471,
+        # ou périmée après un retour arrière (§14) : `ledger_key` seul fait foi
+        # pour le grand livre.
         "spend_key": row.get("spend_key"),
         # #2166 : la clé déjà écrite par ce tour — celle du marqueur, ou la
         # clé durable retrouvée dans sa ligne/réservation (marqueur d'avant
         # 0471, quelle que soit la précision de la connexion de réparation).
-        "ledger_key": row.get("ledger_key") or row.get("spend_key"),
+        # #2905 : un `ledger_key` explicitement NULL (clé indémontrable) ne
+        # retombe jamais sur la colonne, qui peut être périmée ; le repli sur
+        # `spend_key` ne sert qu'aux backends qui ne rendent pas `ledger_key`.
+        "ledger_key": (row["ledger_key"] if "ledger_key" in row
+                       else row.get("spend_key")),
         # #2166/B1 : plusieurs candidats incohérents, aucun tour identifiable :
         # la comptabilité de ce tour doit rester suspendue (fail-closed).
         "ledger_ambiguous": bool(row.get("ledger_ambiguous")),

@@ -145,6 +145,11 @@ class TrainAdmissionsTest(PgTestCase):
         base, first, head = commit("base"), commit("author"), commit("correction")
         self.admissions.policy = train_policy.Versioned(self.tmp, base, self.project.name)
         item = self.entry["work_item_id"]
+        # #2924 : le gel d'attente du banc (SHA factice, sans objet Git) est
+        # remplacé par le gel réel ; gardé, il serait un gel antérieur illisible
+        # et la lecture stricte du train refuserait l'admission.
+        self.db.execute("DELETE FROM work_item_milestones WHERE work_item_id = %s"
+                        " AND kind = 'frozen'", (item,))
         freeze = self.ops.add_milestone(item, "frozen", sha=head, actor="author", verdict=None, note="")
         entry = self.ops.queue_add(item, target="main", frozen_sha=head, note="", actor="fixture",
                                   source=self.admissions.source, frozen_id=freeze["id"])
@@ -156,6 +161,14 @@ class TrainAdmissionsTest(PgTestCase):
             receipt = dataclasses.replace(receipt, milestone={
                 key: mark[key] for key in ("id", "actor", "at_ts", "sha", "verdict")})
             receipts[receipt.subject] = dataclasses.asdict(receipt)
+            # #2928 : la porte sensible ne compte un verdict que sur son reçu
+            # exact lu dans la base, pas seulement dans le fournisseur du train.
+            self.db.execute(
+                "INSERT INTO provenance_receipts"
+                " (subject, sha, actor, session, turn, harness, work_item_id)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                " ON CONFLICT (subject) DO NOTHING",
+                (receipt.subject, head, reader, "s-" + family, "t", family, item))
         provider = types.SimpleNamespace(ProvenanceError=RuntimeError,
             receipt_for_commit=lambda db, sha: receipts.get("commit:" + sha),
             receipt_for_milestone=lambda db, mid: receipts.get("milestone:%d" % mid))
@@ -242,8 +255,18 @@ class TrainAdmissionsTest(PgTestCase):
         actual = preparation.ops.queue_add
         def blocked(*args, **kwargs):
             row = actual(*args, **kwargs)
-            storage.of(other).work.add_milestone(item, "verdict", sha=head, actor="blocked-reader",
-                                                 verdict="blocked", note="fresh blockage")
+            mark = storage.of(other).work.add_milestone(
+                item, "verdict", sha=head, actor="blocked-reader",
+                verdict="blocked", note="fresh blockage")
+            # #2928 : un avis sensible ne compte que sur son reçu exact ; ce
+            # vote réel porte donc sa preuve, sinon le blocage n'existerait pas.
+            other.execute(
+                "INSERT INTO provenance_receipts"
+                " (subject, sha, actor, session, turn, harness, work_item_id)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                " ON CONFLICT (subject) DO NOTHING",
+                ("milestone:%d" % int(mark["id"]), head, "blocked-reader",
+                 "s-claude", "t", "claude", item))
             return row
         with mock.patch.object(preparation.ops, "queue_add", side_effect=blocked):
             with self.assertRaisesRegex(train.TrainError, "blocked verdict"):

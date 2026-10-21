@@ -262,7 +262,8 @@ class CliTest(PgTestCase):
 
     def freeze(self, sha, *extra):
         return self.mesh("work", "milestone", str(self.lot), "frozen", "--sha", sha,
-                         "--actor", "author", "--repo", self.repo.root, *extra)
+                         "--actor", "author", "--repo", self.repo.root, *extra,
+                         env=self.env(AGENT_MAIL_NAME="author"))
 
     def frozen(self) -> list:
         return [m for m in work.milestones(self.db, self.lot) if m["kind"] == "frozen"]
@@ -339,7 +340,8 @@ class CliTest(PgTestCase):
 
     def test_sans_depot_qui_porte_le_sha_le_gel_passe_et_le_dit(self):
         proc = self.mesh("work", "milestone", str(self.lot), "frozen", "--sha", "a" * 40,
-                         "--actor", "author")
+                         "--actor", "author",
+                         env=self.env(AGENT_MAIL_NAME="author"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("static checks not run", proc.stderr)
         self.assertEqual(len(self.frozen()), 1)
@@ -358,7 +360,8 @@ class CliTest(PgTestCase):
 
     def test_options_du_gel_refusees_hors_gel(self):
         proc = self.mesh("work", "milestone", str(self.lot), "verdict", "ok", "--sha", "a" * 40,
-                         "--actor", "rev", "--no-static-checks", "x")
+                         "--actor", "rev", "--no-static-checks", "x",
+                         env=self.env(AGENT_MAIL_NAME="rev"))
         self.assertEqual(proc.returncode, 1)
         self.assertIn("only apply to a freeze", proc.stderr)
 
