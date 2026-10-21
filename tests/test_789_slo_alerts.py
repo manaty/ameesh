@@ -626,6 +626,23 @@ class PaquetTest(_Base):
                          [("verdict_merge", 1, 2400)])
         self.assertIn("pilot", alerts[0]["targets"])
 
+    def test_chemin_normal_p1_sans_mesure_garde_le_repli_30_min(self):
+        # Témoin cx2 (#15024) : P1 normal sans mesure CI → repli 30 min, pas
+        # la cible P1 de 15 min (réservée à une exception déclarée).
+        self.qa_at(self.GO)
+        self.db.execute("UPDATE work_items SET priority = 1 WHERE id = %s",
+                        (self.lot["id"],))
+        self.packet(body="unités : #999999 @ cafebabe")
+        with mock.patch.object(exploitation, "_project_github",
+                               return_value="manaty/ameesh"):
+            self.now = self.GO + 75 * 60          # 00:20, 20 min après le créneau
+            self.assertEqual(self.slo(), [])
+            self.now = self.GO + 96 * 60          # 00:41, 41 min après le créneau
+            alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"], a["threshold"]) for a in alerts],
+                         [("verdict_merge", 1, 1800)])
+        self.assertIn("pilot", alerts[0]["targets"])
+
     def test_exception_p1_garde_15_min_depuis_le_go(self):
         # Hors paquet déclaré : la cible de table (15 min en P1) court depuis
         # le GO, sans le report au créneau de paquet.

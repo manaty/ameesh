@@ -174,7 +174,8 @@ observed hourly UTC cut-off): the time before that slot is not a delay under
 canon §11 bis. On the normal path — any lot with a current GO and no declared
 exception — the target is the real p80 of the packet CI (`progress.ci_suite`,
 7-day window, #2919), with the table's 30-minute target as the fallback when
-no suite is measured; the ×2/×3 thresholds apply to it. A unit declared by an
+no suite is measured — that packet row has no P1 column, so a P1 keeps 30
+min, not 15 —; the ×2/×3 thresholds apply to it. A unit declared by an
 open packet has no escalation target of its own — the packet composer or the
 pilot carries the merge (canon §9, owner decision #103509 option a, home#147).
 A `packet-exception incident|unblock sha=… reason=…` declared for the current

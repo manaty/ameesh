@@ -434,7 +434,21 @@ class PaquetTest(unittest.TestCase):
                 self.assertEqual(row["level"], 1)
                 self.assertEqual(row["overdue_s"], 100)
                 self.assertEqual(row["targets"], ("assignee",))
-                self.assertNotIn("target_source", row)
+                self.assertEqual(row["target_source"], "fallback")
+
+    def test_chemin_normal_p1_sans_mesure_repli_30_min(self):
+        # Témoin cx2 (#15024) : P1 normal sans mesure, la ligne paquet a une
+        # colonne P1 « — » ; 20 min après le créneau → tenu (pas 900/15 min),
+        # 31 min → niveau 1 sur 1800.
+        item, jalons, events = self._qa(priority=1)
+        for offset, level in ((20 * 60, 0), (31 * 60, 1)):
+            with self.subTest(offset=offset):
+                rows = slo.lot_steps(item, jalons, events,
+                                     now=T0 + 1800 + offset)
+                row = self._row(rows, "verdict_merge")
+                self.assertEqual(row["target_s"], 1800)
+                self.assertEqual(row["level"], level)
+                self.assertEqual(row["target_source"], "fallback")
 
     def test_paquet_p1_garde_le_p80_pas_la_cible_p1(self):
         # La colonne P1 de la ligne « paquet » est « — » : un P1 ne reprend pas
@@ -447,16 +461,18 @@ class PaquetTest(unittest.TestCase):
         self.assertEqual(row["level"], 0)
         self.assertEqual(row["targets"], ())
 
-    def test_hors_paquet_p1_garde_15_min_et_l_escalade(self):
-        # Incident/déblocage CI déclaré : la cible de la table (15 min en P1)
-        # et la cible d'escalade restent.
+    def test_exception_p1_garde_15_min_et_l_escalade(self):
+        # Incident/déblocage CI déclaré (`outside_packet`) : la cible de la
+        # table reprend sa colonne P1 (15 min) et l'escalade depuis le GO.
         item, jalons, events = self._qa(priority=1)
-        rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 1000)
+        rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 1000,
+                             outside_packet=True)
         row = self._row(rows, "verdict_merge")
         self.assertEqual(row["target_s"], 900)
         self.assertEqual(row["level"], 1)
         self.assertEqual(row["targets"],
                          ("assignee", "bureau", "auditeur"))
+        self.assertEqual(row["target_source"], "table")
         self.assertNotIn("packet", row)
 
     def test_paquet_fusionne_garde_la_duree_et_le_p80(self):

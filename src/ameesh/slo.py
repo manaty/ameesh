@@ -298,7 +298,7 @@ def _row(step: Step, start, *, now: float, critical: bool, done_ts=None,
 def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
               now: float | None = None, packet_slot: float | None = None,
               dependencies: Iterable[dict] = (), packet: bool = False,
-              p80_s: float | None = None) -> list:
+              p80_s: float | None = None, outside_packet: bool = False) -> list:
     """Les étapes mesurables d'un lot, une ligne par étape applicable.
 
     `jalons` vient de `progress._work_item_milestones` — le SEUL lecteur des
@@ -326,18 +326,19 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
 
     #2919 : `p80_s`, quand il est mesuré, remplace la cible de la table pour
     « GO → fusion » sur le **chemin normal** (tout lot à GO courant sans
-    exception `packet-exception incident|unblock`). C'est le p80 réel de la CI
-    du paquet (`progress.ci_suite`, fenêtre de 7 jours ; sans mesure, la cible
-    de la table — 30 min — reste le repli, la colonne P1 de la ligne paquet
-    étant « — »). Les seuils ×2/×3 s'appliquent à cette cible.
-    `packet=True` marque en plus une unité d'un paquet **ouvert** (attente
-    `packet` de `planned_waits`) : elle n'a **aucune cible d'escalade propre**
-    — `level` 0, `targets` vides, `overdue_s` 0 —, le composeur du paquet ou le
-    pilote porte la fusion (canon §9, décision owner #103509 option a,
-    home#147). La mesure reste lisible (`elapsed_s`, `target_s`, `packet`,
-    `target_source`) pour le taux de respect. Hors paquet déclaré (incident ou
-    déblocage de la CI, §11 bis), la cible de la table (30 min, 15 min en P1)
-    et l'escalade sont inchangées.
+    exception). C'est le p80 réel de la CI du paquet (`progress.ci_suite`,
+    fenêtre de 7 jours). Sans mesure, le repli est la cible de la ligne
+    paquet du canon (30 min, colonne P1 « — »), que le lot soit dans un
+    paquet ouvert ou non. `p80_s=None` ne distingue donc pas une exception
+    déclarée : l'appelant passe `outside_packet=True` pour elle, et la cible
+    de la table reprend sa colonne P1 (15 min) et son escalade depuis le GO.
+    Les seuils ×2/×3 s'appliquent à la cible retenue. `packet=True` marque en
+    plus une unité d'un paquet **ouvert** (attente `packet` de
+    `planned_waits`) : elle n'a **aucune cible d'escalade propre** — `level`
+    0, `targets` vides, `overdue_s` 0 —, le composeur du paquet ou le pilote
+    porte la fusion (canon §9, décision owner #103509 option a, home#147). La
+    mesure reste lisible (`elapsed_s`, `target_s`, `packet`, `target_source`)
+    pour le taux de respect.
 
     #2551 : `dependencies` sont les arêtes de prérequis du lot
     (`work_dependencies.grouped`, enrichies de `satisfied_ts` — fusion ou
@@ -398,10 +399,12 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     if kind == "ok" and verdict is not None and jalons.get("verdict_current", True):
         step = step_of("verdict_merge")
         # #2919 : le p80 mesuré remplace la cible de la table sur le chemin
-        # normal (escalade ×2/×3 relative à lui) ; sans mesure, la ligne paquet
-        # retombe sur la cible de la table (colonne P1 « — »).
+        # normal (escalade ×2/×3 relative à lui). Sans mesure, le repli est la
+        # cible de la ligne paquet (30 min, colonne P1 « — ») ; une exception
+        # déclarée (`outside_packet`) garde la cible de la table, colonne P1
+        # comprise (15 min pour un P1), depuis le GO.
         p80 = None
-        if p80_s is not None:
+        if not outside_packet and p80_s is not None:
             try:
                 candidate = float(p80_s)
             except (TypeError, ValueError):
@@ -409,12 +412,14 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
             if candidate > 0:
                 p80 = candidate
         target = p80
-        if target is None and packet:
+        if target is None and not outside_packet:
             target = float(step.target_s)
         extra = {}
         if p80 is not None:
             extra["target_source"] = "p80"
-        elif packet:
+        elif outside_packet:
+            extra["target_source"] = "table"
+        else:
             extra["target_source"] = "fallback"
         if packet:
             extra["packet"] = True
