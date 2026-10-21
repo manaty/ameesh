@@ -27,6 +27,16 @@ a workstation therefore has one socket pair per agent, and the client
 `AMEESH_DEVICE_CONTROL=0` keeps the read-only state and removes the stop
 channel.
 
+A newly created channel directory is `0700`. An existing directory must
+already be owned by the runner's Unix user and private (no group or other
+permissions); otherwise channels are skipped with a diagnostic. Its permissions
+are never changed: point `AMEESH_DEVICE_DIR` to a dedicated private directory,
+not a shared directory or the home directory. At startup, abandoned
+`device-*.sock` and `control-*.sock` names are removed only when a probe gets
+`ECONNREFUSED` or `ENOENT`, including on persistent storage after a runner PID
+changes. Busy, inaccessible and live sockets, symlinks and regular files are
+left alone. A timeout or full backlog does not prove a socket is stale.
+
 When the platform exposes peer credentials (`SO_PEERCRED`), the channel
 refuses a connection from another Unix user. There is no TCP listener, no
 HTTP route and no token: the file-mode of the socket is the boundary, like
@@ -107,8 +117,9 @@ is mediated or `--once`.
 
   The reply is `{"schema": "ameesh-device-control/1", "ok": true, "agent":
   "...", "returned": [382]}` or `{"ok": false, "error": "..."}`. A runner
-  only accepts an agent it serves (`--agents`); the stop is the exact gesture
-  of `agent-runner stop` — status `stopped`, reason `manuel`, open lots
+  only accepts an agent it serves (`--agents`); an omitted or empty filter
+  serves all agents on this host, with the same host check on every stop. The
+  stop is the exact gesture of `agent-runner stop` — status `stopped`, reason `manuel`, open lots
   returned to the team queue, current turn ending at its safe point (0030).
   It never touches an approval, a gated action, a token or the Compute lease.
 
@@ -195,13 +206,22 @@ connectHost({
 });
 ```
 
-`connectHost` routes `ameesh:stop` to `stopAgent(agent, {mode, runner, mesh,
-control_socket})`. The host performs:
+`connectHost` routes `ameesh:stop` to `stopAgent(agent, {mode, runner, mesh})`.
+No filesystem path is accepted from the renderer. The **main process**
+rediscovers local runner channels, validates the requested agent and runner
+against the fresh local state, and resolves the matching control socket itself.
+Reject missing or ambiguous matches; `runner` and `mesh` are untrusted hints.
+Validate IPC senders and arguments before acting, even when `connectHost` is
+bypassed. The host performs:
 
-* `mode: "clean"`: send `{"op":"stop"}` on `control_socket` (or run
+* `mode: "clean"`: send `{"op":"stop","agent":"…"}` on that resolved socket (or run
   `ameesh device stop <agent>`); the runner finishes at its safe point, the
   lease is released, the lots return to the queue;
-* `mode: "immediate"`: the **Compute runner** destroys the sandbox and
+* `mode: "immediate"`: the component first shows the named agent and the
+  risk of losing unfinished work, with explicit confirm/cancel buttons. The
+  main process must also obtain native confirmation before acting (a page
+  can forge an event or call IPC directly); cancellation does nothing. After
+  confirmation the **Compute runner** destroys the sandbox and
   withdraws the offer; ameesh sees the lease expire and treats the agent as
   stopped. ameesh has no immediate-kill route of its own, and this is not an
   approval.

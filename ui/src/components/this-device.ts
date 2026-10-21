@@ -75,6 +75,7 @@ export class AmeeshThisDevice extends LitElement {
     theme: { reflect: true },
     error: { state: true },
     loading: { state: true },
+    pendingStop: { state: true },
   };
   static override styles = [base, css`
     :host { display: block; min-width: 0; }
@@ -108,6 +109,7 @@ export class AmeeshThisDevice extends LitElement {
   theme = "auto";
   error = "";
   loading = false;
+  private pendingStop: { agent: DeviceAgent; runner?: DeviceRunner; mesh: string } | null = null;
   #timer: ReturnType<typeof setTimeout> | null = null;
   #disposed = false;
 
@@ -120,6 +122,7 @@ export class AmeeshThisDevice extends LitElement {
   override disconnectedCallback(): void {
     super.disconnectedCallback();
     this.#disposed = true;
+    this.pendingStop = null;
     if (this.#timer !== null) clearTimeout(this.#timer);
     this.#timer = null;
   }
@@ -181,9 +184,9 @@ export class AmeeshThisDevice extends LitElement {
 
   private stop(agent: DeviceAgent, runner: DeviceRunner | undefined, mesh: string,
               mode: "clean" | "immediate"): void {
+    this.pendingStop = null;
     this.dispatchEvent(new CustomEvent("ameesh:stop", {
-      detail: { agent: agent.name, runner: runner?.id, mesh,
-        control_socket: runner?.control_socket, mode },
+      detail: { agent: agent.name, runner: runner?.id, mesh, mode },
       bubbles: true, composed: true,
     }));
   }
@@ -200,6 +203,8 @@ export class AmeeshThisDevice extends LitElement {
     const lot = agent.lot ?? {};
     const turn = agent.turn ?? {};
     const lease = agent.lease ?? {};
+    const confirming = this.pendingStop?.agent.name === agent.name
+      && this.pendingStop?.runner?.id === runner?.id && this.pendingStop?.mesh === mesh;
     return html`<tr>
       <th scope="row"><button class="link" @click=${() => this.open("agent", { kind: "agent",
           id: agent.name, row: agent })}>${agent.name ?? "—"}</button>
@@ -219,9 +224,14 @@ export class AmeeshThisDevice extends LitElement {
       <td><div class="actions">
         <button type="button" @click=${() => this.stop(agent, runner, mesh, "clean")}
           title=${this.t("device.stop.clean.help")}>${this.t("device.stop.clean")}</button>
-        <button type="button" class="critical" @click=${() => this.stop(agent, runner, mesh, "immediate")}
+        <button type="button" class="critical" @click=${() => { this.pendingStop = { agent, runner, mesh }; }}
           title=${this.t("device.stop.immediate.help")}>${this.t("device.stop.immediate")}</button>
-      </div></td></tr>`;
+      </div>${confirming ? html`<div role="group" aria-label=${this.t("device.stop.confirm.title")}>
+        <p role="status">${this.t("device.stop.confirm", { agent: agent.name ?? "?" })}</p>
+        <button type="button" class="critical" @click=${() => this.stop(agent, runner, mesh, "immediate")}>${this.t("device.stop.confirm.action")}</button>
+        <button type="button" @click=${() => { this.pendingStop = null; }}>
+          ${this.t("device.stop.cancel")}</button>
+      </div>` : nothing}</td></tr>`;
   }
 
   protected content(state: DeviceState): unknown {
