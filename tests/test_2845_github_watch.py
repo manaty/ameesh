@@ -497,6 +497,27 @@ class CollectionTest(unittest.TestCase):
         self.assertIsNone(scan)
         self.assertFalse(any("page=3" in call for call in api.calls))
 
+    def test_b5_recent_burst_does_not_hide_a_settled_row_behind_it(self):
+        # mesh-design #2955: 13 recent rows with old keys (5 pages) followed by
+        # a settled row. A cutoff after a few full pages would commit U and
+        # lose it. The scan skips recent pages without committing and reaches
+        # the settled row in the same pass.
+        with mock.patch.object(watch, "PAGE_SIZE", 3):
+            rows = [issue(n) for n in range(1, 15)]
+            for n, row in enumerate(rows[:13]):
+                row["key"] = watch.iso(NOW - 2000 + n)
+                row["updated_at"] = watch.iso(NOW + 1)
+            rows[13]["key"] = rows[13]["updated_at"] = watch.iso(NOW - 1000)
+            api = LagApi(rows, [])
+            events, until = self.finish(api, NOW - 3600, NOW)
+            self.assertEqual({e["object_id"] for e in events}, {14})
+            self.assertEqual(until, NOW - watch.INDEX_LAG)
+            for row in rows[:13]:
+                row["key"] = row["updated_at"]
+            more, _ = self.finish(api, until - watch.OVERLAP, NOW + 400, None)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, set(range(1, 15)))
+
     def test_b6_anchor_must_be_an_accepted_row(self):
         # B6 #2955: #6 is deferred (> U) but its old key sits at the end of the
         # page. When #1..#5 move and #6 catches up its key, the re-read page is
@@ -813,6 +834,30 @@ class DeliveryTest(PgTestCase):
         self.assertEqual(watcher.tick(self.db, NOW + 901)[0]["events"], 1)
         self.assertEqual(len(self.messages()), 1)
         self.assertIn("acme/app#1", self.messages()[0]["body"])
+
+    def test_recent_page_budget_suspends_without_moving_the_cursor(self):
+        # #2955: ten recent pages exhaust the pass budget. The scan is
+        # checkpointed without committing the cursor; the next tick resumes
+        # and reaches the settled row behind the recent burst.
+        rows = [issue(n) for n in range(1, 32)]
+        for n, row in enumerate(rows):
+            row["key"] = watch.iso(NOW - 2000 + n)
+            row["updated_at"] = watch.iso(NOW + 1)
+        rows.append(dict(issue(32), key=watch.iso(NOW - 1000),
+                         updated_at=watch.iso(NOW - 1000)))
+        api = LagApi(rows, [])
+        watcher = self.watcher(api)
+        with mock.patch.object(watch, "PAGE_SIZE", 3):
+            self.assertEqual(watcher.tick(self.db, NOW)[0]["events"], 0)
+            self.assertIsNotNone(storage.of(self.db).github_watch.scan(
+                "app", "acme/app"))
+            self.assertEqual(storage.of(self.db).github_watch.cursor(
+                "app", "acme/app"), NOW - watch.INDEX_LAG - watch.BOOTSTRAP)
+            self.assertEqual(watcher.tick(self.db, NOW)[0]["events"], 1)
+        self.assertIsNone(storage.of(self.db).github_watch.scan("app", "acme/app"))
+        self.assertEqual(storage.of(self.db).github_watch.cursor(
+            "app", "acme/app"), NOW - watch.INDEX_LAG)
+        self.assertIn("acme/app#32", self.messages()[0]["body"])
 
     def test_committed_mail_is_written_and_indexed_in_the_thread(self):
         self.watcher(Api([issue()], [comment()])).tick(self.db, NOW)

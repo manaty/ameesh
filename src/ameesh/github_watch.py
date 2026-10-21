@@ -35,14 +35,9 @@ PAGE_SIZE = 100
 #: is outside the model and fails closed (see ``docs/EXPLOITATION.md`` and
 #: ``test_latency_beyond_the_bound_is_outside_the_model``).
 INDEX_LAG = 300
-#: One page plus one backward re-read per pass (#2955).
-PAGES_PER_TICK = 3
-#: #2955: a full page with no settled row is recent (its keys may still lag).
-#: Do not end the stream on one such page: the next page can still carry a
-#: settled row. Four in a row end this stream; the next window reads them
-#: again. A longer run of lagging pages is outside the bounded re-read budget
-#: and would need a longer confirmation (like INDEX_LAG, it is observable).
-EMPTY_PAGES = 4
+#: API-call budget for one pass (#2955): one page plus a backward re-read,
+#: and enough room to skip the recent pages whose index keys still lag.
+PAGES_PER_TICK = 10
 #: One digest per repository and pass; a larger burst waits for the next pass.
 DIGEST_MAX_ITEMS = 25
 #: Quoted GitHub text in one digest (the rest stays behind the links).
@@ -211,10 +206,10 @@ def collect_batch(api, sub, since, now, scan):
     it is delivered with its new version. If the anchor is gone from the
     previous page, one earlier page is read; if it is still absent, the scan
     restarts at page 1 with the same ``since`` (durable digests make replay
-    harmless). The scan stops when the stream ends or after EMPTY_PAGES full
-    pages in a row with no settled row: a recent page whose index keys still
-    lag must not end the stream, while the continuous tail is deferred to the
-    next scan.
+    harmless). A full page with no settled row is recent and skipped within
+    the pass; the scan suspends on the call budget without committing the
+    cursor and resumes next tick. Only a surely indexed row past U, or the end
+    of the list, ends the stream.
     """
     lag = getattr(sub, "index_lag", INDEX_LAG)
     if scan is not None:
@@ -229,8 +224,6 @@ def collect_batch(api, sub, since, now, scan):
     else:
         state = dict(since=since, window_since=since, until=now,
                      settled=now - lag, kind="issue", page=1)
-    if state["page"] > 1 and "snap_prev" not in state:
-        state["page"] = 1  # upgrade an old, unprotected checkpoint safely
     if state["page"] <= 1:
         state.pop("snap_prev", None)
     state.setdefault("window_since", state["since"])
@@ -300,27 +293,31 @@ def collect_batch(api, sub, since, now, scan):
         rows = read(state["page"])
         full = len(rows) == PAGE_SIZE
         settled_rows = [row for row in rows if inside(row)]
-        state["blank"] = (0 if settled_rows or not full
-                          else state.get("blank", 0) + 1)
-
-        # #2955: a full page with no settled row is recent; its keys may still
-        # lag and a settled row can follow. Several such pages in a row defer
-        # this stream to the next window instead of chasing its moving tail.
-        if full and not settled_rows and state["blank"] >= EMPTY_PAGES:
-            if state["kind"] == "issue":
-                state.update(kind="comment", page=1, since=state["window_since"],
-                             blank=0)
-                state.pop("snap_prev", None)
-                if calls >= PAGES_PER_TICK:
-                    return events, state, settled
-                continue
-            return events, None, settled
 
         # A row is surely indexed once its stamp is at least INDEX_LAG old at
         # this read: its key is then its stamp. If such a row is past U, every
         # following key is > U too, so no settled row can follow it.
         stop_after = any(not inside(row) and when(row) <= now - lag for row in rows)
-        previous = read(state["page"] - 1) if state["page"] > 1 else None
+
+        # #2955: a full page with no settled row is recent; its keys may still
+        # lag and a settled row can follow. Skip such pages within this pass,
+        # but never end or commit the cursor: the scan suspends on the call
+        # budget and resumes at the next tick. Only a surely indexed row past
+        # U or the end of the list terminates the stream.
+        if (full and not settled_rows and not stop_after
+                and not state.get("snap_prev")):
+            # No accepted anchor to protect: blank pages are skipped within
+            # this pass, then the scan suspends without committing the cursor.
+            state["blank"] = state.get("blank", 0) + 1
+            state["page"] += 1
+            if calls >= PAGES_PER_TICK:
+                return events, state, settled
+            continue
+
+        skipped = state.get("blank", 0) > 0
+        state["blank"] = 0
+        previous = (None if skipped or stop_after or state["page"] <= 1
+                    else read(state["page"] - 1))
         recovered = []
         if previous is not None and stop_after:
             recovered = [row for row in previous if inside(row)]
