@@ -181,11 +181,14 @@ auteurs tant que leur contenu subsiste :
 
 - gel ancêtre de la tête et absent de la base : son contenu est dans l'histoire ;
 - arbre de la tête égal à celui du gel, ou à la fusion du gel avec la base ;
-- sinon chaque commit n'est repris que si **toutes** ses lignes significatives
-  ajoutées sont encore présentes (et ses lignes retirées toujours absentes).
+- sinon un commit n'est tenu pour réécrit que si **aucune** de ses lignes
+  significatives ne subsiste : une ligne ou un commentaire modifié ne suffit
+  jamais à retirer l'auteur (choix prudent, canon §2).
 
 Un correctif réellement réécrit n'est pas repris (cas admissible, décision
-documentée) ; une lecture illisible ou ambiguë conserve l'auteur. La même
+documentée) ; une réécriture partielle reste attribuée et une lecture illisible
+ou ambiguë conserve l'auteur. Un journal de jalons illisible ne rend jamais une
+liste vide : la lecture stricte refuse, la désignation attend (unknown). La même
 lecture sert la désignation, la porte et le train (`base`/`head` passés par
 chaque appelant) ; les correcteurs antérieurs restent tracés pour l'exclusion
 personnelle. Un lot porteur de paquet reste hors de la reprise (#2803 : seule

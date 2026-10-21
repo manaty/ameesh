@@ -45,7 +45,7 @@ from __future__ import annotations
 
 from typing import Mapping, Optional, Sequence
 
-from . import plan_git, registry, review_lot, review_provenance
+from . import plan_git, registry, review_lot, review_provenance, storage
 
 #: canon §2 : une correction de premier tour va jusqu'à ~50 lignes changées
 REVIEWER_FIX_LINES = 50
@@ -346,10 +346,11 @@ def actor_family(db, actor: str, at_ts: float, families) -> str:
 #   dans l'histoire, donc conservé ;
 # * arbre de la tête égal à celui du gel, ou à la fusion de ce gel avec la
 #   base : contenu identique, conservé ;
-# * sinon le contenu a été réécrit : un commit antérieur n'est repris que si
-#   **toutes** ses lignes significatives ajoutées sont encore dans la tête (et
-#   ses lignes retirées toujours absentes). Un correctif réimplémenté ligne à
-#   ligne ne se devine pas : une lecture illisible ou ambiguë conserve l'auteur.
+# * sinon le contenu a été réécrit : un commit antérieur n'est tenu pour
+#   réécrit que si **aucune** de ses lignes significatives ne subsiste. Une
+#   ligne ou un commentaire modifié ne suffit donc jamais à retirer l'auteur ;
+#   une réécriture complète ne le reprend pas. Le doute (lecture illisible ou
+#   ambiguë) conserve toujours l'auteur.
 #
 # Le doute conserve toujours l'auteur : la porte ne doit jamais rendre une
 # famille « indépendante » par accident. Un correctif réellement réécrit par
@@ -422,19 +423,26 @@ def _commit_lines(repo: str, sha: str):
     removes: dict = {}
     path, old_path, binary, hunk = "", "", False, False
     for line in text.splitlines():
+        if line.startswith("diff --git "):
+            # un nouveau fichier : les en-têtes suivants sont de vrais en-têtes
+            path, old_path, hunk = "", "", False
+            continue
         if line.startswith("Binary files ") or line.startswith("GIT binary patch"):
             binary = True
             continue
-        if line.startswith("@@"):
-            hunk = True
-            continue
         if not hunk:
-            if line.startswith("--- a/"):
+            if line.startswith("@@"):
+                hunk = True
+            elif line.startswith("--- a/"):
                 old_path = line[len("--- a/"):]
+            elif line.startswith("--- /dev/null"):
+                old_path = ""
             elif line.startswith("+++ b/"):
                 path = line[len("+++ b/"):]
             elif line.startswith("+++ /dev/null"):
                 path = old_path            # fichier supprimé
+            continue
+        if line.startswith("@@"):
             continue
         if not path:
             continue
@@ -463,29 +471,30 @@ def _head_lines(repo: str, head: str, path: str, cache: dict):
 
 
 def _commit_survives(repo: str, head: str, sha: str, cache: dict) -> bool:
-    """Toutes les lignes significatives du commit sont-elles encore dans la tête ?
+    """Une partie significative du commit subsiste-t-elle dans la tête ?
 
-    C'est la preuve de contenu de #2924 : un commit dont une seule ligne
-    significative a été réécrite n'est pas « repris à l'identique ». Un diff
-    illisible ou binaire ne permet pas de conclure : il conserve l'auteur."""
+    C'est la preuve de contenu de #2924, volontairement **prudente** : un
+    commit n'est tenu pour réécrit que si **aucune** de ses lignes
+    significatives ne subsiste. Une ligne ou un commentaire modifié, une
+    réorganisation partielle ne suffisent donc jamais à retirer son auteur
+    (canon §2 : le doute conserve l'auteur) ; une réécriture complète, elle,
+    ne le reprend pas. Un diff illisible ou binaire conserve l'auteur."""
     parsed = _commit_lines(repo, sha)
     if parsed is None:
         return True
     adds, removes, binary = parsed
     if binary:
         return True
-    for path, rows in adds.items():
-        lines = _head_lines(repo, head, path, cache)
-        for row in rows:
-            if _meaningful_line(row) and (lines is None
-                                          or row.strip() not in lines):
-                return False
-    for path, rows in removes.items():
-        lines = _head_lines(repo, head, path, cache)
-        for row in rows:
-            if _meaningful_line(row) and lines is not None \
-                    and row.strip() in lines:
-                return False            # la ligne retirée est revenue
+    added = [(path, row) for path, rows in adds.items() for row in rows
+             if _meaningful_line(row)]
+    if added:
+        return any(row.strip() in (_head_lines(repo, head, path, cache) or set())
+                   for path, row in added)
+    removed = [(path, row) for path, rows in removes.items() for row in rows
+               if _meaningful_line(row)]
+    if removed:
+        return any(row.strip() not in (_head_lines(repo, head, path, cache) or set())
+                   for path, row in removed)
     return True
 
 
@@ -646,9 +655,16 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     if not lot:
         return [], [], []
     try:
-        freezes = review_lot._freezes(db, lot)
-    except Exception:  # noqa: BLE001 - jalons illisibles : rien n'est repris
-        return [], [], []
+        rows = storage.of(db).work.milestones(lot, None) or []
+    except Exception as exc:  # noqa: BLE001 - jalons illisibles : jamais ouverts
+        if strict:
+            raise review_provenance.ProvenanceError(
+                "the freeze milestones of lot #%d cannot be read (%s)"
+                % (lot, exc)) from exc
+        return [], ["milestones:%d" % lot], []
+    freezes = sorted((row for row in rows if row.get("kind") == "frozen"),
+                     key=lambda value: (value.get("at_ts") or 0,
+                                        int(value.get("id") or 0)))
     if not freezes:
         return [], [], []
     head_sha = str(head or (milestone or {}).get("sha") or "").strip()
@@ -716,6 +732,7 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                       reverse=True):
         sha = str(row.get("sha") or "").strip()
         if not sha:
+            unknown.append("freeze:%d" % int(row.get("id") or 0))
             continue
         # le contenu d'un gel déjà entré dans la cible n'est pas relu
         if base and _is_ancestor(repo, sha, base) is True:

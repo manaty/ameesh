@@ -9,7 +9,7 @@ oublie les correcteurs codex et claude : leurs familles redeviennent
 
 Le lecteur relit les gels antérieurs du même lot et reprend leurs auteurs tant
 que leur contenu subsiste : arbre identique (ou fusion du gel avec la base),
-ancêtre, ou toutes les lignes significatives encore présentes. Un correctif
+ancêtre, ou au moins une ligne significative encore présente. Un correctif
 réellement réécrit n'est pas repris (cas admissible, documenté par le gel) ; le
 doute conserve l'auteur.
 
@@ -20,9 +20,12 @@ refusé. Une réécriture réelle de son code le retire des auteurs.
 from __future__ import annotations
 
 import os
-from unittest import TestCase
+import shutil
+import tempfile
+from unittest import TestCase, mock
 
 from ameesh import merge_queue, registry, review_authors, work
+from ameesh import review_provenance
 
 from .support import PgTestCase
 from .test_2447_review_designation_activation import _Repo
@@ -236,6 +239,27 @@ class RealRewriteTest(_RewriteFixture):
         self.assertEqual({row["actor"] for row in out["accepted"]},
                          {"cx3", "dev1"})
 
+    def test_a_modified_comment_keeps_the_corrector(self):
+        # #2924 B2 : une ligne/commentaire modifié ne suffit pas à déclarer le
+        # commit réécrit ; les autres lignes du correctif subsistent.
+        self.repo.git("reset", "--hard", self.base)
+        self.repo.write("src/ameesh/runner.py",
+                        "base\nlot\n"
+                        "if not admitted:\n"
+                        "    return deferred  # cx3 fix, commentaire ajusté\n")
+        self.repo.write("tests/test_runner.py",
+                        "def test_admission():\n"
+                        "    assert admitted() is False  # cx3 witness\n")
+        head = self.repo.commit("impl: commentaire ajusté", agent="impl")
+        self.receipt("impl", "deepseek", [head])
+        freeze = self.freeze(head)
+        milestone = {"id": int(freeze["id"]), "sha": head,
+                     "actor": "impl", "at_ts": freeze.get("at_ts")}
+        authors, unknown, _correctors = self.reading(
+            milestone, [head], self.base, head)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"] for row in authors}, {"impl", "cx3"})
+
     def test_an_unrelated_change_keeps_the_corrector(self):
         # Même contenu que A (les lignes de cx3), plus un fichier sans rapport :
         # le contenu du correctif subsiste, il reste auteur.
@@ -257,6 +281,44 @@ class RealRewriteTest(_RewriteFixture):
             milestone, [head], self.base, head)
         self.assertEqual(unknown, [])
         self.assertEqual({row["name"] for row in authors}, {"impl", "cx3"})
+
+
+class ParserTest(TestCase):
+    """#2924 B1 : chaque fichier du diff garde ses propres lignes."""
+
+    def test_two_files_do_not_share_a_path(self):
+        root = tempfile.mkdtemp(prefix="ameesh-2924-")
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        repo = _Repo(root)
+        repo.write("alpha.py", "base\n")
+        repo.write("docs/note.md", "doc\n")
+        repo.commit("base")
+        repo.write("alpha.py", "base\nfix alpha\n")
+        repo.write("docs/note.md", "doc\ndoc beta\n")
+        sha = repo.commit("cx3: correctif + doc", agent="cx3")
+        adds, _removes, binary = review_authors._commit_lines(repo.root, sha)
+        self.assertFalse(binary)
+        self.assertIn("fix alpha", adds["alpha.py"])
+        self.assertIn("doc beta", adds["docs/note.md"])
+        self.assertNotIn("doc beta", adds.get("alpha.py", []))
+        self.assertNotIn("fix alpha", adds.get("docs/note.md", []))
+
+
+class FreezeReadFailureTest(TestCase):
+    """#2924 B3 : un journal de jalons illisible ne rend jamais une liste vide."""
+
+    def test_unreadable_freezes_fail_closed_when_strict(self):
+        with mock.patch.object(review_authors.storage, "of",
+                               side_effect=RuntimeError("journal illisible")):
+            with self.assertRaises(review_provenance.ProvenanceError):
+                review_authors._carried_from_previous(
+                    object(), dict(LOT), None, [], "/depot", FAMILIES,
+                    strict=True)
+            authors, unknown, correctors = review_authors._carried_from_previous(
+                object(), dict(LOT), None, [], "/depot", FAMILIES,
+                strict=False)
+        self.assertEqual((authors, correctors), ([], []))
+        self.assertEqual(unknown, ["milestones:2924"])
 
 
 class PacketIsNotWidenedTest(TestCase):
