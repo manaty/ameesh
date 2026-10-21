@@ -1070,6 +1070,17 @@ class Watcher:
                     break
                 except Exception as exc:  # noqa: BLE001 - jamais fatal au passage
                     self.log("CI %s: check failed (%s)" % (repo, " ".join(str(exc).split())[:200]))
+            # #2957 : le périmètre actif est la configuration de l'hôte
+            # désigné. Un dépôt qui en sort ne doit pas laisser sa ligne de
+            # file : le repli de `github_observation` sur un hôte sans
+            # configuration la surveillerait et alerterait à jamais de son
+            # silence. La purge ne dépend pas des appels GitHub du passage
+            # (un quota épuisé ou une erreur d'un dépôt ne la saute pas).
+            try:
+                storage.of(db).ci.prune_queue(repos)
+            except Exception as exc:  # noqa: BLE001 - cache seulement, jamais fatal
+                self.log("CI: queue rows outside the active perimeter not pruned (%s)"
+                         % " ".join(str(exc).split())[:200])
             return out
         finally:
             plan_github.flush_reads(getattr(self.cfg, "state_dir", None))
