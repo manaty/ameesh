@@ -1106,12 +1106,45 @@ class Mailbox(Domain):
         """Messages non remis marqués `payload.urgent`."""
 
     @abc.abstractmethod
-    def unread_mid_turn(self, recipient: str, limit: int) -> list[dict]:
+    def unread_human(self, recipient: str, limit: int, *,
+                     names: Sequence[str] | None = None) -> list[dict]:
+        """L77/B13 : messages non remis d'un humain ACTIF, filtrés DANS la requête.
+
+        Un humain (`payload.human`, ancien expéditeur `human:*`, ou nom
+        déclaré de l'hôte dans `names`, None = aucun) ne doit pas rester
+        invisible derrière plus de `UNREAD_LIMIT` non-lus ordinaires : le rang 2
+        le sert avant la suite et la consigne en attente. Du plus ancien au
+        plus récent.
+
+        L77/B14 : les passifs (copie `cc`, accusé…) sont écartés par la
+        requête, comme par `mail.passive_reason` — une copie humaine ne
+        remplit pas la fenêtre devant un humain actif.
+        """
+
+    @abc.abstractmethod
+    def unread_human_page(self, recipient: str, limit: int, *,
+                          after_id: int | None = None,
+                          names: Sequence[str] | None = None) -> list[dict]:
+        """L77/B14 : les humains actifs d'APRÈS `after_id`, du plus ancien au
+        plus récent.
+
+        Le serveur médié borne chaque page à 200 et `unread_human` n'a pas de
+        décalage : un préfixe de plus de 200 humains retenus (lots retenus)
+        ne se franchit qu'avec un curseur. `after_id` est l'id du dernier
+        message de la page précédente ; None lit depuis le début. Les passifs
+        sont écartés comme dans `unread_human`.
+        """
+
+    @abc.abstractmethod
+    def unread_mid_turn(self, recipient: str, limit: int, *,
+                        include_human: bool = True) -> list[dict]:
         """L514/#885 : les messages non remis qu'une remise mi-tour peut
         livrer — verdict, arbitrage, message d'un humain, urgent
         (`mail.mid_turn`) —, du plus ancien au plus récent, sans s'arrêter
         aux `UNREAD_LIMIT` premiers non-lus : un verdict derrière plus de 200
-        non-lus est vu au prochain point sûr, pas à la fin du tour."""
+        non-lus est vu au prochain point sûr, pas à la fin du tour.
+        `include_human=False` (L77/B11) : les messages humains sont laissés à
+        la file du tour résident."""
 
     @abc.abstractmethod
     def get(self, message_id: int) -> dict | None:

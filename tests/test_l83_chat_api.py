@@ -97,8 +97,9 @@ class PostHumanMessageTest(unittest.TestCase):
                 mock.patch.object(conversation, "Log", self._Log):
             out = chat.post_human_message(self.cfg, db, human="human:owner", sender="owner",
                                           agent="a1", text="salut")
-        send.assert_called_once_with(db, "owner", "a1", "salut", host=self.cfg.host,
-                                     kind="notify", payload={"human": True},
+        send.assert_called_once_with(db, "human:owner", "a1", "salut", host=self.cfg.host,
+                                     kind="notify",
+                                     payload={"human": True},
                                      work_item_id=None)
         log = self._Log.instances[0]
         self.assertEqual(log.kwargs["project"], "demo")
@@ -210,7 +211,8 @@ class ChatPgTest(PostMixin, PgTestCase):
         self.assertEqual(entry["event_id"], "mail:%d" % out["result"]["message_id"])
         rows = self.mailbox()
         self.assertEqual(len(rows), 1)
-        self.assertEqual((rows[0]["sender"], rows[0]["recipient"]), ("owner", "a1"))
+        self.assertEqual((rows[0]["sender"], rows[0]["recipient"]),
+                         ("human:owner", "a1"))
         self.assertTrue(json.loads(rows[0]["payload"])["human"])
         page = self.history()
         self.assertEqual([e["text"] for e in page["entries"]], [TEXT])

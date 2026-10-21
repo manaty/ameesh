@@ -295,6 +295,15 @@ All the inputs of an agent go through a **single queue**, read by the
     without `!urgent` and without `!stop`. The right to write to the database
     remains the real barrier: whoever has the DSN can write. This is accepted
     as long as the database is private, and it is the limit of v1.
+  * **Entry proof (L77)**: the `user@host` proof is carried only by an
+    interactive human entry whose process has no agent binding
+    (`AGENT_MAIL_NAME` or session binding): CLI `agent-mail send`, `ameesh
+    chat` terminal, `ameesh decide`. An agent-bound process, the API
+    (`serve_actions`, `chat.post_human_message`) and the server write no
+    proof until OIDC/server write: the message is delivered, unverified. The
+    reader verifies the carried proof against `local_accounts`, never its own
+    account. v1 limit accepted: whoever holds the DSN, or removes the binding,
+    can forge it.
   * **With a server (L55) and OIDC (0033, lot D1)**: `ameesh chat` and the
     Nexlink page present an OIDC token; the server verifies the identity and
     the link to the canon, and **it is the server that writes** the message.
