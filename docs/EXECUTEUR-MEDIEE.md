@@ -395,7 +395,7 @@ nouveaux exécuteurs : un ancien serveur refuse les trois opérations, le
 runner journalise la lecture impossible et le réveil reste armé, sans perte
 ni blocage du harnais.
 
-## Contrat 1.5 : humains du rang 2, au-delà du préfixe (#286/B13)
+## Contrat 1.5 : humains du rang 2, au-delà du préfixe (#286/B13, B14)
 
 La file résidente sert les messages humains ordinaires (rang 2) avant le
 courrier urgent d'agent, la suite et la consigne en attente. Sur Postgres, une
@@ -408,10 +408,19 @@ names=None)` applique le même filtre dans la requête du serveur ; le client
 la sert sans repli de pagination. `names` porte les noms déclarés humains de
 l'hôte (`AMEESH_HUMANS` historique) et peut être nul.
 
+B14 : la requête ne rend que les humains **actifs** — les copies passives
+(`cc`, accusé…) sont écartées comme par `mail.passive_reason`, sinon 200
+copies humaines passives remplissaient la fenêtre devant un humain actif.
+Côté client, `deliverable_unread` signale une lecture **tronquée** quand sa
+page n'a pas progressé (backend borné à 200, sans décalage) ; `_pick`
+déclenche alors la recherche humaine même si peu de lignes de la fenêtre
+sont remisables (lots retenus).
+
 L'ajout est compatible : la version passe à `1.5.0`, aucune opération n'est
 retirée ni modifiée. Déployer le serveur avant les nouveaux exécuteurs : un
-ancien serveur refuse l'opération, et le runner médié ne peut alors pas
-trouver un humain au-delà du préfixe.
+ancien serveur refuse l'opération ; le runner médié journalise une fois la
+recherche profonde indisponible et lit comme avant 1.5, sans tuer le fil de
+l'agent à chaque page pleine.
 
 ## Porte d'hôte
 

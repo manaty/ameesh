@@ -147,7 +147,7 @@ MAIL_PAGE = mail.UNREAD_LIMIT
 
 
 def deliverable_unread(cfg, db, agent, *, besoin, mode="unread", deferred=None,
-                       include_human=True, human_names=None) -> list[dict]:
+                       include_human=True, human_names=None, troncature=False):
     """#811 R3 : les non-lus remisables, au-delà d'un préfixe qui les masquait.
 
     `mail.unread` — et ses variantes — borne la lecture aux plus anciens : un
@@ -165,7 +165,14 @@ def deliverable_unread(cfg, db, agent, *, besoin, mode="unread", deferred=None,
 
     L77/B13 : `mode="human"` cherche les humains (`mail.unread_human`), pas le
     préfixe des non-lus ordinaires ; `human_names` porte les noms déclarés
-    humains sur l'hôte. La pagination et les lots retenus restent les mêmes."""
+    humains sur l'hôte. La pagination et les lots retenus restent les mêmes.
+
+    L77/B14 : `troncature=True` rend `(lignes, tronquee)` au lieu de la seule
+    liste. `tronquee` dit que la dernière page n'a pas progressé (backend qui
+    borne la lecture, ex. médié à 200 lignes sans décalage) : il peut rester
+    des non-lus au-delà, même si peu sont remisables dans cette fenêtre. Le
+    défaut reste la liste seule, pour les appelants qui n'ont pas besoin du
+    drapeau."""
     if mode == "human":
         def lire(db, name, limit):
             return mail.unread_human(db, name, limit, names=human_names)
@@ -175,20 +182,23 @@ def deliverable_unread(cfg, db, agent, *, besoin, mode="unread", deferred=None,
     name = agent.get("name")
     besoin = max(1, int(besoin))
 
+    def rendre(rows, coupee=False):
+        return (rows, coupee) if troncature else rows
+
     def filtrer(rows):
         if include_human:
             return rows
         return [row for row in rows if not mail.is_human(row)]
 
     if cfg is None:                   # construction partielle : lecture simple
-        return filtrer(lire(db, name, limit=besoin))
+        return rendre(filtrer(lire(db, name, limit=besoin)))
     if len(projects.agent_projects(agent)) < 2:
-        return filtrer(lire(db, name, limit=besoin))
+        return rendre(filtrer(lire(db, name, limit=besoin)))
     canons = None
     try:
         canons = canon.load_configured(cfg)
     except canon.CanonError:
-        return filtrer(lire(db, name, limit=besoin))
+        return rendre(filtrer(lire(db, name, limit=besoin)))
     page = max(MAIL_PAGE, besoin)
     lus = 0
     while True:
@@ -196,12 +206,19 @@ def deliverable_unread(cfg, db, agent, *, besoin, mode="unread", deferred=None,
         try:
             gardes = deliverable(cfg, db, agent, rows, deferred=deferred, canons=canons)
         except db_mod.DbError:
-            return filtrer(rows)      # dossier illisible : page brute, rien perdu
+            return rendre(filtrer(rows))  # dossier illisible : page brute, rien perdu
         # L77/B11 : le hook d'un tour résident ne remet pas les messages
         # humains, réservés/soldés par la file du tour. On continue de paginer
         # pour ne pas s'arrêter sur une page pleine d'humains.
         gardes = filtrer(gardes)
-        if len(gardes) >= besoin or len(rows) < page or len(rows) <= lus:
-            return gardes
+        if len(gardes) >= besoin:
+            return rendre(gardes)
+        if lus and len(rows) <= lus:
+            # La page demandée n'a pas grandi : le backend la borne (médié,
+            # `limit` ramené à 200) et la suite n'est pas lisible sans
+            # décalage. La lecture est tronquée, pas terminée.
+            return rendre(gardes, True)
+        if len(rows) < page:
+            return rendre(gardes)
         lus = len(rows)
         page = page * 2

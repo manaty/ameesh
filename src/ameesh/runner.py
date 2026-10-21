@@ -661,6 +661,9 @@ class AgentWorker(threading.Thread):
         #: critique (le NOTIFY d'un message déjà servi n'arrête pas son tour).
         self._turn_mail_ids: frozenset[int] = frozenset()
         self._refus_vus: set[int] = set()
+        #: contrat 1.5 absent (ancien serveur médié) : recherche profonde des
+        #: humains indisponible, dite une fois sans tuer le fil.
+        self._humains_profonds_indisponibles = False
         #: arrêt demandé avant la publication du Popen (point de passage unique)
         self.stop_requested = threading.Event()
         self._stop_reason = ""
@@ -4915,13 +4918,16 @@ class AgentWorker(threading.Thread):
         # le courrier urgent (rang 3), la suite et la consigne en attente
         # (rang 4). On lit tout le courrier ici pour les trouver, y compris
         # derrière un préfixe retenu ; les rangs suivants réutilisent la lecture.
-        page = lot_workdir.deliverable_unread(
+        page, page_tronquee = lot_workdir.deliverable_unread(
             cfg, self.db, self.agent, besoin=mail.UNREAD_LIMIT,
-            deferred=self._lot_deferred)
+            deferred=self._lot_deferred, troncature=True)
         # L77/B13 : le déclencheur porte sur la page LUE, avant `_live_mail` —
         # une requête expirée retirée de la page ne doit pas refermer la
         # recherche humaine (200 lus, 199 vivants : le préfixe était plein).
-        page_pleine = len(page) >= mail.UNREAD_LIMIT
+        # L77/B14 : une lecture tronquée par la borne du backend (médié :
+        # 200 lignes sans décalage) laisse peut-être un humain au-delà du
+        # préfixe, même si peu de lignes y sont remisables (lots retenus).
+        page_pleine = page_tronquee or len(page) >= mail.UNREAD_LIMIT
         messages = self._live_mail(page)
         if page_pleine and all(mail.passive_reason(m) for m in messages):
             # L125 : boîte pleine de courrier passif — les messages qui
@@ -4941,10 +4947,21 @@ class AgentWorker(threading.Thread):
             # (`deferred`), AVANT les rangs 3 à 5 : un humain ne se cache ni
             # derrière un urgent d'agent, ni derrière la suite ou la consigne
             # en attente.
-            humains_profonds = self._live_mail(lot_workdir.deliverable_unread(
-                cfg, self.db, self.agent, besoin=mail.UNREAD_LIMIT,
-                mode="human", deferred=self._lot_deferred,
-                human_names=getattr(cfg, "human_names", None)))
+            from .mediated_executor.contract import NotSupportedRemotely
+            try:
+                humains_profonds = self._live_mail(lot_workdir.deliverable_unread(
+                    cfg, self.db, self.agent, besoin=mail.UNREAD_LIMIT,
+                    mode="human", deferred=self._lot_deferred,
+                    human_names=getattr(cfg, "human_names", None)))
+            except NotSupportedRemotely as exc:
+                # Contrat 1.5 absent (ancien serveur) : lire comme avant 1.5,
+                # journalisé une fois, sans tuer le fil de l'agent à chaque
+                # page pleine (déploiement serveur d'abord, documenté).
+                if not getattr(self, "_humains_profonds_indisponibles", False):
+                    self._humains_profonds_indisponibles = True
+                    log("[%s] deep human search unavailable (%s): old executor "
+                        "server, reading without it" % (self.name, exc))
+                humains_profonds = []
             humans = [m for m in humains_profonds
                       if self._from_human(m) and not mail.passive_reason(m)]
         if humans:

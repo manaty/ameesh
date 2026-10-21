@@ -578,6 +578,29 @@ class PorteeTest(ServeurExecTest):
             self.assertEqual(got.status, 200, got.body)
             self.assertEqual([m["id"] for m in got.body["value"]], [human], got.body)
 
+    def test_unread_human_ignores_passive_human_copies(self):
+        """B14/cx3 : 200 copies humaines passives ne remplissent pas la fenêtre.
+
+        Une copie `cc` marquée `human: true` reste passive ; la requête du
+        serveur doit l'écarter, sinon l'humain actif en position 401 reste
+        invisible derrière le préfixe passif.
+        """
+        self.db.execute(
+            "INSERT INTO agent_mailbox (sender, recipient, body, kind, payload)"
+            " SELECT 'human:alice', 'inge-front', 'copy ' || g, 'request',"
+            "        '{\"human\": true, \"cc\": \"alice\"}'::jsonb"
+            " FROM generate_series(1, 200) AS g")
+        human = int(self.db.query(
+            "INSERT INTO agent_mailbox (sender, recipient, body, kind, payload)"
+            " VALUES ('human:carol', 'inge-front', 'active human', 'request',"
+            "         '{\"human\": true}'::jsonb) RETURNING id")[0]["id"])
+        for token, route, names in ((TOKEN, "/op", None),
+                                    (SESSION, "/session/op", ["alice"])):
+            got = self.op("mailbox.unread_human", ["inge-front", 200],
+                          {"names": names}, token=token, route=route)
+            self.assertEqual(got.status, 200, got.body)
+            self.assertEqual([m["id"] for m in got.body["value"]], [human], got.body)
+
     def test_cout_d_un_appareil_range_device(self):
         """Contrat 1.1 : `turn_costs.insert` d'un appareil est rangé
         `source=device`, avec l'exécuteur et le bail de l'enveloppe, quoi

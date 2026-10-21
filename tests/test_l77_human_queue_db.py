@@ -8,6 +8,7 @@ ne duplique pas la trace.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 
 from ameesh import conversation, registry
@@ -78,6 +79,14 @@ class PickHumanFirstTest(PgTestCase):
     At-least-once : la construction du spec ne réserve ni ne remet rien ;
     seule la remise (lancement du harnais) solde la réservation.
     """
+
+    def _bulk(self, name, sender, count, payload):
+        """Dépose `count` messages d'un coup (les boucles de 200 coûtent cher)."""
+        self.db.execute(
+            "INSERT INTO agent_mailbox (sender, recipient, body, kind, payload)"
+            " SELECT %s, %s, 'bulk ' || g, 'request', %s::jsonb"
+            " FROM generate_series(1, %s) AS g",
+            (sender, name, json.dumps(payload), count))
 
     def test_pick_serves_human_first_without_delivering(self):
         from ameesh import mail
@@ -154,6 +163,95 @@ class PickHumanFirstTest(PgTestCase):
                          "the expired request shrank the page and hid the human")
         self.assertTrue(spec.get("human"))
         self.assertEqual(spec["ids"], [human])
+
+    def test_active_human_behind_passive_human_copies_is_served(self):
+        """B14/cx3 : 200 copies humaines passives ne remplissent pas la fenêtre.
+
+        `mailbox.unread_human` doit filtrer les passifs DANS sa requête, sinon
+        le premier humain actif (position 401) reste invisible et la consigne
+        en attente passe devant lui.
+        """
+        from ameesh import mail, registry
+        name = "worker-pick-passive"
+        worker = _make_worker(self, name)
+        self._bulk(name, "agent:bob", mail.UNREAD_LIMIT, {})
+        self._bulk(name, "human:alice", mail.UNREAD_LIMIT,
+                   {"human": True, "cc": "alice"})
+        human = mail.send(self.db, "human:carol", name, "active human",
+                          payload={"human": True})
+        registry.set_pending_prompt(self.db, name, "a queued instruction")
+        spec = worker._pick()
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec["kind"], "mail",
+                         "passive human copies filled the window before the active human")
+        self.assertTrue(spec.get("human"))
+        self.assertEqual(spec["ids"], [human])
+
+    def test_human_after_a_truncated_page_is_served(self):
+        """B14 : une page bornée (médié, 200 lignes) ne referme pas la recherche.
+
+        300 non-lus, dont 150 d'un lot retenu parmi les 200 premiers ; un
+        humain en position 251. La page bornée ne rend que 50 remisables :
+        `page_pleine` doit venir de la lecture TRONQUÉE, pas du compte des
+        remisables, sinon la consigne en attente passe avant l'humain.
+        """
+        from unittest import mock
+        from ameesh import lot_workdir, mail, registry
+        name = "worker-pick-truncated"
+        worker = _make_worker(self, name)
+        self._bulk(name, "agent:bob", 150, {"retained": True})
+        self._bulk(name, "agent:bob", 100, {})
+        human = mail.send(self.db, "human:alice", name, "active human",
+                          payload={"human": True})
+        registry.set_pending_prompt(self.db, name, "a queued instruction")
+
+        real_unread = lot_workdir.mail.unread
+
+        def borne(db, recipient, limit=mail.UNREAD_LIMIT):
+            # Backend médié : la page est ramenée à 200 lignes, sans décalage.
+            return real_unread(db, recipient, limit=min(int(limit), mail.UNREAD_LIMIT))
+
+        def garder(cfg, db, agent, rows, *, deferred=None, canons=None):
+            return [row for row in rows
+                    if not (row.get("payload") or {}).get("retained")]
+
+        with mock.patch.object(lot_workdir.mail, "unread", side_effect=borne), \
+                mock.patch.object(lot_workdir, "deliverable", side_effect=garder):
+            spec = worker._pick()
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec["kind"], "mail",
+                         "a truncated page hid the human behind the retained prefix")
+        self.assertTrue(spec.get("human"))
+        self.assertEqual(spec["ids"], [human])
+
+    def test_old_server_without_deep_human_search_does_not_kill_pick(self):
+        """N : un serveur 1.4 refuse `mailbox.unread_human` ; le fil survit.
+
+        La recherche profonde est alors indisponible : lecture comme avant 1.5
+        (ici la consigne en attente), sans laisser remonter
+        `NotSupportedRemotely`.
+        """
+        from unittest import mock
+        from ameesh import lot_workdir, mail, registry
+        from ameesh.mediated_executor.contract import NotSupportedRemotely
+        name = "worker-pick-old-server"
+        worker = _make_worker(self, name)
+        self._bulk(name, "agent:bob", mail.UNREAD_LIMIT, {})
+        registry.set_pending_prompt(self.db, name, "a queued instruction")
+
+        original = lot_workdir.deliverable_unread
+
+        def lecture(cfg, db, agent, *, besoin, mode="unread", **kwargs):
+            if mode == "human":
+                raise NotSupportedRemotely("op_not_allowed")
+            return original(cfg, db, agent, besoin=besoin, mode=mode, **kwargs)
+
+        with mock.patch.object(lot_workdir, "deliverable_unread",
+                               side_effect=lecture):
+            spec = worker._pick()
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec["kind"], "prompt")
+        self.assertEqual(spec["prompt"], "a queued instruction")
 
 
 class EndOfTurnServiceTest(PgTestCase):

@@ -814,6 +814,57 @@ class DeliverableHumanFilterTest(unittest.TestCase):
         self.assertEqual([r["id"] for r in out], [2])
 
 
+class DeliverableTruncationTest(unittest.TestCase):
+    """L77/B14 : une page bornée par le backend est signalée tronquée."""
+
+    def test_a_page_that_does_not_grow_is_truncated(self):
+        """Médié : 300 non-lus, 150 retenus parmi les 200 premiers.
+
+        La lecture est ramenée à 200 lignes par le serveur ; la deuxième page
+        ne progresse plus. `deliverable_unread` doit rendre 50 remisables ET
+        le drapeau tronqué, pour que `_pick` cherche l'humain au-delà.
+        """
+        from unittest import mock
+        from ameesh import lot_workdir
+        rows = [{"id": index, "payload": {}} for index in range(1, 301)]
+        agent = {"name": "worker", "projects": ["p1", "p2"]}
+
+        def lire(db, name, limit):
+            return rows[:min(int(limit), 200)]  # borne serveur, sans décalage
+
+        def garder(cfg, db, agent, page, *, deferred=None, canons=None):
+            return [row for row in page if int(row["id"]) > 150]
+
+        with mock.patch.object(lot_workdir.mail, "unread", side_effect=lire), \
+                mock.patch.object(lot_workdir.projects, "agent_projects",
+                                  return_value=["p1", "p2"]), \
+                mock.patch.object(lot_workdir.canon, "load_configured",
+                                  return_value=[]), \
+                mock.patch.object(lot_workdir, "deliverable", side_effect=garder):
+            page, tronquee = lot_workdir.deliverable_unread(
+                object(), object(), agent, besoin=200, troncature=True)
+        self.assertEqual([row["id"] for row in page], list(range(151, 201)))
+        self.assertTrue(tronquee)
+
+    def test_a_complete_page_is_not_truncated(self):
+        """La fin de boîte n'est pas une lecture tronquée (pas de recherche)."""
+        from unittest import mock
+        from ameesh import lot_workdir
+        rows = [{"id": index, "payload": {}} for index in range(1, 101)]
+        agent = {"name": "worker", "projects": ["p1", "p2"]}
+
+        with mock.patch.object(lot_workdir.mail, "unread",
+                               side_effect=lambda db, name, limit: rows), \
+                mock.patch.object(lot_workdir.projects, "agent_projects",
+                                  return_value=["p1", "p2"]), \
+                mock.patch.object(lot_workdir.canon, "load_configured",
+                                  return_value=[]):
+            page, tronquee = lot_workdir.deliverable_unread(
+                object(), object(), agent, besoin=200, troncature=True)
+        self.assertEqual(len(page), 100)
+        self.assertFalse(tronquee)
+
+
 class HumanReservationTtlTest(unittest.TestCase):
     """L77/B6 : la réservation humaine couvre tout le tour, pas 10 min."""
 

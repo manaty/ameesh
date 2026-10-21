@@ -153,26 +153,39 @@ class Mailbox(interface.Mailbox):
         )
 
     def unread_human(self, recipient, limit, *, names=None) -> list[dict]:
-        """L77/B13 : les non-lus d'un humain, filtrés DANS la requête — le
-        préfixe des `UNREAD_LIMIT` non-lus ordinaires ne les masque plus.
+        """L77/B13 : les non-lus d'un humain ACTIF, filtrés DANS la requête —
+        le préfixe des `UNREAD_LIMIT` non-lus ordinaires ne les masque plus.
 
         `names` (None = aucun) couvre les noms déclarés humains sur l'hôte
         (ancien `AMEESH_HUMANS`) ; `payload.human` et l'ancien
         `sender human:*` restent reconnus, comme `mail.is_human`.
+
+        L77/B14 : les passifs (copie `cc`, accusé…) sont écartés par la même
+        règle que `mail.passive_reason` (`PASSIVE_SQL`). Sans ce filtre, 200
+        copies humaines passives remplissaient la fenêtre devant un humain
+        actif et le rang 2 le manquait encore.
         """
         names = [str(name) for name in (names or ()) if str(name)]
+        # `IN` explicite plutôt qu'un tableau lié : le pilote psql rend les
+        # listes Python en littéral texte, pas en `text[]` (#286).
+        declares = ""
+        params = [recipient]
+        if names:
+            declares = " OR sender IN (" + ", ".join(["%s"] * len(names)) + ")"
+            params.extend(names)
+        params.append(int(limit))
         return self.db.query(
             """
             SELECT %s
             FROM agent_mailbox
             WHERE recipient = %%s AND delivered_at IS NULL
               AND (payload @> '{"human": true}'::jsonb
-                   OR starts_with(sender, 'human:')
-                   OR sender = ANY(%%s::text[]))
+                   OR starts_with(sender, 'human:')%s)
+              AND NOT %s
             ORDER BY id
             LIMIT %%s
-            """ % MAIL_COLUMNS,
-            (recipient, names, int(limit)),
+            """ % (MAIL_COLUMNS, declares, PASSIVE_SQL.format(t="agent_mailbox")),
+            params,
         )
 
     def unread_mid_turn(self, recipient, limit, *, include_human=True) -> list[dict]:

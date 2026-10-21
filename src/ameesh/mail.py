@@ -153,12 +153,16 @@ def unread_urgent(db: Db, recipient: str, limit: int = 50) -> list[dict]:
 
 def unread_human(db: Db, recipient: str, limit: int = UNREAD_LIMIT, *,
                  names: Sequence[str] | None = None) -> list[dict]:
-    """L77/B13 : les non-lus d'un humain, filtrés DANS la requête — rang 2.
+    """L77/B13 : les non-lus d'un humain ACTIF, filtrés DANS la requête — rang 2.
 
     Un humain (`payload.human`, ancien expéditeur `human:*`, ou nom déclaré de
     l'hôte dans `names`, None = aucun) derrière plus de `UNREAD_LIMIT` non-lus
     ordinaires n'est plus masqué par le préfixe : `_pick` le sert avant la
     suite et la consigne en attente.
+
+    L77/B14 : les messages passifs (copie `cc`, accusé…) sont écartés par la
+    requête, comme par `passive_reason` : une copie humaine ne remplit pas la
+    fenêtre devant un humain actif.
 
     Médié : `mailbox.unread_human` est au contrat (1.5) — le serveur filtre
     dans sa requête, il n'y a plus de lecture bornée aux 200 premiers non-lus
