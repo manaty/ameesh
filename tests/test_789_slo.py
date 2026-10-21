@@ -292,8 +292,8 @@ class MesureTest(unittest.TestCase):
         self.assertEqual(row["elapsed_s"], 300)
 
     def test_intake_retenue_apres_le_debut_ne_reecrit_pas_la_mesure(self):
-        # #2916 : une retenue ajoutée après le début ne réécrit pas la mesure
-        # intake déjà acquise (même règle que #2551 pour une dépendance).
+        # #2916/#2921 : une retenue postérieure au premier build ne réécrit pas
+        # la mesure acquise ; la dernière levée ANTÉRIEURE au début gouverne.
         events = [_ev("intake", T0),
                   _ev("waiting_human", T0 + 60),
                   _ev("intake", T0 + 1800),
@@ -303,9 +303,51 @@ class MesureTest(unittest.TestCase):
         item = _item(state="intake", assignee="executant", updated_ts=T0 + 9000)
         row = self._row(slo.lot_steps(item, _jalons(item, events), events,
                                      now=T0 + 10_000), "intake_started")
-        self.assertEqual(row["started_ts"], T0)
+        self.assertEqual(row["started_ts"], T0 + 1800)
         self.assertEqual(row["done_ts"], T0 + 3600)
+        self.assertEqual(row["elapsed_s"], 1800)
+        # sans levée antérieure, la levée postérieure au début est ignorée
+        events = [_ev("intake", T0),
+                  _ev("build", T0 + 3600),
+                  _ev("waiting_human", T0 + 7200),
+                  _ev("intake", T0 + 9000)]
+        item = _item(state="intake", assignee="executant", updated_ts=T0 + 9000)
+        row = self._row(slo.lot_steps(item, _jalons(item, events), events,
+                                     now=T0 + 10_000), "intake_started")
+        self.assertEqual(row["started_ts"], T0)
         self.assertEqual(row["elapsed_s"], 3600)
+
+    def test_intake_repart_apres_un_hold_de_pilote(self):
+        # #2916/#1225 : un hold explicite de pilote (#1664) n'est pas un état ;
+        # sa levée, autorisée par l'appelant, fait repartir l'horloge comme
+        # une retenue d'état. Cas réel nexlink #1225.
+        release = T0 + 2 * 86400
+        events = [_ev("intake", T0),
+                  _ev("intake", T0 + 60, "hold: attente des gestes owner")]
+        item = _item(assignee="executant")
+        for offset, lvl in ((300, 0), (3660, 1)):
+            with self.subTest(offset=offset):
+                row = self._row(slo.lot_steps(item, _jalons(item, events), events,
+                                             now=release + offset,
+                                             hold_releases=[release]),
+                                "intake_started")
+                self.assertEqual(row["started_ts"], release)
+                self.assertEqual(row["elapsed_s"], offset)
+                self.assertEqual(row["level"], lvl)
+
+    def test_intake_hold_de_pilote_apres_le_debut_ne_reecrit_pas_la_mesure(self):
+        # #2916/#2921 : même filtre pour les holds de pilote — la dernière
+        # levée antérieure au premier build gouverne.
+        events = [_ev("intake", T0),
+                  _ev("intake", T0 + 60, "hold: attente"),
+                  _ev("build", T0 + 3600)]
+        item = _item(state="build", assignee="executant", updated_ts=T0 + 3600)
+        row = self._row(slo.lot_steps(item, _jalons(item, events), events,
+                                     now=T0 + 10_000,
+                                     hold_releases=[T0 + 1800, T0 + 9000]),
+                        "intake_started")
+        self.assertEqual(row["started_ts"], T0 + 1800)
+        self.assertEqual(row["elapsed_s"], 1800)
 
     def test_intake_demarre_ne_reecrit_pas_sa_mesure(self):
         # #2551 : une dépendance ajoutée après le début ne réécrit pas la

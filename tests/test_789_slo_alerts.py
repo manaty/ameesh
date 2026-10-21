@@ -824,6 +824,28 @@ class RetourAttenteHumaineTest(_Base):
                 alerts = [a for a in self.slo() if a["step"] == "intake_started"]
                 self.assertEqual([a["level"] for a in alerts], levels)
 
+    def test_hold_de_pilote_repart_de_la_levee(self):
+        # #2916/#1225 : le cas réel nexlink #1225 — un lot parqué deux jours
+        # sous un hold de pilote ne demande pas de réattribution à la levée.
+        self.age(2 * 24 * HEURE)
+        work.note(self.db, self.lot["id"], "hold: attente des gestes owner",
+                  actor="human:pilote")
+        # la retenue date du début du lot (journal)
+        self.db.execute(
+            "UPDATE work_item_events SET created_at = now() - make_interval(secs => %s)"
+            " WHERE work_item_id = %s AND note LIKE 'hold:%%'",
+            (2 * 24 * HEURE - 60.0, self.lot["id"]))
+        self.now = time.time()
+        self.assertEqual([a for a in self.slo() if a["step"] == "intake_started"], [])
+        lifted = time.time()
+        work.note(self.db, self.lot["id"], "unhold: gestes owner faits",
+                  actor="human:pilote")
+        for offset, levels in ((300, []), (3660, [1])):
+            with self.subTest(offset=offset):
+                self.now = lifted + offset
+                alerts = [a for a in self.slo() if a["step"] == "intake_started"]
+                self.assertEqual([a["level"] for a in alerts], levels)
+
 
 class NotifyLivreTest(_Base):
     """B1 (#1035 R1) : la livraison RÉELLE par le Notifier — depuis #2395,

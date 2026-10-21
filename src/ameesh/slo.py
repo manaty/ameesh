@@ -248,10 +248,12 @@ def hold_release_ts(events: Iterable[dict], *,
         state = event.get("state")
         at = event.get("created_ts")
         if previous in HOLDS and state not in HOLDS and at is not None:
-            released = float(at)
+            stamp = float(at)
+            # #2921 : une levée postérieure au premier build ne réécrit pas la
+            # mesure acquise — on garde la dernière levée antérieure au début.
+            if started is None or stamp <= float(started):
+                released = stamp
         previous = state
-    if started is not None and released is not None and released > float(started):
-        return None
     return released
 
 
@@ -321,7 +323,8 @@ def _row(step: Step, start, *, now: float, critical: bool, done_ts=None, **extra
 
 def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
               now: float | None = None, packet_slot: float | None = None,
-              dependencies: Iterable[dict] = ()) -> list:
+              dependencies: Iterable[dict] = (),
+              hold_releases: Iterable[float] = ()) -> list:
     """Les étapes mesurables d'un lot, une ligne par étape applicable.
 
     `jalons` vient de `progress._work_item_milestones` — le SEUL lecteur des
@@ -358,6 +361,10 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     la dernière sortie de retenue (`hold_release_ts`), pas de l'attribution
     d'origine. Sinon une décision de l'owner rendue après deux jours faisait
     crier « réattribuer maintenant » sur un lot que son porteur reprenait.
+    #2916/#1225 : `hold_releases` porte les levées des holds explicites de
+    pilote (`hold:`/`unhold:`, #1664), autorisées par l'appelant
+    (`planned_waits.pilot_hold_releases`) — un cas réel nexlink. Le temps
+    parqué sous un hold de pilote n'est pas un retard du porteur.
     """
     events = list(events)
     now = time.time() if now is None else float(now)
@@ -382,7 +389,15 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
         ready = intake_ready_ts(assigned, requested, dependencies, started=started)
         # #2916 : le temps passé sous retenue n'est pas un retard intake ; au
         # retour, l'horloge repart de la levée (dernière sortie de retenue).
+        # #1225 : les holds explicites de pilote (#1664) comptent aussi ; leurs
+        # levées sont autorisées par l'appelant et filtrées par `started` ici.
         released = hold_release_ts(events, started=started)
+        for stamp in hold_releases or ():
+            value = float(stamp)
+            if started is not None and value > float(started):
+                continue
+            if released is None or value > float(released):
+                released = value
         if ready is not None and released is not None:
             ready = max(float(ready), released)
         # #2562 : un report planifié ne constitue pas un retard intake.
