@@ -35,6 +35,8 @@ DIGEST_MAX_ITEMS = 25
 DIGEST_MAX_CHARS = 16000
 #: Maximum length of one quoted body in a digest.
 DIGEST_EXCERPT = 4000
+#: #2925: a failed pass is retried sooner than an hourly cadence.
+RETRY = 300
 
 
 @dataclass(frozen=True)
@@ -216,13 +218,19 @@ def collect_batch(api, sub, since, now, scan):
             return events, state, until
         times = [datetime.fromisoformat(row["updated_at"].replace("Z", "+00:00")).timestamp()
                  for row in rows]
-        if times != sorted(times):
+        # #2925: GitHub sorts by an index that can lag just after a write (the
+        # projection writes in the same pass, after `until`). A row past the
+        # window end is not taken here and the next window reads it again, so
+        # only its place on a full page's tail matters: it ends the window.
+        inside = [ts for ts in times if ts <= until]
+        if inside != sorted(inside) or (len(rows) == PAGE_SIZE and times[-1] > until
+                                        and times != sorted(times)):
             raise plan_github.GithubError("GitHub watch: updated order is invalid")
         events.extend(events_from(sub, state["kind"],
                                   [row for row, ts in zip(rows, times) if ts <= until]))
         if len(rows) == PAGE_SIZE and times[-1] <= until:
             cutoff = times[-1] - 1  # GitHub since is exclusive, timestamps have second precision
-            if times[0] < times[-1] and cutoff > state["since"]:
+            if inside[0] < times[-1] and cutoff > state["since"]:
                 state.update(since=cutoff, page=1)
                 state.pop("boundary", None)
                 state.pop("boundary_since", None)
@@ -442,6 +450,7 @@ class Watcher:
                     self.log("GitHub watch %s (%s): %d inputs%s" %
                              (sub.repo, sub.project, count, " [dry run]" if self.dry_run else ""))
             except Exception as exc:
+                self.next[key] = now + min(sub.interval, RETRY)
                 self.log("GitHub watch %s: failed; cursor retained: %s" %
                          (sub.repo, plan_github._one_line(exc)))
         return reports
