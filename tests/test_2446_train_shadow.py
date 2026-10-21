@@ -102,6 +102,15 @@ class ProjectRepo:
         self.git("checkout", "-q", start or "main")
         return head
 
+    def move_branch(self, name, *, path="content", text="moved\n"):
+        """Advance a member branch after its freeze."""
+        self.git("checkout", "-q", name)
+        self.write(path, text)
+        head = self.commit("moved " + name)
+        self.git("push", "-q", "origin", name)
+        self.git("checkout", "-q", "main")
+        return head
+
 
 class ManifestTest(unittest.TestCase):
     def test_admissions_section_is_authoritative(self):
@@ -413,6 +422,33 @@ class ShadowPassageTest(PgTestCase):
         self.assertEqual([row["work_item_id"] for row in plan["members"]],
                          [candidate["id"], queued["id"]])
         self.assertEqual(plan["deferred"], [])
+
+    def test_a_late_queued_admission_is_deferred_but_a_candidate_is_projected(self):
+        """Le filtre late ne vise que les admissions en file, pas l'inventaire."""
+        self.queue_item(self.item, self.mark, self.head)
+        self.db.execute("UPDATE merge_queue SET queued_at = to_timestamp(%s)"
+                        " WHERE work_item_id = %s",
+                        (self.now + 60, self.item["id"]))
+        self.project_repo.branch("lot/projected", path="p.txt", text="p\n")
+        projected = self.add_candidate("lot/projected")[0]
+        result, _ = self.shadow.scheduled_step(self.db, self.now)
+        plan = result["plan"]
+        self.assertEqual([row["work_item_id"] for row in plan["members"]],
+                         [projected["id"]])
+        reasons = {row["work_item_id"]: row["reason"]
+                   for row in plan["deferred"]}
+        self.assertEqual(reasons[self.item["id"]],
+                         "late admission: queued after the cutoff")
+
+    def test_a_compose_error_is_notified_and_fails_the_plan(self):
+        """N P3 auditeur : une branche bougée fait échouer le plan, notifié."""
+        self.queue_item(self.item, self.mark, self.head)
+        self.project_repo.move_branch("lot/member")
+        result, _ = self.shadow.scheduled_step(self.db, self.now)
+        self.assertEqual(result["result"], "shadow-error", result)
+        self.assertIn("member moved beyond its exact freeze", result["error"])
+        self.assertTrue(any("shadow plan failed" in notice
+                            for notice in self.notices), self.notices)
 
     def test_a_generated_file_conflict_follows_land_merge(self):
         """#2963 (3) : un conflit sur un fichier généré est celui de land.merge."""

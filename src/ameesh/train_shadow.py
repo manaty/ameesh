@@ -260,14 +260,8 @@ class Passage:
         # Every queued admission is already in the queue: the candidate
         # inventory must not present it again, even when it is deferred here.
         prepared_ids = {row["work_item_id"] for row in rows}
-        # The active engine drops a late admission before ordering: its
-        # dependents wait with it, so the combined ordering must not see it.
-        for row in rows:
-            if float(row.get("queued_ts") or 0) > slot:
-                deferred.append(_deferred(row["work_item_id"], "queued",
-                                          "late admission: queued after the cutoff"))
-                continue
-            entries.append(dict(row=row, origin="queued", proof=None))
+        entries.extend(dict(row=row, origin="queued", proof=None)
+                       for row in rows)
         if self.candidate is not None:
             inventory = train_candidates.Inventory(
                 db, self.project, candidate=self.candidate).read()
@@ -300,21 +294,37 @@ class Passage:
                         "active enrollment would refuse"))
                     continue
                 prepared = decision["prepared"]
-                # Active enrollment inserts the candidate at this cutoff with
-                # rank NULL and an increasing queued_ts, after the admissions
-                # already queued. The synthetic timestamp reproduces that
-                # order. ``generation`` is part of the admission identity used
+                # Active enrollment inserts the candidate with rank NULL and
+                # an increasing queued_ts. A candidate is not enrolled at the
+                # tick: the inventory lists lots already ready at the cutoff,
+                # which the service enrolls on an earlier event. Its synthetic
+                # timestamp stays just below the cutoff (so the single late
+                # filter below does not discard it) and increases in inventory
+                # order; ``generation`` is part of the admission identity used
                 # by compose, and the shadow fabricates no queue row, so it
                 # uses one neutral value throughout.
                 item = admissions.ops.get(lot)
                 subject = dict(
                     prepared["subject"], generation=0,
                     priority=int((item or {}).get("priority") or 2),
-                    rank=None, queued_ts=float(slot) + 1 + enrolled)
+                    rank=None,
+                    queued_ts=float(slot) - 1.0 + enrolled * 0.001)
                 entries.append(dict(row=subject, origin="candidate",
                                     proof=prepared))
                 prepared_ids.add(lot)
                 enrolled += 1
+        # The active engine drops a late admission before ordering (train.py,
+        # build_beta), and its dependents wait with it. Apply that filter once,
+        # on the combined list: it names the queued admissions only, since the
+        # candidate timestamps were placed below the cutoff above.
+        entries = [entry for entry in entries
+                   if entry["origin"] == "candidate"
+                   or float(entry["row"].get("queued_ts") or 0) <= slot]
+        late = [row for row in rows
+                if float(row.get("queued_ts") or 0) > slot]
+        for row in late:
+            deferred.append(_deferred(row["work_item_id"], "queued",
+                                      "late admission: queued after the cutoff"))
         if entries:
             # One ordering pass over the queued admissions and the candidates,
             # as the engine does after enrollment: a queued dependent of a
