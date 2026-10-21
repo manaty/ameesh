@@ -255,6 +255,19 @@ def collect_batch(api, sub, since, now, scan):
                                            zip(shifted, shifted_times) if ts <= until]))
                 replayed.update(stamps(shifted))
                 state.pop("boundary_since", None)
+                # B2 #2955: more than a page of prefix rows can move forward,
+                # pushing an undelivered row back before this page. A full
+                # re-read page that shares no row with the saved one signals
+                # that shift; restart at page 1 rather than accept the page
+                # read before the check. A smaller shift stays inside this
+                # page, which was just delivered.
+                if (len(previous) == PAGE_SIZE
+                        and not ({row["id"] for row in previous}
+                                 & {item[0] for item in old})):
+                    state.update(page=1)
+                    state.pop("boundary", None)
+                    state["replayed"] = [list(item) for item in sorted(replayed)]
+                    return events, state, until
         times = [when(row) for row in rows]
         # #2925: GitHub sorts by an index that can lag just after a write (the
         # projection writes in the same pass, after `until`). A row past the

@@ -316,6 +316,29 @@ class CollectionTest(unittest.TestCase):
             self.assertIsNone(scan)
             self.assertEqual({e["object_id"] for e in events}, {1, 2, 3, 4})
 
+    def test_multi_page_prefix_shift_restarts_before_skipping_a_row(self):
+        # B2 #2955: moving more than PAGE_SIZE rows of the prefix forward can
+        # push an undelivered row back before the page being checked. A
+        # one-page reconciliation missed #7; the scan must restart at page 1.
+        with mock.patch.object(watch, "PAGE_SIZE", 3):
+            rows = [issue(n) for n in range(1, 13)]
+            for n, row in enumerate(rows):
+                row["updated_at"] = watch.iso(NOW - 250 + n)
+            api = UpdatedApi(rows, [])
+            events, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, None)
+            more, scan, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, set(range(1, 7)))
+            for row in rows[:4]:
+                row["updated_at"] = watch.iso(NOW + 1)
+            for _ in range(20):
+                batch, scan, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
+                events += batch
+                if scan is None:
+                    break
+            self.assertIsNone(scan)
+            self.assertEqual({e["object_id"] for e in events}, set(range(1, 13)))
+
     def test_index_lag_on_a_sparse_page_tail_cannot_skip_the_next_row(self):
         # #2955: same lag on a page sparse enough for the lag-margin seek. The
         # seek re-reads the lagged row and its successor out of updated order;
