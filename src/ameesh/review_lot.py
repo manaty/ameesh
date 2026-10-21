@@ -1282,6 +1282,7 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
             why = "dépôt inconnu : aucun intervalle de fusion lisible"
         elif not tips:
             why = "ni commit de fusion ni gel : aucun intervalle de fusion lisible"
+        unproven = ""
         for candidate in candidates:
             reason = ""
             # le commit de la fusion constatée d'abord ; à défaut le gel (fusion
@@ -1303,6 +1304,13 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
                             candidate, tip[:12])
                         continue
                     paths = lot_measures.diff_paths(candidate, *rng)
+                except lot_measures.UnprovenLotDiff as exc:
+                    # Ce n'est pas un dépôt illisible : c'est la preuve que le
+                    # gel n'appartient pas à la fusion observée. Le doute vaut
+                    # pour la lecture entière — ni un autre dépôt ni un autre
+                    # commit ne doivent relire un gel séparé de sa fusion.
+                    unproven = str(exc)
+                    break
                 except Exception as exc:  # noqa: BLE001 - candidat illisible : le suivant
                     reason = "lecture du diff impossible : %s: %s" % (
                         type(exc).__name__, str(exc)[:160])
@@ -1322,10 +1330,15 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
                 reason = ("diff de fusion vide et aucun delta du lot lisible pour %s"
                           % tip[:12])
                 break
+            if unproven:
+                break
             tried.append((candidate, reason or "aucun intervalle lisible"))
             if proven:
                 break
-        if not proven and tips and tried:
+        if unproven:
+            proven = False
+            why = "lecture du diff impossible : UnprovenLotDiff: %s" % unproven
+        elif not proven and tips and tried:
             if len(tried) == 1:
                 why = tried[0][1]
             else:

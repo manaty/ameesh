@@ -100,9 +100,9 @@ class RepoCandidatesTest(unittest.TestCase):
         other = _repo(os.path.join(self.tmp, "other"))
         _commit(other, "c.txt", "encore")
         out, of_lot = self._class(project=other)
-        self.assertTrue(out.get("doubt"))
+        self.assertIs(out.get("doubt"), True)
         self.assertEqual(out.get("class"), "sensitive")
-        of_lot.assert_not_called()
+        self.assertFalse(of_lot.called, out)
         why = out.get("why") or ""
         self.assertIn(self.agent_dir, why)
         self.assertIn(other, why)
@@ -110,8 +110,8 @@ class RepoCandidatesTest(unittest.TestCase):
 
     def test_4_repo_explicite_reste_autoritaire_sans_repli(self):
         out, of_lot = self._class(repo=self.agent_dir)   # non-git explicite
-        self.assertTrue(out.get("doubt"))
-        of_lot.assert_not_called()
+        self.assertIs(out.get("doubt"), True)
+        self.assertFalse(of_lot.called, out)
         self.assertIn(self.agent_dir, out.get("why") or "")
         self.assertNotIn(self.project, out.get("why") or "")
 
@@ -125,9 +125,26 @@ class RepoCandidatesTest(unittest.TestCase):
         """Deux candidats mais aucun commit à essayer : le doute dit pourquoi,
         sans IndexError ni liste de dépôts qui n'ont rien pu lire."""
         out, of_lot = self._class(sha="", milestones=[])
-        self.assertTrue(out.get("doubt"))
+        self.assertIs(out.get("doubt"), True)
         self.assertEqual(out.get("class"), "sensitive")
-        of_lot.assert_not_called()
+        self.assertFalse(of_lot.called, out)
         why = out.get("why") or ""
         self.assertIn("ni commit de fusion ni gel", why)
         self.assertNotIn("IndexError", why)
+
+    def test_6_un_gel_hors_fusion_ferme_toute_la_lecture(self):
+        """#2823 : un gel non ancêtre de la fusion est une preuve négative.
+        Le candidat suivant ne doit ni relire ce gel ni retomber sur le diff
+        du paquet : la lecture s'arrête sur un doute, sans of_lot."""
+        self.agent_dir = _repo(os.path.join(self.tmp, "premier"))
+        from ameesh import lot_measures as mesures
+        with mock.patch.object(
+                mesures, "lot_diff_range",
+                side_effect=mesures.UnprovenLotDiff("gel hors fusion")), \
+                mock.patch.object(mesures, "diff_range") as repli:
+            out, of_lot = self._class()
+        self.assertEqual(out.get("doubt"), True)
+        self.assertEqual(out.get("class"), "sensitive")
+        self.assertFalse(of_lot.called)
+        self.assertFalse(repli.called)
+        self.assertIn("gel hors fusion", out.get("why") or "")
