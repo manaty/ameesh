@@ -24,6 +24,8 @@
         | unset [--per-hour] [--per-day] [--agent A]
         mesh budget caps, stored in the database, reloaded live (L70);
   ameesh canon check|show|sync          OKF canon: validation, cards, registry;
+  ameesh process check <page.md> [--ref REF] [--version N] [--json]
+        compile the workflow block of a canon Process card (#2225);
   ameesh chat [--harness claude|codex] [--instruction] [--dry-run]
         the owner's conversation agent: decisions of all projects, answers,
         requests forwarded to orchestrators; never takes another agent's
@@ -290,6 +292,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "progress":
         from . import progress
         return progress.main(rest)
+    if command == "process":
+        # #2225 : vérifier le bloc `workflow:` d'une carte Process du canon
+        from . import process_card
+        return process_card.main(rest)
     if command == "deps":
         # #248: node_modules shared per lockfile, without database
         from . import deps
