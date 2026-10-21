@@ -493,7 +493,51 @@ def _any_line_in_head(repo: str, head: str, lines: Sequence[str]) -> bool:
     return True
 
 
-def _commit_survives(repo: str, head: str, sha: str, cache: dict) -> bool:
+def _lines_in_tree(repo: str, rev: str, lines: Sequence[str]) -> set:
+    """Les lignes (dépouillées) de `lines` présentes **telles quelles** dans
+    l'arbre de `rev`, à l'indentation près.
+
+    `git grep -F` trouve les lignes qui *contiennent* un motif ; seules celles
+    qui lui sont égales une fois dépouillées comptent, pour qu'une ligne propre
+    au correcteur ne soit jamais écartée parce qu'une ligne plus longue de la
+    base la contient. Une lecture impossible rend l'ensemble vide : rien n'est
+    écarté, le doute conserve l'auteur (#2977)."""
+    wanted = {str(line).strip() for line in lines or () if str(line).strip()}
+    if not repo or not rev or not wanted:
+        return set()
+    try:
+        proc = plan_git._git(repo, "grep", "-h", "-I", "-F", "-f", "-", rev,
+                             stdin=("\n".join(sorted(wanted)) + "\n").encode("utf-8"))
+    except Exception:  # noqa: BLE001 - lecture impossible : rien d'écarté
+        return set()
+    if proc.returncode != 0:
+        return set()
+    found = {line.strip() for line in
+             proc.stdout.decode("utf-8", "replace").splitlines()}
+    return wanted & found
+
+
+def _inherited_lines(repo: str, head: str, sha: str, base: str,
+                     lines: Sequence[str], cache: dict) -> set:
+    """Les lignes ajoutées par `sha` qui existaient déjà avant lui (#2977).
+
+    Une ligne déjà présente dans l'arbre du parent du correctif (le gel qu'il
+    corrigeait, base comprise) ou dans la base de fusion de la tête et de la
+    cible n'est pas propre au correcteur : sa présence dans la tête ne prouve
+    pas que le correctif subsiste (cas #2968 : `of_lot.assert_not_called()`,
+    déjà dans `tests/test_1104` sur main)."""
+    inherited = set(_lines_in_tree(repo, str(sha) + "^", lines))
+    if base:
+        key = ("merge-base", head, base)
+        if key not in cache:
+            cache[key] = plan_git._out(repo, "merge-base", head, base) or ""
+        if cache[key]:
+            inherited |= _lines_in_tree(repo, cache[key], lines)
+    return inherited
+
+
+def _commit_survives(repo: str, head: str, sha: str, cache: dict,
+                     base: str = "") -> bool:
     """Une partie significative du commit subsiste-t-elle dans la tête ?
 
     C'est la preuve de contenu de #2924, volontairement **prudente** : un
@@ -507,7 +551,14 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict) -> bool:
     suppression. Un fichier peut avoir été déplacé (ou son contenu regroupé
     ailleurs) sans qu'une ligne soit réécrite ; l'absence du seul ancien
     chemin conserve donc l'auteur. Seul un chemin encore présent dont aucune
-    ligne significative ne subsiste prouve la réécriture."""
+    ligne significative ne subsiste prouve la réécriture.
+
+    #2977 : une ligne ajoutée qui existait déjà avant le correctif (parent du
+    commit, ou base de fusion de la tête et de `base`) n'est pas propre au
+    correcteur et ne prouve rien ; seules ses lignes propres sont cherchées,
+    avec la même prudence (chemin d'origine, puis tout l'arbre, B8). Une ligne
+    que le commit retire aussi ailleurs (un déplacement) reste une preuve,
+    comme avant. Sans ligne propre, la lecture passe aux lignes retirées."""
     parsed = _commit_lines(repo, sha)
     if parsed is None:
         return True
@@ -516,6 +567,13 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict) -> bool:
         return True
     added = [(path, row) for path, rows in adds.items() for row in rows
              if _meaningful_line(row)]
+    if added:
+        moved = {row.strip() for rows in removes.values() for row in rows}
+        inherited = _inherited_lines(
+            repo, head, sha, base,
+            [row for _path, row in added if row.strip() not in moved], cache)
+        added = [(path, row) for path, row in added
+                 if row.strip() not in inherited]
     if added:
         missing_path = False
         for path, row in added:
@@ -783,7 +841,7 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
         for commit in shas:
             if commit not in survival:
                 survival[commit] = _commit_survives(
-                    repo, head_sha, commit, file_cache)
+                    repo, head_sha, commit, file_cache, base)
             values.append(survival[commit])
         return all(values) if every else any(values)
 
