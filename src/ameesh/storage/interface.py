@@ -545,6 +545,13 @@ class PendingSpend(Domain):
     par l'ordre des écritures ; plusieurs candidats incohérents suspendent
     (`ledger_ambiguous`).
 
+    #2905 : la colonne `spend_key` n'est crue que si elle est l'identité
+    exacte du marqueur. Après un retour arrière de version (§14), l'ancien
+    `put` réécrit cette identité sans la clé : la colonne garde alors celle du
+    tour précédent, que `get` traite comme NULL (repli par l'identité du tour)
+    — l'écrire ferait perdre le coût du tour au conflit de
+    `turn_costs.spend_key`.
+
     Extensions PostgreSQL optionnelles (#1469), détectées par `hasattr` :
     `put_get(name, start_index, turn, model)` écrit et rend le marqueur comme
     `get`, dans la même instruction ; `clear_if(name, created_at, spend_key)`
@@ -582,9 +589,11 @@ class PendingSpend(Domain):
         """Le marqueur (agent, start_index, turn, model, created_at,
         created_ts, spend_key, ledger_key, ledger_ambiguous, work_item_id,
         turn_id, resident_usage), ou None. `created_at` est l'identité exacte
-        (#2166) ; `spend_key` est la clé du marqueur (NULL avant 0471) ;
-        `ledger_key` est la clé déjà écrite par ce tour — celle du marqueur,
-        ou celle retrouvée dans sa ligne `turn_costs`/sa réservation #1469 par
+        (#2166) ; `spend_key` est l'identité brute portée par la colonne (NULL
+        avant 0471 ; elle borne `clear_if`/`set_resident_usage` et peut être
+        périmée après un retour arrière, #2905) ; `ledger_key` est la clé fiable
+        déjà écrite par ce tour — celle du marqueur seulement si la colonne EST
+        son identité (`agent:index:created_at`, le format de `put`), ou celle
         l'identité du tour (`turn_id`, instant de pose, époque de la clé égale
         à un arrondi historique exact du marqueur, jamais une fenêtre), et la
         ligne/réservation doit suivre le marqueur — jamais par le seul index
