@@ -12,9 +12,10 @@ same lot (agents-2, 21/10: pin 91abace7, gate 20c5a630).
 
 At each passage the train compares both commits:
 
-The commits are compared first; with equal commits, the gate's light floor
-and family flags, the strictest over every configured canon (applicable to
-the project or not), are compared with the pinned canon's.
+The commits are compared first; with equal commits, every other reading of
+the gate is compared with the pin (``gate_rules_gap``): the classes and
+review counts at the configured references, the light floor and family flags
+over every configured canon, and the compiled model families.
 
 * **shadow**: the drift is written in the plan and the pilot is alerted;
 * **active**: the train refuses, by name, to compose a new packet; a packet
@@ -110,20 +111,46 @@ def _pinned_flags(repo, commit):
     return light, exclude, distinct
 
 
-def gate_rules_gap(cfg, canon_path, pin):
-    """What the merge gate reads differently from the pin, across all canons.
+def gate_rules_gap(db, cfg, project, canon_path, pin):
+    """What the merge gate reads differently from the pin; "" when nothing.
 
-    The gate's light floor and family flags (``lot_class._light_reviews``,
-    ``lot_class._review_flags``) are the strictest over **every** configured
-    canon, applicable to the project or not: a canon that does not declare the
-    project's policy can still raise them. Returns "" when they equal the
-    pinned canon's, otherwise the named difference (an unreadable value is a
-    difference too, never a reassuring zero).
+    The designation's commit (``gate_commit``) is not the gate's only reading.
+    Three more readers run at the gate, each with its own sources (#2914,
+    reviews cx3 and qa-01):
+
+    * the class and the review counts (``lot_class.of_lot``) read every
+      configured canon **at its configured reference**
+      (``work.configured_canons``), not at its audited commit: each canon
+      whose federation declares ``project`` must be at the pin;
+    * the light floor and the family flags (``lot_class._light_reviews``,
+      ``_review_flags``) take the strictest of **all** configured canons,
+      applicable to the project or not: they must equal the pin's;
+    * the model families (``review_lot.compiled_families``) come from the
+      first readable canon at its audited commit, without an applicability
+      check: they must equal the pin's.
+
+    An unreadable value is a difference, never a reassuring zero.
     """
-    from . import canon as canon_mod
-    from . import lot_class, mechanics
+    from . import lot_class, mechanics, review, review_lot, work
 
-    canons = canon_mod.load_configured(cfg)
+    pin = str(pin or "").strip().lower()
+    canons = work.configured_canons(cfg)
+    if not canons:
+        return "canons configurés de la porte illisibles"
+    gaps = []
+    for canon in canons:
+        _policy, problems = review.policy_from_federation(
+            getattr(canon, "federation", None), project)
+        errors = [p for p in problems if p[1] == "error"]
+        if errors and all(p[0] == review.UNKNOWN_PROJECT for p in errors):
+            continue  # this canon says nothing of the project (lot_class)
+        root = str(getattr(canon, "root", "") or "") or "canon"
+        if errors:
+            return "politique de classe illisible (%s) : %s" % (root, errors[0][2])
+        ref = str(lot_class._ref(canon) or "").strip().lower()
+        if ref != pin:
+            gaps.append("classe et barème lus par la porte à %s@%s (référence "
+                        "configurée)" % (root, ref[:12] or "?"))
     light, problem = lot_class._light_reviews(canons)
     if problem:
         return "plancher léger de la porte illisible : %s" % problem
@@ -131,16 +158,22 @@ def gate_rules_gap(cfg, canon_path, pin):
     if problem:
         return "drapeaux d'avis de la porte illisibles : %s" % problem
     try:
+        families = tuple(review_lot.compiled_families(db, cfg))
+    except review_lot.FamiliesError as exc:
+        return "familles de la porte illisibles : %s" % str(exc)[:200]
+    try:
         pinned = _pinned_flags(canon_path, pin)
+        pinned_families = tuple(mechanics.load_global(canon_path, pin).families)
     except mechanics.MechanicsError as exc:
         return "règles d'avis du commit épinglé illisibles : %s" % str(exc)[:200]
-    gate = (light, exclude, distinct)
-    if gate == pinned:
-        return ""
     names = ("light_reviews", "exclude_author_family", "distinct_families")
-    return ", ".join("%s porte %s / train %s" % (name, mine, theirs)
-                     for name, mine, theirs in zip(names, gate, pinned)
-                     if mine != theirs)
+    gaps.extend("%s porte %s / train %s" % (name, mine, theirs)
+                for name, mine, theirs in zip(names, (light, exclude, distinct), pinned)
+                if mine != theirs)
+    if families != pinned_families:
+        gaps.append("familles porte %s / train %s"
+                    % ("|".join(families), "|".join(pinned_families)))
+    return "; ".join(gaps)
 
 
 def compare(pin, commit, why=""):
@@ -168,8 +201,8 @@ class Watch:
         if not callable(reader):
             raise TypeError("explicit gate canon reader required")
         self.project, self.pin, self.reader = project, pin, reader
-        #: ``rules(db)`` -> "" or the gate's review-rule difference across all
-        #: configured canons (``gate_rules_gap``); None skips this reading
+        #: ``rules(db)`` -> "" or the gate's other readings that differ from
+        #: the pin (``gate_rules_gap``); None skips this reading
         self.rules = rules
         self.pilot = pilot
         self.mailer = mailer

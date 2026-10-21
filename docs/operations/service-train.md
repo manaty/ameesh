@@ -168,10 +168,18 @@ canon configuré dont la politique du projet se charge
 (`review_designation_activation.policy_sources`) ; sinon les deux ne demandent
 pas le même nombre d'avis pour un même lot. Un écart, un canon de la porte
 illisible, plusieurs canons applicables à des commits différents (le choix
-dépendrait alors des chemins du lot), ou, à commit égal, un plancher léger ou
-des drapeaux de famille de la porte différents de ceux du commit épinglé (la
-porte prend le plus strict de **tous** les canons configurés, applicables au
-projet ou non : `lot_class._light_reviews`, `_review_flags`) :
+dépendrait alors des chemins du lot), ou, à commit égal, une autre lecture
+de la porte différente du commit épinglé (`train_canon.gate_rules_gap`) :
+
+- classes et barèmes (`lot_class.of_lot`) : chaque canon configuré qui déclare
+  le projet, lu à sa **référence configurée** (pas au commit audité), doit
+  être au commit épinglé ;
+- plancher léger et drapeaux de famille : le plus strict de **tous** les
+  canons configurés, applicables au projet ou non
+  (`lot_class._light_reviews`, `_review_flags`) ;
+- familles de modèle (`review_lot.compiled_families`, premier canon lisible).
+
+Dans tous ces cas :
 
 - `shadow` : le plan porte la lecture (`plan.canon` : `pin`, `gate`, `state`) ;
   le journal la nomme et l'orchestrateur du projet reçoit un courrier, une fois

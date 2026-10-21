@@ -13,7 +13,8 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import mechanics, review, train, train_canon, train_runner, train_shadow
+from ameesh import (mechanics, review, review_lot, train, train_canon, train_runner,
+                    train_shadow, work)
 from ameesh import review_designation_activation as rda
 
 PIN = "a" * 40
@@ -116,48 +117,83 @@ class GateCommitTest(unittest.TestCase):
         self.assertIn("not declared", why)
 
 
+DECLARES = {"review_policies": {"risk_classes": {
+    "projects": {"ameesh": {"default": "light", "rules": []}}}}}
+OTHER = {"review_policies": {"risk_classes": {
+    "projects": {"nexlink": {"default": "light", "rules": []}}}}}
+
+
 class GateRulesGapTest(unittest.TestCase):
-    """qa-01: the gate's floor/flags are the strictest over ALL canons."""
+    """The gate's other readers, each at its own source (cx3 and qa-01)."""
 
     def setUp(self):
-        self.cfg = types.SimpleNamespace(canon="/canon-gate", host="h")
-        self.flags = {}
+        self.cfg = types.SimpleNamespace(canon="/canon-train", host="h")
+        self.flags = {("/canon-train", PIN): (1, True, True)}
+        self.families = {("/canon-train", PIN): ("claude", "codex", "deepseek")}
+        self.gate_families = ("claude", "codex", "deepseek")
 
     @staticmethod
-    def canon(repo, commit):
+    def canon(repo, commit, federation=DECLARES):
         source = types.SimpleNamespace(mode="git", repo=repo, commit=commit, prefix="")
-        return types.SimpleNamespace(root=repo, sources=[source])
+        return types.SimpleNamespace(root=repo, sources=[source], federation=federation)
 
-    def gap(self, canons, pin_repo="/canon-train", pin=PIN):
-        def light(repo, commit):
-            value = self.flags[(repo, commit)]
-            if isinstance(value, Exception):
-                raise value
-            return value[0]
+    def gap(self, canons):
+        def value(table, repo, commit):
+            found = table[(repo, commit)]
+            if isinstance(found, Exception):
+                raise found
+            return found
 
-        def flags(repo, commit):
-            value = self.flags[(repo, commit)]
-            if isinstance(value, Exception):
-                raise value
-            return value[1:]
-        with mock.patch("ameesh.canon.load_configured", return_value=canons), \
-                mock.patch.object(mechanics, "light_reviews_at", side_effect=light), \
-                mock.patch.object(mechanics, "review_flags_at", side_effect=flags):
-            return train_canon.gate_rules_gap(self.cfg, pin_repo, pin)
+        def families(db, cfg=None):
+            if isinstance(self.gate_families, Exception):
+                raise self.gate_families
+            return self.gate_families
+        with mock.patch.object(work, "configured_canons", return_value=canons), \
+                mock.patch.object(mechanics, "light_reviews_at",
+                                  side_effect=lambda r, c: value(self.flags, r, c)[0]), \
+                mock.patch.object(mechanics, "review_flags_at",
+                                  side_effect=lambda r, c: value(self.flags, r, c)[1:]), \
+                mock.patch.object(mechanics, "load_global",
+                                  side_effect=lambda r, c: types.SimpleNamespace(
+                                      families=value(self.families, r, c))), \
+                mock.patch.object(review_lot, "compiled_families", side_effect=families):
+            return train_canon.gate_rules_gap(object(), self.cfg, "ameesh",
+                                              "/canon-train", PIN)
 
-    def test_equal_rules_are_no_gap(self):
-        self.flags = {("/canon-train", PIN): (1, True, True)}
+    def test_same_readings_are_no_gap(self):
         self.assertEqual(self.gap([self.canon("/canon-train", PIN)]), "")
 
+    def test_cx3_pin_audited_a_but_configured_ref_b_is_a_gap(self):
+        # same floor and flags at B: only the class/count reading differs
+        self.flags[("/canon-train", GATE)] = (1, True, True)
+        gap = self.gap([self.canon("/canon-train", GATE)])
+        self.assertIn("référence configurée", gap)
+        self.assertIn(GATE[:12], gap)
+
+    def test_a_canon_not_declaring_the_project_does_not_fix_the_class(self):
+        self.flags[("/canon-other", GATE)] = (1, False, True)
+        self.assertEqual(self.gap([self.canon("/canon-train", PIN),
+                                   self.canon("/canon-other", GATE, OTHER)]), "")
+
     def test_a_non_applicable_canon_raising_the_floor_is_a_gap(self):
-        self.flags = {("/canon-train", PIN): (0, True, True),
-                      ("/canon-other", GATE): (1, False, True)}
-        gap = self.gap([self.canon("/canon-train", PIN), self.canon("/canon-other", GATE)])
+        self.flags[("/canon-train", PIN)] = (0, True, True)
+        self.flags[("/canon-other", GATE)] = (1, False, True)
+        gap = self.gap([self.canon("/canon-train", PIN),
+                        self.canon("/canon-other", GATE, OTHER)])
         self.assertIn("light_reviews porte 1 / train 0", gap)
         self.assertNotIn("exclude_author_family", gap)
 
-    def test_unreadable_document_is_a_gap_never_zero(self):
-        self.flags = {("/canon-train", PIN): mechanics.MechanicsError("bad yaml")}
+    def test_qa01_gate_families_from_another_canon_are_a_gap(self):
+        self.gate_families = ("claude", "codex")
+        gap = self.gap([self.canon("/canon-train", PIN)])
+        self.assertIn("familles porte claude|codex / train claude|codex|deepseek", gap)
+        self.gate_families = review_lot.FamiliesError("no readable canon")
+        self.assertIn("familles de la porte illisibles", self.gap([self.canon(
+            "/canon-train", PIN)]))
+
+    def test_unreadable_readings_are_gaps_never_zero(self):
+        self.assertIn("illisibles", self.gap([]))
+        self.flags[("/canon-train", PIN)] = mechanics.MechanicsError("bad yaml")
         self.assertIn("bad yaml", self.gap([self.canon("/canon-train", PIN)]))
 
     def test_watch_turns_a_rule_gap_into_a_named_drift(self):

@@ -309,8 +309,9 @@ def _passage(cfg, spec: ProjectConfig, mode, report):
     canon = train_canon.Watch(spec.name, commit,
                               partial(train_canon.gate_commit, cfg=cfg,
                                       project=spec.name),
-                              rules=lambda db: train_canon.gate_rules_gap(
-                                  cfg, spec.canon, commit),
+                              rules=partial(train_canon.gate_rules_gap, cfg=cfg,
+                                            project=spec.name,
+                                            canon_path=spec.canon, pin=commit),
                               pilot=train_canon.pilot_of(cfg, spec.name))
     if mode == "shadow":
         return train_shadow.Passage(
