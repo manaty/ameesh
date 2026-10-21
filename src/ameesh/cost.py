@@ -56,6 +56,7 @@ from . import config as config_mod
 from . import harnesses
 from . import storage
 from .gauge_cache import CLAUDE_GAUGES
+from .resident import INPUTS_EVENT as RESIDENT_INPUTS_EVENT
 from .resident import USAGE_EVENT as RESIDENT_USAGE_EVENT
 
 #: Barème par défaut du poste de travail (reprise de l'outil de comptage
@@ -1734,11 +1735,16 @@ class CostBook:
         row["turn"] = turn or usage.turn
         row["session"] = session_id
         # L80b : les messages servis par ce tour, quand le flux résident les
-        # porte (`resident.turn.inputs`). Aucun autre chemin n'en produit : les
-        # tours non résidents gardent la colonne non écrite.
+        # porte. Codex/ACP les mettent dans `resident.turn.inputs` ; Claude,
+        # dont le flux porte déjà l'usage, dans l'événement séparé
+        # `resident.inputs`. Aucun autre chemin n'en produit : les tours non
+        # résidents gardent la colonne non écrite.
+        attribution = resident if resident is not None \
+            else _resident_inputs_event(events)
         inputs = None
-        if resident is not None and isinstance(resident.get("inputs"), (list, tuple)):
-            inputs = tuple(str(i) for i in resident["inputs"] if i is not None)
+        if attribution is not None \
+                and isinstance(attribution.get("inputs"), (list, tuple)):
+            inputs = tuple(str(i) for i in attribution["inputs"] if i is not None)
         storage.of(self.db).turn_costs.insert(
             agent=row["agent"], harness=row["harness"], turn=row["turn"],
             model=row["model"], session=row["session"], usd=row["usd"],
@@ -2475,6 +2481,20 @@ def _resident_event(events: Iterable[dict]) -> dict | None:
     found = None
     for event in events:
         if event.get("type") == RESIDENT_USAGE_EVENT:
+            found = event
+    return found
+
+
+def _resident_inputs_event(events: Iterable[dict]) -> dict | None:
+    """L'événement `resident.inputs` de la tranche, s'il y en a un (L80b).
+
+    Le flux de Claude porte lui-même l'usage du tour, donc il n'écrit pas de
+    `resident.turn` ; les messages servis voyagent dans cet événement, écrit
+    après la barrière steer. C'est une attribution seule — l'usage reste celui
+    du flux."""
+    found = None
+    for event in events:
+        if event.get("type") == RESIDENT_INPUTS_EVENT:
             found = event
     return found
 

@@ -276,6 +276,28 @@ def usage_event(protocol: str, result: "resident.TurnResult", *,
     return event
 
 
+def inputs_event(protocol: str, result: "resident.TurnResult", *,
+                 turn: str = "", inputs=()) -> dict | None:
+    """The served-message attribution of a native-usage resident turn (L80b).
+
+    Claude's stream already carries the turn's usage, so `usage_event` writes
+    no `resident.turn` for it; the ids of the messages it served still belong
+    on the ledger line, in this separate event. The runner writes it **after**
+    the steer barrier, so an ACK accepted while the turn closes is included;
+    a failed write never fails the turn (the cost is already counted by the
+    stream, only the attribution is lost). None when there is nothing to say."""
+    if protocol not in NATIVE_USAGE or not inputs:
+        return None
+    return {
+        "type": resident.INPUTS_EVENT,
+        "protocol": protocol,
+        "session": result.session or "",
+        "turn": turn or "",
+        "status": result.status,
+        "inputs": [str(i) for i in inputs if i is not None],
+    }
+
+
 def write_usage_event(path: str, event: dict | None) -> bool:
     """Append `event` to the agent's event stream; True when written.
 

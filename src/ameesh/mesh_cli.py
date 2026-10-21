@@ -3502,8 +3502,8 @@ def build_parser() -> argparse.ArgumentParser:
     pc_turns.add_argument("--since", default="24h", help="duration (16h, 2d) or ISO date")
     pc_turns.add_argument("--limit", type=int, default=500)
     pc_turns.add_argument("--message", default=None,
-                          help="only turns that served this message (mail id or "
-                               "human_message id); the cost shown is the turn's")
+                          help="only turns that served this message (mail id); "
+                               "the cost shown is the turn's")
     pc_turns.add_argument("--json", action="store_true")
     pc_turns.set_defaults(func=cmd_cost)
     pc_gauges = cost_sub.add_parser("gauges", help="plan gauge history")

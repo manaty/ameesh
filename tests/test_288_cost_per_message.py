@@ -9,6 +9,9 @@ réellement servis (`inputs`), et `cost turns --message` les relit.
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import tempfile
 import threading
 import unittest
 from types import SimpleNamespace
@@ -16,7 +19,7 @@ from types import SimpleNamespace
 from ameesh import resident, resident_runner, storage
 
 from .support import PgTestCase
-from .test_cost import Sandbox
+from .test_cost import Sandbox, U
 
 
 class UsageEventInputsTest(unittest.TestCase):
@@ -29,6 +32,21 @@ class UsageEventInputsTest(unittest.TestCase):
         self.assertEqual(event["inputs"], ["12", "human:7"])
         plain = resident_runner.usage_event("acp", result, turn="t1")
         self.assertNotIn("inputs", plain)   # pas de [] parasite
+
+    def test_native_protocol_gets_a_separate_inputs_event(self):
+        # L80b B1 : le flux Claude porte déjà l'usage, donc pas de
+        # `resident.turn` ; les messages servis partent dans leur propre
+        # événement, lu par le grand livre pour l'attribution seule.
+        result = resident.TurnResult(status=resident.COMPLETED, session="s1")
+        self.assertIsNone(resident_runner.usage_event(
+            "claude-stream-json", result, inputs=("12",)))
+        event = resident_runner.inputs_event(
+            "claude-stream-json", result, turn="t1", inputs=("12", "human:7"))
+        self.assertEqual(event["type"], resident.INPUTS_EVENT)
+        self.assertEqual(event["inputs"], ["12", "human:7"])
+        self.assertNotIn("usage", event)
+        self.assertIsNone(resident_runner.inputs_event("acp", result, inputs=("12",)))
+        self.assertIsNone(resident_runner.inputs_event("claude-stream-json", result))
 
 
 class ServedMessageIdsTest(unittest.TestCase):
@@ -60,6 +78,93 @@ class ServedMessageIdsTest(unittest.TestCase):
 
     def test_no_input_no_ids(self):
         self.assertEqual(self._worker()._served_message_ids(), ())
+
+
+class ResidentInputsBoundaryTest(unittest.TestCase):
+    """L80b B2 : la capture des entrées suit la barrière steer du tour.
+
+    L'ancienne capture lisait `_steer_pending` avant la jonction du moniteur et
+    la barrière `_steer_lock` : un ACK de steer accepté pendant la clôture
+    n'était jamais compté. Ici le steer tient la barrière, l'ancien point de
+    capture ne le voit pas ; `_resident_turn_end` attend, puis
+    `_resident_usage_final` l'inclut dans l'événement écrit."""
+
+    def _worker(self, tmp):
+        from ameesh.runner import AgentWorker
+        worker = AgentWorker.__new__(AgentWorker)
+        threading.Thread.__init__(worker)  # machine à états du fil, jamais démarrée
+        worker.name = "w"
+        worker.lock = threading.Lock()
+        worker._steer_lock = threading.Lock()
+        worker._turn_generation = 7
+        worker._turn_live = True
+        worker._steer_pending = []
+        worker._turn_id = "tour-1"
+        worker.proc = None
+        worker.pgid = None
+        worker.stopping = threading.Event()
+        worker.restarting = threading.Event()
+        worker.host_yield = None
+        worker._power_texte = ""
+        worker._urgent_end = lambda: ""
+        worker._path = lambda name: os.path.join(tmp, name)
+        return worker
+
+    @staticmethod
+    def _rp():
+        return SimpleNamespace(
+            alive=True, busy=False, turns=0, last_used=0.0, session="s1",
+            closing=False, mark_alive=lambda: None,
+            driver=SimpleNamespace(protocol="claude-stream-json", busy=False))
+
+    def _tmp(self):
+        tmp = tempfile.mkdtemp(prefix="ameesh-288-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        return tmp
+
+    def test_a_steer_accepted_while_the_turn_closes_is_counted(self):
+        tmp = self._tmp()
+        worker = self._worker(tmp)
+        steer = SimpleNamespace(result=SimpleNamespace(
+            status=resident.COMPLETED, inputs=("u1",)))
+        ready = threading.Event()
+        release = threading.Event()
+
+        def ack():
+            with worker._steer_lock:       # le steer en vol tient la barrière
+                ready.set()
+                release.wait(2)
+                with worker.lock:          # ACK accepté pendant la clôture
+                    worker._steer_pending.append(("j1", [21], 7, steer, "u1"))
+
+        thread = threading.Thread(target=ack)
+        thread.start()
+        try:
+            self.assertTrue(ready.wait(2))
+            # capture d'avant la barrière (l'ancien point) : le steer manque
+            self.assertEqual(worker._served_message_ids([7]), ("7",))
+            release.set()
+            worker._resident_turn_end(self._rp())
+            fin = SimpleNamespace(status=resident.COMPLETED, session="s1")
+            self.assertEqual(worker._resident_usage_final(
+                self._rp(), fin, [7]), (True, None))
+        finally:
+            release.set()
+            thread.join(2)
+        with open(os.path.join(tmp, "events.jsonl"), encoding="utf-8") as fh:
+            event = [json.loads(line) for line in fh][-1]
+        self.assertEqual(event["type"], resident.INPUTS_EVENT)
+        self.assertEqual(event["inputs"], ["21", "7"])
+
+    def test_native_inputs_write_failure_does_not_fail_the_turn(self):
+        from unittest import mock
+        tmp = self._tmp()
+        worker = self._worker(tmp)
+        fin = SimpleNamespace(status=resident.COMPLETED, session="s1")
+        with mock.patch("ameesh.resident_runner.write_usage_event",
+                        return_value=False):
+            self.assertEqual(worker._resident_usage_final(
+                self._rp(), fin, [7]), (True, None))
 
 
 class TurnCostsInputsTest(Sandbox, PgTestCase):
@@ -95,6 +200,29 @@ class TurnCostsInputsTest(Sandbox, PgTestCase):
         row = self.db.query(
             "select inputs from turn_costs where agent = 'a1'")[0]
         self.assertIsNone(row["inputs"])
+
+    def test_claude_inputs_event_attributes_its_stream_turn(self):
+        # L80b B1 : le tour résident Claude n'écrit pas `resident.turn` (son
+        # flux porte l'usage) ; `resident.inputs` donne l'attribution, sans
+        # toucher au coût lu dans le flux.
+        self.agent("a1", "claude")
+        book = self.book()
+        self.events(
+            "a1",
+            {"type": "result", "session_id": "s1", "total_cost_usd": 0.5,
+             "usage": U},
+            {"type": resident.INPUTS_EVENT, "protocol": "claude-stream-json",
+             "session": "s1", "turn": "tour-1", "status": "completed",
+             "inputs": ["12", "13"]})
+        usage = book.record("a1")
+        self.assertAlmostEqual(usage.usd, 0.5, places=9)
+        row = self.db.query(
+            "select inputs from turn_costs where agent = 'a1'")[0]
+        self.assertEqual(row["inputs"], ["12", "13"])
+        rows = storage.of(self.db).operations.turns(
+            agent="a1", since_s=3600, limit=50, message="12")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["inputs"], ["12", "13"])
 
     def test_turns_by_message_returns_the_turn_cost_once(self):
         self._record(["12", "13"])
