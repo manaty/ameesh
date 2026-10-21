@@ -144,6 +144,13 @@ ipcMain.handle("ameesh:open", (_event, target) => {
   (see `followAlerts` in the reference `main.mjs`). Reconnection,
   `Last-Event-ID`, filtering by role and rate limiting belong to the
   application; the reference keeps the frame parsing minimal.
+* **My workstation (L93)**: the local state of this machine's runners is read
+  in the main process from the Unix sockets (`device-*.sock`,
+  `control-*.sock`), never in the renderer — a page has no socket API. Merge
+  the states and expose them as `deviceState()`; a clean stop writes
+  `{"op":"stop","agent":"…"}` on the agent's control socket, an immediate
+  stop belongs to the Compute runner. Nothing of this crosses the mesh. See
+  [`../DEVICE-LOCAL.md`](../DEVICE-LOCAL.md).
 
 ## Content Security Policy
 
