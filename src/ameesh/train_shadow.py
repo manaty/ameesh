@@ -149,7 +149,7 @@ class Passage:
 
     def __init__(self, cfg, project, *, policy_path, policy_commit, workflows,
                  provider, mechanics, repository, candidate=None, initial=None,
-                 notify=None):
+                 notify=None, canon=None):
         if not isinstance(project.name, str) or not project.name:
             raise train.TrainError("explicit shadow project required")
         if not isinstance(policy_commit, str) or not re.fullmatch(
@@ -164,6 +164,9 @@ class Passage:
         #: the same qualified initial-history reader the active Enrollment uses
         self.initial = initial
         self.notify = notify or (lambda message: None)
+        #: #2914: the pinned commit against the gate's (``train_canon.Watch``);
+        #: None on a bench that builds the passage by hand.
+        self.canon = canon
         self.maintenance_at = None
         target = merge_queue._remote_branch(project.target)
         digest = train.digest([project.name, merge_queue.source_of(repository), target])
@@ -187,10 +190,13 @@ class Passage:
             raise train.TrainError("shadow train requires full packet CI in the compiled canon")
         deadline = rules.next_packet(now)
         slot = rules.last_packet(now)
+        reading = self.canon_reading(db)
         try:
             state = self.store.load()
             if not state["plans"] or state["plans"][-1].get("cutoff") != slot:
                 plan = self.plan(db, rules, slot, now)
+                if reading is not None:
+                    plan["canon"] = reading.to_json()
                 state = self.store.record_plan(state, plan)
                 result = {"result": "shadow-plan", "plan": plan}
             else:
@@ -204,6 +210,21 @@ class Passage:
         except Exception as exc:  # the plan stays published; comparison retries next cutoff
             self.notify("shadow comparison failed (%s: %s)" % (type(exc).__name__, exc))
         return result, deadline
+
+    def canon_reading(self, db):
+        """#2914: compare the pin with the gate's canon; a drift is alerted.
+
+        The shadow plan carries the reading (``plan["canon"]``); the pilot is
+        mailed once per distinct reading. Nothing else changes: the shadow
+        never acts, and the pin never follows the gate by itself (#1467).
+        """
+        if self.canon is None:
+            return None
+        reading = self.canon.read(db)
+        if not reading.aligned:
+            self.notify("shadow canon %s" % reading.describe())
+            self.canon.alert(db, reading, "shadow")
+        return reading
 
     def incident_facts(self, db, *, fallback=None):
         """#2682: « aucun fait de train » pour l'ombre, et jamais une levée.

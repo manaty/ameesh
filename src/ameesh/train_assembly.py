@@ -18,7 +18,10 @@ that caller:
   name, an absent piece or a malformed value refuses by name, never by a
   fallback;
 * the absolute reservation deadline is compiled from the configuration
-  (``deadline_minutes``), never from a hard-coded duration.
+  (``deadline_minutes``), never from a hard-coded duration;
+* each passage compares the pinned commit with the canon commit the gate reads
+  on this host (``train_canon``, #2914): a drift is recorded in the shadow
+  plan and alerted to the pilot, and refuses a new active composition.
 
 Two modes are assembled:
 
@@ -48,7 +51,7 @@ from functools import partial
 from datetime import datetime
 
 from . import (mechanics, merge_queue, packet_reservation, plan_git, radar,
-               resolutions, review_provenance, train, train_contracts,
+               resolutions, review_provenance, train, train_canon, train_contracts,
                train_initial, train_policy, train_reservation, train_runner,
                train_shadow)
 
@@ -301,16 +304,23 @@ def _passage(cfg, spec: ProjectConfig, mode, report):
                  if spec.candidate else None)
     initial = (INITIAL_HISTORY["activation-boundary"](spec.initial_since)
                if spec.candidate else None)
+    # #2914: at each passage, the pin is compared with the canon commit the
+    # gate reads on this host; never followed automatically (#1467).
+    canon = train_canon.Watch(spec.name, commit,
+                              partial(train_canon.gate_commit, cfg=cfg,
+                                      canon_path=spec.canon),
+                              pilot=train_canon.pilot_of(cfg, spec.name))
     if mode == "shadow":
         return train_shadow.Passage(
             cfg, project, policy_path=spec.canon, policy_commit=commit,
             workflows=workflows, provider=provider, mechanics=mechanics,
-            repository=repo, candidate=candidate, initial=initial, notify=report)
+            repository=repo, candidate=candidate, initial=initial, notify=report,
+            canon=canon)
     passage = train_runner.Passage(
         cfg, project, owner=cfg.runner, policy=train.Policy(enabled=True),
         policy_path=spec.canon, policy_commit=commit, workflows=workflows,
         provider=provider, mechanics=mechanics, notify=lambda reason, state: report(reason),
-        reservation=reservation, candidate=candidate, initial=initial)
+        reservation=reservation, candidate=candidate, initial=initial, canon=canon)
     return passage
 
 

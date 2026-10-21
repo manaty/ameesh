@@ -84,7 +84,8 @@ class HostLease:
 class Passage:
     def __init__(self, cfg, project, *, owner, policy, policy_path,
                  policy_commit, workflows, provider, mechanics, notify, impact=None,
-                 reservation=None, transports=None, candidate=None, initial=None):
+                 reservation=None, transports=None, candidate=None, initial=None,
+                 canon=None):
         if not isinstance(owner, str) or not owner.strip():
             raise train.TrainError("explicit runner reservation owner required")
         if not isinstance(policy, train.Policy) or not callable(notify):
@@ -101,6 +102,9 @@ class Passage:
         self.reservation = reservation
         self.transports = transports
         self.candidate, self.initial = candidate, initial
+        #: #2914: the pinned commit against the gate's (``train_canon.Watch``);
+        #: None on a bench that builds the passage by hand.
+        self.canon = canon
         self.maintenance_at = None
         self.epoch = None
 
@@ -230,7 +234,8 @@ class Passage:
         if not self.policy.enabled:
             return {"result": "off"}
         runtime = self.runtime(db)
-        return self._step(runtime, now)
+        refused = self.canon_refusal(db, runtime)
+        return refused if refused is not None else self._step(runtime, now)
 
     def scheduled_step(self, db, now):
         """Use the very same compiled object for execution and the next wake."""
@@ -241,7 +246,36 @@ class Passage:
         if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) \
                 or not math.isfinite(deadline) or deadline <= now:
             raise train.TrainError("compiled canon must provide a future packet cutoff")
-        return self._step(runtime, now), deadline
+        refused = self.canon_refusal(db, runtime)
+        return (refused if refused is not None else self._step(runtime, now)), deadline
+
+    def canon_refusal(self, db, runtime):
+        """#2914: refuse by name to compose while the pin differs from the gate.
+
+        A pinned commit that is not the gate's (or a gate commit that cannot be
+        read) would count reviews differently from the merge gate. No new
+        packet is composed; a packet already in flight keeps its terminal
+        path (CI, promotion or drain), and a paused train stays paused. The
+        pin never follows the gate by itself (#1467).
+        """
+        if self.canon is None:
+            return None
+        reading = self.canon.read(db)
+        if reading.aligned:
+            return None
+        state = runtime.load()
+        phase = (state or {}).get("phase")
+        in_flight = phase is not None and phase not in train.TERMINAL \
+            and phase != "composing"
+        if in_flight or phase == "paused":
+            self.notify("canon drift, %s train kept: %s" % (phase, reading.describe()),
+                        state)
+            self.canon.alert(db, reading, "active")
+            return None
+        reason = "composition refused: %s" % reading.describe()
+        self.notify(reason, state)
+        self.canon.alert(db, reading, "active")
+        return {"result": "canon-drift", "reason": reason, "canon": reading.to_json()}
 
     def _step(self, runtime, now):
         engine = train.Engine(runtime, source=runtime.repository.source,
