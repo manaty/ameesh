@@ -63,7 +63,7 @@ class _RewriteFixture(PgTestCase):
                     GIT_AUTHOR_EMAIL=address, GIT_COMMITTER_NAME=agent,
                     GIT_COMMITTER_EMAIL=address)
 
-    def receipt(self, actor, harness, commits):
+    def receipt(self, actor, harness, commits, lot=None):
         for sha in commits:
             self.db.execute(
                 "INSERT INTO provenance_receipts"
@@ -71,7 +71,7 @@ class _RewriteFixture(PgTestCase):
                 " VALUES (%s, %s, %s, %s, %s, %s, %s)"
                 " ON CONFLICT (subject) DO NOTHING",
                 ("commit:" + sha, sha, actor, "s-" + harness, "t", harness,
-                 self.lot))
+                 self.lot if lot is None else lot))
 
     def freeze(self, sha):
         return work.milestone(self.db, self.lot, "frozen", sha=sha,
@@ -328,8 +328,65 @@ class NoReceiptCorrectorTest(_RewriteFixture):
         self.assertNotIn("cx3", {row["name"] for row in correctors})
 
 
+class AmbiguousFamiliesTest(_RewriteFixture):
+    """#2924 B6 : l'ensemble ambigu de familles d'un acteur est transporté.
+
+    Le même agent a écrit sous codex puis sous deepseek dans un gel antérieur ;
+    le squash à arbre identique est signé deepseek. La lecture courante ne doit
+    pas réduire {codex, deepseek} à la seule famille du reçu courant : les deux
+    familles restent prouvées, la famille de l'auteur reste ambiguë et la porte
+    refuse de deviner.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.repo.git("reset", "--hard", self.base)
+        self.repo.write("src/ameesh/runner.py", "base\nlot\ncodex guard\n")
+        self.codex_commit = self.repo.commit("impl: commit codex", agent="impl")
+        self.receipt("impl", "codex", [self.codex_commit])
+        self.repo.write("src/ameesh/runner.py",
+                        "base\nlot\ncodex guard\ndeepseek guard\n")
+        self.deepseek_commit = self.repo.commit("impl: commit deepseek",
+                                                agent="impl")
+        self.receipt("impl", "deepseek", [self.deepseek_commit])
+        self.freeze_a = self.freeze(self.deepseek_commit)
+        parent = self.repo.git("rev-parse", self.deepseek_commit + "^")
+        tree = self.repo.git("rev-parse", self.deepseek_commit + "^{tree}")
+        self.head_b = self.squash(tree, parent, "contenu consolidé ambigu")
+        self.freeze_b = self.freeze(self.head_b)
+        self.milestone = {"id": int(self.freeze_b["id"]), "sha": self.head_b,
+                          "actor": "impl", "at_ts": self.freeze_b.get("at_ts")}
+
+    def test_the_ambiguous_families_are_both_carried(self):
+        families_out: dict = {}
+        authors, unknown, correctors = review_authors.reading(
+            self.db, self.lot_item(), self.milestone, [self.head_b],
+            self.repo.root, FAMILIES, base=self.base, head=self.head_b,
+            families_out=families_out)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": ""})
+        self.assertEqual(families_out.get("impl"), {"codex", "deepseek"})
+
+    def test_the_gate_does_not_guess_the_ambiguous_family(self):
+        klass = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "src/ameesh/runner.py",
+                            "class": "sensitive",
+                            "rule": ["src/ameesh/runner.py"]}],
+                 "repo": self.repo.root, "target": self.base,
+                 "base_sha": self.base}
+        with self.assertRaises(merge_queue._ProvenanceError) as caught:
+            merge_queue._complete_authors(
+                self.db, self.lot_item(), self.head_b, self.repo.root,
+                self.base, klass=klass,
+                marks=work.milestones(self.db, self.lot))
+        self.assertIn("ambiguous", str(caught.exception))
+        self.assertIn("codex", str(caught.exception))
+        self.assertIn("deepseek", str(caught.exception))
+
+
 class MissingPriorFreezeTest(_RewriteFixture):
-    """#2924 B5 : un gel antérieur absent du dépôt de la porte refuse fermé."""
+    """#2924 B5/B7 : un gel antérieur absent est récupéré, sinon refusé."""
 
     def setUp(self):
         super().setUp()
@@ -346,7 +403,9 @@ class MissingPriorFreezeTest(_RewriteFixture):
         self.scratch.git("remote", "add", "origin", self.repo.root)
         self.scratch.git("fetch", "-q", "origin", self.head_b)
 
-    def test_the_reader_refuses_closed(self):
+    def test_the_reader_without_recovery_refuses_closed(self):
+        # B5 : un lecteur direct qui ne peut pas récupérer le gel absent ne
+        # devine aucune famille ; la porte, elle, tente la récupération (B7).
         with self.assertRaises(review_provenance.ProvenanceError):
             review_authors.reading(
                 self.db, self.lot_item(), self.milestone, [self.head_b],
@@ -357,18 +416,70 @@ class MissingPriorFreezeTest(_RewriteFixture):
             self.scratch.root, FAMILIES, base=self.base, head=self.head_b)
         self.assertEqual(unknown, [self.head_a[:12]])
 
-    def test_the_gate_refuses_closed(self):
+    def test_the_gate_recovers_the_missing_freeze(self):
+        # B7 : le gel antérieur n'est pas dans le dépôt de la porte, mais son
+        # SHA est récupérable depuis l'origine du dépôt (remote ou chemin).
         klass = {"class": "sensitive", "doubt": False,
                  "files": [{"path": "src/ameesh/runner.py",
                             "class": "sensitive",
                             "rule": ["src/ameesh/runner.py"]}],
                  "repo": self.scratch.root, "target": self.base,
                  "base_sha": self.base}
+        authors, _families = merge_queue._complete_authors(
+            self.db, self.lot_item(), self.head_b, self.scratch.root,
+            self.base, klass=klass,
+            marks=work.milestones(self.db, self.lot))
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+
+    def test_the_gate_refuses_when_recovery_is_impossible(self):
+        # Sans origine et sans autre dépôt à interroger, aucun objet du gel
+        # antérieur ne peut être relu : la porte refuse toujours fermé.
+        orphan = _Repo(os.path.join(self.tmp, "orphan"))
+        orphan.git("fetch", "-q", self.repo.root, self.head_b)
+        klass = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "src/ameesh/runner.py",
+                            "class": "sensitive",
+                            "rule": ["src/ameesh/runner.py"]}],
+                 "repo": orphan.root, "target": self.base,
+                 "base_sha": self.base}
         with self.assertRaises(merge_queue._ProvenanceError):
             merge_queue._complete_authors(
-                self.db, self.lot_item(), self.head_b, self.scratch.root,
+                self.db, self.lot_item(), self.head_b, orphan.root,
                 self.base, klass=klass,
                 marks=work.milestones(self.db, self.lot))
+
+    def test_a_lot_without_corrector_passes_after_a_rewrite(self):
+        # Témoin B7 positif : un gel réécrit sans correcteur, lu depuis un
+        # dépôt qui ne porte que la cible et la tête, passe la lecture stricte.
+        repo = _Repo(os.path.join(self.tmp, "plain"))
+        repo.write("src/ameesh/runner.py", "base\n")
+        base = repo.commit("base")
+        repo.write("src/ameesh/runner.py", "base\nimpl\n")
+        head_a = repo.commit("impl: lot", agent="impl")
+        item = work.add(self.db, title="réécriture sans correcteur", app="ameesh",
+                        assignee="impl")
+        lot = int(item["id"])
+        work.move(self.db, lot, "build")
+        self.db.execute("UPDATE work_items SET branch_target = %s WHERE id = %s",
+                        (base, lot))
+        self.receipt("impl", "deepseek", [head_a], lot=lot)
+        work.milestone(self.db, lot, "frozen", sha=head_a, actor="impl",
+                       repo=repo.root)
+        tree = repo.git("rev-parse", head_a + "^{tree}")
+        head_b = repo.git("commit-tree", tree, "-p", base, "-m",
+                          "contenu consolidé sans correcteur", env=self.env("impl"))
+        self.receipt("impl", "deepseek", [head_b], lot=lot)
+        work.milestone(self.db, lot, "frozen", sha=head_b, actor="impl",
+                       repo=repo.root)
+        scratch = _Repo(os.path.join(self.tmp, "plain-scratch"))
+        scratch.git("remote", "add", "origin", repo.root)
+        scratch.git("fetch", "-q", "origin", head_b)
+        authors, _families = merge_queue._complete_authors(
+            self.db, work.get(self.db, lot), head_b, scratch.root, base,
+            marks=work.milestones(self.db, lot))
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek"})
 
 
 class ParserTest(TestCase):

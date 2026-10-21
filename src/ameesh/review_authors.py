@@ -641,14 +641,18 @@ def _prior_correctors(repo: str, review_commits: Mapping) -> dict:
             continue
         proven = {value for _sha, value in entries if value}
         family = next(iter(proven)) if len(proven) == 1 else ""
-        out[actor] = {"name": actor, "family": family}
+        # #2924 B6 : l'ensemble des familles prouvées est transporté, pas
+        # seulement sa réduction à une famille unique (vide si ambiguë).
+        out[actor] = {"name": actor, "family": family,
+                      "families": sorted(proven)}
     return out
 
 
 def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                            commits: Sequence[str], repo: str, families, *,
                            base: str = "", head: str = "", provider=None,
-                           strict: bool = False) -> tuple[list, list, list]:
+                           strict: bool = False,
+                           recover=None) -> tuple[list, list, list]:
     """Auteurs/correcteurs des gels antérieurs dont le contenu subsiste (#2924).
 
     Rend `(auteurs, inconnus, correcteurs)` à fusionner dans la lecture de la
@@ -656,7 +660,14 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     dépôt, ou un lot sans gel antérieur rendent des listes vides. Toute
     provenance illisible d'un gel antérieur qui n'est pas déjà couverte par la
     plage courante ajoute un inconnu : l'appelant strict refuse, la désignation
-    attend (jamais de famille supposée)."""
+    attend (jamais de famille supposée).
+
+    #2924 B7 : `recover(sha)` est le seul moyen autorisé de réparer un gel
+    antérieur absent du dépôt de lecture (le clone scratch de `merge-pr` ne
+    porte que la cible et la tête). Il est appelé **avant** de déclarer le gel
+    illisible ; s'il échoue, le refus fermé de B5 reste la règle. Le lecteur
+    direct (sans `recover`) garde le refus : une absence non réparée ne prouve
+    jamais l'absence d'un correcteur."""
     item = dict(item or {})
     if db is None or not repo or packet_composer(item):
         return [], [], []
@@ -736,6 +747,24 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
             values.append(survival[commit])
         return all(values) if every else any(values)
 
+    def present(commit: str) -> bool:
+        """Le commit est-il lisible **localement** (jamais un fetch paresseux) ?"""
+        try:
+            return bool(plan_git.local_commit(repo, str(commit or "").strip()))
+        except Exception:  # noqa: BLE001 - dépôt illisible : absence
+            return False
+
+    def recover_one(commit: str) -> bool:
+        """Tente de rapatrier un gel absent ; True seulement s'il est lisible."""
+        if recover is None:
+            return False
+        try:
+            if present(commit):
+                return True
+            return bool(recover(commit)) and present(commit)
+        except Exception:  # noqa: BLE001 - récupération en échec : absence
+            return False
+
     for row in sorted(prior, key=lambda value: (value.get("at_ts") or 0,
                                                 int(value.get("id") or 0)),
                       reverse=True):
@@ -747,6 +776,23 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                     "cannot be carried" % (row.get("id"), lot))
             unknown.append("freeze:%d" % int(row.get("id") or 0))
             continue
+        # un gel déjà attribué par la plage courante n'a pas besoin d'objets
+        if plan_git.full_commit_id(sha) in current_set:
+            continue
+        if not present(sha) and not recover_one(sha):
+            # #2924 B7 : sans les objets, impossible de prouver qu'aucun
+            # correcteur n'est en cause ; B5 refuse plutôt que de deviner.
+            if strict:
+                raise review_provenance.ProvenanceError(
+                    "prior freeze %s of lot #%d is absent from the repository "
+                    "and cannot be recovered: its authors cannot be carried"
+                    % (sha[:12], lot))
+            unknown.append(sha[:12])
+            continue
+        if base and not present(base):
+            recover_one(base)
+        if head_sha and not present(head_sha):
+            recover_one(head_sha)
         # le contenu d'un gel déjà entré dans la cible n'est pas relu
         if base and _is_ancestor(repo, sha, base) is True:
             continue
@@ -803,7 +849,12 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     for actor in sorted(carried):
         proven = {value for value in carried[actor] if value}
         authors.append({"name": actor,
-                        "family": next(iter(proven)) if len(proven) == 1 else ""})
+                        "family": next(iter(proven)) if len(proven) == 1 else "",
+                        # #2924 B6 : un acteur peut avoir écrit sous plusieurs
+                        # familles dans un gel antérieur ; la lecture courante
+                        # doit recevoir tout l'ensemble, pas la seule réduction
+                        # ambiguë à "".
+                        "families": sorted(proven)})
     return authors, unknown, [correctors[name] for name in sorted(correctors)]
 
 
@@ -812,7 +863,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             *, reference: Optional[Mapping] = None, provider=None,
             strict: bool = False, trace: bool = False,
             families_out: Optional[dict] = None,
-            base: str = "", head: str = "") -> tuple[list, list, list]:
+            base: str = "", head: str = "", recover=None) -> tuple[list, list, list]:
     """`(auteurs, inconnus, correcteurs)` de la plage gelée, même lecture pour tous.
 
     `reference` est l'auteur de référence déjà lu (`reference_author`) : la
@@ -869,6 +920,11 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     `head` (la tête lue) permettent la preuve de contenu ; sans eux, le gel le
     plus récent présent dans `commits` tient lieu de tête. Un contenu
     réellement réécrit n'est pas repris ; le doute conserve l'auteur.
+    `recover(sha)` (#2924 B7) permet à la porte de rapatrier un gel antérieur
+    absent de son clone scratch avant de refuser ; sans lui, le lecteur garde
+    le refus fermé de B5. Un acteur prouvé sous plusieurs familles dans un gel
+    antérieur garde tout l'ensemble (`families_out`), jamais la seule famille
+    du reçu courant.
     """
     item = dict(item or {})
     packet = bool(packet_composer(item))
@@ -981,10 +1037,17 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     # pas ; un contenu réellement réécrit n'est pas repris (le doute conserve).
     carried, carried_unknown, carried_correctors = _carried_from_previous(
         db, item, milestone, commits, repo, families, base=base, head=head,
-        provider=provider, strict=strict)
+        provider=provider, strict=strict, recover=recover)
     unknown.extend(carried_unknown)
     for row in carried:
-        by_name.setdefault(str(row["name"]), set()).add(str(row["family"]))
+        values = row.get("families")
+        if values is None:
+            values = (row.get("family"),)
+        # #2924 B6 : fusionner toutes les familles prouvées, y compris quand
+        # l'acteur a aussi une preuve courante ; la réduction ambiguë à "" ne
+        # doit jamais effacer l'autre famille.
+        by_name.setdefault(str(row["name"]), set()).update(
+            str(value) for value in values if str(value or "").strip())
     out = []
     for actor in sorted(by_name):
         proven = {value for value in by_name[actor] if value}
@@ -999,25 +1062,41 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             row["proof"] = "turn-journal"
             row["fallback_commits"] = sorted(proofs[actor])
         out.append(row)
-    correctors = []
+    corrector_rows: dict[str, dict] = {}
+
+    def record_corrector(name: str, family: str, families_values=()) -> None:
+        """Trace un correcteur en gardant **toutes** ses familles prouvées."""
+        name = str(name or "").strip()
+        if not name:
+            return
+        key = name.lower()
+        proven = {str(value) for value in families_values if str(value or "").strip()}
+        if str(family or "").strip():
+            proven.add(str(family))
+        row = corrector_rows.get(key)
+        if row is None:
+            row = {"name": name, "family": "", "proven": set()}
+            corrector_rows[key] = row
+        row["proven"].update(proven)
+        # une ambiguïté de familles ne change rien à l'exclusion par le nom,
+        # mais elle ne doit pas être présentée comme une famille unique.
+        row["family"] = (next(iter(row["proven"]))
+                         if len(row["proven"]) == 1 else "")
+        if families_out is not None:
+            families_out.setdefault(key, set()).update(row["proven"])
+
     for actor in sorted(small_correctors):
         proven = {value for _sha, value in review_commits[actor] if value}
-        if families_out is not None:
-            families_out.setdefault(actor.lower(), set()).update(proven)
-        # une ambiguïté de familles ne change rien ici : seul le nom exclut
-        family = next(iter(proven)) if len(proven) == 1 else ""
-        correctors.append({"name": actor, "family": family})
+        record_corrector(actor, "", proven)
     # #2924 : un correcteur d'un gel antérieur dont le correctif subsiste garde
     # sa trace ; il est déjà auteur de la tête ci-dessus (l'exclusion de famille
     # ne dépend pas de cette liste).
-    known = {str(row["name"]).lower() for row in correctors}
     for row in carried_correctors:
-        if str(row["name"]).lower() in known:
-            continue
-        correctors.append(dict(row))
-        family = str(row.get("family") or "")
-        if families_out is not None and family:
-            families_out.setdefault(str(row["name"]).lower(), set()).add(family)
+        record_corrector(str(row.get("name") or ""),
+                         str(row.get("family") or ""),
+                         row.get("families") or ())
+    correctors = [{"name": row["name"], "family": row["family"]}
+                  for row in corrector_rows.values()]
     return out, unknown, correctors
 
 
@@ -1025,11 +1104,13 @@ def authors(db, item: Mapping, milestone: Optional[Mapping],
             commits: Sequence[str], repo: str = "", families=(),
             *, reference: Optional[Mapping] = None, provider=None,
             strict: bool = False, trace: bool = False,
-            base: str = "", head: str = "") -> tuple[list, list]:
+            base: str = "", head: str = "",
+            recover=None) -> tuple[list, list]:
     """`(auteurs, inconnus)` — la lecture partagée, sans les correcteurs."""
     authors_, unknown, _correctors = reading(
         db, item, milestone, commits, repo, families, reference=reference,
-        provider=provider, strict=strict, trace=trace, base=base, head=head)
+        provider=provider, strict=strict, trace=trace, base=base, head=head,
+        recover=recover)
     return authors_, unknown
 
 

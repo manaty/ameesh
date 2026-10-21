@@ -1117,6 +1117,48 @@ def _commit_author(places, sha: str) -> str:
     return ""
 
 
+def _object_recoverer(where: str, sources):
+    """Rapatrie par SHA un commit historique absent du dépôt de lecture (#2924 B7).
+
+    Le clone scratch de `merge-pr` ne contient que la cible et la tête ; les
+    commits d'un gel antérieur réécrit n'y sont pas. On les demande au dépôt de
+    l'agent ou à l'origine du projet, puis on vérifie que l'objet est bien
+    lisible localement. Aucun ref n'est déplacé et aucune tête n'est changée :
+    seule la preuve manquante est réparée. Rend False (jamais une exception)
+    quand la récupération échoue, pour que l'appelant strict refuse fermé."""
+    def recover(sha: str) -> bool:
+        text = str(sha or "").strip().lower()
+        if not _HEX.fullmatch(text):
+            return False
+        try:
+            if plan_git.local_commit(where, text):
+                return True
+        except Exception:  # noqa: BLE001 - dépôt illisible : on tente les sources
+            pass
+        # Un objet non complet ne se demande pas par SHA ; il a déjà été résolu
+        # localement s'il était lisible.
+        if len(text) not in (40, 64):
+            return False
+        for source in sources or ():
+            source = str(source or "").strip()
+            if not source:
+                continue
+            try:
+                proc = plan_git._git(where, "fetch", "--quiet", "--no-tags",
+                                     "--", source, text, timeout=FETCH_TIMEOUT)
+            except Exception:  # noqa: BLE001 - source injoignable : suivante
+                continue
+            if proc.returncode != 0:
+                continue
+            try:
+                if plan_git.local_commit(where, text):
+                    return True
+            except Exception:  # noqa: BLE001 - lecture impossible : source suivante
+                continue
+        return False
+    return recover
+
+
 def _freeze_milestone(marks, frozen, repo: str | None = None):
     """Le jalon de gel quand il nomme cette tête, forme du lecteur partagé.
 
@@ -1157,6 +1199,13 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
     famille pour attribuer les commits sans reçu ; elle ne devient pas un
     auteur pour autant.
 
+    #2924 B7 : le clone scratch de `merge-pr` ne contient que la cible et la
+    tête. Un gel antérieur réécrit y est absent ; la porte tente de le
+    rapatrier par SHA depuis le dépôt de l'agent puis l'origine du projet
+    (`recover`), et ne refuse que si cette récupération échoue. Les familles
+    ambiguës d'un même acteur (`families_out`) refusent la porte, jamais une
+    famille devinée.
+
     Un auteur hors registre (outil, humain non préfixé) n'a pas de famille de
     modèle à comparer : il est omis de la liste, jamais supposé. Un correctif
     de relecteur, même petit (#2739), fait de son auteur un auteur de la tête :
@@ -1179,6 +1228,25 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
     for place in (target_repo, base_repo):
         if place and place not in places:
             places.append(place)
+    # #2924 B7 : les objets d'un gel antérieur réécrit ne sont pas dans le
+    # clone scratch de `merge-pr`. On tente de les rapatrier par SHA depuis le
+    # dépôt de l'agent puis l'origine du projet, avant tout refus.
+    sources: list[str] = []
+    for place in (target_repo, repo, base_repo):
+        text = str(place or "").strip()
+        if text and text != repo and text not in sources:
+            sources.append(text)
+    for place in (target_repo, repo, base_repo):
+        text = str(place or "").strip()
+        if not text:
+            continue
+        try:
+            url = (plan_git._out(text, "remote", "get-url", "origin") or "").strip()
+        except Exception:  # noqa: BLE001 - remote illisible : pas de source
+            url = ""
+        if url and url not in sources:
+            sources.append(url)
+    recover = _object_recoverer(repo, sources)
     reference_name = ""
     reader_names: set[str] = set()
     proven_families: dict[str, set] = {}
@@ -1223,7 +1291,7 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
             read, unknown, _correctors = review_authors.reading(
                 db, item, milestone, commits, repo,
                 families=families, strict=True, families_out=proven_families,
-                reference=reference, base=base, head=frozen)
+                reference=reference, base=base, head=frozen, recover=recover)
         except Exception as exc:  # noqa: BLE001 - une lecture illisible ne conclut pas
             raise _ProvenanceError(
                 "the authors of the frozen range cannot be read (%s)" % exc) from exc

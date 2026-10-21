@@ -188,16 +188,32 @@ auteurs tant que leur contenu subsiste :
 Un correctif réellement réécrit n'est pas repris (cas admissible, décision
 documentée) ; une réécriture partielle reste attribuée et une lecture illisible
 ou ambiguë conserve l'auteur. Un journal de jalons illisible ne rend jamais une
-liste vide : la lecture stricte refuse, la désignation attend (unknown). Un gel
-antérieur absent du dépôt de lecture — le clone scratch de `merge-pr` ne
-récupère que la cible et `refs/pull/N/head` — est traité de même : la porte
-stricte refuse plutôt que de retomber sur la plage courante. Consigner la
-lecture des auteurs dans la marque du gel, pour qu'un lecteur ultérieur n'ait
-plus besoin des objets réécrits, est la suite qui rendra la porte passable ;
-tant qu'elle n'est pas faite, le doute ferme la porte. La même
-lecture sert la désignation, la porte et le train (`base`/`head` passés par
-chaque appelant) ; les correcteurs antérieurs restent tracés pour l'exclusion
-personnelle. Un lot porteur de paquet reste hors de la reprise (#2803 : seule
-son delta propre est relu). Témoins :
+liste vide : la lecture stricte refuse, la désignation attend (unknown).
+
+Un acteur peut avoir écrit sous **plusieurs familles** dans un gel antérieur
+(même agent historiquement Codex puis DeepSeek, squash signé DeepSeek). Le
+lecteur transporte tout l'ensemble prouvé, pas la seule réduction ambiguë à
+une chaîne vide : `families_out` garde les deux familles, `authors` rend une
+famille vide (ambiguë), la désignation attend, la porte refuse de deviner et
+le train refuse une famille inconnue. Une preuve courante ne doit jamais
+effacer une famille historique.
+
+Un gel antérieur absent du dépôt de lecture — le clone scratch de `merge-pr`
+ne récupère que la cible et `refs/pull/N/head` — n'est plus un refus
+systématique : la porte tente de le rapatrier **par SHA** depuis le dépôt de
+l'agent puis l'origine du projet, sans déplacer aucune ref, et ne refuse que si
+la récupération échoue (le refus fermé de B5 reste la règle quand les objets
+manquent réellement). Le cas #286 (sept gels non ancêtres de la tête
+`a8da5f82`, lus depuis un dépôt qui ne porte que la cible et la tête) est
+ainsi lisible sans `ProvenanceError`. Consigner au gel la lecture de ses
+auteurs reste une suite utile (elle éviterait le réseau), mais n'est plus
+nécessaire pour qu'un lot regelé après rebase passe la lecture stricte.
+
+La même lecture sert la désignation, la porte et le train (`base`/`head`
+passés par chaque appelant) ; les correcteurs antérieurs restent tracés pour
+l'exclusion personnelle. Un lot porteur de paquet reste hors de la reprise
+(#2803 : seule son delta propre est relu). Témoins :
 `tests/test_2924_history_rewrite_provenance.py` (squash à arbre identique,
-consolidation sur cible avancée, réécriture réelle, changement sans rapport).
+consolidation sur cible avancée, réécriture réelle, changement sans rapport,
+ensembles de familles ambigus, gel absent récupéré par SHA — avec et sans
+correcteur — et absence non récupérable refusée).
