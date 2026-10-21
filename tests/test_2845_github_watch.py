@@ -158,9 +158,10 @@ class CollectionTest(unittest.TestCase):
                 moved["updated_at"] = watch.iso(NOW + 1)
                 source.append(moved)
                 events2, scan, _ = watch.collect_batch(api, SUB, NOW, NOW + 5, scan)
-                self.assertEqual(events2, [])
-                self.assertEqual(scan["page"], 1)
-                self.assertNotIn("boundary", scan)
+                # #2955: the re-read prefix now ends with #201; it is delivered
+                # with the page fetched before the check, so nothing is lost.
+                self.assertEqual({e["object_id"] for e in events2}, set(range(201, 301)))
+                events += events2
                 for _ in range(10):
                     if scan is None:
                         break
@@ -171,7 +172,7 @@ class CollectionTest(unittest.TestCase):
                 self.assertIsNone(scan)
                 self.assertEqual({e["object_id"] for e in events}, set(range(1, 301)))
 
-    def test_drift_during_next_page_read_is_detected_before_acceptance(self):
+    def test_drift_during_next_page_read_is_reconciled_without_skipping(self):
         api = Api([issue(n) for n in range(1, 301)])
         _, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, None)
         get = api.get
@@ -183,8 +184,11 @@ class CollectionTest(unittest.TestCase):
 
         with mock.patch.object(api, "get", side_effect=mutate):
             events, scan, _ = watch.collect_batch(api, SUB, NOW, NOW + 5, scan)
-        self.assertEqual(events, [])
-        self.assertEqual(scan["page"], 1)
+        # #2955: the offset moved while page 2 was read. The re-read page 1
+        # now ends with #101, delivered with the already-read page 2
+        # (#102..#201), so the moved boundary skips no row.
+        self.assertEqual({e["object_id"] for e in events}, set(range(101, 202)))
+        self.assertEqual(scan["page"], 3)
 
     def test_continuous_updates_finish_fixed_window_with_key_progress(self):
         for kind in ("issue", "comment"):
@@ -255,6 +259,31 @@ class CollectionTest(unittest.TestCase):
             api, scan, events = LagApi(rows, []), None, []
             for _ in range(10):
                 batch, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, scan)
+                events += batch
+                if scan is None:
+                    break
+            self.assertIsNone(scan)
+            self.assertEqual({e["object_id"] for e in events}, {1, 2, 3, 4})
+
+    def test_dense_page_whose_prefix_moves_does_not_skip_the_lagged_successor(self):
+        # #2955 review: the old fallback advanced since to the last row's
+        # updated_at - 1 when a dense page's boundary moved. The successor
+        # keyed between that key and the timestamp was never read again.
+        with mock.patch.object(watch, "PAGE_SIZE", 3):
+            rows = [issue(n) for n in range(1, 5)]
+            for row, key, updated in zip(rows, (-250, -200, -195, -194),
+                                         (-250, -200, -190, -194)):
+                row["key"] = watch.iso(NOW + key)
+                row["updated_at"] = watch.iso(NOW + updated)
+            api, scan, events = LagApi(rows, []), None, []
+            batch, scan, _ = watch.collect_batch(api, SUB, NOW - 3600, NOW, scan)
+            events += batch
+            self.assertEqual({e["object_id"] for e in batch}, {1, 2, 3})
+            # #1 catches up and leaves the dense page for the live tail.
+            rows[0]["key"] = watch.iso(NOW + 1)
+            rows[0]["updated_at"] = watch.iso(NOW + 1)
+            for _ in range(10):
+                batch, scan, _ = watch.collect_batch(api, SUB, NOW, NOW, scan)
                 events += batch
                 if scan is None:
                     break
@@ -619,12 +648,14 @@ class DeliveryTest(PgTestCase):
             self.assertEqual(len(self.messages()), 2)
             api.issues.append(api.issues.pop(0))
             watcher.tick(self.db, NOW + 2)
-            self.assertEqual(len(self.messages()), 2)
-            self.assertEqual(storage.of(self.db).github_watch.scan("app", "acme/app")["page"], 1)
+            # #2955: the moved prefix exposes #5 and #6; they are delivered in
+            # this pass with the page read before the check, not replayed.
+            self.assertEqual(len(self.messages()), 3)
+            self.assertEqual(storage.of(self.db).github_watch.scan("app", "acme/app")["page"], 4)
             self.assertLess(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW)
             for delta in range(3, 8):
                 watcher.tick(self.db, NOW + delta)
-        self.assertEqual(len(self.messages()), 4)
+        self.assertEqual(len(self.messages()), 3)
         self.assertIsNone(storage.of(self.db).github_watch.scan("app", "acme/app"))
         self.assertEqual(storage.of(self.db).github_watch.cursor("app", "acme/app"), NOW)
 

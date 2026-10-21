@@ -177,18 +177,28 @@ def collect_batch(api, sub, since, now, scan):
     rows that such a seek re-reads are remembered so the order guard only judges
     the new ones: a lagged tail is, by nature, out of updated order. Dense
     pages, whose span does not exceed the margin, use guarded offsets instead
-    so progress is never traded for the margin. A changed boundary restarts at
-    its saved timestamp, never at an older window. Stop at the fixed window end
-    so continuous updates cannot keep extending the scan. Durable digests make
-    replay harmless.
+    so progress is never traded for the margin. When a re-read boundary moved,
+    do not seek past the tail's updated_at (#2955): rows new to the re-read
+    prefix are delivered and the page fetched just before the check is kept,
+    which preserves progress without trusting an offset that shifted. An index
+    key never moves backward — it lags updated_at and only advances when it
+    catches up — so that next page still follows the moved prefix. Stop at the
+    fixed window end so continuous updates cannot keep extending the scan.
+    Durable digests make replay harmless.
     """
     state = dict(scan) if scan is not None else dict(since=since, window_since=since, until=now, kind="issue", page=1)
-    if state["page"] > 1 and "boundary" not in state:
+    if state["page"] > 1 and not isinstance(state.get("boundary"), list):
         state["page"] = 1  # upgrade an old, unprotected checkpoint safely
+        state.pop("boundary", None)
+        state.pop("boundary_since", None)
+    if state["page"] <= 1:
+        state.pop("boundary", None)
     state.setdefault("window_since", state["since"])
-    # Rows re-read by the previous seek, already delivered: only the new rows
-    # are judged by the updated-order guard.
+    # #2955: rows already delivered may come back in the next read — the
+    # overlap re-read by a seek, or a row whose index caught up and moved
+    # forward. Only the new rows are judged by the updated-order guard.
     replayed = {tuple(item) for item in state.pop("replayed", ())}
+    replayed.update(tuple(item) for item in state.get("boundary", ()))
     events = []
     until = state["until"]
 
@@ -206,9 +216,12 @@ def collect_batch(api, sub, since, now, scan):
             raise plan_github.GithubError("GitHub watch: invalid list response")
         return rows
 
-    def boundary(rows):
-        return hashlib.sha256(json.dumps(
-            [(row["id"], row.get("updated_at")) for row in rows]).encode()).hexdigest()
+    def stamps(rows):
+        return [(row["id"], row.get("updated_at")) for row in rows]
+
+    def when(row):
+        return datetime.fromisoformat(
+            row["updated_at"].replace("Z", "+00:00")).timestamp()
 
     remaining = PAGES_PER_TICK
     while remaining:
@@ -218,19 +231,36 @@ def collect_batch(api, sub, since, now, scan):
             break
         rows = read(state["page"])
         remaining -= cost
-        if checking and boundary(read(state["page"] - 1)) != state["boundary"]:
-            state.update(page=1, since=max(state["since"], state.get("boundary_since", state["since"])))
-            state.pop("boundary")
-            state.pop("boundary_since", None)
-            return events, state, until
-        times = [datetime.fromisoformat(row["updated_at"].replace("Z", "+00:00")).timestamp()
-                 for row in rows]
+        previous = None
+        if checking:
+            previous = read(state["page"] - 1)
+            old = state["boundary"]
+            if [list(item) for item in stamps(previous)] != old:
+                # #2955: the prefix moved while the next page was being read.
+                # The old fallback sought to the tail's updated_at - 1, which
+                # could pass rows whose lagged key fell between that key and
+                # the timestamp. Deliver the rows new to the re-read prefix
+                # instead: they are exactly what the moved offset would have
+                # skipped. The page read just before this check still follows
+                # the prefix — a row only moves forward when its index catches
+                # up — so it is accepted after the prepend and progress holds.
+                known = {tuple(item) for item in old}
+                shifted = [row for row in previous
+                           if (row["id"], row.get("updated_at")) not in known]
+                shifted_times = [when(row) for row in shifted]
+                events.extend(events_from(sub, state["kind"],
+                                          [row for row, ts in
+                                           zip(shifted, shifted_times) if ts <= until]))
+                replayed.update(stamps(shifted))
+                state.pop("boundary_since", None)
+        times = [when(row) for row in rows]
         # #2925: GitHub sorts by an index that can lag just after a write (the
         # projection writes in the same pass, after `until`). A row past the
         # window end is not taken here and the next window reads it again, so
         # only its place on a full page's tail matters: it ends the window.
-        # #2955: rows re-read by the previous seek are already delivered; they
-        # are excluded from the guard, which then judges only the new rows.
+        # #2955: rows already delivered — the previous seek's overlap or the
+        # rows prepended by a moved prefix — are excluded from the guard, which
+        # then judges only the new rows.
         fresh = [ts for row, ts in zip(rows, times)
                  if (row["id"], row.get("updated_at")) not in replayed]
         inside = [ts for ts in fresh if ts <= until]
@@ -256,10 +286,16 @@ def collect_batch(api, sub, since, now, scan):
                 state.pop("boundary_since", None)
                 replayed = {(row["id"], row.get("updated_at"))
                             for row, ts in zip(rows, times) if ts > cutoff}
-                state["replayed"] = [list(item) for item in replayed]
+                state["replayed"] = [list(item) for item in sorted(replayed)]
             else:
-                state.update(page=state["page"] + 1, boundary=boundary(rows),
-                             boundary_since=times[-1] - 1)
+                state.update(page=state["page"] + 1,
+                             boundary=[list(item) for item in stamps(rows)])
+                # What a shifted read can show again: this page and the
+                # previous one, both already delivered. Kept out of the guard.
+                replayed = {(row["id"], row.get("updated_at")) for row in rows}
+                if previous is not None:
+                    replayed.update(stamps(previous))
+                state["replayed"] = [list(item) for item in sorted(replayed)]
         elif state["kind"] == "issue":
             state.update(kind="comment", page=1, since=state["window_since"])
             state.pop("boundary", None)
