@@ -12,7 +12,7 @@ Témoins : (1) réordre dans le même fichier + lignes propres retirées : non
 survivant ; (2) ligne propre retrouvée seulement comme préfixe : non
 survivant ; (3) ligne propre exacte reportée ailleurs : survivant (B8) ;
 (4) déplacement entre chemins : toujours une preuve ; (5) réordre seul :
-survivant tant que la tête garde le voisinage qu'il a créé ; (6) diff
+survivant tant que la tête garde un de ses hunks tel quel ; (6) diff
 binaire ou arbre illisible : survivant.
 """
 from __future__ import annotations
@@ -99,8 +99,8 @@ class CommitSurvivesTest(TestCase):
         self.assertTrue(self.survives(fix, fix, base))
 
     def test_a_same_file_reorder_alone_keeps_the_corrector(self):
-        # Sans ligne propre, le réordre se prouve par le voisinage qu'il a
-        # créé : tant que la tête le garde, l'auteur est conservé.
+        # Sans ligne propre, le réordre se prouve par son hunk tel quel : tant
+        # que la tête le garde, l'auteur est conservé.
         self.repo.write("tests/test_pick.py", FIXTURE)
         base = self.repo.commit("base")
         self.repo.write("tests/test_pick.py", REORDERED)
@@ -119,6 +119,41 @@ class CommitSurvivesTest(TestCase):
         self.repo.write("tests/test_pick.py", FIXTURE)
         head = self.repo.commit("impl: ordre rétabli", agent="dev4")
         self.assertFalse(self.survives(head, fix, base))
+
+    def squash(self, base, files):
+        """Tête réécrite par l'auteur : squash depuis la base de `files`, plus
+        un autre fichier modifié (cas de relecture cx2, #2994 B1)."""
+        self.repo.git("reset", "-q", "--hard", base)
+        for path, text in files.items():
+            self.repo.write(path, text)
+        self.repo.write("docs/note.md", "autre fichier modifié\n")
+        return self.repo.commit("impl: squash", agent="dev4")
+
+    def test_a_kept_reindentation_keeps_the_corrector(self):
+        # B1 (a) : le correctif indente une ligne sous le `if` ; la ligne
+        # dépouillée et ses voisines sont celles du parent.
+        parent = "if condition_here():\n    first_action()\nsecond_action()\n"
+        fixed = "if condition_here():\n    first_action()\n    second_action()\n"
+        self.repo.write("a.py", parent)
+        base = self.repo.commit("base")
+        self.repo.write("a.py", fixed)
+        fix = self.repo.commit("fix", agent="cx3")
+        head = self.squash(base, {"a.py": fixed})
+        self.assertTrue(self.survives(head, fix, base))
+        head = self.squash(base, {"a.py": parent})
+        self.assertFalse(self.survives(head, fix, base))
+
+    def test_a_kept_reorder_of_repeated_lines_keeps_the_corrector(self):
+        # B1 (b) : même comptes, mêmes paires de lignes voisines.
+        names = {"A": "alpha_line()", "B": "beta_line()", "C": "gamma_line()"}
+        parent = "".join(names[key] + "\n" for key in "ABACABACA")
+        fixed = "".join(names[key] + "\n" for key in "ACABABACA")
+        self.repo.write("a.py", parent)
+        base = self.repo.commit("base")
+        self.repo.write("a.py", fixed)
+        fix = self.repo.commit("fix", agent="cx3")
+        head = self.squash(base, {"a.py": fixed})
+        self.assertTrue(self.survives(head, fix, base))
 
     def test_a_binary_diff_keeps_the_corrector(self):
         self.repo.write("a.py", "base_line_here()\n")
