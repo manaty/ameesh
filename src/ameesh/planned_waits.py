@@ -122,23 +122,14 @@ def explicit_holds(events, *, allowed=None) -> dict[int, dict]:
     return out
 
 
-def pilot_holds(db, events, *, cfg=None) -> dict[int, dict]:
-    """Les holds posés par un pilote (#1664) — les seuls comptés par la
-    stagnation.
-
-    `events` est le flux ciblé lu par le stockage
-    (`Progress.lot_hold_events` : transitions d'état + notes hold/levée), ou
-    un journal complet ; les deux donnent le même hold.
+def _pilot_allowed(db, cfg):
+    """Le prédicat d'autorisation d'un hold de pilote (#1664, #2916).
 
     Même autorisation que la correction d'état et la désignation du relecteur
     (`work.corrector`, rôles `work.CORRECTOR_ROLES`) : un humain, ou un agent
     orchestrateur/conception déclaré (`AMEESH_ALERT_ORCHESTRATORS`, fiche Agent
     du canon), sans l'historique des lots confiés. Un hold d'un autre acteur
     garde son effet sur le réveil (règle 1) mais ne supprime pas l'alerte."""
-    events = list(events or ())
-    if not any(is_hold_note(event.get("note")) for event in events):
-        return {}
-    cfg = getattr(db, "cfg", None) if cfg is None else cfg
     from . import assignments, work            # imports tardifs : pas de cycle
     verdict: dict[str, bool] = {}
 
@@ -154,7 +145,78 @@ def pilot_holds(db, events, *, cfg=None) -> dict[int, dict]:
                 verdict[who] = False           # autorisation illisible : pas de hold
         return verdict[who]
 
-    return explicit_holds(events, allowed=allowed)
+    return allowed
+
+
+def pilot_holds(db, events, *, cfg=None) -> dict[int, dict]:
+    """Les holds posés par un pilote (#1664) — les seuls comptés par la
+    stagnation.
+
+    `events` est le flux ciblé lu par le stockage
+    (`Progress.lot_hold_events` : transitions d'état + notes hold/levée), ou
+    un journal complet ; les deux donnent le même hold. La lecture
+    d'autorisation est celle de `_pilot_allowed`."""
+    events = list(events or ())
+    if not any(is_hold_note(event.get("note")) for event in events):
+        return {}
+    cfg = getattr(db, "cfg", None) if cfg is None else cfg
+    return explicit_holds(events, allowed=_pilot_allowed(db, cfg))
+
+
+def pilot_hold_releases(db, events, *, cfg=None) -> dict[int, list]:
+    """#2916 : les instants où un hold de pilote a été levé, par lot.
+
+    Même journal et même autorisation que `pilot_holds` (`hold:` d'un pilote,
+    levé par `unhold:`/`hold lifted:`/`cleared:` ou par un changement d'état).
+    Le délai intake repart de la dernière levée antérieure au début du lot
+    (#2921) : le temps parqué sous un hold de pilote n'est pas un retard
+    imputable au porteur. Un `hold:` d'un acteur ordinaire ne compte pas — il
+    ne suspend pas la stagnation non plus. Toutes les levées sont rendues :
+    l'appelant les filtre par `started` avant de choisir la dernière.
+    """
+    events = list(events or ())
+    if not any(is_hold_note(event.get("note")) for event in events):
+        return {}
+    cfg = getattr(db, "cfg", None) if cfg is None else cfg
+    allowed = _pilot_allowed(db, cfg)
+    ordered: dict[int, list[dict]] = {}
+    for event in events:
+        ordered.setdefault(int(event["work_item_id"]), []).append(event)
+    out: dict[int, list] = {}
+    for ident, lot_events in ordered.items():
+        try:
+            held = False
+            previous = None
+            released: list = []
+            for event in sorted(lot_events,
+                                key=lambda e: (float(e.get("created_ts") or 0.0),
+                                               int(e.get("id") or 0))):
+                state = event.get("state")
+                at = event.get("created_ts")
+                if previous is not None and state != previous:
+                    if held and at is not None:
+                        released.append(float(at))
+                    held = False
+                previous = state
+                text = str(event.get("note") or "").strip()
+                if not text:
+                    continue
+                if is_hold_note(text):
+                    if allowed(event.get("actor") or ""):
+                        held = True
+                elif is_lift_note(text) and held:
+                    if not allowed(event.get("actor") or ""):
+                        continue
+                    held = False
+                    if at is not None:
+                        released.append(float(at))
+        except (TypeError, ValueError):
+            # #1107 : un journal illisible est isolé par lot ; le calcul SLO
+            # du lot portera lui-même l'alerte `lot_unreadable`.
+            continue
+        if released:
+            out[ident] = released
+    return out
 
 
 def ancestors(package_id, packages):
