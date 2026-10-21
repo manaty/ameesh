@@ -529,45 +529,50 @@ def _any_line_in_head(repo: str, head: str, lines: Sequence[str]) -> bool:
     Utilisé seulement quand le chemin d'origine ne porte plus la ligne : un
     fichier peut avoir été déplacé ou son contenu regroupé ailleurs (#2924
     B8). `git grep` lit l'arbre entier en un appel ; une lecture impossible
-    est un doute, jamais une preuve de réécriture."""
-    patterns = "\n".join(str(line).strip() for line in lines or ()
-                         if str(line).strip())
-    if not patterns:
-        return False
+    est un doute, jamais une preuve de réécriture.
+
+    #2994 : seule une ligne **égale** à la ligne cherchée (à l'indentation
+    près) compte, comme dans `_lines_in_tree` ; une ligne plus longue qui la
+    contient (`self.assertIsNone(self.pick(worker), …)` pour
+    `self.assertIsNone(self.pick(worker),`) n'en est pas la trace."""
+    found = _tree_lines(repo, head, lines)
+    return True if found is None else bool(found)
+
+
+def _tree_lines(repo: str, rev: str, lines: Sequence[str]) -> Optional[set]:
+    """Les lignes (dépouillées) de `lines` égales à une ligne de l'arbre de
+    `rev` (à l'indentation près), ou None si la lecture est impossible.
+
+    `git grep -F` trouve les lignes qui *contiennent* un motif ; seules celles
+    qui lui sont égales une fois dépouillées sont rendues."""
+    wanted = {str(line).strip() for line in lines or () if str(line).strip()}
+    if not wanted:
+        return set()
+    if not repo or not rev:
+        return None
     try:
-        proc = plan_git._git(repo, "grep", "-F", "-q", "-f", "-", head,
-                             stdin=(patterns + "\n").encode("utf-8"))
+        proc = plan_git._git(repo, "grep", "-h", "-I", "-F", "-f", "-", rev,
+                             stdin=("\n".join(sorted(wanted)) + "\n").encode("utf-8"))
     except Exception:  # noqa: BLE001 - lecture impossible : doute
-        return True
-    if proc.returncode == 0:
-        return True
+        return None
     if proc.returncode == 1:
-        return False
-    return True
+        return set()
+    if proc.returncode != 0:
+        return None
+    found = {line.strip() for line in
+             proc.stdout.decode("utf-8", "replace").splitlines()}
+    return wanted & found
 
 
 def _lines_in_tree(repo: str, rev: str, lines: Sequence[str]) -> set:
     """Les lignes (dépouillées) de `lines` présentes **telles quelles** dans
     l'arbre de `rev`, à l'indentation près.
 
-    `git grep -F` trouve les lignes qui *contiennent* un motif ; seules celles
-    qui lui sont égales une fois dépouillées comptent, pour qu'une ligne propre
+    Seules les lignes égales comptent (`_tree_lines`), pour qu'une ligne propre
     au correcteur ne soit jamais écartée parce qu'une ligne plus longue de la
     base la contient. Une lecture impossible rend l'ensemble vide : rien n'est
     écarté, le doute conserve l'auteur (#2977)."""
-    wanted = {str(line).strip() for line in lines or () if str(line).strip()}
-    if not repo or not rev or not wanted:
-        return set()
-    try:
-        proc = plan_git._git(repo, "grep", "-h", "-I", "-F", "-f", "-", rev,
-                             stdin=("\n".join(sorted(wanted)) + "\n").encode("utf-8"))
-    except Exception:  # noqa: BLE001 - lecture impossible : rien d'écarté
-        return set()
-    if proc.returncode != 0:
-        return set()
-    found = {line.strip() for line in
-             proc.stdout.decode("utf-8", "replace").splitlines()}
-    return wanted & found
+    return _tree_lines(repo, rev, lines) or set()
 
 
 def _inherited_lines(repo: str, head: str, sha: str, base: str,
@@ -611,7 +616,9 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
     correcteur et ne prouve rien ; seules ses lignes propres sont cherchées,
     avec la même prudence (chemin d'origine, puis tout l'arbre, B8). Une ligne
     que le commit retire aussi ailleurs (un déplacement) reste une preuve,
-    comme avant. Sans ligne propre, la lecture passe aux lignes retirées,
+    comme avant. #2994 : seul un déplacement **entre chemins** est exempté ;
+    une ligne retirée puis rajoutée dans le même fichier (un réordonnancement)
+    est une ligne héritée comme une autre. Sans ligne propre, la lecture passe aux lignes retirées,
     puis aux lignes copiées, cherchées à leur seul chemin (un chemin absent
     conserve l'auteur) : une copie retirée ne garde pas son correcteur (B1).
     Un diff sans ligne significative conserve l'auteur."""
@@ -625,14 +632,21 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
              if _meaningful_line(row)]
     copied: list = []
     if added:
-        moved = {row.strip() for rows in removes.values() for row in rows}
+        removed_from: dict = {}
+        for path, rows in removes.items():
+            for row in rows:
+                removed_from.setdefault(row.strip(), set()).add(path)
+
+        def moved(path, row) -> bool:
+            return bool(removed_from.get(row.strip(), set()) - {path})
+
         inherited = _inherited_lines(
             repo, head, sha, base,
-            [row for _path, row in added if row.strip() not in moved], cache)
+            [row for path, row in added if not moved(path, row)], cache)
         copied = [(path, row) for path, row in added
-                  if row.strip() in inherited]
+                  if not moved(path, row) and row.strip() in inherited]
         added = [(path, row) for path, row in added
-                 if row.strip() not in inherited]
+                 if moved(path, row) or row.strip() not in inherited]
     if added:
         missing_path = False
         for path, row in added:
