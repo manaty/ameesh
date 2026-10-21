@@ -227,6 +227,7 @@ class HostScopeRules(ScopeRules):
 
     _apply_mailbox_unread_urgent = _apply_mailbox_unread
     _apply_mailbox_unread_human = _apply_mailbox_unread
+    _apply_mailbox_unread_human_page = _apply_mailbox_unread
 
     def _apply_mailbox_reserve(self, principal, kw, fence):
         self._owner_epoch(kw)

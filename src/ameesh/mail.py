@@ -172,6 +172,23 @@ def unread_human(db: Db, recipient: str, limit: int = UNREAD_LIMIT, *,
     return storage.of(db).mailbox.unread_human(recipient, limit, names=names)
 
 
+def unread_human_page(db: Db, recipient: str, limit: int = UNREAD_LIMIT, *,
+                      after_id: int | None = None,
+                      names: Sequence[str] | None = None) -> list[dict]:
+    """L77/B14 : les humains actifs après `after_id` — franchit un préfixe
+    de plus de `UNREAD_LIMIT` humains retenus sur un serveur médié borné.
+
+    La première page reste `unread_human` (contrat 1.5) ; les suivantes
+    passent par `mailbox.unread_human_page` (contrat 1.6). Un ancien serveur
+    refuse l'opération : l'appelant garde les humains déjà trouvés et
+    s'arrête (lecture comme avant 1.5)."""
+    from .agent_names import resolve as resolve_agent_name
+    recipient = resolve_agent_name(recipient, db=db,
+                                   operation="mail.unread_human_page")
+    return storage.of(db).mailbox.unread_human_page(
+        recipient, limit, after_id=after_id, names=names)
+
+
 def unread_mid_turn(db: Db, recipient: str, limit: int = UNREAD_LIMIT, *,
                     include_human: bool = True) -> list[dict]:
     """L514/#885 : les non-lus qu'une remise mi-tour peut livrer — verdict,

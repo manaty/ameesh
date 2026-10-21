@@ -200,6 +200,51 @@ def deliverable_unread(cfg, db, agent, *, besoin, mode="unread", deferred=None,
     except canon.CanonError:
         return rendre(filtrer(lire(db, name, limit=besoin)))
     page = max(MAIL_PAGE, besoin)
+    if mode == "human":
+        # L77/B14 : le serveur médié borne CHAQUE page à 200 et n'a pas de
+        # décalage. Un préfixe de plus de 200 humains ACTIFS retenus (lots
+        # retenus) ne se franchit qu'avec un curseur : on lit la première
+        # page par `unread_human` (contrat 1.5), puis la suivante par
+        # `unread_human_page` (contrat 1.6) avec l'id du dernier lu. Les
+        # retenus sont filtrés page par page, jamais livrés.
+        from .mediated_executor.contract import NotSupportedRemotely
+        taille = max(1, min(page, mail.UNREAD_LIMIT))
+        apres = None
+        trouves: list[dict] = []
+        while True:
+            try:
+                if apres is None:
+                    rows = mail.unread_human(db, name, taille, names=human_names)
+                else:
+                    rows = mail.unread_human_page(
+                        db, name, taille, after_id=apres, names=human_names)
+            except NotSupportedRemotely:
+                # Ancien serveur (contrat < 1.6) : garder les humains déjà
+                # trouvés et lire comme avant 1.5, sans tuer le fil. Rien de
+                # trouvé : laisser `_pick` journaliser l'opération absente.
+                if not trouves:
+                    raise
+                return rendre(trouves, True)
+            try:
+                gardes = deliverable(cfg, db, agent, rows,
+                                     deferred=deferred, canons=canons)
+            except db_mod.DbError:
+                gardes = rows
+            trouves.extend(filtrer(gardes))
+            if len(trouves) >= besoin:
+                return rendre(trouves[:besoin])
+            if len(rows) < taille:
+                return rendre(trouves)
+            dernier = None
+            for row in reversed(rows):
+                try:
+                    dernier = int(row["id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                break
+            if dernier is None or (apres is not None and dernier <= apres):
+                return rendre(trouves, True)
+            apres = dernier
     lus = 0
     while True:
         rows = lire(db, name, limit=page)

@@ -601,6 +601,35 @@ class PorteeTest(ServeurExecTest):
             self.assertEqual(got.status, 200, got.body)
             self.assertEqual([m["id"] for m in got.body["value"]], [human], got.body)
 
+    def test_unread_human_page_crosses_200_retained_humans(self):
+        """B14/cx2 : le curseur franchit un préfixe de 200 humains retenus.
+
+        Le serveur borne `unread_human` à 200 ; l'humain remisable en 201 ne
+        se voit qu'avec `after_id`. Les deux routes le servent, sans livrer
+        les retenus.
+        """
+        self.db.execute(
+            "INSERT INTO agent_mailbox (sender, recipient, body, kind, payload,"
+            " work_item_id)"
+            " SELECT 'human:alice', 'inge-front', 'retained ' || g, 'request',"
+            "        '{\"human\": true}'::jsonb, '812'"
+            " FROM generate_series(1, 200) AS g")
+        prefix = self.op("mailbox.unread_human", ["inge-front", 200],
+                         token=SESSION, route="/session/op")
+        self.assertEqual(len(prefix.body["value"]), 200, prefix.body)
+        dernier = prefix.body["value"][-1]["id"]
+        human = int(self.db.query(
+            "INSERT INTO agent_mailbox (sender, recipient, body, kind, payload)"
+            " VALUES ('human:carol', 'inge-front', 'deliverable human', 'request',"
+            "         '{\"human\": true}'::jsonb) RETURNING id")[0]["id"])
+        for token, route, names in ((TOKEN, "/op", None),
+                                    (SESSION, "/session/op", ["alice"])):
+            got = self.op("mailbox.unread_human_page", ["inge-front", 200],
+                          {"after_id": dernier, "names": names},
+                          token=token, route=route)
+            self.assertEqual(got.status, 200, got.body)
+            self.assertEqual([m["id"] for m in got.body["value"]], [human], got.body)
+
     def test_cout_d_un_appareil_range_device(self):
         """Contrat 1.1 : `turn_costs.insert` d'un appareil est rangé
         `source=device`, avec l'exécuteur et le bail de l'enveloppe, quoi

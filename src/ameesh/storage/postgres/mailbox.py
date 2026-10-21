@@ -165,11 +165,26 @@ class Mailbox(interface.Mailbox):
         copies humaines passives remplissaient la fenêtre devant un humain
         actif et le rang 2 le manquait encore.
         """
+        return self._unread_human(recipient, limit, names=names, after_id=None)
+
+    def unread_human_page(self, recipient, limit, *, after_id=None, names=None) -> list[dict]:
+        """L77/B14 : la page suivante des humains actifs, après `after_id`.
+
+        Le serveur médié borne chaque page à 200 : un préfixe de plus de 200
+        humains retenus se franchit par curseur (`id > after_id`), sans
+        livrer les retenus."""
+        return self._unread_human(recipient, limit, names=names, after_id=after_id)
+
+    def _unread_human(self, recipient, limit, *, names, after_id) -> list[dict]:
         names = [str(name) for name in (names or ()) if str(name)]
         # `IN` explicite plutôt qu'un tableau lié : le pilote psql rend les
         # listes Python en littéral texte, pas en `text[]` (#286).
         declares = ""
         params = [recipient]
+        apres = ""
+        if after_id is not None:
+            apres = " AND id > %s"
+            params.append(int(after_id))
         if names:
             declares = " OR sender IN (" + ", ".join(["%s"] * len(names)) + ")"
             params.extend(names)
@@ -178,13 +193,14 @@ class Mailbox(interface.Mailbox):
             """
             SELECT %s
             FROM agent_mailbox
-            WHERE recipient = %%s AND delivered_at IS NULL
+            WHERE recipient = %%s AND delivered_at IS NULL%s
               AND (payload @> '{"human": true}'::jsonb
                    OR starts_with(sender, 'human:')%s)
               AND NOT %s
             ORDER BY id
             LIMIT %%s
-            """ % (MAIL_COLUMNS, declares, PASSIVE_SQL.format(t="agent_mailbox")),
+            """ % (MAIL_COLUMNS, apres, declares,
+                   PASSIVE_SQL.format(t="agent_mailbox")),
             params,
         )
 

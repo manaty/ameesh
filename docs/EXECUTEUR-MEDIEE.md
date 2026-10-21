@@ -9,7 +9,8 @@ résolution d'alias des agents (#423, version `1.3.0`, compatible : voir
 « Contrat 1.3 »), puis par le réveil programmé médié (#2613, version
 `1.4.0`, compatible : voir « Contrat 1.4 »), puis par la recherche des
 humains du rang 2 au-delà du préfixe (#286/B13, version `1.5.0`, compatible :
-voir « Contrat 1.5 »).
+voir « Contrat 1.5 »), puis par le franchissement d'un préfixe de 200 humains
+actifs retenus (#286/B14, version `1.6.0`, compatible : voir « Contrat 1.6 »).
 Étude et décision : `docs/design/etudes/executeur-mediee.md`,
 `docs/design/decisions/00xx-executeur-mediee.md`.
 
@@ -22,7 +23,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 71 opérations et la liste des 411 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 72 opérations et la liste des 411 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -65,12 +66,12 @@ Les portées :
 - **S** : l'agent et l'epoch sont tirés du jeton de session.
 - **aggregate** : une donnée agrégée.
 
-Comptes : 71 opérations, dont 28 lectures et 43 écritures. 61 passent par
-`op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Huit
-lignes de `op` sont marquées `session: true` (contrats 1.1, 1.2, 1.3 et 1.5) :
-elles sont servies aussi par `session/op`. Le test
+Comptes : 72 opérations, dont 29 lectures et 43 écritures. 62 passent par
+`op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Neuf
+lignes de `op` sont marquées `session: true` (contrats 1.1, 1.2, 1.3, 1.5 et
+1.6) : elles sont servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (482
+signature et les mêmes types. Il vérifie aussi que l'interface entière (483
 opérations) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
@@ -395,7 +396,7 @@ nouveaux exécuteurs : un ancien serveur refuse les trois opérations, le
 runner journalise la lecture impossible et le réveil reste armé, sans perte
 ni blocage du harnais.
 
-## Contrat 1.5 : humains du rang 2, au-delà du préfixe (#286/B13, B14)
+## Contrat 1.5 : humains du rang 2, au-delà du préfixe (#286/B13)
 
 La file résidente sert les messages humains ordinaires (rang 2) avant le
 courrier urgent d'agent, la suite et la consigne en attente. Sur Postgres, une
@@ -405,22 +406,30 @@ exécuteur médié, `mailbox.unread` est borné à 200 lignes et n'a pas de
 décalage : un humain en position 201 restait invisible, et la consigne
 passait devant lui. L'opération `mailbox.unread_human(recipient, limit,
 names=None)` applique le même filtre dans la requête du serveur ; le client
-la sert sans repli de pagination. `names` porte les noms déclarés humains de
-l'hôte (`AMEESH_HUMANS` historique) et peut être nul.
+la sert sans repli sur `mailbox.unread`, les pages suivantes étant décrites
+au contrat 1.6. `names` porte les noms déclarés humains de l'hôte
+(`AMEESH_HUMANS` historique) et peut être nul.
 
-B14 : la requête ne rend que les humains **actifs** — les copies passives
-(`cc`, accusé…) sont écartées comme par `mail.passive_reason`, sinon 200
-copies humaines passives remplissaient la fenêtre devant un humain actif.
-Côté client, `deliverable_unread` signale une lecture **tronquée** quand sa
-page n'a pas progressé (backend borné à 200, sans décalage) ; `_pick`
-déclenche alors la recherche humaine même si peu de lignes de la fenêtre
-sont remisables (lots retenus).
+## Contrat 1.6 : humains actifs et préfixe retenu (#286/B14)
 
-L'ajout est compatible : la version passe à `1.5.0`, aucune opération n'est
+B14 : `mailbox.unread_human` ne rend que les humains **actifs** — les copies
+passives (`cc`, accusé…) sont écartées comme par `mail.passive_reason`, sinon
+200 copies humaines passives remplissaient la fenêtre devant un humain actif.
+
+Un préfixe de plus de 200 humains actifs **retenus** (lots retenus) ne se
+franchit pas avec `limit` : le serveur borne chaque page. L'opération
+`mailbox.unread_human_page(recipient, limit, after_id=None, names=None)` rend
+la page suivante (`id > after_id`), avec le même filtre humain actif.
+`deliverable_unread` lit la première page par `unread_human`, puis les
+suivantes par cette opération, et filtre les lots retenus page par page sans
+les livrer. Côté client, `deliverable_unread` signale aussi une lecture
+**tronquée** quand sa page n'a pas progressé ; `_pick` déclenche alors la
+recherche humaine même si peu de lignes de la fenêtre sont remisables.
+
+L'ajout est compatible : la version passe à `1.6.0`, aucune opération n'est
 retirée ni modifiée. Déployer le serveur avant les nouveaux exécuteurs : un
-ancien serveur refuse l'opération ; le runner médié journalise une fois la
-recherche profonde indisponible et lit comme avant 1.5, sans tuer le fil de
-l'agent à chaque page pleine.
+ancien serveur refuse `mailbox.unread_human_page` ; le runner médié garde les
+humains déjà trouvés et lit comme avant, sans tuer le fil de l'agent.
 
 ## Porte d'hôte
 
@@ -609,7 +618,7 @@ Le client vit dans `src/ameesh/storage/remote/` :
 
 | Fichier | Rôle |
 |---|---|
-| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 71 opérations), `LeaseBook` (carnet des baux) |
+| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 72 opérations), `LeaseBook` (carnet des baux) |
 | `http.py` | `HttpTransport(ExecTransport)`, `StaticTokenSource`, `FileTokenSource` |
 | `events.py` | `RemoteSubscription` : SSE, repli en attente longue, curseur gardé |
 | `__init__.py` | `connect(cfg)`, `set_token_source_factory` (point d'attache de L110) |

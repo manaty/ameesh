@@ -108,16 +108,19 @@ class TableTest(unittest.TestCase):
         # #1349 ajoute operations.publish_peek ; contrat 1.4 : #2613 sert
         # due_wakes/claim_wake/consume_wake (réveil programmé médié) ;
         # contrat 1.5 : #286/B13 ajoute mailbox.unread_human (rang 2 de la
-        # file résidente, filtré dans la requête du serveur).
-        self.assertEqual(len(self.c.operations), 71)
+        # file résidente, filtré dans la requête du serveur) ; contrat 1.6 :
+        # #286/B14 ajoute mailbox.unread_human_page (curseur au-delà d'un
+        # préfixe de plus de 200 humains retenus).
+        self.assertEqual(len(self.c.operations), 72)
         self.assertEqual(sum(o.write for o in ops), 43)
-        self.assertEqual(sum(not o.write for o in ops), 28)
+        self.assertEqual(sum(not o.write for o in ops), 29)
         self.assertEqual(sum(o.transport == "session/op" for o in ops), 9)
         # contrat 1.1 : lignes de la route op servies aussi par session/op
         self.assertEqual(sorted(o.name for o in ops if o.session),
                          ["agents.resolve_name", "mailbox.deliver", "mailbox.release", "mailbox.reserve",
-                          "mailbox.unread", "mailbox.unread_human", "threads.index", "threads.recount"])
-        self.assertEqual(self.c.version, "1.5.0")
+                          "mailbox.unread", "mailbox.unread_human",
+                          "mailbox.unread_human_page", "threads.index", "threads.recount"])
+        self.assertEqual(self.c.version, "1.6.0")
         self.assertEqual([o.name for o in ops if o.transport == "events"], ["wakeups.subscribe"])
         self.assertEqual(self.c.prefix, C.PREFIX)
 

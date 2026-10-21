@@ -865,6 +865,55 @@ class DeliverableTruncationTest(unittest.TestCase):
         self.assertFalse(tronquee)
 
 
+class DeliverableHumanCursorTest(unittest.TestCase):
+    """L77/B14 : le curseur franchit un préfixe de 200 humains retenus."""
+
+    def _call(self, first, second, *, page_indisponible=False):
+        from unittest import mock
+        from ameesh import lot_workdir
+        from ameesh.mediated_executor.contract import NotSupportedRemotely
+        agent = {"name": "worker", "projects": ["p1", "p2"]}
+
+        def lire(db, name, limit, *, names=None):
+            return first[:int(limit)]
+
+        def page(db, name, limit, *, after_id=None, names=None):
+            if page_indisponible:
+                raise NotSupportedRemotely("op_not_allowed")
+            return [row for row in second
+                    if int(row["id"]) > int(after_id or 0)][:int(limit)]
+
+        def garder(cfg, db, agent, rows, *, deferred=None, canons=None):
+            return [row for row in rows
+                    if not (row.get("payload") or {}).get("retained")]
+
+        with mock.patch.object(lot_workdir.mail, "unread_human", side_effect=lire), \
+                mock.patch.object(lot_workdir.mail, "unread_human_page",
+                                  side_effect=page), \
+                mock.patch.object(lot_workdir.projects, "agent_projects",
+                                  return_value=["p1", "p2"]), \
+                mock.patch.object(lot_workdir.canon, "load_configured",
+                                  return_value=[]), \
+                mock.patch.object(lot_workdir, "deliverable", side_effect=garder):
+            return lot_workdir.deliverable_unread(
+                object(), object(), agent, besoin=200, mode="human")
+
+    def test_the_cursor_crosses_200_retained_humans(self):
+        first = [{"id": index, "payload": {"human": True, "retained": True}}
+                 for index in range(1, 201)]
+        human = {"id": 201, "payload": {"human": True}}
+        out = self._call(first, [human])
+        self.assertEqual([row["id"] for row in out], [201])
+
+    def test_an_old_server_keeps_the_humans_already_found(self):
+        """Sans l'opération 1.6, on rend la page déjà filtrée, pas rien."""
+        first = ([{"id": 5, "payload": {"human": True}}]
+                 + [{"id": index, "payload": {"human": True, "retained": True}}
+                    for index in range(6, 205)])
+        out = self._call(first, [], page_indisponible=True)
+        self.assertEqual([row["id"] for row in out], [5])
+
+
 class HumanReservationTtlTest(unittest.TestCase):
     """L77/B6 : la réservation humaine couvre tout le tour, pas 10 min."""
 

@@ -31,6 +31,22 @@ def _make_worker(test, name, prompt=None):
     return worker
 
 
+def _capped(original):
+    """Borne une lecture de boîte à UNREAD_LIMIT, comme le serveur médié."""
+    from ameesh import mail
+
+    def appel(*args, **kwargs):
+        if len(args) >= 3:
+            args = list(args)
+            args[2] = min(int(args[2]), mail.UNREAD_LIMIT)
+        elif "limit" in kwargs:
+            kwargs = dict(kwargs)
+            kwargs["limit"] = min(int(kwargs["limit"]), mail.UNREAD_LIMIT)
+        return original(*args, **kwargs)
+
+    return appel
+
+
 class HumanJournalTest(PgTestCase):
     def _worker(self, name="worker"):
         return _make_worker(self, name)
@@ -184,6 +200,93 @@ class PickHumanFirstTest(PgTestCase):
         self.assertIsNotNone(spec)
         self.assertEqual(spec["kind"], "mail",
                          "passive human copies filled the window before the active human")
+        self.assertTrue(spec.get("human"))
+        self.assertEqual(spec["ids"], [human])
+
+    def test_human_after_200_retained_humans_is_served(self):
+        """B14/cx2 : le curseur franchit 200 humains ACTIFS retenus.
+
+        Le serveur médié borne `unread_human` à 200 : sans `after_id`, les 200
+        premiers humains actifs (tous d'un lot retenu) remplissent la fenêtre
+        et l'humain remisable en 201 reste invisible, derrière la consigne.
+        """
+        from unittest import mock
+        from ameesh import lot_workdir, mail, registry
+        name = "worker-pick-retained-humans"
+        worker = _make_worker(self, name)
+        # Deux projets : `deliverable_unread` filtre alors les lots retenus.
+        self.db.execute(
+            "UPDATE agent_registry SET projects = ARRAY['ameesh', 'second']"
+            " WHERE name = %s", (name,))
+        self._bulk(name, "human:alice", mail.UNREAD_LIMIT,
+                   {"human": True, "retained": True})
+        human = mail.send(self.db, "human:carol", name, "deliverable human",
+                          payload={"human": True})
+        registry.set_pending_prompt(self.db, name, "a queued instruction")
+
+        def garder(cfg, db, agent, rows, *, deferred=None, canons=None):
+            return [row for row in rows
+                    if not (row.get("payload") or {}).get("retained")]
+
+        real_unread = lot_workdir.mail.unread
+        real_human = lot_workdir.mail.unread_human
+        real_page = lot_workdir.mail.unread_human_page
+
+        with mock.patch.object(lot_workdir.mail, "unread",
+                               side_effect=_capped(real_unread)), \
+                mock.patch.object(lot_workdir.mail, "unread_human",
+                                  side_effect=_capped(real_human)), \
+                mock.patch.object(lot_workdir.mail, "unread_human_page",
+                                  side_effect=_capped(real_page)), \
+                mock.patch.object(lot_workdir, "deliverable", side_effect=garder):
+            spec = worker._pick()
+            again = worker._pick()
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec["kind"], "mail",
+                         "200 retained humans filled the page before human 201")
+        self.assertTrue(spec.get("human"))
+        self.assertEqual(spec["ids"], [human])
+        self.assertIsNotNone(again)
+        self.assertEqual((again["kind"], again["ids"]), ("mail", [human]))
+
+    def test_human_after_250_retained_humans_is_served(self):
+        """B14/cx2 : plus de 200 retenus, le curseur lit plusieurs pages.
+
+        250 humains actifs retenus : la première page (200) et la deuxième
+        (50 retenus + l'humain remisable) doivent être lues avant la consigne.
+        """
+        from unittest import mock
+        from ameesh import lot_workdir, mail, registry
+        name = "worker-pick-retained-many"
+        worker = _make_worker(self, name)
+        self.db.execute(
+            "UPDATE agent_registry SET projects = ARRAY['ameesh', 'second']"
+            " WHERE name = %s", (name,))
+        self._bulk(name, "human:alice", 250,
+                   {"human": True, "retained": True})
+        human = mail.send(self.db, "human:carol", name, "deliverable human",
+                          payload={"human": True})
+        registry.set_pending_prompt(self.db, name, "a queued instruction")
+
+        def garder(cfg, db, agent, rows, *, deferred=None, canons=None):
+            return [row for row in rows
+                    if not (row.get("payload") or {}).get("retained")]
+
+        real_unread = lot_workdir.mail.unread
+        real_human = lot_workdir.mail.unread_human
+        real_page = lot_workdir.mail.unread_human_page
+
+        with mock.patch.object(lot_workdir.mail, "unread",
+                               side_effect=_capped(real_unread)), \
+                mock.patch.object(lot_workdir.mail, "unread_human",
+                                  side_effect=_capped(real_human)), \
+                mock.patch.object(lot_workdir.mail, "unread_human_page",
+                                  side_effect=_capped(real_page)), \
+                mock.patch.object(lot_workdir, "deliverable", side_effect=garder):
+            spec = worker._pick()
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec["kind"], "mail",
+                         "more than 200 retained humans hid the deliverable human")
         self.assertTrue(spec.get("human"))
         self.assertEqual(spec["ids"], [human])
 

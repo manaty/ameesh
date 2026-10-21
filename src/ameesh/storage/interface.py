@@ -1086,6 +1086,20 @@ class Mailbox(Domain):
         """
 
     @abc.abstractmethod
+    def unread_human_page(self, recipient: str, limit: int, *,
+                          after_id: int | None = None,
+                          names: Sequence[str] | None = None) -> list[dict]:
+        """L77/B14 : les humains actifs d'APRÈS `after_id`, du plus ancien au
+        plus récent.
+
+        Le serveur médié borne chaque page à 200 et `unread_human` n'a pas de
+        décalage : un préfixe de plus de 200 humains retenus (lots retenus)
+        ne se franchit qu'avec un curseur. `after_id` est l'id du dernier
+        message de la page précédente ; None lit depuis le début. Les passifs
+        sont écartés comme dans `unread_human`.
+        """
+
+    @abc.abstractmethod
     def unread_mid_turn(self, recipient: str, limit: int, *,
                         include_human: bool = True) -> list[dict]:
         """L514/#885 : les messages non remis qu'une remise mi-tour peut
