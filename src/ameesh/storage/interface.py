@@ -55,7 +55,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    leases          claim attach_claim state renew release turn_in_progress
                    reap clear_session take_pending_prompt begin_turn
                    restore_prompt end_turn adopt_session_origin
-   pending_spend   put set_model get clear (Postgres optional: put_get clear_if)
+   pending_spend   put set_model set_resident_usage get clear
+                   (Postgres optional: put_get clear_if)
    turn_costs      last_reading insert spent ledger correct last_before first_after
    mailbox         send unread unread_active unread_urgent get mark_delivered reserve
                    deliver release unread_counts history pending_recipients
@@ -533,11 +534,22 @@ class Catalog(Domain):
 class PendingSpend(Domain):
     """Marqueur comptable d'un tour (`spend_pending`) : une ligne par agent.
 
+    Le marqueur porte son identité **exacte** (#2166) : `created_at`, texte
+    UTC à la microseconde, et `spend_key`, la clé du grand livre
+    (`turn_costs.spend_key`, L60) et de la réservation #1469. Une écriture
+    conditionnelle s'y compare, jamais à un `extract(epoch)::float8` relu —
+    une connexion à précision réduite (`extra_float_digits=0`) en perd les
+    derniers chiffres. `spend_key` est NULL sur les marqueurs d'avant 0471 :
+    leur réparation retrouve la clé déjà écrite par leur tour (ligne ou
+    réservation) par l'identité du tour, jamais par un float8 recalculé ni
+    par l'ordre des écritures ; plusieurs candidats incohérents suspendent
+    (`ledger_ambiguous`).
+
     Extensions PostgreSQL optionnelles (#1469), détectées par `hasattr` :
     `put_get(name, start_index, turn, model)` écrit et rend le marqueur comme
-    `get`, dans la même instruction ; `clear_if(name, created_ts)` ne retire
-    que ce marqueur. Absentes de l'interface distante : elle garde les
-    opérations de base, avec le contrôle du bail côté serveur.
+    `get`, dans la même instruction ; `clear_if(name, created_at, spend_key)`
+    ne retire que ce marqueur. Absentes de l'interface distante : elle garde
+    les opérations de base, avec le contrôle du bail côté serveur.
     """
 
     @abc.abstractmethod
@@ -556,16 +568,31 @@ class PendingSpend(Domain):
 
     @abc.abstractmethod
     def set_resident_usage(self, name: str, usage: dict | None,
-                           created_ts: float | None = None) -> bool:
+                           created_at: str | None = None,
+                           spend_key: str | None = None) -> bool:
         """Pose (ou efface avec None) l'événement `resident.turn` du marqueur
-        (L80a) ; faux s'il n'y a pas de marqueur, ou si `created_ts` désigne
-        un autre marqueur. Cet état durable permet à un worker de remplacement
-        de réparer un tour résident dont l'événement n'a pas été écrit."""
+        (L80a) ; faux s'il n'y a pas de marqueur, ou si `created_at`/`spend_key`
+        désignent un autre marqueur. `created_at` est le texte exact rendu par
+        `get`/`put_get` (#2166), jamais un float8 relu. Cet état durable permet
+        à un worker de remplacement de réparer un tour résident dont
+        l'événement n'a pas été écrit."""
 
     @abc.abstractmethod
     def get(self, name: str) -> dict | None:
-        """Le marqueur (agent, start_index, turn, model, created_ts,
-        work_item_id, turn_id, resident_usage), ou None."""
+        """Le marqueur (agent, start_index, turn, model, created_at,
+        created_ts, spend_key, ledger_key, ledger_ambiguous, work_item_id,
+        turn_id, resident_usage), ou None. `created_at` est l'identité exacte
+        (#2166) ; `spend_key` est la clé du marqueur (NULL avant 0471) ;
+        `ledger_key` est la clé déjà écrite par ce tour — celle du marqueur,
+        ou celle retrouvée dans sa ligne `turn_costs`/sa réservation #1469 par
+        l'identité du tour (`turn_id`, instant de pose, époque de la clé égale
+        à un arrondi historique exact du marqueur, jamais une fenêtre), et la
+        ligne/réservation doit suivre le marqueur — jamais par le seul index
+        de début ni par ordre temporel ;
+        `ledger_ambiguous` vrai interdit de deviner et suspend la comptabilité
+        (B1, notamment une réservation étrangère au même index) ;
+        `created_ts` reste l'epoch float8 pour le début du tour
+        (`turn_costs.started_at`)."""
 
     @abc.abstractmethod
     def clear(self, name: str) -> bool:

@@ -724,13 +724,13 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertNotIn("provenance unknown", out["why"])
         self.assertNotIn("r2", [r["name"] for r in out["reviewers"]])
 
-    def test_a_small_inter_agent_amend_keeps_its_family_but_not_a_seat(self):
-        """#2721 / §2 + #2739 — un amend de relecteur sous le seuil reste un correctif.
+    def test_a_small_inter_agent_amend_authors_its_family(self):
+        """#2721 / §2 + #2739/#2888 — un amend de relecteur sous le seuil est un auteur.
 
-        r2/codex garde sa famille éligible (codex n'est pas une famille
-        interdite) mais ne couvre aucun siège, même manuel : la sélection
-        attend un autre agent codex, elle ne désigne pas r2 sur sa propre
-        correction (#2739)."""
+        r2/codex a écrit un commit de la tête : sa famille est exclue comme
+        celle de tout auteur, et il ne couvre aucun siège, même manuel. La
+        sélection attend une famille indépendante ; elle ne désigne pas r2 sur
+        sa propre correction (#2739), ni un autre agent codex (#2888)."""
         self.repo.git("checkout", "-q", "-B", "small-amend", self.base)
         self.repo.write("src/ameesh/work.py", "A\n" * 5)
         self.repo.commit("A", agent="author")
@@ -751,13 +751,13 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.frozen = amended
         _, out = self.freeze()
         authors = {row["name"]: row for row in out["authors"]}
-        self.assertNotIn("r2", authors)
+        self.assertEqual(authors["r2"]["family"], "codex")
         self.assertEqual(out["state"], rd.WAITING, out)
         self.assertEqual(out["reviewers"], [], out)
-        # le correcteur est écarté par son nom ; sa famille (codex) reste
-        # éligible et n'apparaît pas dans les familles interdites.
+        # le correcteur est un auteur de la tête : son nom et sa famille
+        # (codex) sont interdits, comme pour tout auteur (#2888).
         self.assertIn("r2", out["why"])
-        self.assertNotIn("codex", out["why"])
+        self.assertIn("codex", out["why"])
 
     def test_a_borrowed_harness_uses_the_commit_turn_family(self):
         """#2721 P1 cx2 — le harnais déclaré ne prouve pas la famille.

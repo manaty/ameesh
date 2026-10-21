@@ -302,7 +302,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'agent', 'start_index', 'turn', 'model', 'created_at',
         -- #796 (0423) : lot et tour du marqueur comptable, gardés pour la
         -- réparation d'un tour interrompu (de l'état, aucun contenu)
-        'work_item_id', 'turn_id'
+        'work_item_id', 'turn_id',
+        -- #2166 (0471) : clé exacte du marqueur, la même que
+        -- `turn_costs.spend_key` (déjà lue par le rôle) ; elle ne dit que
+        -- l'agent, l'index et l'instant déjà accordés.
+        'spend_key'
     ]),
     ('standing_approvals', ARRAY[
         'id', 'approver', 'authenticator_id', 'connector', 'operations',

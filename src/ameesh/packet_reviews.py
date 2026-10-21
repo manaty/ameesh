@@ -406,9 +406,18 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
         try:
             from . import lot_class, merge_queue
 
+            # #2931 : le dépôt de la porte (`merge-pr`) est un `git init` qui
+            # n'expose que `refs/ameesh/merge-pr/{target,head}` — le
+            # `branch_target` textuel (`origin/main`) ne s'y résout pas. La
+            # tête de cible déjà lue pour la composition est passée comme
+            # révision exacte : la classe et la lecture des auteurs et
+            # correcteurs (#2726/#2739) se font sur elle, pour tout membre,
+            # même sans cible explicite (sans elle, la base était vide et la
+            # preuve d'indépendance sautée).
             klass = lot_class.of_lot(db, lot, cfg=cfg, item=member_row, repo=repo,
                                      head=frozen, milestones=member_marks,
-                                     canons=canons)
+                                     canons=canons,
+                                     base_sha=plan_git._commit(repo, base) or base)
             gate = merge_queue.review_gate(db, member_marks, frozen, repo=repo,
                                            klass=klass, item=member_row)
         except Exception as exc:  # noqa: BLE001 - lecture impossible : refus

@@ -1795,11 +1795,15 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             if not args.branch:
                 raise work.WorkError("name the branch to set, or pass --detach")
             again = work.is_detached(storage.of(db), args.id, args.branch)
+            cleared = args.target is not None and not args.target.strip()
             item = work.set_branch(db, args.id, args.branch, args.target, actor=args.actor,
                                    source="explicit association%s" % (
-                                       " after its detachment" if again else ""))
-            print("lot #%d: branch %s%s" % (item["id"], item.get("branch"), " to %s" % (
-                item["branch_target"]) if item.get("branch_target") else ""))
+                                       " after its detachment" if again else ""),
+                                   clear_target=cleared)
+            print("lot #%d: branch %s%s%s" % (
+                item["id"], item.get("branch"), " to %s" % (
+                    item["branch_target"]) if item.get("branch_target") else "",
+                " (target cleared)" if cleared else ""))
             return 0
         if args.work_command == "delegate":
             # L40 (0030, point 5) : délégation à échéance, gardée comme `assign`
@@ -3328,7 +3332,10 @@ def build_parser() -> argparse.ArgumentParser:
     pw_branch.add_argument("branch", nargs="?", default=None,
                            help="the branch to set; with --detach, the branch to detach "
                                 "(default: the work item's)")
-    pw_branch.add_argument("--target", default=None, help="target branch (see work add)")
+    pw_branch.add_argument("--target", default=None,
+                           help="target branch (see work add); an empty value clears "
+                                "the explicit target and the lot falls back to its "
+                                "project's or the repository's default")
     pw_branch.add_argument("--detach", action="store_true",
                            help="remove the branch from the work item; the merge sweep no longer "
                                 "associates it implicitly (lot/<id>-…); Git is not touched")

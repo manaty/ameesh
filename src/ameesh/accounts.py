@@ -1354,6 +1354,38 @@ def pause_label(evaluations: dict) -> str:
         first.profile.name, first.held[0], first.held[1] * 100, until_label(first.until))
 
 
+#: #2934 : le préambule d'une pause budget — le compte, la fenêtre qui le
+#: retient et l'échéance annoncée. Le pourcentage qui suit la fenêtre est une
+#: mesure continue : il reste dans `status_text`, pas dans la nature.
+_PAUSE_NATURE = re.compile(
+    r"^pause \(account (?P<compte>\(default\)|[^,)]+)"
+    r"(?:, (?P<fenetre>[^\s,]+) [\d.,]+\s*%)?\)"
+    r"(?: until (?P<echeance>[^;]+))?")
+
+#: #2934 : les mesures continues d'une raison sans ce préambule (plafond du
+#: mesh ou du compte payé au token, solde d'API). Elles changent à chaque
+#: contrôle sans que la pause change de nature.
+_PAUSE_MEASURE = re.compile(r"\d+(?:[.,]\d+)?\s*(?:%|\$|€|USD\b|EUR\b)")
+
+
+def pause_nature(reason: str) -> str:
+    """La nature d'une pause budget : ce dont le changement mérite une note.
+
+    « pause (account tertiaire, seven_day 83 %) until 14:20; … » donne le
+    compte, la fenêtre et l'échéance (``tertiaire``, ``seven_day``,
+    ``14:20``) ; les pourcentages, qui bougent à chaque relevé, n'en font pas
+    partie (#2934). Une raison sans ce préambule se compare sans ses mesures
+    continues (montants, pourcentages) : deux contrôles qui ne diffèrent que
+    par la dépense ou la jauge ne réécrivent pas la note du fil, le détail
+    restant dans `status_text`."""
+    found = _PAUSE_NATURE.match(reason or "")
+    if found:
+        return "pause|%s|%s|%s" % (
+            found.group("compte"), found.group("fenetre") or "",
+            found.group("echeance") or "")
+    return _PAUSE_MEASURE.sub("#", reason or "")
+
+
 def _label(evaluations: dict) -> str:
     return "; ".join("%s: %s" % (name, ev.reason) for name, ev in evaluations.items())
 

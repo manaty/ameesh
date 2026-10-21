@@ -367,22 +367,34 @@ def stop_agent(cfg, db, name: str, *, strict: bool = False) -> list[dict]:
     """
     if not isinstance(name, str) or not NAME_RE.match(name):
         raise ValueError("invalid agent name: %r" % (name,))
+    if not strict:
+        return _write_stop(cfg, db, name)
+    # B1 (relecture cx3 du 20/10/2026, message #120743) : le contrôle d'hôte
+    # et l'arrêt ne formaient pas un seul geste. Un placement concurrent
+    # pouvait déplacer l'agent entre la lecture du registre et les écritures,
+    # et l'on arrêtait alors l'agent d'un autre hôte. On verrouille la ligne
+    # du registre d'abord — même ordre que la remise des lots, registre puis
+    # lots — et on garde ce verrou jusqu'au COMMIT : le placement attend.
+    with db.transaction() as tx:
+        rows = tx.query(
+            "SELECT name, host FROM agent_registry"
+            " WHERE name = (SELECT ameesh_resolve_agent_name(%s, %s))"
+            " FOR NO KEY UPDATE", (name, "device.stop"))
+        if not rows:
+            raise ValueError("unknown agent: %s" % name)
+        row = rows[0]
+        if (row.get("host") or "") != (getattr(cfg, "host", "") or ""):
+            raise ValueError("agent %s is not on this host" % name)
+        return _write_stop(cfg, tx, row["name"])
+
+
+def _write_stop(cfg, db, name: str) -> list[dict]:
+    """Le geste d'arrêt : statut ``stopped``, puis remise des lots.
+
+    L'arrêt strict l'appelle dans la transaction qui tient le verrou du
+    registre ; l'arrêt non strict l'appelle directement.
+    """
     from . import registry, work as work_mod
-    if strict:
-        # Keep the host check and the whole stop in one transaction: a
-        # concurrent placement must not move the agent between the check
-        # and the status/lot writes. Existing lock order: registry -> lots.
-        with db.transaction() as tx:
-            rows = tx.query(
-                "SELECT name, host FROM agent_registry WHERE name = "
-                "(SELECT ameesh_resolve_agent_name(%s, %s)) FOR NO KEY UPDATE",
-                (name, "device.stop"))
-            if not rows:
-                raise ValueError("unknown agent: %s" % name)
-            row = rows[0]
-            if (row.get("host") or "") != (getattr(cfg, "host", "") or ""):
-                raise ValueError("agent %s is not on this host" % name)
-            return stop_agent(cfg, tx, row["name"])
     registry.set_status(db, name, "stopped", status_text="stopped by hand",
                         stop_reason="manuel")
     measure_actor = work_mod.measurement_actor(db, cfg)
