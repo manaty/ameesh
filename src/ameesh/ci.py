@@ -98,9 +98,11 @@ L125 :
   souvent pas la ligne `ameesh-work:`) : au pilote du projet, l'orchestrateur
   déclaré au canon (`alert_briefs.project_pilots`) — plus jamais « (no
   recipient) » (#2935). La tête de chaque base est par ailleurs relue à chaque
-  passage, même au-delà de la fenêtre de rattrapage : `ci_main_red` se ferme
-  au premier vert enregistré de la même base, sans attendre la prochaine
-  exécution de cette base (#2935).
+  passage, même au-delà de la fenêtre de rattrapage : le dernier résultat
+  **utile** (`success`/`failure`) par workflow suivi, relances terminées
+  comprises et annulations ignorées, ferme `ci_main_red` au premier vert
+  enregistré de la même base, sans attendre la prochaine exécution de cette
+  base (#2935).
 
 Une exécution rouge sur une branche de base lève aussi l'alerte `ci_main_red`
 (`exploitation`, poussée par `ameesh notify` au responsable humain) : #846,
@@ -1212,9 +1214,14 @@ class Watcher:
         base dont le vert (ou le rouge) a conclu pendant l'interruption n'y
         entrait jamais : l'alerte restait rouge alors que la base était verte,
         jusqu'à la prochaine exécution de cette base. Ici, seule la plus
-        récente exécution **par workflow suivi** est enregistrée, sans courrier
-        ni réveil : l'état de la base suffit à fermer l'alerte, un verdict
-        ancien ne rouvre pas un tour pour rien.
+        récente exécution **utile** (`success`/`failure`) par workflow suivi
+        est retenue, sans courrier ni réveil : l'état de la base suffit à
+        fermer l'alerte, un verdict ancien ne rouvre pas un tour pour rien.
+
+        #2935 (relecture cx3) : une annulation derrière le dernier résultat
+        utile ne le cache plus (`latest_concluded` ignore les annulations) ;
+        une relance terminée pendant l'arrêt (`run_attempt` plus récent sur
+        une ligne déjà connue) est reprise.
         """
         from . import plan_github
         st = storage.of(db)
@@ -1234,13 +1241,18 @@ class Watcher:
                 workflow = workflow_of(run.get("path"))
                 if workflow not in followed:
                     continue
+                if _CONCLUSIONS.get(run.get("conclusion") or "", "failure") \
+                        not in ("success", "failure"):
+                    continue  # annulée : elle ne dit pas l'état de la base
                 run_id = int(run["id"])
                 if workflow not in newest or run_id > int(newest[workflow]["id"]):
                     newest[workflow] = run
             for run in newest.values():
-                if st.ci.run(repo, int(run["id"])) is not None:
-                    continue
-                self._record_terminal(st, repo, run, bases)
+                row = st.ci.run(repo, int(run["id"]))
+                if row is None:
+                    self._record_terminal(st, repo, run, bases)
+                elif int(run.get("run_attempt") or 1) > int(row.get("run_attempt") or 1):
+                    self._record_attempt(st, repo, run, bases)
 
     def _record_terminal(self, st, repo: str, run: dict,
                          bases=BASE_BRANCHES) -> None:
@@ -1252,7 +1264,7 @@ class Watcher:
         `conclude` gardent la ligne dans la forme du relevé normal."""
         run_id = int(run["id"])
         status = _CONCLUSIONS.get(run.get("conclusion") or "", "failure")
-        if status not in ("success", "failure", "cancelled"):
+        if status not in ("success", "failure"):
             return
         st.ci.open_run(repo, run_id, head_sha=run.get("head_sha") or "",
                        branch=run.get("head_branch") or "",
@@ -1266,10 +1278,38 @@ class Watcher:
         if row is None:
             return
         st.ci.conclude(repo, run_id, status)
+        self._record_base_failures(st, repo, row, run_id, status, bases)
+
+    def _record_attempt(self, st, repo: str, run: dict,
+                        bases=BASE_BRANCHES) -> None:
+        """#2935 (relecture cx3 B1) : une relance terminée pendant l'arrêt du
+        veilleur (`run_attempt` plus récent) remplace le résultat de l'attempt
+        suivi — sinon un rouge d'attempt 1 reste alors que la relance a rendu
+        vert. Une annulation n'est pas rejouée : elle ne dit ni vert ni rouge,
+        l'ancien résultat utile reste (`main_red` ignore les annulations).
+
+        `reopen_run` garde ses refus (ligne remplacée, tête plus récente) :
+        une relance d'une tête qui n'est plus la tête courante de la base ne
+        change pas son état courant."""
+        run_id = int(run["id"])
+        status = _CONCLUSIONS.get(run.get("conclusion") or "", "failure")
+        if status not in ("success", "failure"):
+            return
+        attempt = int(run.get("run_attempt") or 1)
+        reopened = st.ci.reopen_run(repo, run_id, run_attempt=attempt)
+        if reopened is None:
+            return
+        st.ci.conclude(repo, run_id, status)
+        row = st.ci.run(repo, run_id) or reopened
+        self._record_base_failures(st, repo, row, run_id, status, bases)
+
+    def _record_base_failures(self, st, repo: str, row: dict, run_id: int,
+                              status: str, bases=BASE_BRANCHES) -> None:
+        """#2935 : les échecs d'un résultat de base, pour le détail de
+        `ci_main_red` ; aucun message : une exécution hors fenêtre ne réveille
+        pas (seul son état est relu)."""
         if status != "failure":
             return
-        # les échecs, pour le détail de `ci_main_red` ; aucun message : une
-        # exécution hors fenêtre ne réveille pas (seul son état est relu)
         try:
             self._record_failed_jobs(st, repo, dict(row, status="failure"), bases)
             checks = self.api("repos/%s/commits/%s/check-runs?per_page=100"

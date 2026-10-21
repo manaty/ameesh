@@ -1774,6 +1774,61 @@ class WatcherTest(PgTestCase):
                       " ".join(ci.main_red(self.db)[0]["tests"]))
         self.assertEqual(self.mails("dev-a") + self.mails("dev-b"), [])
 
+    def test_relance_de_main_terminee_hors_fenetre_reprend_l_attempt(self):
+        """#2935 (relecture cx3 B1) : une relance terminée pendant l'arrêt du
+        veilleur (ligne déjà connue, `run_attempt` plus récent) remplace le
+        résultat de l'attempt suivi — un rouge d'attempt 1 ne reste pas quand
+        l'attempt 2 est vert."""
+        st = storage.of(self.db)
+        sha = "8" * 20
+        st.ci.open_run(DEPOT, 4010, head_sha=sha, branch="main", event="push",
+                       base="main", work_item_id=None, url=None, workflow="tests.yml")
+        st.ci.add_failure(DEPOT, 4010, run_attempt=1, part="psql 1/1",
+                          test="tests.test_a.T.test_1", module="tests.test_a",
+                          status="echec", inherited=False, excerpt="", replay="",
+                          duration_s=None, failed_at=None)
+        st.ci.conclude(DEPOT, 4010, "failure")
+        self.assertEqual([r["run_id"] for r in ci.main_red(self.db)], [4010])
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: self.NOW)
+        self.api.terminated = [self.terminated(
+            4010, sha, "main", conclusion="success", attempt=2,
+            updated_at="1970-01-12T11:46:40+00:00")]  # 2 h : hors fenêtre
+        self.assertEqual(watcher.tick(self.db), [])
+        row = st.ci.run(DEPOT, 4010)
+        self.assertEqual((row["status"], row["run_attempt"]), ("success", 2))
+        self.assertEqual(ci.main_red(self.db), [])
+        self.assertEqual(self.mails("dev-a") + self.mails("dev-b"), [])
+
+    def test_vert_de_main_derriere_une_annulation_hors_fenetre(self):
+        """#2935 (relecture cx3 B2) : le dernier résultat UTILE d'une base est
+        le dernier success/failure, pas la dernière exécution ; un vert R2
+        suivi d'une annulation R3 pendant l'arrêt ferme quand même le rouge
+        R1 (`latest_concluded` ignore les annulations)."""
+        st = storage.of(self.db)
+        st.ci.open_run(DEPOT, 4020, head_sha="8" * 20, branch="main", event="push",
+                       base="main", work_item_id=None, url=None, workflow="tests.yml")
+        st.ci.add_failure(DEPOT, 4020, run_attempt=1, part="psql 1/1",
+                          test="tests.test_a.T.test_1", module="tests.test_a",
+                          status="echec", inherited=False, excerpt="", replay="",
+                          duration_s=None, failed_at=None)
+        st.ci.conclude(DEPOT, 4020, "failure")
+        self.assertEqual([r["run_id"] for r in ci.main_red(self.db)], [4020])
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: self.NOW)
+        self.api.terminated = [
+            self.terminated(4023, "a3" * 20, "main", conclusion="cancelled",
+                            updated_at="1970-01-12T11:46:40+00:00"),
+            self.terminated(4022, "a2" * 20, "main", conclusion="success",
+                            updated_at="1970-01-12T11:46:40+00:00"),
+        ]  # 2 h : hors fenêtre
+        self.assertEqual(watcher.tick(self.db), [])
+        row = st.ci.run(DEPOT, 4022)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "success")
+        self.assertEqual(ci.main_red(self.db), [])
+        self.assertEqual(self.mails("dev-a") + self.mails("dev-b"), [])
+
     def test_main_rouge_par_workflow(self):
         """#1110 P2-2 : sur la même tête de main, un succès d'une autre suite
         ne masque pas l'échec de `backend-suite.yml`."""
