@@ -256,6 +256,57 @@ class MesureTest(unittest.TestCase):
                              dependencies=edges)
         self.assertEqual(self._row(rows, "intake_started")["started_ts"], T0 + 200)
 
+    def test_intake_repart_au_retour_d_une_retenue(self):
+        # #2916 : 2 jours en attente d'une décision owner (ou sous une autre
+        # retenue) ne comptent pas comme retard intake ; au retour, l'horloge
+        # repart de ce retour — témoin de l'auditeur.
+        release = T0 + 2 * 86400
+        item = _item(assignee="executant")
+        for held in ("waiting_human", "blocked"):
+            with self.subTest(held=held):
+                events = [_ev("intake", T0),
+                          _ev(held, T0 + 60, "decision #1 requested"),
+                          _ev("intake", release, "decision #1 answered")]
+                jalons = _jalons(item, events)
+                for offset, lvl in ((300, 0), (3660, 1)):
+                    with self.subTest(offset=offset):
+                        row = self._row(slo.lot_steps(item, jalons, events,
+                                                     now=release + offset),
+                                        "intake_started")
+                        self.assertEqual(row["started_ts"], release)
+                        self.assertEqual(row["elapsed_s"], offset)
+                        self.assertEqual(row["level"], lvl)
+
+    def test_intake_derniere_retenue_levee_gouverne(self):
+        # #2916 : seule la DERNIÈRE sortie de retenue fixe le départ.
+        release = T0 + 7200
+        events = [_ev("intake", T0),
+                  _ev("waiting_human", T0 + 60),
+                  _ev("intake", T0 + 1800),
+                  _ev("blocked", T0 + 3600),
+                  _ev("intake", release)]
+        item = _item(assignee="executant")
+        row = self._row(slo.lot_steps(item, _jalons(item, events), events,
+                                     now=release + 300), "intake_started")
+        self.assertEqual(row["started_ts"], release)
+        self.assertEqual(row["elapsed_s"], 300)
+
+    def test_intake_retenue_apres_le_debut_ne_reecrit_pas_la_mesure(self):
+        # #2916 : une retenue ajoutée après le début ne réécrit pas la mesure
+        # intake déjà acquise (même règle que #2551 pour une dépendance).
+        events = [_ev("intake", T0),
+                  _ev("waiting_human", T0 + 60),
+                  _ev("intake", T0 + 1800),
+                  _ev("build", T0 + 3600),
+                  _ev("waiting_human", T0 + 7200),
+                  _ev("intake", T0 + 9000)]
+        item = _item(state="intake", assignee="executant", updated_ts=T0 + 9000)
+        row = self._row(slo.lot_steps(item, _jalons(item, events), events,
+                                     now=T0 + 10_000), "intake_started")
+        self.assertEqual(row["started_ts"], T0)
+        self.assertEqual(row["done_ts"], T0 + 3600)
+        self.assertEqual(row["elapsed_s"], 3600)
+
     def test_intake_demarre_ne_reecrit_pas_sa_mesure(self):
         # #2551 : une dépendance ajoutée après le début ne réécrit pas la
         # mesure d'intake déjà acquise.

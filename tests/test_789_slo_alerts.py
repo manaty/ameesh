@@ -790,6 +790,41 @@ def stagnation_wait(db, lot, now):
     return stagnation.describe(db, [row], now=now)[int(lot["id"])]["planned_wait"]
 
 
+class RetourAttenteHumaineTest(_Base):
+    """#2916 : au retour en intake après une décision owner, le délai intake
+    repart de ce retour. Les quatre alertes de niveau 3 du 21/10 venaient de
+    lots sortis de `waiting_human` : leur porteur reprenait le travail, une
+    réattribution aurait cassé ce tour."""
+
+    def answer_after_two_days(self):
+        """Le lot attend une décision owner 2 jours, puis elle est rendue."""
+        held_s = 2 * 24 * HEURE
+        self.age(held_s)
+        view = decisions.ask(self.cfg, self.db, requester="dev1",
+                             question="Quel critère pour la porte des avis ?",
+                             options=["a=union", "b=par auteur"],
+                             lot=str(self.lot["id"]))
+        self.assertEqual(work.get(self.db, self.lot["id"])["state"], "waiting_human")
+        # la demande a tenu le lot depuis son début (journal)
+        self.db.execute(
+            "UPDATE work_item_events SET created_at = now() - make_interval(secs => %s)"
+            " WHERE work_item_id = %s AND state = 'waiting_human'",
+            (float(held_s) - 60.0, self.lot["id"]))
+        result = decisions.answer(self.cfg, self.db, view["id"], "a",
+                                 human="human:alice", channel="cli")
+        self.assertEqual(work.get(self.db, self.lot["id"])["state"], "intake")
+        self.assertEqual(result["lot"]["state"], "intake")
+        return time.time()
+
+    def test_retour_en_intake_repart_de_la_decision(self):
+        answered = self.answer_after_two_days()
+        for offset, levels in ((300, []), (3660, [1])):
+            with self.subTest(offset=offset):
+                self.now = answered + offset
+                alerts = [a for a in self.slo() if a["step"] == "intake_started"]
+                self.assertEqual([a["level"] for a in alerts], levels)
+
+
 class NotifyLivreTest(_Base):
     """B1 (#1035 R1) : la livraison RÉELLE par le Notifier — depuis #2395,
     aucun `slo_breach` n'est poussé à l'owner (canon §9, décision owner 18/10),
