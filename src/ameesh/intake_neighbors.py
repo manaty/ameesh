@@ -527,26 +527,97 @@ def _lots_of_commit(repo: str, commit: dict, hash_refs: Optional[bool] = None) -
     return lots
 
 
+def _hunks(text: str) -> list[tuple]:
+    """Les hunks `@@ -a,b +c,d @@` d'un diff (`--unified=0`)."""
+    hunks: list[tuple] = []
+    for line in str(text or "").splitlines():
+        match = _HUNK_RE.match(line)
+        if not match:
+            continue
+        hunks.append((int(match.group(1)), int(match.group(2) or 1),
+                      int(match.group(3)), int(match.group(4) or 1)))
+    return hunks
+
+
 def _diff_hunks(repo: str, head: str, target: str, path: str,
                 cache: dict[str, list[tuple]]) -> list[tuple]:
     """Les hunks `--unified=0` de `head..target` pour ce chemin."""
     if path in cache:
         return cache[path]
-    hunks: list[tuple] = []
     try:
         proc = _git(repo, "diff", "--unified=0", "--no-color", "--no-ext-diff",
                     head, target, "--", path)
     except Exception:  # noqa: BLE001 - dépôt illisible
         proc = None
-    if proc is not None and proc.returncode == 0:
-        for line in proc.stdout.decode("utf-8", "replace").splitlines():
-            match = _HUNK_RE.match(line)
-            if not match:
-                continue
-            hunks.append((int(match.group(1)), int(match.group(2) or 1),
-                          int(match.group(3)), int(match.group(4) or 1)))
+    hunks = (_hunks(proc.stdout.decode("utf-8", "replace"))
+             if proc is not None and proc.returncode == 0 else [])
     cache[path] = hunks
     return hunks
+
+
+def _path_history(repo: str, head: str, target: str, path: str,
+                  cache: dict[str, list[dict]]) -> list[dict]:
+    """Les commits `head..target` qui touchent `path`, du plus ancien au plus récent.
+
+    Chaque entrée porte ses hunks (`--unified=0`). Sert au suivi vers l'avant
+    d'une ligne que la cible ne porte plus (suppression de la ligne ou du
+    fichier) : `git log -L` ne peut pas partir d'une ligne absente de la cible.
+    """
+    if path in cache:
+        return cache[path]
+    try:
+        proc = _git(repo, "log", "--reverse", "--format=%x1e%H%x00%s%x00%B%x00",
+                    "--unified=0", "--no-renames", "--no-color", "--no-ext-diff",
+                    "%s..%s" % (head, target), "--", path)
+    except Exception:  # noqa: BLE001 - dépôt illisible
+        proc = None
+    history: list[dict] = []
+    if proc is not None and proc.returncode == 0:
+        for chunk in proc.stdout.decode("utf-8", "replace").split(_GIT_RECORD_SEP):
+            chunk = chunk.lstrip("\n")
+            if not chunk:
+                continue
+            fields = chunk.split("\x00", 3)
+            if len(fields) < 4:
+                continue
+            sha, subject = fields[0].strip(), fields[1].strip()
+            if not re.fullmatch(r"[0-9a-f]{40,64}", sha):
+                continue
+            history.append({"sha": sha, "subject": subject,
+                            "message": fields[2], "hunks": _hunks(fields[3]),
+                            "path": path})
+    cache[path] = history
+    return history
+
+
+def _forward_line_commits(history: list[dict], line: int) -> list[dict]:
+    """Les commits qui touchent `line` (coordonnées de `head`), du récent au vieux.
+
+    Les hunks sont appliqués dans l'ordre chronologique en suivant la position
+    de la ligne : une insertion au-dessus la décale, une suppression la fait
+    disparaître — mais le commit qui la supprime la touche et doit être gardé
+    (B2, second tour #2988). Une ligne remplacée continue d'être suivie.
+    """
+    position = max(1, int(line))
+    touched: list[dict] = []
+    for commit in history:
+        for old_start, old_count, new_start, new_count in commit["hunks"]:
+            if old_count == 0:
+                if old_start < position:
+                    position += new_count
+                continue
+            old_end = old_start + old_count - 1
+            if position < old_start:
+                break
+            if position <= old_end:
+                touched.append(commit)
+                if new_count == 0:
+                    # ligne supprimée : plus rien à suivre ensuite
+                    return list(reversed(touched))
+                position = new_start + min(position - old_start, new_count - 1)
+                break
+            position += new_count - old_count
+    return list(reversed(touched))
 
 
 def _map_line(hunks: list[tuple], line: int) -> Optional[int]:
@@ -588,34 +659,67 @@ def _git_hits(repo: str, head: str, target: str, refs: list[dict],
     seen_spans: set[tuple] = set()
     trees: dict[str, list[str]] = {}
     diffs: dict[str, list[tuple]] = {}
+    histories: dict[str, list[dict]] = {}
+
+    def record(commits, display, cited_line):
+        for commit in commits:
+            for lot in _lots_of_commit(repo, commit, hash_refs):
+                if lot not in candidates or lot in hits:
+                    continue
+                hits[lot] = {"sha": commit["sha"], "subject": commit["subject"],
+                             "path": display, "line": cited_line,
+                             "motif": "peut-être corrigé par #%d (%s)"
+                                      % (lot, commit["sha"][:9])}
+
+    def deleted(history, first, last, display, cited_line, key):
+        """Suivi avant pour une ligne (ou un fichier) absent de la cible."""
+        if key in seen_spans:
+            return
+        seen_spans.add(key)
+        commits: list[dict] = []
+        for current in range(int(first), int(last) + 1):
+            commits.extend(_forward_line_commits(history, current))
+        record(commits, display, cited_line)
+
     for ref in refs:
         if not ref.get("line"):
             continue
         # B3 : le chemin Git garde sa casse ; la clé textuelle `path` ne sert
         # qu'à rapprocher les constats.
-        path = _resolve_git_path(repo, target, ref.get("git_path") or ref["path"], trees)
-        if not path:
-            continue
-        hunks = _diff_hunks(repo, head, target, path, diffs)
-        line = _map_line(hunks, int(ref["line"]))
-        if line is None:
-            continue
-        end = _map_line(hunks, int(ref.get("end") or ref["line"]))
-        if end is None or end < line:
-            end = line
-        key = (path, line, end)
-        if key in seen_spans:
-            continue
-        seen_spans.add(key)
-        for commit in _commits_touching(repo, head, target, path, line, end):
-            for lot in _lots_of_commit(repo, commit, hash_refs):
-                if lot not in candidates or lot in hits:
+        git_path = ref.get("git_path") or ref["path"]
+        display = ref.get("display") or git_path
+        cited_line = int(ref["line"])
+        cited_end = int(ref.get("end") or cited_line)
+        path = _resolve_git_path(repo, target, git_path, trees)
+        if path:
+            hunks = _diff_hunks(repo, head, target, path, diffs)
+            line = _map_line(hunks, cited_line)
+            if line is not None:
+                end = _map_line(hunks, cited_end)
+                if end is None or end < line:
+                    end = line
+                key = ("log", path, line, end)
+                if key in seen_spans:
                     continue
-                hits[lot] = {"sha": commit["sha"], "subject": commit["subject"],
-                             "path": ref.get("display") or ref["git_path"],
-                             "line": ref["line"],
-                             "motif": "peut-être corrigé par #%d (%s)"
-                                      % (lot, commit["sha"][:9])}
+                seen_spans.add(key)
+                record(_commits_touching(repo, head, target, path, line, end),
+                       display, cited_line)
+                continue
+            # B2 (second tour) : la ligne citée a été supprimée entre la tête
+            # et la cible ; `-L` ne peut pas partir d'une ligne absente. Le
+            # suivi avant garde le commit qui la supprime.
+            deleted(_path_history(repo, head, target, path, histories),
+                    cited_line, cited_end, display, cited_line,
+                    ("history", path, cited_line, cited_end))
+            continue
+        # Le fichier n'existe plus dans la cible : le résoudre dans la tête,
+        # puis suivre la ligne (ou la suppression du fichier) vers la cible.
+        head_path = _resolve_git_path(repo, head, git_path, trees)
+        if not head_path:
+            continue
+        deleted(_path_history(repo, head, target, head_path, histories),
+                cited_line, cited_end, display, cited_line,
+                ("history", head_path, cited_line, cited_end))
     return hits
 
 

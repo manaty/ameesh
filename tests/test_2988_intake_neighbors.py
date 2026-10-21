@@ -156,6 +156,34 @@ class GitTest(PgTestCase):
         self.assertTrue(any("peut-être corrigé par #%d" % lot in motif
                             for motif in row["motifs"]), row["motifs"])
 
+    def test_deleted_line_names_the_lot_that_deleted_it(self):
+        # B2 second tour : la ligne citée est supprimée dans la cible ; `-L`
+        # ne peut pas partir d'une ligne absente, le suivi avant doit garder
+        # le commit qui la supprime.
+        lot = self._merged_lot("suppression de la ligne")
+        self._patch("f.txt", "line1\nline3\n")
+        _git(self.repo, "commit", "-qam", "delete bug line\n\nameesh-work: %d" % lot)
+        found = intake_neighbors.neighbors(
+            self.db, "p", title="f.txt:2", body="", reviewed_head=self.head,
+            repo=self.repo)
+        row = next(item for item in found["neighbors"] if item["id"] == lot)
+        self.assertTrue(any("peut-être corrigé par #%d" % lot in motif
+                            for motif in row["motifs"]), row["motifs"])
+
+    def test_deleted_file_names_the_lot_that_deleted_it(self):
+        # B2 second tour : le fichier entier disparaît ; le chemin est résolu
+        # dans la tête, pas seulement dans la cible.
+        lot = self._merged_lot("suppression du fichier")
+        os.remove(os.path.join(self.repo, "f.txt"))
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "delete file\n\nameesh-work: %d" % lot)
+        found = intake_neighbors.neighbors(
+            self.db, "p", title="f.txt:2", body="", reviewed_head=self.head,
+            repo=self.repo)
+        row = next(item for item in found["neighbors"] if item["id"] == lot)
+        self.assertTrue(any("peut-être corrigé par #%d" % lot in motif
+                            for motif in row["motifs"]), row["motifs"])
+
     def test_real_git_path_case_is_preserved(self):
         # B3 (#2988) : `Makefile` ne doit pas devenir `makefile` pour Git
         # (deux noms distincts sous Linux).
