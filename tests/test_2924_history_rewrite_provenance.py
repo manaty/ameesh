@@ -283,6 +283,59 @@ class RealRewriteTest(_RewriteFixture):
         self.assertEqual({row["name"] for row in authors}, {"impl", "cx3"})
 
 
+class MovedCorrectionTest(_RewriteFixture):
+    """#2924 B8 : un fichier déplacé ne prouve pas une réécriture.
+
+    Le gel B repart de la base et consolide exactement le même source et le
+    même test sous des noms déplacés. Le correcteur a écrit ces lignes : son
+    contenu n'a pas été réécrit, seule son adresse a changé. La preuve de
+    survie ne doit pas chercher uniquement l'ancien chemin ; sans preuve de
+    suppression, le doute conserve l'auteur.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.repo.git("reset", "--hard", self.base)
+        self.repo.write("src/ameesh/moved_runner.py",
+                        self.repo.git("show", self.head_a
+                                      + ":src/ameesh/runner.py") + "\n")
+        self.repo.write("tests/test_moved_runner.py",
+                        self.repo.git("show", self.head_a
+                                      + ":tests/test_runner.py") + "\n")
+        self.head_b = self.repo.commit("impl: contenu déplacé", agent="impl")
+        self.receipt("impl", "deepseek", [self.head_b])
+        self.freeze_b = self.freeze(self.head_b)
+        self.milestone = {"id": int(self.freeze_b["id"]), "sha": self.head_b,
+                          "actor": "impl", "at_ts": self.freeze_b.get("at_ts")}
+
+    def test_a_moved_correction_stays_an_author(self):
+        authors, unknown, correctors = self.reading(
+            self.milestone, [self.head_b], self.base, self.head_b)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+        self.assertIn("cx3", {row["name"] for row in correctors})
+
+    def test_the_gate_refuses_the_moved_corrector_verdict(self):
+        klass = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "src/ameesh/moved_runner.py",
+                            "class": "sensitive",
+                            "rule": ["src/ameesh/moved_runner.py"]}],
+                 "repo": self.repo.root, "target": self.base,
+                 "base_sha": self.base}
+        for actor in ("impl", "cx3", "dev1"):
+            work.milestone(self.db, self.lot, "verdict", sha=self.head_b,
+                           actor=actor, verdict="ok")
+        out = merge_queue.review_gate(
+            self.db, work.milestones(self.db, self.lot), self.head_b,
+            repo=self.repo.root, klass=klass, item=self.lot_item(), required=2)
+        self.assertFalse(out.get("error"), out)
+        self.assertFalse(out["ok"], out["why"])
+        self.assertEqual([entry["actor"] for entry in out["accepted"]],
+                         ["dev1"], out)
+        self.assertIn("cx3", {row["name"] for row in out["authors"]})
+
+
 class NoReceiptCorrectorTest(_RewriteFixture):
     """#2924 B4 : sans reçu exact, le correcteur désigné reste auteur (#2721)."""
 
@@ -364,8 +417,8 @@ class AmbiguousFamiliesTest(_RewriteFixture):
             self.repo.root, FAMILIES, base=self.base, head=self.head_b,
             families_out=families_out)
         self.assertEqual(unknown, [])
-        self.assertEqual({row["name"]: row["family"] for row in authors},
-                         {"impl": ""})
+        got = {row["name"]: row["family"] for row in authors}
+        self.assertEqual(got.get("impl"), "")
         self.assertEqual(families_out.get("impl"), {"codex", "deepseek"})
 
     def test_the_gate_does_not_guess_the_ambiguous_family(self):

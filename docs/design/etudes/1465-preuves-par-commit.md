@@ -183,7 +183,12 @@ auteurs tant que leur contenu subsiste :
 - arbre de la tête égal à celui du gel, ou à la fusion du gel avec la base ;
 - sinon un commit n'est tenu pour réécrit que si **aucune** de ses lignes
   significatives ne subsiste : une ligne ou un commentaire modifié ne suffit
-  jamais à retirer l'auteur (choix prudent, canon §2).
+  jamais à retirer l'auteur (choix prudent, canon §2) ;
+- un chemin absent de la tête n'est pas une preuve de suppression (#2924 B8) :
+  si la ligne n'est plus à son ancien chemin, elle est cherchée dans tout
+  l'arbre (`git grep` sur la tête) ; un fichier déplacé ou un contenu regroupé
+  ailleurs garde donc son auteur. Seul un chemin encore présent, dont aucune
+  ligne significative ne subsiste, prouve la réécriture.
 
 Un correctif réellement réécrit n'est pas repris (cas admissible, décision
 documentée) ; une réécriture partielle reste attribuée et une lecture illisible
@@ -215,5 +220,6 @@ l'exclusion personnelle. Un lot porteur de paquet reste hors de la reprise
 (#2803 : seule son delta propre est relu). Témoins :
 `tests/test_2924_history_rewrite_provenance.py` (squash à arbre identique,
 consolidation sur cible avancée, réécriture réelle, changement sans rapport,
-ensembles de familles ambigus, gel absent récupéré par SHA — avec et sans
-correcteur — et absence non récupérable refusée).
+ensembles de familles ambigus, correctif déplacé vers un autre chemin,
+gel absent récupéré par SHA — avec et sans correcteur — et absence non
+récupérable refusée).

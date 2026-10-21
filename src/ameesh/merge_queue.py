@@ -1145,7 +1145,8 @@ def _object_recoverer(where: str, sources):
                 continue
             try:
                 proc = plan_git._git(where, "fetch", "--quiet", "--no-tags",
-                                     "--", source, text, timeout=FETCH_TIMEOUT)
+                                     "--no-write-fetch-head", "--", source, text,
+                                     timeout=FETCH_TIMEOUT)
             except Exception:  # noqa: BLE001 - source injoignable : suivante
                 continue
             if proc.returncode != 0:

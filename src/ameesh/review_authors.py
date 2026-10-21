@@ -470,6 +470,29 @@ def _head_lines(repo: str, head: str, path: str, cache: dict):
     return cache[path]
 
 
+def _any_line_in_head(repo: str, head: str, lines: Sequence[str]) -> bool:
+    """Une des lignes apparaît-elle **quelque part** dans l'arbre de la tête ?
+
+    Utilisé seulement quand le chemin d'origine ne porte plus la ligne : un
+    fichier peut avoir été déplacé ou son contenu regroupé ailleurs (#2924
+    B8). `git grep` lit l'arbre entier en un appel ; une lecture impossible
+    est un doute, jamais une preuve de réécriture."""
+    patterns = "\n".join(str(line).strip() for line in lines or ()
+                         if str(line).strip())
+    if not patterns:
+        return False
+    try:
+        proc = plan_git._git(repo, "grep", "-F", "-q", "-f", "-", head,
+                             stdin=(patterns + "\n").encode("utf-8"))
+    except Exception:  # noqa: BLE001 - lecture impossible : doute
+        return True
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    return True
+
+
 def _commit_survives(repo: str, head: str, sha: str, cache: dict) -> bool:
     """Une partie significative du commit subsiste-t-elle dans la tête ?
 
@@ -478,7 +501,13 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict) -> bool:
     significatives ne subsiste. Une ligne ou un commentaire modifié, une
     réorganisation partielle ne suffisent donc jamais à retirer son auteur
     (canon §2 : le doute conserve l'auteur) ; une réécriture complète, elle,
-    ne le reprend pas. Un diff illisible ou binaire conserve l'auteur."""
+    ne le reprend pas. Un diff illisible ou binaire conserve l'auteur.
+
+    #2924 B8 : un chemin absent de la tête n'est pas une preuve de
+    suppression. Un fichier peut avoir été déplacé (ou son contenu regroupé
+    ailleurs) sans qu'une ligne soit réécrite ; l'absence du seul ancien
+    chemin conserve donc l'auteur. Seul un chemin encore présent dont aucune
+    ligne significative ne subsiste prouve la réécriture."""
     parsed = _commit_lines(repo, sha)
     if parsed is None:
         return True
@@ -488,8 +517,19 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict) -> bool:
     added = [(path, row) for path, rows in adds.items() for row in rows
              if _meaningful_line(row)]
     if added:
-        return any(row.strip() in (_head_lines(repo, head, path, cache) or set())
-                   for path, row in added)
+        missing_path = False
+        for path, row in added:
+            lines = _head_lines(repo, head, path, cache)
+            if lines is None:
+                missing_path = True
+            elif row.strip() in lines:
+                return True
+        # Le chemin d'origine ne porte plus la ligne : elle a pu être déplacée
+        # avec son fichier ou regroupée ailleurs. La chercher dans tout l'arbre
+        # évite d'effacer le correcteur sur un simple déplacement (#2924 B8).
+        if _any_line_in_head(repo, head, [row for _path, row in added]):
+            return True
+        return missing_path
     removed = [(path, row) for path, rows in removes.items() for row in rows
                if _meaningful_line(row)]
     if removed:
