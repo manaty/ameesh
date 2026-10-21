@@ -152,6 +152,29 @@ class Mailbox(interface.Mailbox):
             (recipient, int(limit)),
         )
 
+    def unread_human(self, recipient, limit, *, names=()) -> list[dict]:
+        """L77/B13 : les non-lus d'un humain, filtrés DANS la requête — le
+        préfixe des `UNREAD_LIMIT` non-lus ordinaires ne les masque plus.
+
+        `names` couvre les noms déclarés humains sur l'hôte (ancien
+        `AMEESH_HUMANS`) ; `payload.human` et l'ancien `sender human:*`
+        restent reconnus, comme `mail.is_human`.
+        """
+        names = [str(name) for name in (names or ()) if str(name)]
+        return self.db.query(
+            """
+            SELECT %s
+            FROM agent_mailbox
+            WHERE recipient = %%s AND delivered_at IS NULL
+              AND (payload @> '{"human": true}'::jsonb
+                   OR starts_with(sender, 'human:')
+                   OR sender = ANY(%%s::text[]))
+            ORDER BY id
+            LIMIT %%s
+            """ % MAIL_COLUMNS,
+            (recipient, names, int(limit)),
+        )
+
     def unread_mid_turn(self, recipient, limit, *, include_human=True) -> list[dict]:
         """L514/#885 : le filtre de `mail.mid_turn` DANS la requête — un
         verdict, un arbitrage, un message humain ou urgent, sans borne sur les

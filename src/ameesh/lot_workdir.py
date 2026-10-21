@@ -147,7 +147,7 @@ MAIL_PAGE = mail.UNREAD_LIMIT
 
 
 def deliverable_unread(cfg, db, agent, *, besoin, mode="unread", deferred=None,
-                       include_human=True) -> list[dict]:
+                       include_human=True, human_names=()) -> list[dict]:
     """#811 R3 : les non-lus remisables, au-delà d'un préfixe qui les masquait.
 
     `mail.unread` — et ses variantes — borne la lecture aux plus anciens : un
@@ -161,9 +161,17 @@ def deliverable_unread(cfg, db, agent, *, besoin, mode="unread", deferred=None,
 
     L77/B11 : `include_human=False` filtre **tous** les retours (lecture
     simple, replis canon/base) ; un repli ne doit jamais rendre un humain au
-    hook résident qui le solderait."""
-    lire = {"unread": mail.unread, "active": mail.unread_active,
-            "urgent": mail.unread_urgent}[mode]
+    hook résident qui le solderait.
+
+    L77/B13 : `mode="human"` cherche les humains (`mail.unread_human`), pas le
+    préfixe des non-lus ordinaires ; `human_names` porte les noms déclarés
+    humains sur l'hôte. La pagination et les lots retenus restent les mêmes."""
+    if mode == "human":
+        def lire(db, name, limit):
+            return mail.unread_human(db, name, limit, names=human_names)
+    else:
+        lire = {"unread": mail.unread, "active": mail.unread_active,
+                "urgent": mail.unread_urgent}[mode]
     name = agent.get("name")
     besoin = max(1, int(besoin))
 

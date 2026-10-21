@@ -1070,6 +1070,17 @@ class Mailbox(Domain):
         """Messages non remis marqués `payload.urgent`."""
 
     @abc.abstractmethod
+    def unread_human(self, recipient: str, limit: int, *,
+                     names: Sequence[str] = ()) -> list[dict]:
+        """L77/B13 : messages non remis d'un humain, filtrés DANS la requête.
+
+        Un humain (`payload.human`, ancien expéditeur `human:*`, ou nom
+        déclaré de l'hôte dans `names`) ne doit pas rester invisible derrière
+        plus de `UNREAD_LIMIT` non-lus ordinaires : le rang 2 le sert avant la
+        suite et la consigne en attente. Du plus ancien au plus récent.
+        """
+
+    @abc.abstractmethod
     def unread_mid_turn(self, recipient: str, limit: int, *,
                         include_human: bool = True) -> list[dict]:
         """L514/#885 : les messages non remis qu'une remise mi-tour peut

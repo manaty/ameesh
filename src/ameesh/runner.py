@@ -4927,6 +4927,19 @@ class AgentWorker(threading.Thread):
             messages = reveil + messages
         humans = [m for m in messages
                   if self._from_human(m) and not mail.passive_reason(m)]
+        if not humans and len(messages) >= mail.UNREAD_LIMIT:
+            # L77/B13 : le préfixe de `UNREAD_LIMIT` peut être saturé par du
+            # courrier ordinaire actif devant un humain. Recherche dédiée,
+            # filtrée dans la requête et soumise aux mêmes lots retenus
+            # (`deferred`), AVANT les rangs 3 à 5 : un humain ne se cache ni
+            # derrière un urgent d'agent, ni derrière la suite ou la consigne
+            # en attente.
+            humains_profonds = self._live_mail(lot_workdir.deliverable_unread(
+                cfg, self.db, self.agent, besoin=mail.UNREAD_LIMIT,
+                mode="human", deferred=self._lot_deferred,
+                human_names=getattr(cfg, "human_names", ())))
+            humans = [m for m in humains_profonds
+                      if self._from_human(m) and not mail.passive_reason(m)]
         if humans:
             self.nudged = False
             self._reprise_attach = False

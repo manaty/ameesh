@@ -99,6 +99,36 @@ class PickHumanFirstTest(PgTestCase):
         self.assertIsNotNone(again)
         self.assertEqual(again["ids"], spec["ids"])
 
+    def test_human_beyond_the_unread_prefix_is_served_before_lower_ranks(self):
+        """B13 : 200 actifs ordinaires devant l'humain ne le cachent pas.
+
+        Le préfixe `UNREAD_LIMIT` est saturé par du courrier ordinaire ; sans
+        recherche dédiée, `_pick` retombait sur la consigne en attente (rang 5)
+        alors qu'un humain attendait (rang 2). Les deux formes d'humain sont
+        couvertes : `payload.human` et l'ancien expéditeur `human:*`.
+        """
+        from ameesh import mail, registry
+        name = "worker-pick-deep"
+        worker = _make_worker(self, name)
+        for index in range(mail.UNREAD_LIMIT):
+            mail.send(self.db, "agent:bob", name,
+                      "ordinary active %d" % index, payload={})
+        mail.send(self.db, "human:alice", name, "marked human",
+                  payload={"human": True})
+        legacy = mail.send(self.db, "human:carol", name, "legacy human", payload={})
+        registry.set_pending_prompt(self.db, name, "a queued instruction")
+        spec = worker._pick()
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec["kind"], "mail",
+                         "the pending prompt (rank 5) hid the human (rank 2)")
+        self.assertTrue(spec.get("human"))
+        self.assertEqual(set(spec["ids"]), set(
+            int(row["id"]) for row in self.db.query(
+                "SELECT id FROM agent_mailbox WHERE recipient = %s"
+                " AND (payload @> '{\"human\": true}'::jsonb"
+                "      OR starts_with(sender, 'human:'))", (name,))))
+        self.assertIn(legacy, spec["ids"])
+
 
 class EndOfTurnServiceTest(PgTestCase):
     """L77 : le message humain n'est soldé qu'à la FIN du tour."""
