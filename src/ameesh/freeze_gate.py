@@ -63,8 +63,10 @@ FREEZE_ABSENT_LINE = re.compile(r"(?m)^[ \t]*ameesh-freeze-absent:[^\n]*(?:\n|$)
 #: d'appelant. Le motif est générique pour couvrir aussi les marques des
 #: branches #2962/#2989 : une ligne fournie par `--note` est retirée avant
 #: l'écriture, comme `FREEZE_ABSENT_LINE` le fait pour `absent`.
-FREEZE_MACHINE_LINE = re.compile(
-    r"(?m)^[ \t]*ameesh-freeze-[a-z0-9-]+:[^\n]*(?:\n|$)")
+#: Le motif juge une ligne déjà strippée : `add_milestone` strippe la note
+#: finale, donc un blanc de tête (`\v`, `\f`, espace insécable) ne doit pas
+#: cacher la marque (#2971, revue impl-05 — même classe que #2989 B).
+FREEZE_MACHINE_LINE = re.compile(r"ameesh-freeze-[a-z0-9-]+:")
 
 
 def milestones(db: Db, item_id: int, limit: int = 100) -> list[dict]:
@@ -483,7 +485,15 @@ def milestone(
     # fait ici, avant les marques que le gate ajoute lui-même, pour que
     # `unverified`/`unpublished` (#2962) et `supersedes` (#2989) restent
     # écrites par le gate et ne soient jamais effacées par un appelant.
-    note = FREEZE_MACHINE_LINE.sub("", note).rstrip()
+    # #2971 (revue impl-05) : `add_milestone` strippe la note finale. Un filtre
+    # ligne à ligne sur `^[ \t]*` laissait donc une ligne machine précédée d'un
+    # blanc Unicode (`\v`, `\f`, espace insécable) devenir valide après ce
+    # strip ; retirer une autre ligne pouvait aussi l'exposer. On juge chaque
+    # ligne sur sa forme strippée — exactement celle que la lecture verra — puis
+    # on strippe l'ensemble : aucune marque fournie par `--note` ne survit.
+    note = "\n".join(
+        line for line in str(note or "").splitlines()
+        if not FREEZE_MACHINE_LINE.match(line.strip())).strip()
     if kind == "verdict":
         # #2674 : refuser à l'écriture un avis qui ne nomme pas la tête relue.
         sha = reviewed_head(db, item, sha, repo=repo)

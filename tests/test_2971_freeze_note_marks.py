@@ -46,6 +46,35 @@ class FreezeNoteMarksTest(PgTestCase):
         row = self.freeze("la marque ameesh-freeze-unverified: est expliquée ici")
         self.assertIn("est expliquée ici", row["note"])
 
+    def test_a_unicode_blank_does_not_hide_a_machine_mark(self):
+        # #2971 (revue impl-05) : `add_milestone` strippe la note finale. Un
+        # blanc de tête que `^[ \t]*` ne couvre pas (`\v`, `\f`, espace
+        # insécable) était retiré par ce strip et laissait une ligne machine
+        # valide, comme le B de #2989. La note est jugée ligne à ligne sur sa
+        # forme strippée : ce que la lecture verra est ce que le filtre a vu.
+        for blank in ("\v", "\f", "\u00a0"):
+            for mark in ("ameesh-freeze-absent: main",
+                         "ameesh-freeze-unverified: deadbeef",
+                         "ameesh-freeze-unpublished: main",
+                         "ameesh-freeze-supersedes: 42"):
+                with self.subTest(blank=repr(blank), mark=mark):
+                    row = self.freeze(blank + mark + "\nrevue demandée")
+                    self.assertNotIn(mark.split(":", 1)[0], row["note"] or "")
+                    self.assertIn("revue demandée", row["note"])
+
+    def test_a_removed_line_does_not_expose_the_next_mark(self):
+        # #2971 (revue impl-05) : retirer une ligne machine peut exposer la
+        # suivante, précédée d'un blanc Unicode que l'ancien motif ne couvrait
+        # pas ; le strip final la rendait alors valide.
+        for blank in ("\v", "\f", "\u00a0"):
+            with self.subTest(blank=repr(blank)):
+                row = self.freeze(
+                    "ameesh-freeze-absent: main\n" + blank
+                    + "ameesh-freeze-unverified: deadbeef\nrevue demandée")
+                self.assertNotIn("ameesh-freeze-absent", row["note"] or "")
+                self.assertNotIn("ameesh-freeze-unverified", row["note"] or "")
+                self.assertIn("revue demandée", row["note"])
+
 
 if __name__ == "__main__":
     unittest.main()
