@@ -4,8 +4,18 @@
 The mode that must run before the switch-over: at each compiled packet cutoff,
 compute the packet the active train would compose, publish it in the host's
 state directory, and compare it with the manifest of the packet the human
-composer actually merged. Nothing is reserved, published, dispatched or merged:
-the inventory and the historical admission readers are used read-only.
+composer actually merged. Nothing is reserved, published, dispatched or
+promoted: the inventory and the historical admission readers are used
+read-only, and the composition replay stays in the disposable clone.
+
+The plan replays the active composition (#2963), it does not merely qualify
+members one by one: the survivors are merged in order by the same
+``train_git.Repository.compose`` in the disposable clone, so the same
+``land.merge``, generated-file handling, main sync and migration guard decide
+the packet. A member the merge would defer (``MemberDeferred``) is published
+as deferred with the same reason, and its dependents follow the engine's
+ordering rule. The clone's final commit is local to the shadow, and migration
+slots are computed but never reserved.
 
 The comparison is the proof the pilot asks for: lots the composer included but
 the train omitted (with the named reason the train had), lots the train would
@@ -59,6 +69,22 @@ def _stamp_of(created_ts, zone=None):
     """The packet stamp of a commit date, in the plan zone (UTC by default)."""
     return datetime.fromtimestamp(float(created_ts), zone or timezone.utc).strftime(
         "%Y%m%d-%H%M")
+
+
+class _ShadowMigrations:
+    """#2963: the composition-time migration guard, without the L122 effect.
+
+    ``train_git.Repository.compose`` renumbers an added migration and audits
+    the composition when the project declares a migration layout. The shadow
+    replays that same guard in its disposable clone, but a plan reserves
+    nothing: ``reserve`` is a no-op, so no slot is taken and no journal is
+    written. Availability of the slot is an effect of the active composition,
+    not a property of the packet the plan projects.
+    """
+
+    @staticmethod
+    def reserve(row, path, old, number, target):
+        return None
 
 
 class NoTrainFacts:
@@ -219,7 +245,8 @@ class Passage:
     def plan(self, db, rules, slot, now):
         repository = train_git.Repository(
             self.project, resolutions.Replayer(self.repository_source, self.clone_path,
-                                               target=self.project.target))
+                                               target=self.project.target),
+            migrations=_ShadowMigrations())
         base = repository.target(self.project.target)
         history = train_history.Recorded(db, repository.clone.path,
                                          provider=self.provider, review_rules=rules)
@@ -229,30 +256,28 @@ class Passage:
         target = merge_queue._remote_branch(self.project.target)
         rows = [row for row in admissions.entries()
                 if merge_queue._remote_branch(row["target"]) == target]
-        deferred, members = [], []
-        prepared_ids = set()
+        deferred, entries = [], []
+        # Every queued admission is already in the queue: the candidate
+        # inventory must not present it again, even when it is deferred here.
+        prepared_ids = {row["work_item_id"] for row in rows}
         if rows:
-            ordered = train.ordered(rows, admissions.dependencies(rows))
+            # The active engine drops a late admission before ordering: its
+            # dependents wait with it, so ordering must see the same rows.
+            late = [row for row in rows
+                    if float(row.get("queued_ts") or 0) > slot]
+            eligible = [row for row in rows
+                        if float(row.get("queued_ts") or 0) <= slot]
+            for row in late:
+                deferred.append(_deferred(row["work_item_id"], "queued",
+                                          "late admission: queued after the cutoff"))
+            ordered = train.ordered(eligible, admissions.dependencies(eligible))
             visible = {train.identity(row) for row in ordered}
-            for row in rows:
+            for row in eligible:
                 if train.identity(row) not in visible:
                     deferred.append(_deferred(row["work_item_id"], "queued",
                                               "open prerequisite or dependency cycle"))
-            for row in ordered:
-                if float(row.get("queued_ts") or 0) > slot:
-                    deferred.append(_deferred(row["work_item_id"], "queued",
-                                              "late admission: queued after the cutoff"))
-                    continue
-                try:
-                    proof = admissions.qualify([row], base, "packet")["members"][0]
-                except train.MemberDeferred as exc:
-                    deferred.append(_deferred(row["work_item_id"], "queued", str(exc)))
-                    continue
-                except train.TrainError as exc:
-                    deferred.append(_deferred(row["work_item_id"], "queued", str(exc)))
-                    continue
-                members.append(_member(row, origin="queued", proof=proof))
-                prepared_ids.add(row["work_item_id"])
+            entries.extend(dict(row=row, origin="queued", proof=None)
+                           for row in ordered)
         if self.candidate is not None:
             inventory = train_candidates.Inventory(
                 db, self.project, candidate=self.candidate).read()
@@ -284,20 +309,56 @@ class Passage:
                         "active enrollment would refuse"))
                     continue
                 prepared = decision["prepared"]
-                members.append(_member(dict(prepared["subject"], priority=2,
-                                            rank=len(members), queued_ts=0),
-                                       origin="candidate", proof=prepared))
+                # A candidate is not queued yet: the engine would enroll it
+                # after the queued admissions. ``generation`` is part of the
+                # admission identity used by compose; the shadow fabricates
+                # no queue row, so it uses the same neutral value throughout.
+                subject = dict(prepared["subject"], generation=0, priority=2,
+                               rank=len(entries), queued_ts=0)
+                entries.append(dict(row=subject, origin="candidate",
+                                    proof=prepared))
                 prepared_ids.add(lot)
+        if entries:
+            # Same members, same engine order: dependencies first. Candidates
+            # sort after the queued admissions, in inventory order.
+            candidate_priority = 1 + max(
+                (int(entry["row"].get("priority") or 2) for entry in entries),
+                default=2)
+            for index, entry in enumerate(entries):
+                if entry["origin"] == "candidate":
+                    entry["row"]["priority"] = candidate_priority
+                    entry["row"]["rank"] = index
+            members_rows = [entry["row"] for entry in entries]
+            ordered = train.ordered(members_rows,
+                                    admissions.dependencies(members_rows))
+            alive = {train.identity(row) for row in ordered}
+            by_admission = {train.identity(entry["row"]): entry for entry in entries}
+            for entry in entries:
+                if train.identity(entry["row"]) not in alive:
+                    deferred.append(_deferred(
+                        entry["row"]["work_item_id"], entry["origin"],
+                        "open prerequisite or dependency cycle"))
+            entries = [by_admission[train.identity(row)] for row in ordered]
+            # #2727: the active composition merges an advanced ``main``
+            # before its members; the shadow replays that same first merge.
+            sync = repository.main_sync(self.project.target, base)
+        else:
+            sync = None
+        entries, composition_deferred = self._compose(
+            repository, admissions, base, sync, entries)
+        deferred.extend(composition_deferred)
         seen = set()
         deferred = [row for row in deferred
                     if not (row["work_item_id"] in seen
                             or seen.add(row["work_item_id"]))]
         deferred.sort(key=lambda row: (row["work_item_id"], row["origin"]))
+        members = [_member(entry["row"], origin=entry["origin"], proof=entry["proof"])
+                   for entry in entries]
         stamp = datetime.fromtimestamp(slot, rules.zone()).strftime("%Y%m%d-%H%M")
         # #2727: main commits unknown to the target are a mechanical member of
         # the next packet, without review or a build lot. It is recorded only
         # when a packet has members: an empty cutoff composes nothing.
-        sync = repository.main_sync(self.project.target, base) if members else None
+        sync = sync if members else None
         plan = dict(schema=SCHEMA, project=self.project.name,
                     target=merge_queue._remote_branch(self.project.target),
                     cutoff=float(slot), local_stamp=stamp, base=base,
@@ -309,6 +370,62 @@ class Passage:
                     % (stamp, len(members), len(deferred),
                        ", sync main %s" % sync["sha"][:12] if sync else ""))
         return plan
+
+    def _compose(self, repository, admissions, base, sync, entries):
+        """Replay the active composition, deferring a refused member.
+
+        Each attempt qualifies the queued admissions and calls the real
+        :meth:`train_git.Repository.compose` in the disposable clone. The
+        refusal may come from the admission reader or from the composition
+        itself (``MemberDeferred``: merge conflict, generated file, migration
+        guard, transport). The refused member and the members it blocks are
+        deferred, exactly as the engine's composing loop does, and the
+        survivors are composed again from the same base.
+        """
+        kept = list(entries)
+        deferred = []
+        while kept:
+            failure = None
+            for entry in kept:
+                if entry["origin"] != "queued" or entry["proof"] is not None:
+                    continue
+                try:
+                    proof = admissions.qualify([entry["row"]], base, "packet")
+                    entry["proof"] = proof["members"][0]
+                except train.MemberDeferred as exc:
+                    failure = exc
+                    break
+                except train.TrainError as exc:
+                    failure = train.MemberDeferred(entry["row"], str(exc))
+                    break
+            if failure is None:
+                try:
+                    repository.compose(self.project.target, base,
+                                       [entry["row"] for entry in kept],
+                                       sync=sync)
+                except train.MemberDeferred as exc:
+                    failure = exc
+            if failure is None:
+                break
+            failed = next((entry for entry in kept
+                           if train.identity(entry["row"]) == failure.admission),
+                          None)
+            if failed is None:
+                raise train.TrainError("composition deferred an unknown admission")
+            candidates = [entry["row"] for entry in kept if entry is not failed]
+            available = train.ordered(candidates,
+                                      admissions.dependencies(candidates))
+            alive = {train.identity(row) for row in available}
+            lost = [entry for entry in kept
+                    if train.identity(entry["row"]) not in alive]
+            for entry in lost:
+                deferred.append(_deferred(
+                    entry["row"]["work_item_id"], entry["origin"],
+                    str(failure) if entry is failed
+                    else "open prerequisite or dependency cycle"))
+            kept = [entry for entry in kept
+                    if train.identity(entry["row"]) in alive]
+        return kept, deferred
 
     # -- comparison with the human composer ---------------------------------
 
