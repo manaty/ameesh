@@ -242,6 +242,52 @@ def _mark_order(mark: dict) -> tuple:
     return (float(mark.get("at_ts") or 0.0), int(mark.get("id") or 0))
 
 
+def _gate_completed_ts(on_freeze, eligible: dict, *, required: int,
+                      waived: bool, distinct_families: bool):
+    """#2965 : premier instant où la porte s'est ouverte, relu chronologiquement.
+
+    La porte ne retient que le **dernier** verdict de chaque acteur ; relire
+    son état final ne dit donc pas quand elle s'est ouverte pour la première
+    fois. On rejoue ici sa chronologie exacte, du plus ancien au plus récent :
+    un blocage courant ferme la porte jusqu'au `ok` du même acteur, et le
+    premier instant où plus aucun blocage ne court et où les avis requis sont
+    réunis est l'instant d'admissibilité. Un `ok` répété après coup ne
+    redate pas une porte déjà ouverte ; un blocage avant le `ok` la retarde.
+
+    `eligible` associe le nom (casefold) d'un relecteur dont l'avis `ok` est
+    retenu par la porte à sa famille ; les avis des auteurs, des correcteurs
+    et des familles non prouvées n'y sont pas. Rend `None` quand aucun verdict
+    ne date l'ouverture (la porte s'ouvre alors au gel seul).
+    """
+    state: dict = {}
+    for mark in sorted(on_freeze, key=_mark_order):
+        actor = str(mark.get("actor") or "").strip().casefold()
+        state[actor] = mark
+        if any((other.get("verdict") or "") == "blocked" for other in state.values()):
+            continue
+        if waived or required == 0:
+            return float(mark.get("at_ts") or 0.0)
+        retained = []
+        for other in state.values():
+            if (other.get("verdict") or "") != "ok":
+                continue
+            name = str(other.get("actor") or "").strip().casefold()
+            if name not in eligible:
+                continue
+            retained.append((_mark_order(other), eligible[name]))
+        retained.sort()
+        if required >= 2 and distinct_families:
+            families = []
+            for _order, family in retained:
+                if family not in families:
+                    families.append(family)
+            if len(families) >= required:
+                return float(mark.get("at_ts") or 0.0)
+        elif len(retained) >= required:
+            return float(mark.get("at_ts") or 0.0)
+    return None
+
+
 def _same_sha(a, b, repo: str | None = None) -> bool:
     """Deux identifiants de commit qui nomment le même commit : égaux, ou
     résolus dans `repo` (un verdict peut citer une abréviation)."""
@@ -517,8 +563,16 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     ici quand `cfg` et `target` sont fournis. Un véhicule sans membre lisible
     garde la lecture historique, jamais un passage à zéro avis.
 
+    #2965 : `completed_ts` publie le premier instant où la porte s'est
+    ouverte, relu chronologiquement (dernier verdict de chaque acteur, blocage
+    levé par le `ok` du même acteur) : un `ok` redondant ne redate pas une
+    porte déjà ouverte, un blocage retarde l'ouverture. Sans verdict à dater,
+    il vaut None (la porte s'ouvre au gel). C'est l'instant d'admissibilité du
+    train, pas une nouvelle règle pour la file.
+
     Rend `{ok, why, class, required, accepted, blocked, waived, author,
-    author_family, authors, corrections, on_freeze, vehicle}` ; ne lève jamais.
+    author_family, authors, corrections, on_freeze, completed_ts, vehicle}` ;
+    ne lève jamais.
     """
     from . import lot_class
     klass = klass or {}
@@ -624,10 +678,13 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                       % (frozen[:12], cls, ", ".join(sorted(
                           str(m.get("actor") or "relecteur sans nom") for m in blocked))))
         return out
-    if waived:
-        out["ok"] = True
-        return out
-    if required == 0:
+    if waived or required == 0:
+        # #2965 : même sans avis requis, un blocage courant ferme la porte
+        # jusqu'à sa levée ; l'instant d'admissibilité est alors celui du
+        # `ok` qui la rouvre, jamais le gel (B2).
+        out["completed_ts"] = _gate_completed_ts(
+            on_freeze, {}, required=required, waived=waived,
+            distinct_families=distinct_families)
         out["ok"] = True
         return out
     if family_of is None and families is None and db is not None:
@@ -826,6 +883,15 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 continue                  # la famille d'un auteur ne compte pas
         accepted.append({"actor": actor, "family": family, "id": mark.get("id"),
                          "at_ts": mark.get("at_ts")})
+    # #2965 : l'instant d'ouverture se lit sur **tous** les avis retenus, pas
+    # seulement sur les `required` premiers choisis pour la famille : un avis
+    # d'une troisième famille tombé plus tôt a bien ouvert la porte à ce
+    # moment-là. On le calcule avant la troncature ci-dessous.
+    out["completed_ts"] = _gate_completed_ts(
+        on_freeze,
+        {str(entry["actor"] or "").strip().casefold(): entry["family"]
+         for entry in accepted},
+        required=required, waived=False, distinct_families=distinct_families)
     if required >= 2 and distinct_families:
         chosen, seen = [], set()
         for entry in accepted:

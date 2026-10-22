@@ -17,6 +17,12 @@ packet's exact manifest at the last first-parent commit before the cutoff; a
 later enrichment or an inherited manifest proves nothing, and the lot then
 stays an extra ("porteur inconnu"). A missing shadow plan for a packet is not
 an explained difference; it is recorded as such.
+
+#2965: the cutoff filter is the active train's own — `Admissions.admitted` for
+a queue row (the admission instant of the freeze and the gate for a row the
+train enrolled itself, the queue instant for a manual admission) and the same
+`admitted_ts` of the preparation for a candidate not yet enrolled. The shadow
+never dates a member by `queued_ts` alone.
 """
 from __future__ import annotations
 
@@ -232,6 +238,20 @@ class Passage:
         deferred, members = [], []
         prepared_ids = set()
         if rows:
+            # #2965 (B3) : la même règle que l'actif, par le même lecteur —
+            # l'instant d'admissibilité du gel et de la porte pour une ligne
+            # que le train a lui-même enrôlée, le `queued_ts` pour une
+            # admission manuelle. L'ombre ne filtre plus sur la seule file,
+            # sinon une ligne enrôlée après le cutoff resterait late malgré
+            # une admission antérieure.
+            admissible = {train.identity(row) for row in
+                          admissions.admitted(rows, slot, base)}
+            for row in rows:
+                if train.identity(row) not in admissible:
+                    deferred.append(_deferred(
+                        row["work_item_id"], "queued",
+                        "late admission: not admissible at the cutoff"))
+            rows = [row for row in rows if train.identity(row) in admissible]
             ordered = train.ordered(rows, admissions.dependencies(rows))
             visible = {train.identity(row) for row in ordered}
             for row in rows:
@@ -239,10 +259,6 @@ class Passage:
                     deferred.append(_deferred(row["work_item_id"], "queued",
                                               "open prerequisite or dependency cycle"))
             for row in ordered:
-                if float(row.get("queued_ts") or 0) > slot:
-                    deferred.append(_deferred(row["work_item_id"], "queued",
-                                              "late admission: queued after the cutoff"))
-                    continue
                 try:
                     proof = admissions.qualify([row], base, "packet")["members"][0]
                 except train.MemberDeferred as exc:
@@ -284,6 +300,22 @@ class Passage:
                         "active enrollment would refuse"))
                     continue
                 prepared = decision["prepared"]
+                # #2965 : l'actif enrôle le candidat puis filtre sur son
+                # instant d'admissibilité (gel + porte). Une préparation dont
+                # la porte s'est ouverte après le cutoff serait classée late
+                # à l'enrôlement : l'ombre applique le même instant, sinon un
+                # dernier avis postérieur au créneau y resterait membre.
+                instant = ((prepared.get("history") or {}).get("reviews")
+                           or {}).get("admitted_ts")
+                try:
+                    late = not float(instant) <= float(slot)
+                except (TypeError, ValueError):
+                    late = True
+                if late:
+                    deferred.append(_deferred(
+                        lot, "candidate",
+                        "late admission: not admissible at the cutoff"))
+                    continue
                 members.append(_member(dict(prepared["subject"], priority=2,
                                             rank=len(members), queued_ts=0),
                                        origin="candidate", proof=prepared))
