@@ -144,11 +144,14 @@ deux configurations lisent deux dossiers sous le même nom de compte.
 """
 from __future__ import annotations
 
+import getpass
 import hashlib
 import math
 import os
 import re
+import shutil
 import stat
+import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Callable, NamedTuple
@@ -221,6 +224,15 @@ def default_home_of(harness: str) -> str:
 def credentials_of(harness: str) -> str:
     """Fichier d'identifiants dont on vérifie la PRÉSENCE (jamais le contenu)."""
     return _account_key(harness, "credentials")
+
+
+def keychain_service_of(harness: str) -> str:
+    """Service du trousseau macOS qui porte les identifiants du harnais (L65).
+
+    Vide : le harnais range ses identifiants dans son dossier (Codex), et le
+    fichier de `credentials_of` reste la référence.
+    """
+    return _account_key(harness, "keychain_service")
 
 
 def session_store_of(harness: str) -> str:
@@ -620,6 +632,103 @@ def by_name(items: list[Profile], name: str | None) -> Profile | None:
 
 
 # --------------------------------------------------------------------------
+# trousseau macOS (L65) : Claude Code y range ses identifiants OAuth
+# --------------------------------------------------------------------------
+
+#: Claude Code nomme son service Keychain `Claude Code-credentials` ; un
+#: `CLAUDE_CONFIG_DIR` déclaré ajoute `-<8 hex>` (sha256 du chemin) depuis que
+#: les profils multiples ont leur propre entrée (2.1.56).
+KEYCHAIN_DIGEST_HEX = 8
+#: variables qui portent le nom de compte du trousseau (le compte macOS)
+KEYCHAIN_ACCOUNT_ENV = ("USER", "LOGNAME")
+#: `security` ne lit que les attributs de l'élément : jamais `-w` (le secret)
+SECURITY_TIMEOUT_S = 5.0
+
+
+def _config_dir_digest(path: str) -> str:
+    """Le suffixe du service Keychain d'un dossier de configuration : les
+    huit premiers caractères hexadécimaux du sha256 du chemin."""
+    return hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:KEYCHAIN_DIGEST_HEX]
+
+
+def keychain_services(profile: Profile, environ=None) -> list[str]:
+    """Les services Keychain où CE profil peut avoir ses identifiants.
+
+    * dossier déclaré (`path`) : l'entrée namespacée du dossier (le harnais
+      reçoit `CLAUDE_CONFIG_DIR`), plus le fichier vérifié par l'appelant ;
+    * compte déclaré sans dossier : l'entrée globale (la variable de dossier
+      reste absente, `apply_env`) ;
+    * profil synthétique (hôte sans comptes) : l'entrée globale, et celle du
+      dossier hérité si l'exécuteur porte `CLAUDE_CONFIG_DIR`.
+    """
+    service = keychain_service_of(profile.harness)
+    if not service:
+        return []
+    if profile.path:
+        return ["%s-%s" % (service, _config_dir_digest(profile.path))]
+    if profile.declared:
+        return [service]
+    environ = os.environ if environ is None else environ
+    variable = config_env_of(profile.harness)
+    if variable and environ.get(variable):
+        return [service, "%s-%s" % (service, _config_dir_digest(profile.home(environ)))]
+    return [service]
+
+
+def _keychain_available(*, which=shutil.which) -> bool:
+    """Le binaire `security` est-il là (macOS) ?"""
+    return bool(which("security") or os.path.isfile("/usr/bin/security"))
+
+
+def _keychain_account(environ=None) -> str:
+    environ = os.environ if environ is None else environ
+    for name in KEYCHAIN_ACCOUNT_ENV:
+        if environ.get(name):
+            return str(environ[name])
+    try:
+        return getpass.getuser()
+    except (KeyError, OSError):
+        return ""
+
+
+def _keychain_item(service: str, account: str = "", *, run=subprocess.run,
+                   which=shutil.which) -> bool:
+    """L'élément `service`/`account` existe-t-il dans le trousseau ?
+
+    `security find-generic-password` sans `-w` : ameesh lit la présence de
+    l'élément, jamais le jeton. L'absence de `security` ou un échec de la
+    commande vaut « absent » ; l'appelant dit alors qu'il n'a pas pu vérifier
+    (`_keychain_available`)."""
+    binary = which("security") or "/usr/bin/security"
+    argv = [binary, "find-generic-password", "-s", service]
+    if account:
+        argv.extend(["-a", account])
+    try:
+        proc = run(argv, capture_output=True, text=True,
+                   timeout=SECURITY_TIMEOUT_S, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def _credentials_in_keychain(profile: Profile, environ=None) -> bool:
+    account = _keychain_account(environ)
+    return any(_keychain_item(service, account)
+               for service in keychain_services(profile, environ))
+
+
+def _append_keychain_problem(profile: Profile, problems: list[str], environ) -> None:
+    if not _keychain_available():
+        problems.append("cannot check Keychain credentials (security not found): "
+                        "a human must log in")
+        return
+    services = keychain_services(profile, environ)
+    if not _credentials_in_keychain(profile, environ):
+        problems.append("credentials missing in the Keychain (%s): a human must log in"
+                        % ", ".join(services))
+
+
+# --------------------------------------------------------------------------
 # validation (dossiers 0700, fichiers de clé 0600, présence des identifiants)
 # --------------------------------------------------------------------------
 
@@ -627,10 +736,13 @@ def check(profile: Profile, environ=None) -> list[str]:
     """Les problèmes d'un profil (liste vide : utilisable). Ne lit aucun secret.
 
     Un dossier déclaré : existe, appartient à l'utilisateur, privé (aucun droit
-    pour le groupe ni les autres), identifiants présents. Un fichier de clé :
-    fichier ordinaire, à l'utilisateur, 0600 au plus. Une variable de clé :
-    présente et non vide dans l'environnement de l'exécuteur. #313 : un compte
-    refusé par ce mesh (`refused`) a ce problème en premier.
+    pour le groupe ni les autres), identifiants présents. Sur macOS, Claude
+    Code les range dans le trousseau (L65) : la présence y est vérifiée par
+    `security find-generic-password` (jamais le secret), avec le fichier
+    `.credentials.json` comme autre preuve. Un fichier de clé : fichier
+    ordinaire, à l'utilisateur, 0600 au plus. Une variable de clé : présente
+    et non vide dans l'environnement de l'exécuteur. #313 : un compte refusé
+    par ce mesh (`refused`) a ce problème en premier.
     """
     refused = getattr(profile, "refused", "")
     return ([refused] if refused else []) + _check(profile, environ)
@@ -641,8 +753,18 @@ def _check(profile: Profile, environ=None) -> list[str]:
     problems: list[str] = []
     uid = os.getuid() if hasattr(os, "getuid") else None
     if profile.kind == "config_dir":
+        cred = credentials_of(profile.harness)
         if profile.default:
-            return problems  # dossier par défaut du harnais : celui de l'utilisateur
+            # dossier par défaut du harnais : celui de l'utilisateur. Sur
+            # macOS seulement (L65), un compte DÉCLARÉ sans dossier est
+            # vérifié dans le trousseau ; un profil synthétique (hôte sans
+            # comptes) garde son comportement d'avant L30 : il peut
+            # s'authentifier autrement qu'avec un compte de forfait.
+            if (profile.declared and platform.is_macos() and cred
+                    and profile.check_credentials
+                    and not os.path.isfile(os.path.join(profile.home(environ), cred))):
+                _append_keychain_problem(profile, problems, environ)
+            return problems
         try:
             info = os.stat(profile.path)
         except OSError:
@@ -653,10 +775,12 @@ def _check(profile: Profile, environ=None) -> list[str]:
             problems.append("directory owned by another user")
         if info.st_mode & 0o077:
             problems.append("directory not private (%o, expected 700)" % (info.st_mode & 0o777))
-        cred = credentials_of(profile.harness)
-        if cred and profile.check_credentials and not platform.is_macos():
+        if cred and profile.check_credentials:
             if not os.path.isfile(os.path.join(profile.path, cred)):
-                problems.append("credentials missing (%s): a human must log in" % cred)
+                if platform.is_macos() and keychain_service_of(profile.harness):
+                    _append_keychain_problem(profile, problems, environ)
+                else:
+                    problems.append("credentials missing (%s): a human must log in" % cred)
         return problems
     if profile.key_file:
         try:

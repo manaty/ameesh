@@ -13,6 +13,8 @@ le reste du code. Un sous-module par sujet :
 * `terminal` : le terminal de l'humain ;
 * `notify` : la notification de bureau (L66) — `notify-send` sous Linux,
   `osascript` sous macOS, toast Windows par `powershell.exe` sous WSL2 ;
+* `service` : les services utilisateur (L65) — LaunchAgents launchd sur macOS,
+  chargés dans `gui/<uid>` ; Linux garde les unités de `deploy/systemd/` ;
 * `host` : mémoire, swap, charge, alimentation, système de fichiers,
   allocation btrfs (#246) ;
 * `offload_shell` : le côté VM du déport (L159b), Linux seulement par
