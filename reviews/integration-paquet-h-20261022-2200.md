@@ -54,6 +54,32 @@ et son SHA, et il porte un trailer `ameesh-work: <lot>`.
 | #3004 | verdicts-missing |
 | #3007 | verdicts-missing |
 
+## Correctif CI du 22/10 20:4xZ
+
+La première exécution complète (run `39848754775`, tête `b942ab68241c`) a
+rougi **13 fois sur 4 modules**, toutes de la même cause : #2962 refuse
+désormais un verdict dont le SHA complet ne se résout dans aucun dépôt et ne
+nomme pas la tête gelée ; des témoins antérieurs posaient un verdict avec un
+SHA fictif sur un lot **jamais gelé**. Aucune unité n'est modifiée.
+
+| module | témoin(s) | adaptation |
+|---|---|---|
+| `test_2971_freeze_note_marks` | 3 | #2962 écrit sa propre ligne `ameesh-freeze-unverified` ; le témoin vérifie la charge fournie par `--note`, pas le nom de la marque |
+| `test_1677_prise_empilee` | `test_verdict_et_gel_ne_changent_plus_la_prise` | le dépôt qui porte le SHA est simulé (même modèle que `_verdict` de #2674) |
+| `test_1465_provenance` | `test_milestone_outside_a_turn_stays_unknown` | idem |
+| `test_789_slo_alerts` | `test_main_local_en_retard_ne_rajoute_pas_un_avis` | le dépôt du commit relu est nommé (`repo=`, comme `--repo`) |
+| `test_705_reviewer_designated` | 2 | la tête gelée est posée au stockage (la porte d'écriture du gel a ses propres témoins, #2962) |
+
+- Commit d'adaptation `f78f25720` (sans trailer `ameesh-work:`), aucune unité
+  modifiée.
+- Tests ciblés locaux sur la tête corrigée : **9 tests OK** (`2971`, `1677`,
+  `1465`, `789`, `705`), banc PostgreSQL local.
+- La CI complète est redemandée une seule fois sur la tête finale ; l'ancien
+  run et son verdict sont remplacés.
+- Conflit de fusion avec #2989 préparé hors de cette branche
+  (`refs/ameesh/resolutions/3009/2989`, `eef75183a789` ; 61 témoins
+  #2786/#2924 verts) : la branche du paquet ne change pas.
+
 ## Contrôles
 
 - Liste calculée du 22/10 20:2xZ : **2 lots prêts** (#2962, #2971), 16 en
