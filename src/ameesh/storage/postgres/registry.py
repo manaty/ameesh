@@ -1108,15 +1108,17 @@ class PendingSpend(interface.PendingSpend):
     #: a été écrite par une connexion dont `extra_float_digits` pouvait être
     #: réduit : à -5, PostgreSQL n'imprime que 10 chiffres significatifs, soit
     #: la seconde entière pour une époque actuelle (~1,8e9 s) — un arrondi
-    #: pouvant atteindre 0,5 s, pas 123 ms. On ne compare donc pas à une
-    #: fenêtre : l'époque de la clé doit être EXACTEMENT l'un des arrondis que
-    #: l'ancienne connexion a pu produire (0 à 6 décimales, les deux voisins
-    #: en cas d'égalité car PostgreSQL arrondit au pair). Un tour étranger
-    #: à un autre instant n'en fait pas partie, même à 0,2 s ; une clé ISO
-    #: (repli exact) est lue comme son époque. La ligne ou la réservation doit
-    #: aussi suivre le marqueur : au même arrondi d'une seconde, celle d'un
-    #: tour antérieur reste étrangère.
+    #: pouvant atteindre 0,5 s, pas 123 ms. À -6, 9 chiffres significatifs
+    #: arrondissent aux dizaines de secondes ; à -7, aux centaines. On couvre
+    #: donc -2 à 6 décimales : l'époque de la clé doit être EXACTEMENT l'un
+    #: des arrondis que l'ancienne connexion a pu produire (les deux voisins
+    #: en cas d'égalité car PostgreSQL arrondit au pair), jamais une fenêtre
+    #: de proximité. Un tour étranger à un autre instant n'en fait pas partie,
+    #: même à 0,2 s ; une clé ISO (repli exact) est lue comme son époque. La
+    #: ligne ou la réservation doit aussi suivre le marqueur : au même
+    #: arrondi, celle d'un tour antérieur reste étrangère.
     _HISTORICAL_ROUNDINGS = 6
+    _HISTORICAL_FLOOR = -2
 
     def _get_sql(self) -> str:
         """`get` en UNE instruction : marqueur et clé durable du MÊME état.
@@ -1126,15 +1128,17 @@ class PendingSpend(interface.PendingSpend):
         sinon, pour une ligne d'avant 0423, l'époque portée par sa clé, qui
         doit être un arrondi historique exact de l'instant du marqueur. Une
         ligne ou une réservation antérieure au marqueur est étrangère, même
-        quand son arrondi tombe dans la même seconde. L'index de début seul ne
-        prouve rien : il est réutilisé après une rotation du flux, donc une
+        quand son arrondi tombe dans le même intervalle. L'index de début seul
+        ne prouve rien : il est réutilisé après une rotation du flux, donc une
         réservation (ou une ligne) au même index mais à un autre instant est
         étrangère. Elle n'est jamais retenue ; une réservation étrangère sans
         candidat, une réservation étrangère encore ouverte, ou une ligne
         étrangère au repli rendent la clé indémontrable (`ledger_ambiguous`), et
         l'appelant suspend au lieu de deviner. Un ancien worker peut écrire sa
         ligne APRÈS le marqueur de son remplaçant (#1469) : la première ligne
-        après `created_at` n'est pas forcément celle du marqueur.
+        après `created_at` n'est pas forcément celle du marqueur. Le repli lit
+        les lignes de l'agent par son index (#2920) ; il est transitoire, le
+        temps d'effacer les marqueurs d'avant 0471.
 
         La colonne `spend_key` n'est crue que si elle EST l'identité exacte du
         marqueur (`agent:index:created_at`, le format de `put`, #2905). Après un
@@ -1154,6 +1158,7 @@ WITH marqueur_brut AS (
       FROM spend_pending WHERE agent = %s
 ), marqueur AS (
     SELECT m.*,
+           (m.agent || ':' || m.start_index || ':') AS prefix,
            -- #2905 : la clé du marqueur n'est crue que si elle EST l'identité
            -- de ce marqueur (`agent:index:created_at`, le format de `put`).
            -- Après un retour arrière (§14), l'ancien `put` réécrit l'identité
@@ -1164,7 +1169,8 @@ WITH marqueur_brut AS (
                      || m.created_at
                 THEN m.spend_key END AS cle_exacte,
            ARRAY(SELECT v
-                   FROM generate_series(0, {self._HISTORICAL_ROUNDINGS}) AS g(d)
+                   FROM generate_series({self._HISTORICAL_FLOOR},
+                                        {self._HISTORICAL_ROUNDINGS}) AS g(d)
                    CROSS JOIN LATERAL (
                        SELECT round(m.epoch, d) AS v
                        UNION
@@ -1180,14 +1186,11 @@ WITH marqueur_brut AS (
     SELECT tc.spend_key, tc.turn_id, tc.started_at, tc.recorded_at,
            m.turn_id AS marqueur_turn_id,
            m.epoques AS epoques,
-           (left(tc.spend_key,
-                 length(m.agent || ':' || m.start_index || ':'))
-                = m.agent || ':' || m.start_index || ':') AS meme_index,
+           (left(tc.spend_key, length(m.prefix)) = m.prefix) AS meme_index,
            -- une ligne du tour ne peut pas précéder son marqueur : celle d'un
            -- index réutilisé, même au même arrondi, est étrangère.
            (tc.recorded_at >= m.created_at::timestamptz) AS posterieure,
-           substr(tc.spend_key,
-                  length(m.agent || ':' || m.start_index || ':') + 1) AS suffixe
+           substr(tc.spend_key, length(m.prefix) + 1) AS suffixe
       FROM turn_costs tc
       JOIN marqueur m ON tc.agent = m.agent
      WHERE m.cle_exacte IS NULL
@@ -1237,14 +1240,11 @@ WITH marqueur_brut AS (
        AND posterieure AND debut_historique <> epoque_historique
 ), reservations_lues AS (
     SELECT ar.spend_key, ar.state, ar.created_at AS pose,
-           (left(ar.spend_key,
-                 length(m.agent || ':' || m.start_index || ':'))
-                = m.agent || ':' || m.start_index || ':') AS meme_index,
+           (left(ar.spend_key, length(m.prefix)) = m.prefix) AS meme_index,
            -- une réservation du tour est prise APRÈS son marqueur : celle
            -- d'un tour antérieur, même au même arrondi, est étrangère.
            (ar.created_at >= m.created_at::timestamptz) AS posterieure,
-           substr(ar.spend_key,
-                  length(m.agent || ':' || m.start_index || ':') + 1) AS suffixe,
+           substr(ar.spend_key, length(m.prefix) + 1) AS suffixe,
            m.epoques AS epoques
       FROM account_reservations ar
       JOIN marqueur m ON ar.agent = m.agent

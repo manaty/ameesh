@@ -650,6 +650,49 @@ class PendingSpendExactTest(PgTestCase):
                 finally:
                     db.close()
 
+    def test_cle_historique_arrondie_aux_dizaines_est_retrouvee(self):
+        """#2920 : `extra_float_digits=-6` arrondit l'époque aux dizaines.
+
+        À 9 chiffres significatifs, une époque actuelle (~1,8e9 s) perd la
+        seconde entière : la clé authentique vaut un multiple de 10 s, à 5 s
+        près du marqueur. Le repli doit reconnaître cet arrondi **discret**
+        (pas une fenêtre : le témoin -5 des 0,2 s reste la règle).
+        """
+        for offset in ("0.456789", "4.567890", "9.500001"):
+            with self.subTest(offset=offset):
+                db = self._db(-6)
+                try:
+                    name = "rounded10" + offset.replace(".", "")
+                    marker = self._legacy_marker_at(db, name, offset=offset,
+                                                    turn_id="B")
+                    key = self._historical_key(name, marker)
+                    key_epoch = float(key.rsplit(":", 1)[1])
+                    self.assertAlmostEqual(
+                        key_epoch % 10.0, 0.0, places=6,
+                        msg="la clé n'est pas arrondie aux dizaines")
+                    exact = self._epoch(marker["created_at"])
+                    self.assertLessEqual(abs(key_epoch - exact), 5.0 + 1e-6)
+                    db.execute(
+                        "INSERT INTO account_reservations (billing_account, agent,"
+                        " usd, period, state, spend_key, created_at)"
+                        " VALUES ('deepseek-manaty', %s, 2.0, current_date,"
+                        " 'open', %s, now())", (name, key))
+
+                    relu = registry.pending_spend_get(db, name)
+                    self.assertFalse(relu["ledger_ambiguous"],
+                                     "la clé authentique a été jugée étrangère")
+                    self.assertEqual(relu["ledger_key"], key)
+
+                    worker = self._worker(db, name)
+                    self.assertTrue(worker._compta_ecrit(relu))
+                    self.assertIsNone(registry.pending_spend_get(db, name))
+                    lignes = db.query(
+                        "SELECT spend_key FROM turn_costs WHERE agent = %s",
+                        (name,))
+                    self.assertEqual([ligne["spend_key"] for ligne in lignes], [key])
+                finally:
+                    db.close()
+
     def test_cle_historique_ne_s_elargit_pas_a_une_fenetre(self):
         """B1 : une clé étrangère à 0,1 s n'est pas un arrondi du marqueur.
 
