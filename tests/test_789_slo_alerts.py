@@ -400,9 +400,20 @@ class ReviewGateRepositoryTest(_Base):
                         cwd=repo)
         registry.upsert(self.db, "cx", harness="codex", host=self.cfg.host)
         row = dict(work.get(self.db, self.lot["id"]), branch_target="main")
+        # #2928 : un avis sensible ne compte que sur son reçu exact, lu sur le
+        # vrai jalon ; l'avis est donc posé en base avant d'être relu.
+        mark = work.milestone(self.db, self.lot["id"], "verdict", sha=sha,
+                              actor="cx", verdict="ok", repo=repo)
+        self.db.execute(
+            "INSERT INTO provenance_receipts"
+            " (subject, sha, actor, session, turn, harness, work_item_id)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            " ON CONFLICT (subject) DO NOTHING",
+            ("milestone:%d" % int(mark["id"]), sha, "cx", "s-codex", "t",
+             "codex", self.lot["id"]))
         marks = [{"kind": "frozen", "sha": sha, "actor": "dev1", "at_ts": 1},
-                 {"kind": "verdict", "sha": sha, "actor": "cx", "verdict": "ok",
-                  "at_ts": 2}]
+                 {"kind": "verdict", "id": int(mark["id"]), "sha": sha,
+                  "actor": "cx", "verdict": "ok", "at_ts": 2}]
         gate = merge_queue.review_gate_for_item(self.db, self.cfg, row, marks)
         self.assertIsNotNone(gate)
         self.assertEqual(gate["required"], 1)
@@ -918,6 +929,63 @@ def stagnation_wait(db, lot, now):
     from ameesh import stagnation
     row = work.get(db, lot["id"])
     return stagnation.describe(db, [row], now=now)[int(lot["id"])]["planned_wait"]
+
+
+class RetourAttenteHumaineTest(_Base):
+    """#2916 : au retour en intake après une décision owner, le délai intake
+    repart de ce retour. Les quatre alertes de niveau 3 du 21/10 venaient de
+    lots sortis de `waiting_human` : leur porteur reprenait le travail, une
+    réattribution aurait cassé ce tour."""
+
+    def answer_after_two_days(self):
+        """Le lot attend une décision owner 2 jours, puis elle est rendue."""
+        held_s = 2 * 24 * HEURE
+        self.age(held_s)
+        view = decisions.ask(self.cfg, self.db, requester="dev1",
+                             question="Quel critère pour la porte des avis ?",
+                             options=["a=union", "b=par auteur"],
+                             lot=str(self.lot["id"]))
+        self.assertEqual(work.get(self.db, self.lot["id"])["state"], "waiting_human")
+        # la demande a tenu le lot depuis son début (journal)
+        self.db.execute(
+            "UPDATE work_item_events SET created_at = now() - make_interval(secs => %s)"
+            " WHERE work_item_id = %s AND state = 'waiting_human'",
+            (float(held_s) - 60.0, self.lot["id"]))
+        result = decisions.answer(self.cfg, self.db, view["id"], "a",
+                                 human="human:alice", channel="cli")
+        self.assertEqual(work.get(self.db, self.lot["id"])["state"], "intake")
+        self.assertEqual(result["lot"]["state"], "intake")
+        return time.time()
+
+    def test_retour_en_intake_repart_de_la_decision(self):
+        answered = self.answer_after_two_days()
+        for offset, levels in ((300, []), (3660, [1])):
+            with self.subTest(offset=offset):
+                self.now = answered + offset
+                alerts = [a for a in self.slo() if a["step"] == "intake_started"]
+                self.assertEqual([a["level"] for a in alerts], levels)
+
+    def test_hold_de_pilote_repart_de_la_levee(self):
+        # #2916/#1225 : le cas réel nexlink #1225 — un lot parqué deux jours
+        # sous un hold de pilote ne demande pas de réattribution à la levée.
+        self.age(2 * 24 * HEURE)
+        work.note(self.db, self.lot["id"], "hold: attente des gestes owner",
+                  actor="human:pilote")
+        # la retenue date du début du lot (journal)
+        self.db.execute(
+            "UPDATE work_item_events SET created_at = now() - make_interval(secs => %s)"
+            " WHERE work_item_id = %s AND note LIKE 'hold:%%'",
+            (2 * 24 * HEURE - 60.0, self.lot["id"]))
+        self.now = time.time()
+        self.assertEqual([a for a in self.slo() if a["step"] == "intake_started"], [])
+        lifted = time.time()
+        work.note(self.db, self.lot["id"], "unhold: gestes owner faits",
+                  actor="human:pilote")
+        for offset, levels in ((300, []), (3660, [1])):
+            with self.subTest(offset=offset):
+                self.now = lifted + offset
+                alerts = [a for a in self.slo() if a["step"] == "intake_started"]
+                self.assertEqual([a["level"] for a in alerts], levels)
 
 
 class NotifyLivreTest(_Base):

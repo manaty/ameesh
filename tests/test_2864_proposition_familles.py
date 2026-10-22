@@ -157,8 +157,9 @@ class PropositionFamillesTest(_Stacked, PgTestCase):
     def test_la_marque_d_un_gel_anterieur_ne_couvre_pas_le_nouveau(self):
         self.freeze()
         # nouveau gel sans désignation : la lecture du gel courant manque.
-        work.milestone(self.db, self.lot, "frozen", sha="b" * 40, actor="author",
-                       on_frozen=lambda *args: None)
+        # Posé au stockage, ce témoin lit les marques, pas la porte du gel.
+        storage.of(self.db).work.add_milestone(
+            self.lot, "frozen", sha="b" * 40, actor="author", verdict=None, note="")
         self.assertEqual(self.take(), [])
         self.assertEqual(self.mails("cx1"), [])
         self.assertEqual(self.mails("r1"), [])

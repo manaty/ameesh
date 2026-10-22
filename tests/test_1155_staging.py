@@ -795,6 +795,37 @@ class SanteCourrierTest(unittest.TestCase):
             self.assertEqual(self.mod.sans_executeur(object(), rows, 0.0, 1000.0), [])
         unread.assert_not_called()
 
+    def test_sans_executeur_exclut_le_profil_humain_meme_en_mode_execute(self):
+        """#2957 : une ligne humaine (cle owner / harness none) n'est pas un
+        executant a relancer : elle reste dans canal_humain, jamais comptee
+        deux fois."""
+        rows = [{'name': 'smichea', 'status': 'idle', 'mode': 'execute',
+                 'key_role': 'owner', 'harness': 'none',
+                 'responsible': 'human:smichea'},
+                {'name': 'orchestrateur', 'status': 'idle'}]
+        with mock.patch.object(self.mod.mail, 'unread_active',
+                               return_value=[{'id': 1, 'created_ts': 900.0}]), \
+             mock.patch.object(self.mod.mail, 'maybe_redelivered', return_value=False):
+            self.assertEqual(
+                [e['destinataire'] for e in
+                 self.mod.sans_executeur(object(), rows, 0.0, 1000.0)],
+                ['orchestrateur'])
+            self.assertEqual(
+                [e['destinataire'] for e in
+                 self.mod.canal_humain(object(), 'h', 1000.0, rows)],
+                ['smichea'])
+
+    def test_sans_executeur_lit_le_prefixe_de_pause_budget(self):
+        """#2957 : la pause budget se lit avec budget.PAUSE_PREFIX, pas un
+        litteral qui deriverait si le prefixe changeait."""
+        rows = [{'name': 'budget', 'status': 'blocked',
+                 'status_text': 'pause : compte epuise'}]
+        with mock.patch.object(self.mod.budget, 'PAUSE_PREFIX', 'pause : '):
+            with mock.patch.object(self.mod.mail, 'unread_active') as unread:
+                self.assertEqual(
+                    self.mod.sans_executeur(object(), rows, 0.0, 1000.0), [])
+            unread.assert_not_called()
+
     def test_sans_executeur_nomme_un_bloque_avec_erreur(self):
         """#2899 : un bloque sans bail et hors pause budget garde sa cause et
         son courrier ; il n'est plus invisible."""
@@ -858,9 +889,26 @@ class SanteCourrierTest(unittest.TestCase):
                   'alerte': 'stopped_with_mail',
                   'lecture': 'agent-mail inbox smichea'},
                  {'destinataire': 'chat-smichea', 'n': 1, 'plus_ancien_s': 10.0,
+                  'responsable': 'human:smichea', 'canal': 'chat',
+                  'alerte': None,
+                  'lecture': 'agent-mail inbox chat-smichea'}])
+
+    def test_canal_humain_fallback_owner_pour_un_profil_sans_responsable(self):
+        """#2957 : un profil externe sans responsable prend le canal humain du
+        proprietaire, lu au registre ; le rapport ne laisse pas 'human:?'."""
+        rows = [{'name': 'veille', 'host': 'h', 'status': 'idle',
+                 'mode': 'externe', 'harness': 'other'}]
+        owner = [{'name': 'smichea', 'key_role': 'owner',
+                  'responsible': 'human:smichea', 'host': 'h'}]
+        with mock.patch.object(self.mod.registry, 'overview', return_value=owner), \
+             mock.patch.object(self.mod.mail, 'unread_active',
+                               return_value=[{'id': 4, 'created_ts': 990.0}]):
+            self.assertEqual(
+                self.mod.canal_humain(object(), 'h', 1000.0, rows),
+                [{'destinataire': 'veille', 'n': 1, 'plus_ancien_s': 10.0,
                   'responsable': 'human:smichea', 'canal': 'human:smichea',
                   'alerte': 'idle_with_mail',
-                  'lecture': 'agent-mail inbox chat-smichea'}])
+                  'lecture': 'agent-mail inbox veille'}])
 
     def test_main_sans_executeur_sort_ko_avec_sa_cause(self):
         """#2899 : un destinataire operationnel sans bail vivant est un KO

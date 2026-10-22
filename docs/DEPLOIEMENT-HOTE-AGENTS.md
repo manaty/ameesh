@@ -237,7 +237,15 @@ session humaine sans exécuteur (`mode=externe`, dont le propriétaire porte-cl�
 boîte morte ni comme souffrance : son courrier est listé dans `canal_humain`,
 avec l’humain responsable, l’alerte poussée (`stopped_with_mail` ou
 `idle_with_mail`) et la lecture sans marquage (`agent-mail inbox <nom>`) ; ce
-courrier ne bloque pas la séquence.
+courrier ne bloque pas la séquence. Un profil sans responsable déclaré prend le
+canal humain du propriétaire, lu dans le registre (`key_role=owner`) : le
+rapport ne laisse plus `canal: "human:?"` quand le propriétaire est connu. Une
+session de chat (`chat-<humain>`) reste un canal humain, mais elle lit son
+courrier à l’ouverture de la conversation : son entrée porte `canal: "chat"` et
+`alerte: null`, jamais `idle_with_mail`/`stopped_with_mail` qu’aucune alerte
+poussée ne couvre (#2957). Les profils humains sont aussi exclus de
+`sans_executeur`, même si une ligne `mode=execute` portait `key_role=owner` ou
+`harness=none` : ils ne sont jamais comptés deux fois (#2957).
 
 ## Signal « staging actif » (#1323)
 

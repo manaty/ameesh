@@ -57,6 +57,25 @@ FREEZE_ABSENT_MARK = "ameesh-freeze-absent:"
 #: ligne fournie par `--note` est retirée avant que le gel n'écrive la sienne
 #: (sinon `--note "ameesh-freeze-absent: main"` contournerait le garde #2784).
 FREEZE_ABSENT_LINE = re.compile(r"(?m)^[ \t]*ameesh-freeze-absent:[^\n]*(?:\n|$)")
+#: #2971 : toute marque machine de la note de gel (`ameesh-freeze-absent`,
+#: `ameesh-freeze-unverified`, `ameesh-freeze-unpublished`,
+#: `ameesh-freeze-supersedes`, ...) est une preuve du gate, jamais une note
+#: d'appelant. Le motif est générique pour couvrir aussi les marques des
+#: branches #2962/#2989 : une ligne fournie par `--note` est retirée avant
+#: l'écriture, comme `FREEZE_ABSENT_LINE` le fait pour `absent`.
+#: Le motif juge une ligne déjà strippée : `add_milestone` strippe la note
+#: finale, donc un blanc de tête (`\v`, `\f`, espace insécable) ne doit pas
+#: cacher la marque (#2971, revue impl-05 — même classe que #2989 B).
+FREEZE_MACHINE_LINE = re.compile(r"ameesh-freeze-[a-z0-9-]+:")
+
+#: #2962 : un gel résolu localement mais absent de `origin/<branche>` après
+#: rafraîchissement reste accepté (geler puis pousser dans le même tour est
+#: permis), mais l'avertissement est explicite dans la sortie et dans la note.
+FREEZE_UNPUBLISHED_MARK = "ameesh-freeze-unpublished:"
+#: #2962 (exception du gel distant) : aucun dépôt de l'auteur n'est lisible
+#: depuis l'hôte. La tête complète est écrite **avec une note**, jamais tenue
+#: pour vérifiée : on ne devine pas un commit qu'aucun dépôt ne peut lire.
+FREEZE_UNVERIFIED_MARK = "ameesh-freeze-unverified:"
 
 
 def milestones(db: Db, item_id: int, limit: int = 100) -> list[dict]:
@@ -103,12 +122,72 @@ def _head_repos(db: Db, item: dict) -> list[str]:
         candidates.append(fire._repo_of(db, item))
     except Exception:  # noqa: BLE001 - registre illisible : pas de dépôt
         pass
+    # #2928 : une tête relue peut vivre dans le dépôt du canon (le cas des
+    # lots `canon/**`), pas dans le dépôt du projet. Elle s'y résout, et la
+    # preuve #1465 s'y écrit — sans cela le verdict s'écrivait sans reçu et
+    # la porte sensible ne pouvait plus le compter.
+    try:
+        from . import canon as canon_mod
+        for entry in canon_mod.configured(getattr(db, "cfg", None)):
+            candidates.append(getattr(entry, "path", ""))
+    except Exception:  # noqa: BLE001 - canon illisible : pas de dépôt
+        pass
     seen: list[str] = []
     for path in candidates:
         path = str(path or "").strip()
         if path and path not in seen and os.path.isdir(path):
             seen.append(path)
     return seen
+
+
+def _author_repos(db: Db, item: dict) -> list[str]:
+    """Les dépôts **de l'auteur** lisibles depuis l'hôte (#2962).
+
+    Seuls comptent le dépôt du projet (radar) et le dossier de travail de
+    l'assigné (registre), pas le répertoire courant : `_head_repos` accepte le
+    cwd comme lieu de résolution commode, mais il n'est pas la preuve que
+    l'auteur peut lire sa propre tête. Un dossier qui existe sans être un
+    checkout git n'est pas un dépôt lisible (`fire._checkout`)."""
+    candidates: list = []
+    try:
+        from . import fire
+    except Exception:  # noqa: BLE001 - pas de validateur : pas de dépôt
+        return []
+    try:
+        from . import lot_class
+        candidates.append(lot_class.repository(getattr(db, "cfg", None), item))
+    except Exception:  # noqa: BLE001 - réglages illisibles : pas de dépôt
+        pass
+    try:
+        candidates.append(fire._repo_of(db, item))
+    except Exception:  # noqa: BLE001 - registre illisible : pas de dépôt
+        pass
+    seen: list[str] = []
+    for path in candidates:
+        where = fire._checkout(str(path or "").strip())
+        if where and where not in seen:
+            seen.append(where)
+    return seen
+
+
+def _proof_repo(db: Db, item: dict, sha: str,
+                repo: str | None = None) -> str | None:
+    """Le dépôt où `sha` se résout, pour la preuve exacte du jalon (#1465/#2928).
+
+    Le répertoire courant d'un relecteur n'est pas celui de la tête relue
+    quand elle vit dans un autre dépôt — le dépôt canon, par exemple. Sans ce
+    dépôt, `proof_for_current_turn` ne résout pas le commit, n'écrit aucun
+    reçu, et la porte sensible refuse désormais ce verdict : la preuve se
+    résout donc là où le commit existe. Rend None quand aucun dépôt ne le
+    connaît : le jalon s'écrit alors sans preuve, comme avant."""
+    text = str(sha or "").strip().lower()
+    if not text:
+        return None
+    from . import freeze_checks
+    for where in ([repo] if repo else []) + _head_repos(db, item):
+        if freeze_checks.commit_in(where, text):
+            return where
+    return None
 
 
 def _proposed_head(db: Db, item: dict, frozen: str, repo: str | None = None) -> str:
@@ -150,12 +229,13 @@ def reviewed_head(db: Db, item: dict, sha: str, *, repo: str | None = None) -> s
     """Le `sha` d'un verdict, vérifié et normalisé (#2674).
 
     Un avis ne compte à la porte (`merge_queue.review_gate`) que s'il nomme la
-    tête relue : un commit complet (40 ou 64 hexadécimaux), ou une abréviation
-    d'au moins [`REVIEWED_HEAD_MIN`] caractères **résolue** — dans `repo`
-    (nommé par `--repo`, alors autoritaire), sinon dans le répertoire courant,
-    le dépôt du projet ou celui de l'assigné, ou encore dans la tête gelée
-    courante. Un `sha` vide, trop court, non hexadécimal ou non résolu est
-    refusé avec la tête gelée proposée : le jalon n'est pas écrit, plutôt
+    tête relue : un commit **résolu** — dans `repo` (nommé par `--repo`, alors
+    autoritaire), sinon dans le répertoire courant, le dépôt du projet ou celui
+    de l'assigné — ou la tête gelée courante. #2962 : un texte de 40
+    hexadécimaux n'est plus cru sur parole ; il doit se résoudre comme une
+    abréviation, ou nommer exactement la tête gelée (le relecteur peut ne pas
+    avoir le dépôt). Un `sha` vide, trop court, non hexadécimal ou non résolu
+    est refusé avec la tête gelée proposée : le jalon n'est pas écrit, plutôt
     qu'un avis qui ne pourrait jamais franchir la porte."""
     text = str(sha or "").strip().lower()
     if not text:
@@ -170,9 +250,15 @@ def reviewed_head(db: Db, item: dict, sha: str, *, repo: str | None = None) -> s
             "verdict refused (head-missing): --sha %r is not a commit id: give the full "
             "head, or an abbreviation of at least %d hex characters (`--sha`)"
             % (sha, REVIEWED_HEAD_MIN), repo=repo)
-    if _FULL_HEAD.fullmatch(text):
-        return text
     from . import freeze_checks
+    # #2962 : une tête **complète** n'est plus crue sur parole. Elle vaut
+    # quand elle nomme exactement la tête gelée courante (même si aucun dépôt
+    # local ne la porte : la tête gelée fait foi, et `--repo` ne peut pas
+    # l'effacer), sinon il faut un dépôt qui la résolve.
+    full = bool(_FULL_HEAD.fullmatch(text))
+    frozen = frozen_head(db, item["id"]) if full else ""
+    if full and frozen == text:
+        return text
     if repo:
         if freeze_checks.commit_in(repo, text):
             return text
@@ -183,8 +269,9 @@ def reviewed_head(db: Db, item: dict, sha: str, *, repo: str | None = None) -> s
     for where in _head_repos(db, item):
         if freeze_checks.commit_in(where, text):
             return text
-    frozen = frozen_head(db, item["id"])
-    if frozen and frozen.startswith(text):
+    if not full:
+        frozen = frozen_head(db, item["id"])
+    if frozen and (frozen == text if full else frozen.startswith(text)):
         return text
     raise _head_refusal(
         db, item,
@@ -291,9 +378,69 @@ def _freeze_absent_marker(db: Db, item: dict, full: str, repo: str | None,
     return "ameesh-freeze-absent: " + " ".join(absent[:8])
 
 
+def _freeze_unpublished(db: Db, item: dict, full: str, repo: str | None,
+                        refreshed: dict | None = None, *, where: str = "") -> str:
+    """La ligne d'avertissement d'un gel absent de `origin/<branche>` (#2962).
+
+    Le gel **n'est pas refusé** : geler puis pousser dans le même tour reste
+    permis. Mais la tête n'est lisible par les autres hôtes qu'une fois la
+    branche poussée ; le gel de #2914 sur 66a06cf0, jamais poussé, a envoyé
+    une désignation sur une tête que personne ne pouvait lire. Le clone est
+    rafraîchi avant la lecture (même cache `refreshed` que la marque #2786) ;
+    une forge illisible ou un fetch refusé n'écrit rien, on ne devine pas.
+    `where` est le dépôt qui a résolu la tête (rendu par `freeze_head`)."""
+    from . import freeze_checks, plan_git
+    branch = str((item or {}).get("branch") or "").strip()
+    if not branch or not full:
+        return ""
+    holder = str(where or "").strip()
+    if not holder:
+        for candidate in ([repo] if repo else []) + _head_repos(db, item):
+            if candidate and freeze_checks.commit_in(candidate, full):
+                holder = candidate
+                break
+    if not holder:
+        return ""
+    try:
+        if plan_git._out(holder, "remote", "get-url", "origin") is None:
+            return ""                      # rien de publié à comparer
+        cache = refreshed if refreshed is not None else {}
+        if plan_git.refresh_clone(holder, "", cache).get("origin"):
+            return ""                      # forge illisible : pas de devinette
+        if plan_git._commit(holder, "refs/remotes/origin/" + branch) is None:
+            detail = "branch not published"
+        elif not plan_git._is_ancestor(holder, full, "refs/remotes/origin/" + branch):
+            detail = "not in the published branch"
+        else:
+            return ""                      # la tête est publiée : rien à dire
+    except Exception:  # noqa: BLE001 - refs illisibles : pas d'avertissement
+        return ""
+    return ("%s %s is not in origin/%s after refresh (%s); push the lot branch "
+            "(freezing before pushing in the same turn stays allowed)"
+            % (FREEZE_UNPUBLISHED_MARK, full[:12], branch, detail))
+
+
+def _freeze_unresolved(text: str, repo: str | None = None) -> str:
+    """Le refus nommé d'une tête de gel qu'aucun dépôt ne résout (#2962).
+
+    Même message pour une abréviation et pour un commit complet : la tête
+    complète n'est pas crue sur parole, elle doit être lisible quelque part.
+    Le `repo` nommé est autoritaire ; hors `--repo`, le refus nomme les lieux
+    où l'auteur peut geler."""
+    if repo:
+        return ("freeze refused (head-unresolved): %s does not name a commit of %s; "
+                "freeze from the lot's worktree or pass --repo <the repository "
+                "holding the commit>" % (text, repo))
+    return ("freeze refused (head-unresolved): %s does not resolve to a commit "
+            "in the author's repository (current directory, project repository, "
+            "assignee's worktree); freeze from the lot's worktree or pass --repo "
+            "<the repository holding the commit>" % text)
+
+
 def freeze_head(db: Db, item: dict, sha: str, *, repo: str | None = None,
-                refreshed: dict | None = None) -> str:
-    """La tête d'un gel, écrite en commit complet (#2786).
+                refreshed: dict | None = None,
+                outcome: dict | None = None) -> str:
+    """La tête d'un gel, écrite en commit complet (#2786, #2962).
 
     Un gel est une tête **immuable** : il ne peut nommer qu'un commit
     complet (40 ou 64 hexadécimaux), ou une abréviation hexadécimale d'au
@@ -305,60 +452,64 @@ def freeze_head(db: Db, item: dict, sha: str, *, repo: str | None = None,
     résoudrait dans SON clone et que le balayage d'un autre arbre passerait
     le lot en `merged` sur un commit que personne n'a relu (#2712).
 
+    #2962 : un SHA complet doit lui aussi se résoudre dans `repo` ou dans
+    [`_head_repos`], pas seulement avoir 40 caractères hexadécimaux. Une
+    tête que personne ne peut lire n'est pas un gel : elle a déjà envoyé une
+    désignation sur un commit introuvable (#2914, 66a06cf0). **Décision pour
+    le gel distant** — quand *aucun dépôt de l'auteur* n'est lisible depuis
+    l'hôte (ni le dépôt du projet, ni le dossier de l'assigné), on **accepte**
+    la tête complète **avec la note `ameesh-freeze-unverified`** : refuser
+    ferait dépendre un gel d'un clone que l'hôte n'a pas, et la note dit
+    exactement ce qui n'a pas été vérifié. C'est la seule exception ; dès
+    qu'un dépôt de l'auteur est lisible, un SHA complet absent de tous les
+    dépôts est refusé `head-unresolved`.
+
     (4) : quand le dépôt de l'auteur est lisible, un commit déjà ancêtre de
     la cible **publiée rafraîchie** est refusé — il n'a aucun commit propre
     et ne prouverait aucune livraison (#2784). `refreshed` est le cache de
-    fetch partagé avec [`_freeze_absent_marker`] pour un même gel. Le `sha`
-    rendu est donc toujours le commit complet à stocker."""
+    fetch partagé avec [`_freeze_absent_marker`] et [`_freeze_unpublished`]
+    pour un même gel. `outcome` (facultatif) reçoit le dépôt qui a résolu la
+    tête ou la marque `unverified` : l'appelant en tire la note, sans
+    redemander au disque. Le `sha` rendu est le commit complet à stocker."""
     from .work import WorkError
     text = str(sha or "").strip().lower()
     from . import freeze_checks
-    if _FULL_HEAD.fullmatch(text):
-        full = text
-    elif not text:
+    if not text:
         raise WorkError(
             "freeze refused (head-missing): a freeze must name the frozen commit — "
             "the full 40-hex commit id, or an abbreviation of at least %d hex "
             "characters resolved in the author's repository (`--sha`)"
             % FROZEN_HEAD_MIN)
-    elif not _REVIEWED_HEAD.fullmatch(text):
+    if not _REVIEWED_HEAD.fullmatch(text):
         raise WorkError(
             "freeze refused (head-missing): --sha %r is not a commit id — a symbolic "
             "ref (HEAD, a branch) is never resolved for a freeze: resolve it first "
             "(`git rev-parse <ref>`) and pass the full commit id, or an abbreviation "
             "of at least %d hex characters (`--sha`)" % (sha, FROZEN_HEAD_MIN))
-    else:
-        full = ""
-        if repo:
-            resolved = freeze_checks.commit_in(repo, text)
-            if resolved and resolved.lower().startswith(text):
-                full = resolved.lower()
-            else:
-                raise WorkError(
-                    "freeze refused (head-unresolved): %s does not name a commit of %s; "
-                    "freeze from the lot's worktree or pass --repo <the repository "
-                    "holding the commit>" % (text, repo))
-        else:
-            for where in _head_repos(db, item):
-                resolved = freeze_checks.commit_in(where, text)
-                if resolved and resolved.lower().startswith(text):
-                    full = resolved.lower()
-                    _refuse_freeze_already_in_target(where, item, full, refreshed)
-                    return full
-            if not full:
-                raise WorkError(
-                    "freeze refused (head-unresolved): %s does not resolve to a commit "
-                    "in the author's repository (current directory, project repository, "
-                    "assignee's worktree); freeze from the lot's worktree or pass --repo "
-                    "<the repository holding the commit>" % text)
+    if repo:
+        resolved = freeze_checks.commit_in(repo, text)
+        if not resolved or not resolved.lower().startswith(text):
+            raise WorkError(_freeze_unresolved(text, repo))
+        full = resolved.lower()
+        if outcome is not None:
+            outcome["repo"] = repo
         _refuse_freeze_already_in_target(repo, item, full, refreshed)
         return full
-    # commit complet : on cherche un dépôt qui le contient pour la garde (4)
-    for where in ([repo] if repo else []) + _head_repos(db, item):
-        if where and freeze_checks.commit_in(where, full):
+    for where in _head_repos(db, item):
+        resolved = freeze_checks.commit_in(where, text)
+        if resolved and resolved.lower().startswith(text):
+            full = resolved.lower()
+            if outcome is not None:
+                outcome["repo"] = where
             _refuse_freeze_already_in_target(where, item, full, refreshed)
-            break
-    return full
+            return full
+    if _FULL_HEAD.fullmatch(text) and not _author_repos(db, item):
+        # #2962, exception du gel distant : la note `unverified` est écrite par
+        # `milestone`; on ne prétend pas que la tête a été vérifiée.
+        if outcome is not None:
+            outcome["unverified"] = True
+        return text
+    raise WorkError(_freeze_unresolved(text))
 
 
 def milestone(
@@ -384,18 +535,24 @@ def milestone(
     livraison hors cible : 0013, 0026, #988), les déclarer à la main serait un
     mensonge sur la frise.
 
-    `verdict` (#2674) exige une tête relue : le `sha` est vérifié par
-    [`reviewed_head`] avant toute écriture — complet, ou abréviation de 12
-    caractères au moins résolue dans un dépôt. Sans elle, le jalon est refusé
-    avec la tête gelée courante proposée ; un avis qui ne peut pas compter à
-    la porte n'est plus accepté en silence. `repo` (facultatif) est le dépôt
-    nommé par `--repo`, où une abréviation doit alors se résoudre.
+    `verdict` (#2674, #2962) exige une tête relue : le `sha` est vérifié par
+    [`reviewed_head`] avant toute écriture — un commit **résolu** dans un
+    dépôt (ou `repo`), ou la tête gelée courante. Un texte complet de 40
+    hexadécimaux n'est plus accepté sur parole. Sans résolution, le jalon est
+    refusé avec la tête gelée courante proposée ; un avis qui ne peut pas
+    compter à la porte n'est plus accepté en silence. `repo` (facultatif) est
+    le dépôt nommé par `--repo`, où la tête doit alors se résoudre.
 
-    `frozen` (#2786) exige une tête **immuable** : le `sha` est vérifié par
-    [`freeze_head`] avant toute écriture — commit complet, ou abréviation
-    hexadécimale d'au moins 12 caractères résolue dans le dépôt de l'auteur
-    et alors écrite complète ; une ref symbolique (`HEAD`, une branche) est
-    refusée, parce que chaque lecteur la résoudrait dans son propre clone.
+    `frozen` (#2786, #2962) exige une tête **immuable** : le `sha` est vérifié
+    par [`freeze_head`] avant toute écriture — commit complet **résolu** dans
+    un dépôt (ou `repo`), ou abréviation hexadécimale d'au moins 12 caractères
+    résolue dans le dépôt de l'auteur et alors écrite complète ; une ref
+    symbolique (`HEAD`, une branche) est refusée, parce que chaque lecteur la
+    résoudrait dans son propre clone. Un gel distant, sans aucun dépôt de
+    l'auteur lisible, écrit la tête complète avec la note
+    [`FREEZE_UNVERIFIED_MARK`]. Un gel résolu mais absent de
+    `origin/<branche>` après rafraîchissement est accepté avec la note
+    [`FREEZE_UNPUBLISHED_MARK`] (geler puis pousser dans le même tour).
 
     `on_frozen` (facultatif, #1617) : le callback du gel, appelé dans la
     transaction du jalon `frozen` avec `(tx, milestone, after_commit)`. Il
@@ -441,6 +598,19 @@ def milestone(
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
+    # #2971 : `--note` ne fournit aucune preuve machine de gel. Le retrait est
+    # fait ici, avant les marques que le gate ajoute lui-même, pour que
+    # `unverified`/`unpublished` (#2962) et `supersedes` (#2989) restent
+    # écrites par le gate et ne soient jamais effacées par un appelant.
+    # #2971 (revue impl-05) : `add_milestone` strippe la note finale. Un filtre
+    # ligne à ligne sur `^[ \t]*` laissait donc une ligne machine précédée d'un
+    # blanc Unicode (`\v`, `\f`, espace insécable) devenir valide après ce
+    # strip ; retirer une autre ligne pouvait aussi l'exposer. On juge chaque
+    # ligne sur sa forme strippée — exactement celle que la lecture verra — puis
+    # on strippe l'ensemble : aucune marque fournie par `--note` ne survit.
+    note = "\n".join(
+        line for line in str(note or "").splitlines()
+        if not FREEZE_MACHINE_LINE.match(line.strip())).strip()
     if kind == "verdict":
         # #2674 : refuser à l'écriture un avis qui ne nomme pas la tête relue.
         sha = reviewed_head(db, item, sha, repo=repo)
@@ -449,12 +619,28 @@ def milestone(
         # résoudrait dans son clone. Le cache de fetch est partagé avec la
         # marque (5) : la cible publiée n'est rafraîchie qu'une fois.
         refreshed: dict = {}
-        sha = freeze_head(db, item, sha, repo=repo, refreshed=refreshed)
+        freeze_info: dict = {}
+        sha = freeze_head(db, item, sha, repo=repo, refreshed=refreshed,
+                          outcome=freeze_info)
         # (5) : la marque des branches où le gel était absent, pour que le
         # balayage ne confonde pas une livraison (avance rapide) avec un gel
         # déjà dans la cible. C'est une preuve machine : une ligne fournie par
         # l'appelant (`--note`) est ignorée et refaite ici (#2786, avis dev4).
         note = FREEZE_ABSENT_LINE.sub("", note).rstrip()
+        # #2962 : un gel distant sans dépôt d'auteur lisible est écrit avec sa
+        # note ; un gel résolu mais pas encore poussé n'est pas refusé, mais
+        # l'avertissement `freeze-unpublished` est explicite (note et sortie).
+        if freeze_info.get("unverified"):
+            note = ((note + "\n" if note else "")
+                    + "%s no repository of the author is readable from this host; "
+                      "%s is written unverified (freeze from the lot's worktree or "
+                      "pass --repo)" % (FREEZE_UNVERIFIED_MARK, sha[:12]))
+        else:
+            warning = _freeze_unpublished(
+                db, item, sha, repo, refreshed,
+                where=str(freeze_info.get("repo") or ""))
+            if warning:
+                note = (note + "\n" if note else "") + warning
         marker = _freeze_absent_marker(db, item, sha, repo, refreshed)
         if marker:
             note = (note + "\n" if note else "") + marker
@@ -475,8 +661,11 @@ def milestone(
     # preuve exacte de son origine (acteur, session, tour, harnais, sha
     # complet). Hors tour (orchestrateur, humain), le jalon s'écrit sans
     # preuve : l'origine reste inconnue, jamais devinée par proximité.
+    # #2928 : la preuve se résout dans le dépôt qui porte la tête (le canon
+    # pour un lot `canon/**`), pas seulement dans le répertoire courant.
     from . import review_provenance
-    proof = review_provenance.proof_for_current_turn(db, actor=actor, sha=sha)
+    proof = review_provenance.proof_for_current_turn(
+        db, actor=actor, sha=sha, cwd=_proof_repo(db, item, sha, repo))
     if proof and not actor:
         actor = proof["actor"]
     row = storage.of(db).work.add_milestone(

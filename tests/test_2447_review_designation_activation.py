@@ -427,6 +427,10 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.repo.git("checkout", "-q", self.base)
         self.repo.git("commit", "-q", "--allow-empty", "-m", "gel vide")
         self.frozen = self.repo.git("rev-parse", "HEAD")
+        # #2924 : le gel suivant relit la provenance des gels antérieurs ; ce
+        # commit porte donc son reçu comme tout commit du lot, même si un gel
+        # sans chemin ne lit pas ses propres auteurs.
+        self.receipts(commits=[self.frozen])
         first, light = self.freeze()
         self.assertEqual(light["state"], rd.NONE, light)
         self.repo.git("checkout", "-q", branch)
@@ -1272,7 +1276,8 @@ class ActivationCliTest(_ActivationFixture, PgTestCase):
         proc = self.mesh(
             "work", "milestone", str(self.lot), "frozen", "--sha", self.frozen,
             "--actor", "author",
-            env=self.env(AMEESH_CANON=self.canon.root, AMEESH_CANON_REF="HEAD"))
+            env=self.env(AMEESH_CANON=self.canon.root, AMEESH_CANON_REF="HEAD",
+                         AGENT_MAIL_NAME="author"))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("reviewers: r1 (claude), r2 (codex)", proc.stdout)
         self.assertEqual([m["recipient"] for m in self.mailbox()], ["r1", "r2"])
@@ -1288,7 +1293,8 @@ class ActivationCliTest(_ActivationFixture, PgTestCase):
         proc = self.mesh(
             "work", "milestone", str(self.lot), "frozen", "--sha", self.frozen,
             "--actor", "author",
-            env=self.env(AMEESH_CANON=self.canon.root, AMEESH_CANON_REF="HEAD"))
+            env=self.env(AMEESH_CANON=self.canon.root, AMEESH_CANON_REF="HEAD",
+                         AGENT_MAIL_NAME="author"))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("review: none", proc.stdout)
         self.assertIn("no pre-merge reviewer", proc.stdout)

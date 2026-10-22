@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import io
 import json
 import os
@@ -19,6 +20,8 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
+
+from . import support  # isolate the test environment before importing product code
 
 from ameesh import device_state as D
 from ameesh import host_cli
@@ -227,6 +230,146 @@ class SocketTest(unittest.TestCase):
         with open(path, encoding="utf-8") as fh:
             self.assertEqual(fh.read(), "keep me")
 
+    def test_uncertain_connect_errors_never_remove_a_socket(self):
+        path = os.path.join(self.dir, "device.sock")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(sock.close)
+        sock.bind(path)
+        for error in (BlockingIOError(errno.EAGAIN, "backlog full"),
+                      PermissionError(errno.EACCES, "denied"),
+                      TimeoutError("probe timed out")):
+            with self.subTest(error=error), mock.patch.object(D.socket, "socket") as probe:
+                probe.return_value.connect.side_effect = error
+                with self.assertRaises(D.DeviceError):
+                    D.StateChannel(path, build)
+                self.assertTrue(os.path.exists(path))
+                probe.return_value.close.assert_called_once()
+
+    def test_a_full_listen_backlog_does_not_remove_a_live_socket(self):
+        path = os.path.join(self.dir, "device.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(path)
+        listener.listen(0)
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(client.close)
+        client.connect(path)
+        with self.assertRaises(D.DeviceError):
+            D.StateChannel(path, build)
+        self.assertTrue(os.path.exists(path))
+        accepted, _ = listener.accept()
+        accepted.close()
+
+    def test_stale_sockets_from_previous_runner_pids_are_reaped(self):
+        stale = []
+        for prefix in (D.STATE_PREFIX, D.CONTROL_PREFIX):
+            path = os.path.join(self.dir, prefix + "host_123.sock")
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.bind(path)
+            sock.close()  # simulated process death: pathname survives
+            stale.append(path)
+        live = D.StateChannel(os.path.join(self.dir, "device-live.sock"), build).start()
+        self.addCleanup(live.stop)
+        unrelated = os.path.join(self.dir, "unrelated.sock")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(unrelated)
+        sock.close()
+        regular = os.path.join(self.dir, "device-file.sock")
+        with open(regular, "w") as fh:
+            fh.write("keep me")
+        link = os.path.join(self.dir, "control-link.sock")
+        os.symlink(live.path, link)
+        channel = D.StateChannel(os.path.join(self.dir, "device-new.sock"), build).start()
+        self.addCleanup(channel.stop)
+        self.assertTrue(all(not os.path.exists(path) for path in stale))
+        self.assertTrue(os.path.exists(unrelated))
+        self.assertTrue(os.path.isfile(regular))
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(D.query(live.path)["schema"], D.SCHEMA)
+
+    def test_stale_socket_at_the_requested_path_can_be_replaced(self):
+        path = os.path.join(self.dir, "device.sock")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(path)
+        sock.close()
+        channel = D.StateChannel(path, build).start()
+        self.addCleanup(channel.stop)
+        self.assertEqual(D.query(path)["schema"], D.SCHEMA)
+
+    def test_socket_replaced_during_probe_is_preserved(self):
+        path = os.path.join(self.dir, "device.sock")
+        original = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(original.close)
+        self.addCleanup(replacement.close)
+        original.bind(path)
+
+        def replaced(_path):
+            os.unlink(path)
+            replacement.bind(path)
+            raise ConnectionRefusedError(errno.ECONNREFUSED, "stale observation")
+
+        with mock.patch.object(D.socket, "socket") as probe:
+            probe.return_value.connect.side_effect = replaced
+            with self.assertRaises(D.DeviceError):
+                D.StateChannel(path, build)
+        self.assertTrue(os.path.exists(path))
+
+    def test_existing_open_directory_is_refused_without_chmod(self):
+        os.chmod(self.dir, 0o755)
+        with self.assertRaises(D.DeviceError):
+            D.StateChannel(os.path.join(self.dir, "device.sock"), build)
+        self.assertEqual(stat.S_IMODE(os.stat(self.dir).st_mode), 0o755)
+
+    def test_existing_private_directory_permissions_are_preserved(self):
+        os.chmod(self.dir, 0o750)
+        with self.assertRaises(D.DeviceError):
+            D.StateChannel(os.path.join(self.dir, "device.sock"), build)
+        self.assertEqual(stat.S_IMODE(os.stat(self.dir).st_mode), 0o750)
+        os.chmod(self.dir, 0o700)
+        with mock.patch.object(D.os, "chmod", wraps=os.chmod) as chmod:
+            channel = D.StateChannel(os.path.join(self.dir, "device.sock"), build)
+            self.addCleanup(channel.stop)
+        self.assertNotIn(mock.call(self.dir, 0o700), chmod.call_args_list)
+
+    def test_new_directory_is_private_even_with_a_restrictive_umask(self):
+        directory = os.path.join(self.dir, "new")
+        self.addCleanup(lambda: os.rmdir(directory))
+        previous = os.umask(0o777)
+        try:
+            channel = D.StateChannel(os.path.join(directory, "device.sock"), build)
+        finally:
+            os.umask(previous)
+        self.addCleanup(channel.stop)
+        self.assertEqual(stat.S_IMODE(os.stat(directory).st_mode), 0o700)
+
+    def test_empty_agent_filter_accepts_local_agents_like_no_filter(self):
+        for allowed in (None, [], iter(())):
+            calls = []
+            channel = D.ControlChannel(os.path.join(self.dir, "control.sock"),
+                                       lambda agent: calls.append(agent), allowed=allowed).start()
+            try:
+                self.assertTrue(D.stop(channel.path, "agent-a")["ok"])
+                self.assertTrue(D.stop(channel.path, "agent-b")["ok"])
+                self.assertEqual(calls, ["agent-a", "agent-b"])
+            finally:
+                channel.stop()
+
+    def test_snapshot_empty_filter_still_includes_every_local_agent(self):
+        store = mock.MagicMock()
+        store.operations.listing.return_value = [row("agent-a"), row("agent-b"),
+                                                row("elsewhere", host="other")]
+        store.hosts.current.return_value = []
+        store.hosts.runners.return_value = []
+        db = mock.Mock()
+        db.query.return_value = []
+        with mock.patch.object(D.storage, "of", return_value=store), \
+                mock.patch.object(D, "_organisations", return_value={None: "test"}):
+            for names in (None, [], iter(()), ["agent-a"]):
+                expected = ["agent-a"] if names == ["agent-a"] else ["agent-a", "agent-b"]
+                body = D.snapshot(cfg(), db, names=names)
+                self.assertEqual([a["name"] for a in body["meshes"][0]["agents"]], expected)
+
     def test_query_of_a_missing_channel_fails_cleanly(self):
         with self.assertRaises(D.DeviceError):
             D.query(os.path.join(self.dir, "absent.sock"))
@@ -264,6 +407,88 @@ class SocketTest(unittest.TestCase):
     def test_merge_keeps_one_row_per_agent(self):
         merged = D.merge([build(), build(now=1320.0)])
         self.assertEqual(len(merged["meshes"][0]["agents"]), 1)
+
+    def test_runner_empty_filter_still_checks_the_host_for_each_stop(self):
+        runner = SimpleNamespace(
+            once=False, dry_run=False, mediated=False, runner_id="test-empty",
+            cfg=SimpleNamespace(host=HOST), db=object(), host_gate=None,
+            agents_filter=[], device_channels=[])
+        state_path, control_path = D.paths(runner.runner_id, self.dir)
+        with mock.patch.dict(os.environ, {"AMEESH_DEVICE_DIR": self.dir}), \
+                mock.patch.object(D, "snapshot", return_value=build()) as snapshot, \
+                mock.patch.object(D, "stop_agent", side_effect=[[], ValueError("other host")]) as stop:
+            Runner.start_device_channels(runner)
+            try:
+                self.assertEqual(len(runner.device_channels), 2)
+                self.assertEqual(D.query(state_path)["schema"], D.SCHEMA)
+                self.assertEqual(snapshot.call_args.kwargs["names"], [])
+                self.assertTrue(D.stop(control_path, "agent-a")["ok"])
+                refused = D.stop(control_path, "agent-b")
+                self.assertFalse(refused["ok"])
+                self.assertIn("other host", refused["error"])
+                self.assertEqual(stop.call_args_list, [
+                    mock.call(runner.cfg, runner.db, "agent-a", strict=True),
+                    mock.call(runner.cfg, runner.db, "agent-b", strict=True)])
+            finally:
+                for channel in runner.device_channels:
+                    channel.stop()
+
+    def test_merge_keeps_the_most_recent_report_over_a_stale_running_turn(self):
+        # N1 (#382) : un ancien running ne doit pas masquer un idle plus récent
+        # parce que son tour avait commencé plus tôt.
+        stale = build(agents=[row(turn_started_ts=90.0)], now=100.0)
+        fresh = build(agents=[row(status="idle", turn_started_ts=None,
+                                 lease_live=False)], now=110.0,
+                      runner_id="runner-agent-a-idle@" + HOST,
+                      socket_path="/tmp/device-idle.sock",
+                      control_socket="/tmp/control-idle.sock",
+                      runner_readings=[])
+        for snapshots in ([stale, fresh], [fresh, stale]):
+            merged = D.merge(snapshots)
+            self.assertEqual(len(merged["meshes"][0]["agents"]), 1)
+            agent = merged["meshes"][0]["agents"][0]
+            self.assertEqual(agent["status"], "idle")
+            self.assertFalse(agent["turn"]["active"])
+            self.assertIsNone(agent["turn"]["started_ts"])
+            self.assertEqual(agent["runner"], "runner-agent-a-idle@" + HOST)
+
+    def test_merge_running_to_stopped_uses_the_newest_report(self):
+        running = build(agents=[row(turn_started_ts=90.0)], now=100.0)
+        stopped = build(agents=[row(status="stopped", turn_started_ts=None,
+                                    lease_live=False)], now=110.0)
+        for snapshots in ([running, stopped], [stopped, running]):
+            merged = D.merge(snapshots)
+            self.assertEqual(len(merged["meshes"][0]["agents"]), 1)
+            agent = merged["meshes"][0]["agents"][0]
+            self.assertEqual(agent["status"], "stopped")
+            self.assertFalse(agent["turn"]["active"])
+
+    def test_merge_overlapping_channels_keeps_the_newest_report(self):
+        # Les deux canaux servent le même agent : le relevé le plus récent
+        # gagne, quel que soit l'ordre de lecture.
+        older = build(agents=[row()], now=100.0)
+        newer = build(agents=[row()], now=110.0,
+                      runner_id="runner-agent-a-new@" + HOST,
+                      socket_path="/tmp/device-new.sock",
+                      control_socket="/tmp/control-new.sock",
+                      runner_readings=[])
+        for snapshots in ([older, newer], [newer, older]):
+            merged = D.merge(snapshots)
+            self.assertEqual(len(merged["meshes"][0]["agents"]), 1)
+            self.assertEqual(merged["meshes"][0]["agents"][0]["runner"],
+                             "runner-agent-a-new@" + HOST)
+
+    def test_merge_a_fresh_running_report_replaces_an_older_idle_one(self):
+        idle = build(agents=[row(status="idle", turn_started_ts=None,
+                                 lease_live=False)], now=100.0)
+        running = build(agents=[row(turn_started_ts=105.0)], now=110.0)
+        for snapshots in ([idle, running], [running, idle]):
+            merged = D.merge(snapshots)
+            self.assertEqual(len(merged["meshes"][0]["agents"]), 1)
+            agent = merged["meshes"][0]["agents"][0]
+            self.assertEqual(agent["status"], "running")
+            self.assertTrue(agent["turn"]["active"])
+            self.assertEqual(agent["turn"]["started_ts"], 105.0)
 
     def test_runner_starts_and_stops_its_two_channels(self):
         runner = SimpleNamespace(

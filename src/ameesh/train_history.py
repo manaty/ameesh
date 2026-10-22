@@ -130,12 +130,16 @@ class Recorded:
         if item is None:
             raise TrainError("lot no longer open for train admission")
         try:
+            reference_families: dict = {}
             reference = review_authors.reference_author(
                 self.db, item, freeze, self.families,
-                provider=self.provider, strict=True)
+                provider=self.provider, strict=True,
+                families_out=reference_families)
             authors, unknown = review_authors.authors(
                 self.db, item, freeze, commits, self.path, self.families,
-                reference=reference, provider=self.provider, strict=True)
+                reference=reference, reference_families=reference_families,
+                provider=self.provider, strict=True,
+                base=base, head=head)
             if unknown:
                 raise TrainError("unknown historical author for commit %s" % unknown[0])
             missing_family = [entry for entry in authors if not entry["family"]]
@@ -146,8 +150,14 @@ class Recorded:
             # d'une tête antérieure ne peut pas refuser l'admission.
             on_freeze = [mark for mark in marks if mark.get("kind") == "verdict"
                          and merge_queue._same_sha(mark.get("sha"), head, self.path)]
+            # #2928 : en classe sensible, un verdict sans reçu exact ne compte
+            # pas — la famille historique ne doit pas venir du journal des
+            # tours pour un avis qui ne prouve pas son origine.
+            sensitive = str((klass or {}).get("class") or "") == "sensitive" \
+                or bool((klass or {}).get("doubt"))
             family_of = review_authors.verdict_families(
-                self.db, on_freeze, self.families, provider=self.provider, strict=True)
+                self.db, on_freeze, self.families, provider=self.provider,
+                strict=True, require_receipt=sensitive)
         except review_provenance.ProvenanceError as exc:
             raise TrainError(str(exc)) from exc
         # Le train lit l'auteur **au gel** (la même référence que la

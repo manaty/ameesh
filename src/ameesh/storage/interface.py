@@ -545,6 +545,13 @@ class PendingSpend(Domain):
     par l'ordre des écritures ; plusieurs candidats incohérents suspendent
     (`ledger_ambiguous`).
 
+    #2905 : la colonne `spend_key` n'est crue que si elle est l'identité
+    exacte du marqueur. Après un retour arrière de version (§14), l'ancien
+    `put` réécrit cette identité sans la clé : la colonne garde alors celle du
+    tour précédent, que `get` traite comme NULL (repli par l'identité du tour)
+    — l'écrire ferait perdre le coût du tour au conflit de
+    `turn_costs.spend_key`.
+
     Extensions PostgreSQL optionnelles (#1469), détectées par `hasattr` :
     `put_get(name, start_index, turn, model)` écrit et rend le marqueur comme
     `get`, dans la même instruction ; `clear_if(name, created_at, spend_key)`
@@ -582,9 +589,11 @@ class PendingSpend(Domain):
         """Le marqueur (agent, start_index, turn, model, created_at,
         created_ts, spend_key, ledger_key, ledger_ambiguous, work_item_id,
         turn_id, resident_usage), ou None. `created_at` est l'identité exacte
-        (#2166) ; `spend_key` est la clé du marqueur (NULL avant 0471) ;
-        `ledger_key` est la clé déjà écrite par ce tour — celle du marqueur,
-        ou celle retrouvée dans sa ligne `turn_costs`/sa réservation #1469 par
+        (#2166) ; `spend_key` est l'identité brute portée par la colonne (NULL
+        avant 0471 ; elle borne `clear_if`/`set_resident_usage` et peut être
+        périmée après un retour arrière, #2905) ; `ledger_key` est la clé fiable
+        déjà écrite par ce tour — celle du marqueur seulement si la colonne EST
+        son identité (`agent:index:created_at`, le format de `put`), ou celle
         l'identité du tour (`turn_id`, instant de pose, époque de la clé égale
         à un arrondi historique exact du marqueur, jamais une fenêtre), et la
         ligne/réservation doit suivre le marqueur — jamais par le seul index
@@ -645,7 +654,8 @@ class TurnCosts(Domain):
                cache_write_tokens: int | None = None,
                work_item_id: int | None = None,
                started_at: float | None = None,
-               turn_id: str | None = None) -> bool:
+               turn_id: str | None = None,
+               inputs: Sequence[str] | None = None) -> bool:
         """Écrit la ligne du tour (une instruction) ; une erreur de base remonte
         telle quelle et n'a rien écrit. `account` (L30, migration 0028) : le
         compte qui a porté le tour ; None = colonne non écrite. `spend_key`
@@ -663,7 +673,8 @@ class TurnCosts(Domain):
         le tour et son instant de début (epoch, horloge de la base) ; None =
         inconnu, colonne non écrite. `turn_id` (#796) : l'identifiant du tour
         (`turn_resources.turn_id`), pour relier la ligne à ses ressources ;
-        None = inconnu."""
+        None = inconnu. `inputs` (L80b, migration 0472) : les identifiants des
+        messages servis par le tour (JSON array) ; None = colonne non écrite."""
 
     @abc.abstractmethod
     def spent(self, seconds: float, *, agent: str,
@@ -1097,12 +1108,45 @@ class Mailbox(Domain):
         """Messages non remis marqués `payload.urgent`."""
 
     @abc.abstractmethod
-    def unread_mid_turn(self, recipient: str, limit: int) -> list[dict]:
+    def unread_human(self, recipient: str, limit: int, *,
+                     names: Sequence[str] | None = None) -> list[dict]:
+        """L77/B13 : messages non remis d'un humain ACTIF, filtrés DANS la requête.
+
+        Un humain (`payload.human`, ancien expéditeur `human:*`, ou nom
+        déclaré de l'hôte dans `names`, None = aucun) ne doit pas rester
+        invisible derrière plus de `UNREAD_LIMIT` non-lus ordinaires : le rang 2
+        le sert avant la suite et la consigne en attente. Du plus ancien au
+        plus récent.
+
+        L77/B14 : les passifs (copie `cc`, accusé…) sont écartés par la
+        requête, comme par `mail.passive_reason` — une copie humaine ne
+        remplit pas la fenêtre devant un humain actif.
+        """
+
+    @abc.abstractmethod
+    def unread_human_page(self, recipient: str, limit: int, *,
+                          after_id: int | None = None,
+                          names: Sequence[str] | None = None) -> list[dict]:
+        """L77/B14 : les humains actifs d'APRÈS `after_id`, du plus ancien au
+        plus récent.
+
+        Le serveur médié borne chaque page à 200 et `unread_human` n'a pas de
+        décalage : un préfixe de plus de 200 humains retenus (lots retenus)
+        ne se franchit qu'avec un curseur. `after_id` est l'id du dernier
+        message de la page précédente ; None lit depuis le début. Les passifs
+        sont écartés comme dans `unread_human`.
+        """
+
+    @abc.abstractmethod
+    def unread_mid_turn(self, recipient: str, limit: int, *,
+                        include_human: bool = True) -> list[dict]:
         """L514/#885 : les messages non remis qu'une remise mi-tour peut
         livrer — verdict, arbitrage, message d'un humain, urgent
         (`mail.mid_turn`) —, du plus ancien au plus récent, sans s'arrêter
         aux `UNREAD_LIMIT` premiers non-lus : un verdict derrière plus de 200
-        non-lus est vu au prochain point sûr, pas à la fin du tour."""
+        non-lus est vu au prochain point sûr, pas à la fin du tour.
+        `include_human=False` (L77/B11) : les messages humains sont laissés à
+        la file du tour résident."""
 
     @abc.abstractmethod
     def get(self, message_id: int) -> dict | None:
@@ -3398,13 +3442,16 @@ class Operations(Domain):
         en `build` sont bornés par le plafond par agent)."""
 
     @abc.abstractmethod
-    def turns(self, *, agent: str | None, since_s: float, limit: int) -> list[dict]:
+    def turns(self, *, agent: str | None, since_s: float, limit: int,
+              message: str | None = None) -> list[dict]:
         """Lignes du grand livre `turn_costs` des `since_s` dernières
         secondes (de l'agent si donné), les plus récentes d'abord : id,
         agent, harness, turn, model, session, usd, input_tokens,
         cached_input_tokens, output_tokens, work_item_id, started_ts,
-        recorded_ts. `work_item_id` et `started_ts` (#796) valent None pour
-        une ligne d'avant la migration 0423 ou un tour sans lot."""
+        recorded_ts, inputs. `work_item_id` et `started_ts` (#796) valent None
+        pour une ligne d'avant la migration 0423 ou un tour sans lot.
+        `message` (L80b) restreint aux tours qui ont servi ce message
+        (`inputs` contient son identifiant)."""
 
     @abc.abstractmethod
     def record_gauges(self, readings: Sequence[dict]) -> int:

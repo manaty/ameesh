@@ -49,10 +49,17 @@ class _Base(PgTestCase):
         self.addCleanup(worker.watchdog_stop.set)
         return worker
 
-    def _hook(self, worker: AgentWorker, harness: str, event: str):
+    def _hook(self, worker: AgentWorker, harness: str, event: str, *,
+              turn: str | None = None):
         env = self.env(AGENT_MAIL_NAME=worker.name,
                        AMEESH_RUNNER_ID=worker.runner.runner_id,
                        AMEESH_LEASE_EPOCH=str(worker.epoch), AMEESH_HARNESS=harness)
+        if turn is not None:
+            # L77/B11 : le fichier de tour nomme un tour résident pour le hook.
+            path = os.path.join(self.tmp, "resident-turn-%s" % worker.name)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(turn)
+            env["AMEESH_TURN_ID_FILE"] = path
         proc = self.cli("hook", harness, env=env, stdin=json.dumps(
             {"hook_event_name": event, "session_id": "s-1", "cwd": self.tmp}))
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -184,6 +191,44 @@ class MidTurnHookTest(_Base):
                              )["hookSpecificOutput"]["additionalContext"]
         self.assertIn("Ordinary progress note.", context)
         self.assertEqual(self._pending("cl"), [])
+
+    def test_resident_turn_leaves_human_mail_to_the_runner(self):
+        """B11 : le hook d'un tour résident ne remet pas les humains ; ils
+        restent non lus pour la file du tour (rang 1/2, au moins une fois)."""
+        for harness in ("deepseek", "codex"):
+            with self.subTest(harness=harness):
+                name = "resident-" + harness
+                worker = self._leased(name, harness)
+                mail.send(self.db, "human:smichea", name, "Owner: ordinary.",
+                          payload={"human": True})
+                mail.send(self.db, "human:smichea", name, "Owner: urgent.",
+                          payload={"human": True, "urgent": True})
+                # Ancien message humain : sender human:* sans payload.human
+                # (mail.is_human le reconnaît aussi) ; il ne doit pas passer.
+                mail.send(self.db, "human:smichea", name, "Owner: legacy urgent.",
+                          kind="event", payload={"urgent": True})
+                mail.send(self.db, "review", name, "Verdict for the turn.",
+                          payload={"verdict": True})
+                out = self._hook(worker, harness, "PostToolUse",
+                                 turn="turn-resident-1")
+                context = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+                self.assertIn("Verdict for the turn.", context)
+                self.assertNotIn("Owner: ordinary.", context)
+                self.assertNotIn("Owner: urgent.", context)
+                self.assertNotIn("Owner: legacy urgent.", context)
+                pending = self._pending(name)
+                self.assertIn("Owner: ordinary.", pending)
+                self.assertIn("Owner: urgent.", pending)
+                self.assertIn("Owner: legacy urgent.", pending)
+                self.assertIn("Owner: legacy urgent.", pending)
+                self.assertNotIn("Verdict for the turn.", pending)
+                # Stop ne les remet pas non plus : la file du tour les soldera.
+                self.assertEqual(self._hook(worker, harness, "Stop",
+                                            turn="turn-resident-1"), "")
+                pending = self._pending(name)
+                self.assertIn("Owner: ordinary.", pending)
+                self.assertIn("Owner: urgent.", pending)
+                self.assertIn("Owner: legacy urgent.", pending)
 
 
 class SendMarksTest(_Base):

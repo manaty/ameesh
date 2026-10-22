@@ -71,7 +71,9 @@ export interface AmeeshHost {
   deviceState?(): DeviceState | null | Promise<DeviceState | null>;
   /** L93: perform the stop the <ameesh-this-device> screen asked for. The
    * clean stop goes to the runner's control socket; the immediate stop is
-   * the Compute runner's own gesture, never an ameesh approval. */
+   * the Compute runner's own gesture, after native confirmation in main.
+   * Main resolves the agent/runner and socket from its own local state;
+   * renderer identifiers are hints, never authority or filesystem paths. */
   stopAgent?(agent: string, options: DeviceStopOptions): void | Promise<void>;
 }
 
@@ -80,7 +82,6 @@ export interface DeviceStopOptions {
   mode: "clean" | "immediate";
   runner?: string;
   mesh?: string;
-  control_socket?: string;
 }
 
 /** The detail of the `ameesh:stop` event. */
@@ -204,7 +205,7 @@ export function connectHost(host: AmeeshHost, options: ConnectHostOptions = {}):
     if (!host.stopAgent) return;
     void host.stopAgent(detail.agent, {
       mode: detail.mode === "immediate" ? "immediate" : "clean",
-      runner: detail.runner, mesh: detail.mesh, control_socket: detail.control_socket,
+      runner: detail.runner, mesh: detail.mesh,
     });
   };
   for (const [type, fn] of openFns) on(type, fn);

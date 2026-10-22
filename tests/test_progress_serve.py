@@ -422,7 +422,9 @@ class ConversationPgTest(PgTestCase):
         rows = self.db.query("select sender, recipient, body, payload::text as payload"
                              " from agent_mailbox order by id")
         self.assertEqual(len(rows), 1)
-        sender = serve.owner(self.cfg, None).split(":", 1)[1]
+        # #286 L77/B1 : la fiche écrit l'humain normalisé `human:<id>`, la
+        # forme que `resident_queue.identity_for` vérifie.
+        sender = serve.owner(self.cfg, None)
         self.assertEqual((rows[0]["sender"], rows[0]["recipient"]), (sender, "a1"))
         self.assertTrue(json.loads(rows[0]["payload"])["human"])
         entries = self.conversation()["entries"]

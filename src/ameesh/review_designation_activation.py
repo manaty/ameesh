@@ -28,12 +28,14 @@ Inputs, all from machine sources (never a note, an assignment or a name):
   (#1465). A designated reviewer's correction is an authored commit of the
   head, whatever its size (#2888): it makes their family an author, and the
   §2 threshold only decides whether the correction should have been pushed at
-  all (too big or a design change returns to the author). A commit without a
-  receipt is attributed by its agent committer's session family in the turn
-  journal (`review_authors`, #2681): the reference author stays the author, a
-  designated reviewer's fix remains their correction and an author; any other
-  commit makes the designation wait, because an unknown family cannot prove
-  independence. #2721 names that fallback in the mark
+  all (too big or a design change returns to the author). The authors of the
+  lot's earlier freezes whose content subsists stay authors (#2924): an
+  identical-content history rewrite does not make their families independent.
+  A commit without a receipt is attributed by its agent committer's session
+  family in the turn journal (`review_authors`, #2681): the reference author
+  stays the author, a designated reviewer's fix remains their correction and an
+  author; any other commit makes the designation wait, because an unknown
+  family cannot prove independence. #2721 names that fallback in the mark
   (`proof: turn-journal`, `fallback_commits`), never as an exact receipt;
 - **candidates**: the registry rows of the lot's project, real session family
   only (`registry.live_harness`), availability and open-lot load;
@@ -686,7 +688,8 @@ def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
 
 def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
                         repo: str, base: str, head: str, *, families=(),
-                        commits=None) -> tuple[list, list, list]:
+                        commits=None, strict: bool = False,
+                        families_out: Optional[dict] = None) -> tuple[list, list, list]:
     """`(auteurs, inconnus, correcteurs)` de la plage gelée `base..head` (#2681/#2739).
 
     La même lecture partagée que la désignation (`review_authors.reading`),
@@ -697,6 +700,12 @@ def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
     un correcteur retiré par une désignation ultérieure. Ne lève pas sur un
     inconnu : l'appelant décide (la porte refuse fermé, le train lève).
 
+    #2961 : `strict=True` (la porte) fait d'un reçu de provenance contradictoire
+    une erreur au lieu d'une absence — la famille de la référence ne se
+    remplace alors pas au registre courant. `families_out` reçoit les familles
+    prouvées par acteur : une famille vide est une absence **ou** une
+    ambiguïté, et la porte distingue les deux.
+
     #2803 : `commits` remplace la plage `base..head` quand l'appelant l'a
     déjà calculée — le delta propre d'un véhicule de paquet, seul contenu que
     sa porte relit (`packet_reviews.need`). La lecture des auteurs et des
@@ -706,7 +715,9 @@ def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
     if commits is None:
         _start, _paths, commits = _range(repo, base, head)
     return review_authors.reading(db, item, milestone, commits, repo,
-                                  families=families)
+                                  families=families, strict=strict,
+                                  families_out=families_out,
+                                  base=base, head=head)
 
 
 def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
@@ -973,7 +984,8 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         candidates = [candidate for candidate in candidates
                       if candidate.name != notify]
     authors, unknown, correctors = review_authors.reading(
-        db, item, freeze, commits, repo, families=policy.families, trace=True)
+        db, item, freeze, commits, repo, families=policy.families, trace=True,
+        base=start, head=frozen_sha)
     return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=paths,
                   commits=commits, policy=policy, authors=authors,
                   unknown_authors=unknown, correctors=correctors,
@@ -1711,7 +1723,8 @@ def _excluded_on_freeze(cfg, db, item: Mapping, freeze: Mapping) -> set[str]:
             return set()
         _start, _paths, commits = _range(repo, base, sha)
         authors, _unknown, correctors = review_authors.reading(
-            db, item, dict(freeze or {}), commits, repo, families=())
+            db, item, dict(freeze or {}), commits, repo, families=(),
+            base=base, head=sha)
     except Exception:  # noqa: BLE001 - plage illisible : comportement historique
         return set()
     return {str(row.get("name") or "").strip().lower()

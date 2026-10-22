@@ -298,6 +298,53 @@ def forcer(cfg, db, explicit: str | None = None) -> str:
         "own bound session, a human terminal says --actor human:<id>" % text)
 
 
+def milestone_actor(cfg, db, explicit: str | None = None, *, kind: str = "") -> str:
+    """#2928 : l'auteur d'un jalon `frozen`/`verdict`, vérifié au chemin d'écriture.
+
+    Même garde que `forcer` (#540), pour la même raison : un jalon est une
+    preuve de relecture, et `--actor` ne doit pas permettre à une session de
+    signer à la place d'un autre agent. Une session qui porte une identité
+    d'agent ne pose le jalon qu'en son propre nom (`--actor` différent :
+    refus) ; une identité refusée ne retombe pas sur le terminal humain. Une
+    session sans identité (un humain à son terminal) nomme un humain
+    (`--actor human:<id>`) — un nom d'agent sans liaison est refusé, sinon
+    n'importe quelle session poserait un verdict au nom d'un relecteur.
+
+    La provenance exacte (#1465) est ensuite écrite dans la même transaction
+    que le jalon ; un tour managé ne peut signer que sa propre preuve.
+    """
+    from . import identity
+
+    text = (explicit or "").strip()
+    if text and not text.startswith(HUMAN_PREFIX):
+        # une graphie d'alias désigne le même agent ; le nom écrit reste le
+        # primaire, comme pour l'acteur ordinaire d'une commande `work`.
+        from .agent_names import resolve
+        text = resolve(text, db=db, cfg=cfg, operation="work.milestone")
+    binding = identity.resolve_binding(cfg, db)
+    if not binding.ok and (binding.name or binding.source != "none"
+                           or os.environ.get("AGENT_MAIL_NAME")):
+        raise WorkError("milestone refused: invalid session identity (%s)"
+                        % (binding.reason or "unbound identity"))
+    if binding.name:
+        if text and text != binding.name:
+            raise WorkError(
+                "milestone refused: this session belongs to %s, it does not post a "
+                "%s milestone on behalf of %s"
+                % (binding.name, kind or "work", text))
+        return binding.name
+    if not text:
+        # aucun nom : le jalon reste anonyme (« inconnu », origine inconnue),
+        # comme avant ; il ne peut pas compter pour un agent à la porte.
+        return UNKNOWN_ACTOR
+    if text.startswith(HUMAN_PREFIX) and len(text) > len(HUMAN_PREFIX):
+        return text
+    raise WorkError(
+        "milestone refused: %s is not a human and this session has no bound agent "
+        "identity (runner lease or `ameesh mail bind`); an agent posts a milestone "
+        "from its own bound session, a human terminal says --actor human:<id>" % text)
+
+
 def pin_authority(cfg, db, actor: str | None = None) -> str | None:
     """#740: who may protect a date from the schedule (`work plan`, `work
     schedule --pin`): the actor `corrector` accepts on a declared role (a
@@ -3106,9 +3153,10 @@ def events(db: Db, item_id: int, limit: int | None = 100) -> list[dict]:
 #: les jalons et la porte du gel/verdict vivent dans `freeze_gate` (#2873),
 #: déclaré sensible à deux avis ; `work` les réexporte pour ses appelants.
 from .freeze_gate import (  # noqa: E402
-    FREEZE_ABSENT_LINE, FREEZE_ABSENT_MARK, FROZEN_HEAD_MIN, MANUAL_KINDS,
-    MILESTONE_KINDS, REVIEWED_HEAD_MIN, VERDICTS, _frozen_head, freeze_head,
-    frozen_head, milestone, milestones, reviewed_head,
+    FREEZE_ABSENT_LINE, FREEZE_ABSENT_MARK, FREEZE_UNPUBLISHED_MARK,
+    FREEZE_UNVERIFIED_MARK, FROZEN_HEAD_MIN, MANUAL_KINDS, MILESTONE_KINDS,
+    REVIEWED_HEAD_MIN, VERDICTS, _frozen_head, freeze_head, frozen_head,
+    milestone, milestones, reviewed_head,
 )
 
 #: les jalons affichés, du plus récent au plus ancien : (nom, colonne d'instant,
