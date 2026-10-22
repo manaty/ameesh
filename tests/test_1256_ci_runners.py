@@ -1532,7 +1532,8 @@ class WorkflowRoutingTest(unittest.TestCase):
             self.assertIn("plan.outputs.plan_sha256", body,
                           "%s downloads the plan artifact without checking its digest" % job)
             self.assertIn("sha256sum -c", body)
-        self.assertEqual(set(consumers), {"psycopg", "psql", "fs-class"})
+        self.assertEqual(set(consumers), {"psycopg", "psql", "fs-class",
+                                          "platform-macos"})
 
     def test_the_required_check_stays_on_the_fleet(self):
         jobs = self.workflows()["tests.yml"]["jobs"]

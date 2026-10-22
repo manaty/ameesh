@@ -21,7 +21,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import canon, p256, visibility
+from ameesh import canon, p256, platform, visibility
 from ameesh.mediated_executor import device, contract as C, identity, jose
 from ameesh.mediated_executor import interfaces as I
 
@@ -561,9 +561,11 @@ class DeviceCliTest(PgTestCase):
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 pid = test.proc.pid
-                for name in ("cmdline", "environ"):
-                    with open("/proc/%d/%s" % (pid, name), "rb") as fh:
-                        seen[name] = fh.read()
+                # L68: the platform layer, not /proc. None (unreadable
+                # process) is kept and fails the assertion below: a secret
+                # that could not be observed must never pass for absent.
+                seen["cmdline"] = platform.command_argv(pid)
+                seen["environ"] = platform.environ(pid)
                 try:
                     status, reply = 201, provider.enroll(body, server_url=test.url)
                 except I.AuthError as exc:
@@ -601,10 +603,20 @@ class DeviceCliTest(PgTestCase):
         self.assertEqual(self.proc.returncode, 0, err)
         self.assertIn("appareil enrôlé", out)
         self.assertTrue(seen, "le serveur n'a rien reçu")
+        def _raw(value):
+            # the platform layer returns argv as a list and the environment
+            # as a dict; both are rendered for the secret search below.
+            if value is None:
+                self.fail("environ illisible : le code pourrait y être sans être vu")
+            if isinstance(value, dict):
+                return "\n".join("%s=%s" % (key, item) for key, item in value.items())
+            if isinstance(value, list):
+                return "\0".join(value)
+            return value
         for variant in (code, code.replace("-", ""), jose.normalize_code(code)):
             for name, raw in seen.items():
                 with self.subTest(where=name):
-                    self.assertNotIn(variant.encode(), raw)
+                    self.assertNotIn(variant, _raw(raw))
             self.assertNotIn(variant, out + err)
         with open(os.path.join(home, device.STATE_FILE), encoding="utf-8") as fh:
             self.assertNotIn(jose.normalize_code(code), fh.read())

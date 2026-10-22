@@ -51,6 +51,14 @@ WORKFLOW_SUFFIXES = (".yml", ".yaml")
 #: La règle interdit « des heures » : une heure pleine est la borne garde-fou.
 MAX_TIMEOUT_MINUTES = 60
 
+#: L68 — bornes supérieures explicites, par (workflow, job). La suite complète
+#: sous macOS tourne sur un runner **hébergé** (elle ne retient aucun runner
+#: de la flotte) et y exécute les quatre parts psycopg l'une après l'autre ;
+#: 120 min couvrent une exécution lente sur un runner Intel 3 vCPU sans
+#: jamais retenir « des heures ». Toute autre borne au-dessus du plafond reste
+#: refusée.
+TIMEOUT_EXCEPTIONS = {("tests.yml", "platform-macos"): 120}
+
 #: Un job : une clé, nom nu ou entre guillemets, suivie du reste de la ligne.
 _JOB = re.compile(r"""^(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_.-]+))\s*:(.*)$""")
 #: `timeout-minutes` d'un job ou d'une étape, à l'indentation du corps.
@@ -303,11 +311,28 @@ class WorkflowTimeoutsTest(unittest.TestCase):
             for job, value in job_timeouts(path.read_text(encoding="utf-8")).items():
                 if value is None:
                     continue  # déjà signalé par test_chaque_job_declare_son_timeout
+                plafond = TIMEOUT_EXCEPTIONS.get((path.name, job), MAX_TIMEOUT_MINUTES)
                 with self.subTest(workflow=path.name, job=job):
                     self.assertLessEqual(
-                        value, MAX_TIMEOUT_MINUTES,
+                        value, plafond,
                         "%s/%s : %s min, plafond %s" % (path.name, job, value,
-                                                        MAX_TIMEOUT_MINUTES))
+                                                        plafond))
+
+    def test_une_exception_ne_vise_qu_un_runner_heberge(self):
+        # L68 : le relèvement du plafond est réservé à un runner **hébergé**
+        # (aucun runner de la flotte n'est retenu). Un job Linux auto-hébergé
+        # qui entrerait dans TIMEOUT_EXCEPTIONS échoue ici.
+        for (workflow, job) in TIMEOUT_EXCEPTIONS:
+            with self.subTest(workflow=workflow, job=job):
+                text = (WORKFLOWS / workflow).read_text(encoding="utf-8")
+                debut = text.index("\n  %s:\n" % job)
+                prochain = re.search(r"(?m)^  [A-Za-z0-9_.-]+:\s*$",
+                                     text[debut + 3:])
+                fin = debut + 3 + prochain.start() if prochain else len(text)
+                bloc = text[debut:fin]
+                self.assertRegex(
+                    bloc, r"(?m)^    runs-on: (?:macos|windows|ubuntu)-",
+                    "une exception de plafond ne vaut que pour un runner hébergé")
 
     def test_le_parseur_lit_le_timeout_du_job_pas_de_l_etape(self):
         text = (

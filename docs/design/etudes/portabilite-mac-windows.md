@@ -281,10 +281,11 @@ in the [open questions](../questions-ouvertes.md).
 The [proposed plan](#proposed-lot-plan) above is kept as written on
 2026-10-10. Measured since then: L63 merged (`6fafe37`); L159d and L159e
 already route host memory, swap, load and pressure through
-`ameesh.platform` (psutil, `None` for load without `os.getloadavg`); CI has a
-`platform-macos` part, limited to the platform tests without a database.
-WSL2 is a Linux: what runs on Linux runs there, except reaching the Windows
-desktop.
+`ameesh.platform` (psutil, `None` for load without `os.getloadavg`); the
+`platform-macos` job now runs the suite selected by the CI plan against a
+PostgreSQL installed in its own step (L68), with the `/proc` tests going
+through the platform layer. WSL2 is a Linux: what runs on Linux runs there,
+except reaching the Windows desktop.
 
 | Lot | Content after the answers | Depends on | Estimate |
 |---|---|---|---|
@@ -298,5 +299,5 @@ desktop.
 
 No Rust lot (Q6). Order: L63b first (security), then L64, L65, L66 and L68 in
 parallel, L69 after L65; L67 waits for an owner decision to start it. Until
-L65 and L68 land, the doc says that macOS is not yet supported and that
-Windows goes through WSL2.
+L65 lands, the doc says that macOS is not yet supported (its CI already runs
+the full suite, L68) and that Windows goes through WSL2.
