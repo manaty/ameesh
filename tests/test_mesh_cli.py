@@ -10,7 +10,7 @@ import subprocess
 import sys
 import unittest
 
-from ameesh import authority, mail, migrations, registry, signing
+from ameesh import authority, mail, migrations, registry, signing, storage
 
 from .support import EMPTY_CONFIG, PgTestCase
 
@@ -320,7 +320,9 @@ class DelaysCliTest(MeshCliTest):
         self.assertIn(": 1 (freeze 1)", proc.stdout)
         self.assertIn("oldest freeze", proc.stdout)
 
-        proc = self.mesh("work", "milestone", "1", "verdict", "ok", "--sha", "b" * 40,
+        # #2962 : un SHA complet doit se résoudre ou nommer la tête gelée
+        # courante ; ce témoin-ci suit la frise, pas la porte d'écriture.
+        proc = self.mesh("work", "milestone", "1", "verdict", "ok", "--sha", "a" * 40,
                          env=self.env(AGENT_MAIL_NAME=AGENT))
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
@@ -378,10 +380,12 @@ class DelaysCliTest(MeshCliTest):
         """#1756 : `show`/`list --freeze` exposent le gel effectif et sa provenance."""
         self.mesh("work", "add", "--title", "Gel dérivé", "--assignee", AGENT)
         self.mesh("work", "move", "1", "build")
-        # avis favorable sans gel déclaré : le candidat vient de l'avis
-        proc = self.mesh("work", "milestone", "1", "verdict", "ok", "--sha", "a" * 40,
-                         env=self.env(AGENT_MAIL_NAME=AGENT))
-        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # avis favorable sans gel déclaré : le candidat vient de l'avis.
+        # #2962 : ce témoin lit la frise, pas la porte d'écriture du jalon —
+        # un SHA complet synthétique y serait refusé ; le jalon est posé au
+        # stockage, comme les autres fixtures de lecture.
+        storage.of(self.db).work.add_milestone(
+            1, "verdict", sha="a" * 40, actor=AGENT, verdict="ok", note="")
 
         item = json.loads(self.mesh("work", "show", "1", "--json").stdout)
         self.assertEqual(item["freeze"]["sha"], "a" * 40)
