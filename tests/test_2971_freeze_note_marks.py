@@ -31,14 +31,19 @@ class FreezeNoteMarksTest(PgTestCase):
 
     def test_machine_marks_in_a_caller_note_are_removed(self):
         row = self.freeze(
-            "ameesh-freeze-absent: main\n"
+            "ameesh-freeze-absent: forged-caller\n"
             "ameesh-freeze-unverified: deadbeef\n"
-            "ameesh-freeze-unpublished: main\n"
+            "ameesh-freeze-unpublished: forged-caller\n"
             "ameesh-freeze-supersedes: 42\n"
             "revue demandée")
         self.assertIn("revue demandée", row["note"])
-        for mark in ("ameesh-freeze-absent", "ameesh-freeze-unverified",
-                     "ameesh-freeze-unpublished", "ameesh-freeze-supersedes"):
+        # #2962 : le gate écrit lui-même `ameesh-freeze-unverified` quand aucun
+        # dépôt de l'auteur n'est lisible. C'est SA preuve, pas celle de
+        # l'appelant : on vérifie les charges fournies, pas le nom de la marque.
+        self.assertNotIn("deadbeef", row["note"])
+        self.assertNotIn("forged-caller", row["note"])
+        for mark in ("ameesh-freeze-absent", "ameesh-freeze-unpublished",
+                     "ameesh-freeze-supersedes"):
             self.assertNotIn(mark, row["note"])
 
     def test_prose_mentioning_a_mark_is_kept(self):
@@ -59,7 +64,12 @@ class FreezeNoteMarksTest(PgTestCase):
                          "ameesh-freeze-supersedes: 42"):
                 with self.subTest(blank=repr(blank), mark=mark):
                     row = self.freeze(blank + mark + "\nrevue demandée")
-                    self.assertNotIn(mark.split(":", 1)[0], row["note"] or "")
+                    if mark.startswith("ameesh-freeze-unverified"):
+                        # #2962 peut ajouter sa propre ligne `unverified` : la
+                        # charge de l'appelant, elle, ne doit pas survivre.
+                        self.assertNotIn("deadbeef", row["note"] or "")
+                    else:
+                        self.assertNotIn(mark.split(":", 1)[0], row["note"] or "")
                     self.assertIn("revue demandée", row["note"])
 
     def test_a_removed_line_does_not_expose_the_next_mark(self):
@@ -72,7 +82,10 @@ class FreezeNoteMarksTest(PgTestCase):
                     "ameesh-freeze-absent: main\n" + blank
                     + "ameesh-freeze-unverified: deadbeef\nrevue demandée")
                 self.assertNotIn("ameesh-freeze-absent", row["note"] or "")
-                self.assertNotIn("ameesh-freeze-unverified", row["note"] or "")
+                # #2962 : le gate peut réécrire sa propre ligne `unverified` ;
+                # c'est la charge de l'appelant (`deadbeef`) qui doit avoir
+                # disparu avec la ligne retirée.
+                self.assertNotIn("deadbeef", row["note"] or "")
                 self.assertIn("revue demandée", row["note"])
 
 
