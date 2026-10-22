@@ -57,6 +57,16 @@ FREEZE_ABSENT_MARK = "ameesh-freeze-absent:"
 #: ligne fournie par `--note` est retirée avant que le gel n'écrive la sienne
 #: (sinon `--note "ameesh-freeze-absent: main"` contournerait le garde #2784).
 FREEZE_ABSENT_LINE = re.compile(r"(?m)^[ \t]*ameesh-freeze-absent:[^\n]*(?:\n|$)")
+#: #2971 : toute marque machine de la note de gel (`ameesh-freeze-absent`,
+#: `ameesh-freeze-unverified`, `ameesh-freeze-unpublished`,
+#: `ameesh-freeze-supersedes`, ...) est une preuve du gate, jamais une note
+#: d'appelant. Le motif est générique pour couvrir aussi les marques des
+#: branches #2962/#2989 : une ligne fournie par `--note` est retirée avant
+#: l'écriture, comme `FREEZE_ABSENT_LINE` le fait pour `absent`.
+#: Le motif juge une ligne déjà strippée : `add_milestone` strippe la note
+#: finale, donc un blanc de tête (`\v`, `\f`, espace insécable) ne doit pas
+#: cacher la marque (#2971, revue impl-05 — même classe que #2989 B).
+FREEZE_MACHINE_LINE = re.compile(r"ameesh-freeze-[a-z0-9-]+:")
 
 #: #2962 : un gel résolu localement mais absent de `origin/<branche>` après
 #: rafraîchissement reste accepté (geler puis pousser dans le même tour est
@@ -588,6 +598,19 @@ def milestone(
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
+    # #2971 : `--note` ne fournit aucune preuve machine de gel. Le retrait est
+    # fait ici, avant les marques que le gate ajoute lui-même, pour que
+    # `unverified`/`unpublished` (#2962) et `supersedes` (#2989) restent
+    # écrites par le gate et ne soient jamais effacées par un appelant.
+    # #2971 (revue impl-05) : `add_milestone` strippe la note finale. Un filtre
+    # ligne à ligne sur `^[ \t]*` laissait donc une ligne machine précédée d'un
+    # blanc Unicode (`\v`, `\f`, espace insécable) devenir valide après ce
+    # strip ; retirer une autre ligne pouvait aussi l'exposer. On juge chaque
+    # ligne sur sa forme strippée — exactement celle que la lecture verra — puis
+    # on strippe l'ensemble : aucune marque fournie par `--note` ne survit.
+    note = "\n".join(
+        line for line in str(note or "").splitlines()
+        if not FREEZE_MACHINE_LINE.match(line.strip())).strip()
     if kind == "verdict":
         # #2674 : refuser à l'écriture un avis qui ne nomme pas la tête relue.
         sha = reviewed_head(db, item, sha, repo=repo)
