@@ -370,8 +370,12 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def claim(self, name: str, owner: str, ttl_seconds: float, *,
-              require_responsible: bool) -> dict | None:
-        """Prend le bail s'il est libre ou expiré ; rend la ligne, sinon None."""
+              require_responsible: bool, host: str | None = None) -> dict | None:
+        """Prend le bail s'il est libre ou expiré ; rend la ligne, sinon None.
+
+        `host` (L165, EP1) : l'hôte qui réclame, pour un agent
+        `releve: election`. None : l'hôte de la ligne (comportement d'un agent
+        épinglé). Le serveur médié force cet argument à l'hôte de l'exécuteur."""
 
     @abc.abstractmethod
     def attach_claim(self, name: str, owner: str, ttl_seconds: float, *,
@@ -2622,6 +2626,22 @@ class Canon(Domain):
         """Écrit les colonnes déclaratives (crée l'agent au besoin) et le profil
         évalué des valeurs écrites, dans la même instruction. Retourne False
         si le CAS refuse une lecture périmée : la politique n'est pas appliquée."""
+
+    @abc.abstractmethod
+    def set_election(self, name: str, releve: str, candidats: Sequence[str] | None,
+                     *, canon: str) -> None:
+        """L165 (EP1) : écrit `releve` / `candidats` de la ligne du canon et
+        retire les verdicts de candidats qui ne sont plus des candidats (ou
+        tous si le rôle redevient `hote`). Ne déplace jamais l'agent."""
+
+    @abc.abstractmethod
+    def write_candidate(self, name: str, host: str, *, canon: str, cwd: str | None,
+                        ok: bool | None, diagnostic: str, ref: str | None,
+                        harness: str | None, provider: str | None,
+                        model: str | None, credential_mode: str | None) -> None:
+        """L165 (EP1) : inscrit le verdict de placement de `name` sur l'hôte
+        candidat `host` (profil évalué calculé dans la même instruction), pour
+        que la réclamation depuis cet hôte soit jugée sur SA politique."""
 
     @abc.abstractmethod
     def clear_responsible(self, name: str, host: str,

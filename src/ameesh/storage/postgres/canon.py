@@ -202,7 +202,7 @@ class Canon(interface.Canon):
     def host_rows(self, host, names) -> list[dict]:
         sql = """
             SELECT name, harness, host, cwd, model, budget_usd, responsible, team, projects,
-                   aliases, roles,
+                   aliases, roles, releve, candidats,
                    provider, credential_mode, capabilities, canon_ref, canon, ephemeral, priority,
                    admitted_hosts, admitted_tags, memory_repository,
                    visibility_ok, visibility_diagnostic,
@@ -234,6 +234,8 @@ class Canon(interface.Canon):
         projects = _caps_param(values.get("projects"))
         aliases = _caps_param(values.get("aliases"))
         roles = _caps_param(values.get("roles"))
+        # L165 (EP1) : relève et hôtes candidats, déclaratifs comme le placement
+        candidats = _caps_param(values.get("candidats"))
         rows = self.db.query(
             """
             __LOCK__
@@ -243,10 +245,10 @@ class Canon(interface.Canon):
                  priority, admitted_hosts, admitted_tags, memory_repository,
                  visibility_ok, visibility_diagnostic,
                  placement_ok, placement_diagnostic, placement_ref, placement_profile, canon,
-                 projects, aliases, roles)
+                 releve, candidats, projects, aliases, roles)
             SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, __CAPS__, %s, false, NULL,
                    %s, __AHOSTS__, __ATAGS__, %s, %s, %s, %s, %s, %s, __PROFILE__, %s,
-                   __PROJECTS__, __ALIASES__, __ROLES__
+                   %s, __CANDIDATS__, __PROJECTS__, __ALIASES__, __ROLES__
               FROM l
             ON CONFLICT (name) DO UPDATE SET
                 harness         = excluded.harness,
@@ -276,6 +278,8 @@ class Canon(interface.Canon):
                 placement_ref   = excluded.placement_ref,
                 placement_profile = excluded.placement_profile,
                 canon           = excluded.canon,
+                releve          = excluded.releve,
+                candidats       = excluded.candidats,
                 updated_at      = now()
             WHERE agent_registry.lease_epoch = %s
               AND (excluded.host = agent_registry.host
@@ -286,6 +290,7 @@ class Canon(interface.Canon):
                .replace("__CAPS__", _CAPS_SQL)
                .replace("__AHOSTS__", _CAPS_SQL)
                .replace("__ATAGS__", _CAPS_SQL)
+               .replace("__CANDIDATS__", _CAPS_SQL)
                .replace("__PROJECTS__", _CAPS_SQL)
                .replace("__ALIASES__", _CAPS_SQL)
                .replace("__ROLES__", _CAPS_SQL)
@@ -298,11 +303,65 @@ class Canon(interface.Canon):
              values.get("memory_repository"),
              values.get("visibility_ok"), values.get("visibility_diagnostic") or "",
              values["placement_ok"], values["placement_diagnostic"], values["placement_ref"])
-            + profile_params(values) + (values.get("canon"), projects, projects, aliases, aliases,
+            + profile_params(values) + (values.get("canon"), values.get("releve") or "hote",
+                                       candidats, candidats, projects, projects, aliases, aliases,
                                        roles, roles,
                                        values.get("_expected_lease_epoch", values.get("lease_epoch", -1))),
         )
         return bool(rows)
+
+    def set_election(self, name, releve, candidats, *, canon) -> None:
+        """L165 (EP1) : `releve` / `candidats` et ménage des verdicts candidats.
+
+        Une ligne qui redevient `hote`, ou dont la liste de candidats se
+        resserre, ne garde pas de verdict pour un hôte qui n'est plus candidat
+        (le prédicat exige aussi l'appartenance, mais un verdict périmé ne doit
+        pas pouvoir resservir si l'hôte redevient candidat plus tard)."""
+        candidates = _caps_param(candidats)
+        #: liste vide pour le DELETE (ANY(NULL) ne supprimerait rien) ; NULL
+        #: pour la colonne (un agent `hote` n'a pas de liste, pas `[]`).
+        empty = ("CASE WHEN %s::text IS NULL THEN ARRAY[]::text[] "
+                 "ELSE ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)) END")
+        nullable = ("CASE WHEN %s::text IS NULL THEN NULL "
+                    "ELSE ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)) END")
+        self.db.execute(
+            "DELETE FROM agent_candidates WHERE name = %s AND canon = %s"
+            " AND (%s <> 'election' OR NOT (host = ANY(" + empty + ")))",
+            (name, canon, releve, candidates, candidates))
+        self.db.execute(
+            """
+            UPDATE agent_registry
+               SET releve = %s, candidats = """ + nullable + """, updated_at = now()
+             WHERE name = %s AND coalesce(canon, '') = %s
+               AND (releve IS DISTINCT FROM %s OR candidats IS DISTINCT FROM """ + nullable + """)
+            """,
+            (releve, candidates, candidates, name, canon, releve, candidates, candidates))
+
+    def write_candidate(self, name, host, *, canon, cwd, ok, diagnostic, ref,
+                        harness, provider, model, credential_mode) -> None:
+        """L165 (EP1) : verdict de placement de `name` sur l'hôte candidat.
+
+        Le profil évalué est calculé ici, pour CET hôte : la réclamation depuis
+        un autre candidat compare le sien, donc un profil divergé ferme la
+        réclamation comme pour un agent épinglé."""
+        self.db.execute(
+            """
+            INSERT INTO agent_candidates
+                (name, host, canon, cwd, placement_ok, placement_diagnostic,
+                 placement_ref, placement_profile, updated_at)
+            SELECT %s, %s, %s, %s, %s, %s, %s,
+                   ameesh_placement_profile(%s, %s, %s, %s, %s), now()
+            ON CONFLICT (name, host) DO UPDATE SET
+                canon = excluded.canon,
+                cwd = excluded.cwd,
+                placement_ok = excluded.placement_ok,
+                placement_diagnostic = excluded.placement_diagnostic,
+                placement_ref = excluded.placement_ref,
+                placement_profile = excluded.placement_profile,
+                updated_at = now()
+            """,
+            (name, host, canon, cwd, ok, diagnostic or "", ref,
+             host, harness, provider, model, credential_mode))
 
     def clear_responsible(self, name, host, owner=None) -> None:
         guard, params = _owner(owner)

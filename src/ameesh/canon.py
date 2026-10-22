@@ -886,6 +886,13 @@ class Agent:
     projects: list[str] | None = None
     #: L243b: alternative spellings of this identity, not new agents.
     aliases: list[str] | None = None
+    #: L165 (EP1): how the role is held. `hote` (default) pins the agent to
+    #: its placement host; `election` lets any candidate host claim the lease.
+    releve: str = "hote"
+    #: L165 (EP1): candidate hosts of an elected role. Every one is admitted
+    #: by the agent's Placement card, so a claim can only happen on a host
+    #: whose current placement verdict admits the agent.
+    candidats: list[str] | None = None
 
     @property
     def is_persona(self) -> bool:
@@ -2819,6 +2826,18 @@ class _Loader:
             agent_aliases = []
         else:
             agent_aliases = list(alias_value or [])
+        # L165 (EP1) : `releve: hote` (défaut) ou `election` ; les candidats
+        # sont les hôtes qui peuvent prendre le bail, tous admis par la fiche
+        # Placement (contrôlé par `validate`, qui connaît les hôtes).
+        releve = (_text(fiche.data.get("releve")) or "hote").strip().lower()
+        if releve not in ("hote", "election"):
+            self.add("agent-releve-invalid", ERROR,
+                     "`releve`: `hote` or `election` expected, not %r (treated as `hote`)"
+                     % fiche.data.get("releve"), **where, **subject)
+            releve = "hote"
+        candidats = self._list(fiche, "candidats", where, "agent-candidats-invalid", **subject)
+        if candidats is not None:
+            candidats = list(dict.fromkeys(c for c in candidats if c))
         self.canon.agents.append(Agent(
             title=fiche.title,
             responsible=_text(fiche.data.get("responsible")),
@@ -2839,6 +2858,8 @@ class _Loader:
             roles=self._roles(fiche, where, subject),
             projects=projects,
             aliases=agent_aliases,
+            releve=releve,
+            candidats=candidats,
         ))
 
     def _build_persona(self, fiche: Fiche, where: dict) -> None:
@@ -3736,9 +3757,15 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
             host = canon.host(name)
             if agent is not None and host is not None:
                 for reason in placement_violations(agent, host, placement):
+                    # L165 (EP1) : pour un rôle élu, une politique d'hôte qui
+                    # refuse l'agent ne ferme QUE ce candidat ; les autres
+                    # hôtes candidats gardent leur propre verdict. Un agent
+                    # épinglé, lui, reste bloqué partout par son erreur.
+                    subject = ({"host": name} if agent.releve == "election"
+                               else {"agent": agent.title})
                     add("placement-policy-violation", ERROR,
                         "%s on %s: %s" % (agent.title, host.title, reason), f,
-                        agent=agent.title)
+                        **subject)
                 _check_work_dir(add, agent, host, placement)
     for name, group in by_agent.items():
         if len(group) > 1:
@@ -3747,6 +3774,36 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                     "agent %s admitted %d times (%s)" % (
                         name, len(group), ", ".join(p.agent or "?" for p in group)),
                     placement.fiche, agent=name)
+    # L165 (EP1) : les candidats d'un rôle élu sont des hôtes du canon, tous
+    # admis par l'admission de l'agent. Sans candidat, le rôle ne peut être
+    # tenu nulle part ; un candidat non admis serait refusé au verdict de
+    # placement, donc la fiche est fautive dès `canon check`.
+    for agent in canon.agents:
+        if agent.releve != "election":
+            if agent.candidats:
+                add("agent-candidats-ignored", WARNING,
+                    "`candidats` declared without `releve: election` (ignored)",
+                    agent.fiche, agent=agent.title)
+            continue
+        if not agent.candidats:
+            add("agent-election-candidats-missing", ERROR,
+                "agent %s is `releve: election` without `candidats`" % agent.title,
+                agent.fiche, agent=agent.title)
+            continue
+        admis: set[str] = set()
+        for placement in by_agent.get(agent.title, []):
+            admis |= set(placement.host_names())
+            for tag in placement.tags():
+                admis |= {host.title for host in canon.hosts if tag in (host.tags or [])}
+        for name in agent.candidats:
+            if canon.host(name) is None:
+                add("agent-election-host-unknown", ERROR,
+                    "agent %s is a candidate on unknown host %s" % (agent.title, name),
+                    agent.fiche, agent=agent.title)
+            elif name not in admis:
+                add("agent-election-host-not-admitted", ERROR,
+                    "agent %s is a candidate on %s, which its admission does not cover"
+                    % (agent.title, name), agent.fiche, agent=agent.title)
     for host in canon.hosts:
         for agent in canon.agents:
             paths = {host.policy.work_dirs[n] for n in [agent.title] + list(agent.aliases or [])

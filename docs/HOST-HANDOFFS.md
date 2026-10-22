@@ -182,3 +182,35 @@ quiescence reconciliation.
 All L232e host effects are currently tested with simulated adapters. The
 runner records `helper:L232b` when no enrolled implementation is supplied;
 real SSH, secret delivery and provider login integration depend on L232b/c/d.
+
+## Elected roles across candidate hosts (L165/EP1)
+
+A governance role can be declared on its Agent card as:
+
+```yaml
+releve: election
+candidats: [ameesh-agents-1, ameesh-agents-2, manaty-mesh-1, pc-smichea]
+```
+
+`releve` defaults to `hote` (today's behaviour: the claim only happens on the
+host of the registry row). With `election`, every host in `candidats` must be
+covered by the same Placement admission. `ameesh canon sync` evaluates and
+stores the placement verdict of each candidate host in `agent_candidates`
+(host policy and visibility included, with its evaluated profile), or refuses
+that candidate without blocking the others.
+
+The lease is still the only permission to run: the first candidate whose
+runner finds the lease free or expired claims it. The claim moves the row to
+that host, with the candidate's work directory and placement verdict, and
+increments `lease_epoch`; the former holder is fenced from renewing, ending
+its turn or reclaiming. The holder is the one that renews, so only it takes
+turns.
+
+These roles are outside L232e: `host drain`, loss detection and handoff
+planning skip them, and a pending `handoff_fenced` does not close their claim.
+There is nothing to publish from a local worktree — the pilot's state lives in
+the mesh database, the canon and GitHub — so the L232e source proof does not
+apply. A stopped host loses the role when its lease expires (the L232e timing,
+180 s by default); a returning host goes back to standby until the lease is
+free again. Candidate ranking, rank delays and hysteresis are EP2; this lot
+only makes the cross-host claim possible.

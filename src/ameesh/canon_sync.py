@@ -170,7 +170,9 @@ DECLARATIVE = ("harness", "host", "cwd", "model", "budget_usd", "responsible", "
                # L244 (#420) : les rôles déclarés d'une fiche Agent/Persona,
                # persistés pour le garde SQL du rôle QA. Le vocabulaire est
                # celui des fiches (L242c, #414) ; aucune criticité n'est écrite.
-               "roles")
+               "roles",
+               # L165 (EP1) : relève (`hote`/`election`) et hôtes candidats
+               "releve", "candidats")
 
 #: statuts de `canon_state` (0008)
 CANON_OK = "ok"
@@ -1276,6 +1278,26 @@ def _set_placement(db: Db, name: str, host: str, verdict: placement_mod.Verdict)
                                        profile=verdict.profile)
 
 
+def _write_candidate(db: Db, canon: Canon, agent, admission, host: str, *,
+                     canon_key: str, forge=None) -> None:
+    """L165 (EP1) : verdict de placement de `agent` sur l'hôte candidat `host`.
+
+    Le verdict est évalué comme celui de l'hôte courant (politique de l'hôte
+    et règle de visibilité), mais écrit dans `agent_candidates` : c'est lui
+    que la réclamation depuis `host` compare. Ne déplace jamais la ligne.
+    """
+    verdict = placement_mod.evaluate(canon, agent.title, host)
+    visibility_mod.annotate(canon, agent, host, verdict, db=db, forge=forge)
+    cwd, _ = canon_mod.work_dir_for(canon.host(host), agent, admission)
+    storage.of(db).canon.write_candidate(
+        agent.title, host, canon=canon_key,
+        cwd=os.path.expanduser(cwd) if cwd else None,
+        ok=verdict.ok, diagnostic=verdict.diagnostic, ref=verdict.ref,
+        harness=agent.harness or "other", provider=agent.provider,
+        model=agent.model,
+        credential_mode=admission.credential_mode or agent.credential_mode)
+
+
 def _lineage_root(by_name: dict[str, dict], creator: str | None) -> tuple[dict | None, str]:
     """Créateur racine d'un éphémère, suivi comme `registry.canon_governed_sql`.
 
@@ -1452,6 +1474,14 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         if admis:
             other_admitted[agent.title] = [h for h in admis if h != host]
 
+    # L165 (EP1) : la relève et les candidats sont déclaratifs, comme le
+    # placement. Écrits avant la lecture pour que `_same` voie la fiche du
+    # jour ; `set_election` ne déplace jamais l'agent et retire les verdicts
+    # des hôtes qui ne sont plus candidats.
+    canon_key = "" if canon.is_default else ident
+    for declared in canon.agents:
+        storage.of(db).canon.set_election(
+            declared.title, declared.releve, declared.candidats, canon=canon_key)
     rows = _rows(db, host, sorted(set(admitted_here) | set(other_admitted)))
 
     #: #538 : les agents réellement gouvernés par CE canon sur CET hôte — les
@@ -1483,10 +1513,17 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
                 member=agent.fiche.member, agent=name, untrusted=canon.untrusted))
             actions.append(SyncAction(name, "conflit", message, [NAME_CONFLICT]))
             continue
+        # L165 (EP1) : sur un hôte candidat, le verdict de placement de CET
+        # hôte est écrit même si la ligne est encore chez un autre candidat :
+        # c'est lui qui autorisera la réclamation depuis ici.
+        candidate = agent.releve == "election" and host in (agent.candidats or [])
         # Hôte courant admis et différent de celui qu'on synchronise : on ne
         # touche à rien, l'exécution reste où elle est (0029).
         if row is not None and row.get("host") not in (None, host) \
                 and row.get("host") in other_admitted.get(name, []):
+            if candidate:
+                _write_candidate(db, canon, agent, admission, host,
+                                 canon_key=canon_key, forge=forge)
             actions.append(SyncAction(
                 name, "laissé",
                 "running on %s, an admitted host: \"canon sync\" does not move it"
@@ -1566,6 +1603,11 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             "placement_ok": verdict.ok,
             "placement_diagnostic": verdict.diagnostic,
             "placement_ref": verdict.ref,
+            # L165 (EP1) : relève et hôtes candidats, déclaratifs comme le
+            # placement ; un agent `hote` n'a pas de liste (NULL).
+            "releve": agent.releve,
+            "candidats": (list(agent.candidats) if agent.candidats is not None
+                          else None),
             # L42 (0031) : canon déclarant (NULL pour le canon par défaut)
             "canon": None if canon.is_default else ident,
             # Reject writes based on a pre-handoff read, including after the
@@ -1591,6 +1633,9 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
                 actions.append(SyncAction(name, "différé", message, [SYNC_INCOMPLETE]))
                 continue
             action = SyncAction(name, "créé" if row is None else "mis à jour")
+        if candidate:
+            _write_candidate(db, canon, agent, admission, host,
+                             canon_key=canon_key, forge=forge)
         action.placement = verdict
         if reasons:
             action.blocked = reasons
@@ -1654,7 +1699,9 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         why = "no longer admitted" if canon.agent(name) is not None else "sheet missing"
         # Sans admission sur cet hôte, plus réclamable ici, quel que soit son
         # statut (fin de tour comprise) : écrit avant l'arrêt, colonnes
-        # déclaratives seulement.
+        # déclaratives seulement. Un rôle élu retiré du canon ne garde pas de
+        # candidats.
+        storage.of(db).canon.set_election(name, "hote", None, canon=canon_key)
         verdict = placement_mod.evaluate(canon, name, host)
         _set_placement(db, name, host, verdict)
         stopped = storage.of(db).canon.stop_removed(
