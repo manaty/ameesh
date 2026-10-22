@@ -187,6 +187,11 @@ class TrainEventTransactionTest(PgTestCase):
         item = work.add(self.db, title="event fixture", app="event-test", source="fixture",
                         estimate=5, estimate_source="fixture", actor="fixture")
         work.set_branch(self.db, item["id"], "lot/events", "origin/main", actor="fixture")
+        # #2962 : un verdict complet doit nommer la tête gelée courante (ou se
+        # résoudre) ; le gel de fixture est posé au stockage, ce témoin-ci
+        # n'exerçant pas la porte.
+        storage.of(self.db).work.add_milestone(
+            item["id"], "frozen", sha="a" * 40, actor="fixture", verdict=None, note="")
         listener = self.listener()
         with self.db.transaction() as tx:
             work.milestone(tx, item["id"], "verdict", sha="a" * 40,
@@ -195,14 +200,14 @@ class TrainEventTransactionTest(PgTestCase):
         signal = json.loads(listener.wait(3)["payload"])
         self.assertEqual((signal["project"], signal["target"], signal["kind"]),
                          ("event-test", "main", "verdict"))
-        self.assertEqual(len(work.milestones(self.db, item["id"])), 2)  # request + verdict
+        self.assertEqual(len(work.milestones(self.db, item["id"])), 3)  # request + freeze + verdict
         with self.assertRaisesRegex(RuntimeError, "rollback"):
             with self.db.transaction() as tx:
                 work.milestone(tx, item["id"], "verdict", sha="a" * 40,
                                actor="other", verdict="blocked")
                 raise RuntimeError("rollback")
         self.assertIsNone(listener.wait(0.1))
-        self.assertEqual(len(work.milestones(self.db, item["id"])), 2)
+        self.assertEqual(len(work.milestones(self.db, item["id"])), 3)
         # A milestone which is not a verdict supplies no train event.
         work.milestone(self.db, item["id"], "frozen", sha="a" * 40, actor="fixture")
         self.assertIsNone(listener.wait(0.1))

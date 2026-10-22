@@ -403,7 +403,7 @@ class ReviewGateRepositoryTest(_Base):
         # #2928 : un avis sensible ne compte que sur son reçu exact, lu sur le
         # vrai jalon ; l'avis est donc posé en base avant d'être relu.
         mark = work.milestone(self.db, self.lot["id"], "verdict", sha=sha,
-                              actor="cx", verdict="ok")
+                              actor="cx", verdict="ok", repo=repo)
         self.db.execute(
             "INSERT INTO provenance_receipts"
             " (subject, sha, actor, session, turn, harness, work_item_id)"

@@ -11,7 +11,7 @@ import json
 import os
 import unittest
 
-from ameesh import packet_link, plan_git, work
+from ameesh import packet_link, plan_git, storage, work
 
 from .support import PgTestCase
 from .test_canon import _TmpMixin, git
@@ -62,8 +62,11 @@ class PacketLinkTest(_TmpMixin, PgTestCase):
     def verdict(self, item: dict, sha: str) -> None:
         for state in ("build", "qa"):
             work.move(self.db, item["id"], state)
-        work.milestone(self.db, item["id"], "verdict", sha=sha, verdict="ok",
-                       actor="relecteur")
+        # Cas #2366 : aucun gel n'est requis pour ce témoin de composition ;
+        # l'avis est posé au stockage, la porte d'écriture est testée ailleurs.
+        storage.of(self.db).work.add_milestone(
+            item["id"], "verdict", sha=sha, actor="relecteur", verdict="ok",
+            note="")
 
     def carrier(self, branch: str = "integration/paquet-1", target: str = "main") -> dict:
         return work.add(self.db, title="paquet", issue_ref="acme/web#1",

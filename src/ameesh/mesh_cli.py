@@ -2368,6 +2368,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 row["kind"], args.id,
                 " (%s)" % row["verdict"] if row.get("verdict") else ""))
             if args.kind == "frozen":
+                # #2962 : l'avertissement de publication (ou de gel distant non
+                # vérifié) est dans la note du jalon ; la sortie le dit aussi,
+                # sans en faire un refus.
+                for line in str(row.get("note") or "").splitlines():
+                    if line.startswith((work.FREEZE_UNPUBLISHED_MARK,
+                                        work.FREEZE_UNVERIFIED_MARK)):
+                        print("warning: %s" % line, file=sys.stderr)
                 # #2442 : un réalignement mécanique sur la cible garde les
                 # verdicts de la tête relue ; sinon l'exécuteur retente.
                 from . import verdict_carry
@@ -3527,11 +3534,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help="frozen (branch frozen) or verdict (review delivered); "
                             "the pilot's fire is `ameesh work fire`")
     pw_ms.add_argument("--sha", default="",
-                       help="the frozen or reviewed commit (frozen: the full 40-hex "
-                            "commit, or an abbreviation of at least 12 hex characters "
-                            "resolved in the author's repository; a symbolic ref is "
-                            "refused. verdict: the full head, or an abbreviation of at "
-                            "least 12 hex characters resolved in a repository)")
+                       help="the frozen or reviewed commit (frozen: a full commit "
+                            "resolved in the author's repository, or an abbreviation "
+                            "of at least 12 hex characters resolved there; a symbolic "
+                            "ref is refused. verdict: a full commit resolved, the "
+                            "current frozen head, or an abbreviation of at least 12 "
+                            "hex characters resolved in a repository)")
     # le verdict est un positionnel (`work milestone 1 verdict ok`), comme la
     # frise se lit ; `frozen` n'en prend pas
     pw_ms.add_argument("verdict", nargs="?", choices=list(work.VERDICTS), default=None,
