@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ameesh"
-version = "1.17.0"
+version = "1.18.0"
 description = "Coordination d'équipes mixtes humains et agents IA : exécuteur multi-harnais, canon OKF, fil lisible, actions sous porte et approbations signées."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -20,9 +20,10 @@ license-files = ["LICENSE"]
 # Windows) ; ailleurs, psycopg pur Python utilise la libpq du système, et sans
 # elle l'import échoue proprement : la couche db retombe alors sur `psql`
 # (repli conservé, `ameesh doctor` le signale si la base est distante).
+# LISTEN/NOTIFY uses Connection.notifies(timeout=), available since psycopg 3.2.
 dependencies = [
-    "psycopg[binary]>=3.1; platform_machine == 'x86_64' or platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'arm64'",
-    "psycopg>=3.1; platform_machine != 'x86_64' and platform_machine != 'AMD64' and platform_machine != 'aarch64' and platform_machine != 'arm64'",
+    "psycopg[binary]>=3.2; platform_machine == 'x86_64' or platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'arm64'",
+    "psycopg>=3.2; platform_machine != 'x86_64' and platform_machine != 'AMD64' and platform_machine != 'aarch64' and platform_machine != 'arm64'",
     # L63 : la couche plateforme (`ameesh.platform`) lit processus, heure de
     # démarrage et mesures de l'hôte par psutil (roues Linux, macOS, Windows).
     # Sous Linux, un repli par /proc reste en place si psutil manque ; ailleurs,
@@ -32,7 +33,7 @@ dependencies = [
 
 [project.optional-dependencies]
 #: conservée pour les commandes d'installation existantes (`ameesh[psycopg]`)
-psycopg = ["psycopg[binary]>=3.1"]
+psycopg = ["psycopg[binary]>=3.2"]
 crypto = ["cryptography>=41"]
 
 [project.scripts]

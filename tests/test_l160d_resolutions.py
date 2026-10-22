@@ -17,9 +17,9 @@ import tempfile
 import unittest
 from unittest import mock
 
-from ameesh import plan_git, radar, resolutions, storage, work
+from ameesh import plan_git, radar, resolutions, review_provenance, storage, work
 
-from .support import PgTestCase
+from .support import PgTestCase, patch_families
 from .test_l160b_radar import LOTS, MIG, _git, _write, git_env, make_repo
 
 #: the line both lots 1 and 2 changed, resolved
@@ -1112,6 +1112,52 @@ class ResolutionsDbTest(PgTestCase):
         snapshot = radar.read_snapshot(cfg, "p")
         pair = [p for p in snapshot["pairs"] if sorted(p["lots"]) == [a, b]][0]
         self.assertEqual((pair["state"], pair["resolution"]["by"]), ("prepared", b))
+
+    def _resolve_in_turn(self, repo, a, b, env):
+        resolutions.open_resolution(self.db, b, a, repo=repo)
+        _write(resolutions.worktree_path(repo, b, a), "shared.py", RESOLVED)
+        with mock.patch.dict(os.environ, env):
+            return resolutions.finish_resolution(self.db, b, a, repo=repo, actor="a2")
+
+    def test_done_in_a_turn_records_the_exact_receipt(self):
+        """#2942 : le commit mécanique de `--done` naît avec sa preuve exacte."""
+        patch_families(self)
+        storage.of(self.db).agents.upsert_unleased(
+            "a2", chantier=None, harness="claude", host="h", cwd="/tmp",
+            session_id="s-2942")
+        repo = make_repo(self.tmp)
+        _identity(repo)
+        a, b = self.lots()
+        env = {"AGENT_MAIL_NAME": "a2", "AMEESH_TURN_ID": "t" * 32,
+               "AMEESH_HARNESS": "claude", "GIT_COMMITTER_NAME": "a2",
+               "GIT_COMMITTER_EMAIL": "a2@ameesh.invalid"}
+        done = self._resolve_in_turn(repo, a, b, env)
+        sha = done["commit"]
+        self.assertEqual((done["receipt"], done["receipt_error"]), ("commit:" + sha, None))
+        recu = review_provenance.receipt_for_commit(self.db, sha)
+        self.assertEqual((recu["actor"], recu["session"], recu["turn"], recu["harness"]),
+                         ("a2", "s-2942", "t" * 32, "claude"))
+        # la paire attestation/fait de création est consommée
+        git_dir = _git(repo, "rev-parse", "--absolute-git-dir")
+        self.assertFalse(os.path.exists(os.path.join(git_dir, review_provenance.INTENT_NAME)))
+
+    def test_done_by_another_committer_leaves_the_origin_unknown(self):
+        """Committer d'un autre que l'acteur du tour : pas de reçu, jamais inventé."""
+        patch_families(self)
+        storage.of(self.db).agents.upsert_unleased(
+            "a2", chantier=None, harness="claude", host="h", cwd="/tmp",
+            session_id="s-2942")
+        repo = make_repo(self.tmp)
+        _identity(repo)
+        a, b = self.lots()
+        env = {"AGENT_MAIL_NAME": "a2", "AMEESH_TURN_ID": "t" * 32,
+               "AMEESH_HARNESS": "claude", "GIT_COMMITTER_NAME": "t",
+               "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+        done = self._resolve_in_turn(repo, a, b, env)
+        self.assertIsNone(done["receipt"])
+        self.assertIn("was not committed by a2", done["receipt_error"])
+        self.assertIsNone(review_provenance.receipt_for_commit(self.db, done["commit"]))
+        self.assertEqual(done["state"], "prepared")
 
 
 class ResolutionsWithoutTableDbTest(PgTestCase):

@@ -431,6 +431,25 @@ retirée ni modifiée. Déployer le serveur avant les nouveaux exécuteurs : un
 ancien serveur refuse `mailbox.unread_human_page` ; le runner médié garde les
 humains déjà trouvés et lit comme avant, sans tuer le fil de l'agent.
 
+## Contrat 1.7 : attribution des messages au grand livre (#288/L80b)
+
+Un tour résident peut servir plusieurs messages (consigne groupée, steer) :
+son coût est celui du **tour**, partagé par ses entrées. L'opération
+`turn_costs.insert` gagne un mot-clé facultatif `inputs` : un tableau de
+chaînes (ou `null`) portant les identifiants des messages réellement servis.
+La ligne `turn_costs.inputs` les conserve (`jsonb`, migration 0472) et
+`ameesh cost turns --message ID` rend les tours qui les ont servis — le `usd`
+affiché est celui du tour entier, jamais divisé.
+
+L'ajout est compatible : la version passe à `1.7.0`, aucune opération n'est
+retirée ni modifiée ; `inputs` est facultatif (`null` par défaut) et les
+lignes antérieures restent `null`. Un client 1.6 n'envoie pas le paramètre.
+Un **serveur 1.6** refuse un appel qui le porte (`bad_args`) : l'exécuteur
+réessaie alors sans `inputs` — le tour reste compté, l'attribution est perdue
+et journalisée ; la comptabilité n'est jamais suspendue pour autant. Déployer
+le serveur avant les exécuteurs n'est pas nécessaire, mais le fait donne
+l'attribution dès le premier tour.
+
 ## Porte d'hôte
 
 Le runner Compute écrit `ameesh-host-state/1`. Ce message porte `state`

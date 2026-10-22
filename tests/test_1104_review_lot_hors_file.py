@@ -122,7 +122,7 @@ class ClassAtMergeRuleTest(unittest.TestCase):
 
     def test_une_panne_de_lecture_du_diff_ne_classe_pas_light(self):
         out, of_lot = self.call({"side_effect": RuntimeError("panne de lecture")})
-        of_lot.assert_not_called()
+        self.assertFalse(of_lot.called, "of_lot ne classe pas un doute")
         self.assertEqual(out["class"], "sensitive")
         self.assertTrue(out["doubt"])
         self.assertIn("lecture du diff impossible", out["why"])
@@ -131,7 +131,7 @@ class ClassAtMergeRuleTest(unittest.TestCase):
         """Gel lisible et ancêtre de la cible, commit de fusion absent du
         dépôt : le repli serait un diff vide, donc « light »."""
         out, of_lot = self.call({"return_value": None})
-        of_lot.assert_not_called()
+        self.assertFalse(of_lot.called, "of_lot ne classe pas un doute")
         self.assertEqual(out["class"], "sensitive")
         self.assertTrue(out["doubt"])
         self.assertIn("ne contient pas le commit", out["why"])

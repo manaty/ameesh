@@ -66,7 +66,7 @@ import threading
 import time
 from contextlib import contextmanager
 
-from . import migrations, plan_git, storage, work
+from . import migrations, plan_git, review_provenance, storage, work
 from .canon import (FETCH_TIMEOUT, GIT_TIMEOUT, NO_LAZY_FETCH, GitError, _git,
                     _git_env)
 
@@ -749,6 +749,28 @@ def _prepared_out(row: dict, lot: int, other: int, *, already: bool) -> dict:
             "files": list(row.get("files") or []), "state": "prepared", "already": already}
 
 
+def _record_receipt(db, path: str, lot: int, actor: str) -> tuple[str | None, str | None]:
+    """Le reçu exact du commit de résolution qui vient de naître (#2942).
+
+    Mêmes bornes que le hook `post-commit` : fait de création constaté sur le
+    reflog, identité du tour (session vivante, famille du canon), puis
+    `record_commit`. Ne bloque jamais la résolution : sans tour managé ou si une
+    garde refuse, l'origine reste inconnue — `(None, raison)` — et aucun reçu
+    n'est fabriqué plus tard."""
+    if db is None:
+        return None, "no database"
+    try:
+        review_provenance.prepare_commit_creation(path, actor=actor)
+        ident = review_provenance.proof_for_current_turn(db, actor=actor, cwd=path)
+        if ident is None:
+            return None, "outside a managed turn, or no live session"
+        row = review_provenance.record_commit(db, "HEAD", identity=ident,
+                                              work_item_id=lot, cwd=path)
+    except review_provenance.ProvenanceError as exc:
+        return None, str(exc)
+    return row["subject"], None
+
+
 def finish_resolution(db, lot: int, other: int, *, repo: str | None = None,
                       actor: str = "", note: str = "", push_fn=push) -> dict:
     """Commits the resolution open in its worktree, points the dedicated ref
@@ -774,6 +796,7 @@ def finish_resolution(db, lot: int, other: int, *, repo: str | None = None,
         raise ResolveError("no resolution of #%d with #%d is open here: "
                            "ameesh work resolve %d --with %d" % (lot, other, lot, other))
     merging = _run(path, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0
+    receipt, receipt_error = None, "commit made by an earlier pass"
     if merging:
         left = with_markers(path, meta["files"])
         if left:
@@ -803,8 +826,18 @@ def finish_resolution(db, lot: int, other: int, *, repo: str | None = None,
         left = with_markers(path, sorted(set(meta["files"]) | _merged_paths(path, meta)))
         if left:
             raise ResolveError("conflict markers left in %s (%s)" % (", ".join(left), path))
-        _check(_run(path, "-c", "rerere.enabled=false", "commit", "--quiet", "--no-verify",
-                    "-F", "-", stdin=_message(meta, note).encode()), "commit")
+        # #2942 : `_run` coupe les crochets (`core.hooksPath=/dev/null`) ; la
+        # paire attestation/fait de création de #1465 est donc posée ici, avec
+        # les mêmes gardes de tour que les hooks, autour du commit mécanique.
+        review_provenance.prepare_commit_intent(path, actor=actor)
+        try:
+            _check(_run(path, "-c", "rerere.enabled=false", "commit", "--quiet",
+                        "--no-verify", "-F", "-", stdin=_message(meta, note).encode()),
+                   "commit")
+            receipt, receipt_error = _record_receipt(db, path, lot, actor)
+        finally:
+            review_provenance.clear_commit_intent(path)
+            review_provenance.clear_commit_creation(path)
     else:
         dirty = _status(path)
         if dirty:  # a resumed --done: the commit is made, later changes are not in it
@@ -844,7 +877,8 @@ def finish_resolution(db, lot: int, other: int, *, repo: str | None = None,
     _remove_worktree(repo, path, force=False)
     return {"lot": lot, "other": other, "commit": sha, "ref": pushed, "push_error": error,
             "local_ref": ref_name(lot, other), "files": meta["files"],
-            "state": "prepared", "already": False}
+            "state": "prepared", "already": False,
+            "receipt": receipt, "receipt_error": receipt_error}
 
 
 def abort_resolution(lot: int, other: int, *, repo: str | None = None) -> bool:
@@ -1389,6 +1423,10 @@ def run(cfg, db, args) -> int:
                 out["lot"], out["other"], out["commit"][:12],
                 "pushed to origin %s" % out["ref"] if out["ref"] else
                 "kept in %s only (push failed: %s)" % (out["local_ref"], out["push_error"])))
+            if out.get("receipt"):
+                print("exact origin recorded: %s" % out["receipt"])
+            else:
+                print("origin unknown (no exact receipt): %s" % out.get("receipt_error"))
             print("the radar replays it at each pass: prepared while the conflict stays the "
                   "same, stale (and you are told) when it changes")
             return 0

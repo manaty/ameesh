@@ -57,15 +57,24 @@ FREEZE_ABSENT_MARK = "ameesh-freeze-absent:"
 #: ligne fournie par `--note` est retirée avant que le gel n'écrive la sienne
 #: (sinon `--note "ameesh-freeze-absent: main"` contournerait le garde #2784).
 FREEZE_ABSENT_LINE = re.compile(r"(?m)^[ \t]*ameesh-freeze-absent:[^\n]*(?:\n|$)")
+#: #2971 : toute marque machine de la note de gel (`ameesh-freeze-absent`,
+#: `ameesh-freeze-unverified`, `ameesh-freeze-unpublished`,
+#: `ameesh-freeze-supersedes`, ...) est une preuve du gate, jamais une note
+#: d'appelant. Le motif est générique pour couvrir aussi les marques des
+#: branches #2962/#2989 : une ligne fournie par `--note` est retirée avant
+#: l'écriture, comme `FREEZE_ABSENT_LINE` le fait pour `absent`.
+#: Le motif juge une ligne déjà strippée : `add_milestone` strippe la note
+#: finale, donc un blanc de tête (`\v`, `\f`, espace insécable) ne doit pas
+#: cacher la marque (#2971, revue impl-05 — même classe que #2989 B).
+FREEZE_MACHINE_LINE = re.compile(r"ameesh-freeze-[a-z0-9-]+:")
 #: #2989 : la ligne machine d'un gel qui déclare un gel antérieur **remplacé**
 #: (typiquement un gel fantôme dont le SHA n'existe nulle part). Elle n'est
 #: écrite que par `work milestone frozen --supersedes <id>`, jamais recopiée
 #: d'une note d'appelant : la porte ignore alors le gel remplacé, avec la note
 #: du nouveau gel comme trace. Sans elle, un gel antérieur absent bloque la
-#: provenance (refus fermé de #2924 B5).
+#: provenance (refus fermé de #2924 B5). Le filtre `--note` est celui, générique,
+#: de #2971 ci-dessus.
 FREEZE_SUPERSEDES_MARK = "ameesh-freeze-supersedes:"
-FREEZE_SUPERSEDES_LINE = re.compile(
-    r"(?m)^[ \t]*ameesh-freeze-supersedes:[^\n]*(?:\n|$)")
 FREEZE_SUPERSEDES_RE = re.compile(
     r"(?m)^ameesh-freeze-supersedes:\s*(\d+)\s*$")
 
@@ -636,6 +645,19 @@ def milestone(
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
+    # #2971 : `--note` ne fournit aucune preuve machine de gel. Le retrait est
+    # fait ici, avant les marques que le gate ajoute lui-même, pour que
+    # `unverified`/`unpublished` (#2962) et `supersedes` (#2989) restent
+    # écrites par le gate et ne soient jamais effacées par un appelant.
+    # #2971 (revue impl-05) : `add_milestone` strippe la note finale. Un filtre
+    # ligne à ligne sur `^[ \t]*` laissait donc une ligne machine précédée d'un
+    # blanc Unicode (`\v`, `\f`, espace insécable) devenir valide après ce
+    # strip ; retirer une autre ligne pouvait aussi l'exposer. On juge chaque
+    # ligne sur sa forme strippée — exactement celle que la lecture verra — puis
+    # on strippe l'ensemble : aucune marque fournie par `--note` ne survit.
+    note = "\n".join(
+        line for line in str(note or "").splitlines()
+        if not FREEZE_MACHINE_LINE.match(line.strip())).strip()
     if kind == "verdict":
         # #2674 : refuser à l'écriture un avis qui ne nomme pas la tête relue.
         sha = reviewed_head(db, item, sha, repo=repo)
@@ -651,18 +673,10 @@ def milestone(
         # balayage ne confonde pas une livraison (avance rapide) avec un gel
         # déjà dans la cible. C'est une preuve machine : une ligne fournie par
         # l'appelant (`--note`) est ignorée et refaite ici (#2786, avis dev4).
-        # #2989 (B des revues cx2 et dev1) : `milestone` fait un `strip()`
-        # final sur la note. Un filtre ligne à ligne sur `^[ \t]*` laissait
-        # passer une ligne machine précédée d'un blanc Unicode (`\v`, `\f`,
-        # espace insécable) ; retirer une autre ligne pouvait aussi l'exposer.
-        # On juge donc chaque ligne sur sa forme strippée — exactement celle
-        # que la lecture verra — puis on strippe l'ensemble : aucune ligne
-        # machine (absence, remplacement) fournie par `--note` ne survit,
-        # quel que soit le blanc.
-        note = "\n".join(
-            line for line in str(note or "").splitlines()
-            if not line.strip().startswith(
-                (FREEZE_ABSENT_MARK, FREEZE_SUPERSEDES_MARK))).strip()
+        # #2989 : la marque de remplacement est écrite ici, après le filtre
+        # générique de #2971 qui a déjà retiré toute marque fournie par `--note`
+        # (blanc de tête compris). `replaced` ne porte que des gels fantômes
+        # prouvés absents, vérifiés ci-dessous.
         if replaced:
             # #2989 : la déclaration ne vaut que pour un gel antérieur du même
             # lot (la ligne machine est écrite ici, jamais recopiée).

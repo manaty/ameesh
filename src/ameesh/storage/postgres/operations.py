@@ -514,9 +514,10 @@ class Operations(interface.Operations):
             (int(limit) if limit is not None else None,))
 
     # -- usage par tour ------------------------------------------------------
-    def turns(self, *, agent, since_s, limit) -> list[dict]:
+    def turns(self, *, agent, since_s, limit, message=None) -> list[dict]:
         sql = ("SELECT id, agent, harness, turn, model, session, usd::float8 AS usd,"
                " input_tokens, cached_input_tokens, output_tokens, work_item_id,"
+               " inputs,"
                " extract(epoch from recorded_at)::float8 AS recorded_ts,"
                " extract(epoch from started_at)::float8 AS started_ts"
                " FROM turn_costs WHERE recorded_at >= now() - make_interval(secs => %s)"
@@ -525,6 +526,11 @@ class Operations(interface.Operations):
         if agent:
             sql += " AND agent = %s"
             params.append(agent)
+        if message is not None:
+            # L80b : les tours qui ont servi ce message (l'index GIN porte le
+            # contenant). Le coût rendu est celui du tour entier, jamais divisé.
+            sql += " AND inputs @> %s::jsonb"
+            params.append(json.dumps([str(message)]))
         sql += " ORDER BY recorded_at DESC, id DESC LIMIT %s"
         params.append(int(limit))
         return self.db.query(sql, tuple(params))

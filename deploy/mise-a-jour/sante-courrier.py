@@ -22,7 +22,12 @@ Read-only checks, then one real delivery probe:
   its pending mail is reported in ``canal_humain`` with the human it belongs
   to and the read-only command that shows it (``agent-mail inbox <name>``),
   never as an agent dead letter, and never blocking: the human channel is the
-  owner alert/decision channel, not the agent mailbox (#2899);
+  owner alert/decision channel, not the agent mailbox (#2899). A chat session
+  (``chat-<human>``) is a human channel too, but it reads its mail when the
+  human opens the conversation: the entry names ``canal: "chat"`` and claims no
+  pushed alert (``alerte: null``), like ``exploitation.alerts`` which excludes
+  it (#2957). A profile that declares no responsible falls back to the owner's
+  human channel, read from the registry (never a hard-coded identity);
 * probe: a system message is dropped to one DRIVEN and FREE persona of the host
   (live lease, not in a turn, not paused by the operator); within ``--attente``
   the persona must answer it with a tool call (``agent-mail send <self> --ack
@@ -66,7 +71,7 @@ import secrets
 import sys
 import time
 
-from ameesh import config, db as db_mod, mail, registry, storage, work
+from ameesh import budget, chat, config, db as db_mod, mail, registry, storage, work
 
 #: seconds allowed for delivery, tool answer and a clean turn end (bounded)
 DEFAULT_ATTENTE = 300.0
@@ -171,14 +176,20 @@ def sans_executeur(db, rows: list[dict], souffrance: float, now: float) -> list[
     (#2899). ``operator_paused`` and a budget pause are deliberate waits: their
     mail is expected to wait. A ``blocked`` agent without a live lease and
     without a budget pause is an operational failure: its mail is named too,
-    with its error (never silently dropped from the report).
+    with its error (never silently dropped from the report). A human profile
+    that would also match ``mode=execute`` (owner key, ``harness=none``) is not
+    an executable agent to restart: it belongs to ``canal_humain`` only, so it
+    is never counted twice (#2957).
     """
     out = []
     for row in rows:
+        if humain_sans_executeur(row):
+            continue
         statut = row.get("status") or "idle"
         if row.get("operator_paused") or statut in ("stopped", "dead"):
             continue
-        if statut == "blocked" and (row.get("status_text") or "").startswith("budget : "):
+        if statut == "blocked" and (row.get("status_text") or "").startswith(
+                budget.PAUSE_PREFIX):
             continue
         if driven(row, now):
             continue
@@ -239,6 +250,18 @@ def dead_letters(db, hote: str, rows: list[dict] | None = None) -> list[dict]:
     return out
 
 
+def owner_human(db) -> str | None:
+    """Le canal humain du propriétaire, pour un profil sans responsable.
+
+    Le registre porte la ligne du propriétaire (``key_role=owner``) et son
+    humain responsable : aucun nom n'est codé en dur (#2957). Hors du canal
+    humain, un tel profil n'a personne à qui pousser l'alerte."""
+    for row in registry.overview(db):
+        if (row.get("key_role") or "") == "owner":
+            return row.get("responsible") or "human:%s" % row.get("name")
+    return None
+
+
 def canal_humain(db, hote: str, now: float,
                  rows: list[dict] | None = None) -> list[dict]:
     """Pending mail of this host's human profiles without executor.
@@ -246,9 +269,14 @@ def canal_humain(db, hote: str, now: float,
     Non-blocking, but never hidden: the report names the human, the age, and
     the read-only command that shows the mail without marking it read. The
     owner alert (``stopped_with_mail``) is the pushed channel; this section is
-    the structured, explicit one (#2899)."""
+    the structured, explicit one (#2899). A chat session is a human channel
+    that reads its mail when the human opens it: ``canal`` says ``chat`` and
+    ``alerte`` stays null, because no pushed alert covers it (#2957). A profile
+    without a declared responsible falls back to the owner's channel from the
+    registry."""
     rows = toutes_personas(db, hote) if rows is None else rows
     out = []
+    fallback = None
     for row in rows:
         if not humain_sans_executeur(row):
             continue
@@ -257,13 +285,19 @@ def canal_humain(db, hote: str, now: float,
             continue
         oldest = max(now - float(m.get("created_ts") or now) for m in messages)
         responsable = row.get("responsible") or None
+        chat_session = chat.is_chat_agent(row)
+        if not responsable and not chat_session:
+            if fallback is None:
+                fallback = owner_human(db) or ""
+            responsable = fallback or None
         entry = {"destinataire": row["name"], "n": len(messages),
                  "plus_ancien_s": round(oldest, 1),
                  "responsable": responsable,
-                 "canal": responsable or "human:?",
-                 "alerte": ("stopped_with_mail"
-                            if (row.get("status") or "") == "stopped"
-                            else "idle_with_mail"),
+                 "canal": "chat" if chat_session else (responsable or "human:?"),
+                 "alerte": (None if chat_session else
+                            ("stopped_with_mail"
+                             if (row.get("status") or "") == "stopped"
+                             else "idle_with_mail")),
                  "lecture": "agent-mail inbox %s" % row["name"]}
         if len(messages) >= mail.UNREAD_LIMIT:
             # la lecture est bornee : le compte est un plancher, pas un total

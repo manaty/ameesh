@@ -649,6 +649,28 @@ class PorteeTest(ServeurExecTest):
         self.assertEqual(storage.of(self.db).turn_costs.spent(
             3600, agent="inge-front", harnesses=None), 0.0)
 
+    def test_cout_d_un_appareil_attribue_les_messages(self):
+        """Contrat 1.7 (L80b) : `inputs` traverse le serveur et se range sur la
+        ligne ; facultatif, il reste NULL quand il est absent."""
+        base = {"agent": "inge-front", "harness": "dsh", "turn": "t-2",
+                "model": "m", "session": None, "usd": 1.25, "input_tokens": 1,
+                "cached_input_tokens": 0, "output_tokens": 1, "cum_usd": None,
+                "cum_input_tokens": None, "cum_cached_input_tokens": None,
+                "cum_output_tokens": None}
+        resp = self.op("turn_costs.insert", [],
+                       dict(base, inputs=["12", "human:7"]),
+                       fence=("inge-front", OWNER, 42))
+        self.assertEqual(resp.status, 200, resp.body)
+        row = self.db.query(
+            "SELECT inputs FROM turn_costs WHERE turn = 't-2'")[0]
+        self.assertEqual(row["inputs"], ["12", "human:7"])
+        resp = self.op("turn_costs.insert", [], dict(base, turn="t-3"),
+                       fence=("inge-front", OWNER, 42))
+        self.assertEqual(resp.status, 200, resp.body)
+        row = self.db.query(
+            "SELECT inputs FROM turn_costs WHERE turn = 't-3'")[0]
+        self.assertIsNone(row["inputs"])
+
     def test_aucun_recu_ni_approbation(self):
         """Toute opération refusée par la table (approbations, nonces,
         reçus, canon…) : 404 sur les deux routes, rien d'exécuté."""
