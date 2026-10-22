@@ -38,7 +38,8 @@ LOG_DIR_ENV = "AMEESH_LAUNCHD_LOG_DIR"
 #: préfixe des labels et des fichiers : `ameesh.runner`, `ameesh-notify.plist`
 LABEL_PREFIX = "ameesh"
 #: fichier d'environnement de l'hôte, le même que celui des unités systemd
-HOST_ENV_FILE = "~/.config/ameesh/env"
+#: (relatif au dossier de l'utilisateur : launchd n'étend pas `~`)
+HOST_ENV_FILE = ".config/ameesh/env"
 #: PATH explicite des services : une session launchd n'importe pas celui du
 #: shell (mise, ~/.local/bin), et le runner doit y trouver ses harnais (L106)
 SERVICE_PATH = ("~/.local/share/mise/shims", "~/.local/bin",
@@ -127,7 +128,7 @@ def shell_command(service: Service, ameesh_bin: str,
     la configuration peut venir de `config.json` ou du trousseau.
     """
     argv = " ".join(shlex.quote(str(item)) for item in (ameesh_bin, *service.args))
-    env_file = os.path.join(_home(env), HOST_ENV_FILE[2:])
+    env_file = os.path.join(_home(env), HOST_ENV_FILE)
     return ("set -a\n"
             "if [ -r %(env)s ]; then . %(env)s; fi\n"
             "set +a\n"
@@ -278,8 +279,8 @@ def status(service: Service, *, run: Callable = subprocess.run,
     _require_macos()
     path = plist_path(service, env)
     out = {"name": service.name, "label": service.label, "path": path,
-           "installed": os.path.isfile(path), "loaded": False, "pid": None,
-           "state": ""}
+           "description": service.description, "installed": os.path.isfile(path),
+           "loaded": False, "pid": None, "state": ""}
     if not out["installed"]:
         return out
     result = _launchctl(run, "print", "%s/%s" % (_domain(), service.label))

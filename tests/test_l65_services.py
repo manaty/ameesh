@@ -430,6 +430,13 @@ class KeychainTest(unittest.TestCase):
         with mock.patch.object(platform, "SYSTEM", "linux"):
             self.assertEqual(accounts.check(profile, {"HOME": self.tmp}), [])
 
+    def test_codex_par_defaut_macos_ne_consulte_pas_le_trousseau(self):
+        profile = accounts.parse({"codex": [{"name": "primaire"}]})["codex"][0]
+        with mock.patch.object(platform, "SYSTEM", "macos"), \
+                mock.patch.object(accounts, "_keychain_item") as item:
+            self.assertEqual(accounts.check(profile, {"HOME": self.tmp}), [])
+        item.assert_not_called()
+
     def test_codex_macos_garde_le_fichier(self):
         profile = accounts.parse({"codex": [{"name": "secondaire",
                                              "path": self.directory}]})["codex"][0]

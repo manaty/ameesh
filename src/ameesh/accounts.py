@@ -761,6 +761,7 @@ def _check(profile: Profile, environ=None) -> list[str]:
             # comptes) garde son comportement d'avant L30 : il peut
             # s'authentifier autrement qu'avec un compte de forfait.
             if (profile.declared and platform.is_macos() and cred
+                    and keychain_service_of(profile.harness)
                     and profile.check_credentials
                     and not os.path.isfile(os.path.join(profile.home(environ), cred))):
                 _append_keychain_problem(profile, problems, environ)

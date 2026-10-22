@@ -39,8 +39,8 @@ from .platform import service as launchd
 SCHEMA = "ameesh-services/1"
 
 
-class ServiceError(RuntimeError):
-    """Une commande `ameesh service` refusée ou en échec (code 1)."""
+class UsageError(RuntimeError):
+    """Une sélection `ameesh service` refusée (code 1)."""
 
 
 def _ameesh_binary(env: Mapping[str, str] | None = None) -> str:
@@ -76,8 +76,8 @@ def _agents(values: list[str]) -> list[str]:
             if not agent:
                 continue
             if not NAME_RE.match(agent):
-                raise ServiceError("invalid agent name %r (letters, digits, . _ -)"
-                                   % agent)
+                raise UsageError("invalid agent name %r (letters, digits, . _ -)"
+                                 % agent)
             if agent not in out:
                 out.append(agent)
     return out
@@ -114,10 +114,10 @@ def services(agents: list[str], *, runner: bool = True, notify: bool = True,
 def _selection(args) -> list[launchd.Service]:
     agents = _agents(args.agent)
     if args.no_runner and args.no_notify:
-        raise ServiceError("nothing to do: --no-runner and --no-notify together")
+        raise UsageError("nothing to do: --no-runner and --no-notify together")
     if agents and args.no_runner:
-        raise ServiceError("--agent names a runner: it cannot be combined with "
-                           "--no-runner")
+        raise UsageError("--agent names a runner: it cannot be combined with "
+                         "--no-runner")
     return services(agents, runner=not args.no_runner, notify=not args.no_notify)
 
 
@@ -222,7 +222,7 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None, *,
         if args.command == "uninstall":
             return _uninstall(args, env, run)
         return _status(args, env, run)
-    except (ServiceError, launchd.ServiceError) as exc:
+    except (UsageError, launchd.ServiceError) as exc:
         print("ameesh service: %s" % exc, file=sys.stderr)
         return 1
 
