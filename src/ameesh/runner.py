@@ -537,6 +537,12 @@ class AgentWorker(threading.Thread):
     #: AttributeError (CI #417).
     resident = None
 
+    #: L165 (EP3) : brief de relève en attente. Il ouvre la session neuve, mais
+    #: le brief MINIMAL d'un lot le COMPLÈTE sans l'écraser (`_open_lot_session`,
+    #: `_switch_lot`) ; il survit donc au premier tour d'un lot. Défaut de
+    #: classe, comme `resident`, pour les constructions partielles.
+    _election_brief = ""
+
     def __init__(self, runner: "Runner", agent: dict, lease: dict):
         super().__init__(name=agent["name"], daemon=True)
         self.runner = runner
@@ -2129,6 +2135,7 @@ class AgentWorker(threading.Thread):
         d'être : oublié, en mémoire et sur disque."""
         self.resume_summary = ""
         self.resume_continuation = False
+        self._election_brief = ""
         try:
             os.unlink(self._path(self.RESUME_PENDING))
         except OSError:
@@ -2186,6 +2193,7 @@ class AgentWorker(threading.Thread):
             log_async("[%s] elected on %s: no persisted resume brief; new session "
                       "opens without one" % (self.name, self.runner.host))
             return False
+        self._election_brief = brief
         if not self._resume_keep(brief, "ameesh"):
             # #389 r3 : au moins en mémoire, le brief ouvre le tour
             self.resume_summary, self.resume_origin = brief, "ameesh"
@@ -2929,6 +2937,22 @@ class AgentWorker(threading.Thread):
                                                  "session": session or ""})
         return True
 
+    def _lot_opening_resume(self, brief: str) -> tuple[str, str]:
+        """Le résumé qui ouvre une session de lot, sans perdre une relève.
+
+        L165 (EP3) : un brief de relève en attente (origine `ameesh`) ouvre la
+        session neuve AVANT le brief du lot, qui le complète ; il n'est jamais
+        écrasé par lui (verdict cx2 B2). Un résumé de rotation (origine
+        `agent`) décrit la même session de lot et ouvre aussi la session, la
+        fiche du lot le complétant (#1898 N1).
+        """
+        election = getattr(self, "_election_brief", "")
+        if election:
+            return (election + "\n\n" + brief if brief else election, "ameesh")
+        if self.resume_summary and self.resume_origin == "agent":
+            return self.resume_summary + "\n\n" + brief, "agent"
+        return brief, "ameesh"
+
     def _open_lot_session(self, lot: str) -> None:
         """#794 : la session qui va s'ouvrir est dédiée au lot `lot` ; son
         ouverture est le brief minimal du lot, jamais un brief de reprise
@@ -2939,12 +2963,13 @@ class AgentWorker(threading.Thread):
         il ouvre la session neuve, la fiche du lot le complète, et le tout est
         réécrit sur disque (`RESUME_PENDING`) pour qu'un redémarrage du worker
         ne ressuscite pas l'ancien résumé seul.
+
+        L165 (EP3) : le brief de relève en attente survit à l'ouverture de la
+        session de lot (`_lot_opening_resume`) ; sans cela, le premier tour
+        élu perdait l'état du rôle (verdict cx2 B2).
         """
         brief = self._lot_brief(str(lot), "", {}) or ""
-        if self.resume_summary and self.resume_origin == "agent":
-            resume, origin = self.resume_summary + "\n\n" + brief, "agent"
-        else:
-            resume, origin = brief, "ameesh"
+        resume, origin = self._lot_opening_resume(brief)
         if resume and not self._resume_keep(resume, origin):
             # disque indisponible : la mémoire au moins, le tour partira
             self.resume_summary, self.resume_origin = resume, origin
@@ -3009,9 +3034,16 @@ class AgentWorker(threading.Thread):
         self.agent = registry.get(self.db, self.name) or self.agent
         self._reset_session_counts()
         if not repris:
-            self.resume_summary = self._lot_brief(lot, courant, out)
-            self.resume_origin = "ameesh"
-            self.resume_continuation = False
+            # L165 (EP3) : le brief de relève en attente n'est pas écrasé par
+            # celui du lot ; les deux ouvrent la session neuve.
+            resume, origin = self._lot_opening_resume(
+                self._lot_brief(lot, courant, out))
+            if resume and not self._resume_keep(resume, origin):
+                self.resume_summary, self.resume_origin = resume, origin
+                self.resume_continuation = False
+            elif not resume:
+                self.resume_summary, self.resume_origin = "", "ameesh"
+                self.resume_continuation = False
         # #2055 : une reprise sans bascule (aucune session active) n'a pas de
         # lot courant à nommer.
         de = courant or "aucun"
@@ -5466,6 +5498,11 @@ class AgentWorker(threading.Thread):
         #538 : `_budget_courrier` réserve ces octets — le bloc de première
         session ne se paie pas sur le courrier (verdict codex #510 r2, P2)."""
         if self.current_session():
+            # L165 (EP3) : un tour qui REPREND une session de lot ne doit pas
+            # perdre le brief de relève en attente ; il l'ouvre comme un
+            # résumé (le brief sera oublié en fin de tour, `_resume_drop`).
+            if getattr(self, "_election_brief", ""):
+                return self._election_prompt() + "\n\n"
             return ""
         if self.resume_summary:
             return self._resume_prompt()
@@ -5476,6 +5513,16 @@ class AgentWorker(threading.Thread):
             self.cfg, agent=self.name, canon_id=self._canon_id(),
             host=(self.agent or {}).get("host") or self.cfg.host)
         return bloc + "\n\n" if bloc else ""
+
+    def _election_prompt(self) -> str:
+        """L165 (EP3) : le brief de relève encadré comme un résumé de reprise
+        (sans autorité), pour le premier tour d'une session de lot reprise."""
+        from . import reprise
+        brief = reprise.with_process_rules(
+            self.cfg, self._election_brief, agent=self.name,
+            canon_id=self._canon_id(),
+            host=(self.agent or {}).get("host") or self.cfg.host)
+        return adapters.resume_prompt(brief, origin="ameesh")
 
     def _budget_courrier(self) -> int:
         """Octets UTF-8 disponibles pour la consigne d'un tour de courrier.

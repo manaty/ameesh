@@ -172,10 +172,13 @@ def claim(db: Db, name: str, owner: str, ttl_seconds: float, *,
 
     L165 (EP3) : `election_brief` n'est appliqué que sur une relève CROISÉE
     (agent élu dont la ligne était chez un autre hôte). La même instruction
-    oublie alors la session de l'ancien hôte et met le brief en tête de la
-    consigne en attente ; la ligne rendue porte `elected` et l'ancien
-    détenteur (`previous_host`, `previous_owner`, `previous_epoch`,
-    `previous_session`). Même hôte : brief ignoré, session gardée.
+    oublie alors la session de l'ancien hôte, écrit le brief dans la ligne
+    (résumé de la session neuve) et ouvre un premier tour court ; la ligne
+    rendue porte `elected` et l'ancien détenteur (`previous_host`,
+    `previous_owner`, `previous_epoch`, `previous_session`). Même hôte : brief
+    ignoré, session gardée. Une relève croisée SANS brief est **refusée** (le
+    CAS ne déplace pas la ligne) : sans lui, l'hôte changerait en gardant la
+    session et le compte de l'ancien (le contrat médié force le brief à null).
     """
     from .agent_names import resolve as resolve_agent_name
     name = resolve_agent_name(name, db=db, operation="registry.claim")

@@ -386,9 +386,10 @@ class Leases(Domain):
         `election_brief` (L165, EP3) : appliqué seulement sur une relève
         croisée d'un agent élu (la ligne était chez un autre hôte) — la même
         instruction oublie la session de l'ancien hôte, laisse son compte au
-        choix de cet hôte et met le brief en tête de la consigne en attente.
-        Ignoré sur le même hôte, pour un agent `hote`, et sur un exécuteur
-        médié (contrat 1.9 : valeur forcée à null côté appareil)."""
+        choix de cet hôte et écrit le brief comme résumé de la session neuve.
+        Ignoré sur le même hôte et pour un agent `hote`. Une relève croisée
+        SANS brief est **refusée** (le CAS ne déplace pas la ligne), cas d'un
+        exécuteur médié (contrat 1.9 : valeur forcée à null côté appareil)."""
 
     @abc.abstractmethod
     def attach_claim(self, name: str, owner: str, ttl_seconds: float, *,

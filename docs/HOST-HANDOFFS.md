@@ -241,5 +241,10 @@ and built from the last persisted state (role card and canon, assigned and
 takeable lots, unread mail, pending decisions, alerts, GitHub observation per
 repository); it names the previous holder, the epoch and the session left
 behind. A same-host re-claim (runner restart) keeps the local session: it is
-not an election. The brief is dropped with its session (`set_session`,
-`clear_session`) so it never resurfaces in a later session.
+not an election. A cross-host claim **without** the brief is refused (the CAS
+writes nothing): a mediated executor, whose brief is forced to null, therefore
+stays on standby. The brief is dropped with its session (`set_session`,
+`clear_session`) so it never resurfaces in a later session. The first turn
+after an election may open a lot session: the lot's minimal brief then
+completes the election briefing, it never replaces it (the role state is not
+lost when the first turn is a lot turn).

@@ -728,7 +728,10 @@ class Leases(interface.Leases):
         `queued` : aucun état « bail pris sans briefing » n'est visible, et
         l'ancien détenteur reste fencé par l'epoch. Même hôte (redémarrage de
         l'exécuteur) ou agent `hote` : le brief est ignoré, la session est
-        gardée. Rend en plus `previous_host`, `previous_owner`,
+        gardée. Une relève croisée SANS brief (`p.brief` NULL, cas du contrat
+        médié qui le force) est **refusée** : le CAS ne déplace pas la ligne,
+        sinon l'hôte changerait en gardant la session et le compte de
+        l'ancien. Rend en plus `previous_host`, `previous_owner`,
         `previous_epoch`, `previous_session` et `elected` (vrai seulement si
         le brief a été appliqué).
         """
@@ -850,6 +853,12 @@ class Leases(interface.Leases):
                -- L46 : même règle que `claimable` — jamais un agent `externe`.
                AND r.mode = 'execute'
                AND (r.releve = 'election' OR r.host = __H__)
+               -- L165 (EP3) : une relève CROISÉE d'un rôle élu ne se fait
+               -- jamais sans brief. Sans lui, la ligne changerait d'hôte en
+               -- gardant la session et le compte de l'ancien (le contrat médié
+               -- force le brief à null) : le CAS refuse, sans rien écrire.
+               AND (r.releve <> 'election' OR verrou.host = __H__
+                    OR p.brief IS NOT NULL)
                AND (r.lease_owner IS NULL OR r.lease_owner = %s
                     OR r.lease_expires_at < clock_timestamp())
                AND (NOT r.ephemeral OR r.ephemeral_expires_at > clock_timestamp())

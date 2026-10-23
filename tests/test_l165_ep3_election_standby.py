@@ -126,6 +126,23 @@ class ElectionClaimTest(_ElectionCase):
         self.assertIsNone(row["election_brief"])
         self.assertIsNone(row["session_id"])
 
+    def test_releve_croisee_sans_brief_est_refusee(self):
+        """Verdict cx2 B1 : le CAS ne déplace jamais la ligne sans brief.
+
+        Le contrat médié force `election_brief` à null : une relève croisée
+        sans brief doit être refusée (rien n'est écrit), jamais laisser la
+        session et le compte de l'ancien hôte sur la ligne déplacée.
+        """
+        self.sync_both()
+        self.hold_atelier()
+        self.assertIsNone(registry.claim(
+            self.db, "relecteur", "runner-banc", 600, host="banc",
+            election_brief=None))
+        row = registry.get(self.db, "relecteur")
+        self.assertEqual((row["host"], row["session_id"], row["election_brief"]),
+                         ("atelier", "session-atelier-1", None))
+        self.assertEqual(row["session_account"], "codex-1")
+
     def test_un_agent_hote_ignore_le_brief(self):
         self.sync_both()
         self.db.execute(
@@ -241,6 +258,29 @@ class RunnerStandbyTest(_ElectionCase):
         self.assertEqual(row["host"], "banc")
         self.assertEqual(row["session_id"], "codex-thread-1")  # session NEUVE
         self.assertIsNone(row["election_brief"])              # brief consommé
+
+    def test_le_premier_tour_d_un_lot_ne_perd_pas_le_brief(self):
+        """Verdict cx2 B2 : le brief du lot ne remplace pas celui de relève."""
+        self.sync_both()
+        self.hold_atelier()
+        lot = work.add(self.db, title="lot de relève", app="ameesh")
+        self.db.execute("UPDATE work_items SET assignee = 'relecteur' WHERE id = %s",
+                        (int(lot["id"]),))
+        mail.send(self.db, "agent:autre", "relecteur", "message du lot",
+                  work_item_id=str(lot["id"]))
+        runner = self.runner_for("banc")
+        with mock.patch.dict(os.environ, {
+                "AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log},
+                clear=False):
+            runner.sweep()
+        self.assertTrue(runner.did_turn, "le gagnant doit prendre son premier tour")
+        with open(self.turns_log, encoding="utf-8") as fh:
+            entries = [json.loads(line) for line in fh if line.strip()]
+        self.assertEqual(len(entries), 1)
+        prompt = entries[0]["argv"][-1]
+        self.assertIn("## Election", prompt)
+        self.assertIn("#%s" % lot["id"], prompt)
+        self.assertIn("previous holder: host atelier", prompt)
 
 
 if __name__ == "__main__":  # pragma: no cover

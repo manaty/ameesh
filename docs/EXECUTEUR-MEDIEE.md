@@ -487,8 +487,10 @@ ignoré et la session locale est reprise normalement.
 
 L'ajout est compatible : la version passe à `1.9.0` ; un client 1.8 omet
 `election_brief`. Côté médié, le paramètre est **forcé à `null`** : un
-appareil ne choisit jamais le texte du résumé, et une relève élue médiée
-n'écrit pas de brief. Rien d'autre ne change dans la table.
+appareil ne choisit jamais le texte du résumé. Une relève **croisée sans
+brief est refusée** (`leases.claim` ne déplace pas la ligne) : côté médié, le
+paramètre forcé à null interdit donc une relève croisée et l'appareil reste en
+attente ; EP3 est natif. Rien d'autre ne change dans la table.
 
 ## Porte d'hôte
 

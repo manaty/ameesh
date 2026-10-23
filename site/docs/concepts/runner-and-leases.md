@@ -46,9 +46,12 @@ only after the claim, renews the lease before each turn, and its harness is
 killed if the lease is lost. On a **cross-host** election the winner opens a
 new session on a deterministic resume briefing built from the mesh database,
 the canon and GitHub — no session crosses hosts. The claim persists that
-briefing and resets the session in the same statement; the brief is dropped
-with the session, so it never resurfaces later. A same-host re-claim (runner
-restart) keeps the local session and is not an election.
+briefing and resets the session in the same statement; a cross-host claim
+without the briefing is refused (the line is not moved), and the briefing is
+dropped with the session, so it never resurfaces later. When the first turn
+opens a lot session, the lot's minimal brief completes the election briefing
+instead of replacing it. A same-host re-claim (runner restart) keeps the local
+session and is not an election.
 
 - **Exclusive claim.** A claim is one conditional, atomic `UPDATE`: two runners
   cannot win the same agent. This is tested with 2 and 4 concurrent

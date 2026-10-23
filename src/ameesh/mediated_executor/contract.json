@@ -763,7 +763,7 @@
     "owner préfixé par exec:<executor_id>: sinon 403 forbidden_scope",
     "ttl_seconds borné par le lease_ttl de l'hôte (GET /host)",
     "hôte indisponible : 403 host_unavailable",
-    "election_brief : natif seulement, forcé à null sur un appareil ; une relève croisée écrit le résumé de reprise de la session neuve"
+    "election_brief : natif seulement, forcé à null sur un appareil ; une relève croisée écrit le résumé de reprise de la session neuve, et une relève croisée sans ce brief est refusée (aucun déplacement de ligne)"
    ]
   },
   {
