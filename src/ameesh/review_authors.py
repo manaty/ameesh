@@ -600,6 +600,60 @@ def _renamed_target(repo: str, head: str, sha: str, path: str, cache: dict):
     return renames.get(path, "")
 
 
+def _tree_blobs(repo: str, rev: str, cache: dict):
+    """`{blob: {chemins}}` de l'arbre de `rev`, None si la lecture échoue.
+
+    #3220 B5 (2e témoin cx2) : deux chemins peuvent porter le **même contenu**
+    sans que Git ne classe le déplacement en renommage, notamment quand le
+    chemin de reprise existe déjà dans la base (Git voit alors `D` + `M`)."""
+    key = ("tree-blobs", rev)
+    if key not in cache:
+        try:
+            proc = plan_git._git(repo, "ls-tree", "-r", "-z", rev)
+        except Exception:  # noqa: BLE001 - lecture impossible : doute
+            proc = None
+        if proc is None or proc.returncode != 0:
+            cache[key] = None
+        else:
+            blobs: dict = {}
+            text = proc.stdout.decode("utf-8", "replace")
+            for entry in text.split("\0"):
+                if not entry:
+                    continue
+                meta, sep, path = entry.partition("\t")
+                fields = meta.split()
+                if not sep or len(fields) < 3 or not path:
+                    continue
+                blobs.setdefault(fields[2], set()).add(path)
+            cache[key] = blobs
+    return cache[key]
+
+
+def _content_carried(repo: str, head: str, sha: str, path: str,
+                     cache: dict):
+    """Le contenu corrigé de `path` vit-il à un **autre** chemin de la tête ?
+
+    #3220 B5 (2e témoin cx2) : `_renamed_target` ne couvre que les renommages
+    classés `R` par Git. Quand le contenu corrigé est repris dans un fichier
+    déjà présent, Git voit `D <path>` + `M <chemin>` et aucun `R` ; le retrait
+    ou la copie a pourtant survécu. La preuve est le blob identique
+    (`sha:path` == `head:autre`), pas le statut du diff. None si la lecture
+    est impossible : le doute conserve l'auteur."""
+    key = ("carried", sha, head, path)
+    if key not in cache:
+        blob = plan_git._out(repo, "rev-parse", "%s:%s" % (sha, path))
+        if blob is None:
+            cache[key] = None
+        else:
+            blobs = _tree_blobs(repo, head, cache)
+            if blobs is None:
+                cache[key] = None
+            else:
+                cache[key] = any(
+                    other != path for other in blobs.get(str(blob).strip(), ()))
+    return cache[key]
+
+
 def _path_line_counts(repo: str, rev: str, path: str, cache: dict):
     """Le nombre d'occurrences de chaque ligne (dépouillée) de `path` dans
     `rev`, ou None si le chemin y est absent ou illisible (#2977 B2)."""
@@ -780,6 +834,14 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
                             target = _head_lines(repo, head, moved, cache)
                             if target is None or row.strip() not in target:
                                 return True
+                        else:
+                            # #3220 B5 (2e témoin cx2) : pas de `R`, mais le
+                            # contenu corrigé peut avoir été repris tel quel
+                            # dans un fichier déjà présent (regroupement B8).
+                            carried = _content_carried(
+                                repo, head, sha, path, cache)
+                            if carried is None or carried:
+                                return True
                         continue
                 return True
             if row.strip() not in lines:
@@ -810,6 +872,14 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
                                 repo, str(sha) + "^", path, cache) or {}
                             if target.get(row.strip(), 0) > before.get(
                                     row.strip(), 0):
+                                return True
+                        else:
+                            # #3220 B5 (2e témoin cx2) : la copie a pu être
+                            # reprise avec le fichier corrigé dans un chemin
+                            # déjà présent, sans que Git ne voie de `R`.
+                            carried = _content_carried(
+                                repo, head, sha, path, cache)
+                            if carried is None or carried:
                                 return True
                         continue
                 return True

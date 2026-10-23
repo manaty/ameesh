@@ -441,6 +441,134 @@ class MovedRemovalTest(_SurvivingRemovalFixture):
         self.assertIn("cx3", {row["name"] for row in out["authors"]})
 
 
+class _RegroupedRemovalFixture(_SurvivingRemovalFixture):
+    """B/P1 cx2 (2e témoin B5) : le chemin de reprise existe dès la base."""
+
+    def _build_head_a(self):
+        self.repo.write("src/ameesh/gate.py",
+                        "allow_all_users_without_check()\n"
+                        "require_session_identity()\n")
+        # L'ancienne implémentation vit déjà au chemin de reprise : Git verra
+        # une modification de ce chemin, pas un renommage depuis gate.py.
+        self.repo.write("relocated/gate.py",
+                        "allow_all_users_without_check()\n"
+                        "require_session_identity()\n")
+        self.base = self.repo.commit("base")
+        self.repo.write("src/ameesh/gate.py", "require_session_identity()\n")
+        self.repo.write(DOC, DOC_TEXT)
+        self.review_doc = self.repo.commit(
+            "cx3: retire la garde et documente", agent="cx3")
+        self.receipt("cx3", "codex", [self.review_doc])
+        self.head_a = self.review_doc
+        self.db.execute("UPDATE work_items SET branch_target = %s WHERE id = %s",
+                        (self.base, self.lot))
+        self.freeze(self.head_a)
+
+
+class RegroupedRemovalTest(_RegroupedRemovalFixture):
+    """B/P1 cx2 : contenu corrigé repris dans un chemin existant, sans `R`."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo.git("reset", "--hard", self.base)
+        self.repo.write("relocated/gate.py",
+                        "require_session_identity()\n")
+        self.repo.git("rm", "-q", "src/ameesh/gate.py")
+        self.head_b = self.repo.commit(
+            "impl: garde corrigée regroupée, document omis", agent="impl")
+        self.receipt("impl", "deepseek", [self.head_b])
+        self.freeze_b = self.freeze(self.head_b)
+        self.milestone = {"id": int(self.freeze_b["id"]), "sha": self.head_b,
+                          "actor": "impl", "at_ts": self.freeze_b.get("at_ts")}
+
+    def test_git_sees_no_rename_for_the_regrouped_content(self):
+        # Le témoin ne vaut que si Git ne classe pas le déplacement en `R`.
+        status = self.repo.git("diff", "--name-status", "-M",
+                               self.review_doc, self.head_b)
+        kinds = {line.split("\t", 1)[0][:1]
+                 for line in status.splitlines() if line}
+        self.assertNotIn("R", kinds)
+
+    def test_the_regrouped_removal_keeps_the_corrector(self):
+        authors, unknown, correctors = self.reading(
+            self.milestone, [self.head_b], self.base, self.head_b)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+        self.assertIn("cx3", {row["name"] for row in correctors})
+
+    def test_the_gate_refuses_the_corrector_with_a_regrouped_removal(self):
+        klass = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "relocated/gate.py",
+                            "class": "sensitive",
+                            "rule": ["relocated/gate.py"]}],
+                 "repo": self.repo.root, "target": self.base,
+                 "base_sha": self.base}
+        for actor in ("cx3", "dev1"):
+            self.verdict(actor, self.head_b)
+        out = merge_queue.review_gate(
+            self.db, work.milestones(self.db, self.lot), self.head_b,
+            repo=self.repo.root, klass=klass, item=self.lot_item(), required=2)
+        self.assertFalse(out.get("error"), out)
+        self.assertFalse(out["ok"], out["why"])
+        self.assertEqual([entry["actor"] for entry in out["accepted"]],
+                         ["dev1"], out)
+        self.assertIn("cx3", {row["name"] for row in out["authors"]})
+
+
+class _RegroupedCopyFixture(_MixedCopyFixture):
+    """B/P1 cx2 (2e témoin B5) : la copie est reprise au chemin existant."""
+
+    def _build_head_a(self):
+        self.repo.write("src/ameesh/policy.py",
+                        "require_session_identity()\n")
+        self.repo.write("src/ameesh/gate.py", "# gate\n")
+        self.repo.write("relocated/gate.py", "# gate\n")
+        self.base = self.repo.commit("base")
+        self.repo.write("src/ameesh/gate.py",
+                        "# gate\nrequire_session_identity()\n")
+        self.repo.write(DOC, DOC_TEXT)
+        self.review_doc = self.repo.commit(
+            "cx3: copie la garde et documente", agent="cx3")
+        self.receipt("cx3", "codex", [self.review_doc])
+        self.head_a = self.review_doc
+        self.db.execute("UPDATE work_items SET branch_target = %s WHERE id = %s",
+                        (self.base, self.lot))
+        self.freeze(self.head_a)
+
+
+class RegroupedCopyTest(_RegroupedCopyFixture):
+    """B/P1 cx2 : la copie survit dans le fichier existant repris, sans `R`."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo.git("reset", "--hard", self.base)
+        self.repo.write("relocated/gate.py",
+                        "# gate\nrequire_session_identity()\n")
+        self.repo.git("rm", "-q", "src/ameesh/gate.py")
+        self.head_b = self.repo.commit(
+            "impl: copie regroupée, document omis", agent="impl")
+        self.receipt("impl", "deepseek", [self.head_b])
+        self.freeze_b = self.freeze(self.head_b)
+        self.milestone = {"id": int(self.freeze_b["id"]), "sha": self.head_b,
+                          "actor": "impl", "at_ts": self.freeze_b.get("at_ts")}
+
+    def test_git_sees_no_rename_for_the_regrouped_copy(self):
+        status = self.repo.git("diff", "--name-status", "-M",
+                               self.review_doc, self.head_b)
+        kinds = {line.split("\t", 1)[0][:1]
+                 for line in status.splitlines() if line}
+        self.assertNotIn("R", kinds)
+
+    def test_the_regrouped_copy_keeps_the_corrector(self):
+        authors, unknown, correctors = self.reading(
+            self.milestone, [self.head_b], self.base, self.head_b)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+        self.assertIn("cx3", {row["name"] for row in correctors})
+
+
 class MovedCopyTest(_MixedCopyFixture):
     """B/P1 cx2 : la copie héritée est déplacée avec le fichier corrigé."""
 
