@@ -433,7 +433,8 @@ def _waiver(db, item) -> tuple:
 
 
 def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=None,
-                           commits=None, strict=False, families_out=None):
+                           commits=None, strict=False, families_out=None,
+                           target=""):
     """Les auteurs et correcteurs de la tête gelée (#2681/#2739/#2888).
 
     Lecture des commits exacts de la plage gelée et de leur provenance, la même
@@ -467,7 +468,8 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
     milestone = _freeze_milestone(marks, frozen, repo)
     authors, unknown, correctors = act.attribution_of_head(
         db, item, milestone, repo, base, frozen, families=families or (),
-        commits=commits, strict=strict, families_out=families_out)
+        commits=commits, strict=strict, families_out=families_out,
+        target=target or base)
     if unknown:
         raise ValueError("author provenance unknown for frozen commit(s): %s"
                          % ", ".join(unknown))
@@ -805,7 +807,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                                              families=families,
                                              commits=own_commits if vehicle_delta else None,
                                              strict=True,
-                                             families_out=proven_families)
+                                             families_out=proven_families,
+                                             target=target or "")
     except Exception as exc:  # noqa: BLE001 - une plage illisible ne conclut pas
         out["error"] = str(exc)
         out["why"] = ("no review verdict ok on the freeze %s (class: %s): the frozen "
@@ -1506,7 +1509,7 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
                 db, item, milestone, commits, repo,
                 families=families, strict=True, families_out=proven_families,
                 reference=reference, reference_families=reference_families,
-                base=base, head=frozen, recover=recover)
+                base=base, head=frozen, target=base, recover=recover)
         except Exception as exc:  # noqa: BLE001 - une lecture illisible ne conclut pas
             raise _ProvenanceError(
                 "the authors of the frozen range cannot be read (%s)" % exc) from exc

@@ -27,6 +27,11 @@ auteurs, avec les mêmes exceptions du canon §2 :
   avancée, un squash à arbre identique ou le report des lignes significatives
   d'un correctif gardent donc sa famille exclue ; un contenu réellement réécrit
   ne la reprend pas, et le doute conserve toujours l'auteur ;
+* un commit **déjà dans la cible** au moment de la lecture ne compte ni comme
+  auteur ni comme tiers du lot (#3116) : la plage reportée d'un ancien gel,
+  calculée avant un rebase, peut contenir du develop déjà relu sous son propre
+  lot ; un inconnu d'un gel antérieur qui n'est plus ancêtre de la tête et dont
+  le contenu ne survit pas ne bloque pas non plus (#3116) ;
 * quand le reçu exact manque (commit restauré par rebase, correction poussée
   hors du hook), le commit est attribué à la famille de session de son
   committer, lue au journal des tours (`turn_costs`, `_turns_harness`) : un
@@ -418,6 +423,64 @@ def _is_ancestor(repo: str, before: str, after: str) -> Optional[bool]:
     return None
 
 
+def target_commit(repo: str, target: str) -> str:
+    """Le commit qu'une cible nomme dans `repo`, ou "" (#3116).
+
+    La cible peut être un commit complet ou une ref (`origin/develop`) : c'est
+    la cible **au moment de la lecture**. Une cible illisible rend "" et le
+    lecteur garde son comportement d'avant (aucun commit n'est écarté) : le
+    doute ne retire jamais un auteur."""
+    text = str(target or "").strip()
+    if not repo or not text:
+        return ""
+    try:
+        return plan_git._commit(repo, text) or ""
+    except Exception:  # noqa: BLE001 - cible illisible : pas d'écart
+        return ""
+
+
+def _not_in_target(repo: str, commits, target: str) -> list:
+    """Les commits de la liste qui ne sont PAS atteignables depuis `target`.
+
+    #3116 : un commit déjà dans la cible a été relu sous son propre lot ; il
+    ne compte ni comme auteur ni comme tiers du lot, qu'il vienne de la plage
+    courante ou du report d'un gel antérieur (#2924). La lecture se fait en un
+    seul `git rev-list ... --not <cible>`, sans une sonde par commit ; une
+    lecture impossible garde la liste entière (le doute ne retire jamais un
+    auteur, il ne le compte pas non plus dans la cible)."""
+    wanted = [str(commit).strip() for commit in commits or ()
+              if str(commit).strip()]
+    if not wanted or not target:
+        return wanted
+    try:
+        text = plan_git._out(repo, "rev-list", *wanted, "--not", str(target))
+    except Exception:  # noqa: BLE001 - lecture impossible : aucun écart
+        return wanted
+    if text is None:
+        return wanted
+    outside = {line.strip() for line in str(text).splitlines() if line.strip()}
+    return [commit for commit in wanted if commit in outside]
+
+
+def _survives_rewrite(repo: str, head: str, sha: str, cache: dict,
+                      base: str = "", target: str = "") -> bool:
+    """Un commit d'un gel antérieur compte-t-il encore pour la tête lue ?
+
+    #3116 : un commit déjà dans la cible ne compte ni comme auteur ni comme
+    tiers. Hors cible, un commit qui n'est plus ancêtre de la tête **et** dont
+    le contenu ne survit pas (preuve de contenu #2924/#2977) a été réellement
+    réécrit : il ne bloque pas la lecture. Un commit encore ancêtre de la tête
+    reste lu comme avant ; une lecture impossible est un doute, qui garde."""
+    if not head:
+        return True
+    if target and _is_ancestor(repo, sha, target) is True:
+        return False
+    if _is_ancestor(repo, sha, head) is True:
+        return True
+    return _commit_survives(repo, head, sha, cache, base,
+                            absent_path_keeps=False, moved_search=False)
+
+
 def _tree_of(repo: str, rev: str) -> Optional[str]:
     """L'arbre d'un commit, ou None s'il est illisible."""
     if not repo or not rev:
@@ -590,7 +653,8 @@ def _inherited_lines(repo: str, head: str, sha: str, base: str,
 
 
 def _commit_survives(repo: str, head: str, sha: str, cache: dict,
-                     base: str = "") -> bool:
+                     base: str = "", *, absent_path_keeps: bool = True,
+                     moved_search: bool = True) -> bool:
     """Une partie significative du commit subsiste-t-elle dans la tête ?
 
     C'est la preuve de contenu de #2924, volontairement **prudente** : un
@@ -614,7 +678,15 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
     comme avant. Sans ligne propre, la lecture passe aux lignes retirées,
     puis aux lignes copiées, cherchées à leur seul chemin (un chemin absent
     conserve l'auteur) : une copie retirée ne garde pas son correcteur (B1).
-    Un diff sans ligne significative conserve l'auteur."""
+    Un diff sans ligne significative conserve l'auteur.
+
+    `absent_path_keeps=False` (un **inconnu** dont on décide s'il bloque,
+    #3116) retire le doute B8 : un chemin absent dont aucune ligne ne se
+    retrouve dans l'arbre de la tête ne prouve plus la présence du contenu.
+    `moved_search=False` écarte en plus la recherche de lignes génériques dans
+    tout l'arbre : pour un inconnu, une ligne courte comme `case "$http" in`
+    trouvée dans un autre fichier n'est pas une preuve de contenu. Les auteurs
+    gardent les défauts (`True`) : le doute conserve l'auteur."""
     parsed = _commit_lines(repo, sha)
     if parsed is None:
         return True
@@ -644,9 +716,10 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
         # Le chemin d'origine ne porte plus la ligne : elle a pu être déplacée
         # avec son fichier ou regroupée ailleurs. La chercher dans tout l'arbre
         # évite d'effacer le correcteur sur un simple déplacement (#2924 B8).
-        if _any_line_in_head(repo, head, [row for _path, row in added]):
+        if moved_search and _any_line_in_head(
+                repo, head, [row for _path, row in added]):
             return True
-        return missing_path
+        return missing_path and absent_path_keeps
     removed = [(path, row) for path, rows in removes.items() for row in rows
                if _meaningful_line(row)]
     if removed and any(
@@ -662,7 +735,7 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
         for path, row in copied:
             present = _path_line_counts(repo, head, path, cache)
             if present is None:
-                return True
+                return absent_path_keeps
             before = _path_line_counts(repo, str(sha) + "^", path, cache) or {}
             if present.get(row.strip(), 0) > before.get(row.strip(), 0):
                 return True
@@ -720,7 +793,9 @@ def _freeze_reference(db, item: Mapping, freeze: Mapping, families) -> dict:
 
 def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
                    repo: str, families, *, provider=None,
-                   strict: bool = False) -> tuple[dict, dict, dict, list]:
+                   strict: bool = False, target: str = "", head: str = "",
+                   base: str = "", cache: Optional[dict] = None
+                   ) -> tuple[dict, dict, dict, list]:
     """`(auteurs, commits_écrits, corrections, inconnus)` d'un gel antérieur.
 
     Même attribution que `reading` — reçu exact, puis committer d'adresse
@@ -728,7 +803,12 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
     encore plus anciens. `commits_écrits` associe à chaque acteur les commits
     qu'il a écrits : c'est la preuve de contenu de #2924. `corrections` porte
     les commits des relecteurs désignés ; leur qualification de « correctif de
-    premier tour » se fait dans `_prior_correctors` (#2888)."""
+    premier tour » se fait dans `_prior_correctors` (#2888).
+
+    #3116 : `target` est la cible au moment de la lecture. Ses commits ne
+    comptent ni comme auteurs ni comme tiers. Hors cible, un inconnu qui n'est
+    plus ancêtre de `head` et dont le contenu ne survit pas ne bloque plus
+    (`_survives_rewrite`) ; `cache` partage la preuve de contenu."""
     reference = _freeze_reference(db, item, freeze, families)
     author_name = str(reference.get("name") or "").strip()
     author_family = str(reference.get("family") or "")
@@ -737,6 +817,14 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
     written: dict[str, list] = {}
     review_commits: dict[str, list] = {}
     unknown: list[str] = []
+    cache = {} if cache is None else cache
+    commits = _not_in_target(repo, commits, target)
+
+    def record_unknown(value: str) -> None:
+        """Un inconnu ne bloque que s'il compte encore pour la tête (#3116)."""
+        if _survives_rewrite(repo, head, value, cache, base, target):
+            unknown.append(str(value)[:12])
+
     for raw in commits or ():
         sha = str(raw or "").strip()
         if not sha:
@@ -746,12 +834,12 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
         except review_provenance.ProvenanceError:
             if strict:
                 raise
-            unknown.append(sha[:12])
+            record_unknown(sha)
             continue
         if receipt is None:
             actor, stamp = commit_actor(repo, sha)
             if not actor:
-                unknown.append(sha[:12])
+                record_unknown(sha)
                 continue
             if actor != author_name:
                 try:
@@ -759,7 +847,7 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
                 except Exception:  # noqa: BLE001 - registre illisible : inconnu
                     known = False
                 if not known:
-                    unknown.append(sha[:12])
+                    record_unknown(sha)
                     continue
             if actor == author_name:
                 proven = actor_family(db, actor, stamp, families) or author_family
@@ -771,11 +859,11 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
                 review_commits.setdefault(actor, []).append((sha, proven))
                 written.setdefault(actor, []).append(sha)
                 continue
-            unknown.append(sha[:12])
+            record_unknown(sha)
             continue
         actor = str(receipt.get("actor") or "").strip()
         if not actor:
-            unknown.append(sha[:12])
+            record_unknown(sha)
             continue
         proven = _family(receipt.get("harness"), families)
         by_name.setdefault(actor, set()).add(proven)
@@ -843,7 +931,7 @@ def _superseded_freeze_ids(freezes: Sequence[Mapping]) -> set[int]:
 def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                            commits: Sequence[str], repo: str, families, *,
                            base: str = "", head: str = "", provider=None,
-                           strict: bool = False,
+                           strict: bool = False, target: str = "",
                            recover=None) -> tuple[list, list, list]:
     """Auteurs/correcteurs des gels antérieurs dont le contenu subsiste (#2924).
 
@@ -865,7 +953,14 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     est absent (même après `recover`) est ignoré : c'est un gel fantôme, son
     contenu n'a jamais existé, et le blocage de la provenance serait définitif.
     La note du gel remplaçant porte la trace de la déclaration. Un gel remplacé
-    mais encore lisible est lu comme avant (B5)."""
+    mais encore lisible est lu comme avant (B5).
+
+    #3116 : `target` est la cible au moment de la lecture (un commit ou une
+    ref). Un commit qui y est déjà entré a été relu sous son propre lot : il ne
+    compte ni comme auteur ni comme tiers, même s'il apparaît dans la plage
+    d'un gel antérieur calculée avant un rebase. Un gel entièrement contenu
+    dans la cible n'est pas relu. Sans `target` lisible, `base` (toujours un
+    ancêtre de la cible) sert de borne sûre."""
     item = dict(item or {})
     if db is None or not repo or packet_composer(item):
         return [], [], []
@@ -912,6 +1007,7 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                            None)
     if not head_sha:
         return [], [], []
+    target_sha = target_commit(repo, target) or target_commit(repo, base)
     if current is not None:
         prior = [row for row in freezes
                  if int(row.get("id") or 0) < int(current.get("id") or 0)]
@@ -1003,7 +1099,10 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
             recover_one(base)
         if head_sha and not present(head_sha):
             recover_one(head_sha)
-        # le contenu d'un gel déjà entré dans la cible n'est pas relu
+        # le contenu d'un gel déjà entré dans la cible n'est pas relu (#3116) :
+        # ses commits ont été relus sous leur propre lot, jamais sous celui-ci.
+        if target_sha and _is_ancestor(repo, sha, target_sha) is True:
+            continue
         if base and _is_ancestor(repo, sha, base) is True:
             continue
         # un gel plus récent déjà traité couvre celui-ci (même histoire)
@@ -1018,6 +1117,8 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
             unknown.append(sha[:12])
             continue
         earlier = _commits_between(repo, start, sha)
+        if earlier is not None:
+            earlier = _not_in_target(repo, earlier, target_sha)
         if earlier is None:
             if strict:
                 raise review_provenance.ProvenanceError(
@@ -1032,7 +1133,8 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
         try:
             by_name, written, review_commits, unreadable = _prior_reading(
                 db, item, row, earlier, repo, families,
-                provider=provider, strict=strict)
+                provider=provider, strict=strict, target=target_sha,
+                head=head_sha, base=base, cache=file_cache)
         except Exception as exc:  # noqa: BLE001 - un gel antérieur illisible
             if strict:
                 raise review_provenance.ProvenanceError(
@@ -1074,7 +1176,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             reference_families: Optional[Mapping] = None, provider=None,
             strict: bool = False, trace: bool = False,
             families_out: Optional[dict] = None,
-            base: str = "", head: str = "", recover=None) -> tuple[list, list, list]:
+            base: str = "", head: str = "", target: str = "",
+            recover=None) -> tuple[list, list, list]:
     """`(auteurs, inconnus, correcteurs)` de la plage gelée, même lecture pour tous.
 
     `reference` est l'auteur de référence déjà lu (`reference_author`) : la
@@ -1140,9 +1243,18 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     le refus fermé de B5. Un acteur prouvé sous plusieurs familles dans un gel
     antérieur garde tout l'ensemble (`families_out`), jamais la seule famille
     du reçu courant.
+
+    #3116 : `target` est la cible au moment de la lecture (commit ou ref). Un
+    commit qui y est déjà entré ne compte ni comme auteur ni comme tiers du
+    lot, qu'il vienne de la plage courante ou du report d'un gel antérieur :
+    il a été relu sous son propre lot. Sans `target`, `base` — toujours un
+    ancêtre de la cible — sert de borne sûre ; sans l'un ni l'autre, la
+    lecture garde son comportement d'avant (aucun commit écarté).
     """
     item = dict(item or {})
     packet = bool(packet_composer(item))
+    target_sha = target_commit(repo, target) or target_commit(repo, base)
+    commits = _not_in_target(repo, commits, target_sha)
     proven_reference: dict = dict(reference_families or {})
     if reference is None:
         reference = reference_author(db, item, milestone, families,
@@ -1261,7 +1373,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     # pas ; un contenu réellement réécrit n'est pas repris (le doute conserve).
     carried, carried_unknown, carried_correctors = _carried_from_previous(
         db, item, milestone, commits, repo, families, base=base, head=head,
-        provider=provider, strict=strict, recover=recover)
+        provider=provider, strict=strict, target=target_sha, recover=recover)
     unknown.extend(carried_unknown)
     for row in carried:
         values = row.get("families")
@@ -1329,13 +1441,13 @@ def authors(db, item: Mapping, milestone: Optional[Mapping],
             *, reference: Optional[Mapping] = None,
             reference_families: Optional[Mapping] = None, provider=None,
             strict: bool = False, trace: bool = False,
-            base: str = "", head: str = "",
+            base: str = "", head: str = "", target: str = "",
             recover=None) -> tuple[list, list]:
     """`(auteurs, inconnus)` — la lecture partagée, sans les correcteurs."""
     authors_, unknown, _correctors = reading(
         db, item, milestone, commits, repo, families, reference=reference,
         reference_families=reference_families, provider=provider,
-        strict=strict, trace=trace, base=base, head=head,
+        strict=strict, trace=trace, base=base, head=head, target=target,
         recover=recover)
     return authors_, unknown
 
