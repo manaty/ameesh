@@ -42,6 +42,16 @@ class OptionalJobReadingTest(unittest.TestCase):
                 self.assertTrue(any("plateforme macOS" in text and "actions/runs/600" in text
                                     for text in reading["inconclusive"]))
 
+    def test_jobs_skipped_by_design_are_not_consigned(self):
+        # Real push run on main: these jobs are skipped by their `if:`.
+        data = suite(mac="success")
+        data["runs"][0]["jobs"] += [fixture._job("version number", "skipped"),
+                                    fixture._job("lecteurs de la doc", "skipped")]
+        reading = self.read(data)
+        self.assertTrue(release.reading_is_green(reading), reading)
+        self.assertEqual(reading["inconclusive"], [])
+        self.assertEqual(release._run_evidence(data["runs"][0])["inconclusive"], [])
+
     def test_optional_failure_excludes_the_candidate(self):
         reading = self.read(suite(mac="failure"))
         self.assertFalse(release.reading_is_green(reading))

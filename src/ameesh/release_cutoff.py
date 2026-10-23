@@ -454,7 +454,7 @@ def ci_reading(project: "ProjectRelease", sha: str) -> dict:
                     job["name"], job["conclusion"] or job["status"], run["url"])
                 if job["conclusion"] == "failure":
                     negative.append(label)
-                elif not _job_success(job):
+                elif _job_inconclusive(job):
                     inconclusive.append(label)
         acceptable = bool(aggregate_ok and not negative and not pending
                           and not reading.get("missing"))
@@ -1036,6 +1036,15 @@ def _job_success(job: dict) -> bool:
     return job.get("status") == "completed" and job.get("conclusion") == "success"
 
 
+def _job_inconclusive(job: dict) -> bool:
+    """A job that neither succeeded nor was skipped by its `if:` (#3244).
+
+    On every push to main, `version number`, `lecteurs de la doc` and
+    `autre système de fichiers` are skipped by design: the aggregate decides
+    whether they were due, so they are neither consigned nor reopened."""
+    return not _job_success(job) and job.get("conclusion") != "skipped"
+
+
 def _aggregate_success(run: dict) -> bool:
     """The stable aggregate certifies its dependencies, regardless of macOS."""
     aggregates = [job for job in run.get("jobs", ())
@@ -1111,7 +1120,7 @@ def _run_evidence(run: dict) -> dict:
     return {"id": run["id"], "url": run["url"], "workflow": run["workflow"],
             "event": run["event"], "jobs": len(run["jobs"]),
             "inconclusive": ["%s (%s)" % (job["name"], job["conclusion"] or job["status"])
-                             for job in run["jobs"] if not _job_success(job)]}
+                             for job in run["jobs"] if _job_inconclusive(job)]}
 
 
 def tree_green(repo: str, project: "ProjectRelease", sha: str, reference: str | None,
