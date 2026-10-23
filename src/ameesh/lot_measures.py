@@ -562,8 +562,13 @@ def diff_stat(repo: str, sha: str, target: str | None = None) -> dict | None:
     diff_insertions, diff_deletions, measured_size}`, or None when the
     repository does not hold the commit."""
     rng = diff_range(repo, sha, target)
-    if rng is None:
-        return None
+    return None if rng is None else _range_stat(repo, rng)
+
+
+def _range_stat(repo: str, rng: tuple[str, str]) -> dict | None:
+    """The size of the proven range `rng`, or None when `git diff` cannot read
+    it (an incomplete clone, a missing object): a read failure, not a doubt
+    about the range (#3056)."""
     text = _git(repo, "diff", "--shortstat", "--no-renames", rng[0], rng[1])
     if text is None:
         return None
@@ -638,9 +643,10 @@ def measure_one(db, cand: dict, *, repos=(), ci=gh_ci_runs,
 
     A stored size is kept when this measure cannot read one (another host may
     hold what this one lacks). `replace_size` (a measure asked again by id):
-    a repository holds the merge commit and the size doubts, the forge being
-    readable — the stored size is cleared, never left to show a value the
-    current rule refutes (#3056)."""
+    repositories hold the merge commit but none proves its range, the forge
+    being readable — the stored size is cleared, never left to show a value
+    the current rule refutes (#3056). A proven range whose `git diff` fails
+    is a read failure: the size stays."""
     st = storage.of(db).work
     item_id = int(cand["id"])
     events = st.events(item_id, 1000)
@@ -652,11 +658,23 @@ def measure_one(db, cand: dict, *, repos=(), ci=gh_ci_runs,
     # #3038 : le premier checkout qui porte le commit peut ne pas porter la
     # cible publiée ; un suivant le fait. On ne conclut au doute qu'après.
     stat = None
+    # #3056 : la taille stockée n'est effacée que si AUCUN dépôt porteur ne
+    # prouve de plage (cible publiée illisible ou absente) et que la forge a
+    # répondu. Une plage prouvée dont `git diff` échoue est un échec de
+    # lecture : la taille reste. Décidé ici, avant la lecture de la CI, dont
+    # l'attente pourrait faire expirer une erreur ls-remote en cache.
+    proven = False
     for candidate in holding:
-        stat = diff_stat(candidate, cand["merge_sha"], cand.get("branch_target"))
+        rng = diff_range(candidate, cand["merge_sha"], cand.get("branch_target"))
+        if rng is None:
+            continue
+        proven = True
+        stat = _range_stat(candidate, rng)
         if stat is not None:
             repo = candidate
             break
+    size_doubt = (replace_size and bool(holding) and not proven
+                  and not _forge_unreadable(holding))
     # the CI runs are read in the repository that holds the merge commit
     runs = ci(repo, cand.get("branch")) if ci and repo else None
     # #796 : les tours que le grand livre attribue au lot ; vide = inconnu
@@ -679,7 +697,7 @@ def measure_one(db, cand: dict, *, repos=(), ci=gh_ci_runs,
                declared_size=cand.get("change_size") or None)
     if stat is not None:
         out.update(stat)
-    elif replace_size and holding and not _forge_unreadable(holding):
+    elif size_doubt:
         out["size_doubt"] = True
     return st.save_measure(item_id, out)
 

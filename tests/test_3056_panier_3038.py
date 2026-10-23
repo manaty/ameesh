@@ -3,7 +3,8 @@
 
 * une mesure redemandée par identifiant qui doute efface la taille stockée
   (le `coalesce` de `save_measure` gardait la taille fausse des 7 doutes du
-  recalcul #3038) ; une passe ordinaire, ou une forge illisible, la garde ;
+  recalcul #3038) ; une passe ordinaire, une forge illisible ou un `git diff`
+  qui échoue sur une plage prouvée (relecture cx1) la gardent ;
 * la pointe publiée lue par `ls-remote` n'est réutilisée que
   `PUBLISHED_TIP_TTL_S` : `class_at_merge`, hors d'une passe de mesure, ne
   relit plus une pointe périmée du même processus ;
@@ -157,6 +158,41 @@ class ExplicitMeasureDoubtPgTest(PgTestCase):
         self.assertIn("published target unreadable",
                       lot_measures.describe_size(lot_measures.view(
                           storage.of(self.db).work.measure(lid))))
+
+    def measured(self, title):
+        repo, socle, tip, merge = _repo(self.tmp)
+        _git(repo, "update-ref", "refs/remotes/origin/develop", merge)
+        lot = work.add(self.db, title=title, branch="lot/3056",
+                       branch_target="develop")
+        lid = int(lot["id"])
+        work.move(self.db, lid, "build")
+        work.close_merged(self.db, lid, sha=tip)
+        lot_measures.measure(self.db, [lid], repos=[repo], ci=None)
+        self.assertEqual(self.size(lid), (1, 2, 0, "s"))
+        return repo, socle, lid
+
+    def test_un_echec_de_git_diff_garde_la_taille(self):
+        """Relecture cx1 : clone incomplet, plage prouvée mais `git diff`
+        illisible (blob absent) — un échec de lecture, pas un doute."""
+        repo, _, lid = self.measured("mesure #3056 clone incomplet")
+        blob = _git(repo, "rev-parse", "HEAD:docs/preuve.md")
+        os.remove(os.path.join(repo, ".git", "objects", blob[:2], blob[2:]))
+        lot_measures.measure(self.db, [lid], repos=[repo], ci=None)
+        self.assertEqual(self.size(lid), (1, 2, 0, "s"))
+
+    def test_le_doute_se_decide_avant_la_lecture_de_la_ci(self):
+        """Relecture cx1 : l'attente de la CI peut faire expirer l'erreur
+        ls-remote en cache ; la forge illisible garde quand même la taille."""
+        repo, socle, lid = self.measured("mesure #3056 ci lente")
+        _git(repo, "remote", "add", "origin", "/nexiste/pas")
+        _git(repo, "update-ref", "refs/remotes/origin/develop", socle)
+
+        def slow_ci(repo_dir, branch):
+            lot_measures._PUBLISHED_TIPS.clear()     # le cache a expiré
+            return None
+
+        lot_measures.measure(self.db, [lid], repos=[repo], ci=slow_ci)
+        self.assertEqual(self.size(lid), (1, 2, 0, "s"))
 
     def test_sans_depot_qui_porte_le_commit_la_taille_reste(self):
         repo, _, tip, merge = _repo(self.tmp)
