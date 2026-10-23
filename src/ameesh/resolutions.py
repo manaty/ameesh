@@ -137,7 +137,11 @@ def _local_from(repo: str, url: str) -> str:
 
     La règle de Git (`url_is_local_not_ssh`) : sans `://`, une adresse est un
     chemin local s'il n'y a pas de `:` ou si un `/` le précède ; sinon c'est
-    la syntaxe scp d'une forge distante."""
+    la syntaxe scp d'une forge distante.
+
+    #3041 : `repo` est résolu physiquement (`realpath`), comme Git résout `..`
+    depuis la cible d'un checkout symlinké ; `abspath` lirait le voisin du
+    lien, un leurre possible."""
     url = (url or "").strip()
     if not url or "://" in url:
         return url
@@ -146,7 +150,7 @@ def _local_from(repo: str, url: str) -> str:
         return url                      # git@hôte:chemin
     if os.path.isabs(url):
         return url
-    return os.path.normpath(os.path.join(os.path.abspath(repo), url))
+    return os.path.normpath(os.path.join(os.path.realpath(repo), url))
 
 
 def ref_name(lot: int, other: int) -> str:

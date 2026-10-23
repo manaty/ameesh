@@ -1438,6 +1438,9 @@ def _status_success(contexts, required) -> list:
 
 def latest_rollup(rollup) -> list:
     """#2524 : les derniers checks par (workflow, nom), statuts par contexte.
+    #3008 : une suite connue (`checkSuiteId`, rollup construit depuis les
+    check runs de la tête) entre dans la clé : deux workflows homonymes ne se
+    masquent pas.
 
     Seule une date strictement plus récente remplace une entrée. Dates
     absentes, invalides ou ex aequo : garder les entrées ambiguës afin de ne
@@ -1451,7 +1454,8 @@ def latest_rollup(rollup) -> list:
                    or "state" in entry and "conclusion" not in entry)
         name = entry.get("context" if context else "name")
         key = (("context", name) if context else
-               ("check", entry.get("workflowName"), name)) if name else ("unknown", index)
+               ("check", entry.get("workflowName"), entry.get("checkSuiteId"), name)
+               ) if name else ("unknown", index)
         # `gh` exporte la date d'un StatusContext sous `startedAt` (son
         # `createdAt` GraphQL) ; `createdAt` reste lu pour un rollup GraphQL brut.
         raw = (entry.get("startedAt") or entry.get("createdAt")) if context else entry.get("startedAt")
@@ -1736,22 +1740,20 @@ def ci_state(rollup) -> str:
     """#3085 : l'état de la CI d'un rollup sous la règle du 23/10 — un non
     concluant ne bloque pas (voir `ci_result`).
 
-    Les checks du portier `paquet` font exception : ce sont la preuve que la
-    suite complète a tourné (ou a été remplacée), pas un test à consigner.
-    Un check `paquet` non vert (sauté, annulé, en cours, échoué) y garde son
-    ancien effet : `pending` s'il n'a pas fini, `red` sinon."""
-    if packet_proof_entries(rollup):
-        unfinished, bad = False, False
-        for entry in packet_proof_entries(rollup):
-            if entry.get("__typename") != "StatusContext" \
-                    and str(entry.get("status") or "").upper() != "COMPLETED":
-                unfinished = True
-            elif check_result(entry) != CI_GREEN_RESULT:
-                bad = True
-        if unfinished:
-            return "pending"
-        if bad:
-            return "red"
+    Les checks du portier `paquet` portent la preuve que la suite complète a
+    tourné (ou a été remplacée) : un `FAILURE` exécuté et une sentinelle
+    `paquet (run proof unavailable)` restent `red`, un check en cours
+    `pending`. Un check `paquet` **non concluant** (sauté, annulé pour
+    quota, expiré) ne prouve aucun défaut : il est consigné par le
+    classifieur global, qui le laisse vert."""
+    entries = packet_proof_entries(rollup)
+    unfinished = any(entry.get("__typename") != "StatusContext"
+                     and str(entry.get("status") or "").upper() != "COMPLETED"
+                     for entry in entries)
+    if unfinished:
+        return "pending"
+    if any(check_result(entry) == CI_NEGATIVE_RESULT for entry in entries):
+        return "red"
     return ci_result(rollup)["state"]
 
 

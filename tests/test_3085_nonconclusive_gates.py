@@ -52,6 +52,22 @@ class ClassificationTest(unittest.TestCase):
         self.assertEqual(radar.ci_state([f2271._context("approval", "ERROR")]), "green")
         self.assertEqual(radar.ci_state([f2271._context("approval", "FAILURE")]), "red")
 
+    def test_a_non_conclusive_packet_proof_does_not_paint_the_ci_red(self):
+        # B2 : SKIPPED/CANCELLED/TIMED_OUT du workflow `paquet` restaient
+        # bloquants par exception ; seule la sentinelle et un `FAILURE`
+        # exécuté prouvent un défaut.
+        for conclusion in ("SKIPPED", "CANCELLED", "TIMED_OUT"):
+            with self.subTest(conclusion=conclusion):
+                packet = {"__typename": "CheckRun",
+                          "name": "suite complète du paquet / tests",
+                          "workflowName": "paquet", "status": "COMPLETED",
+                          "conclusion": conclusion}
+                self.assertEqual(radar.ci_state([packet]), "green")
+        sentinel = {"__typename": "CheckRun",
+                    "name": "paquet (run proof unavailable)",
+                    "status": "COMPLETED", "conclusion": "FAILURE"}
+        self.assertEqual(radar.ci_state([sentinel]), "red")
+
     def test_an_unnamed_negative_check_is_never_dropped(self):
         rows = [{"status": "COMPLETED", "conclusion": "FAILURE"},
                 f2271._check("tests")]
@@ -81,10 +97,10 @@ class ReadyPrTest(unittest.TestCase):
     """`fire.ready_pr` : les checks requis, classés ; l'optionnel ne gate pas."""
 
     def ready(self, rollup, *, required=(("tests", None),), gh=None,
-              ci="green"):
+              ci="green", project=None):
         status = f2271._status(rollup, ci=ci)
         report: dict = {}
-        ok, why = fire.ready_pr(status, target="main", project=None,
+        ok, why = fire.ready_pr(status, target="main", project=project,
                                 frozen=f2271.SHA, required=required,
                                 slug="manaty/ameesh", gh=gh, report=report)
         return ok, why, report
@@ -134,6 +150,93 @@ class ReadyPrTest(unittest.TestCase):
         # check requis ; les requis ayant conclu, la porte ne l'attend pas.
         ok, why, _ = self.ready([f2271._check("tests"),
                                  f2271._check("macOS", None, "IN_PROGRESS")])
+        self.assertTrue(ok, why)
+
+    def test_the_global_ci_required_read_does_not_reintroduce_optional_checks(self):
+        # B1 de la relecture de 966bf4d : avec `ci_required`, la seconde
+        # lecture globale (`commit_ci`) remettait le macOS facultatif
+        # `pending`/`FAILURE` dans les bloquants, malgré `tests` vert.
+        project = radar.Project("ameesh", "/r", github="manaty/ameesh",
+                                ci_required=True)
+        for optional in (f2271._check("macOS", None, "IN_PROGRESS"),
+                         f2271._check("macOS", "FAILURE")):
+            with self.subTest(optional=optional):
+                with mock.patch.object(
+                        fire.merge_queue, "_required_ci",
+                        side_effect=fire.merge_queue.QueueError("global read")) as read:
+                    ok, why, _ = self.ready([f2271._check("tests"), optional],
+                                            project=project)
+                self.assertTrue(ok, why)
+                read.assert_not_called()
+
+    def test_ci_required_still_reads_the_commit_without_a_required_check(self):
+        # La lecture globale reste la seule preuve d'un projet `ci_required`
+        # dont la branche n'expose aucun check requis.
+        project = radar.Project("ameesh", "/r", github="manaty/ameesh",
+                                ci_required=True)
+        with mock.patch.object(
+                fire.merge_queue, "_required_ci",
+                side_effect=fire.merge_queue.QueueError("no run on the freeze")) as read:
+            ok, why, _ = self.ready([f2271._check("tests")], required=(),
+                                    project=project)
+        self.assertFalse(ok)
+        self.assertIn("no run", why)
+        read.assert_called_once()
+
+    def test_a_skipped_packet_proof_is_consigned_not_blocking(self):
+        # B2 : un check du portier `paquet` sauté/annulé n'est pas un défaut
+        # prouvé ; il se consigne au lieu de retenir la porte.
+        packet = {"__typename": "CheckRun", "name": "suite complète du paquet / tests",
+                  "workflowName": "paquet", "status": "COMPLETED",
+                  "conclusion": "SKIPPED"}
+        ok, why, report = self.ready([f2271._check("tests"), packet])
+        self.assertTrue(ok, why)
+        self.assertEqual(report["consigned"],
+                         ["suite complète du paquet / tests (SKIPPED)"])
+
+    def test_a_failed_or_pending_packet_proof_still_blocks(self):
+        for status, conclusion in (("COMPLETED", "FAILURE"),
+                                   ("IN_PROGRESS", None)):
+            with self.subTest(status=status, conclusion=conclusion):
+                packet = {"__typename": "CheckRun",
+                          "name": "suite complète du paquet / tests",
+                          "workflowName": "paquet", "status": status,
+                          "conclusion": conclusion}
+                ok, why, _ = self.ready([f2271._check("tests"), packet])
+                self.assertFalse(ok)
+                self.assertIn("paquet", why)
+
+    def test_a_required_status_in_error_is_consigned_not_blocking(self):
+        # B3 : `ci/tests=ERROR` était consigné par `_required_gate` puis
+        # rejeté par `ci_green(required_statuses)`.
+        project = radar.Project("nexlink", "/r", github="o/nexlink",
+                                required_statuses=(("integration/**", "ci/"),))
+        ok, why, report = self.ready(
+            [f2271._check("tests"), f2271._context("ci/tests", "ERROR")],
+            project=project)
+        self.assertTrue(ok, why)
+        self.assertIn("ci/* (ERROR)", report["consigned"])
+
+    def test_a_required_status_failure_or_pending_still_blocks(self):
+        project = radar.Project("nexlink", "/r", github="o/nexlink",
+                                required_statuses=(("integration/**", "ci/"),))
+        for state in ("FAILURE", "PENDING"):
+            with self.subTest(state=state):
+                ok, why, _ = self.ready(
+                    [f2271._check("tests"), f2271._context("ci/tests", state)],
+                    project=project)
+                self.assertFalse(ok)
+                self.assertIn("ci/*", why)
+
+    def test_an_optional_commit_status_does_not_gate(self):
+        # Un statut hors préfixe requis n'est pas un check requis ; l'ancien
+        # `ci_green` refusait tout statut non `SUCCESS`, même facultatif.
+        project = radar.Project("nexlink", "/r", github="o/nexlink",
+                                required_statuses=(("integration/**", "ci/"),))
+        ok, why, _ = self.ready(
+            [f2271._check("tests"), f2271._context("ci/tests"),
+             f2271._context("macos/optional", "FAILURE")],
+            project=project)
         self.assertTrue(ok, why)
 
 

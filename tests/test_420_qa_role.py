@@ -133,6 +133,9 @@ class RolesPersistenceTest(PgTestCase):
             "visibility_ok": True, "visibility_diagnostic": "", "placement_ok": True,
             "placement_diagnostic": "", "placement_ref": "placement", "placement_profile": None,
             "canon": None, "ephemeral": False, "projects": ["acme"], "roles": roles,
+            # L165 (#3010) : relève et hôtes candidats, déclaratifs comme le
+            # placement ; `write_declared` pose `hote` par défaut.
+            "releve": "hote", "candidats": None,
             "_expected_lease_epoch": -1,
         }
 

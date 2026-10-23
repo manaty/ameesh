@@ -1424,7 +1424,7 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
     comme la porte historique. Toute lecture illisible — lecteur partagé,
     cible, gel, `git log`, registre — lève `_ProvenanceError` : la porte
     refuse au lieu d'accepter une liste partielle."""
-    from . import review_authors, review_lot
+    from . import resolutions, review_authors, review_lot
     if not repo:
         raise _ProvenanceError("no repository for the frozen delta")
     try:
@@ -1450,7 +1450,8 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
         if not text:
             continue
         try:
-            url = (plan_git._out(text, "remote", "get-url", "origin") or "").strip()
+            url = resolutions._local_from(  # #3041 : relatif à `text`
+                text, plan_git._out(text, "remote", "get-url", "origin") or "")
         except Exception:  # noqa: BLE001 - remote illisible : pas de source
             url = ""
         if url and url not in sources:
@@ -1832,7 +1833,9 @@ def fetch_fresh(repo: str, names, clone=None,
     from . import resolutions
     names = sorted({n for n in names if n})
     remote = {n: _remote_branch(n) for n in names}
-    url = plan_git._out(repo, "remote", "get-url", "origin")
+    # #3041 : l'URL est rejouée dans le clone ; un chemin relatif se lit
+    # depuis `repo`.
+    url = resolutions._local_from(repo, plan_git._out(repo, "remote", "get-url", "origin") or "")
     if not url:
         return {n: plan_git._commit(repo, "refs/heads/" + remote[n]) for n in names}, repo
     what = "branch%s %s" % ("es" if len(names) > 1 else "", ", ".join(names))
@@ -2384,6 +2387,13 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
     `parts` is `readiness`'s (L1651): the caller that requalifies a lot (§12
     package manifest) passes the due contexts it vouches for, `()` to disable
     the per-lot proof for that gesture."""
+    # L165 (EP4) : l'entrée en file est un geste du pilote hors base (la file
+    # poussera). Le bail élu est vérifié avant les lectures de préparation et
+    # journalisé dans la transaction de l'écriture ; le radar et un humain ne
+    # sont pas concernés (`gate` rend None).
+    from . import pilot_gesture
+    fence = pilot_gesture.gate(cfg, db, "queue", "queue add #%d" % lot,
+                               project=getattr(project, "name", None))
     if ci == "github":
         from . import radar
         ci = radar.github_ci(project or radar.Project(name="", repo=repo), strict=True)
@@ -2404,13 +2414,24 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
     if ready.get("waived"):
         waived_note = ", verdict waived by %s (#1979)" % (
             ready.get("waived_by") or "pilot")
-    row = storage.of(db).work.queue_add(
-        lot, target=ready["target"], frozen_sha=ready["frozen_sha"], frozen_id=ready["frozen_id"],
-        source=source_of(repo), note="merge queue of %s: queued at %s%s, class %s%s%s%s" % (
-            ready["target"], ready["frozen_sha"][:12],
-            ", PR #%s green" % ready["pr"] if ready["pr"] else "",
-            ready.get("class") or "?", " (%s)" % ready["class_why"]
-            if ready.get("class_why") else "", parts_note, waived_note), actor=actor)
+
+    def add(tx):
+        return storage.of(tx).work.queue_add(
+            lot, target=ready["target"], frozen_sha=ready["frozen_sha"],
+            frozen_id=ready["frozen_id"], source=source_of(repo),
+            note="merge queue of %s: queued at %s%s, class %s%s%s%s" % (
+                ready["target"], ready["frozen_sha"][:12],
+                ", PR #%s green" % ready["pr"] if ready["pr"] else "",
+                ready.get("class") or "?", " (%s)" % ready["class_why"]
+                if ready.get("class_why") else "", parts_note, waived_note),
+            actor=actor)
+
+    if fence is None:
+        row = add(db)
+    else:
+        with db.transaction() as tx:
+            fence.hold(tx)
+            row = add(tx)
     if row is None:
         raise QueueError("lot #%d is no longer open" % lot)
     # L539 : la classe lue à l'entrée, rendue avec la ligne de file (lecture)
@@ -2421,9 +2442,17 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
 
 
 def leave(db, lot: int, *, actor: str = "", reason: str = "") -> bool:
-    return storage.of(db).work.queue_remove(
-        lot, note="merge queue: taken out%s" % (" (%s)" % reason if reason else ""),
-        actor=actor)
+    from . import pilot_gesture
+    fence = pilot_gesture.gate(None, db, "queue", "queue remove #%d" % lot)
+    if fence is None:
+        return storage.of(db).work.queue_remove(
+            lot, note="merge queue: taken out%s" % (" (%s)" % reason if reason else ""),
+            actor=actor)
+    with db.transaction() as tx:
+        fence.hold(tx)
+        return storage.of(tx).work.queue_remove(
+            lot, note="merge queue: taken out%s" % (" (%s)" % reason if reason else ""),
+            actor=actor)
 
 
 # --------------------------------------------------------------------------
