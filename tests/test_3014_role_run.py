@@ -112,20 +112,23 @@ class RoleRunGuardTest(PgTestCase):
             with open(marker, encoding="utf-8") as source:
                 self.assertEqual(source.read(), "%s banc 11" % NAME)
 
-    def test_the_command_does_not_inherit_the_agent_identity(self):
-        self.lease()
+    def test_the_command_acts_as_the_role_under_the_lease(self):
+        self.lease(epoch=7, owner="runner-test")
         with tempfile.TemporaryDirectory() as folder:
             marker = os.path.join(folder, "env")
             command = ["python3", "-c",
-                       "import os, pathlib; pathlib.Path(%r).write_text("
-                       "'|'.join([os.environ.get('AGENT_MAIL_NAME', 'none'),"
-                       " os.environ.get('AMEESH_RUNNER_ID', 'none')]))" % marker]
-            with mock.patch.dict(os.environ, {"AGENT_MAIL_NAME": "pilote",
-                                             "AMEESH_RUNNER_ID": "runner"}):
+                       "import os, pathlib; pathlib.Path(%r).write_text('|'.join(["
+                       "os.environ.get('AGENT_MAIL_NAME', 'none'),"
+                       " os.environ.get('AMEESH_RUNNER_ID', 'none'),"
+                       " os.environ.get('AMEESH_LEASE_EPOCH', 'none'),"
+                       " os.environ.get('AMEESH_TURN_ID', 'none')]))" % marker]
+            with mock.patch.dict(os.environ, {"AGENT_MAIL_NAME": "foreign",
+                                             "AMEESH_RUNNER_ID": "foreign-runner",
+                                             "AMEESH_TURN_ID": "turn-1"}):
                 code, _ = self.run_cli(self._cfg(), self.args(command))
             self.assertEqual(code, 0)
             with open(marker, encoding="utf-8") as source:
-                self.assertEqual(source.read(), "none|none")
+                self.assertEqual(source.read(), "%s|runner-test|7|none" % NAME)
 
     def test_other_host_is_standby_and_runs_nothing(self):
         self.lease(host="banc")

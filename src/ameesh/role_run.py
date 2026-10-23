@@ -13,9 +13,17 @@ them. This module is that gate, and nothing more:
   current holder* and, when given, the **epoch**. The epoch is passed to the
   command (``AMEESH_LEASE_EPOCH``) so that an effect outside the database can
   be fenced by EP4 in the same transaction as its write;
-* it is only the **entry** check. EP4's ``pilot_gesture`` is the single
-  transaction guard of a pilot's gestures (merge, queue, assignment, packet,
-  decision routing); this module never writes a lease, an epoch or an event.
+* it is only the **entry** check, so a lease may change between this read and
+  the command's gesture. That is intended: the command receives the role, its
+  lease owner and its **epoch** (``AMEESH_ROLE``, ``AMEESH_LEASE_EPOCH``), and
+  every gesture outside the database calls EP4's unique transaction guard
+  (``pilot_gesture``), which compares the epoch and renews under the same
+  owner. This module never writes a lease, an epoch or an event;
+* the command's identity is the **role**, bound to that lease
+  (``AGENT_MAIL_NAME`` + ``AMEESH_RUNNER_ID`` = lease owner + epoch): a gesture
+  is never anonymous, and a command that drops the epoch is refused by EP4's
+  guard instead of passing unfenced. ``AMEESH_TURN_ID`` is removed: a timer is
+  not an agent turn.
 
 The command is an argument vector, never a shell string. Its exit code is
 returned unchanged. The wrapper's own refusals are:
@@ -222,9 +230,10 @@ def run(cfg, args) -> int:
             emit(report, result="would-run")
             return 0
         env = os.environ.copy()
-        # The timer is not the role agent's turn: an inherited identity must
-        # not let the command act (or renew a lease) as that agent. Only the
-        # epoch we pass is a fencing token; the runner credentials are gone.
+        # The command is not an agent turn: never inherit the shell's turn or
+        # a foreign tenure. It acts as the ROLE, under the very lease read
+        # above: the owner and the epoch are the ones EP4's guard will check
+        # and renew, so an old host cannot present a newer epoch by accident.
         for key in ("AGENT_MAIL_NAME", "AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID",
                     "AMEESH_TURN_ID", "AMEESH_LEASE_EPOCH", "AMEESH_LEASE_OWNER",
                     "AMEESH_LEASE_LEFT", "AMEESH_ROLE", "AMEESH_ROLE_HOST"):
@@ -232,6 +241,9 @@ def run(cfg, args) -> int:
         env.update({
             # a child loads the same host, even when its AMEESH_HOST was unset
             "AMEESH_HOST": host,
+            # explicit actor = the role, bound to the live lease (EP4 gate).
+            "AGENT_MAIL_NAME": report["role"],
+            "AMEESH_RUNNER_ID": str(report.get("owner") or ""),
             ENV_ROLE: report["role"],
             ENV_HOST: host,
             ENV_EPOCH: str(report.get("epoch") or ""),
