@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import urlencode
@@ -220,7 +221,9 @@ def collect_batch(api, sub, since, now, scan):
     """
     lag = getattr(sub, "index_lag", INDEX_LAG)
     if scan is not None:
-        state = dict(scan)
+        # deliver uses the original checkpoint for its concurrent-writer guard.
+        # Recheck progress and skipped-page lists must not mutate that value.
+        state = deepcopy(scan)
         if "settled" not in state:
             # Checkpoint written before the bounded window: replay the page
             # under the new model instead of trusting partial snapshots.

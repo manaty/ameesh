@@ -6,6 +6,7 @@ import json
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from types import SimpleNamespace as NS
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
@@ -746,6 +747,30 @@ class CollectionTest(unittest.TestCase):
             with mock.patch.object(api, "get", side_effect=mutate):
                 events, until = self.finish(api, NOW - 3600, NOW)
         self.assertEqual({e["object_id"] for e in events}, {101})
+        self.assertEqual(until, NOW - watch.INDEX_LAG)
+
+    def test_skipped_page_recheck_keeps_the_input_checkpoint_unchanged(self):
+        # deliver compares scan_before with the durable checkpoint. A resumed
+        # recheck must not mutate that expected value through shared children.
+        rows = [issue(n) for n in range(1, 11)]
+        for n, row in enumerate(rows):
+            row["key"] = watch.iso(NOW - 2000 + n)
+            row["updated_at"] = watch.iso(NOW - 1)
+        rows[-1]["key"] = rows[-1]["updated_at"] = watch.iso(NOW - 1000)
+        api, scan, events = LagApi(rows), None, []
+        with mock.patch.object(watch, "PAGE_SIZE", 3), \
+                mock.patch.object(watch, "PAGES_PER_TICK", 2):
+            for _ in range(8):
+                before = deepcopy(scan)
+                batch, after, until = watch.collect_batch(
+                    api, SUB, NOW - 3600, NOW, scan)
+                self.assertEqual(scan, before)
+                events.extend(batch)
+                scan = after
+                if scan is None:
+                    break
+        self.assertIsNone(scan)
+        self.assertEqual({e["object_id"] for e in events}, {10})
         self.assertEqual(until, NOW - watch.INDEX_LAG)
 
     def test_b6_anchor_must_be_an_accepted_row(self):
