@@ -8,6 +8,7 @@ only its fencing epoch survives between calls, never a closed connection.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import math
 import threading
@@ -22,10 +23,19 @@ from . import (merge_queue, radar, resolutions, storage, train, train_admissions
 #: #2446: one host executes the train service. The lease is independent of the
 #: per-target packet reservation; it is renewed while the service runs and
 #: released on a clean stop. A host that loses it stops scheduling passages
-#: until it can acquire it again.
+#: until it can acquire it again. #3134: the runner's shutdown closes it even
+#: when a passage outlives the stop (the process then exits immediately); the
+#: TTL only covers a crash. 900 s is kept: the lease is renewed between
+#: passages only, and a passage (prevalidation, CI read) may exceed 300 s.
+#: #3142: its holder adopts the target reservations a previous holder's
+#: runner left behind (`train_store.Ledger.adopt`), fenced by a new epoch.
 SERVICE_LEASE_KEY = "train-service"
 SERVICE_LEASE_TTL_S = 900.0
 SERVICE_LEASE_RETRY_S = 60.0
+#: #3134: how long the runner's shutdown waits for a train effect still in
+#: flight (push, promotion, SQL write) before releasing the lease. Far below
+#: the runner units' `TimeoutStopSec`; past it the lease expires with its TTL.
+SERVICE_STOP_EFFECT_S = 120.0
 
 
 class HostLease:
@@ -49,36 +59,112 @@ class HostLease:
         self.ttl, self.retry, self.clock = float(ttl), float(retry), clock
         self.epoch = None
         self.next_at = 0.0
+        # #3134: the runner's main thread closes the lease while the service
+        # thread may still be inside a passage. Every train effect of a
+        # passage runs under this lock (`effect`): the close waits for the
+        # effect in flight, and every later effect is refused. A closed lease
+        # is never acquired again by this incarnation. `depth` counts the
+        # effects open on the thread holding the lock: an effect nested in
+        # the one in flight (promote -> ledger.acquire, publish -> reserve)
+        # finishes it; only a new top-level effect is refused.
+        self.lock = threading.RLock()
+        self.closed = False
+        self.depth = 0
 
     def acquire(self, db, now=None):
         """Take the service lease; False when another host holds it."""
         now = self.clock() if now is None else float(now)
-        epoch = storage.of(db).work.land_lock(self.key, self.owner, self.ttl)
-        if epoch is None:
-            self.epoch, self.next_at = None, now + self.retry
-            return False
-        self.epoch, self.next_at = int(epoch), now + self.ttl / 3.0
-        return True
+        with self.lock:
+            if self.closed:
+                self.epoch, self.next_at = None, now + self.retry
+                return False
+            epoch = storage.of(db).work.land_lock(self.key, self.owner, self.ttl)
+            if epoch is None:
+                self.epoch, self.next_at = None, now + self.retry
+                return False
+            self.epoch, self.next_at = int(epoch), now + self.ttl / 3.0
+            return True
 
     def renew(self, db, now=None):
         """Keep the same epoch; False when the lease is gone."""
         now = self.clock() if now is None else float(now)
-        if self.epoch is None:
-            return False
-        epoch = storage.of(db).work.land_lock(self.key, self.owner, self.ttl,
-                                              epoch=self.epoch)
-        if epoch != self.epoch:
-            self.epoch, self.next_at = None, now + self.retry
-            return False
-        self.next_at = now + self.ttl / 3.0
-        return True
+        with self.lock:
+            if self.epoch is None:
+                return False
+            epoch = storage.of(db).work.land_lock(self.key, self.owner, self.ttl,
+                                                  epoch=self.epoch)
+            if epoch != self.epoch:
+                self.epoch, self.next_at = None, now + self.retry
+                return False
+            self.next_at = now + self.ttl / 3.0
+            return True
 
     def release(self, db):
         """Release this service's lease; never touch another holder's."""
-        if self.epoch is None:
-            return False
-        epoch, self.epoch = self.epoch, None
-        return bool(storage.of(db).work.land_unlock(self.key, self.owner, epoch))
+        with self.lock:
+            if self.epoch is None:
+                return False
+            epoch, self.epoch = self.epoch, None
+            return bool(storage.of(db).work.land_unlock(self.key, self.owner, epoch))
+
+    @contextlib.contextmanager
+    def effect(self):
+        """#3134: one train effect, under the held lease; refused once closed or lost."""
+        with self.lock:
+            if self.depth == 0 and (self.closed or self.epoch is None):
+                raise train.TrainError("train service lease released; stale train effect refused")
+            self.depth += 1
+            try:
+                yield
+            finally:
+                self.depth -= 1
+
+    def close(self, db, *, timeout=None):
+        """#3134: fence every later effect, then release the lease.
+
+        Returns None when an effect is still running after ``timeout``: the
+        lease is then kept (it expires with its TTL) rather than released
+        under a write in flight; otherwise what ``release`` returns.
+        """
+        self.closed = True
+        if not self.lock.acquire(timeout=-1 if timeout is None else max(0.0, float(timeout))):
+            return None
+        try:
+            return self.release(db)
+        finally:
+            self.lock.release()
+
+
+#: #3134: the runtime calls that write. The target reservation check
+#: (`ledger.acquire`) precedes every effect; publication is fenced at its
+#: push and composition at its migration reservations, so a long
+#: prevalidation or replay never holds the service lease's lock.
+_FENCED = (("save", "release", "enroll", "quarantine", "start_ci", "reconcile", "promote"),
+           ("acquire", "before_publish"),
+           ("publish",),
+           ("reserve", "landed"))
+
+
+def _fenced(runtime, guard):
+    """#3134: run each write of ``runtime`` under the service lease's ``guard``."""
+    if guard is None:
+        return runtime
+
+    def fence(call):
+        def run(*args, **kwargs):
+            with guard():
+                return call(*args, **kwargs)
+        return run
+
+    ports = (runtime, runtime.ledger, runtime.repository, runtime.migrations)
+    for port, names in zip(ports, _FENCED):
+        if port is None:
+            continue
+        for name in names:
+            call = getattr(port, name, None)
+            if callable(call):
+                setattr(port, name, fence(call))
+    return runtime
 
 
 class Passage:
@@ -103,16 +189,30 @@ class Passage:
         self.candidate, self.initial = candidate, initial
         self.maintenance_at = None
         self.epoch = None
+        #: #3134: the service lease's `effect`, set by `Service`; None outside it.
+        self.guard = None
+        #: #3142: the service lease itself, set by `Service`: its holder adopts
+        #: the target reservation another runner's train left behind.
+        self.lease = None
+
+    def held_lease(self):
+        """#3142: (key, owner, epoch) of the service lease this process holds, or None."""
+        lease = self.lease
+        epoch = getattr(lease, "epoch", None)
+        if lease is None or epoch is None or getattr(lease, "closed", False):
+            return None
+        return lease.key, lease.owner, epoch
 
     def reservation_ledger(self, db):
         if self.reservation is None:
             raise train.TrainError("explicit qualified packet reservation required")
         return self.reservation.bind(db, self.project,
             merge_queue._remote_branch(self.project.target), self.owner,
-            train_ci.contract_digest(self.workflows))
+            train_ci.contract_digest(self.workflows), service=self.held_lease)
 
     def maintain(self, db, now):
-        self.maintenance_at = self.reservation_ledger(db).maintain(now)
+        with (self.guard() if self.guard is not None else contextlib.nullcontext()):
+            self.maintenance_at = self.reservation_ledger(db).maintain(now)
         return self.maintenance_at
 
     def repository_path(self):
@@ -188,7 +288,8 @@ class Passage:
         repository = train_git.Repository(self.project, clone, transports=transports,
                                           migrations=migrations)
         ledger = (self.reservation_ledger(db) if self.reservation is not None else
-                  train_store.Ledger(db, self.project, target, self.owner))
+                  train_store.Ledger(db, self.project, target, self.owner,
+                                     service=self.held_lease))
         authority = fires(self.cfg, ledger) if rules.merge_named_fire else fires(ledger, rules)
         history = train_history.Recorded(db, clone.path, provider=self.provider, review_rules=rules)
         admissions = train_admissions.Admissions(db, self.project, history, policy=requirement)
@@ -220,10 +321,11 @@ class Passage:
                             % (result.get("why") or result.get("cause") or "?"), result)
             return result
 
-        return train_runtime.Runtime(ledger=ledger, repository=repository, ci=ci,
+        return _fenced(train_runtime.Runtime(ledger=ledger, repository=repository, ci=ci,
             fires=authority, admissions=admissions,
             target=target, policy=policy, notify=self.notify, inventory=inventory,
-            enrollment=enrollment, migrations=migrations, prevalidation=prevalidate)
+            enrollment=enrollment, migrations=migrations, prevalidation=prevalidate),
+            self.guard)
 
     def step(self, db, now):
         """One bounded event/pass; never wait for CI and never retain ``db``."""
@@ -249,6 +351,11 @@ class Passage:
         engine.epoch = self.epoch
         try:
             result = engine.step(now)
+            adopted = getattr(runtime.ledger, "adopted", None)
+            if adopted:
+                self.notify("train reservation adopted from %s (epoch %s -> %s)" % (
+                    adopted["previous_owner"], adopted["previous_epoch"], adopted["epoch"]),
+                    adopted)
             if runtime.enrollment_result is not None:
                 result["enrollment"] = runtime.enrollment_result
             return result
@@ -269,6 +376,9 @@ class Service:
         self.cfg, self.passages = cfg, tuple(passages)
         self.stop, self.report, self.clock = stop, report, clock
         self.lease = lease
+        for passage in self.passages:
+            passage.guard = lease.effect if lease is not None else None
+            passage.lease = lease
         self.condition = threading.Condition()
         self.pending = set(range(len(self.passages)))
         self.deadlines = {}
@@ -360,13 +470,16 @@ class Service:
         finally:
             db.close()
 
-    def _release_lease(self):
-        if self.lease is None or self.lease.epoch is None:
+    def _release_lease(self, timeout=None):
+        """Close the lease, from the service thread or the runner's shutdown."""
+        if self.lease is None:
             return
         from .scoped_db import ScopedDb
         db = ScopedDb(self.cfg)
         try:
-            self.lease.release(db)
+            if self.lease.close(db, timeout=timeout) is None and timeout:
+                self.report("train service lease kept: a train effect is still running;"
+                            " it expires with its TTL")
         except Exception as exc:
             self.report("train service lease release failed (%s: %s)"
                         % (type(exc).__name__, exc))
@@ -423,9 +536,21 @@ class Service:
         self.thread = threading.Thread(target=self.run, daemon=True, name="integration-trains")
         self.thread.start()
 
-    def shutdown(self):
+    def shutdown(self, *, join=2.0):
         # The runner sets its stop event before calling this method.
         with self.condition:
             self.condition.notify_all()
         if self.thread is not None:
-            self.thread.join(timeout=2.0)
+            self.thread.join(timeout=join)
+            if self.thread.is_alive():
+                # #3134: a passage outlives the stop. The runner will exit
+                # immediately (`_sortie_sure`) and this thread's `finally`
+                # never runs: fence every later effect now, and release the
+                # lease at once unless an effect is in flight (`finish`).
+                self._release_lease(timeout=0)
+
+    def finish(self, timeout=SERVICE_STOP_EFFECT_S):
+        """#3134: at the end of the runner's shutdown, wait for the effect
+        still in flight, then release the lease before the process exits."""
+        if self.lease is not None and self.lease.epoch is not None:
+            self._release_lease(timeout=timeout)

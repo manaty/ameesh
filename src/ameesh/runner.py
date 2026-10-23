@@ -9715,6 +9715,11 @@ class Runner:
         if getattr(self, "host_gate", None) is not None:
             self.host_gate.tick()  # dernier acquittement : plus aucun bail
             self.host_gate.stop()
+        if train_service is not None:
+            # #3134 : un effet de train encore en vol (push, promotion) finit,
+            # puis le bail train-service est rendu avant la sortie immédiate
+            # de `_sortie_sure` ; les effets suivants sont déjà refusés.
+            train_service.finish()
         # par la file : aucune écriture synchrone sur le chemin d'arrêt avant
         # le repli de `_sortie_sure` (relecture codex2 de 669a6fe, B1)
         log_async("shutdown: %d lease(s) returned, %d turn(s)" % (len(workers), self.turns))
