@@ -289,7 +289,12 @@ the epoch it was opened with is refused, and the message names the current
 holder, its host and its epoch. The gate renews the lease and writes a
 `pilot.gesture` event in the same database transaction, so a stale epoch
 cannot even journal the gesture; the effect follows. The event carries the
-agent, gesture, ref, epoch and host — never a token or a secret.
+agent, gesture, ref, epoch and host — never a token or a secret. The renewal
+never shortens the lease: it keeps at least the TTL of the agent's host
+(`policy.lease_ttl` or `volatile` of its Host card, else `AMEESH_LEASE_TTL`
+— the runner's own rule) and never below the expiry already held, so a
+gesture cannot make the lease expire before the next heartbeat and elect
+another pilot (#3115).
 
 An EP5 timer (`ameesh role run`) may carry no agent identity but passes
 `AMEESH_ROLE` and the epoch it entered with. That pair is fenced too: a role
