@@ -292,15 +292,21 @@ def _move_ref(source: str, target: str) -> str:
 
 def _move_object(source: str, target: str) -> str:
     """Déplace l'objet libre `source` vers `target`, sous le verrou de
-    quarantaine de son dépôt (`_store_lock`) et hors `core.createObject=rename`
-    (`_replacing_writer`). Git par défaut ne remplace jamais un objet présent
-    (`link()`, EEXIST = déjà là) : tant que le fichier vide est à son chemin,
-    aucun écrivain ne peut y mettre un objet complet, et seule une autre
-    quarantaine pourrait l'en retirer — le verrou l'exclut. La relecture après
-    déplacement reste une défense : un objet complet emporté est remis à son
-    chemin par un lien qui n'écrase rien, et un échec de la remise est nommé
-    avec l'endroit où l'objet se trouve. Rend pourquoi l'objet reste en place,
-    vide s'il a été déplacé."""
+    quarantaine de son dépôt (`_store_lock`).
+
+    La preuve de sûreté tient à Git lui-même, pas à sa configuration : un
+    écrivain (`hash-object -w`, `unpack-objects`, fetch) teste d'abord la
+    présence du fichier (`freshen_loose_object`, `access(F_OK)`) et n'écrit
+    rien s'il est là, même vide, quel que soit `core.createObject` — c'est ce
+    qui rendait l'incident permanent (témoin `test_git_never_rewrites_a_present
+    _empty_object`). Tant que le fichier vide est à son chemin, aucun écrivain
+    ne peut donc y mettre un objet complet ; seul un autre déménageur le
+    pourrait, et le verrou exclut les autres passes. Défenses en plus : refus
+    si un écrivain visible est configuré en `rename` (`_replacing_writer`), et
+    relecture après déplacement — un objet complet emporté (déménageur hors
+    ameesh, geste à la main) est remis par un lien qui n'écrase rien, et un
+    échec de la remise est nommé avec l'endroit où l'objet se trouve. Rend
+    pourquoi l'objet n'est pas en quarantaine, vide s'il l'est."""
     if os.lstat(source).st_size != 0:
         return "no longer empty"
     os.rename(source, target)
@@ -356,7 +362,10 @@ def _replacing_writer(git_dir: str) -> bool:
     est partagé par le dépôt et tous ses worktrees liés : la configuration
     effective de **chacun** est lue (`config.worktree` avec
     `extensions.worktreeConfig`, includes, global, système). Un seul `rename`,
-    une lecture impossible ou un worktree illisible : oui (refus fermé)."""
+    une lecture impossible ou un worktree illisible : oui (refus fermé).
+    Défense en plus seulement : la configuration d'un autre utilisateur ou d'un
+    `-c` n'est pas lisible d'ici, et la sûreté ne repose pas sur elle (Git ne
+    réécrit jamais un objet présent, voir `_move_object`)."""
     gitdirs = [git_dir]
     worktrees = os.path.join(git_dir, "worktrees")
     try:

@@ -72,6 +72,24 @@ class CorruptionReadingTest(unittest.TestCase):
             self.assertFalse(resolutions.local_corruption(message), message)
             self.assertEqual(resolutions.fetch_failure(message), message)
 
+    def test_git_never_rewrites_a_present_empty_object(self):
+        # la preuve de sûreté de `_move_object` contre le Git installé : un
+        # objet présent, même vide, n'est jamais réécrit, quel que soit
+        # `core.createObject` (relectures cx2/deepseek, gels #16631)
+        tmp = tempfile.mkdtemp(prefix="ameesh-3181-git-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        _git(tmp, "init", "-q")
+        sha = subprocess.run(["git", "-C", tmp, "hash-object", "--stdin"], input=b"banc\n",
+                             capture_output=True, check=True).stdout.decode().strip()
+        path = os.path.join(tmp, ".git", "objects", sha[:2], sha[2:])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w").close()
+        for mode in ("rename", "link"):
+            subprocess.run(["git", "-C", tmp, "-c", "core.createObject=" + mode,
+                            "hash-object", "-w", "--stdin"], input=b"banc\n",
+                           capture_output=True)
+            self.assertEqual(os.path.getsize(path), 0, mode)
+
     def test_the_subcommand_skips_config_options(self):
         self.assertEqual(resolutions._subcommand(
             ("-c", "transfer.unpackLimit=1", "fetch", "--quiet")), "fetch")
