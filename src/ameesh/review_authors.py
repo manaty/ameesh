@@ -26,7 +26,10 @@ auteurs, avec les mêmes exceptions du canon §2 :
   contenu subsiste restent auteurs de la tête. Une consolidation sur une cible
   avancée, un squash à arbre identique ou le report des lignes significatives
   d'un correctif gardent donc sa famille exclue ; un contenu réellement réécrit
-  ne la reprend pas, et le doute conserve toujours l'auteur. Un gel antérieur
+  ne la reprend pas. C'est la survie du contenu qui décide (#3220) : un fichier
+  déplacé ou un contenu identique réécrit par un autre garde l'auteur, un
+  fichier supprimé ou des lignes toutes disparues ne le gardent pas ; une
+  lecture impossible, elle, conserve toujours l'auteur. Un gel antérieur
   absent du clone de lecture est demandé à la forge (`origin`) par SHA exact,
   quel que soit l'appelant (#3147) : le résultat de la porte ne dépend pas du
   clone ;
@@ -692,11 +695,18 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
     (canon §2 : le doute conserve l'auteur) ; une réécriture complète, elle,
     ne le reprend pas. Un diff illisible ou binaire conserve l'auteur.
 
-    #2924 B8 : un chemin absent de la tête n'est pas une preuve de
-    suppression. Un fichier peut avoir été déplacé (ou son contenu regroupé
-    ailleurs) sans qu'une ligne soit réécrite ; l'absence du seul ancien
-    chemin conserve donc l'auteur. Seul un chemin encore présent dont aucune
-    ligne significative ne subsiste prouve la réécriture.
+    #2924 B8 : un chemin absent ne prouve pas à lui seul une suppression. Un
+    fichier peut avoir été déplacé (ou son contenu regroupé ailleurs) sans
+    qu'une ligne soit réécrite ; la preuve cherche donc les lignes
+    significatives du commit dans tout l'arbre de la tête, pas seulement à
+    leur ancien chemin.
+
+    #3220 : si aucune de ces lignes ne subsiste nulle part, le contenu a
+    réellement disparu (fichier supprimé, ou toutes ses lignes retirées) et
+    l'auteur n'est pas reporté. Un chemin absent n'est plus, à lui seul, un
+    doute qui garderait l'auteur ; un fichier déplacé avec ses lignes, lui,
+    le garde. Une lecture impossible reste un doute (`_any_line_in_head`
+    rend True), jamais une preuve de suppression.
 
     #2977 : une ligne ajoutée qui existait déjà avant le correctif (parent du
     commit, ou base de fusion de la tête et de `base`) n'est pas propre au
@@ -736,19 +746,19 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
         added = [(path, row) for path, row in added
                  if moved(path, row) or row.strip() not in inherited]
     if added:
-        missing_path = False
         for path, row in added:
             lines = _head_lines(repo, head, path, cache)
-            if lines is None:
-                missing_path = True
-            elif row.strip() in lines:
+            if lines is not None and row.strip() in lines:
                 return True
         # Le chemin d'origine ne porte plus la ligne : elle a pu être déplacée
         # avec son fichier ou regroupée ailleurs. La chercher dans tout l'arbre
         # évite d'effacer le correcteur sur un simple déplacement (#2924 B8).
         if _any_line_in_head(repo, head, [row for _path, row in added]):
             return True
-        return missing_path
+        # #3220 : aucune ligne propre au commit ne subsiste nulle part. Le
+        # contenu est réellement supprimé (fichier retiré, ou toutes ses lignes
+        # réécrites) : un chemin absent ne garde plus l'auteur à lui seul.
+        return False
     removed = [(path, row) for path, rows in removes.items() for row in rows
                if _meaningful_line(row)]
     if removed and any(
@@ -784,8 +794,12 @@ def _freeze_content_preserved(repo: str, freeze_sha: str, head_sha: str,
 
     `True` quand l'arbre est identique, ou quand la tête est exactement la
     fusion du gel avec la base (une consolidation sur une cible avancée). Un
-    arbre illisible ou une fusion conflictuelle ne prouvent pas une réécriture :
-    le doute rend `True` (les auteurs restent)."""
+    arbre illisible ne prouve pas une réécriture : le doute rend `True` (les
+    auteurs restent). Une fusion **conflictuelle**, elle, n'est pas une preuve
+    de conservation : la fonction rend `False`, et la preuve de contenu par
+    commit (#3220) décide sur la tête réelle si les lignes du gel antérieur y
+    subsistent. Sans cette lecture, un rebase conflictuel garderait tous les
+    auteurs d'un gel dont un fichier a pourtant disparu (#3216)."""
     head_tree = _tree_of(repo, head_sha)
     freeze_tree = _tree_of(repo, freeze_sha)
     if head_tree is None or freeze_tree is None:
@@ -794,7 +808,7 @@ def _freeze_content_preserved(repo: str, freeze_sha: str, head_sha: str,
         return True
     if base:
         merged = _merged_tree(repo, freeze_sha, base)
-        if merged is None or merged == head_tree:
+        if merged is not None and merged == head_tree:
             return True
     return False
 
@@ -1074,12 +1088,22 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
 
     def survives(written: Mapping, stored: bool, actor: str, *,
                  every: bool = False) -> bool:
-        """Le contenu écrit par `actor` dans ce gel subsiste-t-il dans la tête ?"""
+        """Le contenu écrit par `actor` dans ce gel subsiste-t-il dans la tête ?
+
+        #3220 : un commit déjà présent dans la plage courante est attribué par
+        la lecture de cette tête ; le re-prouver par le contenu serait
+        redondant, et un gros commit gelé coûterait un `git grep` complet sur
+        tout l'arbre. Seuls les commits du gel antérieur que la plage courante
+        ne couvre pas demandent la preuve de contenu."""
         shas = written.get(actor) or []
         if not shas:
             return False
         if stored:
             return True
+        shas = [commit for commit in shas
+                if plan_git.full_commit_id(commit) not in current_set]
+        if not shas:
+            return True              # déjà attribué par la plage courante
         values = []
         for commit in shas:
             if commit not in survival:
