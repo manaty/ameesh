@@ -21,7 +21,7 @@ from ameesh import mail, registry, review_authors, review_designation as rd
 from ameesh import review_designation_activation as act
 from ameesh import review_designation_pg as pg
 from ameesh import review_provenance as prov
-from ameesh import storage, work
+from ameesh import storage, verdict_carry, work
 from ameesh.work_reviewers import designated
 
 from .support import PgTestCase
@@ -1397,6 +1397,115 @@ class PendingLoadTest(_ActivationFixture, PgTestCase):
         mark = act._marks(self.db, lot)[-1][2]
         self.assertEqual(mark["state"], rd.DESIGNATED, mark)
         self.assertIn("load: r1b 2", mark["why"])
+
+
+class UnreadableMarkTest(_ActivationFixture, PgTestCase):
+    """#3047: an unreadable designation mark can never cancel a freeze.
+
+    A note with the mark prefix and invalid JSON used to reach a `::jsonb`
+    cast inside the freeze transaction: PostgreSQL aborted the transaction and
+    every freeze of the mesh failed while the lot stayed open. The mark is now
+    read as text and parsed in Python; an unreadable one charges nobody and is
+    journaled with its lot and note id, and the freeze continues.
+    """
+
+    def pending_lot(self, reviewer: str, sha: str) -> int:
+        """An open lot whose last freeze designates `reviewer`, no verdict yet.
+
+        The same direct state as #3004's `PendingLoadTest`: the freeze hook
+        writes the journal mark and the `reviewers` column in one transaction,
+        the benchmark writes them without the hook.
+        """
+        item = work.add(self.db, title="pending %s" % sha[:8], app="ameesh",
+                        assignee="author")
+        lot = int(item["id"])
+        work.move(self.db, lot, "build")
+        work.move(self.db, lot, "qa")
+        row = work.milestone(self.db, lot, "frozen", sha=sha, actor="author",
+                             on_frozen=lambda tx, milestone, threads: None,
+                             after_commit=[])
+        note = pg._mark_note(lot, int(row["id"]), state=rd.DESIGNATED,
+                             required=1,
+                             reviewers=[{"name": reviewer, "family": "claude"}],
+                             missing=0, why="test: pending review",
+                             authors=[], policy_ref="", sha=sha)
+        storage.of(self.db).work.note(lot, "qa", note, "test")
+        self.db.execute("UPDATE work_items SET reviewers = ARRAY[%s] WHERE id = %s",
+                        (reviewer, lot))
+        return lot
+
+    def latest_freeze(self, lot: int) -> int:
+        return int(self.db.query(
+            "SELECT id FROM work_item_milestones WHERE work_item_id = %s"
+            " AND kind = 'frozen' ORDER BY at DESC, id DESC LIMIT 1",
+            (int(lot),))[0]["id"])
+
+    def unreadable_mark(self, lot: int, freeze_id: int) -> int:
+        """Write a mark with a valid prefix and invalid JSON, return its id."""
+        text = "review-designation:%d:%d: {not json" % (int(lot), int(freeze_id))
+        storage.of(self.db).work.note(int(lot), "qa", text, "test")
+        return int(self.db.query(
+            "SELECT max(id) AS id FROM work_item_events WHERE work_item_id = %s",
+            (int(lot),))[0]["id"])
+
+    def notes(self) -> list:
+        return [str(row["note"]) for row in self.db.query(
+            "SELECT note FROM work_item_events WHERE work_item_id = %s",
+            (self.lot,))]
+
+    def test_an_unreadable_mark_on_another_lot_does_not_block_the_freeze(self):
+        # the oldest failure of the lot: `prepare` runs in the freeze
+        # transaction, so the cast error left it aborted and NO freeze of the
+        # mesh could be written while this lot stayed open.
+        other = self.pending_lot("r1", "%040x" % 21)
+        note_id = self.unreadable_mark(other, self.latest_freeze(other))
+        row, out = self.freeze()
+        self.assertEqual(row["kind"], "frozen")
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        # the unreadable mark charges nobody: r1 is only the frozen lot's own
+        # (valid) designation, not the other lot's ignored mark
+        loads = act._loads(self.db)
+        self.assertEqual(loads.get("r1"), 1, loads)
+        self.assertEqual(loads.get("r2"), 1, loads)
+        marker = "review-designation-unreadable:%d:%d:" % (other, note_id)
+        self.assertEqual(sum(marker in note for note in self.notes()), 1,
+                         self.notes())
+        # a replay of the same read does not journal the same note twice
+        act.prepare(self.cfg, self.db, self.lot, fetch=False)
+        self.assertEqual(sum(marker in note for note in self.notes()), 1,
+                         self.notes())
+
+    def test_a_valid_mark_is_still_read_next_to_an_unreadable_one(self):
+        self.pending_lot("r1", "%040x" % 31)
+        bad = self.pending_lot("r2", "%040x" % 32)
+        self.unreadable_mark(bad, self.latest_freeze(bad))
+        loads = act._loads(self.db)
+        # the valid mark still counts, the invalid one counts for nobody
+        self.assertEqual(loads.get("r1"), 1, loads)
+        self.assertNotIn("r2", loads)
+
+    def test_a_carried_designation_is_still_read(self):
+        # the Python read keeps both prefixes of #3004: a report copied by
+        # `verdict_carry` is as authoritative as a direct selection
+        sha = "%040x" % 41
+        lot = self.pending_lot("r1", sha)
+        carried = verdict_carry.carried_mark_note(
+            lot, {"id": self.latest_freeze(lot), "sha": sha},
+            {"carried": [{"actor": "r1"}]})
+        storage.of(self.db).work.note(lot, "qa", carried, "test")
+        self.assertEqual(act._loads(self.db).get("r1"), 1)
+
+    def test_an_unreadable_mark_on_the_frozen_lot_is_ignored_and_journaled(self):
+        row, _ = self.freeze()
+        note_id = self.unreadable_mark(self.lot, int(row["id"]))
+        # the frozen lot's own unreadable mark is ignored (chosen over a named
+        # refusal: the freeze must continue, the trace explains the undercount)
+        inputs = act.prepare(self.cfg, self.db, self.lot, fetch=False)
+        self.assertIsInstance(inputs, act.Inputs)
+        self.assertNotIn("r1", act._loads(self.db))
+        marker = "review-designation-unreadable:%d:%d:" % (self.lot, note_id)
+        self.assertEqual(sum(marker in note for note in self.notes()), 1,
+                         self.notes())
 
 
 class ActivationCliTest(_ActivationFixture, PgTestCase):
