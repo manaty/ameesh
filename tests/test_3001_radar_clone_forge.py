@@ -196,6 +196,32 @@ class CloneFollowsForgeTest(unittest.TestCase):
             self.clone, "develop", head)
         self.assertEqual(again, [head])
 
+    def test_declared_target_is_certified_before_the_project_target(self) -> None:
+        """Relecture ameesh-cx2 (B/P1) : le clone nexlink déclare
+        `ameesh.target origin/main` alors que la cible du projet est `develop`.
+        La cible déclarée, celle que `default_target` consomme, est certifiée
+        elle aussi : elle suit la forge, puis est refusée si la forge se tait."""
+        replayer = self._replayer(target="develop")
+        replayer.ensure()
+        _git(self.clone, "config", "ameesh.target", "origin/main")
+        _git(self.pusher, "checkout", "-q", "main")
+        _git(self.pusher, "pull", "-q", "--ff-only", "origin", "main")
+        main = _commit(self.pusher, "m.txt", "main\n", "main moves on")
+        _git(self.pusher, "push", "-q", "origin", "main")
+        replayer.ensure()
+        self.assertEqual(plan_git.default_target(self.clone), "origin/main")
+        self.assertEqual(self._tracked("main"), main)
+        self.assertEqual(self._tracked("develop"), self.published)
+        self.assertEqual(replayer.target_doubt, "")
+        os.rename(self.forge, self.forge + ".moved")
+        replayer.ensure()
+        self.assertIsNone(self._tracked("main"))
+        self.assertIsNone(self._tracked("develop"))
+        self.assertIn("origin/main", replayer.target_doubt)
+        self.assertIn("origin/develop", replayer.target_doubt)
+        with self.assertRaises(plan_git.MergeProbeError):
+            plan_git.default_target(self.clone)
+
     def test_checkout_without_origin_keeps_its_branches(self) -> None:
         alone = os.path.join(self.tmp, "alone")
         _git(self.tmp, "init", "-q", "-b", "main", alone)

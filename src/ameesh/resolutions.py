@@ -1126,32 +1126,44 @@ class Replayer:
         _run(self.path, "remote", "set-head", "origin", "--auto", timeout=FETCH_TIMEOUT)
         return True
 
-    def _target_branch(self) -> str:
-        for name in (self.target, plan_git.declared_target(self.path) or "",
+    def _target_branches(self) -> list[str]:
+        """Les cibles que lisent les lecteurs du clone, dans l'ordre où
+        `plan_git.default_target` les consomme : la cible déclarée du clone
+        (`ameesh.target`, jamais écrasée par `declare_target`), puis celle du
+        projet (la base `develop` d'un lot nexlink, #3025), puis la branche par
+        défaut de la forge (`origin/HEAD`)."""
+        branches: list[str] = []
+        for name in (plan_git.declared_target(self.path) or "", self.target,
                      plan_git._out(self.path, "symbolic-ref", "--quiet", "--short",
                                    _FORGE_REFS + "HEAD") or ""):
             branch = plan_git.short_branch(name)
-            if branch and branch != "HEAD" and not plan_git._SHA_RE.match(branch):
-                return branch
-        return ""
+            if (branch and branch != "HEAD" and not plan_git._SHA_RE.match(branch)
+                    and branch not in branches):
+                branches.append(branch)
+        return branches
 
     def refresh_target(self) -> str:
         """#3001 : `refs/remotes/origin/<cible>` du clone est la pointe que la
-        forge publie (`git ls-remote`), récupérée au besoin. Une cible que la
-        forge ne certifie pas — forge illisible, ref restée plus ancienne — est
-        effacée du clone et le doute noté (`target_doubt`) : un lecteur trouve
-        une cible absente, jamais une pointe périmée ni la branche locale du
-        checkout. Rend la pointe certifiée ; vide sans forge ou sans cible."""
+        forge publie (`git ls-remote`), récupérée au besoin, pour **chaque**
+        cible lue (`_target_branches`). Une cible que la forge ne certifie pas
+        — forge illisible, ref restée plus ancienne — est effacée du clone et le
+        doute noté (`target_doubt`) : un lecteur trouve une cible absente,
+        jamais une pointe périmée ni la branche locale du checkout. Rend la
+        pointe certifiée de la première cible ; vide sans forge, sans cible ou
+        si elle n'est pas certifiée."""
         url = self.forge_url()
-        branch = self._target_branch()
-        if not url or not branch or not self._tracks_forge(url):
+        branches = self._target_branches()
+        if not url or not branches or not self._tracks_forge(url):
             return ""
-        try:
-            return self.forge_tip(branch)
-        except StaleTarget as exc:
-            self.target_doubt = str(exc)
-            _run(self.path, "update-ref", "-d", _FORGE_REFS + branch)
-            return ""
+        tips, doubts = {}, []
+        for branch in branches:
+            try:
+                tips[branch] = self.forge_tip(branch)
+            except StaleTarget as exc:
+                doubts.append(str(exc))
+                _run(self.path, "update-ref", "-d", _FORGE_REFS + branch)
+        self.target_doubt = "; ".join(doubts)
+        return tips.get(branches[0], "")
 
     def forge_tip(self, branch: str) -> str:
         """La pointe de `branch` à la forge, amenée sous
@@ -1182,7 +1194,6 @@ class Replayer:
             raise StaleTarget("origin/%s is at %s, the forge publishes %s: an older "
                               "target is refused, not read"
                               % (branch, (held or "nothing")[:12], published[:12]))
-        self.target_doubt = ""
         return published
 
     def _declared_ref(self) -> str:
