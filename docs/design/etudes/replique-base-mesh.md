@@ -1,7 +1,7 @@
 ---
 type: Study
 title: "Database replica and failover: the mesh's last single point (EP8)"
-description: "EP8: the mesh database and the WireGuard hub are one VM. Three PostgreSQL 17 nodes on the existing VMs, synchronous streaming replication, etcd + Patroni for a deterministic failover under five minutes, a multi-host DSN, WAL archiving and PITR; six lots, no new VM, no overage."
+description: "EP8: the mesh database and the WireGuard hub are one VM. Three PostgreSQL 17 nodes on the existing VMs, synchronous streaming replication, etcd + Patroni for a deterministic failover (target under one minute, requirement under five), a multi-host DSN, WAL archiving and PITR; six lots, no new VM, no overage."
 status: proposed
 tags: [postgres, replication, bascule, disponibilite, etcd, patroni, wireguard, sauvegarde]
 generated: { by: "ameesh-dev3/deepseek-flash", at: "2026-10-22T20:45:00Z" }
@@ -22,7 +22,8 @@ sources:
   there is no database to hold a lease, and no WireGuard path between the VMs.
 - Recommendation: three PostgreSQL 17 nodes on the three existing VMs,
   synchronous streaming replication between the two 8 vCPU agent VMs,
-  etcd + Patroni for a deterministic failover in under a minute, a private
+  etcd + Patroni for a deterministic failover (target under one minute,
+  requirement under five, as in the RTO row), a private
   network so the hub leaves the database path, a multi-host DSN, and WAL
   archiving with point-in-time recovery to object storage.
 - Six lots, about 34 agent-hours, no new VM. The recommended design's only new
@@ -30,8 +31,7 @@ sources:
   exist); a fourth voter is an option with a new monthly cost, not part of the
   recommendation.
 - The owner decides the network (private network or WireGuard mesh), the
-  primary VM, the synchronous count, the bucket, the optional PC copy and the
-  switchover window.
+  primary VM, the bucket, the optional PC copy and the switchover window.
 
 ## What happened
 
@@ -227,14 +227,14 @@ make the PC a quorum member.
 | `pc-smichea` | optional delayed DR copy; never a voter | it is off often; a copy there protects against a bad migration, not against a host loss |
 
 The two agent VMs are the primary and the synchronous standby; `manaty-mesh-1`
-is a voter and an asynchronous standby with `nofailover: true`: it receives
-replication and votes in etcd, but it is never promoted automatically. If both
-agent VMs are lost, the surviving hub has no etcd quorum (1/3) and does not
-promote; the mesh stops. With the default single synchronous standby, the hub
-is asynchronous and may miss the last commits; if the measured latency allows
-the stronger setting in section 3 (`synchronous_node_count: 2`), it holds a
-complete copy but still cannot serve alone. That is a double failure, not the
-single failure this study removes.
+is a voter and an asynchronous standby with `nofailover: true` and
+`nosync: true`: it receives replication and votes in etcd, but it is never
+promoted automatically and never enters `synchronous_standby_names`, so no
+commit waits for the smallest, hub-loaded host. If both agent VMs are lost,
+the surviving hub has no etcd quorum (1/3) and does not promote; the mesh
+stops. The hub is asynchronous and may miss the last commits; the WAL archive
+(section 6) holds them. That is a double failure, not the single failure this
+study removes.
 
 The primary starts on `ameesh-agents-1` and follows the EP2 candidate score
 (availability, readiness, capacity) on a planned switchover. The current
@@ -258,14 +258,15 @@ no swap.
   synchronous standby is unavailable while the etcd quorum remains, the
   primary keeps serving with a degraded RPO rather than blocking writes; a
   double host loss loses the quorum and the cluster stops rather than forks.
-  If the measured commit latency with `manaty-mesh-1` stays under about
-  10 ms, `synchronous_node_count: 2` makes the hub a second synchronous
-  standby: it then holds a complete copy in the double-failure case, but adds
-  no availability, because a double host loss also loses the etcd quorum.
-  The lot verifies which standby Patroni reports as `sync_state=sync` and that
-  the hub does not silently become the only synchronous standby at an
-  unacceptable latency; if it does, the setting is corrected and the RPO
-  window is documented.
+  `manaty-mesh-1` carries the Patroni tag `nosync: true`: it is never a
+  synchronous standby, so the cluster never pays the hub's latency on a
+  commit, and it never becomes the only synchronous standby when an agent VM
+  is down (the primary then runs without a synchronous standby, as
+  `synchronous_mode_strict: false` allows, and the archive bounds the loss).
+  A second synchronous standby would add no availability anyway, because a
+  double host loss also loses the etcd quorum. The lot verifies that Patroni
+  reports the other agent VM as `sync_state=sync` and the hub as `async` in
+  every state, including with one agent VM stopped.
 - `wal_log_hints=on` is required for `pg_rewind` (the current server has it
   off; enabling it is part of the restart in EP8.1). Without it, a returning
   old primary is re-seeded with `pg_basebackup`, which is slower but correct.
@@ -284,12 +285,11 @@ no swap.
 - Three Patroni 4.x instances, one per VM, managing the local PostgreSQL.
   Settings: `ttl: 30`, `loop_wait: 10`, `retry_timeout: 10`,
   `maximum_lag_on_failover: 1MB`, `synchronous_mode: true`,
-  `synchronous_node_count: 1` (2 only if the measured hub latency allows;
-  section 3), `synchronous_mode_strict: false`,
+  `synchronous_node_count: 1`, `synchronous_mode_strict: false`,
   `failsafe_mode: false` (a DCS outage pauses writes instead of risking a
   fork), `postgresql.use_pg_rewind: true`. Priorities:
   `ameesh-agents-1: 100`, `ameesh-agents-2: 90`, `manaty-mesh-1: 0` with
-  `nofailover: true`.
+  `nofailover: true` and `nosync: true`.
 - Fencing is the etcd leader lease plus the Patroni leader lock. A primary
   that loses the DCS demotes when its lease expires, before the new leader is
   elected; a partitioned old primary therefore cannot accept writes while
@@ -320,6 +320,14 @@ postgresql://ameesh@<private-1>,<private-2>,<private-3>:5432/ameesh
   primary or a standby is skipped. The existing psycopg driver passes the DSN
   to libpq unchanged; the LISTEN/NOTIFY listener reconnects through the same
   DSN after its `down` event.
+- A NOTIFY is not queued for a listener that is not connected: those sent
+  while the listener is down, and those of transactions the old primary had
+  not replicated, are never delivered. After every reconnection the listener
+  therefore runs a full sweep before waiting again: it wakes every worker so
+  each one re-reads its mail, its leases and the budget from the database,
+  as the train service's `wake()` already does for its own channel. Today the
+  runner relies on its `poll` heartbeat for mail, leases and budget; EP8.4
+  makes the sweep explicit and its failover test proves it.
 - Every client host needs the same `ameesh` role password for the three
   addresses (a `.pgpass` entry per host, 0600, outside the repository).
   The role and its password hash are replicated; the secret distribution is
@@ -407,7 +415,7 @@ postgresql://ameesh@<private-1>,<private-2>,<private-3>:5432/ameesh
 | A standby agent VM stops | the primary continues; Patroni reconfigures the sync set | 0 | no outage |
 | `manaty-mesh-1` (hub) stops | the two agents keep working on the private network; the PC loses database access; etcd keeps 2/3 | 0 | 0 for the VMs; the PC when the hub returns |
 | The PC stops | no effect on the database or the VMs | 0 | 0 |
-| The primary and one other node stop | the surviving etcd is 1/3: no quorum, the mesh stops; the survivor may be the asynchronous hub and miss the last commits (count=1), or hold them all (count=2); it cannot serve alone | 0 on the sync survivor; possibly the last commits on the asynchronous hub | repair or restore; a fourth voter would be needed to survive two |
+| The primary and one other node stop | the surviving etcd is 1/3: no quorum, the mesh stops; the survivor may be the asynchronous (`nosync`) hub and miss the last commits, which the WAL archive holds; it cannot serve alone | 0 on the sync survivor; possibly the last commits on the asynchronous hub | repair or restore; a fourth voter would be needed to survive two |
 | The whole `fr-par-1` zone | restore from the off-region S3 archive, or from the PC copy if it is current, on a new VM | up to the last archived WAL | hours |
 | A logical error (bad migration, bad delete) | point-in-time recovery to before the error | 0 at the restore point | 30–60 min |
 
@@ -424,9 +432,9 @@ L232e's.
 | EP8.1 | Off-host WAL archiving and PITR (`pgBackRest` to S3); keep the daily dump; enable `archive_mode`/`wal_log_hints` with one short restart; restore drill | sensitive (data/ops) | 4 h | S3 bucket | a restore to a chosen point on `ameesh-tests` passes `ameesh doctor`; the daily dump still works |
 | EP8.2 | Private network among the three VMs (preferred) or the WireGuard partial mesh; database on the private addresses; `pg_hba`; the PC path; test with the hub down | sensitive (infra/rights) | 6 h | owner/bureau infrastructure | each DB node reaches the others with the hub stopped; no public database; the PC path is documented |
 | EP8.3 | Three-node streaming replication; PostgreSQL 17 client tools; `replicator`/`rewind` roles; slots; synchronous configuration; manual switchover and `pg_rewind` | sensitive (SQL/rights) | 6 h | EP8.1, EP8.2 | `pg_stat_replication` shows two standbys, the synchronous ones at zero lag; a manual promotion works; the old primary rejoins |
-| EP8.4 | etcd + Patroni: three voters, TLS, automatic failover, `pg_rewind`, priorities/`nofailover`, `patronictl`, alerts, the multi-host DSN and client tests | sensitive (failover/rights) | 8 h | EP8.3 | a killed primary is replaced in under 60 s with no data loss; a partition shows no two primaries; the clients reconnect |
-| EP8.5 | `ameesh db status`/`doctor`, the `db_*` alerts, the multi-host DSN documentation and `.pgpass`, the PgBouncer upstream, the `sauvegarder-base.sh` update | light (code/ops) | 4 h | EP8.4 | the status shows the primary and the lag; the alerts fire with the PC off; the PgBouncer path is tested if adopted. A new `ameesh` command makes this a minor version; a shell-only option stays a patch |
-| EP8.6 | Live switchover to the cluster, the canon host cards, the runbooks, the drill (primary kill, network cut, PC off, two-node loss) and its report | sensitive (ops), release proof | 6 h | EP8.4, EP8.5 | the mesh runs on the cluster; a primary loss gives a new primary in under 5 min with RPO 0; no split brain; the old primary rejoins; the report is on the lot |
+| EP8.4 | etcd + Patroni: three voters, TLS, automatic failover, `pg_rewind`, priorities/`nofailover`/`nosync`, `patronictl`, alerts, the multi-host DSN and client tests | sensitive (failover/rights) | 8 h | EP8.3 | a killed primary is replaced in under 1 min (the target) with no data loss; a partition shows no two primaries; the clients reconnect; after the failover the listener sweeps mail, leases and budget (a message sent during the failover is delivered without waiting for the poll) |
+| EP8.5 | `ameesh db status`/`doctor`, the `db_*` alerts, the multi-host DSN documentation and `.pgpass`, the PgBouncer upstream, the `sauvegarder-base.sh` update | sensitive (`deploy/serveur`, ops): two families | 4 h | EP8.4 | the status shows the primary and the lag; the alerts fire with the PC off; the PgBouncer path is tested if adopted. A new `ameesh` command makes this a minor version; a shell-only option stays a patch |
+| EP8.6 | Live switchover to the cluster, the canon host cards, the runbooks, the drill (primary kill, network cut, PC off, two-node loss) and its report | sensitive (ops), release proof | 6 h | EP8.4, EP8.5 | the mesh runs on the cluster; a primary loss gives a new primary in under 1 min (target; 5 min is the requirement) with RPO 0; no split brain; the old primary rejoins; the report is on the lot |
 
 About 34 agent-hours in total. EP8.1 and EP8.2 can start in parallel; the
 rest follow. The estimates are agent-hours; review, CI and the packet wait
@@ -449,10 +457,10 @@ exists and the restart window (decision 8) is agreed.
    `ameesh-agents-2` has more memory free but only 13 GB of disk (90 % used);
    clean it before it carries a standby. `manaty-mesh-1` stays
    `nofailover`.
-3. **Synchronous count**: 1 by default (the two agent VMs; the hub
-   asynchronous); 2 if the commit latency with the hub stays under about
-   10 ms, which makes the hub a complete double-failure copy but does not add
-   availability. Measure in EP8.3.
+3. **Synchronous set**: not an open choice. The count is 1 (the two agent
+   VMs); the hub is tagged `nosync` and stays asynchronous, because a second
+   synchronous standby would add its latency to every commit and no
+   availability. The double-failure copy is the WAL archive, not the hub.
 4. **A fourth voter**: not for one-host tolerance. A small witness VM would
    let the mesh survive two host failures at a new monthly cost; the owner
    decides if that is worth it.
@@ -469,9 +477,9 @@ exists and the restart window (decision 8) is agreed.
 
 ## To validate in the lots
 
-- The inter-node RTT and the synchronous commit latency, especially with
-  `manaty-mesh-1` as a synchronous standby; choose the synchronous count from
-  the measurement, not from the topology diagram.
+- The inter-node RTT and the synchronous commit latency between the two
+  agent VMs; that the `nosync` hub never appears in
+  `synchronous_standby_names`, including with one agent VM stopped.
 - That the three VMs share a Scaleway project and region, or the fallback to
   the WireGuard mesh; the private NICs and the security groups.
 - The free disk and the WAL budget on `manaty-mesh-1`; the 13 GB on
