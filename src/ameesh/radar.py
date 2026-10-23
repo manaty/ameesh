@@ -1640,13 +1640,25 @@ CI_INCONCLUSIVE = frozenset(("SKIPPED", "NEUTRAL", "CANCELLED", "TIMED_OUT",
 CI_INCONCLUSIVE_STATES = frozenset(("ERROR",))
 
 
+#: #3221 : les états qu'une porte écrit entre parenthèses après le nom consigné
+CI_CONSIGNED_STATES = (CI_INCONCLUSIVE | CI_INCONCLUSIVE_STATES | CI_NEGATIVE
+                       | frozenset(("SUCCESS", "PENDING", "EXPECTED", "?")))
+
+
 def nonconclusive_source(app: str, entry: str) -> str:
     """#3209 : la clé du lot de correction d'un check non concluant — l'app
     et le **nom du check**, sans l'état consigné (`tests (CANCELLED)` →
     `tests`) ni la tête : le même check au paquet suivant ou à la release
-    retrouve le lot encore ouvert (`work.add_or_note`)."""
-    name = re.sub(r"\s*\([^()]*\)\s*$", "", str(entry or "")).strip()
-    return "nonconclusive:%s:%s" % (app, name or str(entry or "").strip())
+    retrouve le lot encore ouvert (`work.add_or_note`).
+    #3221 : seul un suffixe fait d'états connus est retiré ; une parenthèse du
+    nom (`tests (linux)`, nom brut de la release) reste dans la clé."""
+    text = str(entry or "").strip()
+    match = re.match(r"^(.*?)\s*\(([^()]*)\)$", text)
+    if match and match.group(1) and all(
+            state.strip().upper() in CI_CONSIGNED_STATES
+            for state in match.group(2).split(",")):
+        text = match.group(1)
+    return "nonconclusive:%s:%s" % (app, text)
 
 
 def conclusion_result(status, conclusion) -> str:
