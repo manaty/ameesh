@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import time
 import unittest
 from unittest import mock
 
@@ -36,7 +37,8 @@ from ameesh import (
 from .support import PgTestCase
 
 IDENTITY_KEYS = ("AGENT_MAIL_NAME", "AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID",
-                 "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH")
+                 "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH",
+                 "AMEESH_ROLE", "AMEESH_ROLE_HOST", "AMEESH_LEASE_OWNER")
 
 
 class GestureFenceTest(PgTestCase):
@@ -75,6 +77,19 @@ class GestureFenceTest(PgTestCase):
 
     def live(self):
         return self.identity_env(name=self.name, runner="runner-h1", epoch=self.epoch)
+
+    @contextlib.contextmanager
+    def role_env(self, *, role: str | None = None, epoch: int | None = None,
+                 owner: str | None = None, name: str | None = None):
+        """EP5 `ameesh role run` : le rôle et son époque, sans identité d'agent."""
+        with self.identity_env(name=name):
+            if role:
+                os.environ["AMEESH_ROLE"] = role
+            if epoch is not None:
+                os.environ["AMEESH_LEASE_EPOCH"] = str(epoch)
+            if owner:
+                os.environ["AMEESH_LEASE_OWNER"] = owner
+            yield
 
     def events(self, *, ref: str | None = None) -> list[dict]:
         sql = ("SELECT id, type, object, data FROM ameesh_events "
@@ -181,6 +196,59 @@ class GestureFenceTest(PgTestCase):
         self.assertIn("lease", str(caught.exception).lower())
         self.assertEqual(self.events(ref="packet record #9"), [])
 
+    # -- EP5 timers (`AMEESH_ROLE`) --------------------------------------
+    def test_role_timer_live_journalise_le_role(self):
+        with self.role_env(role=self.name, epoch=self.epoch):
+            gate = pilot_gesture.gate(self.cfg, self.db, "merge", "role merge #1")
+            self.assertIsNotNone(gate)
+            self.assertEqual(gate.role, self.name)
+            gate.hold(self.db)
+        data = self.events(ref="role merge #1")[0]["data"]
+        self.assertEqual(data["role"], self.name)
+        self.assertEqual(data["epoch"], self.epoch)
+
+    def test_role_timer_sans_epoque_refuse(self):
+        with self.role_env(role=self.name):
+            with self.assertRaises(pilot_gesture.GestureRefused) as caught:
+                pilot_gesture.gate(self.cfg, self.db, "merge", "role merge #2")
+        self.assertIn("without AMEESH_LEASE_EPOCH", str(caught.exception))
+        self.assertEqual(self.events(ref="role merge #2"), [])
+
+    def test_role_timer_epoque_perimee_refusee(self):
+        old = self.epoch
+        registry.release(self.db, self.name, "runner-h1", old)
+        lease = registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+        self.assertIsNotNone(lease)
+        with self.role_env(role=self.name, epoch=old):
+            with self.assertRaises(pilot_gesture.GestureRefused) as caught:
+                pilot_gesture.gate(self.cfg, self.db, "merge", "role merge #3")
+        self.assertIn("runner-h2", str(caught.exception))
+        self.assertEqual(self.events(ref="role merge #3"), [])
+
+    def test_role_timer_proprietaire_divergent_refuse(self):
+        with self.role_env(role=self.name, epoch=self.epoch, owner="runner-ailleurs"):
+            with self.assertRaises(pilot_gesture.GestureRefused) as caught:
+                pilot_gesture.gate(self.cfg, self.db, "merge", "role merge #4")
+        self.assertIn("runner-ailleurs", str(caught.exception))
+        self.assertEqual(self.events(ref="role merge #4"), [])
+
+    def test_role_timer_inconnu_refuse(self):
+        with self.role_env(role="role-inconnu-3013", epoch=1):
+            with self.assertRaises(pilot_gesture.GestureRefused) as caught:
+                pilot_gesture.gate(self.cfg, self.db, "merge", "role merge #5")
+        self.assertIn("no such agent", str(caught.exception))
+
+    def test_marge_refusee_si_le_bail_renouvele_est_trop_court(self):
+        with self.live():
+            gate = pilot_gesture.gate(self.cfg, self.db, "merge", "marge #1")
+            self.assertIsNotNone(gate)
+            with mock.patch.object(pilot_gesture.registry, "renew",
+                                   return_value=time.time() + 5.0):
+                with self.assertRaises(pilot_gesture.GestureRefused) as caught:
+                    gate.hold(self.db, margin_s=60.0)
+        self.assertIn("external call", str(caught.exception))
+        self.assertEqual(self.events(ref="marge #1"), [])
+
     # -- the five call sites --------------------------------------------
     def test_work_assign_live_ecrit_le_geste(self):
         worker = "worker-%s" % self.name
@@ -192,6 +260,17 @@ class GestureFenceTest(PgTestCase):
         self.assertEqual(out["item"]["assignee"], worker)
         rows = self.events(ref="#%d" % lot)
         self.assertEqual([row["data"]["gesture"] for row in rows], ["assign"])
+
+    def test_role_timer_live_attribue(self):
+        worker = "worker-%s" % self.name
+        registry.upsert(self.db, worker, harness="claude", host="h1",
+                        cwd=self.tmp, status="idle")
+        lot = self.new_lot()
+        with self.role_env(role=self.name, epoch=self.epoch):
+            out = work.assign(self.db, lot, worker, cfg=self.cfg)
+        self.assertEqual(out["item"]["assignee"], worker)
+        data = self.events(ref="#%d" % lot)[0]["data"]
+        self.assertEqual(data["role"], self.name)
 
     def test_work_assign_stale_refuse_sans_changer_le_lot(self):
         worker = "worker-%s" % self.name

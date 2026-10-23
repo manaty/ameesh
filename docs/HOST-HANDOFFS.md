@@ -244,10 +244,26 @@ holder, its host and its epoch. The gate renews the lease and writes a
 cannot even journal the gesture; the effect follows. The event carries the
 agent, gesture, ref, epoch and host — never a token or a secret.
 
+An EP5 timer (`ameesh role run`) may carry no agent identity but passes
+`AMEESH_ROLE` and the epoch it entered with. That pair is fenced too: a role
+without `AMEESH_LEASE_EPOCH` is refused, and the transmitted epoch is
+compared to the live lease in the same transaction (its owner is checked when
+the wrapper declares one). A timer therefore never passes as a human.
+
+For an external call — `work merge-pr`'s push, `land`'s push or `gh pr
+merge`, and the fire's merge — the database transaction cannot cover GitHub.
+The pilot's lease is renewed just before the call with a margin at least the
+call's worst case (push timeout plus read-back), and the call is refused if
+the renewed lease does not have that margin left. The residual race remains:
+a call that blocks beyond its own timeout can outlive the renewed lease, and
+another candidate may then take the role. The target lease, the
+compare-and-swap on the target and GitHub's `--match-head-commit` are the
+last guards; a failed renewal refuses the effect before it starts, and an
+uncertain outcome is reported and reconciled, never silently retried.
+
 Humans, the bureau, host-pinned agents (`releve: hote`) and runner-internal
-sweeps (no session identity: the radar landing a queue, a merge driven by a
-fire) are unchanged. This does not replace the target lease (`merge_locks`)
-or GitHub's compare-and-swap: it stops a pilot that lost the election from
-starting the gesture at all. The packet composition itself is local git work;
-what is fenced is the composition record the pilot writes and the train fire
-that follows it.
+sweeps without `AMEESH_ROLE` are unchanged. This does not replace the target
+lease (`merge_locks`) or GitHub's compare-and-swap: it stops a pilot that
+lost the election from starting the gesture at all. The packet composition
+itself is local git work; what is fenced is the composition record the pilot
+writes and the train fire that follows it.

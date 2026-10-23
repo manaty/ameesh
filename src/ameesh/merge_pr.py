@@ -120,6 +120,12 @@ POLL_S = float(os.environ.get("AMEESH_MERGE_PR_POLL_S", "5"))
 ATTEMPTS = int(os.environ.get("AMEESH_MERGE_PR_ATTEMPTS", "12"))
 #: short `git ls-remote`/`rev-parse` calls; fetch and push use FETCH_TIMEOUT
 SHORT_TIMEOUT = 60.0
+#: L165 (EP4) : marge de bail renouvelée juste avant le push externe. Elle
+#: couvre le pire cas du push (`FETCH_TIMEOUT`) et une lecture de la PR après
+#: (`SHORT_TIMEOUT`). La course résiduelle (un réseau qui bloque au-delà) est
+#: documentée dans `docs/HOST-HANDOFFS.md` ; le CAS de la cible et
+#: `--match-head-commit` restent les dernières gardes.
+PILOT_CALL_MARGIN_S = FETCH_TIMEOUT + SHORT_TIMEOUT
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _HTTPS = re.compile(r"^https?://", re.I)
 #: a URL carrying credentials (`https://user:token@…`): never shown as such,
@@ -658,11 +664,14 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
     fetch_url = (fetch_url or "").strip() or ("https://github.com/%s.git" % slug)
     push_url = check_push_url(push_url or ("git@github.com:%s.git" % slug))
     # L165 (EP4) : la fusion hors API est un geste du pilote hors base. Le bail
-    # élu est vérifié et journalisé avant la première lecture GitHub ou toute
-    # écriture ; un `--dry-run` n'agit pas et n'a rien à fencer.
+    # élu est vérifié avant la première lecture GitHub ; il est renouvelé juste
+    # avant le push avec la marge de l'appel. Un `--dry-run` n'agit pas et n'a
+    # rien à fencer.
+    fence = None
     if not dry_run:
         from . import pilot_gesture
-        pilot_gesture.guard(cfg, db, "merge", "merge-pr #%d (lot #%d)" % (pr, lot))
+        fence = pilot_gesture.gate(cfg, db, "merge",
+                                   "merge-pr #%d (lot #%d)" % (pr, lot))
     # #1003 B/P1: one repository identity, verified before the first read; a
     # divergence writes nothing and admits nothing.
     _bind_repo_identity(repo, slug, fetch_url, push_url)
@@ -693,6 +702,9 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         if state == "MERGED":
             # N1 (#1003): an already-MERGED PR does not declare a lot without
             # the lot/freeze/branch/target link; nothing is written otherwise.
+            # L165 (EP4) : la déclaration est un effet, fence-la même sans push.
+            if fence is not None:
+                fence.hold(db)
             _already_lot_links(db, lot, head, view, target, repo, cfg)
             return _already(slug, pr, head, view, target=target, fetch_url=fetch_url,
                             owner=owner)
@@ -843,6 +855,11 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
 
         ref = "refs/heads/%s" % target
         reservation.refresh()
+        # L165 (EP4) : renouvellement du bail élu juste avant l'appel externe,
+        # avec la marge du push et de sa lecture ; refus si le bail renouvelé
+        # n'a pas cette marge (course résiduelle documentée).
+        if fence is not None:
+            fence.hold(db, margin_s=PILOT_CALL_MARGIN_S)
         try:
             proc = _run(owner, "push", "--quiet", "--no-verify",
                         "--force-with-lease=%s:%s" % (ref, tip), push_url,

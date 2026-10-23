@@ -61,6 +61,10 @@ FIRE_KINDS = (FIRE, UNFIRE)
 MAX_LOTS = 1000
 #: durée du bail d'une opération de feu
 LOCK_TTL_S = 120.0
+#: L165 (EP4) : marge du bail élu renouvelée juste avant `gh pr merge`
+#: (timeout de 120 s + relecture de la PR). La course résiduelle est
+#: documentée dans `docs/HOST-HANDOFFS.md`.
+FIRE_CALL_MARGIN_S = 180.0
 #: résultats qu'un passage n'a pas à journaliser
 QUIET = ("idle", "armed", "queued", "busy", "withdrawn")
 #: résultats qu'un passage de l'exécuteur dit dans son journal : état changé,
@@ -1854,6 +1858,17 @@ def _merge_direct(cfg, db, row: dict, marks: list, fire: dict, status: dict, *, 
     try:
         if not _renew(handle) or not _renew(cible, land.LOCK_TTL_S):
             return {"lot": lot, "result": "busy"}
+        # L165 (EP4) : le passage peut être mené par une minuterie de rôle
+        # (`AMEESH_ROLE`) ; le bail élu est renouvelé juste avant l'appel
+        # GitHub, avec la marge de `gh pr merge` et de sa relecture.
+        from . import pilot_gesture
+        try:
+            fence = pilot_gesture.gate(cfg, db, "merge", "fire merge #%d" % lot,
+                                       project=(fresh_row.get("app") or None))
+            if fence is not None:
+                fence.hold(db, margin_s=FIRE_CALL_MARGIN_S)
+        except pilot_gesture.GestureRefused as exc:
+            return {"lot": lot, "result": "error", "error": str(exc)}
         ok, error = _merge_pr(slug, status, head, _method(project, info), gh=gh,
                               target=target,
                               default=str(info.get("default_branch") or ""))
