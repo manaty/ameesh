@@ -202,9 +202,12 @@ def pr_status(slug: str, number: int, *, gh) -> dict:
     rollup = radar.merge_rollup(data.get("statusCheckRollup"), slug=slug,
                                 head=data.get("headRefOid") or "",
                                 branch=data.get("headRefName") or "", gh=gh)
+    # `ci` garde son sens strict (file/affichage) ; `ci_rule` porte la règle
+    # owner du 23/10 (#3085) que lit `fire.ready_pr`.
     pending = any((c.get("status") or "COMPLETED") != "COMPLETED"
                   or (c.get("state") or "") == "PENDING" for c in rollup)
     ci = "green" if radar.ci_green(rollup) else "pending" if pending or not rollup else "red"
+    ci_rule = radar.ci_state(rollup)
     return {"number": int(number), "state": str(data.get("state") or "").upper(),
             "head": str(data.get("headRefOid") or "").strip().lower(),
             "base": str(data.get("baseRefName") or "").strip(),
@@ -212,7 +215,8 @@ def pr_status(slug: str, number: int, *, gh) -> dict:
             # la porte des avis puisse opposer à la ref locale du checkout.
             "base_oid": str(data.get("baseRefOid") or "").strip().lower(),
             "branch": str(data.get("headRefName") or "").strip(),
-            "draft": bool(data.get("isDraft")), "ci": ci, "rollup": rollup,
+            "draft": bool(data.get("isDraft")), "ci": ci, "ci_rule": ci_rule,
+            "rollup": rollup,
             "auto": data.get("autoMergeRequest") is not None,
             "title": str(data.get("title") or "")}
 
@@ -493,8 +497,9 @@ def _check_locked(cfg, db, lot: int, *, gh, dry_run: bool, actor: str,
         return dict(out, result="error", error=(
             "%s no longer enforces %s: nothing proves the CI the publication relied on, "
             "nothing merged" % (base, ", ".join(dropped) or "any required check")))
+    report: dict = {}
     ok, why = fire.ready_pr(view, target=base, project=project, frozen=sha,
-                            required=required, slug=slug, gh=gh)
+                            required=required, slug=slug, gh=gh, report=report)
     if not ok:
         return dict(out, result="pending", why=why)
     if dry_run:
@@ -517,10 +522,40 @@ def _check_locked(cfg, db, lot: int, *, gh, dry_run: bool, actor: str,
                                title=fresh.get("title") or "", gh=gh)
     if error is not None:
         return dict(out, result="error", error="merge: %s" % error)
-    _note(db, lot, "merged", slug, number, sha,
-          "base=%s commit=%s — merged by ameesh into %s at its published head, gates green"
-          % (base, commit or "already-contained", base), actor)
-    return dict(out, result="merged", commit=commit)
+    consigned = list(report.get("consigned") or ())
+    note = ("base=%s commit=%s — merged by ameesh into %s at its published head, gates green"
+            % (base, commit or "already-contained", base))
+    if consigned:
+        note += ("; required checks non concluants consignés (règle owner 23/10) : %s"
+                 % ", ".join(consigned))
+    _note(db, lot, "merged", slug, number, sha, note, actor)
+    if consigned:
+        _open_correction(db, row, slug=slug, number=number, sha=sha, base=base,
+                         consigned=consigned, actor=actor)
+    return dict(out, result="merged", commit=commit, consigned=consigned)
+
+
+def _open_correction(db, row: dict, *, slug: str, number: int, sha: str, base: str,
+                     consigned: list, actor: str):
+    """#3085 : ouvre le lot de correction d'un check requis non concluant qui
+    n'a pas retenu la fusion. Le lot est journalisé, sans assigné (file de
+    l'équipe) ; son ouverture ne défait jamais la fusion déjà écrite."""
+    text = ", ".join(consigned)
+    try:
+        return work.add(
+            db,
+            title="CI non concluante sur %s@%s : corriger %s" % (slug, sha[:12], text),
+            type="bug", priority=2, app=str(row.get("app") or ""),
+            source="nonconclusive:%s#%d@%s" % (slug, int(number), sha),
+            body=("Le check requis n'a pas conclu (ni vert ni négatif) sur la tête %s "
+                  "du paquet %s#%d (base %s) : %s.\n\nRègle owner du 23/10 (canon home "
+                  "§3) : un résultat non concluant ne bloque pas la fusion ; il se "
+                  "consigne et ouvre ce lot de correction. Rejouer ou réparer le "
+                  "check, sans relire le paquet déjà fusionné."
+                  % (sha, slug, int(number), base, text)),
+            actor=actor)
+    except Exception:  # noqa: BLE001 - la fusion est écrite, le lot est un suivi
+        return None
 
 
 def watch(cfg, db, app: str, *, gh=None, dry_run: bool = False) -> list[dict]:

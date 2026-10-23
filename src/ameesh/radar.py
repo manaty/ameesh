@@ -1622,6 +1622,143 @@ def ci_green(rollup, required=()) -> bool:
     return True
 
 
+#: #3085 (règle owner du 23/10, canon home §3) : un check ne bloque une porte
+#: que s'il est **négatif** — un test exécuté qui démontre un défaut. Tout
+#: autre résultat conclu est *non concluant* (sauté, neutralisé, annulé,
+#: expiré, démarrage raté, statut en erreur) : il se consigne, il n'arrête
+#: rien. Un check encore en cours n'est pas un résultat : il attend.
+CI_GREEN_RESULT = "green"
+CI_NEGATIVE_RESULT = "negative"
+CI_INCONCLUSIVE_RESULT = "inconclusive"
+CI_WAITING_RESULT = "waiting"
+#: conclusions (check run) d'un rouge prouvé ; la casse est libre
+CI_NEGATIVE = frozenset(("FAILURE",))
+#: conclusions (check run) qui ne prouvent rien
+CI_INCONCLUSIVE = frozenset(("SKIPPED", "NEUTRAL", "CANCELLED", "TIMED_OUT",
+                             "STALE", "STARTUP_FAILURE", "ACTION_REQUIRED"))
+#: états (statut de commit) qui ne prouvent rien
+CI_INCONCLUSIVE_STATES = frozenset(("ERROR",))
+
+
+def conclusion_result(status, conclusion) -> str:
+    """#3085 : classe un run ou un check brut (`status`, `conclusion`, casse
+    libre) en `green` / `negative` / `inconclusive` / `waiting`.
+
+    Seule `FAILURE` est un défaut prouvé. Un job annulé (quota), sauté,
+    expiré ou qui n'a pas démarré n'a rien démontré : non concluant, jamais
+    négatif. Un run qui n'est pas terminé attend."""
+    if str(status or "").strip().lower() != "completed":
+        return CI_WAITING_RESULT
+    value = str(conclusion or "").strip().upper()
+    if value == "SUCCESS":
+        return CI_GREEN_RESULT
+    if value in CI_NEGATIVE:
+        return CI_NEGATIVE_RESULT
+    if value in CI_INCONCLUSIVE:
+        return CI_INCONCLUSIVE_RESULT
+    # une conclusion absente ou inconnue n'est pas un résultat : elle attend,
+    # elle ne verdit jamais la porte.
+    return CI_WAITING_RESULT
+
+
+def state_result(state) -> str:
+    """#3085 : classe un statut de commit (`SUCCESS`, `FAILURE`, `PENDING`,
+    `ERROR`) ; `ERROR` dit que le check n'a pas conclu, pas qu'il a échoué."""
+    value = str(state or "").strip().upper()
+    if value == "SUCCESS":
+        return CI_GREEN_RESULT
+    if value == "FAILURE":
+        return CI_NEGATIVE_RESULT
+    if value in CI_INCONCLUSIVE_STATES:
+        return CI_INCONCLUSIVE_RESULT
+    return CI_WAITING_RESULT
+
+
+def check_result(entry) -> str:
+    """#3085 : classe une entrée de `statusCheckRollup`."""
+    if not isinstance(entry, dict):
+        return CI_WAITING_RESULT
+    if entry.get("__typename") == "StatusContext" \
+            or "state" in entry and "conclusion" not in entry:
+        return state_result(entry.get("state"))
+    return conclusion_result(entry.get("status"), entry.get("conclusion"))
+
+
+def rollup_state_result(state) -> str:
+    """#3085 : classe un état déjà normalisé par `_rollup_state` (majuscules),
+    qui mêle les états d'un statut et les conclusions d'un check."""
+    value = str(state or "").strip().upper()
+    if value == "SUCCESS":
+        return CI_GREEN_RESULT
+    if value == "FAILURE":
+        return CI_NEGATIVE_RESULT
+    if value == "PENDING" or not value:
+        return CI_WAITING_RESULT
+    if value in CI_INCONCLUSIVE or value in CI_INCONCLUSIVE_STATES:
+        return CI_INCONCLUSIVE_RESULT
+    return CI_WAITING_RESULT
+
+
+def ci_result(rollup) -> dict:
+    """#3085 : `{state, green, negative, inconclusive, waiting}` d'un rollup.
+
+    `state` vaut `red` dès un négatif, `pending` si un check attend (ou si le
+    rollup est vide : rien ne se suppose vert), `green` sinon — un non
+    concluant n'empêche pas le vert, il est listé pour être consigné. Les
+    noms sont triés, sans doublon."""
+    rows = latest_rollup(rollup)
+    found = {CI_GREEN_RESULT: [], CI_NEGATIVE_RESULT: [],
+             CI_INCONCLUSIVE_RESULT: [], CI_WAITING_RESULT: []}
+    for entry in rows:
+        found[check_result(entry)].append(str(
+            entry.get("context") if entry.get("__typename") == "StatusContext"
+            else entry.get("name") or entry.get("context") or ""))
+    # le classement se fait sur les entrées, pas sur les noms : un check sans
+    # nom reste un résultat et ne disparaît pas du verdict.
+    state = ("red" if found[CI_NEGATIVE_RESULT]
+             else "pending" if not rows or found[CI_WAITING_RESULT]
+             else "green")
+    out = {key: sorted({name for name in names if name}) for key, names in found.items()}
+    out["state"] = state
+    return out
+
+
+def packet_proof_entries(rollup) -> list:
+    """Les checks du portier de suite complète d'un paquet : le workflow
+    `paquet` et la sentinelle `paquet (run proof unavailable)` que
+    `merge_rollup` ajoute quand la preuve manque (#2876/#3066)."""
+    out = []
+    for entry in latest_rollup(rollup) or ():
+        name = str(entry.get("name") or entry.get("context") or "")
+        if str(entry.get("workflowName") or "") == "paquet" \
+                or name == "paquet (run proof unavailable)":
+            out.append(entry)
+    return out
+
+
+def ci_state(rollup) -> str:
+    """#3085 : l'état de la CI d'un rollup sous la règle du 23/10 — un non
+    concluant ne bloque pas (voir `ci_result`).
+
+    Les checks du portier `paquet` font exception : ce sont la preuve que la
+    suite complète a tourné (ou a été remplacée), pas un test à consigner.
+    Un check `paquet` non vert (sauté, annulé, en cours, échoué) y garde son
+    ancien effet : `pending` s'il n'a pas fini, `red` sinon."""
+    if packet_proof_entries(rollup):
+        unfinished, bad = False, False
+        for entry in packet_proof_entries(rollup):
+            if entry.get("__typename") != "StatusContext" \
+                    and str(entry.get("status") or "").upper() != "COMPLETED":
+                unfinished = True
+            elif check_result(entry) != CI_GREEN_RESULT:
+                bad = True
+        if unfinished:
+            return "pending"
+        if bad:
+            return "red"
+    return ci_result(rollup)["state"]
+
+
 def github_ci(project: Project, gh=None, *, strict: bool = False):
     """La fonction `branche -> {number, url, head, green, draft} | None` du
     projet (PR ouverte de la branche, `head` : son commit de tête), lue avec
@@ -1720,6 +1857,12 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None)
     pending = sorted(label(n, r) for n, r in latest.items() if (r.get("status") or "") != "completed")
     failed = sorted(label(n, r) for n, r in latest.items() if (r.get("status") or "") == "completed"
                     and (r.get("conclusion") or "").lower() not in CI_PASSING)
+    #: #3085 : le classement négatif / non concluant / vert de chaque source,
+    #: pour que la porte de release ne prenne pas un job annulé ou sauté pour
+    #: un défaut prouvé.
+    results: list[tuple[str, str]] = [
+        (label(identity, run), conclusion_result(run.get("status"), run.get("conclusion")))
+        for identity, run in latest.items()]
     # L1651 (#1650): what the frozen commit carries, label by label. A due
     # part is proven by a context that exists here and is terminal-success; a
     # part absent from this map was never dispatched, which is exactly the
@@ -1773,6 +1916,8 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None)
             activity[key], external[key] = at, check
     for check in external.values():
         label = "%s/%s" % (check["app"]["id"], check["name"])
+        results.append((label, conclusion_result(check.get("status"),
+                                                 check.get("conclusion"))))
         if check.get("status") != "completed":
             pending.append(label)
             note(label, "pending")
@@ -1804,6 +1949,7 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None)
     for status in statuses["statuses"]:
         if not isinstance(status, dict) or not status.get("context"):
             raise plan_github.GithubError("commit statuses: invalid context")
+        results.append((status["context"], state_result(status.get("state"))))
         if status.get("state") == "pending":
             pending.append(status["context"])
             note(status["context"], "pending")
@@ -1819,7 +1965,16 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None)
     # #1748 (a): the declared prefixes of `branch` need a `success` status
     missing = _status_success([(s["context"], s.get("state")) for s in statuses["statuses"]],
                               required_statuses(project, branch))
+    # #3085 : un résultat non concluant (job sauté, annulé pour quota, panne
+    # de démarrage) ne rend pas la tête rouge ; il est listé pour être
+    # consigné. `green` garde son sens strict, `acceptable` porte la règle.
+    negative = sorted({name for name, result in results
+                       if result == CI_NEGATIVE_RESULT})
+    inconclusive = sorted({name for name, result in results
+                           if result == CI_INCONCLUSIVE_RESULT})
+    acceptable = bool(count) and not pending and not negative and not missing
     return {"runs": count, "green": bool(count) and not pending and not failed and not missing,
+            "acceptable": acceptable, "negative": negative, "inconclusive": inconclusive,
             "pending": sorted(pending), "failed": sorted(failed), "missing": missing,
             "contexts": contexts, "statuses": status_contexts}
 

@@ -70,7 +70,11 @@ def gh_for(rows, *, single=False, runs=None, pr_run=None, api_error=False):
 
 
 class PacketReplacementTest(unittest.TestCase):
-    def assert_gate(self, rows, green, **proof):
+    def assert_gate(self, rows, green, *, gate=None, **proof):
+        """`green` est la preuve stricte (`ci_green`, `status["ci"]`, merge-pr) ;
+        `gate` est le verdict du feu/paquet (#3085), qui peut absoudre un non
+        concluant hors du portier `paquet`."""
+        gate = green if gate is None else gate
         normalized = radar.merge_rollup(rows, slug="manaty/ameesh", head=SHA,
                                         branch="integration/paquet-h-2876",
                                         gh=gh_for(rows, **proof))
@@ -81,13 +85,13 @@ class PacketReplacementTest(unittest.TestCase):
             if reader is fire._pr_status:
                 ready, why = fire.ready_pr(status, target="main", project=None,
                                           frozen=SHA, required=("tests",))
-                self.assertEqual(ready, green, why)
+                self.assertEqual(ready, gate, why)
         status = packet_automerge.pr_status("manaty/ameesh", 2194,
                                            gh=gh_for(rows, single=True, **proof))
         self.assertEqual(status["ci"] == "green", green)
         ready, why = fire.ready_pr(status, target="main", project=None,
                                   frozen=SHA, required=("tests",))
-        self.assertEqual(ready, green, why)
+        self.assertEqual(ready, gate, why)
         merge_view = merge_pr.pr_view("manaty/ameesh", 2194,
                                        gh=gh_for(rows, single=True, **proof))
         if green:
@@ -137,7 +141,16 @@ class PacketReplacementTest(unittest.TestCase):
                                ("tests", "psql 2/16"), ("paquet", "security")):
             for conclusion in ("FAILURE", "CANCELLED"):
                 rows = witness() + [check(name, conclusion, workflow=workflow)]
-                self.assert_gate(rows, False)
+                # #3085/#3066 : le feu/paquet ne lit que les checks requis et
+                # le portier `paquet`. Un check facultatif (autre nom, autre
+                # workflow) ne gate pas, même rouge ; un `FAILURE` du nom
+                # requis ou du portier bloque encore, et un CANCELLED du
+                # portier aussi (preuve stricte). `ci_green`, `status.ci` et
+                # merge-pr gardent leur preuve stricte.
+                blocking = (workflow == "paquet"
+                            or (name == "tests" and conclusion == "FAILURE"))
+                with self.subTest(workflow=workflow, name=name, conclusion=conclusion):
+                    self.assert_gate(rows, False, gate=not blocking)
 
     def test_status_contexts_cannot_replace_pr_or_be_erased(self):
         rows = witness()
