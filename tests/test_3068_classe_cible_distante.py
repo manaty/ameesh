@@ -100,7 +100,7 @@ class UnnamedTargetGitTest(unittest.TestCase):
         self.assertEqual(klass["class"], "light", klass["why"])
         self.assertEqual([entry["path"] for entry in klass["files"]], ["README.md"])
         self.assertEqual(klass["target"], "main")
-        self.assertEqual(klass["base_sha"], "origin/main")
+        self.assertEqual(klass["base_sha"], "refs/remotes/origin/main")
 
     def test_the_clone_default_target_is_read_on_origin(self):
         # sans `branch_target` ni projet : `origin/HEAD` du clone, déjà distante
@@ -108,7 +108,34 @@ class UnnamedTargetGitTest(unittest.TestCase):
         klass = lot_class.of_lot(None, 42, cfg=None, item=self.row(),
                                  repo=agents, milestones=self.marks(c))
         self.assertEqual(klass["class"], "light", klass["why"])
-        self.assertEqual(klass["base_sha"], "origin/main")
+        self.assertEqual(klass["base_sha"], "refs/remotes/origin/main")
+
+    def test_a_qualified_target_is_read_on_its_full_remote_ref(self):
+        agents, _a, _b, c = self.witness()
+        klass = lot_class.of_lot(None, 42, cfg=None,
+                                 item=self.row(branch_target="origin/main"),
+                                 repo=agents, milestones=self.marks(c))
+        self.assertEqual(klass["class"], "light", klass["why"])
+        self.assertEqual(klass["base_sha"], "refs/remotes/origin/main")
+
+    def test_a_homonym_tag_does_not_mask_the_remote_target(self):
+        # B1 de la relecture cx2 : `origin/main` en nom court se résout
+        # d'abord en `refs/tags/origin/main` ; une étiquette posée sur le gel
+        # vidait le diff et rendait léger un lot qui ajoute une migration.
+        agents, _a, b, _c = self.witness()
+        _git(agents, "checkout", "-q", "-b", "lot/sql", b)
+        d = _commit(agents, "src/ameesh/migrations/9998_lot.sql", "-- lot\n", "D, sql")
+        _git(agents, "tag", "origin/main", d)
+        self.assertEqual(_git(agents, "rev-parse", "origin/main"), d)
+        for target in ("main", "origin/main"):
+            klass = lot_class.of_lot(None, 42, cfg=None,
+                                     item=self.row(branch_target=target),
+                                     repo=agents, milestones=self.marks(d))
+            self.assertEqual(klass["class"], "sensitive", (target, klass["why"]))
+            self.assertFalse(klass["doubt"], klass["why"])
+            self.assertEqual(klass["base_sha"], "refs/remotes/origin/main")
+            self.assertEqual([entry["path"] for entry in klass["files"]],
+                             ["src/ameesh/migrations/9998_lot.sql"])
 
     def test_a_base_named_by_the_caller_is_kept(self):
         # l'appelant qui nomme sa base en reste juge (#2464) : rien n'est

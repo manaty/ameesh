@@ -128,13 +128,18 @@ def default_base(cfg, item: dict, repo: str, *, declared_only: bool = False) -> 
 def _landing_ref(repo: str, target: str) -> str:
     """La référence qui lit la cible d'atterrissage `target` dans `repo`.
 
-    `origin/<cible>` quand le clone la connaît, sinon `target` tel quel (dépôt
-    sans distant, SHA, ref déjà distante) : jamais une branche locale qu'aucun
-    `fetch` ne fait avancer quand sa version distante est lisible (#3068)."""
+    `refs/remotes/<distant>/<cible>` quand le clone la connaît, sinon `target`
+    tel quel (dépôt sans distant, SHA) : jamais une branche locale qu'aucun
+    `fetch` ne fait avancer quand sa version distante est lisible (#3068).
+    La référence est rendue **complète** : le nom court `origin/main` se
+    résout d'abord en `refs/tags/origin/main`, et une étiquette homonyme
+    remplacerait la cible dans le diff de classe (B1 de la relecture cx2)."""
     try:
         remote = canon_mod.remote_branch(repo, target)
-        if remote and plan_git._commit(repo, remote):
-            return remote
+        if remote:
+            full = "refs/remotes/" + remote
+            if plan_git._commit(repo, full):
+                return full
     except canon_mod.GitError:  # sonde illisible : le diff dira son erreur
         pass
     return target
