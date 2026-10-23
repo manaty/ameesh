@@ -156,6 +156,14 @@ dans le canon :
   (`.credentials.json` pour Claude, `auth.json` pour Codex : présence
   seulement) ; fichier de clé **0600** ; variable de clé présente. Un compte
   qui échoue n'est jamais choisi, et `ameesh accounts list` dit pourquoi.
+  Sur macOS (L65), Claude Code range ses identifiants OAuth dans le
+  **trousseau** : la présence y est vérifiée par
+  `security find-generic-password` (sans `-w`, jamais le secret), sur
+  l'entrée globale `Claude Code-credentials` d'un compte par défaut ou sur
+  l'entrée namespacée `Claude Code-credentials-<sha256(dossier)[:8]>` d'un
+  compte déclaré avec `path` (Claude Code 2.1.56 et suivants) ; le fichier
+  `.credentials.json` reste une preuve quand il existe. Codex garde
+  `auth.json` sur macOS.
 * `hourly_usd` : plafond horaire du compte (dépense des tours attribués au
   compte). Il est propre à l'hôte et s'ajoute aux plafonds du mesh, qui se
   règlent en base pour toutes les machines par `ameesh budget set` (L70,
