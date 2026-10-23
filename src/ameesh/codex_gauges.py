@@ -2,6 +2,8 @@
 """Reconcile Codex session readings without trusting the newest file alone."""
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import time
@@ -35,6 +37,47 @@ class SessionReadings(list):
     def __init__(self, items, *, truncated):
         super().__init__(items)
         self.truncated = truncated
+
+
+_PLAN_CLAIM = "https://api.openai.com/auth"
+
+
+def live_plan(home):
+    """Le forfait du compte vivant, lu dans `<home>/auth.json` (#3034).
+
+    `auth.json` porte un jeton `id_token` : sa charge utile nomme le forfait
+    (`chatgpt_plan_type`). On ne vérifie pas la signature — ce n'est pas une
+    preuve d'identité, seulement le forfait que le compte **vivant** déclare,
+    pour ne pas attribuer à ce compte des relevés d'un ancien forfait. Le jeton
+    n'est jamais rendu ni journalisé ; un fichier absent, illisible ou sans
+    forfait donne `None` (comportement d'avant #3034)."""
+    path = os.path.join(str(home or ""), "auth.json")
+    try:
+        with open(path, "rb") as stream:
+            node = json.loads(stream.read(1024 * 1024))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(node, dict):
+        return None
+    token = (node.get("tokens") or {}).get("id_token") \
+        if isinstance(node.get("tokens"), dict) else None
+    if not isinstance(token, str):
+        return None
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except (ValueError, binascii.Error, UnicodeDecodeError):
+        return None
+    if not isinstance(claims, dict):
+        return None
+    auth = claims.get(_PLAN_CLAIM)
+    plan = auth.get("chatgpt_plan_type") if isinstance(auth, dict) else None
+    if not isinstance(plan, str):
+        return None
+    return plan.strip().lower() or None
 
 
 def recent_files(root):
@@ -118,19 +161,44 @@ def _session_reading(path, read_at):
     return SessionReadings(windows.values(), truncated=os.path.getsize(path) > TAIL_BYTES)
 
 
-def reconcile(readings, now, *, truncated=False):
+def reconcile(readings, now, *, truncated=False, plan=None):
     """Keep the newest observation per window; reject mixed identities/plans.
 
     Session metadata names the creator, not necessarily the account used by
     a resumed session. It cannot by itself certify a later rate-limit event.
     Never blend incompatible plans into a seemingly healthy account.
+
+    #3034 : `plan` est le forfait du compte **vivant** (`live_plan`, lu dans
+    `auth.json`). Quand les relevés partagent une identité unique et que ce
+    forfait est connu, les relevés d'un autre forfait viennent d'une session
+    d'avant la bascule : ils sont ignorés (ni ambiguïté, ni fenêtres) plutôt
+    que de rendre le compte inutilisable. Sans forfait vivant lisible, ou avec
+    plusieurs identités, le refus d'ambiguïté reste la règle.
     """
     from .cost import Gauges, _codex_overage
 
     live = [r for r in readings if not r[0].reset_passed(now)]
     plans = {r[1].get("plan_type") for r in live if r[1].get("plan_type")}
     identities = {r[2] for r in live if r[2]}
-    if len(plans) > 1 or len(identities) > 1:
+    if len(identities) > 1:
+        raise AmbiguousCodexGauges("ambiguous Codex account: conflicting live session identities or plans")
+    if plan and len(identities) == 1:
+        wanted = str(plan).strip().lower()
+        observed = {
+            str(r[1].get("plan_type")).strip().lower()
+            for r in readings if r[1].get("plan_type")}
+        if observed and wanted not in observed:
+            # Aucun journal ne porte le forfait vivant : on ne vide pas le
+            # compte en silence (des jauges absentes se liraient comme 0 %).
+            raise AmbiguousCodexGauges(
+                "ambiguous Codex account: no live reading matches the declared plan")
+        readings = [
+            r for r in readings
+            if not r[1].get("plan_type")
+            or str(r[1].get("plan_type")).strip().lower() == wanted]
+        live = [r for r in readings if not r[0].reset_passed(now)]
+        plans = {r[1].get("plan_type") for r in live if r[1].get("plan_type")}
+    if len(plans) > 1:
         raise AmbiguousCodexGauges("ambiguous Codex account: conflicting live session identities or plans")
     windows = {}
     for gauge, limits, _identity in readings:
