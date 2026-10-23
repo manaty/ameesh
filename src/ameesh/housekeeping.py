@@ -77,6 +77,14 @@ l'humain. Chaque famille a sa règle :
   existants sont conservés) ; `docker volume rm` refuse de lui-même un volume
   encore monté.
 
+* **Scopes systemd `dsh-subprocess-*`** (#3226, [`reap_dsh_scopes`]) : sans
+  la garde #490, dsh lance ses outils dans des scopes du gestionnaire
+  utilisateur, hors du groupe et du cgroup du tour, qui survivent au tour.
+  Un scope dont le processus dsh n'existe plus et dont tous les processus
+  portent l'`AMEESH_TURN_ID` d'un tour clos de cet hôte est tué (SIGTERM puis
+  SIGKILL) une heure après la fin du tour ; dsh vivant ou tour en cours :
+  gardé ; attribution impossible : gardé et signalé (alerte `dsh_scope`).
+
 * **Entrées de `/tmp` apparues pendant un tour** (L162 : clone de relecture,
   `--cacheDirectory` explicite, image `docker save`) : elles sont signalées
   (`tmp_orphan`) avec la commande à lancer, NON ATTRIBUÉES (#222 : `/tmp` est
@@ -3632,6 +3640,130 @@ def reap_volumes(runtime, db, host: str, policy: Policy, *, dry_run: bool = Fals
     return out
 
 
+#: #3226 : délai après la fin du tour avant de récolter un scope dsh laissé
+DSH_SCOPE_GRACE_S = 3600.0
+#: #3226 : un scope gardé (non attribuable) est re-signalé au plus si souvent
+DSH_SCOPE_REFRESH_S = 12 * 3600.0
+_MENAGE_TMP = "/%s/tmp/" % MANAGED_DIR
+
+
+def _tmpdir_agent(tmpdir: str | None) -> str | None:
+    """L'agent d'un TMPDIR `…/.menage/tmp/<agent>[/…]`, pour le seul constat."""
+    if not tmpdir or _MENAGE_TMP not in tmpdir:
+        return None
+    return tmpdir.split(_MENAGE_TMP, 1)[1].split("/", 1)[0] or None
+
+
+def dsh_scope_verdict(scope: dict, row: dict | None, host: str,
+                      now: float) -> tuple[str, str, str | None]:
+    """#3226 : (action, raison, tour) d'un scope `dsh-subprocess-*` relevé par
+    `platform.dsh_scopes.scan` ; action `kill`, `wait` ou `signal`.
+
+    Récolté seulement si le processus dsh qui l'a lancé n'existe plus, que
+    TOUS ses processus portent le même `AMEESH_TURN_ID`, que ce tour est connu
+    de CET hôte, clos (`done`, `orphan`) et fini depuis `DSH_SCOPE_GRACE_S`.
+    dsh vivant, tour `running` : attente. Liste ou environnement illisible,
+    aucun tour ou plusieurs, tour inconnu ici : gardé et signalé (comme
+    `_orphan_verdict`)."""
+    if scope["owner_alive"]:
+        return "wait", "dsh pid %d alive" % scope["dsh_pid"], None
+    members = scope["members"]
+    if scope["unreadable"] or any(m["unread"] for m in members):
+        return "signal", "process list or environment unreadable: not attributable", None
+    turns = {m["turn"] for m in members}
+    if turns == {None}:
+        return "signal", "no AMEESH_TURN_ID: not attributable", None
+    if len(turns) != 1:
+        return "signal", "several turns (%s): not attributable" % ", ".join(
+            sorted(t[:8] if t else "none" for t in turns)), None
+    turn = turns.pop()
+    if row is None or (row.get("host") or "") != (host or ""):
+        return "signal", "turn %s unknown on this host: not attributable" % turn[:8], turn
+    if row.get("status") == "running":
+        return "wait", "turn %s not closed" % turn[:8], turn
+    ended = row.get("ended_ts")
+    try:
+        since = float(ended)
+    except (TypeError, ValueError):
+        since = max(float(m["start"]) for m in members)
+    if now - since < DSH_SCOPE_GRACE_S:
+        return "wait", "turn %s closed %ds ago (grace %ds)" % (
+            turn[:8], int(now - since), int(DSH_SCOPE_GRACE_S)), turn
+    return "kill", "turn %s %s, dsh pid %d gone" % (
+        turn[:8], row.get("status") or "closed", scope["dsh_pid"]), turn
+
+
+def reap_dsh_scopes(db, host: str, *, dry_run: bool = False, now: float | None = None,
+                    scan=None, terminate=None) -> dict:
+    """#3226 : les scopes systemd `dsh-subprocess-*` laissés par un tour clos
+    (dsh sans la garde #490) sont tués — SIGTERM, puis SIGKILL — après
+    `DSH_SCOPE_GRACE_S`, journalisés (`dsh_scope`, `killed`) ; ceux qu'on ne
+    sait pas attribuer sont gardés et signalés (`signaled`, re-signalé au
+    plus toutes les `DSH_SCOPE_REFRESH_S`, `gone` quand ils disparaissent).
+    `scan`/`terminate` : ceux de `platform.dsh_scopes` (surchargés par les
+    tests). Rend `{entries, plan}`."""
+    from .platform import dsh_scopes
+    scan = dsh_scopes.scan if scan is None else scan
+    terminate = dsh_scopes.terminate if terminate is None else terminate
+    now = time.time() if now is None else float(now)
+    out: dict = {"entries": [], "plan": []}
+    try:
+        scopes = scan()
+    except (OSError, platform.NotAvailable):
+        scopes = None
+    if scopes is None:
+        return out
+    hk = storage.of(db).housekeeping
+    turns = storage.of(db).turn_resources
+    last = {row["path"]: row for row in hk.latest_by_path(host, "dsh_scope")}
+    seen = set()
+    for scope in scopes:
+        unit = scope["unit"]
+        seen.add(unit)
+        members = scope["members"]
+        turn_ids = {m["turn"] for m in members if m.get("turn")}
+        row = turns.get(next(iter(turn_ids))) if len(turn_ids) == 1 else None
+        action, why, turn = dsh_scope_verdict(scope, row, host, now)
+        agent = (row or {}).get("agent") or next(
+            (a for a in (_tmpdir_agent(m.get("tmpdir")) for m in members) if a), None)
+        previous = last.get(unit) or {}
+        data = {"dsh_pid": scope["dsh_pid"], "turn": turn,
+                "pids": [m["pid"] for m in members],
+                "commands": [m["command"] for m in members[:3]],
+                "first_seen": ((previous.get("data") or {}).get("first_seen")
+                               if previous.get("action") == "signaled" else None) or now}
+        base = {"kind": "dsh_scope", "path": unit, "agent": agent}
+        if action == "wait":
+            out["plan"].append(dict(base, action="attend", detail=why))
+            continue
+        if action == "kill":
+            out["plan"].append(dict(base, action="suppression", detail=why))
+            if dry_run:
+                continue
+            left = terminate(members)
+            if not left:
+                out["entries"].append(dict(base, action="killed", data=data,
+                                           detail="%s: SIGTERM then SIGKILL" % why))
+                continue
+            why = "%s: %d process(es) survived SIGKILL (%s)" % (
+                why, len(left), ", ".join(str(m["pid"]) for m in left))
+        else:
+            out["plan"].append(dict(base, action="signalé", detail=why))
+            if dry_run:
+                continue
+        fresh = (previous.get("action") == "signaled" and previous.get("detail") == why
+                 and now - float(previous.get("at_ts") or 0) < DSH_SCOPE_REFRESH_S)
+        if not fresh:
+            out["entries"].append(dict(base, action="signaled", detail=why, data=data))
+    if not dry_run:
+        for unit, previous in last.items():
+            if unit not in seen and previous.get("action") == "signaled":
+                out["entries"].append({"kind": "dsh_scope", "action": "gone", "path": unit,
+                                       "agent": previous.get("agent"),
+                                       "detail": "dsh scope gone"})
+    return out
+
+
 def tmp_problem(path: str, owner: str | None, key: str, *, registered: bool,
                 idle_after: float, now: float) -> str:
     """L219: why the pass keeps the temporary directory `path` of an agent
@@ -3736,6 +3868,9 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
       mesh a déclarés jetables (`ameesh.bench=disposable`) sont récoltés après
       `docker_volume_idle` d'absence continue, les autres signalés avec leur
       commande, jamais supprimés ;
+    * scopes systemd `dsh-subprocess-*` d'un tour clos (#3226,
+      `reap_dsh_scopes`), tués après `DSH_SCOPE_GRACE_S` ; non attribuables :
+      gardés et signalés ;
     * entrées de /tmp signalées pendant un tour : jamais supprimées si non
       attribuées (#222) ; un signalement attribué d'avant #222, supprimé si
       abandonné (garde-fous de `_orphan_verdict`, L162) ; sinon dites avec la
@@ -4105,6 +4240,16 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     volumes = reap_volumes(runtime, db, host, policy, dry_run=dry_run, now=now)
     entries += volumes["entries"]
     plan += volumes["plan"]
+    # 4c. #3226 : scopes systemd `dsh-subprocess-*` laissés par un tour clos
+    #     (dsh sans la garde #490) : tués après le délai de grâce ; ceux qu'on
+    #     ne sait pas attribuer gardés et signalés
+    try:
+        scopes = reap_dsh_scopes(db, host, dry_run=dry_run, now=now)
+    except Exception as exc:  # jamais fatal pour le passage
+        scopes = {"entries": [], "plan": []}
+        skipped.append("dsh scopes: pass failed (%s)" % type(exc).__name__)
+    entries += scopes["entries"]
+    plan += scopes["plan"]
     # 5. /tmp entries signaled during a turn (L162): unattributed ones are
     #    never deleted (#222), an attributed one (before #222) is deleted once
     #    abandoned (`_orphan_verdict` guards), the others are told
