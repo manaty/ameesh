@@ -281,7 +281,12 @@ class Agents(Domain):
     @abc.abstractmethod
     def claimable(self, host: str, names: Sequence[str] | None, *,
                   require_responsible: bool) -> list[dict]:
-        """Agents de l'hôte sans bail vivant, réclamables (mêmes règles que `claim`)."""
+        """Agents de l'hôte sans bail vivant, réclamables (mêmes règles que `claim`).
+
+        L165 (EP3) : pour un agent `releve: election` rendu sur un hôte
+        candidat, `host` est l'hôte qui réclame et `previous_host` l'hôte de la
+        ligne (l'ancien détenteur, ou l'hôte de la dernière synchronisation) ;
+        `session_id` est encore la session de cet ancien détenteur."""
 
     @abc.abstractmethod
     def runner_seen(self, host: str, owner: str, names: Sequence[str] | None) -> None:
@@ -370,12 +375,21 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def claim(self, name: str, owner: str, ttl_seconds: float, *,
-              require_responsible: bool, host: str | None = None) -> dict | None:
+              require_responsible: bool, host: str | None = None,
+              election_brief: str | None = None) -> dict | None:
         """Prend le bail s'il est libre ou expiré ; rend la ligne, sinon None.
 
         `host` (L165, EP1) : l'hôte qui réclame, pour un agent
         `releve: election`. None : l'hôte de la ligne (comportement d'un agent
-        épinglé). Le serveur médié force cet argument à l'hôte de l'exécuteur."""
+        épinglé). Le serveur médié force cet argument à l'hôte de l'exécuteur.
+
+        `election_brief` (L165, EP3) : appliqué seulement sur une relève
+        croisée d'un agent élu (la ligne était chez un autre hôte) — la même
+        instruction oublie la session de l'ancien hôte, laisse son compte au
+        choix de cet hôte et écrit le brief comme résumé de la session neuve.
+        Ignoré sur le même hôte et pour un agent `hote`. Une relève croisée
+        SANS brief est **refusée** (le CAS ne déplace pas la ligne), cas d'un
+        exécuteur médié (contrat 1.9 : valeur forcée à null côté appareil)."""
 
     @abc.abstractmethod
     def attach_claim(self, name: str, owner: str, ttl_seconds: float, *,
@@ -391,7 +405,8 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def renew(self, name: str, owner: str, epoch: int, ttl_seconds: float) -> float | None:
-        """Prolonge le bail ; rend la nouvelle échéance, None si on ne le détient plus."""
+        """Prolonge le bail sans raccourcir son échéance ; rend la nouvelle
+        échéance, None si on ne le détient plus."""
 
     @abc.abstractmethod
     def release(self, name: str, owner: str, epoch: int) -> bool:
@@ -1449,6 +1464,11 @@ class WorkItems(Domain):
         """L118c: journaled project correction, atomically with its old value."""
 
     @abc.abstractmethod
+    def set_type(self, item_id: int, type: str, *, current: str, actor: str) -> dict | None:
+        """#2954: journaled lot type correction, if the lot still carries
+        `current` (compare-and-set, no lost concurrent correction)."""
+
+    @abc.abstractmethod
     def without_project(self) -> list[dict]:
         """L118c: open lots with empty app, once per id, including waiting_human."""
 
@@ -1466,7 +1486,7 @@ class WorkItems(Domain):
             estimate_source: str | None = None, change_size: str | None = None,
             queued_note: str | None = None, forced_note: str | None = None,
             mark_item_id: int | None = None, mark_note: str = "",
-            parent_lot: int | None = None) -> dict:
+            parent_lot: int | None = None, unique_ref: bool = False) -> dict:
         """Crée le lot en `intake` (rattaché à une fiche WorkPackage si
         `package_id`, L29 ; avec sa branche si `branch`, L118 ; sa priorité
         si `priority`, L130 ; avec sa durée estimée et sa ligne d'historique
@@ -1493,6 +1513,13 @@ class WorkItems(Domain):
         **same** transaction — a blocking edge if the parent is still open, a
         journal trace if it is already finished, everything rolled back if it
         is unknown.
+
+        `unique_ref` (#2954): with an `issue_ref`, take a transaction advisory
+        lock on the reference and refuse the creation (`DbError`) when any lot,
+        whatever its state, already carries it. Two hosts creating the incident
+        of the same run serialize: the second sees the first and the caller
+        re-reads the winner. Off by default: several lots may legitimately
+        share a reference except where the identity is one per execution.
 
         L'ordre des verrous est commun avec `assign` (#540, revue R1 delta) :
         les lignes de lots d'abord (`mark_item_id` et `parent_lot`, par
@@ -1716,6 +1743,40 @@ class WorkItems(Domain):
         revision=0 creates it. Every write locks and then rechecks the lease
         against wall time, and compares the previous document revision.
         A stale holder cannot overwrite a newer train. No remote API grant.
+        """
+
+    @abc.abstractmethod
+    def train_abandon(self, key: str, plan_id: str, document: dict, *, revision: int,
+                      owner: str, epoch: int) -> dict | None:
+        """#3138: terminal write of one exact never-fired train plan.
+
+        Same lease/epoch and revision checks as `train_save`, plus in the same
+        transaction: the persisted plan id is still `plan_id`, its phase is not
+        terminal or `promoting`, and no active/promoting/landed fire receipt
+        exists for it. A concurrent fire grant is serialized on the target
+        lease, so a plan cannot be abandoned between the grant's check and its
+        insertion. Returns the new document, None on any mismatch.
+        """
+
+    @abc.abstractmethod
+    def train_adopt(self, key: str, owner: str, *, revision: int,
+                    previous: tuple | None, service: tuple, ttl_s: float) -> dict | None:
+        """#3142: the train service's current holder takes over the target
+        reservation another `train:*` owner left behind.
+
+        In one transaction: ``service`` (key, owner, epoch) must be the live
+        service lease; a key bound to a role
+        (``train-service:<role>:<epoch>``) also requires that role's live
+        lease at that exact epoch, so an old election's still-live service
+        key cannot adopt the reservation back from the new holder; the target
+        row must be held by another `train:*` owner (at ``previous``
+        (owner, epoch) when given, expired or not); the train document must
+        still be at ``revision``. The row passes to ``owner`` at the next
+        epoch, so every write of the old epoch is refused afterwards. A
+        reservation ticket of the document naming the held (owner, epoch) is
+        rewritten to the new ones; with ``previous``, it must exist.
+        Never takes an ordinary (non-`train:*`) reservation. Returns
+        {epoch, previous_owner, previous_epoch}, or None.
         """
 
     @abc.abstractmethod
@@ -3580,7 +3641,13 @@ class HostLifecycle(Domain):
     @abc.abstractmethod
     def drain(self, host: str, *, actor: str, duration: int | None = None,
               critical: Sequence[str] = ()) -> dict:
-        """Close claims/enable atomically and retain agents' original host."""
+        """Close claims/enable atomically and retain agents' original host.
+
+        #3029: an elected role holding its lease on this host is returned in
+        the same transaction, with its epoch bumped, so another candidate can
+        claim at once instead of waiting for the TTL. It stays out of the
+        L232e handoff journal (there is no local work to publish).
+        """
 
     @abc.abstractmethod
     def undrain(self, host: str, *, actor: str) -> dict | None:
@@ -3611,6 +3678,21 @@ class HostLifecycle(Domain):
     def detect_losses(self, *, actor: str, older_than: int,
                       critical: Sequence[str] = ()) -> list[dict]:
         """Close stale known hosts atomically; loss is not a quiescence proof."""
+
+    @abc.abstractmethod
+    def reconcile_loss(self, host: str, *, actor: str, fresh_within: int) -> dict:
+        """Reopen a lost host only on a verified proof.
+
+        Readings in database time must cover at least `fresh_within` without a
+        hole that large, with no reading dated in the future; every origin
+        agent must still be home and unfenced, with no active handoff and no
+        `recover_source` attempt since the loss. A live lease of an agent that
+        is home is the returning host's own runner and does not block the
+        proof (#3180). The transition `lost -> returning -> available` is
+        atomic and leaves its actor and evidence in `ameesh_events`. Returns
+        `{"host", "mode", "reconciled", "missing", ...}`; a refusal names the
+        missing proof.
+        """
 
 
 class HostResources(Domain):
@@ -4382,6 +4464,43 @@ class GithubWatch(Domain):
         """Persist or clear partial progress atomically with mailbox delivery."""
 
 
+class NotifyLiveness(Domain):
+    """#3007 : preuve partagée que le notificateur joint un humain.
+
+    Le seul notificateur à canaux peut tomber avec son poste ; les autres
+    hôtes lisent ces battements dans la base au lieu de conclure de leur
+    propre configuration. `human = '*'` dit que `notify.default` couvre tout
+    humain. Un battement est un fait d'hôte, jamais un secret : hôte,
+    `human:<id>` et instant.
+    """
+
+    @abc.abstractmethod
+    def beat(self, host: str, humans: Sequence[str], *,
+             now: float | None = None) -> int:
+        """Écrit (ou rafraîchit) un battement par humain couvert ; rend le
+        nombre de lignes. Une liste vide n'écrit rien."""
+
+    @abc.abstractmethod
+    def latest(self) -> list[dict]:
+        """Tous les battements connus — les périmés compris : l'appelant juge
+        la fraîcheur (`host`, `human`, `seen_ts`)."""
+
+    @abc.abstractmethod
+    def claim_brief(self, recipient: str, human: str, *, since: float,
+                    now: float | None = None) -> dict:
+        """Réclame atomiquement le brief de `(recipient, human)` si son dernier
+        envoi est plus ancien que `since` (epoch) ; rend
+        `{"claimed": bool, "previous_ts": float | None}`. `previous_ts` est
+        l'envoi précédent quand la réclamation est prise (None au premier), ce
+        qui permet d'écrire la relance. La transaction est terminée au retour :
+        l'appelant envoie ensuite le courrier, et `release_brief` le rend en
+        cas d'échec."""
+
+    @abc.abstractmethod
+    def release_brief(self, recipient: str, human: str) -> None:
+        """Rend une réclamation dont le courrier n'a pas pu être déposé."""
+
+
 class Storage(abc.ABC):
     """Les domaines du stockage, liés à une connexion ou une transaction."""
 
@@ -4405,6 +4524,7 @@ class Storage(abc.ABC):
     events: Events
     mailbox: Mailbox
     github_watch: GithubWatch
+    notify_liveness: NotifyLiveness
     wakeups: Wakeups
     keys: Keys
     approvals: Approvals

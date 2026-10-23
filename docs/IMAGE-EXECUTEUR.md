@@ -7,9 +7,9 @@ Contrat de l'API : `docs/EXECUTEUR-MEDIEE.md`. Étude :
 `docs/design/etudes/executeur-mediee.md`.
 
 Une modification incompatible ouvre `ameesh-executor/2`. Elle ne retouche
-jamais la v1 en silence. Brouillons : `deploy/executor-image/Containerfile`
-et `deploy/executor-image/ameesh-executor` (aucune image construite ni
-publiée).
+jamais la v1 en silence. Construction et publication :
+`deploy/executor-image/Containerfile` et `deploy/executor-image/publish.sh`,
+par la CI (§9). Le travail est relu et fusionné avant toute publication.
 
 ## 1. Point d'entrée
 
@@ -195,7 +195,99 @@ L'acquittement porte `seq`, `state`, `in_turn` (les agents encore en tour),
   de clé ni de contenu de modèle. Ils peuvent nommer les agents, l'hôte et
   le mesh : ils restent sur l'appareil et ne remontent pas au hub.
 
-## 9. Signature des releases de l'image
+## 9. Publication et signature des releases de l'image
+
+### 9.1 Publication de l'image (CI)
+
+| Élément | Valeur |
+|---|---|
+| registre | `ghcr.io/manaty/ameesh-executor` |
+| construction | `deploy/executor-image/Containerfile` |
+| publication | `deploy/executor-image/publish.sh`, appelé par `.github/workflows/image-executor.yml` |
+| tag | `sha-<12>`, immuable, jamais mobile |
+| plateforme | un manifeste simple `linux/amd64` ; le digest signé est celui de ce manifeste |
+| épinglages | image Node par digest de manifeste amd64 ; arbre dsh par `package.json` + `package-lock.json` (versions et intégrités sha512 figées) |
+
+La publication passe par GitHub Actions, sur un runner **auto-hébergé**
+(`self-hosted, linux, ameesh-ci`) ; un job de fourche est ignoré
+(`github.repository`). Le workflow n'a **aucun déclencheur de branche ni de
+PR** : il ne s'exécute que par `workflow_dispatch`, et sa première étape
+refuse toute ref autre que `main`. GitHub n'expose `workflow_dispatch`
+qu'une fois le fichier sur la branche par défaut : la publication ne peut
+donc commencer qu'**après la fusion**, avec le feu du pilote. La preuve
+avant fusion est le build local du `Containerfile` sur `linux/amd64`, les
+tests et la CI ; aucun tag n'est publié depuis une branche de lot ou une PR.
+Le run se déclenche par `workflow_dispatch` sur `main` (onglet Actions, ou
+`gh workflow run image-executor.yml --ref main`), avec le feu du pilote.
+Le garde `refs/heads/main` écarte une erreur de déclenchement ; il ne fait
+pas frontière d'autorité contre un acteur qui peut écrire dans le dépôt :
+c'est la signature O4 (§9.2), faite hors CI avec la clé de release, qui fait
+la porte — et Nexlink épingle ensuite le digest dans la recette.
+
+Aucun tag mobile, aucun `latest` : un consommateur épingle un **digest**.
+Un tag `sha-<12>` déjà publié n'est jamais réécrit ; une seconde exécution
+sur le même commit rend le digest existant. Le tag ne porte que la
+révision : le digest est l'identité de release, et c'est lui que Nexlink
+épingle.
+
+Les paquets apt suivent les dépôts Debian au moment de la construction, et
+`npm ci` s'exécute avec `--ignore-scripts` : les deux dépendances les plus
+mouvantes sont épinglées (base Node par digest, arbre dsh par
+`package-lock.json`), et le digest publié est la référence de contenu. Une
+reconstruction du même commit peut donc différer ; un tag `sha-<12>` déjà
+publié n'est pas reconstruit.
+
+Le workflow n'utilise que le `GITHUB_TOKEN` du dépôt, avec la seule
+permission `packages: write` (`contents: read` par ailleurs). Aucun jeton
+personnel n'est employé ni stocké. Le jeton GHCR et le bearer du registre ne
+passent jamais par la ligne de commande : `publish.sh` les donne à `curl`
+par sa configuration lue sur stdin (`-K -`), et `docker login` reçoit le mot
+de passe par `--password-stdin` (plusieurs runners partagent l'utilisateur
+de l'hôte ; `/proc/<pid>/cmdline` exposerait un secret passé en argv). La
+configuration docker du run vit dans `$DOCKER_CONFIG`, sous le dossier
+temporaire du job (`0700`), jamais dans le `~/.docker` partagé de
+l'utilisateur : un `docker logout` global déconnecterait les jobs
+concurrents.
+
+**Preuve de publication.** `publish.sh` écrit, dans le résumé du run et dans
+`digest.txt` :
+
+```
+image=ghcr.io/manaty/ameesh-executor
+revision=<sha 40>
+version=<version de pyproject.toml>
+tag=sha-<12>
+platform=linux/amd64
+digest=sha256:<64 hex>
+image_ref=ghcr.io/manaty/ameesh-executor@sha256:<64 hex>
+```
+
+Il relie le digest à **ce run** : le digest imprimé par `docker push` doit
+être celui que le registre sert ensuite pour le tag, le blob de
+configuration du manifeste servi doit être l'ID de l'image construite, et
+le label `org.opencontainers.image.revision` doit valoir la révision
+publiée. Une absence de tag ne se conclut que sur un 404 ; un index
+multi-architecture ou une autre architecture arrête le run. Le blob de
+configuration est lu en suivant la redirection HTTPS du registre (307 chez
+GHCR) **sans le bearer** : le premier appel authentifié ne suit pas la
+redirection, la `Location` signée est appelée sans authentification, et une
+redirection non HTTPS arrête le run. Si le tag existait déjà, rien n'est
+poussé : le script ne rend que le digest existant après avoir vérifié sa
+révision, et le dit dans le journal. Le digest signé est donc toujours celui
+que le registre sert à la fin du run, lié soit au push de ce run, soit au
+label de révision du tag existant.
+
+L'auteur du lot reporte la ligne `image_ref` sur le fil du lot et la remet
+au bureau pour la signature O4 (§9.2) ; c'est cette valeur, et elle seule,
+que le bureau signe.
+
+Le paquet est **privé** par défaut sur ghcr ; son passage en public est une
+décision de l'owner (ou du bureau sur délégation), pas du workflow. Le
+digest d'une image publiée reste disponible sur le registre ; on ne le
+supprime pas tant qu'un déploiement peut y revenir. Le retour arrière est un
+ré-épinglage sur le digest précédent.
+
+### 9.2 Signature (O4)
 
 - **Clé.** La clé de release ameesh est une clé ECDSA P-256 (ES256), unique,
   propre à l'image `ameesh-executor`.
@@ -225,8 +317,10 @@ L'acquittement porte `seq`, `state`, `in_turn` (les agents encore en tour),
     `sign_release.py` est acceptée par le code de vérification du hub
     (Node, `dsaEncoding: 'ieee-p1363'`), et refusée pour une autre image.
 - **Procédure de release.**
-  1. La CI construit l'image et la pousse. Elle relève le digest.
-  2. Le propriétaire signe sur son poste :
+  1. La CI construit l'image `linux/amd64` et la pousse (§9.1). Elle relève
+     `image_ref = <registre>/ameesh-executor@sha256:<64 hex>`.
+  2. Le propriétaire — ou le bureau, sur la délégation de l'owner — signe sur
+     son poste :
      `deploy/executor-image/sign_release.py sign --key <clé> <image@digest>`.
      La commande rend `ameesh-release-signature/1` : `{image,
      image_signature, public_key}`.
@@ -292,7 +386,7 @@ L'acquittement porte `seq`, `state`, `in_turn` (les agents encore en tour),
 | **D1** API d'exécuteur médiée | `/api/exec/v1` sur le serveur du mesh : le contrat est figé (62 opérations, version 1.1), le serveur, le client, le relais de modèle et le dépôt de travail | L107 (contrat, fait), L108 (serveur), L109 (client), L111 (relais), L113 (dépôt de travail) |
 | **D2** émetteur de jetons serveur à serveur | **abandonné en v0.2**. Le hub ne voit, ne détient ni ne relaie aucun jeton. L'exécuteur obtient lui-même ses jetons (`amx1` de 10 min, `ams1` liés au bail), par sa clé enrôlée | L110 (enrôlement et identité) |
 | **D3** fiche Host et admission | la fiche `Host` au canon (`policy.volatile`, `occupants`), l'admission des agents sur l'hôte, et le code d'enrôlement lié à l'hôte et à une liste d'agents. **Sans fiche, aucun code n'est émis** | L110 (codes, révocation), L112 (porte d'hôte), canon du mesh (PR revue par un mainteneur) |
-| image et empaquetage | cette interface ; les brouillons du `Containerfile` et de l'entrée | **L114** |
+| image et empaquetage | cette interface ; l'image `linux/amd64` construite et publiée par la CI (§9.1) | **L114**, **#3166** |
 | essai de bout en bout | un mesh jetable et une VM : enrôlement, tour relayé, drainage, VM tuée, révocation, tentatives interdites | L115 |
 
 **Reste à câbler en L114b** (aucun changement d'interface) :

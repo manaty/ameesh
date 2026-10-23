@@ -38,8 +38,28 @@ every candidate; any of them may take the lease when it is free or expired,
 and the winner becomes the holder. `canon sync` writes the placement verdict
 of **each** candidate host, so the host policy and visibility rule are still
 checked on the host that claims. Such a role is not moved by L232e: there is
-no local work to publish, and the lease epoch fences the former holder. The
-repository note `docs/HOST-HANDOFFS.md` has the full election rules.
+no local work to publish, and the lease epoch fences the former holder. A
+planned `host drain` returns the holder's lease at once (epoch incremented in
+the drain transaction), so a candidate can take over without waiting for the
+expiry; an unplanned stop waits for the lease to expire. The repository note
+`docs/HOST-HANDOFFS.md` has the full election rules. The
+best *ready* candidate wins, with a short per-rank delay before the claim
+(0 s, 20 s, 40 s…); availability over seven days decides, capacity only breaks
+ties, and a holder is replaced only after a challenger has stayed 5 points
+ahead for an hour, at the end of the holder's turn. `ameesh role status` shows
+the holder, the epoch and the ranking.
+
+A candidate runner takes **no turn before the lease**: the worker is created
+only after the claim, renews the lease before each turn, and its harness is
+killed if the lease is lost. On a **cross-host** election the winner opens a
+new session on a deterministic resume briefing built from the mesh database,
+the canon and GitHub — no session crosses hosts. The claim persists that
+briefing and resets the session in the same statement; a cross-host claim
+without the briefing is refused (the line is not moved), and the briefing is
+dropped with the session, so it never resurfaces later. When the first turn
+opens a lot session, the lot's minimal brief completes the election briefing
+instead of replacing it. A same-host re-claim (runner restart) keeps the local
+session and is not an election.
 
 - **Exclusive claim.** A claim is one conditional, atomic `UPDATE`: two runners
   cannot win the same agent. This is tested with 2 and 4 concurrent
@@ -51,6 +71,17 @@ repository note `docs/HOST-HANDOFFS.md` has the full election rules.
 - **Fencing.** Renewing, starting a turn and taking a prompt all require a live
   lease. An expired lease cannot be extended; the runner has to claim again,
   with a new epoch.
+- **Fencing the pilot's gestures.** For an elected role, a merge, a merge
+  queue entry or landing, an assignment, a recorded packet composition and a
+  decision request are refused unless the session holds the live lease at its
+  own epoch. The check renews the lease and journals the gesture in the same
+  transaction; a stale session is refused, naming the current holder. An EP5
+  timer passes `AMEESH_ROLE` and its epoch: a role without an epoch is
+  refused. Just before an external call (push, `gh pr merge`) the lease is
+  renewed with a margin at least the call's worst case; the residual race is
+  documented in `docs/HOST-HANDOFFS.md`. Humans, host-pinned agents and
+  runner-internal sweeps without `AMEESH_ROLE` are unchanged
+  (`pilot_gesture.py`).
 - **Lease loss stops the harness.** The lease is renewed by a heartbeat during
   turns. If it is lost, the harness's whole process group receives `SIGKILL`
   and the turn is not counted.

@@ -84,6 +84,7 @@ from . import plan as plan_mod
 from . import process_projection as projection_mod
 from . import process_workflow as workflow_mod
 from . import projects as projects_mod
+from . import role_run
 from . import storage
 from . import work as work_mod
 from .connectors import ConnectorError
@@ -2476,7 +2477,15 @@ def _three_way(view: LotView, issue: dict, managed=None) -> tuple[dict, list, li
         ours = [k for k, d in zip(_FIELD_NAMES, recorded) if _digest(want[k]) != d]
         human = [k for k, d in zip(_FIELD_NAMES, recorded) if _digest(have[k]) != d]
     else:
+        # Issue désignée et adoptée : rien n'a encore été écrit, donc aucune
+        # empreinte. Seules les étiquettes sont à nous — plus la fermeture :
+        # un lot déjà clos ferme son issue dans ce passage même, sinon le
+        # commentaire « issue closed by ameesh » contredirait une issue restée
+        # ouverte et l'empreinte figerait cet écart en retouche humaine (#3086).
         ours, human = ["labels"], []
+        if (want["state"] or "").lower() == "closed" \
+                and (have["state"] or "").lower() != "closed":
+            ours.append("state")
     write = [k for k in ours if want[k] != have[k]]
     kept = [k for k in human if k not in ours]
     return want, write, human, kept
@@ -2833,15 +2842,15 @@ class Projector:
         if not settings.projects:
             return []
         here = getattr(self.cfg, "host", None)
-        if not settings.host:
-            self._once("no-host", "GitHub issues: no designated host (`github.host`): no "
-                                  "automatic projection; `ameesh work project-github --app "
-                                  "<project>` remains possible")
-            return []
-        if settings.host != here:
-            self._once(("elsewhere", settings.host),
-                       "GitHub issues: the projection is run by host %s, not %s"
-                       % (settings.host, here))
+        if not role_run.host_authorized(self.cfg, settings.host):
+            if not settings.host:
+                self._once("no-host", "GitHub issues: no designated host (`github.host`): no "
+                                      "automatic projection; `ameesh work project-github --app "
+                                      "<project>` remains possible")
+            else:
+                self._once(("elsewhere", settings.host),
+                           "GitHub issues: the projection is run by host %s, not %s"
+                           % (settings.host, here))
             return []
         reports: list[dict] = []
         feed = None
