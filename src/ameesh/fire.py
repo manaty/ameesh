@@ -61,6 +61,10 @@ FIRE_KINDS = (FIRE, UNFIRE)
 MAX_LOTS = 1000
 #: durée du bail d'une opération de feu
 LOCK_TTL_S = 120.0
+#: L165 (EP4) : marge du bail élu renouvelée juste avant `gh pr merge`
+#: (timeout de 120 s + relecture de la PR). La course résiduelle est
+#: documentée dans `docs/HOST-HANDOFFS.md`.
+FIRE_CALL_MARGIN_S = 180.0
 #: résultats qu'un passage n'a pas à journaliser
 QUIET = ("idle", "armed", "queued", "busy", "withdrawn")
 #: résultats qu'un passage de l'exécuteur dit dans son journal : état changé,
@@ -185,15 +189,22 @@ def give(db, lot: int, *, sha: str, actor: str, note: str = "", repo: str | None
     if handle is None:
         raise FireError("another fire operation holds lot #%d: retry once it is done" % lot)
     try:
+        # L165 (EP4) : le feu du pilote est un geste hors base (il arme la
+        # fusion) ; l'époque du bail élu est vérifiée et journalisée avant.
+        from . import pilot_gesture
+        try:
+            fence = pilot_gesture.gate(None, db, "merge", "fire #%d" % lot)
+        except pilot_gesture.GestureRefused as exc:
+            raise FireError(str(exc)) from exc
         return _give_locked(db, lot, sha=sha, actor=actor, note=note, repo=repo,
-                            exception=exception, reason=reason)
+                            exception=exception, reason=reason, fence=fence)
     finally:
         _unlock(handle)
 
 
 def _give_locked(db, lot: int, *, sha: str, actor: str, note: str = "",
                  repo: str | None = None, exception: str = "",
-                 reason: str = "") -> dict:
+                 reason: str = "", fence=None) -> dict:
     item = work.get(db, lot)
     if item is None:
         raise FireError("lot #%d not found" % lot)
@@ -230,14 +241,32 @@ def _give_locked(db, lot: int, *, sha: str, actor: str, note: str = "",
             target = plan_git.default_target(repo) or ""
         except plan_git.MergeProbeError:
             target = ""
-    try:
-        packet_guard.check_merge(db, lot, item.get("branch") or "", target, frozen,
-                                 exception=exception, reason=reason, actor=actor)
-    except packet_guard.PacketGuardError as exc:
-        raise FireError(str(exc)) from exc
     full = merge_queue.pinned(repo, wanted) if repo else None
-    return work.milestone(db, lot, FIRE, sha=full or wanted, actor=actor,
-                          note=(note or "").strip())
+
+    def check(database):
+        try:
+            packet_guard.check_merge(database, lot, item.get("branch") or "", target,
+                                     frozen, exception=exception, reason=reason,
+                                     actor=actor)
+        except packet_guard.PacketGuardError as exc:
+            raise FireError(str(exc)) from exc
+
+    if fence is None:
+        check(db)
+        return work.milestone(db, lot, FIRE, sha=full or wanted, actor=actor,
+                              note=(note or "").strip())
+    # L165 (EP4) : la déclaration `--exception` de `check_merge` et le jalon
+    # sont des écritures du même geste ; hold, déclaration et jalon partagent
+    # la transaction gardée après les lectures de préparation (revue cx2 B3).
+    from . import pilot_gesture
+    with db.transaction() as tx:
+        try:
+            fence.hold(tx)
+        except pilot_gesture.GestureRefused as exc:
+            raise FireError(str(exc)) from exc
+        check(tx)
+        return work.milestone(tx, lot, FIRE, sha=full or wanted, actor=actor,
+                              note=(note or "").strip())
 
 
 def withdraw(db, lot: int, *, actor: str, note: str = "", repo: str | None = None) -> dict:
@@ -248,14 +277,28 @@ def withdraw(db, lot: int, *, actor: str, note: str = "", repo: str | None = Non
     if handle is None:
         raise FireError("another fire operation holds lot #%d: retry once it is done" % lot)
     try:
+        from . import pilot_gesture
+        try:
+            fence = pilot_gesture.gate(None, db, "merge", "unfire #%d" % lot)
+        except pilot_gesture.GestureRefused as exc:
+            raise FireError(str(exc)) from exc
         item = work.get(db, lot)
         if item is None:
             raise FireError("lot #%d not found" % lot)
         fire = active(work.milestones(db, lot))
         if fire is None:
             raise FireError("lot #%d carries no active fire: nothing to withdraw" % lot)
-        return work.milestone(db, lot, UNFIRE, sha=_norm(fire.get("sha")), actor=actor,
-                              note=(note or "withdrawn by %s" % actor).strip())
+        if fence is None:
+            return work.milestone(db, lot, UNFIRE, sha=_norm(fire.get("sha")), actor=actor,
+                                  note=(note or "withdrawn by %s" % actor).strip())
+        with db.transaction() as tx:
+            try:
+                fence.hold(tx)
+            except pilot_gesture.GestureRefused as exc:
+                raise FireError(str(exc)) from exc
+            return work.milestone(tx, lot, UNFIRE, sha=_norm(fire.get("sha")),
+                                  actor=actor,
+                                  note=(note or "withdrawn by %s" % actor).strip())
     finally:
         _unlock(handle)
 
@@ -1906,6 +1949,17 @@ def _merge_direct(cfg, db, row: dict, marks: list, fire: dict, status: dict, *, 
     try:
         if not _renew(handle) or not _renew(cible, land.LOCK_TTL_S):
             return {"lot": lot, "result": "busy"}
+        # L165 (EP4) : le passage peut être mené par une minuterie de rôle
+        # (`AMEESH_ROLE`) ; le bail élu est renouvelé juste avant l'appel
+        # GitHub, avec la marge de `gh pr merge` et de sa relecture.
+        from . import pilot_gesture
+        try:
+            fence = pilot_gesture.gate(cfg, db, "merge", "fire merge #%d" % lot,
+                                       project=(fresh_row.get("app") or None))
+            if fence is not None:
+                fence.hold(db, margin_s=FIRE_CALL_MARGIN_S)
+        except pilot_gesture.GestureRefused as exc:
+            return {"lot": lot, "result": "error", "error": str(exc)}
         ok, error = _merge_pr(slug, status, head, _method(project, info), gh=gh,
                               target=target,
                               default=str(info.get("default_branch") or ""))
