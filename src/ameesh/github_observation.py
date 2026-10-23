@@ -5,6 +5,20 @@ from __future__ import annotations
 from . import plan_github, storage
 
 
+def _observer_hint(settings) -> str:
+    """Où regarder, sans faire passer la configuration locale pour l'observateur.
+
+    Sur une VM qui ne porte pas la clé `github`, `settings.host` est vide :
+    écrire « github.host (not designated) » laisserait croire que c'est cet
+    hôte-là qui devait relever, alors que la lecture est partagée et faite
+    ailleurs (#2957).
+    """
+    if settings.host:
+        return "github.host (%s)" % settings.host
+    return ("github.host on the designated observer (not set in this host's "
+            "local configuration; the reading is shared)")
+
+
 def alerts(cfg, db, now: float, *, fresh_s: float) -> list[dict]:
     """A missing or stale complete queue reading is an observation failure.
 
@@ -37,8 +51,8 @@ def alerts(cfg, db, now: float, *, fresh_s: float) -> list[dict]:
             "github_observation_stale", None, seen,
             round(age) if age is not None else None, round(fresh_s),
             "GitHub observation of %s: last complete reading %s; expected within "
-            "%d min. Check github.host (%s), ameesh-notify on that host, and "
-            "the gh token/authentication" % (
-                repo, last, fresh_s // 60, settings.host or "not designated"),
+            "%d min. Check %s, ameesh-notify on that host, and the gh "
+            "token/authentication" % (
+                repo, last, fresh_s // 60, _observer_hint(settings)),
             repo=repo, reason=key, last_seen_ts=seen))
     return out
