@@ -130,6 +130,21 @@ class ElectionMaxAgentsTest(test_canon._TmpMixin, unittest.TestCase):
         self.assertEqual([placement.evaluate(loaded, "relecteur", h).ok
                           for h in ("atelier", "banc")], [True, True])
 
+    def test_admission_par_alias_comptee_une_fois(self):
+        """B3 (relecture cx2) : l'admission écrite sous un alias est celle du rôle."""
+        from ameesh import placement
+        write(self.root, "agents/relecteur.md", election_agent(aliases=["elu"]))
+        write(self.root, "placements/relecteur-atelier.md", fiche(
+            type="Placement", title="elu@candidats", agent="elu",
+            hosts=["atelier", "banc"], credential_mode="api-key"))
+        self.hosts(atelier=1, banc=2)
+        loaded = self.load()
+        self.assertEqual(codes(canon.validate(loaded), canon.ERROR), set())
+        self.assertEqual(placement.host_load(loaded)[1], {"relecteur": "banc"})
+        for name in ("relecteur", "elu"):
+            self.assertIs(placement.evaluate(loaded, name, "banc").ok, True, name)
+            self.assertIs(placement.evaluate(loaded, name, "atelier").ok, False, name)
+
     def test_candidat_refuse_par_sa_politique_n_assoit_pas(self):
         """B2 (relecture cx2) : un candidat qui refuse le harnais n'offre pas de place."""
         from ameesh import placement

@@ -77,12 +77,20 @@ def admission_of(canon: Canon, agent: str):
 
 
 def covered_by_host(canon: Canon, *, without: str | None = None) -> dict[str, list]:
-    """Hôte -> admissions qui le couvrent (#3101), hors celle de `without`."""
+    """Hôte -> admissions qui le couvrent (#3101), hors celles de `without`.
+
+    L'exclusion suit l'identité résolue (titre ou alias) ; une admission dont
+    l'agent est inconnu du canon reste comptée.
+    """
+    target = canon.agent(without) if without else None
     covered: dict[str, list] = defaultdict(list)
     for admission in canon.placements:
-        if admission.agent and admission.agent != without:
-            for name in admitted_hosts(canon, admission):
-                covered[name].append(admission)
+        if not admission.agent or admission.agent == without:
+            continue
+        if target is not None and canon.agent(admission.agent) is target:
+            continue
+        for name in admitted_hosts(canon, admission):
+            covered[name].append(admission)
     return covered
 
 
