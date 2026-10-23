@@ -19,7 +19,7 @@ instead.
 | Platform | State |
 |---|---|
 | **Linux** | The reference platform; the full suite runs in CI. Install and run. |
-| **macOS** | **Not supported yet.** The platform layer of L63 is merged (psutil, guarantees that refuse instead of passing) and, since L68, CI runs the full suite on macOS against a PostgreSQL installed in the CI step. The launchd service and the Keychain credentials check (L65) are not delivered. Use a **remote database only** (owner answer #9414). |
+| **macOS** | **Not supported yet.** The platform layer of L63 is merged (psutil, guarantees that refuse instead of passing) and, since L68, CI runs the full suite on macOS against a PostgreSQL installed in the CI step (the job is not a required check until that suite is green there). The launchd service and the Keychain credentials check (L65) are not delivered. Use a **remote database only** (owner answer #9414). |
 | **Windows** | **WSL2 only.** Native Windows is deferred (owner answer #9411; lot L67), and ameesh does not start there. Inside WSL2 it is a Linux, so the Linux instructions below apply, with one constraint: the **harness must run inside WSL too**, because ameesh cannot see Windows processes and cannot verify that a session is closed. |
 
 ## Requirements

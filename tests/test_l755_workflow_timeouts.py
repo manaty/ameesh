@@ -53,11 +53,12 @@ MAX_TIMEOUT_MINUTES = 60
 
 #: L68 — bornes supérieures explicites, par (workflow, job). La suite complète
 #: sous macOS tourne sur un runner **hébergé** (elle ne retient aucun runner
-#: de la flotte) et y exécute les quatre parts psycopg l'une après l'autre ;
-#: 120 min couvrent une exécution lente sur un runner Intel 3 vCPU sans
-#: jamais retenir « des heures ». Toute autre borne au-dessus du plafond reste
-#: refusée.
-TIMEOUT_EXCEPTIONS = {("tests.yml", "platform-macos"): 120}
+#: de la flotte) et y exécute les huit parts psycopg (#1476) l'une après
+#: l'autre : ~90 min de travail mesuré sous Linux, jamais mesuré sous macOS.
+#: 240 min est un plafond **provisoire** pour ne pas annuler le premier run,
+#: sous le maximum GitHub de 6 h ; il sera resserré après cette mesure. Toute
+#: autre borne au-dessus du plafond reste refusée.
+TIMEOUT_EXCEPTIONS = {("tests.yml", "platform-macos"): 240}
 
 #: Un job : une clé, nom nu ou entre guillemets, suivie du reste de la ligne.
 _JOB = re.compile(r"""^(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_.-]+))\s*:(.*)$""")

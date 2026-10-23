@@ -561,9 +561,10 @@ class DeviceCliTest(PgTestCase):
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 pid = test.proc.pid
-                # L68: the platform layer, not /proc. None (unreadable
-                # process) is kept and fails the assertion below: a secret
-                # that could not be observed must never pass for absent.
+                # L68: the platform layer, not /proc. An empty argv or a None
+                # environment (unreadable process) is kept and fails the
+                # assertion below: a secret that could not be observed must
+                # never pass for absent.
                 seen["cmdline"] = platform.command_argv(pid)
                 seen["environ"] = platform.environ(pid)
                 try:
@@ -609,8 +610,15 @@ class DeviceCliTest(PgTestCase):
             if value is None:
                 self.fail("environ illisible : le code pourrait y être sans être vu")
             if isinstance(value, dict):
+                if not value:
+                    self.fail("environ vide : le code pourrait y être sans être vu")
                 return "\n".join("%s=%s" % (key, item) for key, item in value.items())
             if isinstance(value, list):
+                # codex #393 N2: command_argv rend [] quand le processus est
+                # illisible ; une liste vide rendrait "" et la preuve
+                # "secret absent" passerait à vide.
+                if not value:
+                    self.fail("argv vide : le code pourrait y être sans être vu")
                 return "\0".join(value)
             return value
         for variant in (code, code.replace("-", ""), jose.normalize_code(code)):

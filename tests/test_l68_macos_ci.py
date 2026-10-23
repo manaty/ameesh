@@ -7,6 +7,11 @@ du plan (toute la suite sur main/release/**/paquet, les impactés d'une PR de
 lot) avec le pilote psycopg. macOS n'a pas de conteneurs de service : la base
 est installée et démarrée dans une étape, jamais par `services:`.
 
+Décision de la revue #393 (23/10) : tant que la suite complète n'a pas tourné
+verte sous macOS, ce job reste **indépendant** du check requis `tests` —
+l'exiger ferait rougir le premier paquet pour tous les lots (§11 bis). Il
+entre dans les `needs` de `tests` quand cette preuve existe (lot de suite).
+
 Ces témoins lisent le workflow (sous-ensemble de texte, pas de PyYAML) et les
 tests `/proc` réécrits : une régression du job ou un retour à une lecture
 directe de `/proc` dans ces tests rougit ici, sans attendre un runner macOS.
@@ -14,6 +19,7 @@ directe de `/proc` dans ces tests rougit ici, sans attendre un runner macOS.
 from __future__ import annotations
 
 import os
+import re
 import unittest
 
 from .support import REPO
@@ -69,7 +75,42 @@ class MacosSuiteJobTest(unittest.TestCase):
     def test_the_runner_is_the_standard_x64_image(self):
         # #987 : pas de `macos-latest` arm64, qui n'obtenait pas de capacité.
         self.assertIn("runs-on: macos-26-intel", self.job)
-        self.assertIn("timeout-minutes: 120", self.job)
+        # N1 de la revue #393 : 8 parts en série sous macOS, ~90 min mesuré
+        # sous Linux ; plafond provisoire, resserré après la première mesure.
+        self.assertIn("timeout-minutes: 240", self.job)
+
+    def test_the_git_identity_step_is_taken_from_the_linux_jobs(self):
+        # B2 de la revue #393 : un runner hébergé macOS n'a pas d'identité git
+        # globale ; les dépôts temporaires des tests en ont besoin.
+        self.assertIn("- *git", self.job)
+        self.assertIn("GIT_CONFIG_GLOBAL=", self.text)
+
+    def test_the_job_is_not_required_before_its_first_full_green_run(self):
+        # Décision de conception de la revue #393 : aucun paquet ne doit
+        # rougir pour un job macOS qui n'a jamais exécuté le plan complet.
+        debut = self.text.index("\n  tests:\n")
+        aggregate = self.text[debut:]
+        needs = re.search(r"(?m)^    needs: \[(.*)\]$", aggregate)
+        self.assertIsNotNone(needs, "job tests : ligne needs introuvable")
+        self.assertNotIn("platform-macos", needs.group(1))
+        self.assertIn("platform-macos n'est pas encore requis", aggregate)
+
+
+class LinuxOnlyWitnessesAreBoundedTest(unittest.TestCase):
+    """Les lectures Linux qui restent (pas de couche possible) sont bornées."""
+
+    def test_the_poste_proc_exe_witness_is_linux_only(self):
+        chemin = os.path.join(REPO, "tests", "test_2950_poste_processus.py")
+        with open(chemin, encoding="utf-8") as fh:
+            source = fh.read()
+        self.assertIn("skipUnless(platform.is_linux()", source)
+
+    def test_the_mount_witness_uses_a_fixture_not_the_host_proc(self):
+        chemin = os.path.join(REPO, "tests", "test_l159g_pilot.py")
+        with open(chemin, encoding="utf-8") as fh:
+            source = fh.read()
+        self.assertNotIn("MOUNTINFO=/proc/self/mountinfo", source)
+        self.assertIn("self.mountinfo(tmp, mount)", source)
 
 
 class ProcTestsGoThroughTheLayerTest(unittest.TestCase):
