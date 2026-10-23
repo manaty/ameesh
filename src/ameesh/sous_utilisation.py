@@ -45,6 +45,7 @@ from __future__ import annotations
 import os
 import time
 
+from . import work_lifecycle as lifecycle
 from . import accounts as accounts_mod
 from . import cost as cost_mod
 from . import db as db_mod
@@ -101,11 +102,11 @@ DEFAULT_HOST_UNDERUSED_TURNS = 1.0
 #: un hôte sans relevé depuis 10 min n'est pas « à vide » : il est éteint
 HOST_FRESH_S = 600.0
 #: états de lot qui attendent un preneur (`idle_capacity`)
-WAITING_LOT_STATES = ("intake", "build")
+WAITING_LOT_STATES = lifecycle.ACTIVE
 #: L165b : un lot dans ces états attend un autre que son assigné (relecture,
 #: humain, autre lot) ; l'agent qui n'a que ceux-là est libre pour un lot
 #: d'équipe et compte dans `idle_capacity`
-LOTS_WAITING_ON_OTHERS = ("qa", "waiting_human", "blocked")
+LOTS_WAITING_ON_OTHERS = lifecycle.WAITING_ON_OTHERS
 #: mots qui désignent un orchestrateur dans `roles`/`role` d'une fiche Agent
 ORCHESTRATOR_ROLES = ("orchestrateur", "orchestrator")
 #: L165b : rôles de l'agent de conception, prévenu aussi d'`idle_capacity`
@@ -1040,9 +1041,9 @@ def is_backlog_item(lot: dict) -> bool:
     pas."""
     if (lot.get("assignee") or "").strip():
         return False
-    if lot.get("state") == "intake":
+    if lot.get("state") == lifecycle.REQUESTED:
         return lot.get("type") == "improvement"
-    return (lot.get("type") == "improvement" and lot.get("state") == "build"
+    return (lot.get("type") == "improvement" and lot.get("state") == lifecycle.IN_PROGRESS
             and bool(lot.get("returned_to_queue")))
 
 

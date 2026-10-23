@@ -47,6 +47,7 @@ import sys
 import textwrap
 import time
 
+from . import work_lifecycle as lifecycle
 from . import config as config_mod
 from . import db as db_mod
 from . import storage
@@ -156,7 +157,7 @@ def _paid_harnesses():
 #: plus récent (correctif du 2026-10-11)
 _LOT_SOURCES = (("mail_lot", "mail"), ("session_lot", "session"), ("assigned_lot", "assigned"))
 #: un lot dans ces états n'est jamais « en cours »
-_DONE = ("merged", "promoted", "closed")
+_DONE = lifecycle.COMPLETED
 
 
 def _lot_of(row: dict) -> dict | None:

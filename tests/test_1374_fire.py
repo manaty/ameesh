@@ -557,6 +557,31 @@ class ReadyTest(unittest.TestCase):
         self.assertTrue(ok, why)
         self.assertEqual(klass["class"], "light")
 
+    def test_the_resolved_target_base_drives_the_class_and_the_gate(self):
+        # #3091 : la cible déjà résolue par l'appelant (baseRefOid de la PR)
+        # est la révision de classe et la preuve passée à la porte, pas la ref
+        # locale du checkout qui peut être en retard.
+        klass = {"class": "light"}
+        base = "4" * 40
+        seen = {}
+
+        def gate(db, marks, frozen, **kw):
+            seen.update(kw)
+            return {"ok": True}
+
+        with mock.patch.object(fire.lot_class, "of_lot", return_value=klass) as of_lot, \
+                mock.patch.object(merge_queue, "_class_base", return_value="origin/main"), \
+                mock.patch.object(merge_queue, "pinned",
+                                  side_effect=lambda repo, rev: rev), \
+                mock.patch.object(merge_queue, "review_gate", side_effect=gate):
+            ok, why, _ = fire.ready_verdicts(
+                None, None, self.ROW, _marks(_mark("frozen", A)),
+                repo="/repo", project=None, target="main", base_sha=base)
+        self.assertTrue(ok, why)
+        self.assertEqual(of_lot.call_args.kwargs["base"], "main")
+        self.assertEqual(of_lot.call_args.kwargs["base_sha"], base)
+        self.assertEqual(seen["target"], base)
+
     def test_sensitive_requires_a_family_before_any_pr(self):
         marks = _marks(_mark("frozen", A))
         klass = {"class": "sensitive", "doubt": False, "files": [

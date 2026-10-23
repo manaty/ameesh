@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import math
 import os
 import time
 import threading
@@ -29,6 +30,10 @@ _CACHE_LOCK = threading.Lock()
 MAX_FILES = 32
 TAIL_BYTES = 256 * 1024
 META_BYTES = 64 * 1024
+#: #3044 : longueur de la fenêtre courte Codex (5 h). Une courte vivante ne
+#: peut être observée que depuis moins d'une fenêtre courte ; au-delà, aucun
+#: relevé de l'échantillon ne peut la cacher, le compte est au repos.
+SHORT_WINDOW_S = 5 * 3600.0
 
 
 class SessionReadings(list):
@@ -81,8 +86,18 @@ def live_plan(home):
 
 
 def recent_files(root):
-    """Stat once per journal, retain only the newest bounded sample."""
+    """Stat once per journal, retain only the newest bounded sample.
+
+    #3122 : rend aussi la borne des journaux **non lus** — la date du plus
+    récent d'entre eux, `math.inf` si elle est inconnue. Un journal écarté de
+    l'échantillon (33e par mtime) ou impossible à dater peut porter une courte
+    vivante : `reconcile` ne prouve le repos que si cette borne est plus
+    vieille qu'une fenêtre courte. `None` quand tout a été retenu.
+    """
+    unknown = False
+
     def candidates():
+        nonlocal unknown
         for directory, _dirs, names in os.walk(root):
             for name in names:
                 if not name.endswith(".jsonl"):
@@ -91,10 +106,21 @@ def recent_files(root):
                 try:
                     yield os.stat(path).st_mtime, path
                 except OSError:
+                    # Sans date, aucune borne : le repos ne se prouvera pas.
+                    unknown = True
                     continue
 
     selected = heapq.nlargest(MAX_FILES + 1, candidates())
-    return selected[:MAX_FILES], len(selected) > MAX_FILES
+    dropped = selected[MAX_FILES:]
+    if unknown:
+        unread_before = math.inf
+    elif dropped:
+        unread_before = max(mtime for mtime, _path in dropped)
+    else:
+        unread_before = None
+    # Un journal daté mais écarté, ou non datable, est du contenu non lu : la
+    # prudence de l'échantillon tronqué s'applique aussi.
+    return selected[:MAX_FILES], bool(dropped) or unknown, unread_before
 
 
 def session_reading(path, read_at):
@@ -122,9 +148,22 @@ def session_reading(path, read_at):
     return readings
 
 
+def _read_journal_tail(path, limit=TAIL_BYTES):
+    """La queue du journal, sans avaler une erreur de lecture (#3122).
+
+    `cost._read_tail` rend "" sur OSError : un journal illisible passerait
+    pour un journal lu et vide, et le repos #3044 serait prouvé à tort. Ici
+    l'erreur remonte ; l'appelant la compte comme non lue, avec sa date."""
+    with open(path, "rb") as stream:
+        size = os.fstat(stream.fileno()).st_size
+        if size > limit:
+            stream.seek(size - limit)
+        return stream.read(limit).decode("utf-8", "ignore")
+
+
 def _session_reading(path, read_at):
     # Local import avoids a cost -> codex_gauges -> cost import cycle.
-    from .cost import Gauge, _epoch, _find_rate_limits, _fraction, _read_tail
+    from .cost import Gauge, _epoch, _find_rate_limits, _fraction
 
     identity = None
     try:
@@ -135,7 +174,7 @@ def _session_reading(path, read_at):
     except (OSError, ValueError, AttributeError):
         pass
     windows = {}
-    for line in _read_tail(path, TAIL_BYTES).splitlines():
+    for line in _read_journal_tail(path).splitlines():
         if '"rate_limits"' not in line:
             continue
         try:
@@ -161,7 +200,7 @@ def _session_reading(path, read_at):
     return SessionReadings(windows.values(), truncated=os.path.getsize(path) > TAIL_BYTES)
 
 
-def reconcile(readings, now, *, truncated=False, plan=None):
+def reconcile(readings, now, *, truncated=False, plan=None, unread_before=None):
     """Keep the newest observation per window; reject mixed identities/plans.
 
     Session metadata names the creator, not necessarily the account used by
@@ -176,6 +215,17 @@ def reconcile(readings, now, *, truncated=False, plan=None):
     saturée ou en overage, l'ignorer masquerait une pause ou une dépense
     (argent, overage) — le compte reste refusé. Sans forfait vivant lisible,
     ou avec plusieurs identités, le refus d'ambiguïté reste la règle.
+
+    #3044 : un échantillon tronqué d'un compte non-pro sans fenêtre courte
+    **vivante** est accepté quand une courte a été retenue (échue) et que le
+    relevé le plus récent est plus vieux qu'une fenêtre courte — le compte est
+    au repos, la courte échue vaut 0 % (L71). Un relevé récent sans courte
+    vivante, ou un échantillon sans aucune courte, garde le refus #2843.
+
+    #3122 : ce repos ne se prouve que pour ce qui a été **lu**. `unread_before`
+    est la date du plus récent journal non lu (écarté du scan borné, préfixe
+    tronqué, ou sauté sur OSError) ; une courte vivante a pu y être observée
+    tant qu'elle est dans la fenêtre courte. Sans borne connue, pas de repos.
     """
     from .cost import Gauges, _codex_overage
 
@@ -246,9 +296,32 @@ def reconcile(readings, now, *, truncated=False, plan=None):
         # sampled short observations have all expired is refused (a pause)
         # until a live one appears — the same prudence as for a sample with no
         # short window at all, accepting that bounded residual.
-        if sample_plans != {"pro"} and not any(
-                g.window_s <= 5 * 3600 and not g.reset_passed(now)
-                for g, _limits in windows.values()):
+        # #3044: an account left unused longer than the short window cannot
+        # produce a live short observation: a live short seen at `now` would
+        # have been observed less than one short window ago. When the newest
+        # observation of the plan-filtered sample is that old *and a short was
+        # observed* (even expired), the account is at rest — the retained
+        # short is expired and counts 0 % (L71), and refusing would deadlock it
+        # (never chosen, never refreshed). A recent observation without a live
+        # short keeps the #2843 refusal: it can hide a saturated short outside
+        # the bounded sample. A sample with no short at all keeps it too: the
+        # layout is not proven.
+        # #3122: the same proof covers only what was read. A journal outside
+        # the sample, a truncated prefix or an unreadable journal could hold a
+        # live short observed up to its own date; the rest is proven only when
+        # every such journal is older than one short window. An unknown bound
+        # (`unread_before is None` while truncated) proves nothing.
+        short_windows = [g for g, _limits in windows.values()
+                         if g.window_s <= SHORT_WINDOW_S]
+        short_live = any(not g.reset_passed(now) for g in short_windows)
+        newest = max((g.read_at for g, _limits in windows.values()
+                      if g.read_at is not None), default=None)
+        unread_at_rest = unread_before is not None \
+            and now - unread_before >= SHORT_WINDOW_S
+        at_rest = newest is not None and now - newest >= SHORT_WINDOW_S \
+            and unread_at_rest
+        if sample_plans != {"pro"} and not short_live \
+                and not (short_windows and at_rest):
             missing.append("short window")
         if not any(g.window_s > 5 * 3600 for g, _limits in windows.values()):
             missing.append("weekly window")

@@ -511,6 +511,29 @@ class LotIssuesTest(_Base):
         self.project()
         self.assertEqual(self.issue(PUBLIC, "Écrite à la main")["state"], "closed")
 
+    def test_issue_designee_adoptee_close_avant_le_premier_passage(self):
+        """#3086 : un lot déjà clos ferme son issue adoptée dans le passage même.
+
+        Le marqueur est écrit avec l'état voulu : sans la fermeture, l'empreinte
+        dirait « ameesh a écrit closed » alors que l'issue est restée ouverte,
+        et le passage suivant prendrait cet écart pour une retouche humaine."""
+        self.gh.repo(PUBLIC)["issues"].append(
+            {"id": 9501, "number": 51, "title": "Ticket externe", "body": "texte humain",
+             "labels": ["bug"], "state": "open", "state_reason": None})
+        lot = work.add(self.db, title="Export", app="web", issue_ref=PUBLIC + "#51")
+        work.close(self.db, lot["id"], abandoned=True)
+        report = self.project()
+        issue = self.issue(PUBLIC, "Ticket externe")
+        self.assertEqual((issue["state"], issue["state_reason"]),
+                         ("closed", "not_planned"))
+        self.assertIn("Work item %d abandoned" % lot["id"],
+                      self.comments(PUBLIC, 51)[-1])
+        self.assertEqual(report["counts"]["closed"], 1)
+        # un passage suivant ne rouvre rien et ne réécrit pas la fermeture
+        self.gh.reset_calls()
+        self.project()
+        self.assertEqual(self.gh.writes(), [])
+
     def test_doublon_d_un_projecteur_concurrent_ferme(self):
         lot = work.add(self.db, title="Export", app="web")
 

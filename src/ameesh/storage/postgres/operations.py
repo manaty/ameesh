@@ -273,6 +273,9 @@ class Operations(interface.Operations):
             UPDATE agent_registry AS r
                SET session_id = NULL,
                    session_work_item = NULL,
+                   -- L165 (EP3) : le brief de relève décrivait l'ancienne
+                   -- session ; il part avec elle.
+                   election_brief = NULL,
                    session_reset_at = clock_timestamp(),
                    -- le brief EN TÊTE, puis la consigne courante d'un tour qui
                    -- n'a pas abouti (bail expiré ou rendu), puis l'attente :
@@ -323,6 +326,9 @@ class Operations(interface.Operations):
                    session_cwd = coalesce(%s::text, r.cwd),
                    session_origin = %s,
                    session_work_item = NULL,
+                   -- L165 (EP3) : une session adoptée remplace tout brief de
+                   -- relève en attente.
+                   election_brief = NULL,
                    -- #1037 : un changement de harnais DÉCLARÉ emporte les
                    -- réglages du harnais précédent : les garder ferait lancer
                    -- le nouveau harnais avec le modèle, l'effort ou le tier de
@@ -372,6 +378,10 @@ class Operations(interface.Operations):
                SET session_id = CASE WHEN p.oubli THEN NULL ELSE r.session_id END,
                    session_work_item = CASE WHEN p.oubli THEN NULL
                                             ELSE r.session_work_item END,
+                   -- L165 (EP3) : oublier la session oublie le brief de relève
+                   -- qui la décrivait ; sans oubli, il reste en attente.
+                   election_brief = CASE WHEN p.oubli THEN NULL
+                                         ELSE r.election_brief END,
                    session_reset_at = CASE WHEN p.oubli THEN clock_timestamp()
                                            ELSE r.session_reset_at END,
                    pending_prompt = CASE

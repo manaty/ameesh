@@ -380,6 +380,10 @@ class HostScopeRules(ScopeRules):
 
     def _apply_work_note(self, principal, kw, fence):
         self._require_assigned(principal, kw.get("item_id"))
+        from .. import review_floor
+        if review_floor.is_floor_note(kw.get("text")):
+            # #3183 : la porte lit cette ligne ; l'assigné ne l'écrit pas.
+            raise ScopeError("forbidden_scope", "plancher d'avis réservé au pilote")
 
     def _require_assigned(self, principal, item_id):
         rows = self.db.query(

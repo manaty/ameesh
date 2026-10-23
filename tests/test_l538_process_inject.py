@@ -444,8 +444,9 @@ class BriefProcessTest(_TmpMixin, PgTestCase):
 
     def test_un_resume_plein_ne_chasse_pas_les_regles(self):
         # verdict codex #510 r3 (P2) : la place du bloc de règles est réservée
-        # D'ABORD — un résumé qui remplit le plafond (16 000 octets, en ASCII
-        # comme en « é ») est tronqué, les règles restent, jamais l'inverse.
+        # D'ABORD — un résumé qui remplit le plafond (16 000 octets avant
+        # #3126, 19 000 depuis, en ASCII comme en « é ») est tronqué, les
+        # règles restent, jamais l'inverse.
         for plein in ("a" * reprise.BRIEF_MAX_BYTES,
                       "é" * (reprise.BRIEF_MAX_BYTES // 2)):
             self.assertEqual(len(plein.encode("utf-8")), reprise.BRIEF_MAX_BYTES)

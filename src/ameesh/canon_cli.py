@@ -353,6 +353,12 @@ def _show_one(canon: canon_mod.Canon, args: argparse.Namespace) -> int:
             "all" if p.credential_modes is None else _join(p.credential_modes),
             "—" if p.max_agents is None else p.max_agents,
             "; tags %s" % _join(h.tags) if h.tags else ""))
+        if h.unavailable_until:
+            # #3070 : l'indisponibilité déclarée (canon §12), échue ou non
+            print("  %-14s unavailable until %s%s%s" % (
+                "", h.unavailable_until,
+                " (%s)" % h.unavailable_reason if h.unavailable_reason else "",
+                "" if h.unavailable_at(time.time()) else " — past, no longer applies"))
     print("agents     :")
     for a in canon.agents:
         hosts = placement_mod.admitted_hosts(canon, placement_mod.admission_of(canon, a.title))

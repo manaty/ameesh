@@ -1,0 +1,92 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Image ameesh-executor (#3166) : construit l'image médiée et la publie sur le
+# registre ghcr.io du dépôt, puis relève le digest linux/amd64 que le bureau
+# signe (O4). Contrat de l'image : docs/IMAGE-EXECUTEUR.md §9.
+#
+# Aucune publication avant la fusion : le seul déclencheur est
+# `workflow_dispatch`, et l'étape de tête refuse toute ref autre que main.
+# GitHub n'expose `workflow_dispatch` qu'une fois le fichier sur la branche par
+# défaut : la publication ne peut donc commencer qu'après la fusion, avec le
+# feu du pilote (même règle que l'image approve, #953).
+#
+# Toute la publication (lecture du registre, push du tag sha-<12>, contrôle du
+# manifeste linux/amd64, digest) vit dans deploy/executor-image/publish.sh.
+# Une absence de tag ne se conclut que sur un 404 ; le jeton du dépôt porte
+# `packages: write` (permission déclarée ici), aucun jeton personnel.
+name: image executor
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  # Clé fixe, volontairement pas github.ref : deux publications de la même
+  # image ne doivent pas se croiser, sinon un tag peut être réécrit. Une
+  # exécution en attente est remplacée par la suivante.
+  group: image-executor-publish
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: image executor
+    # Une fourche n'a ni l'écriture du paquet ni accès à nos runners
+    # auto-hébergés : le job est ignoré, jamais exécuté sur un runner hébergé.
+    if: github.repository == 'manaty/ameesh'
+    runs-on: [self-hosted, linux, ameesh-ci]
+    timeout-minutes: 60
+    env:
+      IMAGE: ghcr.io/manaty/ameesh-executor
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      - name: Version, révision et ref autorisée
+        id: meta
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in
+            refs/heads/main) ;;
+            *)
+              echo "::error::ref $GITHUB_REF refusée : la publication part de main après la fusion"
+              exit 1
+              ;;
+          esac
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)"
+          test -n "$version"
+          revision="$(git rev-parse HEAD)"
+          sha12="$(printf '%s' "$revision" | cut -c1-12)"
+          {
+            echo "version=$version"
+            echo "revision=$revision"
+            echo "sha12=$sha12"
+          } >> "$GITHUB_OUTPUT"
+          echo "version $version, revision $revision (tag sha-$sha12)"
+
+      - name: Build de l'image linux/amd64
+        # L'image locale est la source du tag sha-<12> ; l'architecture est
+        # vérifiée par publish.sh avant tout réseau. Le manifeste publié doit
+        # être un manifeste simple linux/amd64 (pas un index multi-arch) :
+        # c'est ce digest que le bureau signe.
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 \
+            -f deploy/executor-image/Containerfile \
+            --build-arg VERSION="${{ steps.meta.outputs.version }}" \
+            --build-arg REVISION="${{ steps.meta.outputs.revision }}" \
+            -t "$IMAGE:sha-${{ steps.meta.outputs.sha12 }}" \
+            .
+          docker image inspect --format 'image locale {{.Os}}/{{.Architecture}} {{.Id}} ({{.Size}} octets)' \
+            "$IMAGE:sha-${{ steps.meta.outputs.sha12 }}"
+
+      - name: Publication (tag immuable, digest pour la signature O4)
+        id: publish
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA_TAG: sha-${{ steps.meta.outputs.sha12 }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          REVISION: ${{ steps.meta.outputs.revision }}
+          PLATFORM: linux/amd64
+        run: bash deploy/executor-image/publish.sh
