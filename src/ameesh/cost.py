@@ -1082,6 +1082,10 @@ class CostBook:
         #3034 : `plan` est le forfait du compte vivant (`auth.json`) ; quand il
         est connu et l'identité unique, les relevés d'un autre forfait sont
         ignorés au lieu de rendre le compte ambigu.
+        #3122 : la date du plus récent journal non lu (écarté du scan borné,
+        # préfixe tronqué, lecture en échec) borne ce qu'il a pu observer ;
+        `reconcile` ne prouve le repos #3044 que si elle est plus vieille
+        qu'une fenêtre courte.
 
         Lecture **JSON structurée**, pas une expression régulière : l'ordre des clés
         n'est pas garanti (`plan_type` peut précéder `primary`), `secondary` peut
@@ -1093,17 +1097,29 @@ class CostBook:
         racine = sessions if sessions is not None else self.codex_sessions
         from .codex_gauges import recent_files, reconcile, session_reading
 
-        files, truncated = recent_files(racine)
+        files, truncated, unread_before = recent_files(racine)
+
+        def unread(stamp):
+            nonlocal unread_before
+            if unread_before is None or stamp > unread_before:
+                unread_before = stamp
+
         now = self.clock()
         readings = []
         for read_at, path in files:
             try:
                 sample = session_reading(path, read_at)
-                readings.extend(sample)
-                truncated = truncated or sample.truncated
             except OSError:
+                # Journal sauté : sa date reste une borne de ce qu'il a pu
+                # observer (#3122).
+                unread(read_at)
                 continue
-        return reconcile(readings, now, truncated=truncated, plan=plan)
+            readings.extend(sample)
+            if sample.truncated:
+                truncated = True
+                unread(read_at)
+        return reconcile(readings, now, truncated=truncated, plan=plan,
+                         unread_before=unread_before)
 
     def gauges(self, harness: str | None = None, *, record: bool = True) -> Gauges:
         """Les jauges de forfait, par **source déclarée** dans les descripteurs (L16).
