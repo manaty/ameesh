@@ -54,6 +54,13 @@ class MacosSuiteJobTest(unittest.TestCase):
         self.assertIn("plan.outputs.plan_sha256", self.job)
         self.assertIn("sha256sum -c -", self.job)
 
+    def test_every_part_runs_before_the_job_fails(self):
+        # N1 de la revue #393 : sous `set -e`, une première part rouge
+        # arrêtait la boucle et masquait les suivantes.
+        self.assertIn("rc=0", self.job)
+        self.assertIn("|| rc=1", self.job)
+        self.assertIn('exit "$rc"', self.job)
+
     def test_postgresql_is_installed_and_started_in_a_step(self):
         # `services:` runs Linux containers only: on macOS the database is a
         # step, and the suite must not silently skip its database tests.
