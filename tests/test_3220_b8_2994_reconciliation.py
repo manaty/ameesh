@@ -162,3 +162,79 @@ class CommitSurvivesTest(TestCase):
         self.repo.write("docs/review.md", "rewritten doc line\n")
         head = self.repo.commit("impl: retrait regroupé", agent="impl")
         self.assertTrue(self.survives(head, fix, base))
+
+    def test_a_common_removed_line_is_not_an_annulment(self):
+        # B9 (dev2) : « return None » figure déjà dans le fichier de reprise
+        # avant le correctif ; sa présence ne prouve pas que le retrait a été
+        # annulé. Le compte d'occurrences le dit.
+        self.repo.write("gate.py",
+                        "def corrected():\n"
+                        "    return None\n"
+                        "    guard_line_1()\n"
+                        "    guard_line_2()\n"
+                        "    guard_line_3()\n"
+                        "    guard_line_4()\n")
+        self.repo.write("relocated/gate.py",
+                        "def old_feature():\n"
+                        "    return None\n"
+                        "    old_line()\n")
+        base = self.repo.commit("base")
+        self.repo.write("gate.py",
+                        "def corrected():\n"
+                        "    guard_line_1()\n"
+                        "    guard_line_2()\n"
+                        "    guard_line_3()\n"
+                        "    guard_line_4()\n")
+        self.repo.write("docs/review.md", "own review line\n")
+        fix = self.repo.commit("fix", agent="cx3")
+        self.repo.git("reset", "-q", "--hard", base)
+        self.repo.git("rm", "-q", "gate.py")
+        self.repo.write("relocated/gate.py",
+                        "def corrected():\n"
+                        "    guard_line_1()\n"
+                        "    guard_line_2()\n"
+                        "    guard_line_3()\n"
+                        "    guard_line_4()\n"
+                        "def old_feature():\n"
+                        "    return None\n"
+                        "    old_line()\n")
+        head = self.repo.commit("impl: contenu regroupé", agent="impl")
+        self.assertTrue(self.survives(head, fix, base))
+
+    def test_an_extra_common_removed_line_is_an_annulment(self):
+        # B9 : une occurrence de plus que dans le fichier corrigé (ou son
+        # parent) est une réintroduction, donc une annulation du retrait.
+        self.repo.write("gate.py",
+                        "def corrected():\n"
+                        "    return None\n"
+                        "    guard_line_1()\n"
+                        "    guard_line_2()\n"
+                        "    guard_line_3()\n"
+                        "    guard_line_4()\n")
+        self.repo.write("relocated/gate.py",
+                        "def old_feature():\n"
+                        "    return None\n"
+                        "    old_line()\n")
+        base = self.repo.commit("base")
+        self.repo.write("gate.py",
+                        "def corrected():\n"
+                        "    guard_line_1()\n"
+                        "    guard_line_2()\n"
+                        "    guard_line_3()\n"
+                        "    guard_line_4()\n")
+        self.repo.write("docs/review.md", "own review line\n")
+        fix = self.repo.commit("fix", agent="cx3")
+        self.repo.git("reset", "-q", "--hard", base)
+        self.repo.git("rm", "-q", "gate.py")
+        self.repo.write("relocated/gate.py",
+                        "def corrected():\n"
+                        "    guard_line_1()\n"
+                        "    guard_line_2()\n"
+                        "    guard_line_3()\n"
+                        "    guard_line_4()\n"
+                        "    return None\n"
+                        "def old_feature():\n"
+                        "    return None\n"
+                        "    old_line()\n")
+        head = self.repo.commit("impl: contenu regroupé", agent="impl")
+        self.assertFalse(self.survives(head, fix, base))

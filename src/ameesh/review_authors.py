@@ -804,7 +804,8 @@ def _removal_block_survives(repo: str, head: str, sha: str, paths,
                 if not any(now[at:at + size] == post
                            for at in range(len(now) - size + 1)):
                     continue
-                if any(row in now for row in gone):
+                if _gone_annulled(repo, sha, candidate, now, gone,
+                                  cache) is True:
                     continue
                 return True
     return False
@@ -926,7 +927,8 @@ def _post_image_carried(repo: str, head: str, sha: str, path: str,
                             cache[key] = True   # lecture impossible : doute
                             break
                         continue
-                    if any(row in now for row in gone):
+                    if _gone_annulled(repo, sha, candidate, now, gone,
+                                      cache) is True:
                         continue             # le retrait a été annulé ici
                     if _ordered_contains(now, wanted):
                         cache[key] = True
@@ -947,6 +949,37 @@ def _path_line_counts(repo: str, rev: str, path: str, cache: dict):
                 counts[line.strip()] = counts.get(line.strip(), 0) + 1
         cache[key] = counts
     return cache[key]
+
+
+def _line_occurrences(lines, row) -> int:
+    """Nombre d'occurrences de `row` (dépouillée) dans `lines`."""
+    wanted = str(row).strip()
+    return sum(1 for line in lines or () if line.strip() == wanted)
+
+
+def _gone_annulled(repo: str, sha: str, candidate: str, now,
+                   gone, cache: dict):
+    """Le retrait est-il annulé dans `now` ? True/False, None si doute.
+
+    #3220 B9 (dev2) : la simple présence d'une ligne retirée ne prouve pas
+    son annulation : une ligne banale (`return None`) peut déjà figurer dans
+    le fichier de reprise avant le correctif. On compare donc les occurrences
+    de la tête au nombre déjà présent dans le fichier au commit corrigé, ou à
+    défaut dans son parent. Une référence illisible n'annule rien (doute)."""
+    for row in gone:
+        if _line_occurrences(now, row) == 0:
+            continue
+        baseline = None
+        for rev in (sha, str(sha) + "^"):
+            counts = _path_line_counts(repo, rev, candidate, cache)
+            if counts is not None:
+                baseline = counts.get(str(row).strip(), 0)
+                break
+            if _path_absent(repo, rev, candidate, cache) is None:
+                return None             # lecture impossible : doute
+        if baseline is not None and _line_occurrences(now, row) > baseline:
+            return True                 # occurrence ajoutée : retrait annulé
+    return False
 
 
 def _raw_out(repo: str, *args: str) -> Optional[str]:
