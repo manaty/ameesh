@@ -40,10 +40,11 @@ def critical_names(cfg, db):
 def reconcile(cfg, db, host, *, actor=None):
     """#3035: verified reopening of a lost host, for a lifecycle pass or the command.
 
-    The proof is database state read under the host gate lock (fresh reading,
-    origins home and unfenced, no live lease, no active handoff, no recovery
-    attempt), never the returning machine's own declaration. A refusal names
-    the missing proof instead of forcing the host open.
+    The proof is database state read under the host gate lock (readings in
+    database time covering one detection window without a hole, origins home
+    and unfenced, no live lease, no active handoff, no recovery attempt),
+    never the returning machine's own declaration. A refusal names the missing
+    proof instead of forcing the host open.
     """
     if not isinstance(host, str) or not NAME_RE.fullmatch(host):
         raise ValueError("invalid host name")

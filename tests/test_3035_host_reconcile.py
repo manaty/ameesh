@@ -3,9 +3,11 @@
 import contextlib
 import io
 import json
+import threading
+import time
 from unittest import mock
 
-from ameesh import host_lifecycle, registry, storage
+from ameesh import db as db_mod, host_lifecycle, registry, storage
 from ameesh.runner import Runner
 from .support import PgTestCase
 
@@ -25,9 +27,14 @@ class HostReconcileTest(PgTestCase):
         self.age_source()
         registry.release(self.db, "dev", "runner", self.lease["lease_epoch"])
         self.control = self.detect_loss()[0]
+        # The loss happened one detection window ago: readings of the return
+        # must fall after it, as they do on a real host that stayed lost.
+        self.db.execute("UPDATE host_lifecycle "
+                        "SET updated_at=clock_timestamp()-interval '900 seconds' "
+                        "WHERE host='source'")
 
     def age_source(self):
-        self.db.execute("UPDATE host_resources SET sampled_at=clock_timestamp()-interval '10 minutes' "
+        self.db.execute("UPDATE host_resources SET sampled_at=clock_timestamp()-interval '1000 seconds' "
                         "WHERE host='source'")
 
     def detect_loss(self):
@@ -36,6 +43,15 @@ class HostReconcileTest(PgTestCase):
 
     def fresh(self):
         return self.api.hosts.record({"host": "source", "gate_state": "available"})
+
+    def returned(self, *, span=200, middle=100):
+        """A sustained return: two readings in the detection window, then a fresh one."""
+        self.db.execute(
+            "INSERT INTO host_resources(host, sampled_at, gate_state) VALUES "
+            "('source', clock_timestamp()-make_interval(secs=>%s), 'available'), "
+            "('source', clock_timestamp()-make_interval(secs=>%s), 'available')",
+            (span, middle))
+        return self.fresh()
 
     def reconcile(self, *, actor="runner-peer@target", fresh_within=180):
         return self.api.host_lifecycle.reconcile_loss(
@@ -63,8 +79,16 @@ class HostReconcileTest(PgTestCase):
     def test_gate_state_names_lost_instead_of_draining(self):
         self.assertEqual(self.api.hosts.latest("source")["gate_state"], "lost")
 
+    def test_lost_stays_closed_for_the_placement_reader(self):
+        # The only functional reader of the field, in this tree and in 1.16.0,
+        # opens on `available` alone: an unknown value stays closed.
+        from ameesh import relocation
+        latest = self.api.hosts.latest("source")
+        self.assertEqual(latest["gate_state"], "lost")
+        self.assertFalse(relocation.gate_open(dict(latest, sampled_ts=time.time()), None))
+
     def test_verified_proof_reopens_claims_and_traces_actor_and_evidence(self):
-        self.fresh()
+        self.returned()
         result = self.reconcile()
         self.assertTrue(result["reconciled"], result)
         row = self.api.host_lifecycle.get("source")
@@ -82,14 +106,38 @@ class HostReconcileTest(PgTestCase):
         self.assertGreaterEqual(event["data"]["fresh_ts"], event["data"]["lost_ts"])
         self.assertLessEqual(event["data"]["first_fresh_ts"], event["data"]["fresh_ts"])
         self.assertGreater(event["data"]["first_fresh_ts"], event["data"]["lost_ts"])
+        self.assertEqual(event["data"]["readings"], 3)
         self.assertEqual(event["data"]["checks"],
-                         ["fresh_reading", "agents_home", "no_live_lease",
-                          "no_active_handoff", "no_recovery_attempt"])
+                         ["fresh_reading", "sustained_readings", "no_reading_gap",
+                          "agents_home", "no_live_lease", "no_active_handoff",
+                          "no_recovery_attempt"])
 
-    def test_fresh_reading_alone_does_not_reopen(self):
+    def test_a_single_fresh_reading_does_not_reopen(self):
         self.fresh()
+        result = self.reconcile()
+        self.assertFalse(result["reconciled"])
+        self.assertEqual(result["missing"], ["sustained_readings"])
         self.assertEqual(self.api.host_lifecycle.get("source")["mode"], "lost")
         self.assertIsNone(registry.claim(self.db, "dev", "runner", ttl_seconds=300))
+
+    def test_a_short_history_does_not_reopen(self):
+        self.db.execute("INSERT INTO host_resources(host, sampled_at, gate_state) "
+                        "VALUES ('source', clock_timestamp()-interval '100 seconds', 'available')")
+        self.fresh()
+        self.assertEqual(self.reconcile()["missing"], ["sustained_readings"])
+
+    def test_a_hole_as_large_as_the_window_does_not_reopen(self):
+        self.db.execute("INSERT INTO host_resources(host, sampled_at, gate_state) "
+                        "VALUES ('source', clock_timestamp()-interval '200 seconds', 'available')")
+        self.fresh()
+        self.assertEqual(self.reconcile()["missing"], ["reading_gap"])
+
+    def test_a_future_reading_is_refused(self):
+        self.returned()
+        self.db.execute("UPDATE host_resources SET sampled_at=clock_timestamp()+interval '1 hour' "
+                        "WHERE host='source'")
+        self.assertEqual(self.reconcile()["missing"], ["future_reading"])
+        self.assertEqual(self.api.host_lifecycle.get("source")["mode"], "lost")
 
     def test_missing_fresh_reading_is_a_named_refusal(self):
         result = self.reconcile()
@@ -98,14 +146,14 @@ class HostReconcileTest(PgTestCase):
         self.assertEqual(self.api.host_lifecycle.get("source")["mode"], "lost")
 
     def test_stale_fresh_reading_beyond_the_threshold_is_refused(self):
-        self.fresh()
+        self.returned()
         self.db.execute("UPDATE host_resources SET sampled_at=clock_timestamp()-interval '5 minutes' "
                         "WHERE host='source'")
         result = self.reconcile()
         self.assertEqual(result["missing"], ["fresh_reading"])
 
     def test_agent_moved_elsewhere_keeps_the_host_closed(self):
-        self.fresh()
+        self.returned()
         self.db.execute("UPDATE agent_registry SET host='target' WHERE name='dev'")
         result = self.reconcile()
         self.assertFalse(result["reconciled"])
@@ -113,7 +161,7 @@ class HostReconcileTest(PgTestCase):
         self.assertEqual(self.api.host_lifecycle.get("source")["mode"], "lost")
 
     def test_live_lease_keeps_the_host_closed(self):
-        self.fresh()
+        self.returned()
         self.db.execute("UPDATE agent_registry SET lease_owner='runner', "
                         "lease_expires_at=clock_timestamp()+interval '5 minutes' WHERE name='dev'")
         result = self.reconcile()
@@ -121,33 +169,69 @@ class HostReconcileTest(PgTestCase):
         self.assertEqual(self.api.host_lifecycle.get("source")["mode"], "lost")
 
     def test_fenced_agent_keeps_the_host_closed(self):
-        self.fresh()
+        self.returned()
         self.db.execute("UPDATE agent_registry SET handoff_fenced=true WHERE name='dev'")
         result = self.reconcile()
         self.assertIn("handoff_fenced:dev", result["missing"])
 
     def test_active_handoff_keeps_the_host_closed(self):
-        self.fresh()
+        self.returned()
         self.add_handoff(state="planned")
         result = self.reconcile()
         self.assertIn("active_handoff:dev", result["missing"])
         self.assertEqual(self.api.host_lifecycle.get("source")["mode"], "lost")
 
     def test_recovery_attempt_since_the_loss_keeps_the_host_closed(self):
-        self.fresh()
+        self.returned()
         self.add_handoff(state="verified", evidence={"source_recovered": True})
         result = self.reconcile()
         self.assertIn("recovery_attempted:dev", result["missing"])
         self.assertEqual(self.api.host_lifecycle.get("source")["mode"], "lost")
 
+    def test_recovery_committed_while_reconcile_waits_is_seen_under_the_gate(self):
+        self.returned()
+        started, out = threading.Event(), []
+
+        def waiter():
+            other = db_mod.connect(self.cfg)
+            try:
+                started.set()
+                out.append(storage.of(other).host_lifecycle.reconcile_loss(
+                    "source", actor="runner-peer@target", fresh_within=180))
+            finally:
+                other.close()
+
+        thread = threading.Thread(target=waiter, daemon=True)
+        with self.db.transaction() as tx:
+            tx.query("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                     ("host-gate:source",))
+            thread.start()
+            self.assertTrue(started.wait(5))
+            thread.join(0.1)
+            self.assertTrue(thread.is_alive(), "reconciliation must wait on the host gate")
+            # The recovery commits while reconciliation waits on the same gate;
+            # the proof is read again under the lock and sees it.
+            tx.execute(
+                "INSERT INTO host_handoffs(id,agent,source,target,state,plan,evidence,"
+                "memory_bytes,disk_bytes,reserved_until) VALUES ('op-3035','dev','source',"
+                "'target','prepared',%s::jsonb,%s::jsonb,1,1,"
+                "clock_timestamp()+interval '5 minutes')",
+                (json.dumps({"reason": "host_loss"}),
+                 json.dumps({"source_recovered": True})))
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(out[0]["reconciled"])
+        self.assertIn("recovery_attempted:dev", out[0]["missing"])
+        self.assertEqual(self.api.host_lifecycle.get("source")["mode"], "lost")
+
     def test_recovery_attempt_before_this_loss_does_not_block_it(self):
-        self.fresh()
+        self.returned()
         self.add_handoff(state="verified", evidence={"source_recovered": True}, age="1 day")
         result = self.reconcile()
         self.assertTrue(result["reconciled"], result)
 
     def test_reconciliation_is_idempotent(self):
-        self.fresh()
+        self.returned()
         self.assertTrue(self.reconcile()["reconciled"])
         again = self.reconcile()
         self.assertFalse(again["reconciled"])
@@ -158,7 +242,7 @@ class HostReconcileTest(PgTestCase):
             "AND object='host:source'", (self.event_base,))[0]["n"], 1)
 
     def test_runner_lifecycle_pass_reconciles_a_returning_host(self):
-        self.fresh()
+        self.returned()
         runner = object.__new__(Runner)
         runner.runner_id = "runner-mty-x@peer"
         runner.cfg = self.cfg
@@ -175,7 +259,7 @@ class HostReconcileTest(PgTestCase):
         impl.assert_called_once_with(["reconcile", "source"])
 
     def test_module_reconcile_uses_the_session_corrector(self):
-        self.fresh()
+        self.returned()
         with mock.patch.object(host_lifecycle.work, "corrector",
                                return_value="human:smichea") as corrector:
             result = host_lifecycle.reconcile(self.cfg, self.db, "source")
@@ -184,7 +268,6 @@ class HostReconcileTest(PgTestCase):
         self.assertEqual(self.api.host_lifecycle.get("source")["actor"], "human:smichea")
 
     def test_command_refuses_then_reopens_with_its_actor(self):
-        from ameesh import db as db_mod
         real_connect = db_mod.connect
 
         def connect(_cfg):
@@ -198,7 +281,7 @@ class HostReconcileTest(PgTestCase):
                 refused = host_lifecycle.main(["reconcile", "source"])
             self.assertEqual(refused, 1)
             self.assertIn("fresh_reading", out.getvalue())
-            self.fresh()
+            self.returned()
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 reopened = host_lifecycle.main(["reconcile", "source"])

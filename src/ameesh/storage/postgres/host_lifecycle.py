@@ -169,12 +169,15 @@ class HostLifecycle(interface.HostLifecycle):
     def reconcile_loss(self, host, *, actor, fresh_within):
         """#3035: reopen a lost host only after a proof that no second executor exists.
 
-        The gate lock is the same one loss publication, claims and enable take:
-        a reading or a recovery effect cannot interleave between the checks and
-        the `lost -> returning -> available` transition. Recovery evidence is a
-        database fact (fresh reading, origins home, no live lease, no active
-        handoff, no `recover_source` since the loss), never the returning
-        machine's own claim.
+        The gate lock is the same one loss publication, reads and
+        `promote_loss`/`recover_source` take: a reading or a recovery effect
+        cannot interleave between the checks and the `lost -> returning ->
+        available` transition. Recovery evidence is database state (readings in
+        database time, origins home, no live lease, no active handoff, no
+        `recover_source` since the loss), never the returning machine's own
+        claim. One fresh reading is not enough: the host must have published
+        continuously for at least one detection window, without a hole that
+        large, and a reading dated in the future is refused.
         """
         if not isinstance(host, str) or not host:
             raise ValueError("host required")
@@ -194,14 +197,36 @@ class HostLifecycle(interface.HostLifecycle):
                 "SELECT extract(epoch from updated_at)::float8 AS lost_ts "
                 "FROM host_lifecycle WHERE host=%s", (host,))[0]["lost_ts"]
             # Read again under the lock: `hosts.record` takes it too, so a
-            # heartbeat observed here stays fresh through the transition.
-            fresh = tx.query(
-                "SELECT max(sampled_at) >= clock_timestamp()-make_interval(secs=>%s) AS fresh, "
-                "extract(epoch from max(sampled_at))::float8 AS fresh_ts "
-                "FROM host_resources WHERE host=%s", (fresh_within, host))[0]
-            if fresh["fresh"] is not True:
+            # heartbeat observed here stays fresh through the transition. All
+            # comparisons use database time; a host clock never proves return,
+            # and a reading dated in the future is refused outright.
+            now = tx.query(
+                "SELECT extract(epoch from clock_timestamp())::float8 AS now_ts, "
+                "extract(epoch from max(sampled_at))::float8 AS latest_ts, "
+                "coalesce(max(sampled_at) <= clock_timestamp(), true) AS not_future "
+                "FROM host_resources WHERE host=%s", (host,))[0]
+            if now["not_future"] is not True:
+                return {"host": host, "mode": "lost", "reconciled": False,
+                        "missing": ["future_reading"], "lost_ts": lost_ts}
+            if (now["latest_ts"] is None
+                    or now["now_ts"] - float(now["latest_ts"]) > fresh_within):
                 return {"host": host, "mode": "lost", "reconciled": False,
                         "missing": ["fresh_reading"], "lost_ts": lost_ts}
+            # Hysteresis: a single isolated reading must not reopen a host that
+            # oscillates. The readings after the loss must cover a full
+            # detection window, with no hole as large as that window.
+            readings = tx.query(
+                "SELECT extract(epoch from sampled_at)::float8 AS at_ts "
+                "FROM host_resources WHERE host=%s AND sampled_at > to_timestamp(%s) "
+                "AND sampled_at <= clock_timestamp() ORDER BY sampled_at", (host, lost_ts))
+            times = [float(row["at_ts"]) for row in readings]
+            if len(times) < 2 or now["now_ts"] - times[0] < fresh_within:
+                return {"host": host, "mode": "lost", "reconciled": False,
+                        "missing": ["sustained_readings"], "lost_ts": lost_ts}
+            if any(later - earlier > fresh_within
+                   for earlier, later in zip(times, times[1:])):
+                return {"host": host, "mode": "lost", "reconciled": False,
+                        "missing": ["reading_gap"], "lost_ts": lost_ts}
 
             missing = []
             # Every execute agent of the host, not only the recorded origins:
@@ -212,7 +237,10 @@ class HostLifecycle(interface.HostLifecycle):
                 "AND r.lease_expires_at > clock_timestamp() ORDER BY name FOR UPDATE", (host,))
             missing.extend("live_lease:" + row["name"] for row in live)
             # An active handoff of any age still owns a destination reservation
-            # and may be about to switch; reopening would leave it held.
+            # and may be about to switch; reopening would leave it held. This
+            # read is under the same gate lock as `promote_loss` and
+            # `recover_source`, so a recovery commits before or after us, never
+            # in the middle of the proof.
             active = tx.query(
                 "SELECT id, agent FROM host_handoffs WHERE source=%s "
                 "AND state NOT IN ('verified','cancelled') ORDER BY id", (host,))
@@ -264,10 +292,7 @@ class HostLifecycle(interface.HostLifecycle):
                 raise ValueError("lost host return proof changed during reconciliation")
             # #3035: the first reading after the loss is the start of the
             # measured recovery (fresh reading -> first lease taken).
-            first_fresh = tx.query(
-                "SELECT extract(epoch from min(sampled_at))::float8 AS first_fresh_ts "
-                "FROM host_resources WHERE host=%s AND sampled_at > to_timestamp(%s)",
-                (host, lost_ts))[0]["first_fresh_ts"]
+            first_fresh = times[0]
             evidence = {
                 "generation": control["generation"],
                 "actor": actor,
@@ -276,10 +301,12 @@ class HostLifecycle(interface.HostLifecycle):
                 "to": "available",
                 "lost_ts": lost_ts,
                 "first_fresh_ts": first_fresh,
-                "fresh_ts": fresh["fresh_ts"],
+                "fresh_ts": now["latest_ts"],
+                "readings": len(times),
                 "agents": [row["name"] for row in origins],
-                "checks": ["fresh_reading", "agents_home", "no_live_lease",
-                           "no_active_handoff", "no_recovery_attempt"],
+                "checks": ["fresh_reading", "sustained_readings", "no_reading_gap",
+                           "agents_home", "no_live_lease", "no_active_handoff",
+                           "no_recovery_attempt"],
             }
             tx.execute(
                 "INSERT INTO ameesh_events(type,object,project,data) "

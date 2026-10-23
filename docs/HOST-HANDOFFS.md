@@ -138,15 +138,17 @@ its automatic return timer is removed. A new heartbeat does not reopen
 claims on a lost host.
 `undrain` refuses a lost host; the planned-return path cannot bypass the
 recovery proof. A returning machine stays withdrawn until a verified
-reconciliation proves a fresh reading, every origin agent still home with no
-live lease, no fence and no active handoff, and no `recover_source` attempt
-since the loss. The next lifecycle pass of a healthy runner, or
-`ameesh host reconcile HOST`, then records `lost -> returning -> available`
-with its actor and evidence in the event log. A new heartbeat alone does not
-reopen claims, and an agent moved elsewhere by a recovery keeps the automatic
-proof closed. `ameesh_host_gate_state` names a lost host `lost` (the generic
-`draining` it used to return hid the bound). Lost-host recovery moves agents
-forward rather than restoring an uncertain source executor.
+reconciliation proves a sustained fresh reading history in database time
+(covering one detection window without a hole, and no reading dated in the
+future), every origin agent still home with no live lease, no fence and no
+active handoff, and no `recover_source` attempt since the loss. The next
+lifecycle pass of a healthy runner, or `ameesh host reconcile HOST`, then
+records `lost -> returning -> available` with its actor and evidence in the
+event log. A single fresh heartbeat does not reopen claims, and an agent moved
+elsewhere by a recovery keeps the automatic proof closed.
+`ameesh_host_gate_state` names a lost host `lost` (the generic `draining` it
+used to return hid the bound). Lost-host recovery moves agents forward rather
+than restoring an uncertain source executor.
 
 Detection preserves agent placement, expired leases and running-turn state;
 it is not proof that an executor has stopped. Critical agents become eligible
