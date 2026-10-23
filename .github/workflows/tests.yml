@@ -880,12 +880,16 @@ jobs:
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
         run: |
           set -euo pipefail
-          brew install postgresql@17 bash coreutils gnu-sed
+          # #3042 : `find -printf` (deploy/mise-a-jour/poste.sh) est GNU ;
+          # le banc l'exécute aussi via son faux ssh, sous macOS comme sous
+          # Linux. findutils fournit ce `find` dans libexec/gnubin.
+          brew install postgresql@17 bash coreutils gnu-sed findutils
           {
             echo "$(brew --prefix postgresql@17)/bin"
             echo "$(brew --prefix bash)/bin"
             echo "$(brew --prefix coreutils)/libexec/gnubin"
             echo "$(brew --prefix gnu-sed)/libexec/gnubin"
+            echo "$(brew --prefix findutils)/libexec/gnubin"
           } >> "$GITHUB_PATH"
       - name: base jetable (PostgreSQL dans une étape, pas un service)
         run: |
