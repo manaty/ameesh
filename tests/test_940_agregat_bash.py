@@ -1,128 +1,191 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""L940 : le check requis `tests` rougit quand une part est en échec ou annulée.
+"""L940/#3251 : le check requis `tests` ne verdit jamais muet.
 
-Sous `bash -e`, `test A || { test B && test C; }` ne fait pas sortir le script
-quand A est faux : l'échec est dans une liste `&&`, exemptée de `-e`, le groupe
-rend 1 et le script continue. Le job `tests` — seul check exigé par la
-protection de main — concluait donc SUCCESS avec une part psql en échec ou
-annulée (production : run 38357567337, job tests 115330451235, log
-« psql : cancelled (parts [1]) », SUCCESS).
+#940 (13/10/2026) : une part psql annulée concluait `tests` SUCCESS sans
+qu'aucun test n'ait tourné — un vert muet, fusionné. La garde bash d'alors
+exigeait `success` de chaque part, ce qui a rendu rouge toute annulation
+interne.
 
-Ce contrat rejoue le script exact du job, substitué pour chaque scénario, sous
-`bash -e` : aucun accès base, aucune suite.
+#3251 (décision owner #128512, 23/10, option a) déplace la frontière : un
+non-concluant **à l'intérieur** d'un agrégat qui a conclu n'est pas bloquant
+(canon §3), mais l'agrégat doit le dire. L'étape « bilan des parts » appelle
+`scripts/ci-agregat.py`, qui :
+
+* rougit `tests` sur un **échec** prouvé, une part sautée qui devait tourner
+  ou un plan refusé (inchangé, #940) ;
+* laisse `tests` vert sur une **annulation interne** (capacité hébergée,
+  runner perdu) et publie le check de détail `tests (bilan des parts)` en
+  `neutral`, que fire/radar consignent ;
+* échoue si l'annulation ne peut pas être consignée (jeton en lecture seule,
+  API en panne) : jamais de SUCCESS muet.
+
+Ce contrat vérifie l'étape du workflow (chaque résultat passé au classifieur,
+plus aucune garde bash) et rejoue les deux issues qui font #940 : l'échec
+réel rougit, l'annulation ne verdit pas sans consignation.
 """
 from __future__ import annotations
 
+import importlib.util
 import pathlib
 import re
-import subprocess
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 WORKFLOW = REPO / ".github" / "workflows" / "tests.yml"
-_STEP = "      - name: bilan des parts\n        run: |\n"
+_STEP = "      - name: bilan des parts\n"
+_RUN = "        run: |\n"
 _EXPR = re.compile(r"\$\{\{\s*(.*?)\s*\}\}")
 
 
-def job_script() -> str:
-    """Le `run` de l'étape « bilan des parts » du job `tests`, dé-indenté."""
+def _charger():
+    spec = importlib.util.spec_from_file_location(
+        "ci_agregat_l940", REPO / "scripts" / "ci-agregat.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+agregat = _charger()
+
+
+def step_block() -> str:
+    """Le texte exact de l'étape « bilan des parts » (nom, env, run)."""
     text = WORKFLOW.read_text(encoding="utf-8")
     try:
-        start = text.index(_STEP) + len(_STEP)
+        start = text.index(_STEP)
     except ValueError:  # pragma: no cover - dépend du fichier
         raise AssertionError("étape « bilan des parts » introuvable dans tests.yml")
+    end = text.index("\n      - ", start + len(_STEP)) + 1
+    return text[start:end]
+
+
+def job_script() -> str:
+    """Le `run` de l'étape, dé-indenté (les `env:` éventuels sont sautés)."""
+    block = step_block()
+    try:
+        start = block.index(_RUN) + len(_RUN)
+    except ValueError:  # pragma: no cover - dépend du fichier
+        raise AssertionError("bloc `run: |` introuvable dans l'étape « bilan des parts »")
     lines = []
-    for line in text[start:].splitlines():
+    for line in block[start:].splitlines():
         if line.strip() and not line.startswith("          "):
             break
         lines.append(line[10:] if line.startswith("          ") else "")
     script = "\n".join(lines) + "\n"
-    assert "needs.psql.result" in script, "script extrait vide ou déplacé"
+    assert "ci-agregat.py" in script, "script extrait vide ou déplacé"
     return script
 
 
-def scenario(**over: str) -> str:
-    """Le script avec chaque expression remplacée ; refuse une expression inconnue."""
-    values = {
-        "needs.plan.result": "success",
-        "needs.plan.outputs.version_only": "false",
-        "needs.plan.outputs.docs_only": "false",
-        "needs.plan.outputs.psycopg": "[1, 2]",
-        "needs.plan.outputs.psql": "[1]",
-        "needs.doc-readers.result": "success",
-        "needs.psycopg.result": "success",
-        "needs.psql.result": "success",
-        "needs.platform-macos.result": "success",
-        "needs.fs-class.result": "success",
-        "needs.version.result": "success",
-        "github.event_name": "pull_request",
+class WorkflowContractTest(unittest.TestCase):
+    """L'étape passe les résultats au classifieur, sans garde bash parallèle."""
+
+    #: chaque résultat lu par le classifieur, et l'argument qui le porte
+    ARGS = {
+        "github.event_name": "--event",
+        "needs.plan.result": "--plan",
+        "needs.version.result": "--version",
+        "needs.plan.outputs.version_only": "--version-only",
+        "needs.plan.outputs.docs_only": "--docs-only",
+        "needs.doc-readers.result": "--doc-readers",
+        "needs.psycopg.result": "--psycopg",
+        "needs.plan.outputs.psycopg": "--psycopg-parts",
+        "needs.psql.result": "--psql",
+        "needs.plan.outputs.psql": "--psql-parts",
+        "needs.platform-macos.result": "--plateforme-macos",
+        "needs.fs-class.result": "--autre-fs",
     }
-    values.update(over)
 
-    def repl(match):
-        expr = match.group(1)
-        if expr not in values:
-            raise AssertionError("expression non couverte par le contrat : %s" % expr)
-        return values[expr]
+    #: les sorties de plan (JSON) sont citées en simple, le reste en double
+    SINGLE = {"needs.plan.outputs.psycopg", "needs.plan.outputs.psql"}
 
-    return _EXPR.sub(repl, job_script())
+    def test_chaque_resultat_est_passe_au_classifieur(self):
+        script = job_script()
+        for expr, flag in self.ARGS.items():
+            quote = "'" if expr in self.SINGLE else '"'
+            with self.subTest(expr=expr):
+                self.assertIn("%s %s${{ %s }}%s" % (flag, quote, expr, quote), script)
+
+    def test_l_etape_publie_le_detail(self):
+        script = job_script()
+        self.assertIn("--publish", script)
+        self.assertIn("GH_TOKEN", step_block())
+
+    def test_plus_aucune_garde_bash_ne_classe_les_parts(self):
+        # #940 : les gardes `test ... = success || { ... }` sous bash -e
+        # avalaient l'échec de la branche gauche du `&&`. Le classifieur les
+        # remplace : aucune comparaison de résultat de job ne reste en shell.
+        script = job_script()
+        for expr in self.ARGS:
+            if expr.startswith("needs."):
+                self.assertNotRegex(script, r'test\s+"\$?\{\{\s*%s\s*\}\}"'
+                                    % re.escape(expr))
+        self.assertNotIn("|| {", script)
+
+    def test_chaque_expression_du_script_est_couverte(self):
+        seen = set(_EXPR.findall(job_script()))
+        self.assertEqual(seen - set(self.ARGS), set())
+
+    def test_le_script_du_bilan_est_present_avant_l_etape(self):
+        # #3251 : le bilan exécute `scripts/ci-agregat.py`, donc le dépôt doit
+        # être extrait avant l'étape. Sans ce checkout, un runner neuf n'a pas
+        # le script : l'agrégat requis rougit sur tout run.
+        text = WORKFLOW.read_text(encoding="utf-8")
+        job = text[text.index("\n  tests:\n"):]
+        before = job[:job.index(_STEP)]
+        self.assertIn("- uses: actions/checkout@v4", before)
 
 
-def run_script(script: str) -> subprocess.CompletedProcess:
-    """Le script exact sous `bash -e` (le shell des étapes GitHub)."""
-    return subprocess.run(["bash", "-e", "-c", script], cwd=REPO,
-                          capture_output=True, text=True)
+class SilentSuccessTest(unittest.TestCase):
+    """#940 : une annulation ne verdit jamais sans consignation publiée."""
 
+    class FakeGh:
+        def __init__(self, fail=False):
+            self.fail, self.created = fail, []
 
-class AggregateGuardTest(unittest.TestCase):
+        def create(self, name, conclusion, title, summary):
+            if self.fail:
+                raise agregat.AgregatError("jeton en lecture seule")
+            self.created.append((name, conclusion))
+            return 1
 
-    def test_le_contrat_couvre_toutes_les_expressions(self):
-        # scenario() lève si une expression du workflow n'a pas de valeur
-        self.assertIn("psql    : success", scenario())
+    def run_main(self, rules, gh=None) -> int:
+        args = ["--event", "pull_request", "--plan", "success",
+                "--version", "success", "--version-only", "false",
+                "--docs-only", "false", "--doc-readers", "skipped",
+                "--psycopg", "success", "--psycopg-parts", "[1]",
+                "--publish"]
+        args += rules
+        return agregat.main(args, gh=gh)
 
-    def test_vert_quand_tout_reussit(self):
-        self.assertEqual(run_script(scenario()).returncode, 0)
+    def test_annulation_consignee_publie_neutral_et_ne_rougit_pas(self):
+        gh = self.FakeGh()
+        self.assertEqual(self.run_main(["--psql", "cancelled", "--psql-parts", "[1]"],
+                                       gh=gh), 0)
+        self.assertEqual(gh.created, [(agregat.DETAIL_CHECK, "neutral")])
 
-    def test_autre_fs_accepte_seulement_reussite_ou_saut_legitime(self):
-        for result in ("success", "skipped", "failure", "cancelled"):
-            with self.subTest(result=result):
-                done = run_script(scenario(**{"needs.fs-class.result": result}))
-                self.assertEqual(done.returncode == 0, result in ("success", "skipped"),
-                                 done.stdout)
+    def test_annulation_non_consignable_rougit(self):
+        # #940 : on ne peut pas verdir quand l'annulation ne peut pas être
+        # consignée. Une PR de fourche sans `checks: write` reste rouge.
+        self.assertEqual(self.run_main(["--psql", "cancelled", "--psql-parts", "[1]"],
+                                       gh=self.FakeGh(fail=True)), 2)
 
-    def test_psql_en_echec_rougit_le_job(self):
-        done = run_script(scenario(**{"needs.psql.result": "failure"}))
-        self.assertNotEqual(done.returncode, 0, done.stdout)
+    def test_echec_reel_rougit_et_publie_failure(self):
+        gh = self.FakeGh()
+        self.assertEqual(self.run_main(["--psql", "failure", "--psql-parts", "[1]"],
+                                       gh=gh), 1)
+        self.assertEqual(gh.created, [(agregat.DETAIL_CHECK, "failure")])
 
-    def test_psql_annule_rougit_le_job(self):
-        done = run_script(scenario(**{"needs.psql.result": "cancelled"}))
-        self.assertNotEqual(done.returncode, 0, done.stdout)
+    def test_vert_complet_publie_success(self):
+        gh = self.FakeGh()
+        self.assertEqual(self.run_main(["--psql", "success", "--psql-parts", "[1]"],
+                                       gh=gh), 0)
+        self.assertEqual(gh.created, [(agregat.DETAIL_CHECK, "success")])
 
-    def test_psql_saute_sans_part_reste_legitime(self):
-        done = run_script(scenario(**{"needs.psql.result": "skipped",
-                                      "needs.plan.outputs.psql": "[]"}))
-        self.assertEqual(done.returncode, 0, done.stdout)
-
-    def test_psql_saute_avec_des_parts_rougit_le_job(self):
-        done = run_script(scenario(**{"needs.psql.result": "skipped"}))
-        self.assertNotEqual(done.returncode, 0, done.stdout)
-
-    def test_psycopg_en_echec_rougit_le_job(self):
-        done = run_script(scenario(**{"needs.psycopg.result": "failure"}))
-        self.assertNotEqual(done.returncode, 0, done.stdout)
-
-    def test_version_sautee_sur_une_pr_rougit_le_job(self):
-        done = run_script(scenario(**{"needs.version.result": "skipped"}))
-        self.assertNotEqual(done.returncode, 0, done.stdout)
-
-    def test_version_sautee_sur_main_reste_legitime(self):
-        done = run_script(scenario(**{"needs.version.result": "skipped",
-                                      "github.event_name": "push"}))
-        self.assertEqual(done.returncode, 0, done.stdout)
-
-    def test_version_en_echec_rougit_le_job(self):
-        done = run_script(scenario(**{"needs.version.result": "failure"}))
-        self.assertNotEqual(done.returncode, 0, done.stdout)
+    def test_vert_sans_publication_reste_vert(self):
+        # Une PR de fourche n'a pas `checks: write` : sans annulation, rien
+        # ne doit être consigné, la publication en échec ne rougit pas.
+        self.assertEqual(self.run_main(["--psql", "success", "--psql-parts", "[1]"],
+                                       gh=self.FakeGh(fail=True)), 0)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -174,8 +174,9 @@ agents) et journalise le premier refus :
 ## Contrat CI
 
 `train_contracts.ameesh()` épingle les blobs de `.github/workflows/paquet.yml`
-(le run appelant), `.github/workflows/tests.yml` (le workflow appelé) et des
-planificateurs (`test-plan.py`, `test-parts.py`, `ci-flow.py`, `map.py`). La
+(le run appelant), `.github/workflows/tests.yml` (le workflow appelé), du
+classifieur de l'agrégat (`ci-agregat.py`, #3251) et des planificateurs
+(`test-plan.py`, `test-parts.py`, `ci-flow.py`, `map.py`). La
 preuve est le run `push` de `paquet.yml` à la tête exacte : il doit référencer
 `tests.yml` au même SHA et porter les jobs appelés, préfixés par le job
 appelant (`suite complète du paquet / plan`, `… / psycopg 4/8`, `… / tests`) :

@@ -97,8 +97,11 @@ class MacosShortJobTest(unittest.TestCase):
         needs = re.search(r"(?m)^    needs: \[(.*)\]$", aggregate)
         self.assertIsNotNone(needs, "job tests : ligne needs introuvable")
         self.assertIn("platform-macos", needs.group(1).split(", "))
-        self.assertIn('test "${{ needs.platform-macos.result }}" = success',
-                      aggregate)
+        # #3251 : le résultat du job est lu par le classifieur de l'agrégat
+        # (une annulation se consigne, un échec rougit), pas par une garde
+        # bash `= success`.
+        self.assertIn(
+            '--plateforme-macos "${{ needs.platform-macos.result }}"', aggregate)
         self.assertNotIn("continue-on-error: true", self.job)
 
 

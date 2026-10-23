@@ -97,7 +97,7 @@ class WorkflowFsClassTest(unittest.TestCase):
         besoins = re.search(r"^    needs: \[(.*?)\]$", self.agrege, re.M)
         self.assertIsNotNone(besoins, "job tests sans liste needs")
         self.assertIn("fs-class", [nom.strip() for nom in besoins.group(1).split(",")])
-        self.assertIn(
-            'test "${{ needs.fs-class.result }}" = success '
-            '|| test "${{ needs.fs-class.result }}" = skipped',
-            self.agrege)
+        # #3251 : le classifieur de l'agrégat lit le résultat de la part (un
+        # échec bloque, un saut hors release reste légitime, une annulation
+        # se consigne) ; le contrat de l'étape passe la sortie telle quelle.
+        self.assertIn('--autre-fs "${{ needs.fs-class.result }}"', self.agrege)
