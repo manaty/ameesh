@@ -1449,6 +1449,11 @@ class WorkItems(Domain):
         """L118c: journaled project correction, atomically with its old value."""
 
     @abc.abstractmethod
+    def set_type(self, item_id: int, type: str, *, current: str, actor: str) -> dict | None:
+        """#2954: journaled lot type correction, if the lot still carries
+        `current` (compare-and-set, no lost concurrent correction)."""
+
+    @abc.abstractmethod
     def without_project(self) -> list[dict]:
         """L118c: open lots with empty app, once per id, including waiting_human."""
 
@@ -1466,7 +1471,7 @@ class WorkItems(Domain):
             estimate_source: str | None = None, change_size: str | None = None,
             queued_note: str | None = None, forced_note: str | None = None,
             mark_item_id: int | None = None, mark_note: str = "",
-            parent_lot: int | None = None) -> dict:
+            parent_lot: int | None = None, unique_ref: bool = False) -> dict:
         """Crée le lot en `intake` (rattaché à une fiche WorkPackage si
         `package_id`, L29 ; avec sa branche si `branch`, L118 ; sa priorité
         si `priority`, L130 ; avec sa durée estimée et sa ligne d'historique
@@ -1493,6 +1498,13 @@ class WorkItems(Domain):
         **same** transaction — a blocking edge if the parent is still open, a
         journal trace if it is already finished, everything rolled back if it
         is unknown.
+
+        `unique_ref` (#2954): with an `issue_ref`, take a transaction advisory
+        lock on the reference and refuse the creation (`DbError`) when any lot,
+        whatever its state, already carries it. Two hosts creating the incident
+        of the same run serialize: the second sees the first and the caller
+        re-reads the winner. Off by default: several lots may legitimately
+        share a reference except where the identity is one per execution.
 
         L'ordre des verrous est commun avec `assign` (#540, revue R1 delta) :
         les lignes de lots d'abord (`mark_item_id` et `parent_lot`, par
@@ -3611,6 +3623,19 @@ class HostLifecycle(Domain):
     def detect_losses(self, *, actor: str, older_than: int,
                       critical: Sequence[str] = ()) -> list[dict]:
         """Close stale known hosts atomically; loss is not a quiescence proof."""
+
+    @abc.abstractmethod
+    def reconcile_loss(self, host: str, *, actor: str, fresh_within: int) -> dict:
+        """Reopen a lost host only on a verified proof.
+
+        Readings in database time must cover at least `fresh_within` without a
+        hole that large, with no reading dated in the future; every origin
+        agent must still be home and unfenced, with no live lease, no active
+        handoff and no `recover_source` attempt since the loss. The transition
+        `lost -> returning -> available` is atomic and leaves its actor and
+        evidence in `ameesh_events`. Returns `{"host", "mode", "reconciled",
+        "missing", ...}`; a refusal names the missing proof.
+        """
 
 
 class HostResources(Domain):

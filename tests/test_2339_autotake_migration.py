@@ -27,6 +27,10 @@ class LogTest(unittest.TestCase):
         state.host_gate = None
         state.take_interval = 1
         state._take_next = 0
+        # L165 (EP2) : `sweep` publie les scores de rôles puis purge les
+        # libertés d'élection observées ; la doublure n'en a aucune.
+        state.role_evaluation_once = lambda: None
+        state._election_free_since = {}
         state.take_pass.side_effect = db_mod.DbError(
             'column x does not exist\nDETAIL: ' + 'x' * 500, sqlstate='42P01')
         with mock.patch.object(runner, 'log_async') as log, \

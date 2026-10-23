@@ -4929,6 +4929,7 @@
     "set_estimate",
     "set_issue_ref",
     "set_partial_seen",
+    "set_type",
     "timeline",
     "turn_spans",
     "unassign",
@@ -4984,6 +4985,7 @@
     "get",
     "listing",
     "progress",
+    "reconcile_loss",
     "undrain"
    ],
    "github_watch": [
