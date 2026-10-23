@@ -255,6 +255,12 @@ IDLE_PROMPT = (
     "take up your assignment (board, workstream). If you have nothing to do, "
     "say so with agent-mail send orchestrateur, then stop."
 )
+#: #3033 : l'en-tête des avis dus, ajouté à `IDLE_PROMPT` quand il y en a —
+#: un agent qui en doit un n'est pas « disponible »
+IDLE_REVIEWS_HEADER = (
+    "Reviews you owe (designated at a freeze, no verdict of yours on its head): "
+    "render them before declaring yourself available."
+)
 #: #1270 : reprise cadencée d'un tour tombé sur une panne passagère du
 #: fournisseur, quand ce tour ne laissait aucune consigne en attente (courrier,
 #: événements, reprise : le courrier est soldé au lancement)

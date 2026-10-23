@@ -57,8 +57,9 @@ class TableTest(unittest.TestCase):
 
     def test_seules_les_etapes_des_evenements_sont_mesurees(self):
         mesurees = {s.key for s in slo.STEPS if s.measured}
+        # #3033 : `green_verdict` est mesurée depuis la désignation au gel
         self.assertEqual(mesurees, {"signal_assigned", "intake_started",
-                                    "build_quiet", "verdict_merge"})
+                                    "build_quiet", "green_verdict", "verdict_merge"})
         for step in slo.STEPS:
             if not step.measured:
                 self.assertEqual(step.source, slo.EXTERNAL, step.key)

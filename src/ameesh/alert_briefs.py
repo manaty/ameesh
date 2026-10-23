@@ -300,7 +300,8 @@ def _slo_breach(alert: dict) -> str:
                alert.get("lot_state") or "?", step,
                sous_utilisation._duration(alert.get("value") or 0),
                sous_utilisation._duration(alert.get("threshold") or 0),
-               ", assigned to %s" % who if who else ", unassigned"))
+               (", owed by reviewer %s" % who if alert.get("step") == "green_verdict"
+                else ", assigned to %s" % who if who else ", unassigned")))
     # #2016 : quand la commande est proposée, elle porte le titulaire lu
     # (`--if-holder`) : le pilote ou le bureau parti de ce brief est refusé si
     # le lot a changé de main entre-temps, au lieu d'écraser le premier geste.
@@ -371,6 +372,26 @@ def _slo_breach(alert: dict) -> str:
             move = ("pilot: the lot is `blocked` and waits for its unblock/decision — "
                     "do not reassign its holder; unblock it or record the decision "
                     "(ameesh work note %d \"hold: <reason>\")" % lot)
+    elif alert.get("step") == "green_verdict":
+        # #3033 : l'avis est dû par le relecteur désigné, pas par le porteur ;
+        # le geste est de rendre le verdict, puis de remplacer le relecteur.
+        sha = str(alert.get("sha") or "")
+        verdict = "ameesh work milestone %d verdict ok|blocked --sha %s" % (
+            lot, sha or "<frozen sha>")
+        if level >= 3:
+            move = ("bureau or auditor: the pilot has not replaced reviewer %s — designate "
+                    "another reviewer of an independent family now (ameesh work reviewer "
+                    "%d <agent>, then ameesh work reviewer %d %s --remove)"
+                    % (who or "?", lot, lot, who or "<reviewer>"))
+        elif level >= 2:
+            move = ("pilot: reviewer %s has not delivered the verdict — nudge them, or "
+                    "designate another reviewer of an independent family (ameesh work "
+                    "reviewer %d <agent>, then ameesh work reviewer %d %s --remove); do not "
+                    "reassign the lot's holder" % (who or "?", lot, lot, who or "<reviewer>"))
+        else:
+            move = ("reviewer %s: review the frozen head and render your verdict now (%s); "
+                    "if you cannot, tell the pilot so another reviewer is designated"
+                    % (who or "?", verdict))
     elif level >= 3:
         move = ("bureau or auditor: reassign it now to a free agent (ameesh work assign "
                 "%d <agent>%s, then agent-mail send <agent> \"…\" --lot %d); do not wait "
