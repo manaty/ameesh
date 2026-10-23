@@ -657,6 +657,12 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         slug = slug_ident[1]
     fetch_url = (fetch_url or "").strip() or ("https://github.com/%s.git" % slug)
     push_url = check_push_url(push_url or ("git@github.com:%s.git" % slug))
+    # L165 (EP4) : la fusion hors API est un geste du pilote hors base. Le bail
+    # élu est vérifié et journalisé avant la première lecture GitHub ou toute
+    # écriture ; un `--dry-run` n'agit pas et n'a rien à fencer.
+    if not dry_run:
+        from . import pilot_gesture
+        pilot_gesture.guard(cfg, db, "merge", "merge-pr #%d (lot #%d)" % (pr, lot))
     # #1003 B/P1: one repository identity, verified before the first read; a
     # divergence writes nothing and admits nothing.
     _bind_repo_identity(repo, slug, fetch_url, push_url)

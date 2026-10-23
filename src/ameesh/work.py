@@ -473,6 +473,14 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
         if get(db, parent_lot) is None:
             raise WorkError("parent lot #%d not found" % parent_lot)
     if assignee:
+        # L165 (EP4) : créer un lot déjà attribué est une attribution (le
+        # destinataire sera réveillé) ; un lot de décision (`team_queue=False`,
+        # assigné à son demandeur) n'est pas ce geste. Un humain ou un
+        # exécuteur sans session liée n'est pas concerné.
+        if team_queue:
+            from . import pilot_gesture
+            pilot_gesture.guard(cfg, db, "assign",
+                                "add for %s" % assignee, project=(app or None))
         # L46 : l'assigné enregistré est celui que la garde a normalisé
         check = check_assignee(db, assignee, externe=externe, cfg=cfg)
         assignee = check["assignee"]
@@ -1641,11 +1649,27 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
         note += "; %s (pilot, %s): %s" % (WIP_EXCEPTION_MARK, actor or UNKNOWN_ACTOR, reason)
     queued = _queued_note(check, "not assigned to %s (before: %s, now: nobody)"
                           % (check["assignee"], previous or "nobody"))
-    row = storage.of(db).work.assign(item_id, check["assignee"],
-                                     current=(None if claim and not previous else previous),
-                                     note=note, actor=actor, queued_note=queued,
-                                     forced_note=queued and _forced_note(check, note, force,
-                                                                         actor))
+    # L165 (EP4) : l'attribution est un geste du pilote hors base (elle
+    # réveille un autre agent). Le bail élu est vérifié et journalisé dans la
+    # même transaction que l'écriture ; un acteur humain ou un exécuteur sans
+    # session liée n'est pas concerné (`gate` rend None).
+    from . import pilot_gesture
+    fence = pilot_gesture.gate(cfg, db, "assign", "#%d" % item_id,
+                               project=(item.get("app") or None))
+    if fence is None:
+        row = storage.of(db).work.assign(item_id, check["assignee"],
+                                         current=(None if claim and not previous else previous),
+                                         note=note, actor=actor, queued_note=queued,
+                                         forced_note=queued and _forced_note(check, note, force,
+                                                                             actor))
+    else:
+        with db.transaction() as tx:
+            fence.hold(tx)
+            row = storage.of(tx).work.assign(
+                item_id, check["assignee"],
+                current=(None if claim and not previous else previous),
+                note=note, actor=actor, queued_note=queued,
+                forced_note=queued and _forced_note(check, note, force, actor))
     if row is None:
         if claim:
             holder = (get(db, item_id) or {}).get("assignee")
@@ -2473,6 +2497,13 @@ def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = 
     # Preserve idempotency and the closed-lot diagnostic without requiring
     # that an old clone or object still be available.
     if item["state"] not in (*MERGED_STATES, "closed"):
+        # L165 (EP4) : déclarer une fusion faite à la main est un geste du
+        # pilote hors base (le constat ferme le lot). Le bail élu est vérifié
+        # avant toute lecture de preuve ; un balayage automatique n'a pas de
+        # session liée et n'est pas concerné.
+        from . import pilot_gesture
+        pilot_gesture.guard(cfg, db, "merge", "merged #%d" % item_id,
+                            project=(item.get("app") or None))
         if pr_text:
             text, pr_ref, frozen_id = _merged_pr(
                 item, pr_text, sha=text, db=db, announce=announce)

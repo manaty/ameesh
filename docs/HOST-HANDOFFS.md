@@ -222,3 +222,32 @@ apply. A stopped host loses the role when its lease expires (the L232e timing,
 180 s by default); a returning host goes back to standby until the lease is
 free again. Candidate ranking, rank delays and hysteresis are EP2; this lot
 only makes the cross-host claim possible.
+
+## Fencing the elected pilot's gestures outside the database (L165/EP4)
+
+The epoch fences more than the runner's own writes. The effects a pilot
+prepares outside the database check the epoch first:
+
+| gesture | entry point |
+|---|---|
+| merge | `ameesh work fire` / `work merged` / `work merge-pr` |
+| merge queue | `ameesh work queue add\|remove` / `work land` |
+| assignment | `ameesh work assign` (and mail assignment through it) |
+| packet | `ameesh work packet record` / the packet train fire |
+| decision routing | `ameesh decide ask` |
+
+For an agent whose card says `releve: election`, `pilot_gesture.gate` reads
+the session's bound identity. A session that is not the live lease-holder at
+the epoch it was opened with is refused, and the message names the current
+holder, its host and its epoch. The gate renews the lease and writes a
+`pilot.gesture` event in the same database transaction, so a stale epoch
+cannot even journal the gesture; the effect follows. The event carries the
+agent, gesture, ref, epoch and host — never a token or a secret.
+
+Humans, the bureau, host-pinned agents (`releve: hote`) and runner-internal
+sweeps (no session identity: the radar landing a queue, a merge driven by a
+fire) are unchanged. This does not replace the target lease (`merge_locks`)
+or GitHub's compare-and-swap: it stops a pilot that lost the election from
+starting the gesture at all. The packet composition itself is local git work;
+what is fenced is the composition record the pilot writes and the train fire
+that follows it.

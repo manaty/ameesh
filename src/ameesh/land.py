@@ -742,6 +742,11 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
             "queue source %s does not match project %s repository; select the source "
             "project (or requeue a legacy entry without a source)"
             % (source or "<missing>", project.name))}
+    # L165 (EP4) : faire atterrir la file est un geste du pilote hors base (le
+    # push suit). Un passage radar n'a pas d'identité de session : sans bail
+    # élu à vérifier, `guard` ne fait rien.
+    from . import pilot_gesture
+    pilot_gesture.guard(cfg, db, "queue", "land #%d" % lot, project=project.name)
     projects = tuple(radar.settings_of(cfg).projects.values())
     key = lock_key(project, row["target"])
     ops = storage.of(db).work

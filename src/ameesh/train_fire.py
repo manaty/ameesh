@@ -59,6 +59,11 @@ class Fires:
 
     def give(self, plan, *, actor=None):
         who = self._pilot(actor)
+        # L165 (EP4) : le feu du train est un geste de paquet du pilote hors
+        # base (il autorisera la fusion) ; l'époque du bail élu est vérifiée
+        # avant tout reçu durable.
+        from . import pilot_gesture
+        pilot_gesture.guard(self.cfg, self.db, "packet", "train fire %s" % plan.get("id"))
         document = dict(schema="ameesh-train-fire/1", plan=json.loads(json.dumps(plan)),
                         binding=binding(plan), actor=who)
         receipt = self.ops.train_fire_give(self.ledger.key, document)
@@ -68,6 +73,9 @@ class Fires:
 
     def withdraw(self, plan, fire_id, *, actor=None):
         who = self._pilot(actor)
+        from . import pilot_gesture
+        pilot_gesture.guard(self.cfg, self.db, "packet",
+                            "train unfire %s" % plan.get("id"))
         fingerprint = binding(plan)
         current = self.ops.train_fire_read(self.ledger.key, plan["id"])
         if not current or current["id"] != fire_id or binding(current["plan"]) != fingerprint:

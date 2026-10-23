@@ -51,6 +51,13 @@ repository note `docs/HOST-HANDOFFS.md` has the full election rules.
 - **Fencing.** Renewing, starting a turn and taking a prompt all require a live
   lease. An expired lease cannot be extended; the runner has to claim again,
   with a new epoch.
+- **Fencing the pilot's gestures.** For an elected role, a merge, a merge
+  queue entry or landing, an assignment, a recorded packet composition and a
+  decision request are refused unless the session holds the live lease at its
+  own epoch. The check renews the lease and journals the gesture in the same
+  transaction; a stale session is refused, naming the current holder. Humans,
+  host-pinned agents and runner-internal sweeps are unchanged
+  (`pilot_gesture.py`, `docs/HOST-HANDOFFS.md`).
 - **Lease loss stops the harness.** The lease is renewed by a heartbeat during
   turns. If it is lost, the harness's whole process group receives `SIGKILL`
   and the turn is not counted.

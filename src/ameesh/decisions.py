@@ -605,20 +605,40 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
     }
     if source_mail is not None:
         decision["source_mail"] = int(source_mail)
-    row = storage.of(db).decisions.create(
-        sender=requester, recipient=owner or OWNER_ANY,
-        body=request_text(decision, requester=requester, owner=owner),
-        payload={PAYLOAD_KEY: decision}, work_item_id=str(lot_id), host=cfg.host)
-    decision_id = int(row["id"])
-    fil.record(cfg, db, sender=requester, recipients=[owner or OWNER_ANY],
-               text=request_text(decision, requester=requester, owner=owner,
-                                 decision_id=decision_id),
-               ts=row.get("created_ts"), project=fil.project_for(cfg, row.get("sender_project")),
-               lot=lot_id, mailbox_ids=[decision_id],
-               meta={"kind": KIND, "decision": decision_id, "urgent": True if urgent else None,
-                     "signature": "exigée" if needs_signature else None})
-    lot_state = _hold_lot(db, item, actor=requester, note="decision #%d requested from %s: %s" % (
-        decision_id, _owner_label(owner), fil.excerpt(question, 160)))
+
+    def write(tx):
+        row = storage.of(tx).decisions.create(
+            sender=requester, recipient=owner or OWNER_ANY,
+            body=request_text(decision, requester=requester, owner=owner),
+            payload={PAYLOAD_KEY: decision}, work_item_id=str(lot_id), host=cfg.host)
+        decision_id = int(row["id"])
+        fil.record(cfg, tx, sender=requester, recipients=[owner or OWNER_ANY],
+                   text=request_text(decision, requester=requester, owner=owner,
+                                     decision_id=decision_id),
+                   ts=row.get("created_ts"),
+                   project=fil.project_for(cfg, row.get("sender_project")),
+                   lot=lot_id, mailbox_ids=[decision_id],
+                   meta={"kind": KIND, "decision": decision_id,
+                         "urgent": True if urgent else None,
+                         "signature": "exigée" if needs_signature else None})
+        state = _hold_lot(tx, item, actor=requester,
+                          note="decision #%d requested from %s: %s" % (
+                              decision_id, _owner_label(owner),
+                              fil.excerpt(question, 160)))
+        return row, decision_id, state
+
+    # L165 (EP4) : router une décision vers un humain est un geste du pilote
+    # hors base (elle ouvre un tour et déplace le lot). Le bail élu est
+    # vérifié et journalisé avant la première écriture.
+    from . import pilot_gesture
+    fence = pilot_gesture.gate(cfg, db, "decision", "decision lot #%d" % lot_id,
+                               project=decision.get("project"))
+    if fence is None:
+        row, decision_id, lot_state = write(db)
+    else:
+        with db.transaction() as tx:
+            fence.hold(tx)
+            row, decision_id, lot_state = write(tx)
     out = get(db, decision_id, now) or {"id": decision_id}
     out["lot_state"] = lot_state
     return out

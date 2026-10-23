@@ -185,6 +185,10 @@ def give(db, lot: int, *, sha: str, actor: str, note: str = "", repo: str | None
     if handle is None:
         raise FireError("another fire operation holds lot #%d: retry once it is done" % lot)
     try:
+        # L165 (EP4) : le feu du pilote est un geste hors base (il arme la
+        # fusion) ; l'époque du bail élu est vérifiée et journalisée avant.
+        from . import pilot_gesture
+        pilot_gesture.guard(None, db, "merge", "fire #%d" % lot)
         return _give_locked(db, lot, sha=sha, actor=actor, note=note, repo=repo,
                             exception=exception, reason=reason)
     finally:
@@ -248,6 +252,8 @@ def withdraw(db, lot: int, *, actor: str, note: str = "", repo: str | None = Non
     if handle is None:
         raise FireError("another fire operation holds lot #%d: retry once it is done" % lot)
     try:
+        from . import pilot_gesture
+        pilot_gesture.guard(None, db, "merge", "unfire #%d" % lot)
         item = work.get(db, lot)
         if item is None:
             raise FireError("lot #%d not found" % lot)
