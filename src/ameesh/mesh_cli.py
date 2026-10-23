@@ -1618,6 +1618,12 @@ def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
             except Exception:  # noqa: BLE001 - l'affichage ne casse pas le lot
                 full = []
             item["reviewed"] = intake_neighbors.reviewed_head_of(full)
+        # #3183 : le plancher d'avis du pilote et sa source.
+        from . import review_floor
+        try:
+            item["reviews_floor"] = review_floor.of_lot(db, lot_id, cfg=cfg)
+        except Exception as exc:  # noqa: BLE001 - l'affichage ne casse pas le lot
+            item["reviews_floor"] = {"floor": None, "error": str(exc)[:200]}
         from . import plan_git
         item["freeze"] = plan_git.freeze_candidate(
             item["milestones"], repo=repo,
@@ -2020,6 +2026,14 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 if designated(item):
                     print("reviewer : %s (designated for the review, #2076)" %
                           ", ".join(designated(item)))
+            floor = item.get("reviews_floor") or {}
+            if floor.get("floor"):
+                print("floor    : %d review(s) of distinct families (by %s, %s; #3183)" % (
+                    floor["floor"], floor.get("actor") or "?",
+                    _fmt_moment(floor.get("at_ts"))))
+            elif floor.get("error"):
+                print("floor    : unreadable (%s): the gate requires two reviews"
+                      % floor["error"])
             if item.get("priority"):
                 print("priority : %s (%s)" % (
                     item["priority"], work.PRIORITY_LABELS.get(item["priority"], "?")))
@@ -2217,8 +2231,26 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("ameesh work reviewer: AGENT, --remove and --no-verdict are "
                       "mutually exclusive", file=sys.stderr)
                 return 2
+            if args.floor is not None and (args.remove or args.no_verdict):
+                print("ameesh work reviewer: --floor goes alone or with AGENT, not with "
+                      "--remove or --no-verdict", file=sys.stderr)
+                return 2
+            if args.floor is not None:
+                # #3183 : le plancher d'avis du pilote, posé avant la désignation
+                # (il vaut dans tout état ouvert, la désignation exige qa).
+                from . import review_floor
+                floor = review_floor.set_floor(cfg, db, args.id, args.floor,
+                                               reason=args.reason, actor=args.actor)
+                if floor["changed"]:
+                    print("lot #%d: review floor %d (was %d, by %s)" % (
+                        floor["lot"], floor["floor"], floor["previous"], floor["actor"]))
+                else:
+                    print("lot #%d: review floor already %d: nothing written" % (
+                        floor["lot"], floor["floor"]))
+                if not args.agent:
+                    return 0
             if not args.agent and not (args.remove or args.no_verdict):
-                print("ameesh work reviewer: give AGENT, --remove or --no-verdict",
+                print("ameesh work reviewer: give AGENT, --remove, --no-verdict or --floor",
                       file=sys.stderr)
                 return 2
             if args.remove and args.agent:
@@ -3438,6 +3470,14 @@ def build_parser() -> argparse.ArgumentParser:
     pw_reviewer.add_argument("--actor", default="",
                              help="who designates: the session's bound identity by default; "
                                   "a human or an orchestrator (same authority as --correct)")
+    pw_reviewer.add_argument("--floor", type=int, default=None, choices=(0, 1, 2),
+                             metavar="N",
+                             help="#3183: pilot's review floor: the gate, the freeze "
+                                  "designation and paquet-candidats require max(scale, N) "
+                                  "reviews of distinct families; journaled, kept across "
+                                  "refreezes; 0 withdraws it (a human's floor: by a human)")
+    pw_reviewer.add_argument("--reason", default="",
+                             help="#3183: why the floor (journaled with it)")
     pw_reviewer.set_defaults(func=cmd_work)
     pw_reviewers = work_sub.add_parser(
         "reviewers",

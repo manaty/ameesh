@@ -70,6 +70,7 @@ import os
 import re
 import subprocess
 import time
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Mapping, Optional, Sequence
 
@@ -78,7 +79,7 @@ from . import db as db_mod
 from . import lot_class, mechanics, plan_git, projects, registry, review
 from . import review_designation as rd
 from . import review_designation_pg as pg
-from . import review_authors, storage, work
+from . import review_authors, review_floor, storage, work
 
 #: the sender of the journal notes and automatic mails
 SENDER = pg.SENDER
@@ -1151,6 +1152,13 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     policy = _policy(cfg, db, project, paths)
     if isinstance(policy, Unavailable):
         return policy
+    # #3183 : le plancher posé par un pilote (`review_floor`) relève le compte
+    # de la désignation comme celui de la porte ; un journal illisible attend.
+    floor = review_floor.apply({}, db, int(lot), cfg=cfg)
+    if floor.get("reviews_floor_unreadable"):
+        return Unavailable("review floor unreadable: %s" % floor["reviews_floor_unreadable"])
+    if int(floor.get("reviews_floor") or 0) > policy.required:
+        policy = dataclasses.replace(policy, required=int(floor["reviews_floor"]))
     listing = registry.overview(db)
     notify = _notify(cfg, db, project, listing)
     families = policy.families
