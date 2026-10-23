@@ -170,10 +170,12 @@ def reconcile(readings, now, *, truncated=False, plan=None):
 
     #3034 : `plan` est le forfait du compte **vivant** (`live_plan`, lu dans
     `auth.json`). Quand les relevés partagent une identité unique et que ce
-    forfait est connu, les relevés d'un autre forfait viennent d'une session
-    d'avant la bascule : ils sont ignorés (ni ambiguïté, ni fenêtres) plutôt
-    que de rendre le compte inutilisable. Sans forfait vivant lisible, ou avec
-    plusieurs identités, le refus d'ambiguïté reste la règle.
+    forfait est connu, les relevés d'un autre forfait ne comptent plus pour
+    l'ambiguïté ni dans les fenêtres. Mais un tel relevé peut être plus récent
+    que le dernier du forfait vivant : si une de ses fenêtres vivantes est
+    saturée ou en overage, l'ignorer masquerait une pause ou une dépense
+    (argent, overage) — le compte reste refusé. Sans forfait vivant lisible,
+    ou avec plusieurs identités, le refus d'ambiguïté reste la règle.
     """
     from .cost import Gauges, _codex_overage
 
@@ -192,6 +194,25 @@ def reconcile(readings, now, *, truncated=False, plan=None):
             # compte en silence (des jauges absentes se liraient comme 0 %).
             raise AmbiguousCodexGauges(
                 "ambiguous Codex account: no live reading matches the declared plan")
+        others = [
+            r for r in readings
+            if r[1].get("plan_type")
+            and str(r[1].get("plan_type")).strip().lower() != wanted]
+
+        def saturated(reading):
+            # #3034 (B1) : un relevé d'un autre forfait, plus récent que le
+            # dernier du forfait vivant, peut être le vrai relevé du compte.
+            # L'ignorer n'est sûr que s'il ne signale ni saturation ni
+            # overage ; une fenêtre échue, elle, ne bloque plus (L71).
+            gauge, limits, _identity = reading
+            if gauge.reset_passed(now):
+                return False
+            return gauge.used >= 1.0 or _codex_overage(limits, [gauge]).in_use
+
+        if any(saturated(reading) for reading in others):
+            raise AmbiguousCodexGauges(
+                "ambiguous Codex account: a live window of another plan is "
+                "saturated or in overage")
         readings = [
             r for r in readings
             if not r[1].get("plan_type")

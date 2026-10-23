@@ -212,6 +212,62 @@ class CodexReadingsTest(Sandbox, unittest.TestCase):
         self.assertEqual({g.key: g.used for g in result.gauges},
                          {"codex-300min": 0.05, "codex-10080min": 0.10})
 
+    def test_live_plan_refuses_a_saturated_live_reading_of_another_plan(self):
+        # #3034 B1 : le relevé pro, plus récent et à 100 %, ne peut pas être
+        # jeté au nom du forfait team de auth.json — le compte paraîtrait sain
+        # alors qu'il est saturé, et peut-être en overage.
+        home = os.path.join(self.tmp_cost, "compte-codex")
+        sessions = os.path.join(home, "sessions")
+        self._declared_codex(home, "team")
+        journal(sessions, "team", event(self.now - 120, short=5, week=10),
+                identity="account-a")
+        journal(sessions, "pro", event(self.now, short=100, week=13, plan="pro"),
+                identity="account-a")
+        profile = accounts.parse({"codex": [{"name": "unique", "path": home}]})["codex"][0]
+        result = accounts.evaluate(self.book(), profile, [profile], self.now,
+                                   record=False)
+        self.assertFalse(result.ok)
+        self.assertTrue(result.hard)
+        self.assertIn("ambiguous Codex account", result.reason)
+        self.assertIn("another plan", result.reason)
+
+    def test_live_plan_ignores_a_healthy_newer_reading_of_another_plan(self):
+        # Données réelles de ~/.codex-secondary : le jeton dit team, le dernier
+        # relevé team date de plusieurs heures, puis le serveur a rendu pro à
+        # 11-13 %. Le pro n'est ni saturé ni en overage : le compte passe.
+        home = os.path.join(self.tmp_cost, "compte-codex")
+        sessions = os.path.join(home, "sessions")
+        self._declared_codex(home, "team")
+        journal(sessions, "team", event(self.now - 7 * 3600, short=5, week=11),
+                identity="account-a")
+        journal(sessions, "pro", event(self.now, short=None, week=13, plan="pro"),
+                identity="account-a")
+        profile = accounts.parse({"codex": [{"name": "unique", "path": home}]})["codex"][0]
+        result = accounts.evaluate(self.book(), profile, [profile], self.now,
+                                   record=False)
+        self.assertTrue(result.ok, result.reason)
+        self.assertFalse(result.hard)
+        self.assertEqual({g.key: g.used for g in result.gauges},
+                         {"codex-300min": 0.05, "codex-10080min": 0.11})
+
+    def test_live_plan_ignores_a_saturated_but_expired_reading_of_another_plan(self):
+        # Une fenêtre saturée déjà remise à zéro ne maintient pas le refus :
+        # seule une fenêtre vivante saturée ou en overage compte.
+        home = os.path.join(self.tmp_cost, "compte-codex")
+        sessions = os.path.join(home, "sessions")
+        self._declared_codex(home, "team")
+        journal(sessions, "team", event(self.now, short=5, week=10),
+                identity="account-a")
+        journal(sessions, "pro", event(self.now - 7200, short=100, week=10,
+                                       plan="pro"), identity="account-a")
+        profile = accounts.parse({"codex": [{"name": "unique", "path": home}]})["codex"][0]
+        result = accounts.evaluate(self.book(), profile, [profile], self.now,
+                                   record=False)
+        self.assertTrue(result.ok, result.reason)
+        self.assertFalse(result.hard)
+        self.assertEqual({g.key: g.used for g in result.gauges},
+                         {"codex-300min": 0.05, "codex-10080min": 0.10})
+
     def test_missing_live_plan_keeps_refusing_mixed_plans(self):
         home = os.path.join(self.tmp_cost, "compte-codex")
         sessions = os.path.join(home, "sessions")
