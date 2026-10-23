@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
+import sys
+import tempfile
 import unittest
 
 from .support import REPO
@@ -71,6 +74,13 @@ class MacosSuiteJobTest(unittest.TestCase):
         self.assertIn("createdb", self.job)
         self.assertIn('AMEESH_REQUIRE_DB: "1"', self.job)
 
+    def test_the_gnu_find_of_the_deployment_scripts_is_installed(self):
+        # #3042 : poste.sh utilise `find -printf` (GNU) ; le faux ssh du banc
+        # l'exécute sous macOS, où le find BSD refuse cette primaire.
+        self.assertIn("brew install postgresql@17 bash coreutils gnu-sed findutils",
+                      self.job)
+        self.assertIn("$(brew --prefix findutils)/libexec/gnubin", self.job)
+
     def test_the_platform_contract_still_runs_on_macos(self):
         for nom in ("tests.test_l63_platform.PlatformTest",
                     "tests.test_l63_platform.LintTest",
@@ -101,6 +111,29 @@ class MacosSuiteJobTest(unittest.TestCase):
         self.assertIsNotNone(needs, "job tests : ligne needs introuvable")
         self.assertNotIn("platform-macos", needs.group(1))
         self.assertIn("platform-macos n'est pas encore requis", aggregate)
+
+
+class BenchTmpdirTest(unittest.TestCase):
+    """#3042 : le banc résout TMPDIR avant de créer ses bacs jetables."""
+
+    def test_a_symlinked_tmpdir_is_resolved_before_the_fixtures(self):
+        # Sous macOS /tmp et /var sont des liens : un bac créé sous le TMPDIR
+        # lexical fait refuser ses ancêtres symboliques par les gardes de
+        # déploiement. Le sous-processus importe le paquet `tests` (qui résout)
+        # puis rend le répertoire que tempfile utilisera.
+        with tempfile.TemporaryDirectory(prefix="ameesh-l68-tmp-") as base:
+            real = os.path.join(base, "real")
+            link = os.path.join(base, "link")
+            os.mkdir(real)
+            os.symlink(real, link)
+            env = dict(os.environ, TMPDIR=link,
+                       PYTHONPATH=os.path.join(REPO, "src"))
+            done = subprocess.run(
+                [sys.executable, "-c",
+                 "import tempfile, tests; print(tempfile.gettempdir())"],
+                cwd=REPO, env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(done.stdout.strip(), os.path.realpath(link))
 
 
 class LinuxOnlyWitnessesAreBoundedTest(unittest.TestCase):
