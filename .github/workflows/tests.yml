@@ -971,12 +971,21 @@ jobs:
               echo "::error::le plan ne donne aucune part psycopg alors que du code a changé" >&2
               exit 1 ;;
           esac
+          # N1 de la revue #393 : toutes les parts tournent, même après un
+          # échec ; le job échoue à la fin avec le code accumulé. Sous `set -e`
+          # une première part rouge masquerait les suivantes (une CI de paquet
+          # ne verrait qu'un défaut à la fois).
+          rc=0
           part=1
           while [ "$part" -le "$parts" ]; do
             python3 scripts/test-parts.py run --plan "$RUNNER_TEMP/plan.json" \
-              --part "$part" --driver psycopg
+              --part "$part" --driver psycopg || rc=1
             part=$((part + 1))
           done
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::une ou plusieurs parts psycopg ont échoué (voir les tests ci-dessus)" >&2
+          fi
+          exit "$rc"
 
   # L161a : PR de documentation seule, ses lecteurs déclarés seulement, sans base
   doc-readers:
