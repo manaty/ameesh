@@ -491,6 +491,28 @@ class WorkItems(interface.WorkItems):
                                  "project %r → %r" % (item.get("app"), app), actor)
             return rows[0]
 
+    @_retry_deadlock
+    def set_type(self, item_id, type, *, current, actor) -> dict | None:  # noqa: A002
+        """#2954 : retype journalé, conditionné au type lu (compare-and-set)."""
+        with self.db.transaction() as tx:
+            if not _lock_migration_writer(tx, item_id):
+                return None
+            rows = tx.query("SELECT %s FROM work_items WHERE id = %%s FOR NO KEY UPDATE"
+                            % item_columns(self.db), (int(item_id),))
+            if not rows or rows[0].get("type") != current:
+                return None
+            if current == type:
+                return rows[0]
+            rows = tx.query("UPDATE work_items SET type = %%s, updated_at = now()"
+                            " WHERE id = %%s AND type = %%s RETURNING %s"
+                            % item_columns(self.db),
+                            (type, int(item_id), current))
+            if not rows:
+                return None
+            WorkItems(tx)._event(int(item_id), rows[0]["state"],
+                                 "type %r → %r" % (current, type), actor)
+            return rows[0]
+
     def without_project(self) -> list[dict]:
         return self.db.query("SELECT %s FROM work_items WHERE btrim(coalesce(app, '')) = ''"
                              " AND state NOT IN %s ORDER BY id" % (item_columns(self.db), _CLOSED))
@@ -505,7 +527,7 @@ class WorkItems(interface.WorkItems):
             branch=None, branch_target=None, priority=None, estimate_minutes=None,
             estimate_source=None, change_size=None, queued_note=None,
             forced_note=None, mark_item_id=None, mark_note="",
-            parent_lot=None) -> dict:
+            parent_lot=None, unique_ref=False) -> dict:
         """Crée le lot en `intake`, puis sa première ligne de journal ; L157 :
         avec sa durée estimée (et sa ligne d'historique), en UNE transaction.
         #540 : `queued_note` (voir l'interface).
@@ -514,6 +536,13 @@ class WorkItems(interface.WorkItems):
         La ligne marquée est verrouillée **avant** l'insertion et la
         `issue_ref` est relue sous ce verrou : deux appels concurrents ne
         peuvent pas créer deux lots pour la même référence (revue #544 r2).
+
+        #2954 : `unique_ref` prend d'abord un verrou consultatif de
+        transaction sur `issue_ref` puis relit la référence, quel que soit
+        l'état des lots ; deux hôtes qui créent l'incident du même run se
+        sérialisent et le second reçoit `DbError` (son appelant relit le
+        gagnant). Le verrou est pris avant les lignes de lots : aucun chemin
+        ne prend l'ordre inverse.
 
         `parent_lot` (#1193): the explicit parent of a suite lot. The parent is
         read back **under lock in the same transaction**: still open, the
@@ -530,6 +559,13 @@ class WorkItems(interface.WorkItems):
         l'ordre inverse ici (agent puis parent) interbloquait l'ajout d'une
         suite avec l'attribution de son parent."""
         with self.db.transaction() as tx:
+            if unique_ref and str(issue_ref or "").strip():
+                # #2954 : deux watchers (deux hôtes) peuvent ouvrir l'incident
+                # du même run dans la même fenêtre. Le verrou est pris avant
+                # toute ligne de lot ; la relecture ci-dessous, après le
+                # commit du premier, voit sa ligne.
+                tx.query("SELECT pg_advisory_xact_lock(hashtextextended("
+                         "lower(%s), 0))", (issue_ref,))
             # #540 : lignes de lots d'abord, par identifiant croissant, puis
             # le verrou d'agent de `_pending` — même ordre que `assign`.
             marked = None
@@ -552,6 +588,16 @@ class WorkItems(interface.WorkItems):
             if mark_item_id is not None and str(issue_ref or "").strip():
                 # le verrou sur la ligne marquée sérialise les créateurs :
                 # le second relit la référence après le commit du premier
+                duplicate = tx.query(
+                    "SELECT id FROM work_items WHERE lower(issue_ref) = lower(%s)"
+                    " ORDER BY id LIMIT 1", (issue_ref,))
+                if duplicate:
+                    raise DbError("issue_ref %s is already carried by lot #%d"
+                                  % (issue_ref, int(duplicate[0]["id"])))
+            if unique_ref and str(issue_ref or "").strip():
+                # #2954 : sous le verrou consultatif, la relecture voit le
+                # premier créateur (son commit précède l'acquisition) ; un lot
+                # fermé garde l'identité de l'exécution, comme `_open`.
                 duplicate = tx.query(
                     "SELECT id FROM work_items WHERE lower(issue_ref) = lower(%s)"
                     " ORDER BY id LIMIT 1", (issue_ref,))
