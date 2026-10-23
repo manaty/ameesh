@@ -2477,7 +2477,15 @@ def _three_way(view: LotView, issue: dict, managed=None) -> tuple[dict, list, li
         ours = [k for k, d in zip(_FIELD_NAMES, recorded) if _digest(want[k]) != d]
         human = [k for k, d in zip(_FIELD_NAMES, recorded) if _digest(have[k]) != d]
     else:
+        # Issue désignée et adoptée : rien n'a encore été écrit, donc aucune
+        # empreinte. Seules les étiquettes sont à nous — plus la fermeture :
+        # un lot déjà clos ferme son issue dans ce passage même, sinon le
+        # commentaire « issue closed by ameesh » contredirait une issue restée
+        # ouverte et l'empreinte figerait cet écart en retouche humaine (#3086).
         ours, human = ["labels"], []
+        if (want["state"] or "").lower() == "closed" \
+                and (have["state"] or "").lower() != "closed":
+            ours.append("state")
     write = [k for k in ours if want[k] != have[k]]
     kept = [k for k in human if k not in ours]
     return want, write, human, kept
