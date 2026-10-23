@@ -280,6 +280,22 @@ dans un échantillon tronqué, le compte est refusé comme relevé incomplet :
 une limite de lecture ne doit pas masquer une fenêtre saturée. Le forfait
 pro peut ne publier que la semaine.
 
+#3044 : un compte non-pro **au repos** — aucun relevé plus récent que sa
+fenêtre courte (5 h) — ne peut plus produire de courte vivante. Quand une
+courte a été retenue, échue, elle compte pour 0 % (L71) et le relevé est
+accepté au lieu d'être refusé pour toujours : jamais choisi, le compte ne
+serait jamais rafraîchi. La relaxation est bornée : un relevé récent (moins
+d'une fenêtre courte) sans courte vivante, ou un échantillon sans aucune
+courte, garde le refus #2843 — une courte saturée peut se cacher hors de
+l'échantillon borné, et le format n'est pas prouvé sans courte observée.
+
+#3122 : ce repos ne se prouve que sur les journaux **lus**. Un journal écarté
+du scan (33e par date), un préfixe tronqué (> 256 Kio) ou un journal illisible
+peut porter une courte vivante : sa date de fichier borne ce qu'il a pu
+observer, et le repos n'est accepté que si le plus récent de ces journaux est
+plus vieux qu'une fenêtre courte. Une date inconnue interdit le repos, même
+quand le reste de l'échantillon est au repos.
+
 Depuis la tranche 3 de #1580 (15/10/2026), les jauges d'un compte Claude
 peuvent venir du fichier du widget omarchy (`~/.local/state/omarchy/agents/
 usage/claude*.json`, dossier réglable par l'hôte avec

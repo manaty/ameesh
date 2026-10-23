@@ -2,10 +2,12 @@
 """L63 : couche plateforme (`ameesh.platform`), adoption fail-closed, lint.
 
 `PlatformTest`, `LintTest` et `GuaranteeTest` tournent sans base : la CI les
-lance aussi sous macOS (job court requis `platform-macos-short`, et dans
-`platform-macos` où L68 exécute en plus la suite sélectionnée par le plan).
-Sous Linux, chacun passe deux fois : avec psutil (s'il est
-installé) et par le repli /proc (psutil retiré).
+lance aussi sous macOS (job court `platform-macos` de `tests.yml`), où L68
+exécute en plus la suite sélectionnée par le plan dans `macos.yml` (nocturne et
+`ci-macos`, hors du chemin du paquet depuis #3198). Depuis #3026, ce job court
+est requis par `tests`. Sous Linux, chacun passe
+deux fois : avec psutil (s'il est installé) et par le repli /proc (psutil
+retiré).
 """
 from __future__ import annotations
 

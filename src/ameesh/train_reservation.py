@@ -20,14 +20,14 @@ class Reservation:
             raise TrainError("qualified reservation provider and absolute deadline required")
         self.provider, self.deadline, self.clock = provider, deadline, clock
 
-    def bind(self, db, project, target, owner, contract):
+    def bind(self, db, project, target, owner, contract, *, service=None):
         return ReservedLedger(db, project, target, owner,
-                              reservation=self, contract=contract)
+                              reservation=self, contract=contract, service=service)
 
 
 class ReservedLedger(Ledger):
-    def __init__(self, db, project, target, owner, *, reservation, contract):
-        super().__init__(db, project, target, owner)
+    def __init__(self, db, project, target, owner, *, reservation, contract, service=None):
+        super().__init__(db, project, target, owner, service=service)
         self.project, self.target = project, target
         self.reservation, self.provider = reservation, reservation.provider
         self.contract = contract
@@ -62,8 +62,29 @@ class ReservedLedger(Ledger):
                 ticket = self._ticket(state, epoch)
                 return self._renew(ticket, self.reservation.clock()).epoch
             except TrainError:
-                return None
+                return self._adopt(state) if epoch is None else None
         return super().acquire(epoch)
+
+    def _adopt(self, state):
+        """#3142: the plan of another runner's train, left in flight when its
+        service lease passed here, resumes under this owner at a new epoch
+        instead of waiting for its reservation's TTL."""
+        try:
+            saved = self.provider.Ticket.from_json(state.get("reservation"))
+        except self.provider.ReservationError:
+            return None
+        now = self.reservation.clock()
+        if saved.owner == self.owner or not saved.owner.startswith("train:") \
+                or (saved.key, saved.ci_contract) != (self.key, self.contract) \
+                or now >= saved.deadline:
+            return None
+        if self.adopt(state, (saved.owner, saved.epoch),
+                      min(saved.ttl_s, saved.deadline - now)) is None:
+            return None
+        try:
+            return self._renew(self._ticket(super().load(), self.adopted["epoch"]), now).epoch
+        except TrainError:
+            return None
 
     def load(self):
         state = super().load()

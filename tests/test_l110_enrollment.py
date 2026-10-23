@@ -39,6 +39,29 @@ def _key_dir() -> str:
     return os.path.join(path, "exec")
 
 
+def _observed(value):
+    """Rend une observation de la couche plateforme pour la recherche du code.
+
+    Une lecture refusée n'est pas une absence (#3023) : `None` ou un
+    environnement vide, et un argv vide (processus vivant dont les arguments
+    n'ont pas pu être lus) lèvent, au lieu de passer pour « rien à trouver ».
+    `command_argv` rend `[]` quand le processus est illisible."""
+    if value is None:
+        raise AssertionError("environ illisible : le code pourrait y être sans être vu")
+    if isinstance(value, dict):
+        if not value:
+            raise AssertionError("environ vide : le code pourrait y être sans être vu")
+        return "\n".join("%s=%s" % (key, item) for key, item in value.items())
+    if isinstance(value, list):
+        # codex #393 N2: command_argv rend [] quand le processus est
+        # illisible ; une liste vide rendrait "" et la preuve
+        # "secret absent" passerait à vide.
+        if not value:
+            raise AssertionError("argv vide : le code pourrait y être sans être vu")
+        return "\0".join(value)
+    return value
+
+
 # ==========================================================================
 # appareil : clé et signatures
 # ==========================================================================
@@ -536,6 +559,33 @@ class IdentiteBaseTest(PgTestCase):
             source.access_token(refresh=True)
 
 
+class ObservationRefuseeTest(unittest.TestCase):
+    """#3023 : le témoin de confidentialité ne confond plus une observation
+    impossible avec une absence de secret dans argv (garde N2 de #393).
+
+    La couche plateforme rend `None` pour un environnement illisible, `{}`
+    pour un environnement vide et `[]` pour un argv illisible (processus
+    disparu, lecture refusée) : tous doivent faire échouer le témoin, jamais
+    passer pour une chaîne vide."""
+
+    def test_une_lecture_refusee_est_refusee(self):
+        for value in (None, [], {}):
+            with self.subTest(valeur=value):
+                with self.assertRaises(AssertionError):
+                    _observed(value)
+
+    def test_un_pid_disparu_rend_un_argv_vide_que_le_temoin_refuse(self):
+        # le vrai chemin de la couche : un processus qui n'existe plus.
+        disparu = platform.command_argv(2 ** 31 - 1)
+        self.assertEqual(disparu, [])
+        with self.assertRaises(AssertionError):
+            _observed(disparu)
+
+    def test_une_lecture_valide_reste_cherchee(self):
+        self.assertEqual(_observed(["a", "b"]), "a\0b")
+        self.assertEqual(_observed({"A": "b"}), "A=b")
+
+
 class DeviceCliTest(PgTestCase):
     """La vraie commande `ameesh device enroll --code-file` : le code n'est
     ni dans la ligne de commande, ni dans l'environnement, ni dans la sortie."""
@@ -604,27 +654,10 @@ class DeviceCliTest(PgTestCase):
         self.assertEqual(self.proc.returncode, 0, err)
         self.assertIn("appareil enrôlé", out)
         self.assertTrue(seen, "le serveur n'a rien reçu")
-        def _raw(value):
-            # the platform layer returns argv as a list and the environment
-            # as a dict; both are rendered for the secret search below.
-            if value is None:
-                self.fail("environ illisible : le code pourrait y être sans être vu")
-            if isinstance(value, dict):
-                if not value:
-                    self.fail("environ vide : le code pourrait y être sans être vu")
-                return "\n".join("%s=%s" % (key, item) for key, item in value.items())
-            if isinstance(value, list):
-                # codex #393 N2: command_argv rend [] quand le processus est
-                # illisible ; une liste vide rendrait "" et la preuve
-                # "secret absent" passerait à vide.
-                if not value:
-                    self.fail("argv vide : le code pourrait y être sans être vu")
-                return "\0".join(value)
-            return value
         for variant in (code, code.replace("-", ""), jose.normalize_code(code)):
             for name, raw in seen.items():
                 with self.subTest(where=name):
-                    self.assertNotIn(variant, _raw(raw))
+                    self.assertNotIn(variant, _observed(raw))
             self.assertNotIn(variant, out + err)
         with open(os.path.join(home, device.STATE_FILE), encoding="utf-8") as fh:
             self.assertNotIn(jose.normalize_code(code), fh.read())

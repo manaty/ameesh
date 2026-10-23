@@ -113,7 +113,11 @@ class PressionTest(PgTestCase):
 
     def test_auditeur_passe_et_leve_une_ancienne_pause_de_charge(self):
         auditeur = self._worker("auditeur")
-        with self._sous(CRITIQUE):
+        # Le scope mémoire de L234 n'existe que sous Linux ; le sujet ici est
+        # la décision de l'exécuteur, pas le lancement de systemd-run (couvert
+        # par test_l234_auditor). On pose donc sa disponibilité.
+        with self._sous(CRITIQUE), mock.patch(
+                "ameesh.platform.audit_guard.available", return_value=True):
             # Une pause posée avant L234 ne doit pas rester affichée.
             auditeur._host_pressure_note(CRITIQUE)
             self.assertIn("paused: critical pressure", registry.get(self.db, "auditeur")["status_text"])
@@ -121,6 +125,16 @@ class PressionTest(PgTestCase):
         self.assertEqual(spec["kind"], "prompt")
         self.assertEqual(spec["prompt"], "travail")
         self.assertNotIn("paused: critical pressure", registry.get(self.db, "auditeur")["status_text"])
+
+    def test_auditeur_retenu_quand_le_scope_memoire_manque(self):
+        # L234 n'exempte l'auditeur que si le scope mémoire existe : hors
+        # Linux (macOS), pas de systemd-run, donc l'auditeur reste retenu au
+        # lieu de tourner sans borne.
+        auditeur = self._worker("auditeur")
+        with self._sous(CRITIQUE), mock.patch(
+                "ameesh.platform.audit_guard.available", return_value=False):
+            self.assertTrue(auditeur._held_by_pressure(CRITIQUE))
+            self.assertIsNone(auditeur.pick())
 
     def test_auditeur_reste_sous_la_garde_de_budget(self):
         auditeur = self._worker("auditeur")

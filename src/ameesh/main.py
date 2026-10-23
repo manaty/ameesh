@@ -69,8 +69,8 @@
   ameesh harness list|show|check|versions  harnesses (L16, L120);
   ameesh heavy [--nice N] -- <command> | --status [--json]
         heavy suite (tests, build) in one of the host's capped slots (L131);
-  ameesh host drain HOST [--for 8h] | undrain HOST | status [HOST]
-        durable withdrawal, return and lost-host recovery (L232e);
+  ameesh host drain HOST [--for 8h] | undrain HOST | reconcile HOST | status [HOST]
+        durable withdrawal, return and verified lost-host recovery (L232e);
   ameesh host enroll|revoke|list|show   enroll lending devices (L110,
         authorized human only);
   ameesh hosts [--json] [HOST]          host resources (L31);
@@ -134,6 +134,12 @@
         turn's account can resume it, otherwise a deterministic resume brief;
   ameesh review-class [--project P] [--diff REF | FILE ...]
         review class of the changed files from the project's policy;
+  ameesh role run <agent> [--min-left S] [--dry-run] [--json] -- <commande…>
+        L165 (EP5) : une minuterie mécanique ne tourne que sur l'hôte qui
+        détient le bail vivant de ce rôle (composeur, veille GitHub, guet CI) ;
+        l'époque du bail est passée à la commande pour la garde EP4 ;
+  ameesh role status [ROLE] [--json]   elected roles: holder, epoch, ranked
+                                        candidates (L165); the runners publish;
   ameesh run [options]        the machine's runner; `agent-runner` remains
         an alias;
   ameesh serve --exec-only --auth-file FILE [--listen HOST:PORT] …
@@ -263,6 +269,11 @@ def _dispatch(argv: list[str] | None) -> int:
         print(__doc__)
         return 0
     command, rest = argv[0], argv[1:]
+    if command == "role" and rest[:1] == ["run"]:
+        # L165 (EP5) : minuterie gardée par le bail du rôle. Routé avant
+        # `role status` (EP2) : les deux sous-commandes vivent dans `role`.
+        from . import role_run
+        return role_run.main(rest[1:])
     if command == "module":
         from . import modules
         return modules.main(rest)
@@ -318,9 +329,13 @@ def _dispatch(argv: list[str] | None) -> int:
         # L85: the event log of `GET /api/v1/events`
         from . import events
         return events.main(rest)
-    if command == "host" and rest and rest[0] in ("drain", "undrain", "status"):
+    if command == "host" and rest and rest[0] in ("drain", "undrain", "reconcile", "status"):
         from . import host_lifecycle
         return host_lifecycle.main(rest)
+    if command == "role":
+        # L165 (EP2) : détenteur, époque et candidats classés d'un rôle élu
+        from . import role
+        return role.main(rest)
     if command == "plan":
         # L96 : feuille de route (engagements, propositions, Gantt)
         from . import roadmap

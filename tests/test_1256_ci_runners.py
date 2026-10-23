@@ -41,6 +41,12 @@ TOOLS_REL = TOOLS.lstrip("/")
 # second (option A of the R2 B1 arbitration)
 LENT = "ameesh-lent"
 FLEET = "ameesh-ci"
+# #3128: the host name the bench tells the scripts. Without `--host` the
+# scripts read `hostname -s`; a CI runner's name is not a canon host name (the
+# macOS runners' is 63 characters with uppercase, which the scripts rightly
+# refuse), so a witness that omitted the option tested the machine, not the
+# test host (canon §3).
+NAMED_HOST = "ci-3"
 
 
 def structure_text(value):
@@ -453,10 +459,19 @@ class CiRunnersTest(unittest.TestCase):
             return args
         return (*args, "--disk-floor-mib", "1")
 
+    def _with_host(self, args):
+        """#3128: the bench names its host (NAMED_HOST). The scripts default to
+        `hostname -s`, and the runner of the machine the bench runs on is not
+        the host under test; a long uppercase label must not decide whether a
+        witness passes."""
+        if "--host" in args:
+            return args
+        return ("--host", NAMED_HOST, *args)
+
     def real_run(self, *args, **env_extra):
         """A real run (no `--dry-run`) against the test host: non-root, the
         `runuser` shim on PATH; refuses to touch anything else (R2 cx2 #1256)."""
-        return subprocess.run(["bash", SCRIPT, *self._with_floor(args)],
+        return subprocess.run(["bash", SCRIPT, *self._with_host(self._with_floor(args))],
                               capture_output=True, text=True,
                               env=self.script_env(**env_extra))
 
@@ -478,7 +493,8 @@ class CiRunnersTest(unittest.TestCase):
     def run_script(self, *args, busy=False, **env_extra):
         if busy:
             env_extra["CI_RUNNERS_TEST_BUSY"] = "1"
-        return subprocess.run(["bash", SCRIPT, "--dry-run", *self._with_floor(args)],
+        return subprocess.run(["bash", SCRIPT, "--dry-run",
+                               *self._with_host(self._with_floor(args))],
                               capture_output=True, text=True,
                               env=self.script_env(**env_extra))
 
@@ -486,7 +502,8 @@ class CiRunnersTest(unittest.TestCase):
         """Un check qui vit pendant le témoin : lu sur stdout (octets, sans
         tampon Python), arrêté en cleanup même si une assertion échoue avant
         sa fin."""
-        proc = subprocess.Popen(["bash", SCRIPT, "--dry-run", *self._with_floor(args)],
+        proc = subprocess.Popen(["bash", SCRIPT, "--dry-run",
+                                 *self._with_host(self._with_floor(args))],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 env=self.script_env(**env_extra))
         self.addCleanup(self.stop_script, proc)
@@ -1532,13 +1549,11 @@ class WorkflowRoutingTest(unittest.TestCase):
             self.assertIn("plan.outputs.plan_sha256", body,
                           "%s downloads the plan artifact without checking its digest" % job)
             self.assertIn("sha256sum -c", body)
-        self.assertEqual(set(consumers),
-                         {"psycopg", "psql", "fs-class", "platform-macos"})
-        # L68b (#3026) : le job macOS est dans la clôture requise et vérifie
-        # lui aussi l'empreinte avant d'exécuter le plan.
-        macos = jobs["platform-macos"]
-        self.assertIn("plan.outputs.plan_sha256", structure_text(macos))
-        self.assertIn("sha256sum -c", structure_text(macos))
+        self.assertEqual(set(consumers), {"psycopg", "psql", "fs-class"})
+        # #3198 : le job macOS de tests.yml est le verdict court de la couche
+        # plateforme (L63/L66), sans plan ni base : il ne consomme pas
+        # l'artefact `plan`. #3026 le fait entrer dans la clôture requise ;
+        # la suite complète macOS vit dans macos.yml, hors de cette clôture.
 
     def test_the_required_check_stays_on_the_fleet(self):
         jobs = self.workflows()["tests.yml"]["jobs"]
@@ -1553,8 +1568,8 @@ class WorkflowRoutingTest(unittest.TestCase):
             self.assertEqual(name, self.REQUIRED)
         closure = self.needs_closure(jobs, self.REQUIRED) | {self.REQUIRED}
         self.assertEqual(closure, {"plan", "version", "psycopg", "psql",
-                                   "platform-macos", "platform-macos-short",
-                                   "doc-readers", "fs-class", "tests"})
+                                   "platform-macos", "doc-readers", "fs-class",
+                                   "tests"})
         for job in sorted(closure):
             self.assertNotIn("AMEESH_LENT_RUNS_ON", str(jobs[job].get("runs-on", "")),
                              "%s is part of the required path" % job)

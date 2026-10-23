@@ -3,8 +3,11 @@
 l'humain responsable.
 
 Aucun envoi réel : ntfy et Slack sont de faux serveurs HTTP sur la boucle
-locale, `notify-send` est le faux binaire de tests/fakebin (jamais le vrai :
-`AMEESH_NOTIFY_SEND_BIN` le désigne explicitement, sans repli sur le PATH).
+locale, le backend de bureau est le faux binaire de tests/fakebin (jamais le
+vrai : `AMEESH_NOTIFY_SEND_BIN` / `AMEESH_OSASCRIPT_BIN` le désignent
+explicitement, sans repli sur le PATH). Les assertions suivent la route de
+CET OS (`ameesh.platform.SYSTEM`, L66/#3131) : `notify-send` sous Linux,
+`osascript` sous macOS.
 """
 from __future__ import annotations
 
@@ -18,7 +21,8 @@ import unittest
 
 from ameesh import alert_ack, fil, mail, notify, registry, storage, work
 
-from .support import FAKEBIN, PgTestCase
+from .support import (DESKTOP_MISSING, DESKTOP_VAR, FAKEBIN, PgTestCase,
+                      desktop_backend_env, desktop_received)
 from .test_canon import _TmpMixin, write
 
 FAKE_NOTIFY_SEND = os.path.join(FAKEBIN, "notify-send")
@@ -63,8 +67,8 @@ class _Http:
 
 
 def _sender_env(log_path: str, **extra) -> dict:
-    env = {"AMEESH_NOTIFY_SEND_BIN": FAKE_NOTIFY_SEND, "AMEESH_FAKE_NOTIFY_LOG": log_path,
-           "PATH": os.environ.get("PATH", "")}
+    env = dict(desktop_backend_env(FAKE_NOTIFY_SEND), PATH=os.environ.get("PATH", ""),
+               AMEESH_FAKE_NOTIFY_LOG=log_path)
     env.update(extra)
     return env
 
@@ -211,13 +215,14 @@ class CanauxTest(_Http, unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_desktop_faux_notify_send(self):
+    def test_desktop_faux_backend(self):
         sender = notify.Sender(env=_sender_env(self.log))
         sender.send(notify.Channel("desktop", "desktop"), self.msg)
         argv = _desktop_log(self.log)
         self.assertEqual(len(argv), 1)
-        self.assertIn("--urgency=critical", argv[0])
-        self.assertEqual(argv[0][-2:], [self.msg.title, self.msg.body])
+        titre, corps, urgence = desktop_received(argv[0])
+        self.assertEqual(urgence, "critical")
+        self.assertEqual((titre, corps), (self.msg.title, self.msg.body))
         # échec du binaire : constat lisible, retentable
         sender = notify.Sender(env=_sender_env(self.log, AMEESH_FAKE_NOTIFY_EXIT="1"))
         with self.assertRaises(notify.ChannelError) as ctx:
@@ -226,10 +231,10 @@ class CanauxTest(_Http, unittest.TestCase):
         self.assertFalse(ctx.exception.permanent)
 
     def test_desktop_absent(self):
-        env = _sender_env(self.log, AMEESH_NOTIFY_SEND_BIN=os.path.join(self.tmp, "absent"))
+        env = _sender_env(self.log, **{DESKTOP_VAR: os.path.join(self.tmp, "absent")})
         with self.assertRaises(notify.ChannelError) as ctx:
             notify.Sender(env=env).send(notify.Channel("desktop", "desktop"), self.msg)
-        self.assertIn("notify-send not found", str(ctx.exception))
+        self.assertIn(DESKTOP_MISSING, str(ctx.exception))
         self.assertTrue(ctx.exception.permanent)
         self.assertEqual(_desktop_log(self.log), [])
 
@@ -299,7 +304,7 @@ class CanauxTest(_Http, unittest.TestCase):
         results = notify.send_test(ncfg, "human:proprio", "atelier",
                                    sender=notify.Sender(env=_sender_env(self.log)))
         self.assertEqual(results, [("desktop", None), ("ntfy", None)])
-        self.assertIn("test message", _desktop_log(self.log)[0][-2])
+        self.assertIn("test message", desktop_received(_desktop_log(self.log)[0])[0])
         self.assertIn("human:proprio", ntfy.requests[0]["body"])
 
 
@@ -416,7 +421,7 @@ class AcheminementTest(_Base):
         self.assertEqual(len(ntfy.requests), 1)
         self.assertIn("agent ouvrier", ntfy.requests[0]["body"])
         self.assertEqual(len(_desktop_log(self.desk)), 1)   # autre → notify.default
-        self.assertIn("agent autre", _desktop_log(self.desk)[0][-1])
+        self.assertIn("agent autre", desktop_received(_desktop_log(self.desk)[0])[1])
 
 
 class AlertesReellesTest(_Base):
@@ -437,14 +442,15 @@ class AlertesReellesTest(_Base):
                            "envoyee")])
         argv = _desktop_log(self.desk)
         self.assertEqual(len(argv), 1)
-        self.assertIn("agent stopped with mail", argv[0][-2])
-        self.assertIn("bail_expire", argv[0][-1])
+        titre, corps, _urgence = desktop_received(argv[0])
+        self.assertIn("agent stopped with mail", titre)
+        self.assertIn("bail_expire", corps)
         self.assertEqual(self.passe(notifier), [])     # une alerte qui dure : rien
         self.db.execute("UPDATE agent_mailbox SET delivered_at = now()")
         records = self.passe(notifier)
         self.assertEqual([(r["event"], r["delivery"]) for r in records],
                          [("resolved", "envoyee")])
-        self.assertIn("resolved", _desktop_log(self.desk)[-1][-2])
+        self.assertIn("resolved", desktop_received(_desktop_log(self.desk)[-1])[0])
 
     def test_types_filtres(self):
         alertes = [_alert("long_turn", responsible="human:p"),
@@ -826,10 +832,10 @@ class FiabiliteTest(_Base):
 
     def test_canal_absent_permanent(self):
         sender = notify.Sender(env=_sender_env(
-            self.desk, AMEESH_NOTIFY_SEND_BIN=os.path.join(self.tmp, "absent")))
+            self.desk, **{DESKTOP_VAR: os.path.join(self.tmp, "absent")}))
         notifier = self.notifier(self.ncfg(default_human="human:proprio"), sender=sender)
         records = self.passe(notifier, [_alert()])
-        self.assertIn("notify-send not found", records[0]["channels"]["desktop"])
+        self.assertIn(DESKTOP_MISSING, records[0]["channels"]["desktop"])
         self.assertTrue(any("GIVING UP" in l for l in self.logs))
         self.assertEqual(self.passe(notifier, [_alert()]), [])
 
@@ -850,9 +856,10 @@ class CliTest(_Base):
         return path
 
     def env_cli(self, notify_raw: dict, **extra):
-        return self.env(AMEESH_CONFIG=self.config(notify_raw),
-                        AMEESH_NOTIFY_SEND_BIN=FAKE_NOTIFY_SEND,
-                        AMEESH_FAKE_NOTIFY_LOG=self.desk, **extra)
+        env = dict(desktop_backend_env(FAKE_NOTIFY_SEND, AMEESH_FAKE_NOTIFY_LOG=self.desk),
+                   AMEESH_CONFIG=self.config(notify_raw))
+        env.update(extra)
+        return self.env(**env)
 
     def _arrete_avec_courrier(self):
         self.register("ouvrier", "claude", cwd=self.tmp)

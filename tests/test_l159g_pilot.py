@@ -19,6 +19,12 @@ from .support import REPO, PgTestCase
 
 GUEST = os.path.join(REPO, "deploy", "guest")
 GIB = 1024 ** 3
+# #3128: the host name the bench tells the script. Without `--host` it reads
+# `hostname -s`; a CI runner's name is not a canon host name (the macOS
+# runners' is 63 characters with uppercase, which the script rightly refuses),
+# so a witness that omitted the option tested the machine, not the fixture
+# (canon §3).
+NAMED_HOST = "vm-test"
 # #1601: the pilot's guard accepts a path only when every character is in
 # [A-Za-z0-9/._-] and no component goes through a symbolic link. A host
 # TMPDIR may fail both (an agent's …/<agent>~<id>, a symlinked /tmp): the
@@ -131,11 +137,15 @@ class InstallPilotTest(unittest.TestCase):
         return dict(os.environ, PILOT_TEST_HOST=self.host, **extra)
 
     def run_script(self, *args, stdin=None, **extra):
+        # #3128: the bench names its host; the script's default `hostname -s`
+        # is the machine's, not the fixture's (see NAMED_HOST).
+        if "--host" not in args:
+            args = ("--host", NAMED_HOST, *args)
         return subprocess.run(["bash", self.SCRIPT, "--dry-run", *args], capture_output=True,
                               text=True, input=stdin, env=self.env(**extra))
 
     def dry(self, *args, stdin=None, **extra):
-        return self.run_script("--host", "vm-test", *args, stdin=stdin, **extra)
+        return self.run_script("--host", NAMED_HOST, *args, stdin=stdin, **extra)
 
     def on_host(self, path, content=None):
         """PATH made in the test's host: a directory, or a file with CONTENT."""
@@ -950,6 +960,13 @@ class InstallPilotTest(unittest.TestCase):
         self.on_host("/srv/ameesh-guest/home/.dsh/hooks.json", "{}")
         self.on_host("/srv/ameesh-guest/home/.dsh/profiles/agent/cordis.yml", "[]\n")
         clone = self.clone_here()
+        # #3128: a fresh clone holds no helper of its own; the machine's
+        # system git config must not decide what the bench reads (macOS adds
+        # credential.helper=osxkeychain there). This empty local helper is the
+        # reset --enable writes before adding ours; "none" then means none in
+        # use, whatever the system config says.
+        subprocess.run(["git", "-C", clone, "config", "--local", "--replace-all",
+                        "credential.helper", ""], check=True)
         out = self.run_script("--check", "--host", "vm-test", "--canon", self.canon()).stdout
         self.assertIn("FAIL /srv/ameesh-guest/work/deepseek6: credential helpers in use: none", out)
         for args in (("--replace-all", "credential.helper", ""),
@@ -985,8 +1002,13 @@ class InstallPilotTest(unittest.TestCase):
         root = "/srv/ameesh-guest"
         for d in ("", "/home", "/tmp", "/work"):
             os.chmod(self.on_host(root + d), 0o700 if d else 0o2710)
+        # #3128: macOS drops the setgid bit of a directory whose group the
+        # caller does not belong to (the fixture is runner:wheel), so the mode
+        # the check must report is read back from disk instead of assuming
+        # 2710. Linux keeps 2710 here: the L159b layout is still witnessed.
+        root_mode = "%o" % stat.S_IMODE(os.stat(self.host + root).st_mode)
         out = self.run_script("--check", "--host", "vm-test").stdout
-        self.assertIn("ok   %s (2710 " % root, out)
+        self.assertIn("ok   %s (%s " % (root, root_mode), out)
         for d in ("home", "tmp", "work"):
             self.assertIn("ok   %s/%s (700 " % (root, d), out)
         # a tree reopened by hand is said, never silently repaired

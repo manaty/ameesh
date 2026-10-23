@@ -366,6 +366,34 @@ class Lecteur:
         return env_value(data, key)
 
 
+def _drop_privileges(owner: int, group: int) -> None:
+    """Abandonne les droits vers (owner, group), portable Linux et macOS.
+
+    Linux expose `setres*`, qui fixent et laissent relire les identifiants
+    réel, effectif et sauvé. macOS ne connaît que `setre*` (pas de `getres*`) :
+    en root, `setreuid`/`setregid` fixent aussi l'identifiant sauvé ; hors
+    root, ils ne peuvent viser que les identifiants déjà portés. La
+    vérification porte donc sur ce que la plateforme sait relire.
+    """
+    if os.geteuid() == 0 and hasattr(os, 'setgroups'):
+        os.setgroups([])
+    if hasattr(os, 'setresgid'):
+        os.setresgid(group, group, group)
+    else:  # macOS : setresgid absent
+        os.setregid(group, group)
+    if hasattr(os, 'setresuid'):
+        os.setresuid(owner, owner, owner)
+    else:  # macOS : setresuid absent
+        os.setreuid(owner, owner)
+    if hasattr(os, 'getresuid'):
+        uids, gids = os.getresuid(), os.getresgid()
+    else:  # macOS : getresuid/getresgid absents
+        uids = (os.getuid(), os.geteuid())
+        gids = (os.getgid(), os.getegid())
+    if uids != (owner,) * len(uids) or gids != (group,) * len(gids):
+        raise OSError('privileges kept')
+
+
 class Installeur:
     """Côté hôte : installation atomique, pont `0600`, rotation et révocation.
 
@@ -476,12 +504,7 @@ class Installeur:
             status = 1
             try:
                 os.close(reader)
-                if os.geteuid() == 0:
-                    os.setgroups([])
-                os.setresgid(group, group, group)
-                os.setresuid(owner, owner, owner)
-                if os.getresuid() != (owner,) * 3 or os.getresgid() != (group,) * 3:
-                    raise OSError('privileges kept')
+                _drop_privileges(owner, group)
                 child = Installeur.__new__(Installeur)
                 child.__dict__.update(self.__dict__)
                 child.uid, child.gid, child.isolate = owner, group, False

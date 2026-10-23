@@ -125,6 +125,26 @@ def default_base(cfg, item: dict, repo: str, *, declared_only: bool = False) -> 
         return None
 
 
+def _landing_ref(repo: str, target: str) -> str:
+    """La référence qui lit la cible d'atterrissage `target` dans `repo`.
+
+    `refs/remotes/<distant>/<cible>` quand le clone la connaît, sinon `target`
+    tel quel (dépôt sans distant, SHA) : jamais une branche locale qu'aucun
+    `fetch` ne fait avancer quand sa version distante est lisible (#3068).
+    La référence est rendue **complète** : le nom court `origin/main` se
+    résout d'abord en `refs/tags/origin/main`, et une étiquette homonyme
+    remplacerait la cible dans le diff de classe (B1 de la relecture cx2)."""
+    try:
+        remote = canon_mod.remote_branch(repo, target)
+        if remote:
+            full = "refs/remotes/" + remote
+            if plan_git._commit(repo, full):
+                return full
+    except canon_mod.GitError:  # sonde illisible : le diff dira son erreur
+        pass
+    return target
+
+
 def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=(),
                     overview: list | None = None) -> tuple[str, str]:
     """Le dépôt local qui contient le commit gelé `frozen`, et ce commit résolu.
@@ -520,7 +540,12 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     if reason:
         out.update({"class": RELEASE, "why": reason, "doubt": False})
         return out
-    revision = base_sha or base
+    # #3068 : une cible que l'appelant n'a pas nommée (vue `work show`,
+    # stagnation) se lit sur `origin/<cible>` avant la branche locale, comme la
+    # file (#2207) : dans le clone partagé des agents, `main` local n'avance
+    # pas, et le diff depuis lui rapportait au lot tout ce qui a été fusionné
+    # depuis (#2955 léger affiché sensible, 60 fichiers au lieu de 3).
+    revision = base_sha or (_landing_ref(repo, base) if landing else base)
     if not revision:
         out["why"] = "no target branch: freeze the lot or name its target"
         return out

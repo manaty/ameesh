@@ -491,6 +491,28 @@ class WorkItems(interface.WorkItems):
                                  "project %r → %r" % (item.get("app"), app), actor)
             return rows[0]
 
+    @_retry_deadlock
+    def set_type(self, item_id, type, *, current, actor) -> dict | None:  # noqa: A002
+        """#2954 : retype journalé, conditionné au type lu (compare-and-set)."""
+        with self.db.transaction() as tx:
+            if not _lock_migration_writer(tx, item_id):
+                return None
+            rows = tx.query("SELECT %s FROM work_items WHERE id = %%s FOR NO KEY UPDATE"
+                            % item_columns(self.db), (int(item_id),))
+            if not rows or rows[0].get("type") != current:
+                return None
+            if current == type:
+                return rows[0]
+            rows = tx.query("UPDATE work_items SET type = %%s, updated_at = now()"
+                            " WHERE id = %%s AND type = %%s RETURNING %s"
+                            % item_columns(self.db),
+                            (type, int(item_id), current))
+            if not rows:
+                return None
+            WorkItems(tx)._event(int(item_id), rows[0]["state"],
+                                 "type %r → %r" % (current, type), actor)
+            return rows[0]
+
     def without_project(self) -> list[dict]:
         return self.db.query("SELECT %s FROM work_items WHERE btrim(coalesce(app, '')) = ''"
                              " AND state NOT IN %s ORDER BY id" % (item_columns(self.db), _CLOSED))
@@ -505,7 +527,7 @@ class WorkItems(interface.WorkItems):
             branch=None, branch_target=None, priority=None, estimate_minutes=None,
             estimate_source=None, change_size=None, queued_note=None,
             forced_note=None, mark_item_id=None, mark_note="",
-            parent_lot=None) -> dict:
+            parent_lot=None, unique_ref=False) -> dict:
         """Crée le lot en `intake`, puis sa première ligne de journal ; L157 :
         avec sa durée estimée (et sa ligne d'historique), en UNE transaction.
         #540 : `queued_note` (voir l'interface).
@@ -514,6 +536,13 @@ class WorkItems(interface.WorkItems):
         La ligne marquée est verrouillée **avant** l'insertion et la
         `issue_ref` est relue sous ce verrou : deux appels concurrents ne
         peuvent pas créer deux lots pour la même référence (revue #544 r2).
+
+        #2954 : `unique_ref` prend d'abord un verrou consultatif de
+        transaction sur `issue_ref` puis relit la référence, quel que soit
+        l'état des lots ; deux hôtes qui créent l'incident du même run se
+        sérialisent et le second reçoit `DbError` (son appelant relit le
+        gagnant). Le verrou est pris avant les lignes de lots : aucun chemin
+        ne prend l'ordre inverse.
 
         `parent_lot` (#1193): the explicit parent of a suite lot. The parent is
         read back **under lock in the same transaction**: still open, the
@@ -530,6 +559,13 @@ class WorkItems(interface.WorkItems):
         l'ordre inverse ici (agent puis parent) interbloquait l'ajout d'une
         suite avec l'attribution de son parent."""
         with self.db.transaction() as tx:
+            if unique_ref and str(issue_ref or "").strip():
+                # #2954 : deux watchers (deux hôtes) peuvent ouvrir l'incident
+                # du même run dans la même fenêtre. Le verrou est pris avant
+                # toute ligne de lot ; la relecture ci-dessous, après le
+                # commit du premier, voit sa ligne.
+                tx.query("SELECT pg_advisory_xact_lock(hashtextextended("
+                         "lower(%s), 0))", (issue_ref,))
             # #540 : lignes de lots d'abord, par identifiant croissant, puis
             # le verrou d'agent de `_pending` — même ordre que `assign`.
             marked = None
@@ -552,6 +588,16 @@ class WorkItems(interface.WorkItems):
             if mark_item_id is not None and str(issue_ref or "").strip():
                 # le verrou sur la ligne marquée sérialise les créateurs :
                 # le second relit la référence après le commit du premier
+                duplicate = tx.query(
+                    "SELECT id FROM work_items WHERE lower(issue_ref) = lower(%s)"
+                    " ORDER BY id LIMIT 1", (issue_ref,))
+                if duplicate:
+                    raise DbError("issue_ref %s is already carried by lot #%d"
+                                  % (issue_ref, int(duplicate[0]["id"])))
+            if unique_ref and str(issue_ref or "").strip():
+                # #2954 : sous le verrou consultatif, la relecture voit le
+                # premier créateur (son commit précède l'acquisition) ; un lot
+                # fermé garde l'identité de l'exécution, comme `_open`.
                 duplicate = tx.query(
                     "SELECT id FROM work_items WHERE lower(issue_ref) = lower(%s)"
                     " ORDER BY id LIMIT 1", (issue_ref,))
@@ -2451,6 +2497,121 @@ class WorkItems(interface.WorkItems):
                 " updated_at = clock_timestamp() WHERE target_key = %s AND revision = %s"
                 " RETURNING revision", (json.dumps(document), key, int(revision)))
             return dict(document, revision=int(rows[0]["revision"])) if rows else None
+
+    def train_abandon(self, key, plan_id, document, *, revision, owner, epoch) -> dict | None:
+        with self.db.transaction() as tx:
+            held = tx.query("SELECT owner, epoch"
+                            " FROM merge_locks WHERE target = %s FOR UPDATE", (key,))
+            if not held or held[0]["owner"] != owner or int(held[0]["epoch"]) != epoch:
+                return None
+            live = tx.query("SELECT 1 FROM merge_locks WHERE target = %s"
+                            " AND expires_at > clock_timestamp()", (key,))
+            if not live:
+                return None
+            # The target row lock is also taken by train_fire_give: a grant is
+            # either committed before this read (seen just below and refused),
+            # or waits and then finds the terminal phase this write leaves.
+            rows = tx.query("SELECT document FROM integration_trains"
+                            " WHERE target_key = %s FOR UPDATE", (key,))
+            if not rows:
+                return None
+            current = rows[0]["document"]
+            if isinstance(current, str):
+                current = json.loads(current)
+            phase = current.get("phase")
+            if phase in ("landed", "empty", "paused", "invalidated") or phase == "promoting" \
+                    or (current.get("plan") or {}).get("id") != plan_id:
+                return None
+            fire = WorkItems(tx).train_fire_read(key, plan_id)
+            if fire and fire.get("state") in ("active", "promoting", "landed"):
+                return None
+            if (document.get("plan") or {}).get("id") != plan_id:
+                return None
+            updated = tx.query(
+                "UPDATE integration_trains SET revision = revision + 1, document = %s::jsonb,"
+                " updated_at = clock_timestamp() WHERE target_key = %s AND revision = %s"
+                " RETURNING revision", (json.dumps(document), key, int(revision)))
+            return dict(document, revision=int(updated[0]["revision"])) if updated else None
+
+    def train_adopt(self, key, owner, *, revision, previous, service, ttl_s) -> dict | None:
+        if not owner.startswith("train:") or key == service[0]:
+            return None
+        # L165 (EP4) × #3142, B cx2 : une clé de service liée à un rôle porte
+        # l'époque du rôle (`train-service:<rôle>:<époque>`). Elle survit à sa
+        # tenure par le TTL de service (900 s) : l'adoption doit aussi prouver
+        # que cette époque est le bail vivant courant du rôle, sinon l'ancien
+        # élu reprendrait la réservation au nouvel élu.
+        parts = str(service[0] or "").split(":")
+        role = (parts[1], int(parts[2])) if (len(parts) == 3 and parts[1]
+                and parts[0] == "train-service" and parts[2].isdigit()) else None
+        with self.db.transaction() as tx:
+            # Service lease first, then the target: no writer locks them in
+            # the other order (train_save only locks the target row).
+            if not tx.query("SELECT 1 FROM merge_locks WHERE target = %s AND owner = %s"
+                            " AND epoch = %s AND expires_at > clock_timestamp() FOR SHARE",
+                            (service[0], service[1], int(service[2]))):
+                return None
+            if role is not None:
+                current = tx.query(
+                    "SELECT lease_epoch, status,"
+                    " lease_expires_at > clock_timestamp() AS live"
+                    " FROM agent_registry WHERE name = %s FOR SHARE", (role[0],))
+                if not current or current[0]["lease_epoch"] is None \
+                        or int(current[0]["lease_epoch"]) != role[1] \
+                        or not current[0]["live"] \
+                        or str(current[0]["status"] or "") == "stopped":
+                    return None
+            held = tx.query("SELECT owner, epoch FROM merge_locks WHERE target = %s FOR UPDATE",
+                            (key,))
+            if not held or not (held[0]["owner"] or "").startswith("train:") \
+                    or held[0]["owner"] == owner:
+                return None
+            before = (held[0]["owner"], int(held[0]["epoch"]))
+            if previous is not None and before != (previous[0], int(previous[1])):
+                return None
+            rows = tx.query("SELECT revision, document FROM integration_trains"
+                            " WHERE target_key = %s FOR UPDATE", (key,))
+            if (int(rows[0]["revision"]) if rows else 0) != int(revision):
+                return None
+            document = rows[0]["document"] if rows else None
+            if isinstance(document, str):
+                document = json.loads(document)
+            ticket = (document or {}).get("reservation")
+            # A ticket naming the held epoch moves with it, whoever asked:
+            # left behind, it would bind the plan to the fenced holder.
+            if not isinstance(ticket, dict) \
+                    or (ticket.get("owner"), ticket.get("epoch")) != before:
+                if previous is not None:
+                    return None
+                document = None
+            # The target or document lock may have waited: recheck the
+            # service lease against wall time after every lock, like train_save.
+            if not tx.query("SELECT 1 FROM merge_locks WHERE target = %s AND owner = %s"
+                            " AND epoch = %s AND expires_at > clock_timestamp()",
+                            (service[0], service[1], int(service[2]))):
+                return None
+            # The role lease can also expire while those locks wait: FOR SHARE
+            # blocks a claim, not time. Recheck the exact epoch, liveness and
+            # status after every lock, next to the final service check
+            # (B/P1 cx2, #3142×#3014).
+            if role is not None:
+                current = tx.query(
+                    "SELECT 1 FROM agent_registry WHERE name = %s AND lease_epoch = %s"
+                    " AND lease_expires_at > clock_timestamp()"
+                    " AND coalesce(status, '') <> 'stopped' FOR SHARE",
+                    (role[0], role[1]))
+                if not current:
+                    return None
+            epoch = int(tx.query(
+                "UPDATE merge_locks SET owner = %s, epoch = epoch + 1,"
+                " expires_at = clock_timestamp() + %s * interval '1 second'"
+                " WHERE target = %s RETURNING epoch", (owner, float(ttl_s), key))[0]["epoch"])
+            if document is not None:
+                document["reservation"] = dict(document["reservation"], owner=owner, epoch=epoch)
+                tx.execute("UPDATE integration_trains SET revision = revision + 1,"
+                           " document = %s::jsonb, updated_at = clock_timestamp()"
+                           " WHERE target_key = %s", (json.dumps(document), key))
+            return {"epoch": epoch, "previous_owner": before[0], "previous_epoch": before[1]}
 
     @staticmethod
     def _train_fire(rows):

@@ -237,6 +237,8 @@ class TrainRunnerTest(PgTestCase):
         self.assertNotIn("enrollment", result)
         reader.assert_not_called()
         self.assertEqual(train.digest(self.ops.train_read(self.key)["plan"]), train.digest(plan))
+        # #3139: the composed packet keeps the enrollment record of its pass.
+        self.assertEqual(self.ops.train_read(self.key)["enrollment_deferred"], [])
         self.assertEqual(len(self.ops.train_read(self.key)["attempts"]), 1)
         self.assertEqual(self.ops.queue(None)[0]["generation"], entry["generation"])
         self.assertEqual(self.notices, [])
@@ -250,10 +252,30 @@ class TrainRunnerTest(PgTestCase):
         refused = result["enrollment"]["deferred"]
         self.assertEqual([row["work_item_id"] for row in refused], [original["work_item_id"]])
         self.assertIn("queue-history-unknown", refused[0]["reason"])
+        # #3139: the refusal names the lot and its freeze, and the journal
+        # carries the same facts lot by lot instead of one generic line.
+        self.assertEqual(refused[0]["frozen_sha"], self.head)
+        self.assertEqual(refused[0]["frozen_id"], original["frozen_id"])
+        self.assertEqual(len(self.notices), 1)
+        self.assertIn("lot #%d" % original["work_item_id"], self.notices[0])
+        self.assertIn(self.head[:12], self.notices[0])
+        self.assertIn("queue-history-unknown", self.notices[0])
+        state = self.ops.train_read(self.key)
+        self.assertEqual(state["phase"], "empty")
+        self.assertEqual([row["lot"] for row in state["enrollment_deferred"]],
+                         [original["work_item_id"]])
+        self.assertEqual(state["enrollment_deferred"][0]["frozen_sha"], self.head)
+        self.assertIn("queue-history-unknown",
+                      state["enrollment_deferred"][0]["reason"])
+        self.assertIsInstance(state["enrollment_checked_ts"], float)
         self.assertEqual(self.ops.queue(None), [])
         self.assertEqual(work.events(self.db, original["work_item_id"]), before)
         self.assertEqual(self.api_calls, [])
-        self.assertEqual(self.notices, ["candidate enrollment deferred"])
+        # A second pass replaces the record instead of stacking stale refusals.
+        self.passage(candidate=reader).step(self.db, self.now + 1)
+        replay = self.ops.train_read(self.key)
+        self.assertGreater(replay["revision"], state["revision"])
+        self.assertEqual(len(replay["enrollment_deferred"]), 1)
 
     def test_competing_passage_cannot_read_candidates_or_allocate_without_target_reservation(self):
         _, reader = self.packet_intake()

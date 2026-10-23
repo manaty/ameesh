@@ -199,7 +199,7 @@ class VersionOnlyTest(unittest.TestCase):
         self.assertIn('if [ "${{ needs.plan.outputs.version_only }}" = "true" ]', text)
         self.assertIn(
             "needs: [plan, version, psycopg, psql, platform-macos, "
-            "platform-macos-short, doc-readers, fs-class]", text)
+            "doc-readers, fs-class]", text)
 
 
 class EstimatesPgTest(PgTestCase):

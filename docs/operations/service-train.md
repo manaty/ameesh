@@ -61,6 +61,18 @@ reprendre le bail l'un de l'autre (le SQL autorise le même propriétaire à
 prendre un nouvel epoch). Après un arrêt brutal, le successeur attend donc
 l'expiration du TTL ; un arrêt propre le libère tout de suite.
 
+Les réservations de cible (`<projet>:<cible>`, propriétaire `train:<exécuteur>`)
+ne suivent pas le bail de service : un exécuteur arrêté laisse les siennes
+posées. Le nouveau porteur du bail les adopte (#3142) au lieu d'attendre leur
+TTL de 30 min : dans une même transaction, son bail de service vivant est
+vérifié, la réservation passe à son propriétaire `train:` à l'epoch suivant, et
+le ticket du plan en vol est réécrit. L'ancien epoch est ensuite refusé partout
+(sauvegarde du train, renouvellement, publication, revendication de
+promotion, libération). Le plan reprend où il était : une publication
+incertaine est republiée à l'identique (idempotente), une promotion incertaine
+passe par la réconciliation. Une réservation ordinaire (fusion d'un lot seul)
+n'est jamais adoptée, ni un ticket dont l'epoch ne correspond plus à la ligne.
+
 ## Modes
 
 ### `shadow` — le plan calculé, sans effet
@@ -167,11 +179,26 @@ planificateurs (`test-plan.py`, `test-parts.py`, `ci-flow.py`, `map.py`). La
 preuve est le run `push` de `paquet.yml` à la tête exacte : il doit référencer
 `tests.yml` au même SHA et porter les jobs appelés, préfixés par le job
 appelant (`suite complète du paquet / plan`, `… / psycopg 4/8`, `… / tests`) :
-la matrice complète 8 psycopg + 16 psql, le job `plateforme macOS` et l'agrégat
-`tests`. Une PR ouverte laisse `suite` sauté : les jobs appelés sont absents et
-le train ne s'en sert jamais. Une modification d'un de ces fichiers exige un
-nouveau contrat audité : le témoin `tests/test_2446_train_contract.py` compare
-les blobs au commit.
+la matrice complète 8 psycopg + 16 psql, le job **court** `plateforme macOS`
+(L63/L66, #3198) et l'agrégat `tests`. La suite complète sous macOS n'est plus
+dans ce contrat : elle vit dans `.github/workflows/macos.yml` (nocturne sur
+`main`, `ci-macos` sur une PR) et ne retient plus le paquet. Une PR ouverte
+laisse `suite` sauté : les jobs appelés sont absents et le train ne s'en sert
+jamais. Une modification d'un de ces fichiers exige un nouveau contrat audité :
+le témoin `tests/test_2446_train_contract.py` compare les blobs au commit.
+
+#3098 : les blobs de référence ne sont pas lus dans le module installé, qui
+reste l'instantané de la release, mais dans `src/ameesh/train_contracts.py` au
+**commit de base** de la cible — code relu et atterri. Le module installé
+fournit toujours les chemins et les jobs du contrat. Un paquet qui change une
+source est donc refusé, et une fois ce paquet atterri par la voie « déblocage
+CI » (§11 bis) avec son ré-épinglage, la coupure suivante repart immédiatement,
+sans attendre la release et le déploiement suivants. **Toutes** les sources
+déclarées par la base sont vérifiées, y compris celles que le module installé ne
+connaît pas encore : la tête ne peut pas les déplacer. Une base dont les épingles
+ne correspondent pas à son propre arbre, qui omet une source auditée, ou dont le
+commit est absent du clone, est refusée par un message nommé. Témoins :
+`tests/test_3098_train_contract_pins.py`.
 
 ### Nexlink — les parts dues (#2503)
 
