@@ -2531,6 +2531,12 @@ class WorkItems(interface.WorkItems):
                 if previous is not None:
                     return None
                 document = None
+            # The target or document lock may have waited: recheck the
+            # service lease against wall time after every lock, like train_save.
+            if not tx.query("SELECT 1 FROM merge_locks WHERE target = %s AND owner = %s"
+                            " AND epoch = %s AND expires_at > clock_timestamp()",
+                            (service[0], service[1], int(service[2]))):
+                return None
             epoch = int(tx.query(
                 "UPDATE merge_locks SET owner = %s, epoch = epoch + 1,"
                 " expires_at = clock_timestamp() + %s * interval '1 second'"

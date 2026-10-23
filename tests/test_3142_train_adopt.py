@@ -3,6 +3,8 @@
 de l'ancien porteur, fencées par l'époque, au lieu d'attendre leur TTL."""
 from __future__ import annotations
 
+import threading
+import time
 import types
 
 from ameesh import (land, packet_reservation, storage, train, train_reservation,
@@ -139,6 +141,40 @@ class AdoptionTest(PgTestCase):
         self.assertTrue(self.lease.release(self.db))
         self.assertIsNone(self.ledger("runner-b@host-b", service=lambda: stale).acquire(None))
         self.assertEqual(self.lock(), held)
+
+    def test_a_service_lease_expiring_during_the_lock_wait_adopts_nothing(self):
+        # cx2 B1: the service check passes, the target lock waits, the
+        # service lease expires meanwhile; nothing may move afterwards.
+        old, _, state = self.left_publishing()
+        held = self.lock()
+        self.assertTrue(self.lease.acquire(self.db, now=1000))
+        self.db.execute("UPDATE merge_locks SET expires_at = clock_timestamp()"
+                        " + interval '1 second' WHERE target = %s", (self.lease.key,))
+        adopting, blocker = self.connect(), self.connect()
+        self.addCleanup(adopting.close)
+        self.addCleanup(blocker.close)
+        result = {}
+
+        def adopt():
+            result["adopted"] = storage.of(adopting).work.train_adopt(
+                self.key, "train:runner-b@host-b", revision=state["revision"],
+                previous=held, service=self.service(), ttl_s=1800)
+
+        with blocker.transaction() as tx:
+            tx.query("SELECT 1 FROM merge_locks WHERE target = %s FOR UPDATE", (self.key,))
+            thread = threading.Thread(target=adopt)
+            thread.start()
+            deadline = time.monotonic() + 5
+            while not self.db.query("SELECT 1 FROM pg_locks WHERE NOT granted") \
+                    and time.monotonic() < deadline:
+                time.sleep(0.05)
+            tx.query("SELECT pg_sleep(1.2)")
+        thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, {"adopted": None})
+        self.assertEqual(self.lock(), held)
+        ticket = self.ops.train_read(self.key)["reservation"]
+        self.assertEqual(("train:runner-a@host-a", old.epoch), (ticket["owner"], ticket["epoch"]))
 
     def test_a_moved_epoch_or_an_ordinary_reservation_is_never_adopted(self):
         old, _, state = self.left_publishing()
