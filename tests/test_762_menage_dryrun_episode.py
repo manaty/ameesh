@@ -152,6 +152,8 @@ class EpisodeTest(PgTestCase):
         return [a for a in exploitation._housekeeping_alerts([], self.db)
                 if a["type"] == kind]
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "#762/#718 : mountinfo est Linux ; hors Linux, vide par conception")
     def test_truncated_after_mounts_unreadable_keeps_its_since(self):
         tmp = menage.turn_env(self.mine, self.pol, "codex3", {})["TMPDIR"]
         many = [os.path.join(tmp, "many", "f%d" % i) for i in range(6)]

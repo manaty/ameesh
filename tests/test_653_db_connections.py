@@ -220,7 +220,10 @@ class OperatorRecipe(unittest.TestCase):
                     mock.patch.object(self.recipe.pwd, 'getpwuid', return_value=types.SimpleNamespace(
                         pw_name='ameesh', pw_dir='/home/ameesh')), \
                     mock.patch.object(Path, 'home', return_value=Path('/home/ameesh')):
-                self.assertEqual(self.recipe.approved_home(), Path('/home/ameesh'))
+                # approved_home rend le chemin canonique : sous macOS /home est
+                # un lien vers /System/Volumes/Data/home (L68).
+                self.assertEqual(self.recipe.approved_home(),
+                                 Path('/home/ameesh').resolve())
 
     def test_socket_dsn_removes_upstream_tls_and_preserves_startup_options(self):
         try:
