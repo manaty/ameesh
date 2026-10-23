@@ -81,3 +81,14 @@ et son SHA, et il porte un trailer `ameesh-work: <lot>`.
   gel de la tête finale ; le gate les exige.
 - Tests ciblés : la suite complète de la CI sur la tête gelée fait foi. Aucun
   test local n'a été relancé pour ce paquet.
+
+## Correctif CI (23/10 01:0xZ)
+
+La suite complète a refusé le blob de `.github/workflows/tests.yml` épinglé au
+contrat #2446 (`tests.test_2446_train_contract`, parts psycopg 8/8 et psql
+6/16) : #393 a changé ce workflow (`6a420c0d…` → `171321e2…`) et ses deux avis
+(ameesh-cx2 codex, ameesh-dev1 claude, gel #15619 sur `627808b15`) portent sur
+ce blob exact, mais l'épinglage de `src/ameesh/train_contracts.py` ne l'avait
+pas suivi. Correctif mécanique d'une ligne : épinglage du blob audité, aucune
+unité modifiée. Le manifeste (chemin de relecture libre) et ce correctif
+forment le nouveau commit de tête, regelé et repassé en suite complète.
