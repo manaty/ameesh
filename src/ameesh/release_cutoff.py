@@ -462,6 +462,23 @@ def _landing_release(repo: str, sha: str) -> bool:
     return len(parents) == 3
 
 
+def reading_is_green(reading: dict) -> bool:
+    """#3085 : la tête est verte pour la release quand elle l'est strictement,
+    ou quand chaque check a conclu sans qu'aucun ne soit négatif.
+
+    Un job sauté, annulé pour quota ou une panne de démarrage ne démontre pas
+    un défaut : il se consigne (le plan le cite et un lot de correction
+    s'ouvre) et ne retient pas la release. Un check encore en cours, un rouge
+    prouvé, un préfixe requis absent ou une tête sans aucun check ne sont
+    jamais verts (`acceptable` est alors faux). Une lecture sans clé
+    `acceptable` garde l'ancien sens strict."""
+    if reading.get("green"):
+        return True
+    if "acceptable" in reading:
+        return bool(reading.get("acceptable"))
+    return False
+
+
 def commit_is_green(repo: str, project: "ProjectRelease", sha: str,
                     reading: dict | None = None) -> bool:
     """The exact commit is green; a non-green release commit inherits its chain.
@@ -473,6 +490,9 @@ def commit_is_green(repo: str, project: "ProjectRelease", sha: str,
     (last_green). The chain is followed iteratively through `[skip ci]` release
     commits, with no fixed depth: a long series of red-landing releases must
     stay green as a chain.
+
+    #3085 : une lecture `acceptable` (tous les checks ont conclu, aucun
+    négatif) vaut le vert ; voir `reading_is_green`.
     """
     seen = set()
     current = sha
@@ -483,7 +503,7 @@ def commit_is_green(repo: str, project: "ProjectRelease", sha: str,
         first = False
         current_reading = (ci_reading(project, current)
                            if current_reading is None else current_reading)
-        if current_reading.get("green"):
+        if reading_is_green(current_reading):
             return True
         if _landing_release(repo, current):
             return False
@@ -1169,6 +1189,13 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
         migrations=migrations,
         runs=[tree_proof_text(head, tree_proof)] if tree_proof else None,
         version_bump=project.version_bump)
+    # #3085 : un résultat non concluant ne retient pas la release ; il est
+    # cité dans les notes et un lot de correction s'ouvre (règle owner 23/10).
+    if reading.get("inconclusive"):
+        notes += ("\n\n## Checks non concluants (non bloquants, règle owner du 23/10)\n\n"
+                  "Sur la tête %s : %s. Aucun n'est un rouge prouvé ; ils sont "
+                  "consignés et un lot de correction est ouvert.\n"
+                  % (head[:12], ", ".join(reading["inconclusive"])))
     return Plan(project=project, rules=rules, canon_commit=source.commit,
                 cutoff_at=cutoff_at, cutoff_label=cutoff_label, head=head, ci=reading,
                 green=green, last_green=green_commit, base=base, current_version=current,
@@ -1181,6 +1208,30 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
 # --------------------------------------------------------------------------
 # release commit, tag, GitHub release
 # --------------------------------------------------------------------------
+
+def _open_correction(db, project: "ProjectRelease", plan: "Plan"):
+    """#3085 : ouvre le lot de correction d'un check non concluant qui n'a pas
+    retenu la release (règle owner du 23/10). Suivi seulement : la release
+    n'en dépend pas, et un échec d'écriture ne la défait pas."""
+    from . import work
+    text = ", ".join(plan.ci.get("inconclusive") or ())
+    try:
+        return work.add(
+            db,
+            title="CI non concluante sur %s@%s : corriger %s"
+                  % (project.name, plan.head[:12], text),
+            type="bug", priority=2, app=project.name,
+            source="nonconclusive:%s@%s" % (project.name, plan.head),
+            body=("Les checks suivants n'ont pas conclu (ni verts ni négatifs) sur la "
+                  "tête %s releasée en %s : %s.\n\nRègle owner du 23/10 (canon home "
+                  "§3) : un résultat non concluant ne bloque pas la release ; il se "
+                  "consigne et ouvre ce lot de correction. Rejouer ou réparer le "
+                  "check, sans refaire la release."
+                  % (plan.head, plan.version, text)),
+            actor="ameesh")
+    except Exception:  # noqa: BLE001 - la release est écrite, le lot est un suivi
+        return None
+
 
 def _worktree(repo: str, sha: str) -> tuple[str, str]:
     folder = tempfile.mkdtemp(prefix="ameesh-release-", dir=os.path.dirname(repo) or None)
@@ -1664,10 +1715,12 @@ def _report_body(project: ProjectRelease, plan: Plan | None, *, result: str,
                      % (proof["head"][:12], ", ".join(
                          run["url"] or "run %s" % run["id"] for run in proof["runs"])))
     elif plan and plan.ci:
-        lines.append("CI tête: %s%s." % (
-            "verte" if plan.ci.get("green") else "non verte",
-            " ; dernier vert %s" % plan.last_green[:12]
-            if not plan.ci.get("green") and plan.last_green else ""))
+        state = "verte" if reading_is_green(plan.ci) else "non verte"
+        caveat = (" ; non concluants %s" % ", ".join(plan.ci["inconclusive"])
+                  if plan.ci.get("inconclusive") else "")
+        last = (" ; dernier vert %s" % plan.last_green[:12]
+                if not reading_is_green(plan.ci) and plan.last_green else "")
+        lines.append("CI tête: %s%s%s." % (state, caveat, last))
     if staging:
         lines.append("Staging: sortie %s en %ss (journal %s)."
                      % (staging.get("exit"), staging.get("duration_s"), staging.get("log")))
@@ -1865,11 +1918,15 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
                         "Release non faite à la coupure %s : rien de nouveau depuis %s "
                         "(base %s, tête %s, CI %s). Aucun tag, aucun déploiement."
                         % (label, plan.previous["tag"], plan.base[:12], plan.head[:12],
-                           "verte" if plan.ci.get("green") else "non verte"),
+                           "verte" if reading_is_green(plan.ci) else "non verte"),
                         report)
         return report
 
     deviations = []
+    if plan.ci.get("inconclusive"):
+        deviations.append(
+            "tête %s: checks non concluants non bloquants (%s) — consignés, lot de "
+            "correction ouvert" % (plan.head[:12], ", ".join(plan.ci["inconclusive"])))
     if plan.tree_green:
         deviations.append(
             "tête %s: CI en cours, arbre identique à la tête de paquet %s "
@@ -1925,6 +1982,10 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
     tag = landed["tag"]
     fetch(project.repo, project.remote, project.target)
     ensure_github_release(project, tag, plan.version, plan.notes)
+    if plan.ci.get("inconclusive") and db is not None:
+        # #3085 : la release est publiée ; le suivi du non concluant s'ouvre
+        # après elle, il ne la retient ni ne la défait.
+        _open_correction(db, project, plan)
     # Staging deploys the tag's commit V (the green content), never the main
     # head; `origin/main` now contains the landing merge M when main was red.
     staging = (None if no_staging else
