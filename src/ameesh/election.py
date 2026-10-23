@@ -324,10 +324,20 @@ def _canon_reason(db, role: Mapping, host: str) -> str:
 
 
 def _placement_reason(db, role: Mapping, host: str) -> str:
-    """The candidate verdict of this host, written by its own `canon sync`."""
+    """The candidate verdict of this host, written by its own `canon sync`.
+
+    It must still be *current*: the claim CAS also compares the verdict's canon
+    and profile (host, harness, provider, model, credentials) with the role's
+    own, so a verdict written before a rename or a card change is refused by
+    `registry.claim`; ranking it ready would only make the next candidate wait.
+    """
     row = pg.candidate(db, role.get("name") or "", host)
     if row is None:
         return "no placement verdict on this host (canon sync)"
+    if row.get("canon_fresh") is False:
+        return "placement verdict is from another canon (canon sync)"
+    if row.get("placement_profile_fresh") is False:
+        return "placement verdict predates the current card (canon sync)"
     if row.get("placement_ok") is not True:
         return "placement refused: %s" % ((row.get("placement_diagnostic") or "")
                                           or "not admitted")

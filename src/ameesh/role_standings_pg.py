@@ -21,9 +21,21 @@ WINDOW_S = 7 * 86400
 #: the hysteresis needs one hour; keep a day of margin, never grow forever
 HISTORY_S = 2 * 86400
 
-#: candidate rows of an elected role, written by `canon sync` on each host
-_CANDIDATE_COLUMNS = ("host, canon, cwd, placement_ok, placement_diagnostic, "
-                      "placement_ref, updated_at")
+#: candidate rows of an elected role, written by `canon sync` on each host.
+#: `canon_fresh`/`placement_profile_fresh` recheck the two conditions of the
+#: claim CAS (`canon_claim_predicate_sql`) that a stored verdict can outlive:
+#: a canon renamed since the sync, or a profile (host/harness/provider/model/
+#: credentials) changed since the evaluation. A reader that ignored them would
+#: rank a candidate that `registry.claim` then refuses.
+_CANDIDATE_COLUMNS = (
+    "c.host, c.canon, c.cwd, c.placement_ok, c.placement_diagnostic, "
+    "c.placement_ref, c.updated_at, "
+    "(c.canon = coalesce(r.canon, '')) AS canon_fresh, "
+    "(c.placement_profile IS NOT DISTINCT FROM ameesh_placement_profile("
+    "c.host, r.harness, r.provider, r.model, r.credential_mode))"
+    " AS placement_profile_fresh")
+_CANDIDATE_FROM = ("agent_candidates c JOIN agent_registry r"
+                   " ON r.name = c.name")
 
 
 def now_ts(db) -> float:
@@ -39,14 +51,14 @@ def now_ts(db) -> float:
 def candidate_rows(db, name: str) -> list[dict]:
     """The `agent_candidates` verdicts of `name`, one per candidate host."""
     return db.query(
-        "SELECT " + _CANDIDATE_COLUMNS + " FROM agent_candidates"
-        " WHERE name = %s ORDER BY host", (name,))
+        "SELECT " + _CANDIDATE_COLUMNS + " FROM " + _CANDIDATE_FROM +
+        " WHERE c.name = %s ORDER BY c.host", (name,))
 
 
 def candidate(db, name: str, host: str) -> dict | None:
     rows = db.query(
-        "SELECT " + _CANDIDATE_COLUMNS + " FROM agent_candidates"
-        " WHERE name = %s AND host = %s", (name, host))
+        "SELECT " + _CANDIDATE_COLUMNS + " FROM " + _CANDIDATE_FROM +
+        " WHERE c.name = %s AND c.host = %s", (name, host))
     return rows[0] if rows else None
 
 
