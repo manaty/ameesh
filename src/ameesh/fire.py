@@ -805,6 +805,38 @@ def _required_pairs(required) -> tuple:
     return tuple(pairs)
 
 
+def _latest_runs(runs) -> list:
+    """#3008 : les derniers check runs par (application, suite, nom), comme
+    `radar.latest_rollup` pour le rollup (#2524) : un re-run vert sur la même
+    tête remplace l'ancien run rouge de sa suite.
+
+    Seule une date strictement plus récente remplace une entrée. Suite
+    inconnue, date absente, invalide ou ex aequo : toutes les entrées
+    ambiguës restent, afin de ne jamais masquer un échec sur la foi de
+    l'ordre reçu."""
+    from datetime import datetime
+
+    groups = {}
+    for index, run in enumerate(runs or ()):
+        suite = run.get("check_suite_id")
+        key = (("suite", run.get("app_id"), suite, _rollup_name(run))
+               if suite is not None else ("unknown", index))
+        try:
+            stamp = datetime.fromisoformat(run.get("started_at").replace("Z", "+00:00"))
+            stamp = stamp.timestamp() if stamp.tzinfo is not None else None
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            stamp = None
+        groups.setdefault(key, []).append((run, stamp))
+    latest = []
+    for entries in groups.values():
+        if any(stamp is None for _, stamp in entries):
+            latest.extend(run for run, _ in entries)
+        else:
+            newest = max(stamp for _, stamp in entries)
+            latest.extend(run for run, stamp in entries if stamp == newest)
+    return latest
+
+
 def _required_gap(required, rollup, provenance=None) -> list:
     """Les checks requis que `rollup` et `provenance` ne prouvent pas.
 
@@ -830,8 +862,9 @@ def _required_gap(required, rollup, provenance=None) -> list:
             if bad:
                 gaps.append("%s (%s)" % (name, ", ".join(bad)))
             continue
-        runs = [entry for entry in provenance or ()
-                if _rollup_name(entry) == name and entry.get("app_id") == app_id]
+        runs = _latest_runs([entry for entry in provenance or ()
+                             if _rollup_name(entry) == name
+                             and entry.get("app_id") == app_id])
         if not runs:
             providers = sorted({str(entry.get("app_id")) for entry in provenance or ()
                                 if _rollup_name(entry) == name
@@ -994,10 +1027,18 @@ def _head_check_runs(slug: str | None, sha: str, *, gh) -> list:
             if app_id is not None and (isinstance(app_id, bool)
                                        or not isinstance(app_id, int)):
                 raise land.LandError("gh api %s: malformed check run app" % path)
+            # #3008 : la date et la suite départagent un re-run sur la même tête
+            suite = run.get("check_suite")
+            suite_id = suite.get("id") if isinstance(suite, dict) else None
+            if isinstance(suite_id, bool) or not isinstance(suite_id, int):
+                suite_id = None
+            started = run.get("started_at")
             runs.append({"name": run["name"],
                          "status": str(run.get("status") or ""),
                          "conclusion": str(run.get("conclusion") or ""),
-                         "app_id": app_id})
+                         "app_id": app_id,
+                         "started_at": started if isinstance(started, str) else None,
+                         "check_suite_id": suite_id})
     return runs
 
 
@@ -1237,8 +1278,13 @@ def required_on_head(project, target: str, sha: str, *, gh) -> list:
         return []
     runs = _head_check_runs(slug, sha, gh=gh)
     statuses = _head_statuses(slug, sha, gh=gh)
-    rollup = ([{"__typename": "CheckRun", "name": run["name"], "status": run["status"],
-                "conclusion": run["conclusion"]} for run in runs] + statuses)
+    # #3008 : la date ne sert que si la suite est connue — sans elle,
+    # `latest_rollup` regrouperait deux workflows homonymes par le seul nom
+    rollup = ([dict({"__typename": "CheckRun", "name": run["name"],
+                     "status": run["status"], "conclusion": run["conclusion"]},
+                    **({"startedAt": run["started_at"], "checkSuiteId": run["check_suite_id"]}
+                       if run.get("check_suite_id") is not None else {}))
+               for run in runs] + statuses)
     return _required_gap(required, rollup, runs)
 
 
