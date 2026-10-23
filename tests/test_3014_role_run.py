@@ -100,6 +100,32 @@ class RoleRunGuardTest(PgTestCase):
         self.assertFalse(role_run.holder(self.db, NAME, "atelier"))
         self.assertFalse(role_run.holder(self.db, NAME, ""))
 
+    # -- train service lease ------------------------------------------------
+    def test_train_service_lease_follows_the_role_epoch(self):
+        from ameesh import train_runner
+        key = "train-service-3014"
+        self.db.execute("DELETE FROM merge_locks WHERE target LIKE %s",
+                        (key + "%",))
+        cfg = self._cfg()
+        try:
+            old = train_runner.HostLease(cfg, key=key, ttl=900, retry=1)
+            old.bind_role(NAME, 1)
+            self.assertTrue(old.acquire(self.db))
+            self.assertEqual(old.key, "%s:%s:1" % (key, NAME))
+            # Same tenure: a second service incarnation is still excluded.
+            same = train_runner.HostLease(cfg, key=key, ttl=900, retry=1)
+            same.bind_role(NAME, 1)
+            self.assertFalse(same.acquire(self.db))
+            # New role epoch: the dead holder's 900 s service lease must not
+            # block the new holder (study §3, new pilot in under 5 min).
+            new = train_runner.HostLease(cfg, key=key, ttl=900, retry=1)
+            new.bind_role(NAME, 2)
+            self.assertTrue(new.acquire(self.db))
+            self.assertEqual(new.key, "%s:%s:2" % (key, NAME))
+        finally:
+            self.db.execute("DELETE FROM merge_locks WHERE target LIKE %s",
+                            (key + "%",))
+
     # -- wrapper ------------------------------------------------------------
     def test_holder_runs_the_command_with_the_fencing_environment(self):
         self.lease(epoch=11)
@@ -410,11 +436,13 @@ class TrainRoleTest(unittest.TestCase):
             role="pilote")
         fake = mock.Mock()
         with mock.patch("ameesh.scoped_db.ScopedDb", return_value=fake), \
-                mock.patch("ameesh.role_run.holder", return_value=False):
+                mock.patch("ameesh.role_run.live",
+                           return_value={"held": False, "host": "banc", "epoch": 1}):
             self.assertFalse(service._role_ready())
             self.assertEqual(service.pending, {0})
         with mock.patch("ameesh.scoped_db.ScopedDb", return_value=fake), \
-                mock.patch("ameesh.role_run.holder", return_value=True):
+                mock.patch("ameesh.role_run.live",
+                           return_value={"held": True, "host": "banc", "epoch": 2}):
             self.assertTrue(service._role_ready())
 
     def test_service_without_a_role_keeps_the_old_behaviour(self):

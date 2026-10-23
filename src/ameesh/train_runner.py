@@ -41,7 +41,17 @@ class HostLease:
                 or isinstance(retry, bool) or not isinstance(retry, (int, float)) \
                 or retry <= 0:
             raise train.TrainError("positive train service lease duration required")
+        self.base_key = key
         self.key = key
+        #: L165 (EP5): tenure binding. With an elected role, the service key
+        #: carries the role epoch (`train-service:<role>:<epoch>`): a new
+        #: holder of the role does not wait for the dead holder's service
+        #: lease TTL (900 s) before composing, which would break the 5-minute
+        #: election target. The old key expires on its own; the role lease is
+        #: the cross-host exclusion, this key is the second line within one
+        #: tenure. Without a role the key is unchanged (host pin).
+        self.role = None
+        self.role_epoch = None
         # #2446/Codex B2: `land_lock` lets the SAME owner take a new epoch
         # immediately. One owner per service incarnation is therefore
         # mandatory: two processes configured with the same runner id must
@@ -51,6 +61,24 @@ class HostLease:
         self.ttl, self.retry, self.clock = float(ttl), float(retry), clock
         self.epoch = None
         self.next_at = 0.0
+
+    def bind_role(self, name: str, epoch: int | None) -> bool:
+        """Bind the service key to the role tenure; True when the key changed.
+
+        The epoch is an integer from the role's live lease. A new epoch means
+        a new holder (EP1 increments it on every claim): it gets a fresh
+        key, so a service lease left by a host that stopped abruptly cannot
+        hold the new holder for its TTL. The old key is left to expire; the
+        caller may release it first when it still holds it.
+        """
+        if not name or epoch is None:
+            return False
+        epoch = int(epoch)
+        if self.role == name and self.role_epoch == epoch:
+            return False
+        self.role, self.role_epoch = name, epoch
+        self.key = "%s:%s:%d" % (self.base_key, name, epoch)
+        return True
 
     def acquire(self, db, now=None):
         """Take the service lease; False when another host holds it."""
@@ -355,7 +383,18 @@ class Service:
         error = ""
         try:
             db = ScopedDb(self.cfg)
-            held = bool(role_run.holder(db, self.role, self.cfg.host))
+            report = role_run.live(db, self.role)
+            held = bool(report["held"] and report["host"] == self.cfg.host)
+            if held and self.lease is not None:
+                epoch = report.get("epoch")
+                if (self.lease.role_epoch is not None
+                        and (self.lease.role != self.role
+                             or self.lease.role_epoch != epoch)):
+                    # Release the previous tenure's key BEFORE binding the new
+                    # one; a dead holder cannot do it and the key expires on
+                    # its own, which is why the new epoch never waits for it.
+                    self._release_lease()
+                self.lease.bind_role(self.role, epoch)
         except Exception as exc:  # noqa: BLE001 - a broken read is not a lease
             held = False
             error = "%s: %s" % (type(exc).__name__, exc)
