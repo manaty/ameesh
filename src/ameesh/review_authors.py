@@ -727,10 +727,12 @@ def _removal_hunks(repo: str, sha: str, path: str, cache: dict):
     """Les hunks de `path` qui **retirent** des lignes, None si illisible.
 
     Chaque hunk porte sa post-image (`lignes de contexte + ajouts`, la ligne
-    retirée absente), les lignes retirées et les lignes ajoutées. La post-image
-    d'un retrait est le contexte qui l'entoure ; elle prouve la survie quand on
-    la retrouve ailleurs d'un seul tenant. `added` distingue un retrait pur du
-    côté retiré d'une modification (#2994)."""
+    retirée absente), sa pré-image (`lignes de contexte + lignes retirées`,
+    les ajouts absents, lue depuis `sha^`), les lignes retirées et les lignes
+    ajoutées. La post-image d'un retrait est le contexte qui l'entoure ; elle
+    prouve la survie quand on la retrouve ailleurs d'un seul tenant. La
+    pré-image prouve au contraire que le retrait a été annulé. `added`
+    distingue un retrait pur du côté retiré d'une modification (#2994)."""
     key = ("removal-hunks", sha, path)
     if key not in cache:
         parent = plan_git._out(repo, "rev-parse", "--verify", "--quiet",
@@ -745,22 +747,28 @@ def _removal_hunks(repo: str, sha: str, path: str, cache: dict):
                 cache[key] = None
             else:
                 blocks = []
+                pre: list = []
                 post: list = []
                 removed: list = []
                 added: list = []
                 for line in str(text).splitlines() + ["@@"]:
                     if line.startswith("@@"):
                         if post and removed:
-                            blocks.append({"post": post, "removed": removed,
+                            blocks.append({"pre": pre, "post": post,
+                                           "removed": removed,
                                            "added": added})
-                        post, removed, added = [], [], []
+                        pre, post, removed, added = [], [], [], []
                     elif line[:1] == " ":
-                        post.append(line[1:].strip())
+                        value = line[1:].strip()
+                        pre.append(value)
+                        post.append(value)
                     elif line.startswith("+") and not line.startswith("+++ "):
                         post.append(line[1:].strip())
                         added.append(line[1:].strip())
                     elif line.startswith("-") and not line.startswith("--- "):
-                        removed.append(line[1:].strip())
+                        value = line[1:].strip()
+                        pre.append(value)
+                        removed.append(value)
                 cache[key] = blocks
     return cache[key]
 
@@ -776,7 +784,13 @@ def _removal_block_survives(repo: str, head: str, sha: str, paths,
     significatives ne prouve rien (leçon #2994 : une ligne isolée rouvre le
     faux survivant) ; un chemin présent mais illisible est un doute. `allow`
     filtre les retraits qui peuvent encore prouver une survie (#2994/#2614) :
-    un bloc dont un retrait ne passe pas est écarté en entier."""
+    un bloc dont un retrait ne passe pas est écarté en entier.
+
+    #3220 B10 (cx2/cx3, piste auditeur) : le retrait n'est tenu pour annulé
+    dans un candidat que si la **pré-image** du hunk (contexte + lignes
+    retirées + contexte, depuis `sha^`) y réapparaît d'un seul tenant. Une
+    occurrence supplémentaire d'une ligne banale dans une fonction indépendante
+    ne l'annule pas : compter ne localise pas la réintroduction."""
     changed = _changed_paths(repo, head, sha, cache)
     if changed is None:
         return True
@@ -804,9 +818,8 @@ def _removal_block_survives(repo: str, head: str, sha: str, paths,
                 if not any(now[at:at + size] == post
                            for at in range(len(now) - size + 1)):
                     continue
-                if _gone_annulled(repo, sha, candidate, now, gone,
-                                  cache) is True:
-                    continue
+                if _pre_image_reappears(block, now):
+                    continue             # retrait annulé à cet endroit
                 return True
     return False
 
@@ -892,6 +905,9 @@ def _post_image_carried(repo: str, head: str, sha: str, path: str,
     Quand la post-image est petite, ce repli la traite comme un doute
     favorable à l'auteur plutôt que d'exiger trois lignes de contexte : c'est
     le contenu entier du fichier corrigé qui est comparé, pas un bloc isolé.
+    #3220 B10 : un candidat n'est écarté que si la **pré-image** localisée du
+    retrait y réapparaît d'un seul tenant (`_pre_image_reappears`) ; une ligne
+    banale ajoutée dans une fonction indépendante ne l'annule pas.
     None si une lecture échoue (le doute conserve l'auteur)."""
     excluded = tuple(sorted(str(value) for value in exclude or ()))
     key = ("post-image", sha, head, path, excluded, allow_removal is not None)
@@ -927,8 +943,8 @@ def _post_image_carried(repo: str, head: str, sha: str, path: str,
                             cache[key] = True   # lecture impossible : doute
                             break
                         continue
-                    if _gone_annulled(repo, sha, candidate, now, gone,
-                                      cache) is True:
+                    if any(_pre_image_reappears(block, now)
+                           for block in blocks):
                         continue             # le retrait a été annulé ici
                     if _ordered_contains(now, wanted):
                         cache[key] = True
@@ -951,35 +967,23 @@ def _path_line_counts(repo: str, rev: str, path: str, cache: dict):
     return cache[key]
 
 
-def _line_occurrences(lines, row) -> int:
-    """Nombre d'occurrences de `row` (dépouillée) dans `lines`."""
-    wanted = str(row).strip()
-    return sum(1 for line in lines or () if line.strip() == wanted)
+def _pre_image_reappears(block, now) -> bool:
+    """La pré-image d'un hunk de retrait réapparaît-elle telle quelle dans `now` ?
 
-
-def _gone_annulled(repo: str, sha: str, candidate: str, now,
-                   gone, cache: dict):
-    """Le retrait est-il annulé dans `now` ? True/False, None si doute.
-
-    #3220 B9 (dev2) : la simple présence d'une ligne retirée ne prouve pas
-    son annulation : une ligne banale (`return None`) peut déjà figurer dans
-    le fichier de reprise avant le correctif. On compare donc les occurrences
-    de la tête au nombre déjà présent dans le fichier au commit corrigé, ou à
-    défaut dans son parent. Une référence illisible n'annule rien (doute)."""
-    for row in gone:
-        if _line_occurrences(now, row) == 0:
-            continue
-        baseline = None
-        for rev in (sha, str(sha) + "^"):
-            counts = _path_line_counts(repo, rev, candidate, cache)
-            if counts is not None:
-                baseline = counts.get(str(row).strip(), 0)
-                break
-            if _path_absent(repo, rev, candidate, cache) is None:
-                return None             # lecture impossible : doute
-        if baseline is not None and _line_occurrences(now, row) > baseline:
-            return True                 # occurrence ajoutée : retrait annulé
-    return False
+    #3220 B9/B10 (revues dev2, cx2, cx3 ; piste auditeur) : une ligne banale
+    (`return None`) peut déjà figurer dans le fichier de reprise, ou être
+    ajoutée dans une fonction indépendante. Ni sa présence ni un compte global
+    ne prouvent l'annulation du retrait. La preuve localisée est la pré-image
+    du hunk (contexte avant + lignes retirées + contexte après, lue depuis
+    `sha^`) retrouvée d'un seul tenant : c'est le symétrique de
+    `_hunks_survive`. Un bloc de moins de trois lignes significatives ne
+    prouve rien ; le doute conserve alors l'auteur."""
+    pre = block.get("pre") or []
+    if len([row for row in pre if _meaningful_line(row)]) < 3:
+        return False
+    size = len(pre)
+    return any(now[at:at + size] == pre
+               for at in range(len(now) - size + 1))
 
 
 def _raw_out(repo: str, *args: str) -> Optional[str]:
