@@ -37,6 +37,23 @@ def critical_names(cfg, db):
     return names
 
 
+def reconcile(cfg, db, host, *, actor=None):
+    """#3035: verified reopening of a lost host, for a lifecycle pass or the command.
+
+    The proof is database state read under the host gate lock (fresh reading,
+    origins home and unfenced, no live lease, no active handoff, no recovery
+    attempt), never the returning machine's own declaration. A refusal names
+    the missing proof instead of forcing the host open.
+    """
+    if not isinstance(host, str) or not NAME_RE.fullmatch(host):
+        raise ValueError("invalid host name")
+    if actor is None:
+        actor = work.corrector(cfg, db)
+    fresh_within = max(180, int(getattr(cfg, "resource_interval", 60) * 3))
+    return storage.of(db).host_lifecycle.reconcile_loss(
+        host, actor=actor, fresh_within=fresh_within)
+
+
 def readiness(db, agent, target, *, adapter=None, requirements_for=None):
     """Evaluate helper inventory and host-scoped logins, exposing only named gaps."""
     required = host_preflight.Requirements(target, agent["harness"], agent.get("session_account") or "")
@@ -167,6 +184,9 @@ def main(argv=None):
     withdraw.add_argument("--for", dest="duration", help="request return after this duration, e.g. 8h")
     restore = commands.add_parser("undrain", help="reopen the host and request agents' return")
     restore.add_argument("host")
+    recovered = commands.add_parser(
+        "reconcile", help="verified reopening of a lost host whose readings returned")
+    recovered.add_argument("host")
     status = commands.add_parser("status", help="show durable drain and return progress")
     status.add_argument("host", nargs="?")
     args = parser.parse_args(argv)
@@ -181,9 +201,14 @@ def main(argv=None):
             result = api.undrain(args.host, actor=work.corrector(cfg, db))
             if result is None:
                 raise ValueError("host has no drain request")
+        elif args.command == "reconcile":
+            result = reconcile(cfg, db, args.host)
         else:
             result = [api.get(args.host)] if args.host else api.listing()
         print(json.dumps(result, ensure_ascii=False))
+        if args.command == "reconcile" and not (
+                result.get("reconciled") or result.get("mode") == "available"):
+            return 1
         return 0
     except (ValueError, db_mod.DbError) as exc:
         print("host request refused: " + str(exc))
