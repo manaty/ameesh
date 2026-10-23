@@ -30,9 +30,9 @@ class _RoleCase(PgTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.cfg = dataclasses.replace(self.cfg, host=self.HOST)
-        for table in ("role_standings", "agent_candidates", "canon_state",
-                      "host_lifecycle", "host_holds", "credential_health",
-                      "host_resources"):
+        for table in ("role_standings", "role_handover", "agent_candidates",
+                      "canon_state", "host_lifecycle", "host_holds",
+                      "credential_health", "host_resources"):
             self.db.execute("DELETE FROM " + table)
         # Un descripteur de harnais factice : ces témoins ne dépendent pas des
         # binaires installés sur la machine de CI (éprouvé séparément).
@@ -610,6 +610,71 @@ class RunnerWiringTest(_RoleCase):
         self.assertIsNone(obj.role_evaluation_once())
         self.assertEqual(self.db.query(
             "SELECT count(*)::int AS n FROM role_standings")[0]["n"], 1)
+
+    def test_la_preparation_ne_publie_pas_un_role_hors_filtre(self):
+        # #3099 : un exécuteur filtré sur un autre agent ne publie pas de
+        # relevé prêt pour un rôle qu'il ne réclamera jamais.
+        registry.upsert(self.db, "autre", harness="claude", host="banc",
+                        cwd="/work")
+        self.ready_host("pilote", "banc")
+        obj = runner.Runner(self.cfg, self.db, once=True, agents=["autre"])
+        self.addCleanup(obj.stop.set)
+        self.assertEqual(obj.role_evaluation_once(), 0)
+        self.assertEqual(pg.latest(self.db, "pilote"), {})
+
+    def test_la_marque_de_bascule_survit_au_redemarrage(self):
+        # #3099 : la marque écrite avant de rendre le bail est relue par un
+        # nouvel exécuteur ; le détenteur repris attend la marge du challenger.
+        self.standings_for_handover()
+        obj = self.runner()
+        obj.note_handover_release("pilote", "atelier", 0.0)
+        again = self.runner()
+        self.assertGreater(again.handover_wait_s("pilote"), 1.0)
+        again._election_free_since["pilote"] = again.clock.monotonic() - 21.0
+        allowed, reason, _ = again.election_claim_allowed(self.role_row)
+        self.assertFalse(allowed)
+        self.assertIn("handover", reason)
+
+    def test_le_premier_claim_relit_la_marque_de_bascule(self):
+        # B1 de la relecture #3099 : le tout premier claim d'un Runner neuf
+        # relit `role_handover` sans passer par `handover_wait_s` ni par un
+        # autre préchargement, sinon la marge durable est ignorée au
+        # redémarrage.
+        self.standings_for_handover()
+        obj = self.runner()
+        obj.note_handover_release("pilote", "atelier", 0.0)
+        again = self.runner()
+        self.assertFalse(again._handover_loaded)
+        again._election_free_since["pilote"] = again.clock.monotonic() - 21.0
+        allowed, reason, _ = again.election_claim_allowed(self.role_row)
+        self.assertFalse(allowed)
+        self.assertIn("handover", reason)
+        self.assertTrue(again._handover_loaded)
+
+    def test_le_refroidissement_survit_au_redemarrage(self):
+        # #3099 : la marque échue devient le refroidissement du challenger ;
+        # un exécuteur repris ne redonne pas le rôle au même challenger mort.
+        now = self.history("pilote", "banc", 90.0)
+        self.history("pilote", "atelier", 96.0, now=now)
+        role_row = self.hold("pilote", "banc", epoch=7, expires_in=300)
+        obj = self.runner()
+        obj.note_handover_release("pilote", "atelier", 0.0)
+        self.db.execute(
+            "UPDATE role_handover"
+            " SET released_until = now() - interval '1 second'")
+        again = self.runner()
+        self.assertIn("atelier", again.handover_failed("pilote"))
+        worker = runner.AgentWorker(again, registry.get(self.db, "pilote"), role_row)
+        self.addCleanup(worker.watchdog_stop.set)
+        self.assertIsNone(worker._election_handover())
+        # Sans refroidissement, la bascule reste due.
+        again._handover_failed.clear()
+        worker._handover_next = 0.0
+        self.assertIsNotNone(worker._election_handover())
+
+    def standings_for_handover(self):
+        self.standing("pilote", "atelier", 99.0)
+        self.standing("pilote", "banc", 90.0)
 
 
 if __name__ == "__main__":

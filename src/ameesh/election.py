@@ -451,16 +451,25 @@ def candidate_state(db, role: Mapping, host: str, *, now: float | None = None,
 # publication (each candidate host publishes only its local part)
 # --------------------------------------------------------------------------
 def publish_self(cfg, db, host: str, *, interval_s: float = EVAL_INTERVAL_S,
-                 now: float | None = None, force: bool = False) -> int:
+                 now: float | None = None, force: bool = False,
+                 names: Sequence[str] | None = None) -> int:
     """Publish the local standing of `host` for every elected role it may hold.
 
     At most one row per role and per `interval_s` unless `force`; a role this
-    host is not a candidate for is skipped. Database errors propagate (the
-    caller decides whether they are fatal); a role whose evaluation fails is
-    still published as not ready, so silence never looks like readiness.
+    host is not a candidate for is skipped. `names` restricts publication to
+    the agents an executor can actually claim (its `agents_filter`): a runner
+    that cannot claim a role must not publish readiness for it, or a holder
+    would hand that role over to a challenger that never claims (#3099).
+    Database errors propagate (the caller decides whether they are fatal); a
+    role whose evaluation fails is still published as not ready, so silence
+    never looks like readiness.
     """
     published = 0
     for role in pg.elected_roles(db, host):
+        # même convention que `registry.claimable` : une liste vide ne filtre
+        # pas, seule une liste non vide restreint la publication
+        if names and role["name"] not in names:
+            continue
         latest = pg.latest(db, role["name"]).get(host) or {}
         age = None
         if latest.get("evaluated_ts") is not None:

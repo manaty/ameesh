@@ -1948,13 +1948,11 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     classe, indépendants (familles distinctes, aucune celle de l'auteur) et
     sans blocage non levé ; la même porte que le feu du pilote.
 
-    The CI is required **explicitly**: for a project without `ci_required`,
-    `ci=None` (no reader) and a reader that answers nothing are refused, like
-    a red CI — an absent status is not a green one (revue #544 r1). A project
-    with `ci_required` may instead certify admission with GitHub's CI on the
-    frozen commit when no PR vouches for it (`ci=None`, or a reader that
-    answers nothing because there is no open PR): a green commit CI is not
-    blocked by the absence of a PR (revue #544 r2).
+    The CI is required **explicitly**: `ci=None` without `ci_required` is
+    refused (no reader). When the PR reader reports no PR, the frozen
+    commit's CI certifies admission instead (#3080), including the declared
+    statuses and due parts. An unreadable PR, a moved head or a red PR never
+    falls back to a green commit.
 
     L1651 (#1650): a project that declares `ci_parts` also proves the
     **completeness** of the frozen CI — the exact set of parts the change set
@@ -2102,9 +2100,9 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
         except plan_github.GithubError as exc:
             raise QueueError("cannot read the CI of branch %s on GitHub (%s): try again once "
                              "gh works" % (row["branch"], exc)) from exc
-        if not status and not needs_commit_ci:
-            raise QueueError("no CI status for branch %s (lot #%d): a green CI on the frozen "
-                             "head %s is required" % (row["branch"], lot, tip[:12]))
+        if not status:
+            # #3080: commit statuses (e.g. lot/*) do not need an open PR.
+            needs_commit_ci = True
     if status:
         if not _same(status.get("head"), tip):
             raise QueueError("PR #%s is at %s, not at the freeze %s: its CI does not "
@@ -2118,6 +2116,7 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
                              "from a non-draft PR" % status.get("number"))
     proof = None
     if needs_commit_ci:
+        project = project or radar.Project(name=os.path.basename(repo), repo=repo)
         if parts is None and getattr(project, "ci_parts", None):
             parts = _parts_reader(project, repo, target, tip, clone, cfg=cfg)
         _required_ci(project, tip, commit_ci, parts=parts, branch=row["branch"])
@@ -2267,8 +2266,8 @@ def _parts_reader(project, repo: str, target: str, sha: str, clone, cfg=None):
 
 def _required_ci(project, sha: str, commit_ci=None, *, parts=None,
                  branch: str | None = None) -> None:
-    """L160g (#473): `ci_required` — GitHub's CI green on the frozen commit
-    `sha` itself; QueueError otherwise (no run, running, red, unreadable).
+    """GitHub CI on frozen `sha`: `ci_required` or no PR (#3080).
+    QueueError otherwise (no run, running, red, unreadable).
 
     L1651 (#1650): `parts` (a callable returning the due contexts, or a
     sequence; None: none) closes the completeness hole. Each due part must
@@ -2281,14 +2280,17 @@ def _required_ci(project, sha: str, commit_ci=None, *, parts=None,
     commit — the reader is pinned to `sha` — can stand for a part of this
     one."""
     from . import plan_github, radar
+    requirement = "ci_required" if getattr(project, "ci_required", False) else "no PR"
     try:
         runs = (commit_ci or (lambda s: radar.commit_ci(project, s, branch=branch)))(sha)
     except plan_github.GithubError as exc:
-        raise QueueError("project %s requires CI on the frozen commit (ci_required), "
-                         "unreadable (%s): try again once gh works" % (project.name, exc)) from exc
+        raise QueueError("project %s requires CI on the frozen commit (%s), "
+                         "unreadable (%s): try again once gh works"
+                         % (project.name, requirement, exc)) from exc
     if not runs["runs"]:
-        raise QueueError("project %s requires CI on the frozen commit (ci_required): no run "
-                         "on %s yet (push it, let the workflows run)" % (project.name, sha[:12]))
+        raise QueueError("project %s requires CI on the frozen commit (%s): no run "
+                         "on %s yet (push it, let the workflows run)"
+                         % (project.name, requirement, sha[:12]))
     if runs["pending"]:
         raise QueueError("the CI on the frozen commit %s is still running (%s)"
                          % (sha[:12], ", ".join(runs["pending"])))

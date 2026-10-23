@@ -12,12 +12,15 @@ verte sous macOS, ce job reste **indépendant** du check requis `tests` —
 l'exiger ferait rougir le premier paquet pour tous les lots (§11 bis). Il
 entre dans les `needs` de `tests` quand cette preuve existe (lot de suite).
 
-Ces témoins lisent le workflow (sous-ensemble de texte, pas de PyYAML) et les
-tests `/proc` réécrits : une régression du job ou un retour à une lecture
-directe de `/proc` dans ces tests rougit ici, sans attendre un runner macOS.
+Ces témoins lisent le workflow (sous-ensemble de texte, pas de PyYAML), les
+tests `/proc` réécrits et les témoins Linux-only gardés par
+`platform.is_linux()` (#3132) : une régression du job, un retour à une lecture
+directe de `/proc`, ou un témoin Linux-only non gardé rougit ici, sans
+attendre un runner macOS.
 """
 from __future__ import annotations
 
+import ast
 import os
 import re
 import subprocess
@@ -112,6 +115,18 @@ class MacosSuiteJobTest(unittest.TestCase):
         self.assertNotIn("platform-macos", needs.group(1))
         self.assertIn("platform-macos n'est pas encore requis", aggregate)
 
+    def test_the_plan_guard_is_outside_the_tolerated_step(self):
+        # #3048 (N de la revue #3030) : `continue-on-error` de #3042 ne
+        # tolère que la portabilité de la suite ; la garde « aucune part
+        # psycopg » est une étape à part, sans tolérance, avant la suite.
+        garde = self.job.index("- name: le plan donne des parts psycopg (L68)")
+        suite = self.job.index("- name: suite du plan (L68, pilote psycopg)")
+        self.assertLess(garde, suite)
+        etape = self.job[garde:suite]
+        self.assertIn("aucune part psycopg", etape)
+        self.assertIn("exit 1", etape)
+        self.assertNotIn("continue-on-error", etape)
+
 
 class BenchTmpdirTest(unittest.TestCase):
     """#3042 : le banc résout TMPDIR avant de créer ses bacs jetables."""
@@ -138,6 +153,72 @@ class BenchTmpdirTest(unittest.TestCase):
 
 class LinuxOnlyWitnessesAreBoundedTest(unittest.TestCase):
     """Les lectures Linux qui restent (pas de couche possible) sont bornées."""
+
+    #: #3132 : témoins Linux-only de la suite macOS (cgroup, PSI, /proc,
+    #: waitid, inotify). Chacun est gardé par la couche plateforme
+    #: (`platform.is_linux()`, ou la capacité `waitid`) : sous macOS il est
+    #: sauté proprement, et sous Linux il continue de prouver.
+    BOUNDED = (
+        ("test_l73_housekeeping.py",
+         "test_nouvelle_session_ne_vide_pas_un_dossier_tmp_tenu"),
+        ("test_l73_housekeeping.py",
+         "test_dossier_tmp_d_un_agent_absent_tenu_par_un_processus_est_garde"),
+        ("test_l73_housekeeping.py",
+         "test_dossier_tmp_tenu_par_un_processus_n_est_pas_evince"),
+        ("test_762_menage_dryrun_episode.py",
+         "test_truncated_after_mounts_unreadable_keeps_its_since"),
+        ("test_530_housekeeping_followups.py",
+         "test_mount_table_unreadable_is_journaled_and_alerted"),
+        ("test_530_housekeeping_followups.py",
+         "test_mount_table_unreadable_never_resolves_an_unremovable_episode"),
+        ("test_530_housekeeping_followups.py",
+         "test_mount_table_readable_again_lifts_the_unscanned_alert"),
+        ("test_l231_deps.py", "test_6_holders_see_mapped_files"),
+        ("test_476_background_signals.py",
+         "test_capture_refuses_a_harness_already_reaped_by_another_poller",
+         "waitid"),
+        ("test_turn_grace.py", "test_groupe_disparu_ferme_non_orphelin"),
+        ("test_turn_grace.py", "test_shutdown_vanished_process_closes_without_orphan"),
+        ("test_turn_grace.py",
+         "test_failed_handoff_preserves_child_migrated_to_another_turn"),
+        ("test_turn_grace.py", "test_echeance_de_la_grace_reglee_par_agent"),
+        ("test_turn_grace.py", "test_tour_clos_au_point_sur_garde_le_travail_de_fond"),
+        ("test_l131_suites_lourdes.py",
+         "test_a_worker_ignoring_sigterm_keeps_the_slot_until_sigkill"),
+        ("test_l131_suites_lourdes.py", "test_a_suite_on_a_terminal_can_read_it"),
+        ("test_l131_suites_lourdes.py", "test_reads_dev_tty_with_stdin_redirected"),
+        ("test_l131_suites_lourdes.py",
+         "test_ctrl_z_suspends_the_wrapper_and_fg_resumes"),
+        ("test_l131_suites_lourdes.py",
+         "test_a_fork_chain_and_setsid_cannot_outlive_the_slot"),
+        # garde de classe : tout le contrat de préchargement du garde cgroup
+        ("test_l490_deepseek_cgroup.py", "PreloadTest"),
+        ("test_l112_host_gate.py", "test_changement_vu_par_inotify"),
+    )
+
+    @staticmethod
+    def _guarded(tree: ast.AST, name: str, needle: str = "is_linux") -> bool:
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.ClassDef)) or node.name != name:
+                continue
+            for decorator in node.decorator_list:
+                dumped = ast.dump(decorator)
+                if "skipUnless" in dumped and needle in dumped:
+                    return True
+        return False
+
+    def test_every_linux_only_witness_is_skipped_off_linux(self):
+        for entry in self.BOUNDED:
+            nom, temoin = entry[:2]
+            garde = entry[2] if len(entry) > 2 else "is_linux"
+            chemin = os.path.join(REPO, "tests", nom)
+            with open(chemin, encoding="utf-8") as fh:
+                tree = ast.parse(fh.read(), filename=chemin)
+            with self.subTest(module=nom, witness=temoin):
+                self.assertTrue(
+                    self._guarded(tree, temoin, garde),
+                    "%s : %s doit rester gardé par %s (#3132)"
+                    % (nom, temoin, garde))
 
     def test_the_poste_proc_exe_witness_is_linux_only(self):
         chemin = os.path.join(REPO, "tests", "test_2950_poste_processus.py")
