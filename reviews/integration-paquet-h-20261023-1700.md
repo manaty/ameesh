@@ -111,6 +111,16 @@ témoins #3100) et `tests.test_3057_panier_vivacite` **8/8**.
 
 Aucune autre résolution : les 25 autres fusions sont propres.
 
+## Adaptation mécanique du véhicule
+
+`0f487e660` : `ui/src/api/schema.d.ts` régénéré (`npm run gen`). #3013
+(paquet h-1500) a ajouté l'événement `pilot.gesture` au schéma OpenAPI sans
+régénérer les types du client ; la tête de `main` est rouge sur le job `ui`
+(`schema.d.ts is stale`), préexistant à ce paquet. Le delta est la seule ligne
+d'énumération `type: … "pilot.gesture"`, production mécanique du générateur
+(`ui/scripts/gen-api.mjs`) — aucun avis requis (§2, adaptation mécanique). Le
+job `ui` n'est pas un check requis, mais un test négatif ne reste pas rouge.
+
 ## Écartés (ce véhicule)
 
 | lot | motif |
@@ -146,7 +156,7 @@ Les autres lots du calcul sont en attente et n'étaient pas prêts : #114, #390,
   têtes gelées (voir leurs lots).
 - **Migrations** : `0478_role_handover.sql` (#3099) seule migration ajoutée ;
   aucun numéro en collision.
-- **Diff** : 105 fichiers, +7125/−453 hors manifeste ; `git diff --check`
+- **Diff** : 107 fichiers, +7295/−454 hors manifeste ; `git diff --check`
   propre ; aucun marqueur de conflit.
 - **Contrôle d'inclusion** (`scripts/paquet-inclusion.py`, tête `49e232681`) :
   **aucun défaut**, 26 compositions / 28 lots attendus, 27 prêts sur 27
