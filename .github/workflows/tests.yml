@@ -851,10 +851,11 @@ jobs:
   # (gratuit), pas un runner « large » payant (canon §3). Défense en
   # profondeur : .github/workflows/relance-hosted.yml rejoue les jobs annulés
   # faute de runner.
-  # L68 — DÉCISION DE CONCEPTION (revue #393, 23/10) : ce job n'est pas encore
-  # exigé par `tests`. La suite complète vit dans `macos.yml`, hors du chemin
-  # du paquet ; #3026 (macOS vert) décidera de la désignation du check requis
-  # macOS, sans ramener la suite longue ici.
+  # L68/#3198 — DÉCISION DE CONCEPTION (revue #393, 23/10) : ce job est le
+  # verdict COURT de la couche plateforme ; la suite complète vit dans
+  # `macos.yml`, hors du chemin du paquet. Depuis #3026 (L68b), ce job court
+  # est REQUIS : il entre dans les `needs` de `tests` ; la suite longue reste
+  # un nocturne hors porte et ne revient jamais ici.
   platform-macos:
     name: plateforme macOS
     needs: plan
@@ -1007,7 +1008,7 @@ jobs:
     # #3198 : hors demande de gel (étiquette `ci-macos`), il saute et change de
     # nom — jamais de `tests` vert sans tests.
     if: always() && github.event.label.name != 'ci-macos'
-    needs: [plan, version, psycopg, psql, doc-readers, fs-class]
+    needs: [plan, version, psycopg, psql, platform-macos, doc-readers, fs-class]
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
@@ -1025,9 +1026,9 @@ jobs:
           echo "doc     : ${{ needs.doc-readers.result }}"
           echo "psycopg : ${{ needs.psycopg.result }} (parts ${{ needs.plan.outputs.psycopg }})"
           echo "psql    : ${{ needs.psql.result }} (parts ${{ needs.plan.outputs.psql }})"
-          # L68/#3198 : platform-macos est le job court de la couche
-          # plateforme (la suite complète vit dans macos.yml) ; il n'est pas
-          # encore requis, donc pas dans les `needs` et rien à vérifier ici.
+          # L68b (#3026) : le job court macOS est requis ; la suite longue
+          # de macos.yml reste hors du chemin du paquet.
+          echo "macOS   : ${{ needs.platform-macos.result }}"
           echo "autre FS: ${{ needs.fs-class.result }}"
           echo "version : ${{ needs.version.result }}"
           # un plan refusé (étiquette étrangère, SHA qui ne nomme pas la tête,
@@ -1060,6 +1061,9 @@ jobs:
           # vides) doit rougir le check requis, jamais conclure SUCCESS.
           test "${{ needs.psycopg.result }}" = success
           test "${{ needs.psql.result }}" = success || { test '${{ needs.plan.outputs.psql }}' = '[]' && test "${{ needs.psql.result }}" = skipped; } || exit 1
+          # L68b (#3026) : le job court macOS est requis ; un échec ou une
+          # annulation rougit `tests`.
+          test "${{ needs.platform-macos.result }}" = success
           # #748 : la part sur l'autre système de fichiers n'existe que pour une
           # release (ou à la main) ; quand elle a tourné, elle compte
           test "${{ needs.fs-class.result }}" = success || test "${{ needs.fs-class.result }}" = skipped

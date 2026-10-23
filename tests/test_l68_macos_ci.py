@@ -15,9 +15,10 @@ PR.
 macOS n'a pas de conteneurs de service : la base est installée et démarrée
 dans une étape, jamais par `services:`.
 
-Décision de la revue #393 (23/10), conservée : tant que #3026 n'a pas livré
-macOS vert, aucun job macOS n'est requis par `tests` — l'exiger ferait rougir
-le premier paquet pour tous les lots (§11 bis).
+Depuis #3026 (L68b), le job court `platform-macos` est REQUIS : il entre dans
+les `needs` de `tests`. La suite longue de `macos.yml` reste un nocturne hors
+du chemin du paquet ; elle n'est pas encore verte sous macOS (les correctifs
+de portabilité sont suivis par lots séparés).
 
 Ces témoins lisent les workflows (sous-ensemble de texte, pas de PyYAML), les
 tests `/proc` réécrits et les témoins Linux-only gardés par
@@ -88,15 +89,17 @@ class MacosShortJobTest(unittest.TestCase):
         # #987 : pas de `macos-latest` arm64, qui n'obtenait pas de capacité.
         self.assertIn("runs-on: macos-26-intel", self.job)
 
-    def test_the_job_is_not_required_before_macos_vert(self):
-        # Décision de conception de la revue #393 : aucun paquet ne doit
-        # rougir pour un job macOS tant que #3026 n'a pas livré macOS vert.
+    def test_the_short_job_is_required(self):
+        # L68b (#3026) : #3198 a sorti la suite longue du chemin du paquet ;
+        # c'est le verdict court macOS qui est requis.
         debut = self.text.index("\n  tests:\n")
         aggregate = self.text[debut:]
         needs = re.search(r"(?m)^    needs: \[(.*)\]$", aggregate)
         self.assertIsNotNone(needs, "job tests : ligne needs introuvable")
-        self.assertNotIn("platform-macos", needs.group(1))
-        self.assertNotIn("needs.platform-macos.result", aggregate)
+        self.assertIn("platform-macos", needs.group(1).split(", "))
+        self.assertIn('test "${{ needs.platform-macos.result }}" = success',
+                      aggregate)
+        self.assertNotIn("continue-on-error: true", self.job)
 
 
 class MacosFullSuiteWorkflowTest(unittest.TestCase):
