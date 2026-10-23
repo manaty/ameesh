@@ -106,6 +106,43 @@ class GateHoldLeaseTtlTest(PgTestCase):
         self.assertGreater(self.remaining(), 570.0)
 
     # -- never shorten an expiry already held ------------------------------
+    def test_renew_ne_raccourcit_jamais(self):
+        # Le contrat de l'écriture : le plus tardif de l'échéance tenue et de
+        # la nouvelle. Un renouvellement court ne ramène pas un bail long.
+        self.assertIsNotNone(registry.renew(self.db, NAME, RUNNER, self.epoch, 1200))
+        self.assertIsNotNone(registry.renew(self.db, NAME, RUNNER, self.epoch, 10))
+        self.assertGreater(self.remaining(), 1170.0)
+        self.assertLess(self.remaining(), 1230.0)
+
+    def test_hold_ne_perd_pas_un_renouvellement_concurrent(self):
+        # Course de cx2 : hold lit un bail à 100 s, le heartbeat renouvelle à
+        # 1200 s et commit, puis hold renouvelle. L'écriture verrouillée doit
+        # garder 1200 s (GREATEST), pas écraser à la valeur calculée avant.
+        self.db.execute(
+            "UPDATE agent_registry SET lease_expires_at = clock_timestamp() "
+            "+ interval '100 seconds' WHERE name = %s", (NAME,))
+        other = self.connect()
+        self.addCleanup(other.close)
+        original = registry.get
+        calls = {"n": 0}
+
+        def heartbeat_between(*args, **kwargs):
+            row = original(*args, **kwargs)
+            calls["n"] += 1
+            if calls["n"] == 1:  # avant le verrou de hold, pas pendant
+                registry.renew(other, NAME, RUNNER, self.epoch, 1200)
+            return row
+
+        cfg = dataclasses.replace(self.cfg, lease_ttl=300.0)
+        with self.live():
+            gate = pilot_gesture.gate(cfg, self.db, "assign", "#race")
+            self.assertIsNotNone(gate)
+            with mock.patch.object(pilot_gesture.registry, "get",
+                                   side_effect=heartbeat_between):
+                gate.hold(self.db, ttl_s=300.0)
+        self.assertGreater(self.remaining(), 1170.0)
+        self.assertLess(self.remaining(), 1230.0)
+
     def test_hold_ne_raccourcit_pas_le_bail_du_runner(self):
         # Le runner vient de renouveler à 1200 s ; ce processus ne sait pas
         # encore lire ce réglage : le geste doit conserver l'échéance tenue,

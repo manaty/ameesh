@@ -109,10 +109,12 @@ class Gate:
         the host's own TTL (`lease_ttl`), and a claim only takes a free or
         expired lease (EP1). Returns the event id.
 
-        The renewal also never shortens an expiry already held: a Host card
-        unreadable here, or a configuration changed since the claim, must not
-        make the lease expire before the runner's next heartbeat and elect
-        another pilot (#3115).
+        The renewal also never shortens an expiry already held: `renew` keeps
+        the later of the current expiry and the new one under the row lock
+        (`GREATEST`), so a Host card unreadable here, a configuration changed
+        since the claim, or a heartbeat renewing between our read and the lock
+        must not make the lease expire before the runner's next heartbeat and
+        elect another pilot (#3115).
 
         `margin_s` is the worst-case duration of an external call (a push, a
         `gh pr merge`, its read-back) made right after this transaction. The
@@ -132,14 +134,7 @@ class Gate:
                     "gesture %s refused for %s: the agent is stopped at epoch %s "
                     "(no gesture from a stopped role)"
                     % (self.gesture, self.agent, self.epoch))
-            # never shorten an expiry the runner already holds (the Host card
-            # may be unreadable from this process, or its TTL changed)
-            try:
-                held = float(before.get("lease_expires_ts") or 0.0) - time.time()
-            except (TypeError, ValueError):
-                held = 0.0
-            expires = registry.renew(tx, self.agent, self.runner, self.epoch,
-                                     max(ttl, held))
+            expires = registry.renew(tx, self.agent, self.runner, self.epoch, ttl)
             if expires is None:
                 raise GestureRefused(_refusal(tx, self))
             # `renew` locks the agent row; a stop committed just before the
