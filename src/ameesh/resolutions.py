@@ -313,8 +313,8 @@ def _move_object(source: str, target: str) -> str:
         # quarantaine (rien n'est supprimé), le chemin porte un objet
         return "replaced concurrently, rewritten again at its path; copy kept in %s" % target
     except OSError as exc:
-        return ("replaced concurrently and NOT restored (%s): the valid object is at %s, "
-                "link it back to %s" % (exc, target, source))
+        return ("moved away although replaced concurrently, and NOT restored (%s): the "
+                "valid object is only at %s, link it back to %s" % (exc, target, source))
     os.unlink(target)
     return "replaced concurrently, restored at its path"
 
@@ -428,14 +428,14 @@ def _quarantine_store(objects: str, git_dir: str, common: str, stamp: str) -> li
         except OSError as exc:
             kept = "error: %s" % exc
         line = ("%s -> %s" % (source, target) if not kept
-                else "%s left in place: %s" % (source, kept))
+                else "%s not quarantined: %s" % (source, kept))
         try:
             with open(os.path.join(box, "moved.log"), "a", encoding="utf-8") as log:
                 log.write(line + "\n")
         except OSError:
             pass
-        print("ameesh: #3181 %s %s" % ("quarantined empty" if not kept else "not moved",
-                                       line), file=sys.stderr)
+        print("ameesh: #3181 %s%s" % ("" if kept else "quarantined empty ", line),
+              file=sys.stderr)
         if not kept:
             moved.append(source)
     return moved
