@@ -991,14 +991,19 @@ def _packet_proof_gate(rollup) -> tuple:
     #3085 (règle owner du 23/10) : un check du portier **non concluant**
     (sauté, annulé pour quota, expiré, démarrage raté) n'est pas un défaut
     prouvé : il se consigne au lieu de bloquer, comme tout autre check.
+    #3209 : la suite sautée parce qu'une PR porte la tête
+    (`radar.packet_suite_covered`) n'a rien à consigner.
     Rend `(gaps, consigned)`."""
     from . import radar
     gaps, consigned = [], []
-    for entry in radar.packet_proof_entries(rollup):
+    entries = radar.packet_proof_entries(rollup)
+    for entry in entries:
         name = str(entry.get("name") or entry.get("context") or "paquet")
         state = _rollup_state(entry) or "?"
         result = radar.check_result(entry)
         if result == radar.CI_INCONCLUSIVE_RESULT:
+            if radar.packet_suite_covered(entry, entries):
+                continue
             consigned.append("%s (%s)" % (name, state))
         elif result != radar.CI_GREEN_RESULT:
             gaps.append("%s (%s)" % (name, state))
