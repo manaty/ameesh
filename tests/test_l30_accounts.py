@@ -12,6 +12,8 @@ import dataclasses
 import hashlib
 import json
 import os
+import shlex
+import sys
 import time
 import unittest
 from unittest import mock
@@ -350,9 +352,24 @@ class _Base(PgTestCase):
         lease = registry.claim(self.db, name, runner.runner_id, 3600)
         return runner, AgentWorker(runner, registry.get(self.db, name), lease)
 
+    def _python_du_banc(self) -> str:
+        """#3242 : les faux harnais (`#!/usr/bin/env python3`) jouent sous
+        l'interpréteur du banc. Sous un HOME patché, un `python3` de shims
+        (mise, pyenv) qui lit sa configuration dans HOME échoue : aucun tour
+        enregistré. Ce dossier, mis en tête du PATH, n'en dépend pas."""
+        dossier = os.path.join(self.tmp, "python-du-banc")
+        chemin = os.path.join(dossier, "python3")
+        if not os.path.exists(chemin):
+            os.makedirs(dossier, exist_ok=True)
+            with open(chemin, "w", encoding="utf-8") as fh:
+                fh.write('#!/bin/sh\nexec %s "$@"\n' % shlex.quote(sys.executable))
+            os.chmod(chemin, 0o755)
+        return dossier
+
     def _tour(self, worker, prompt: str = "travail", **env_extra) -> dict | None:
         registry.set_pending_prompt(self.db, worker.name, prompt)
-        env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log}
+        env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
+               "PATH": self._python_du_banc() + os.pathsep + os.environ.get("PATH", "")}
         env.update(env_extra)
         with mock.patch.dict(os.environ, env, clear=False):
             for name in ("AMEESH_TEST_RATE_LIMIT",):
