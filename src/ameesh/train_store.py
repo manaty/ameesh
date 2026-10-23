@@ -34,3 +34,14 @@ class Ledger:
         if result is None:
             raise TrainError("target lease or train revision changed; stale intent refused")
         return result
+
+    def abandon(self, state, expected, epoch):
+        """Terminal write of one never-fired plan, relative to its exact plan."""
+        plan = state.get("plan") or {}
+        if not isinstance(plan.get("id"), str):
+            raise TrainError("no persisted plan to abandon")
+        result = self.ops.train_abandon(self.key, plan["id"], state, revision=expected,
+                                        owner=self.owner, epoch=epoch)
+        if result is None:
+            raise TrainError("target lease, train revision or fire changed; abandon refused")
+        return result

@@ -185,3 +185,20 @@ class TrainCommandTest(PgTestCase):
         self.assertEqual(result, 0)
         self.assertEqual(json.loads(output.getvalue())["phase"], "invalidated")
         db.close.assert_called_once_with()
+
+    def test_storage_abandon_refuses_a_fire_granted_after_the_command_read(self):
+        # #3138: the command reads the state before taking the lease; a
+        # concurrent grant must not slip between that read and the terminal
+        # write. The storage rechecks the fire under the target row lock.
+        item, document = self.unfired()
+        epoch = self.ledger.acquire(None)
+        self.assertIsNotNone(epoch)
+        try:
+            with mock.patch.object(work, "corrector", return_value="pilot"):
+                self.fires.give(item, actor="pilot")
+            terminal = dict(document, phase="invalidated", abandoned={"actor": "pilot"})
+            with self.assertRaisesRegex(train.TrainError, "fire changed"):
+                self.ledger.abandon(terminal, document["revision"], epoch)
+            self.assertEqual(self.ledger.load()["phase"], "publishing")
+        finally:
+            self.ledger.release(epoch)

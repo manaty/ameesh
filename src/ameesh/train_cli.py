@@ -63,7 +63,7 @@ def _abandon(ledger, plan, *, actor, reason, now):
         state["abandoned"] = dict(actor=actor, at_ts=now, reason=reason,
                                   previous_phase=phase, plan=current["id"],
                                   fire=(fire or {}).get("id"))
-        saved = ledger.save(state, int(state["revision"]), epoch)
+        saved = ledger.abandon(state, int(state["revision"]), epoch)
     finally:
         ledger.release(epoch)
     return dict(phase=saved["phase"], revision=saved["revision"], plan=saved["plan"],
