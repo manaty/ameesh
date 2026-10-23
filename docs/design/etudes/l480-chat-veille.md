@@ -83,8 +83,9 @@ $human ──frappes──► lanceur ──pty maître──► harnais interac
   ligne reste en attente pour le tour suivant (échec fermé). Le lanceur
   invalide au démarrage le marqueur d'une session précédente.
 * **Garde de brouillon** : une frappe de `$human` qui ne se termine pas par
-  `Entrée` (un `\r` final non précédé d'un antislash ou d'`ESC`) ni par
-  `Ctrl-C` (`\x03`) laisse un brouillon ouvert ; la veille ne sert alors rien,
+  `Entrée` (un `\r` final non précédé d'un antislash ou d'`ESC`, y compris
+  quand cet octet est arrivé dans la lecture précédente) ni par `Ctrl-C`
+  (`\x03`) laisse un brouillon ouvert ; la veille ne sert alors rien,
   même au-delà des 15 min, pour ne jamais coller sa ligne au début d'un
   message humain non validé. En mode brut, `Ctrl+J` (`\n`), un antislash suivi
   d'Entrée et `Alt+Entrée` insèrent un saut de ligne et laissent le brouillon

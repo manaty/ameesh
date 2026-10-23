@@ -909,6 +909,7 @@ class Veille:
         self._text: str | None = None
         self._text_at: float | None = None
         self._draft_open = False
+        self._tail = b""             # dernier octet de la lecture précédente
         self._last_human = 0.0
         self._last_served: float | None = None
         self._stop = threading.Event()
@@ -938,13 +939,14 @@ class Veille:
 
         `data` sont les octets lus sur l'entrée du terminal. Un brouillon
         reste ouvert tant que la dernière frappe ne le soumet pas (Entrée, un
-        \r final non précédé d'un antislash ou d'ESC) ni ne l'abandonne
-        (Ctrl-C, \x03) : la veille ne sert alors rien, même au-delà de
-        `max_defer`, pour ne jamais coller sa ligne au début d'un message
-        humain non validé."""
+        \r final non précédé d'un antislash ou d'ESC — même si cet octet est
+        arrivé dans la lecture précédente) ni ne l'abandonne (Ctrl-C, \x03) :
+        la veille ne sert alors rien, même au-delà de `max_defer`, pour ne
+        jamais coller sa ligne au début d'un message humain non validé."""
         self._last_human = self.now() if now is None else float(now)
         if data:
-            self._draft_open = not _draft_submitted(data)
+            self._draft_open = not _draft_submitted(self._tail + data)
+            self._tail = data[-1:]
 
     def due(self, now: float | None = None) -> str | None:
         """La ligne à servir maintenant, ou None (rien de nouveau, frappe
