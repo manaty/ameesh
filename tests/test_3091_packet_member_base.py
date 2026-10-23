@@ -8,11 +8,23 @@ cible avait gagnés depuis (dont des chemins sensibles) : un membre léger étai
 reclassé sensible et le paquet refusé (« 2 independent review verdict(s)
 required »).
 
-Les témoins prennent les trois cas :
-* un membre léger dont la base est la base du paquet, alors que le
-  `origin/main` du dépôt de la porte est plus ancien, reste léger ;
-* un membre léger parti d'une base plus ancienne que le paquet reste léger
-  (la base du paquet n'ajoute pas au diff les commits de la cible) ;
+La base enregistrée par la composition (`work_packet_members.base_sha`) est
+utilisée, mais elle n'est **pas** crue sur parole : elle doit être contenue
+dans la cible résolue par l'appelant. Sans cette preuve, un enregistrement
+`--base X` où X est un commit du véhicule ferait sortir X de toute relecture
+(verdict bloquant cx1 de la relecture #3091).
+
+Les témoins prennent :
+* un membre léger dont la base de composition est la cible : il reste léger ;
+* un membre léger parti d'une base plus ancienne que la composition : il reste
+  jugé sur son propre delta, et la base du paquet ne reprend pas les commits
+  de la cible ;
+* une cible qui a avancé après la composition : la base enregistrée, plus
+  ancienne, est prouvée et utilisée (les commits de la cible gagnés depuis ne
+  sont ni au membre ni au véhicule) ;
+* le témoin négatif de cx1 : une base enregistrée **en avant** de la cible
+  n'est pas une preuve ; le commit propre du véhicule reste dans le delta et
+  exige ses deux avis ;
 * un membre réellement sensible demande toujours deux avis indépendants.
 """
 from __future__ import annotations
@@ -40,7 +52,7 @@ def _canon():
 
 
 class PacketMemberBaseTest(PgTestCase):
-    """La base de classe du membre vient de la composition, pas du checkout."""
+    """La base de classe du membre vient de la composition, prouvée sur la cible."""
 
     def setUp(self):
         super().setUp()
@@ -61,8 +73,12 @@ class PacketMemberBaseTest(PgTestCase):
         self.repo.write(".github/workflows/tests.yml", "name: tests\n")
         self.base = self.repo.commit("main: tests workflow", agent="author")
         self.receipt(self.base, "author", "deepseek")
-        # Le dépôt de la porte a un `origin/main` en retard : c'est la ref que
-        # l'ancienne lecture prenait pour la base du membre.
+        # Une cible plus récente (postérieure à la composition) : elle porte un
+        # autre chemin sensible, pour distinguer la base prouvée de la cible.
+        self.repo.write(".github/workflows/deploy.yml", "name: deploy\n")
+        self.ahead = self.repo.commit("main: deploy workflow", agent="author")
+        self.receipt(self.ahead, "author", "deepseek")
+        # Le dépôt de la porte a un `origin/main` en retard.
         self.repo.git("update-ref", "refs/remotes/origin/main", self.old)
 
     # -- fixtures ---------------------------------------------------------
@@ -85,80 +101,124 @@ class PacketMemberBaseTest(PgTestCase):
             ("milestone:%d" % int(mark["id"]), sha, actor,
              "s-" + harness, "t", harness))
 
+    def member_row(self, head):
+        row = work.add(self.db, title="membre", app="ameesh", branch="lot/member",
+                       branch_target="main")
+        lot = int(row["id"])
+        self.db.execute("UPDATE work_items SET assignee = 'author' WHERE id = %s",
+                        (lot,))
+        storage.of(self.db).work.add_milestone(
+            lot, "frozen", sha=head, actor="author", verdict=None, note="")
+        return lot
+
+    def record(self, base, head, lot, member_head):
+        vehicle = work.add(self.db, title="paquet", app="ameesh",
+                           branch="integration/paquet", branch_target="main")
+        self.vehicle = int(vehicle["id"])
+        storage.of(self.db).work.record_packet(
+            self.vehicle, branch="integration/paquet", base_sha=base,
+            head_sha=head,
+            units=[{"work_item_id": lot, "unit_sha": member_head,
+                    "frozen_sha": member_head}],
+            note="packet composition recorded", actor="author")
+
+    def compose(self, base, lot):
+        self.repo.git("checkout", "-q", "-b", "integration/paquet", base)
+        self.repo.git("merge", "-q", "--no-ff", "-m",
+                      "Merge #%d — membre\n\nameesh-work: %d" % (lot, lot),
+                      "lot/member")
+        return self.repo.git("rev-parse", "HEAD")
+
     def member(self, *, start=None, path="src/ameesh/member.py", text="member\n"):
         """Un membre gelé, sa composition sur la base du paquet, son record."""
         self.repo.git("checkout", "-q", "-b", "lot/member", start or self.base)
         self.repo.write(path, text)
         self.head = self.repo.commit("member", agent="author")
         self.receipt(self.head, "author", "deepseek")
-        row = work.add(self.db, title="membre", app="ameesh", branch="lot/member",
-                       branch_target="main")
-        self.lot = int(row["id"])
-        self.db.execute("UPDATE work_items SET assignee = 'author' WHERE id = %s",
-                        (self.lot,))
-        storage.of(self.db).work.add_milestone(
-            self.lot, "frozen", sha=self.head, actor="author", verdict=None,
-            note="")
+        self.lot = self.member_row(self.head)
         self.repo.git("checkout", "-q", "main")
-        self.repo.git("checkout", "-q", "-b", "integration/paquet", self.base)
-        self.repo.git("merge", "-q", "--no-ff", "-m",
-                      "Merge #%d — membre\n\nameesh-work: %d"
-                      % (self.lot, self.lot), "lot/member")
-        self.packet = self.repo.git("rev-parse", "HEAD")
-        vehicle = work.add(self.db, title="paquet", app="ameesh",
-                           branch="integration/paquet", branch_target="main")
-        self.vehicle = int(vehicle["id"])
-        storage.of(self.db).work.record_packet(
-            self.vehicle, branch="integration/paquet", base_sha=self.base,
-            head_sha=self.packet,
-            units=[{"work_item_id": self.lot, "unit_sha": self.head,
-                    "frozen_sha": self.head}],
-            note="packet composition recorded", actor="author")
+        self.packet = self.compose(self.base, self.lot)
+        self.record(self.base, self.packet, self.lot, self.head)
         return self.lot, self.head
 
-    def need(self):
-        """La porte du véhicule, avec la ref de cible périmée du checkout."""
+    def need(self, base):
+        """La porte du véhicule, avec la cible que l'appelant a résolue."""
         row = work.get(self.db, self.vehicle)
         return packet_reviews.need(
             self.db, self.vehicle, row, [], self.repo.root,
-            "origin/main", self.packet, cfg=None, canons=[_canon()])
+            base, self.packet, cfg=None, canons=[_canon()])
 
-    def classify(self):
+    def classify(self, base):
         """La porte, et la classe reçue pour le membre (la première lue)."""
         with mock.patch.object(merge_queue, "review_gate",
                                wraps=merge_queue.review_gate) as gate:
-            out = self.need()
+            out = self.need(base)
         return out, gate.call_args_list[0].kwargs["klass"]
 
     # -- témoins ----------------------------------------------------------
-    def test_a_light_member_over_a_stale_gate_base_stays_light(self):
-        # La base réelle du paquet porte un workflow sensible ; le membre,
-        # lui, n'ajoute qu'un fichier léger. Le `origin/main` du checkout de
-        # la porte est plus ancien que la base du paquet : la classe ne doit
-        # pas compter les changements que la cible a gagnés entre les deux.
+    def test_a_member_of_the_composition_base_stays_light(self):
+        # La cible réelle porte un workflow sensible ; le membre, lui, n'ajoute
+        # qu'un fichier léger. La classe ne compte que son propre delta.
         self.member()
-        out, klass = self.classify()
+        out, klass = self.classify(self.base)
         self.assertEqual(klass["class"], "light", klass)
         self.assertTrue(out["ok"], out)
         self.assertEqual(out["required"], 0)
+        self.assertEqual(out["own_paths"], [])
 
     def test_a_member_from_an_older_base_stays_light(self):
         # Le membre est parti de la cible d'avant la composition. La base du
         # paquet ne doit pas ajouter au diff les commits de la cible gagnés
         # depuis : le membre reste jugé sur son propre delta.
         self.member(start=self.old)
-        out, klass = self.classify()
+        out, klass = self.classify(self.base)
         self.assertEqual(klass["class"], "light", klass)
         self.assertTrue(out["ok"], out)
         self.assertEqual(out["required"], 0)
+        self.assertEqual(out["own_paths"], [])
+
+    def test_a_recorded_base_behind_the_target_is_proven_and_used(self):
+        # La cible a avancé après la composition : ses nouveaux commits ne
+        # sont ni au membre ni au delta propre du véhicule, et la base
+        # enregistrée (contenue dans cette cible) est la borne juste.
+        self.member()
+        out, klass = self.classify(self.ahead)
+        self.assertEqual(klass["class"], "light", klass)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["required"], 0)
+        self.assertEqual(out["own_paths"], [])
+
+    def test_a_recorded_base_ahead_of_the_target_cannot_hide_its_commit(self):
+        # Témoin cx1 : la branche du véhicule porte un commit propre sensible
+        # X, puis fusionne un membre léger ; `record --base X` accepte X car
+        # il est ancêtre de la tête. X ne doit pas sortir de la relecture.
+        self.repo.git("checkout", "-q", "-b", "lot/member", self.base)
+        self.repo.write("src/ameesh/member.py", "member\n")
+        head = self.repo.commit("member", agent="author")
+        self.receipt(head, "author", "deepseek")
+        lot = self.member_row(head)
+        self.repo.git("checkout", "-q", "-b", "integration/paquet", self.base)
+        self.repo.write(".github/workflows/deploy.yml", "name: deploy\n")
+        own = self.repo.commit("vehicule: workflow", agent="author")
+        self.repo.git("merge", "-q", "--no-ff", "-m",
+                      "Merge #%d — membre\n\nameesh-work: %d" % (lot, lot),
+                      "lot/member")
+        self.packet = self.repo.git("rev-parse", "HEAD")
+        # Le record menteur (ou hérité d'une composition fautive) : X en base.
+        self.record(own, self.packet, lot, head)
+        out, klass = self.classify(self.base)
+        self.assertEqual(klass["class"], "light", klass)
+        self.assertIsNone(out["ok"], out)
+        self.assertEqual(out["required"], 2)
+        self.assertIn(".github/workflows/deploy.yml", out["own_paths"])
 
     def test_a_sensitive_member_still_needs_two_independent_reviews(self):
         self.member(path=".github/workflows/deploy.yml", text="name: deploy\n")
-        out, klass = self.classify()
+        out, klass = self.classify(self.base)
         self.assertEqual(klass["class"], "sensitive", klass)
         self.assertFalse(out["ok"], out)
         self.assertIn("2 independent review verdict(s) required", out["why"])
         self.verdict("r_claude", self.head)
-        self.assertFalse(self.need()["ok"], "one family is not enough")
+        self.assertFalse(self.need(self.base)["ok"], "one family is not enough")
         self.verdict("r_codex", self.head)
-        self.assertTrue(self.need()["ok"])
+        self.assertTrue(self.need(self.base)["ok"])
