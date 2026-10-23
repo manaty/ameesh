@@ -342,16 +342,21 @@ class PlatformTest(unittest.TestCase):
         """L230 : un processus illisible dont le `comm` ET l'`argv[0]` sont
         dans `allow` n'est plus un doute (le ménage de /tmp peut conclure que
         personne ne tient l'entrée) ; un nom emprunté d'un seul côté, ou
-        absent de la liste, reste un doute."""
+        absent de la liste, reste un doute. #3195 : les agents de clés
+        (`gpg-agent`, `ssh-agent`) y sont toujours, sous la même règle."""
         if os.geteuid() == 0:
             self.skipTest("root lit tout : pas de refus de lecture à simuler")
         uid = "%d %d %d %d" % ((os.getuid(),) * 4)
-        cas = (("nommé et annoncé", "gpg-agent", None, ("gpg-agent",), False),
-               ("nom absent de la liste", "gpg-agent", None, ("ssh-agent",), True),
-               ("argv emprunté", "gpg-agent", "/usr/bin/malveillant",
-                ("gpg-agent",), True),
-               ("comm emprunté", "node", "/usr/bin/gpg-agent", ("gpg-agent",), True),
-               ("allow vide", "gpg-agent", None, (), True))
+        cas = (("nommé et annoncé", "btop", None, ("btop",), False),
+               ("nom absent de la liste", "btop", None, ("htop",), True),
+               ("argv emprunté", "btop", "/usr/bin/malveillant", ("btop",), True),
+               ("comm emprunté", "node", "/usr/bin/btop", ("btop",), True),
+               ("allow vide", "btop", None, (), True),
+               ("agent de clés, allow vide", "gpg-agent", None, (), False),
+               ("agent ssh, allow vide", "ssh-agent", None, (), False),
+               ("agent de clés, argv emprunté", "gpg-agent", "/usr/bin/malveillant", (),
+                True),
+               ("agent de clés, comm emprunté", "node", "/usr/bin/gpg-agent", (), True))
         for nom, comm, argv0, allow, doute in cas:
             with self.subTest(nom):
                 racine = self._faux_proc(comm, uid)
@@ -455,7 +460,8 @@ class PlatformTest(unittest.TestCase):
             # le détenteur n'est pas retrouvé et le doute l'emporte (CI macOS).
             cible = os.path.realpath(os.path.join(tmp, "tenu"))
             open(cible, "w").close()
-            racine = self._faux_proc("gpg-agent", moi)
+            # #3195 : gpg-agent n'est plus un doute ; un autre non dumpable l'est
+            racine = self._faux_proc("btop", moi)
             # ce processus-ci tient `cible` : le /proc simulé porte son lien
             os.symlink(cible, os.path.join(racine, str(os.getpid()), "fd", "3"))
             with mock.patch.object(platform, "psutil", None), \

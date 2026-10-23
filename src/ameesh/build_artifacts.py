@@ -16,11 +16,15 @@ housekeeping pass frees what a build regenerates:
   default), and NO process of the user has its cwd, its executable, an open
   file or a mapped file inside it (`platform.user_paths`, read again right
   before each deletion). A process of the user that cannot be read leaves a
-  doubt: no deletion at all for the pass, unless its name is allowed by the
-  policy (`unreadable_ok`, empty by default; logged) or it is the user's
-  service manager (`systemd --user`: not dumpable, lives in `/`).
+  doubt: no deletion at all for the pass (the dry run still lists its plan,
+  #3195), unless its name is allowed by the policy (`unreadable_ok`, empty
+  by default; logged) or it is the user's service manager (`systemd --user`:
+  not dumpable, lives in `/`) or a key agent (`gpg-agent`, `ssh-agent`: not
+  dumpable, serve from `/` or the home; #3195).
 * **Never**: the main checkout of a repository, an agent's working directory
-  or a directory that contains one, a locked worktree (`git worktree lock`),
+  or a directory that contains one, a worktree charged to an agent in turn or
+  named (branch or directory) after a lot still open (#3195: `keep`), a
+  locked worktree (`git worktree lock`),
   a worktree whose walk is incomplete (unreadable entry, mount point, too many
   entries), an artifact with a file tracked by git inside (untracked files
   inside `node_modules` or `target` are regenerable by definition: deleted),
@@ -759,8 +763,8 @@ def _identities(paths) -> set:
 
 
 def run(candidates: list[dict], rules, *, idle_s: float, protected, skip_roots=(),
-        owner_of=lambda path: None, dry_run: bool, now: float, allow=(),
-        budget_s: float = PASS_BUDGET_S, clock=time.monotonic,
+        owner_of=lambda path: None, keep=lambda worktree: "", dry_run: bool, now: float,
+        allow=(), budget_s: float = PASS_BUDGET_S, clock=time.monotonic,
         lock_path: str | None = None, journal_path: str | None = None) -> dict:
     """Plans, and unless `dry_run` deletes, the artifacts of idle worktrees,
     and first finishes the trash dirs of the journal.
@@ -768,10 +772,13 @@ def run(candidates: list[dict], rules, *, idle_s: float, protected, skip_roots=(
     `candidates`: from `worktrees()`; `protected`: agents' working
     directories (a worktree that is or contains one is never touched);
     `skip_roots`: managed roots, never entered nor deleted; `owner_of(path)`:
-    the agent a worktree is charged to; `allow`: names of unreadable
-    processes that do not block (policy `unreadable_ok`); `lock_path`: the
-    host-wide lock of deleting passes; `journal_path`: the journal of the
-    trash dirs (`Journal`), without which nothing is deleted. Returns
+    the agent a worktree is charged to; `keep(candidate)`: why an idle
+    worktree keeps its artifacts all the same ('' if nothing: #3195, an open
+    lot, a turn in progress); `allow`: names of unreadable processes that do
+    not block (policy `unreadable_ok`); `lock_path`: the host-wide lock of
+    deleting passes; `journal_path`: the journal of the trash dirs
+    (`Journal`), without which nothing is deleted. A doubt on the processes
+    deletes nothing; the dry run still lists the plan (#3195). Returns
     `entries` (to log), `plan`, `skipped` (reasons)."""
     entries: list[dict] = []
     plan: list[dict] = []
@@ -800,9 +807,12 @@ def run(candidates: list[dict], rules, *, idle_s: float, protected, skip_roots=(
         budget = Budget(budget_s, clock)
         scan = platform.user_paths(allow=allow)
         doubt = scan.doubt()
-        if doubt:
+        if doubt and not dry_run:
             skipped.append("artifacts: nothing deleted, %s" % doubt)
             return result
+        if doubt:
+            # #3195: the dry run still lists what would go, and why --apply will not
+            skipped.append("artifacts: --apply would delete nothing, %s" % doubt)
         if scan.allowed:
             skipped.append("artifacts: unreadable process(es) let through by unreadable_ok: %s"
                            % ", ".join(scan.allowed))
@@ -811,7 +821,7 @@ def run(candidates: list[dict], rules, *, idle_s: float, protected, skip_roots=(
                 dry_run=dry_run, budget=budget)
         if rules and candidates:
             _run(candidates, rules, result, idle_s=idle_s, protected=protected,
-                 skip_roots=skip_roots, owner_of=owner_of, dry_run=dry_run, now=now,
+                 skip_roots=skip_roots, owner_of=owner_of, keep=keep, dry_run=dry_run, now=now,
                  allow=allow, scan=scan, avoid=avoid, journal=journal,
                  skip_ids=[tuple(r["id"]) for r in pending if r.get("id")], budget=budget)
     finally:
@@ -866,12 +876,13 @@ def _log(result, base, path, why, done, worktree, rule, allowed) -> None:
                                         "unreadable_allowed": list(allowed), "rule": rule}))
 
 
-def _run(candidates, rules, result, *, idle_s, protected, skip_roots, owner_of, dry_run, now,
-         allow, scan, avoid, journal, skip_ids, budget: Budget) -> None:
+def _run(candidates, rules, result, *, idle_s, protected, skip_roots, owner_of, keep, dry_run,
+         now, allow, scan, avoid, journal, skip_ids, budget: Budget) -> None:
     plan, skipped = result["plan"], result["skipped"]
     protected = [os.path.realpath(p) for p in protected if p]
     roots = [os.path.realpath(p) for p in skip_roots if p]
     recent = 0
+    kept: list[str] = []
     for wt in candidates:
         if budget.expired():
             skipped.append("artifacts: time budget reached, the remaining worktrees wait for "
@@ -897,6 +908,13 @@ def _run(candidates, rules, result, *, idle_s, protected, skip_roots, owner_of, 
         idle = now - float(found["latest"])
         if idle < idle_s:
             recent += 1
+            continue
+        try:
+            reason = keep(wt)
+        except Exception as exc:  # noqa: BLE001 - nothing proved: kept
+            reason = "open lot not ruled out (%s)" % type(exc).__name__
+        if reason:
+            kept.append("%s: %s" % (path, reason))
             continue
         held = scan.holders(path)
         if held:
@@ -946,6 +964,9 @@ def _run(candidates, rules, result, *, idle_s, protected, skip_roots, owner_of, 
     if recent:
         skipped.append("artifacts: %d worktree(s) active within %s, kept"
                        % (recent, _fmt_age(idle_s)))
+    if kept:
+        skipped.append("artifacts: %d idle worktree(s) kept (open lot or turn in progress): %s%s"
+                       % (len(kept), " ; ".join(kept[:5]), " ; …" if len(kept) > 5 else ""))
     left = sum(1 for p in plan if p["action"] == "remis")
     if left:
         skipped.append("artifacts: time budget reached, %d left for the next pass" % left)

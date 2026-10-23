@@ -687,14 +687,15 @@ def holders(path: str | None, needle: str | None = None, exclude=(), *,
     `allow` (L230) : noms des processus de l'utilisateur dont l'illisibilité
     n'est PAS un doute — le choix explicite de l'owner de l'hôte, vide par
     défaut ; le `comm` ET le nom de base d'`argv[0]` doivent s'y trouver
-    (même règle que `user_paths`), sinon le refus reste un doute. Un détenteur
+    (même règle que `user_paths`), sinon le refus reste un doute. #3195 : les
+    agents de clés (`KEY_AGENTS`) y sont toujours. Un détenteur
     CONSTATÉ (fichier ouvert, dossier courant, `needle`) reste rapporté, même
     si son nom est dans `allow` : l'allow ne lève que le doute, jamais une
     observation."""
     real = os.path.realpath(path) if path else None
     is_dir = bool(real) and os.path.isdir(real)
     exclude = set(int(p) for p in exclude)
-    allow = frozenset(allow or ())
+    allow = KEY_AGENTS | frozenset(allow or ())
     ps = _psutil()
     if ps is not None:
         return _holders_psutil(ps, real, is_dir, needle, exclude, mapped,
@@ -1169,6 +1170,14 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False, session=False,
 #: never readable (not dumpable) and never inside a worktree: the user's
 #: service manager (`systemd --user`, cwd `/`)
 SERVICE_MANAGER = frozenset({"systemd", "(sd-pam)"})
+#: #3195: not dumpable on purpose (their memory holds keys) and never inside
+#: a worktree either: the key agents answer on a socket from `/` (started as
+#: a daemon) or from the user's home (`gpg-agent --supervised`, a service of
+#: `systemd --user`). On ameesh-agents-1 and -2, one `gpg-agent` alive since
+#: 13/10 held back every deletion of build output for ten days.
+KEY_AGENTS = frozenset({"gpg-agent", "ssh-agent"})
+#: let through without a word, whatever `allow` says
+BUILT_IN_UNREADABLE = SERVICE_MANAGER | KEY_AGENTS
 
 
 class UserPaths:
@@ -1248,13 +1257,14 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
     A process gone meanwhile is ignored, and so is a zombie (`_zombie`, #1678):
     it holds nothing anymore. One that cannot be read (not dumpable: setuid,
     file capabilities) is a doubt, unless its name (`comm`) AND the base name
-    of its `argv[0]` are both in `allow` or the service manager: its `exe` link
-    is unreadable too, its command line is not. Without `/proc` (other OS),
-    `available` is false."""
+    of its `argv[0]` are both in `allow` (listed in `allowed`), or both name
+    the service manager or a key agent (`BUILT_IN_UNREADABLE`, not listed):
+    its `exe` link is unreadable too, its command line is not. Without `/proc`
+    (other OS), `available` is false."""
     if not _proc_ok():
         return UserPaths(available=False)
     uid = os.getuid() if uid is None else uid
-    allow = SERVICE_MANAGER | set(allow or ())
+    allow = BUILT_IN_UNREADABLE | set(allow or ())
     out = UserPaths()
     try:
         pids = [p for p in os.listdir(PROC) if p.isdigit()]
@@ -1297,7 +1307,7 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
         except OSError:
             argv0 = _read_text(os.path.join(base, "cmdline")).split("\0", 1)[0]
             if name in allow and os.path.basename(argv0) in allow:
-                if name not in SERVICE_MANAGER:
+                if name not in BUILT_IN_UNREADABLE:
                     out.allowed.append(who)
             else:
                 out.unreadable.append(who)

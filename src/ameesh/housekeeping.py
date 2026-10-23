@@ -52,7 +52,8 @@ l'humain. Chaque famille a sa règle :
   poubelle journalisée (L230).
 * **Build output of idle worktrees** (L230, [`build_artifacts`]):
   `node_modules`, Rust `target/`, deleted once the worktree is idle for 24 h
-  with no process of the user inside; never in a main checkout.
+  with no process of the user inside; never in a main checkout, nor while
+  its agent is in turn or a lot it names is open (#3195).
 
 * **Clones ad hoc d'un lot** (#2743, [`housekeeping_clones`]) : enfant direct
   d'une racine de travail dont le `.git` est un dossier ; rattaché à un lot
@@ -3353,29 +3354,61 @@ def _shared_roots() -> tuple:
 
 def _artifact_pass(db, host: str, policy: Policy, *, cwd_of: dict, dry_run: bool,
                    now: float, skip_roots=(), lock_path: str | None = None,
-                   journal_path: str | None = None) -> dict:
+                   journal_path: str | None = None, running=(), known_agents=()) -> dict:
     """L230: the worktrees of the repositories of the registered agents (and
     the tracked ones), their build artifacts deleted once idle; in a thread
-    at the lowest priority, one worktree at a time."""
+    at the lowest priority, one worktree at a time.
+
+    #3195: an idle worktree keeps them while the agent it is charged to is in
+    turn (`running`), or while a lot named by its branch or its directory is
+    open (an unknown id names no lot; an unreadable state keeps it). A
+    worktree of the clone an agent works in is that agent's."""
+    from . import housekeeping_clones
+
     rules = build_artifacts.rules_of(policy.artifacts)
     tracked = storage.of(db).housekeeping.worktrees(host, ("active", "kept"), limit=None)
     owner = {_real(row["path"]): row["agent"] for row in tracked}
     agents = sorted(cwd_of.items(), key=lambda item: -len(item[1]))
+    clone_of = {_real(cwd): name for name, cwd in cwd_of.items()}
+    names = tuple(known_agents or ()) or tuple(cwd_of)
+    main_of: dict[str, str] = {}
+    states: dict[int, str | None] = {}
 
     def owner_of(path: str):
         real = _real(path)
         if real in owner:
             return owner[real]
-        return next((name for name, cwd in agents if _under(real, _real(cwd))), None)
+        return next((name for name, cwd in agents if _under(real, _real(cwd))), None) \
+            or clone_of.get(main_of.get(real, ""))
+
+    def keep(wt: dict) -> str:
+        agent = owner_of(wt["path"])
+        if agent and agent in running:
+            return "turn in progress for %s" % agent
+        branch = wt.get("branch") or ""
+        lots = cited_lots(branch, agent=branch_agent(branch, names)) \
+            + housekeeping_clones.named_lots(os.path.basename(os.path.normpath(wt["path"])),
+                                             names)
+        for ident in dict.fromkeys(lots):
+            if ident not in states:
+                states[ident] = _lot_state(db, ident)
+            if states[ident] is not None and states[ident] not in LOT_ENDED:
+                return "lot #%d %s" % (ident, states[ident])
+        return ""
+
+    def candidates() -> list[dict]:
+        found = build_artifacts.worktrees(seeds, list_worktrees)
+        main_of.update((_real(wt["path"]), _real(wt["main"])) for wt in found)
+        return found
 
     seeds = list(cwd_of.values()) + [row["path"] for row in tracked]
     skip = tuple(skip_roots) + _shared_roots()
     return build_artifacts.gently(
         lambda: build_artifacts.run(
-            build_artifacts.worktrees(seeds, list_worktrees), rules,
+            candidates(), rules,
             idle_s=policy.artifact_idle, protected=list(cwd_of.values()), skip_roots=skip,
-            owner_of=owner_of, dry_run=dry_run, now=now, allow=policy.unreadable_ok,
-            lock_path=lock_path, journal_path=journal_path))
+            owner_of=owner_of, keep=keep, dry_run=dry_run, now=now,
+            allow=policy.unreadable_ok, lock_path=lock_path, journal_path=journal_path))
 
 
 def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
@@ -4087,7 +4120,8 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
         try:
             art = _artifact_pass(db, host, policy, cwd_of=cwd_of, dry_run=dry_run, now=now,
                                  skip_roots=(troot, croot, cfg.state_dir),
-                                 lock_path=lock_path, journal_path=journal_path)
+                                 lock_path=lock_path, journal_path=journal_path,
+                                 running=running, known_agents=registered)
         except Exception as exc:  # jamais fatal pour le passage
             art = {"entries": [], "plan": [], "skipped": [
                 "artifacts: pass impossible (%s)" % type(exc).__name__]}
