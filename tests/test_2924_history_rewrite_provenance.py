@@ -24,7 +24,7 @@ import shutil
 import tempfile
 from unittest import TestCase, mock
 
-from ameesh import merge_queue, registry, review_authors, work
+from ameesh import merge_queue, registry, review_authors, storage, work
 from ameesh import review_provenance
 
 from .support import PgTestCase
@@ -73,9 +73,9 @@ class _RewriteFixture(PgTestCase):
                 ("commit:" + sha, sha, actor, "s-" + harness, "t", harness,
                  self.lot if lot is None else lot))
 
-    def freeze(self, sha):
+    def freeze(self, sha, **kwargs):
         return work.milestone(self.db, self.lot, "frozen", sha=sha,
-                              actor="impl", repo=self.repo.root)
+                              actor="impl", repo=self.repo.root, **kwargs)
 
     def verdict(self, actor, sha, verdict="ok"):
         """Pose un verdict avec son reçu exact (#2928, classe sensible)."""
@@ -566,6 +566,181 @@ class ParserTest(TestCase):
         self.assertIn("doc beta", adds["docs/note.md"])
         self.assertNotIn("doc beta", adds.get("alpha.py", []))
         self.assertNotIn("fix alpha", adds.get("docs/note.md", []))
+
+
+class SupersededGhostFreezeTest(_RewriteFixture):
+    """#2989 : un gel fantôme déclaré remplacé ne bloque plus la provenance."""
+
+    GHOST = "66a06cf09d5c2f2dfe45be5c15cf0b6ea3df8c4c"
+
+    def setUp(self):
+        super().setUp()
+        self.ghost = storage.of(self.db).work.add_milestone(
+            self.lot, "frozen", sha=self.GHOST, actor="impl", verdict=None,
+            note="gel fantôme : SHA erroné, jamais poussé")
+        parent = self.repo.git("rev-parse", self.head_a + "^")
+        tree = self.repo.git("rev-parse", self.head_a + "^{tree}")
+        self.head_b = self.squash(tree, parent, "contenu consolidé")
+        self.freeze_b = self.freeze(self.head_b, supersedes=[self.ghost["id"]])
+        self.base = parent
+        self.milestone = {"id": int(self.freeze_b["id"]), "sha": self.head_b,
+                          "actor": "impl", "at_ts": self.freeze_b.get("at_ts")}
+
+    def test_the_ghost_is_ignored_and_the_corrector_is_carried(self):
+        authors, unknown, correctors = self.reading(
+            self.milestone, [self.head_b], self.base, self.head_b)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+        self.assertIn("cx3", {row["name"] for row in correctors})
+
+    def test_the_designation_reads_the_same_authors(self):
+        from ameesh import review_designation_activation as act
+
+        authors, unknown, _correctors = act.attribution_of_head(
+            self.db, self.lot_item(), self.milestone, self.repo.root,
+            self.base, self.head_b, families=FAMILIES)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+
+    def test_the_merge_gate_does_not_fail_on_the_ghost(self):
+        klass = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "src/ameesh/runner.py",
+                            "class": "sensitive",
+                            "rule": ["src/ameesh/runner.py"]}],
+                 "repo": self.repo.root, "target": self.base,
+                 "base_sha": self.base}
+        authors, _families = merge_queue._complete_authors(
+            self.db, self.lot_item(), self.head_b, self.repo.root, self.base,
+            klass=klass, marks=work.milestones(self.db, self.lot))
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+
+    def test_the_supersedes_marker_is_written_not_forged(self):
+        row = self.freeze(
+            self.head_b,
+            note="ameesh-freeze-supersedes: 1\nrevue demandée",
+            supersedes=[self.ghost["id"]])
+        self.assertIn("ameesh-freeze-supersedes: %d" % int(self.ghost["id"]),
+                      row["note"])
+        self.assertNotIn("ameesh-freeze-supersedes: 1\n", row["note"])
+        self.assertIn("revue demandée", row["note"])
+
+    def test_an_unknown_superseded_freeze_is_refused(self):
+        with self.assertRaises(work.WorkError) as caught:
+            self.freeze(self.head_b, supersedes=[999999])
+        self.assertIn("not a prior", str(caught.exception))
+
+    def test_supersedes_a_present_freeze_is_refused(self):
+        # #2989 N1 (revue dev2) : la marque ne vaut que pour un fantôme prouvé.
+        # Le gel de la tête A est encore lisible : le remplacer effacerait ses
+        # auteurs si sa récupération venait à échouer (refus fermé B5).
+        present = next(row for row in work.milestones(self.db, self.lot)
+                       if row.get("kind") == "frozen"
+                       and row.get("sha") == self.head_a)
+        with self.assertRaises(work.WorkError) as caught:
+            self.freeze(self.head_b, supersedes=[present["id"]])
+        self.assertIn("readable", str(caught.exception))
+        self.assertIn("proven ghost", str(caught.exception))
+
+    def test_supersedes_is_refused_for_a_verdict(self):
+        with self.assertRaises(work.WorkError) as caught:
+            work.milestone(self.db, self.lot, "verdict", sha=self.head_b,
+                           actor="dev1", verdict="ok",
+                           supersedes=[self.ghost["id"]])
+        self.assertIn("only makes sense", str(caught.exception))
+
+    def test_a_ghost_not_declared_replaced_still_refuses(self):
+        # #2924 B5 reste la règle : seul le gel déclaré remplacé est ignoré.
+        other = storage.of(self.db).work.add_milestone(
+            self.lot, "frozen", sha="b" * 40, actor="impl", verdict=None,
+            note="un autre gel fantôme, non déclaré remplacé")
+        again = self.freeze(self.head_b)
+        milestone = {"id": int(again["id"]), "sha": self.head_b,
+                     "actor": "impl", "at_ts": again.get("at_ts")}
+        with self.assertRaises(review_provenance.ProvenanceError):
+            review_authors.reading(
+                self.db, self.lot_item(), milestone, [self.head_b],
+                self.repo.root, FAMILIES, base=self.base, head=self.head_b,
+                strict=True)
+
+
+class SupersededPresentFreezeTest(_RewriteFixture):
+    """#2989 N3 : un gel remplacé mais encore lisible reste lu (B5)."""
+
+    def setUp(self):
+        super().setUp()
+        self.present = next(row for row in work.milestones(self.db, self.lot)
+                            if row.get("kind") == "frozen"
+                            and row.get("sha") == self.head_a)
+        parent = self.repo.git("rev-parse", self.head_a + "^")
+        tree = self.repo.git("rev-parse", self.head_a + "^{tree}")
+        self.head_b = self.squash(tree, parent, "contenu consolidé")
+        self.freeze_b = self.freeze(self.head_b)
+        # Marque posée hors CLI (donnée historique ou forgée) : le gel nommé
+        # est encore présent. La lecture ne doit pas l'effacer — c'est le refus
+        # fermé B5 qui reste, comme si la marque n'existait pas.
+        self.db.execute(
+            "UPDATE work_item_milestones SET note = %s WHERE id = %s",
+            ("ameesh-freeze-supersedes: %d" % int(self.present["id"]),
+             int(self.freeze_b["id"])))
+        self.milestone = {"id": int(self.freeze_b["id"]), "sha": self.head_b,
+                          "actor": "impl", "at_ts": self.freeze_b.get("at_ts")}
+
+    def test_the_present_replaced_freeze_is_still_read(self):
+        authors, unknown, correctors = self.reading(
+            self.milestone, [self.head_b], self.base, self.head_b)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+        self.assertIn("cx3", {row["name"] for row in correctors})
+
+
+class ForgedSupersedesNoteTest(_RewriteFixture):
+    """#2989 B (revue cx2) : un blanc de tête ne forge pas la marque machine."""
+
+    def test_a_leading_vertical_tab_cannot_forge_the_marker(self):
+        ghost = storage.of(self.db).work.add_milestone(
+            self.lot, "frozen", sha="f" * 40, actor="impl", verdict=None,
+            note="gel fantôme, non déclaré remplacé")
+        parent = self.repo.git("rev-parse", self.head_a + "^")
+        tree = self.repo.git("rev-parse", self.head_a + "^{tree}")
+        head_b = self.squash(tree, parent, "contenu consolidé")
+        row = self.freeze(head_b, note="\vameesh-freeze-supersedes: %d"
+                         % int(ghost["id"]))
+        self.assertNotRegex(row["note"] or "",
+                            r"(?m)^ameesh-freeze-supersedes:")
+        milestone = {"id": int(row["id"]), "sha": head_b,
+                     "actor": "impl", "at_ts": row.get("at_ts")}
+        # la marque n'a pas été écrite : le fantôme reste non déclaré, B5 refuse
+        with self.assertRaises(review_provenance.ProvenanceError):
+            review_authors.reading(
+                self.db, self.lot_item(), milestone, [head_b],
+                self.repo.root, FAMILIES, base=self.base, head=head_b,
+                strict=True)
+
+
+class RemovedLineCannotExposeMarkerTest(_RewriteFixture):
+    """#2989 B (revue dev1) : un filtre ne découvre pas la ligne suivante."""
+
+    def test_a_removed_absent_line_cannot_expose_the_supersedes_marker(self):
+        # Retirer `ameesh-freeze-absent:` exposait `\vameesh-freeze-supersedes:`,
+        # que `[ \t]*` ne couvrait pas ; le strip final de `milestone` la
+        # rendait valide, sans `--supersedes` ni contrôle du gel remplacé.
+        ghost = storage.of(self.db).work.add_milestone(
+            self.lot, "frozen", sha="e" * 40, actor="impl", verdict=None,
+            note="autre gel fantôme, non déclaré remplacé")
+        parent = self.repo.git("rev-parse", self.head_a + "^")
+        tree = self.repo.git("rev-parse", self.head_a + "^{tree}")
+        head_b = self.squash(tree, parent, "contenu consolidé")
+        for blank in ("\v", "\f", "\u00a0"):
+            with self.subTest(blank=repr(blank)):
+                row = self.freeze(
+                    head_b, note="ameesh-freeze-absent: master\n" + blank
+                    + "ameesh-freeze-supersedes: %d" % int(ghost["id"]))
+                self.assertNotRegex(row["note"] or "",
+                                    r"(?m)^ameesh-freeze-supersedes:")
 
 
 class FreezeReadFailureTest(TestCase):

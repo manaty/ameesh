@@ -342,7 +342,13 @@ class FauxApi:
                     branch = unquote(path.split("branch=")[1].split("&")[0])
                     runs = [r for r in runs
                             if (r.get("head_branch") or "") == branch]
-                return {"workflow_runs": runs}
+                # #2938 : l'API pagine par 100 comme GitHub ; `page` 1 par défaut
+                total = len(runs)
+                page = 1
+                if "&page=" in path:
+                    page = int(path.split("&page=")[1].split("&")[0])
+                runs = runs[(page - 1) * 100:page * 100]
+                return {"total_count": total, "workflow_runs": runs}
             runs = self._status_runs(path)
             return {"total_count": len(runs) + (1 if self.truncated else 0),
                     "workflow_runs": runs}
@@ -1828,6 +1834,100 @@ class WatcherTest(PgTestCase):
         self.assertEqual(row["status"], "success")
         self.assertEqual(ci.main_red(self.db), [])
         self.assertEqual(self.mails("dev-a") + self.mails("dev-b"), [])
+
+    # -- #2938 : pagination de la tête de base et borne de fenêtre -----------
+    OLD = "1970-01-12T11:46:40+00:00"  # 2 h avant NOW : hors fenêtre de rattrapage
+
+    def _base_runs(self, count, *, start, conclusion, updated_at):
+        return [self.terminated(start - i, "%040x" % (start - i), "main",
+                                conclusion=conclusion, updated_at=updated_at)
+                for i in range(count)]
+
+    def test_tete_de_base_pagine_derriere_cent_annulations(self):
+        """#2938 (N1/N2 cx3) : plus de cent annulations plus récentes ne
+        cachent plus le dernier résultat utile ; la page suivante est lue, le
+        vert est enregistré sans courrier et ferme `ci_main_red`."""
+        st = storage.of(self.db)
+        st.ci.open_run(DEPOT, 4001, head_sha="8" * 20, branch="main", event="push",
+                       base="main", work_item_id=None, url=None, workflow="tests.yml")
+        st.ci.add_failure(DEPOT, 4001, run_attempt=1, part="psql 1/1",
+                          test="tests.test_a.T.test_1", module="tests.test_a",
+                          status="echec", inherited=False, excerpt="", replay="",
+                          duration_s=None, failed_at=None)
+        st.ci.conclude(DEPOT, 4001, "failure")
+        self.assertEqual([r["run_id"] for r in ci.main_red(self.db)], [4001])
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: self.NOW)
+        self.api.terminated = self._base_runs(
+            100, start=4200, conclusion="cancelled", updated_at=self.OLD) + [
+            self.terminated(4100, "f" * 20, "main", conclusion="success",
+                            updated_at=self.OLD)]
+        watcher._refresh_bases(self.db, DEPOT, {"tests.yml"}, ("main",))
+        row = st.ci.run(DEPOT, 4100)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "success")
+        self.assertEqual(ci.main_red(self.db), [])
+        self.assertEqual(self.mails("dev-a") + self.mails("dev-b"), [])
+        self.assertTrue(any("&page=2" in p for p in self.api.paths))
+
+    def test_tete_de_base_ne_relit_pas_une_execution_recente_sans_courrier(self):
+        """#2938 (N auditeur) : une exécution récente que le rattrapage n'a pas
+        vue n'est pas enregistrée en silence par le relevé de tête, même
+        derrière plus de cent annulations récentes : elle reste à `_catch_up`,
+        qui courrielle."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: self.NOW)
+        self.api.terminated = self._base_runs(
+            100, start=4200, conclusion="cancelled", updated_at=self.AT_NOW) + [
+            self.terminated(4100, "f" * 20, "main", conclusion="failure",
+                            updated_at=self.AT_NOW)]
+        watcher._refresh_bases(self.db, DEPOT, {"tests.yml"}, ("main",))
+        self.assertIsNone(storage.of(self.db).ci.run(DEPOT, 4100))
+        self.assertEqual(ci.main_red(self.db), [])
+        self.assertEqual(self.mails("dev-a") + self.mails("dev-b"), [])
+        self.assertTrue(any("&page=2" in p for p in self.api.paths))
+
+    def test_tete_de_base_laisse_une_execution_recente_au_rattrapage(self):
+        """#2938 (N auditeur) : la borne de fenêtre vaut aussi page 1 — le
+        relevé de tête n'enregistre pas une exécution récente, son état et son
+        courrier appartiennent au rattrapage."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: self.NOW)
+        self.api.terminated = [self.terminated(4110, "e" * 20, "main",
+                                               conclusion="failure",
+                                               updated_at=self.AT_NOW)]
+        watcher._refresh_bases(self.db, DEPOT, {"tests.yml"}, ("main",))
+        self.assertIsNone(storage.of(self.db).ci.run(DEPOT, 4110))
+        self.assertEqual(self.mails("dev-a") + self.mails("dev-b"), [])
+
+    def test_tete_de_base_s_arrete_des_que_chaque_workflow_a_son_resultat(self):
+        """#2938 : la page 1 suffit quand elle porte un résultat utile de
+        chaque workflow suivi ; aucune page 2 n'est demandée (coût borné)."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: self.NOW)
+        self.api.terminated = [self.terminated(4200, "d" * 20, "main",
+                                               conclusion="success",
+                                               updated_at=self.OLD)] + self._base_runs(
+            99, start=4199, conclusion="cancelled", updated_at=self.OLD)
+        watcher._refresh_bases(self.db, DEPOT, {"tests.yml"}, ("main",))
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 4200)["status"], "success")
+        self.assertEqual(len([p for p in self.api.paths if "status=completed" in p
+                              and "&page=" in p]), 1)
+
+    def test_tete_de_base_borne_la_pagination_et_le_dit_une_fois(self):
+        """#2938 : une branche sans résultat utile ne fait pas paginer sans
+        fin ; le plafond est journalisé une seule fois."""
+        journal = []
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: self.NOW, log=journal.append)
+        self.api.terminated = self._base_runs(
+            600, start=5000, conclusion="cancelled", updated_at=self.OLD)
+        watcher._refresh_bases(self.db, DEPOT, {"tests.yml"}, ("main",))
+        watcher._refresh_bases(self.db, DEPOT, {"tests.yml"}, ("main",))
+        pages = [p for p in self.api.paths if "status=completed" in p and "&page=" in p]
+        self.assertEqual(len(pages), 10)  # 5 pages, deux passages
+        self.assertEqual(len([l for l in journal if "truncated at 5 pages" in l]), 1)
+        self.assertIsNone(storage.of(self.db).ci.run(DEPOT, 5000))
 
     def test_main_rouge_par_workflow(self):
         """#1110 P2-2 : sur la même tête de main, un succès d'une autre suite

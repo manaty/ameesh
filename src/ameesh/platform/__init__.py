@@ -102,8 +102,28 @@ from .host import (CGROUP_ROOT, btrfs_allocation, btrfs_fs_info, cgroup_cpu_max,
                    mount_of, own_cgroup, own_cgroup_bounded, parse_pressure, power, pressure,
                    mountinfo, covering_mount, mount_id)
 
+#: L68 — fonctions qui servent une GARANTIE de sécurité : sur un hôte qui ne
+#: peut pas répondre (ni psutil, ni /proc, interface absente), elles lèvent
+#: `NotAvailable` ; elles ne rendent jamais une liste vide ni un `None` qui
+#: voudrait dire « rien trouvé ». `tests/test_l63_platform.py::GuaranteeTest`
+#: exerce cette liste sur un OS muet et échoue si une garantie ajoutée ici
+#: n'a pas son témoin.
+GUARANTEES = (
+    "ancestry",
+    "boot_time",
+    "children",
+    "env_values",
+    "environ",
+    "holders",
+    "open_fd_count",
+    "process_table",
+    "self_cgroup_paths",
+    "start_time",
+)
+
 __all__ = [
     "NotAvailable", "SYSTEM", "is_linux", "is_macos", "is_windows", "has_psutil",
+    "GUARANTEES",
     "alive", "ancestry", "become_subreaper", "boot_time", "command_line", "environ",
     "env_values", "fd_path",
     "children", "holders", "open_fd_count", "process_table", "process_group_exists", "reap", "exited_child", "exited_child_status", "start_time", "same_start",
