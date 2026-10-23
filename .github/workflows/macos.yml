@@ -88,8 +88,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
+          # #3207 : pas de cache pip — sous `pull_request_target`,
+          # setup-python écrirait un cache dans la portée de la branche de
+          # base à partir du pyproject de la PR (l'auditeur de #3198 l'a
+          # écarté ; une suite par nuit ou à la demande n'en a pas besoin).
       - name: PostgreSQL et outils GNU (Homebrew)
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
