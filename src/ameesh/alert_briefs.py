@@ -17,9 +17,12 @@ projet du lot et demande d'en désigner un (`ameesh work reviewer <id>
 elle, par `ameesh work move <id> qa --reviewer <agent>`.
 
 #3007 : `notify_undeliverable` ne demande pas un geste sur un lot — elle dit
-qu'aucune route de notification ne joint l'humain qui a des décisions en
-attente sur cet hôte. Elle part aux orchestrateurs de l'alerte et à
-l'auditeur, avec le repli (canal de secours ou retour du notificateur).
+qu'aucun notificateur VIVANT ne couvre l'humain qui a des décisions en
+attente. Elle part aux orchestrateurs de l'alerte et à l'auditeur, avec le
+repli (canal de secours ou retour du notificateur). Son brief n'est **pas**
+envoyé par le notificateur (ce serait le disparu qui parle) : la passe du
+runner hors du poste le porte (`notify_gap.brief_once`), et
+`NOTIFIER_EXCLUDED` l'en écarte côté `ameesh notify`.
 
 Chaque courrier dit l'action attendue, avec la commande exacte. Une alerte
 part une fois à sa levée, puis une seule relance si elle dure encore
@@ -42,9 +45,13 @@ BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias"
                  # retiré ou une configuration que l'exécuteur ne lit pas ; les
                  # orchestrateurs peuvent vérifier, l'auditeur suit
                  "budget_pause_long",
-                 # #3007 : aucune route de notification vers l'humain qui a des
-                 # décisions en attente — les agents doivent le savoir
+                 # #3007 : aucun notificateur vivant ne couvre l'humain qui a
+                 # des décisions en attente — les agents doivent le savoir
                  "notify_undeliverable")
+#: #3007 : types qu'un notificateur ne briefe jamais lui-même — leur brief
+#: dépend de sa propre liveness, il est porté par `notify_gap.brief_once`
+#: (ménage du runner) pour survivre à la chute du poste.
+NOTIFIER_EXCLUDED = ("notify_undeliverable",)
 #: une relance, si l'alerte dure encore 6 h après le premier courrier
 REMIND_AFTER_S = 6 * 3600.0
 #: rôles d'une fiche Agent du canon qui désignent l'auditeur
@@ -416,16 +423,17 @@ def _budget_pause_long(alert: dict) -> str:
 
 
 def _notify_undeliverable(alert: dict) -> str:
-    """#3007 : cet hôte ne joint pas l'humain qui a des décisions en attente.
-    Aux orchestrateurs et à l'auditeur : la poussée n'a pas eu lieu, le geste
-    de repli est un canal de secours ou le retour du notificateur."""
-    return ("Human not reachable by the notifier from this host: %s. Expected action: "
-            "restore ameesh-notify (and its routes) on the host that holds them, or "
-            "have a fallback route configured on a healthy host and started there; "
-            "keep the pending requests visible in the lot threads meanwhile — no agent "
-            "can push them without a channel. This alert resolves by itself when a "
-            "route exists on the host or when nothing is pending."
-            % (alert.get("detail") or "no notification channel"))
+    """#3007 : aucun notificateur vivant ne couvre l'humain qui a des décisions
+    en attente. Aux orchestrateurs et à l'auditeur : la poussée n'a pas eu
+    lieu, le geste de repli est un canal de secours ou le retour du
+    notificateur. Le brief est porté hors du poste (`notify_gap.brief_once`)."""
+    return ("No living notifier covers the human with pending decisions: %s. Expected "
+            "action: restore ameesh-notify (and its routes) on the host that holds them, "
+            "or configure a fallback route on a healthy host and start it there; keep "
+            "the pending requests visible in the lot threads meanwhile — no agent can "
+            "push them without a channel. This alert resolves by itself when a notifier "
+            "beats again for that human, or when nothing is pending."
+            % (alert.get("detail") or "no notifier heartbeat"))
 
 
 def _for_auditor(alert: dict) -> str:
@@ -548,8 +556,8 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             text = _budget_pause_long(alert)
             teams = _projects(by_name, alert.get("agent"))
         elif kind == "notify_undeliverable":
-            # #3007 : l'absence de route est mesh-wide (hôte + humain) ; tous
-            # les orchestrateurs de l'alerte et l'auditeur la reçoivent.
+            # #3007 : aucun notificateur vivant ne couvre l'humain ; tous les
+            # orchestrateurs de l'alerte et l'auditeur la reçoivent.
             text = _notify_undeliverable(alert)
             teams = set()
         else:

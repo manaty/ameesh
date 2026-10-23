@@ -237,6 +237,10 @@ TURN_CGROUP_READY_S = 30.0
 #: L976 : au plus un balayage du courrier en souffrance par heure (le seuil de
 #: l'alerte `mail_undeliverable` est de 15 min)
 DEAD_LETTER_SWEEP_EVERY_S = 3600.0
+#: #3007 : cadence du constat de vie du notificateur, porté par chaque hôte
+#: (le ménage peut être coupé ; ce fil ne dépend pas de lui). La réclamation
+#: en base dédoublonne les hôtes et espace les relances de six heures.
+NOTIFY_HEALTH_EVERY_S = 300.0
 #: #339 r2: a process of this user whose environment cannot be read keeps a
 #: row if it started after the row, less this margin (the harness starts
 #: just before its row is opened; the base's clock may drift from the host's)
@@ -10013,6 +10017,43 @@ class Runner:
                       % (action["old"], action["new"], action["reason"].splitlines()[0]))
         return report
 
+    def notify_health_once(self, db=None, now: float | None = None) -> dict | None:
+        """#3007 : dit, depuis cet hôte, si un notificateur vivant couvre les
+        humains qui ont des décisions en attente, et briefe les agents.
+
+        Le constat vient des battements partagés (`notify_liveness`) : une VM
+        sans route n'est plus une alerte, et le brief ne dépend pas du poste
+        qui porte `ameesh-notify`. La réclamation `(destinataire, humain)` en
+        base dédoublonne les hôtes et espace les relances. Sa propre connexion
+        quand `db` est absent ; jamais fatal à l'exécuteur."""
+        if getattr(self, "dry_run", False) or getattr(self, "mediated", False):
+            return None
+        own = db is None
+        try:
+            if own:
+                from .scoped_db import ScopedDb
+                db = ScopedDb(self.cfg)
+            from . import notify_gap
+            report = notify_gap.brief_once(self.cfg, db, now=now)
+        except Exception as exc:      # jamais fatal pour l'exécuteur
+            log_async("notify gap: pass failed (%s: %s)" % (type(exc).__name__, exc))
+            return None
+        finally:
+            if own and db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+        for entry in report["sent"]:
+            log_async("notify gap: brief %s to %s for %s (%d decision(s))"
+                      % ("reminder" if entry.get("reminder") else "sent",
+                         entry["recipient"], entry["human"],
+                         len(entry.get("decisions") or ())))
+        for entry in report["failed"]:
+            log_async("notify gap: brief to %s failed (%s)"
+                      % (entry.get("recipient") or "?", entry.get("error")))
+        return report
+
     def branch_sweep_once(self) -> dict | None:
         """L118 : un relevé des branches des lots ouverts dont l'assigné est sur
         cet hôte (et, avec `--agents`, parmi eux) : une branche fusionnée dans
@@ -10325,6 +10366,28 @@ class Runner:
                 delay = period
 
         threading.Thread(target=boucle, daemon=True, name="menage").start()
+
+    def start_notify_health_poll(self) -> None:
+        """#3007 : le constat de vie du notificateur, depuis chaque hôte.
+
+        Une passe toutes les `NOTIFY_HEALTH_EVERY_S` (5 min), indépendante du
+        ménage et du poste qui porte `ameesh-notify` : quand celui-ci tombe,
+        les VM continuent de voir le silence et de briefer les agents. Le
+        premier passage est décalé pour ne pas faire partir tous les hôtes à
+        la même seconde (la réclamation en base dédoublonne de toute façon)."""
+        if self.once or getattr(self, "mediated", False) or getattr(self, "dry_run", False):
+            return
+
+        def boucle() -> None:
+            import random
+            if self.stop.wait(random.uniform(30.0, 120.0)):
+                return
+            while not self.stop.is_set():
+                self.notify_health_once()
+                if self.stop.wait(NOTIFY_HEALTH_EVERY_S):
+                    return
+
+        threading.Thread(target=boucle, daemon=True, name="notify-health").start()
 
     def refresh_host_limits(self, canon, *others, complete: bool = True) -> None:
         """Met à jour les limites physiques de CET hôte depuis les canons.
@@ -11269,6 +11332,7 @@ class Runner:
         self.start_resource_poll()
         self.start_version_poll()
         self.start_housekeeping_poll()
+        self.start_notify_health_poll()
         self.start_branch_sweep_poll()
         self.start_train_service()
         self.start_device_channels()

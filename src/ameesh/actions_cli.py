@@ -524,13 +524,13 @@ def cmd_decisions(cfg: Config, args: argparse.Namespace) -> int:
     try:
         queue = decisions_view(db, human=args.for_human, include_closed=args.all, now=now,
                                viewer=viewer)
+        # #3007 : la file ne prouve pas que l'humain a été joint. Les
+        # battements partagés des notificateurs disent si un vivant le couvre ;
+        # sinon, le dire ici — c'est là qu'un agent regarde les demandes en
+        # attente, et `ameesh notify --test` ne le dit qu'à qui pense à lancer.
+        gaps = [] if args.json else notify_gap.gaps(db, queue["requests"], now=now)
     finally:
         db.close()
-    # #3007 : la file ne prouve pas que l'humain a été joint. Si cet hôte n'a
-    # aucune route pour lui, le dire ici — c'est là qu'un agent regarde les
-    # demandes en attente, et `ameesh notify --test` ne le dit qu'à qui pense
-    # à le lancer.
-    gaps = [] if args.json else notify_gap.gaps(cfg, queue["requests"], now=now)
     if args.json:
         _dump(queue)
         return 0

@@ -1,41 +1,56 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#3007: a pending decision the human cannot be pushed about from this host.
+"""#3007: a pending decision no living notifier can push to its human.
 
-`ameesh notify` pushes an alert to the responsible human on the channels of
-THIS host's configuration (`notify.routes`, `notify.default`). In practice one
-host (`pc-smichea`) holds the only routes (desktop, ntfy, Slack) and runs the
-service. When that host is lost the rest of the mesh keeps reading the shared
-database — pending decisions, overdue decisions, `ameesh decisions` — but
-nothing reaches the human, and no other host has a route. The only witness
-was `ameesh notify --test human:<id>` (exit 2, no channel), which an agent
-runs only if it thinks of it (incident #3006, 2026-10-21: decision #123440
-overdue and unanswered, no channel from the healthy mesh).
+`ameesh notify` pushes alerts to the responsible human on the channels of the
+host that runs it (`notify.routes`, `notify.default`). In practice one host
+(`pc-smichea`) holds the only routes and runs the service; when it is lost the
+rest of the mesh keeps reading the shared database — pending and overdue
+decisions, `ameesh decisions` — but nothing reaches the human, and no other
+host has a route. The only witness was `ameesh notify --test human:<id>`
+(exit 2, no channel), which an agent runs only if it thinks of it (incident
+#3006, 2026-10-21: decision #123440 overdue and unanswered).
 
-The expected outcome of #3007 is either a fallback channel on a healthy host
-or the absence of a route signalled where an agent sees it. This module does
-the second, from the pending decisions that `ameesh alerts` and
-`ameesh decisions` already read: it names, per human and per host, the fact
-that nothing is pushed here, with the requests, the age, the overdue count
-and the fallback gesture. `exploitation.alerts` turns each gap into a
-`notify_undeliverable` alert (so it is in `ameesh alerts`, the API and the
-embedded interface), and `ameesh decisions` prints the same warning above its
-queue. The alert resolves by itself when a route for that human exists on the
-host, or when no request is pending.
+**Shared proof, not a local guess.** A host without routes is the normal case
+on the VMs, so "no channel on THIS host" is not a gap: it raised a permanent
+false alert while the post was healthy, and it said nothing the day the post
+was lost (review of #3007, 2026-10-23). The notifier therefore records a
+heartbeat in the shared base (`notify_liveness`, migration 0474) at every
+pass, per host and per human it covers (`*` for `notify.default`). This module
+reads that snapshot: a gap is a pending-decision owner that **no heartbeat
+fresh within `ALIVE_S`** covers. A stale heartbeat names the lost host and its
+silence; a human no heartbeat ever named is reported uncovered while another
+notifier lives. With no heartbeat recorded at all, nothing is proven and no
+alert is raised (a fresh install, the CI bench): the signal appears with the
+first notifier pass and disappears with its last.
 
-The observation is LOCAL on purpose: a host with a route does not raise it,
-and the text says « on this host ». A mesh-wide claim would need a shared
-notifier heartbeat, which the mesh does not have (the notify state lives in
-`<state>/notify/state.json`, per host). The fallback itself — a second
-notifier with an ntfy route on a healthy host — is an operator gesture,
-documented in docs/EXPLOITATION.md, « Alertes poussées ».
+`exploitation.alerts` turns each gap into a `notify_undeliverable` alert (so
+it is in `ameesh alerts`, the API and the embedded interface), and
+`ameesh decisions` prints the same warning above its queue.
+
+**The brief runs off the post.** A brief emitted by the notifier itself would
+never fire in the outage it reports (the notifier is the missing piece). The
+runner's periodic pass on every host calls `brief_once`: it briefs the
+orchestrators and the auditor by `event` mail, claims each (recipient, human)
+in `notify_briefs` so two hosts do not duplicate and the reminder comes after
+`alert_briefs.REMIND_AFTER_S`, and releases the claim if the mail cannot be
+deposited. The alert resolves by itself when a heartbeat covers the human
+again, or when no request is pending.
+
+The fallback itself — a second notifier with a route on a healthy host — stays
+an operator gesture, documented in docs/EXPLOITATION.md, « Alertes poussées ».
 """
 from __future__ import annotations
 
 import time
 
 #: type d'alerte (déclaré dans `exploitation.ALERT_TYPES`, étiqueté dans
-#: `notify.TYPE_LABELS`) : la route manque ICI, pas nécessairement ailleurs.
+#: `notify.TYPE_LABELS`) : aucun notificateur VIVANT ne couvre l'humain.
 GAP_TYPE = "notify_undeliverable"
+#: A notifier silent this long no longer covers its humans. The service loops
+#: every 30 s by default: ten minutes is twenty missed passes, not a restart.
+ALIVE_S = 600.0
+#: schéma des alertes (le même que `exploitation.ALERT_SCHEMA`, sans cycle).
+ALERT_SCHEMA = "ameesh-alert/1"
 
 
 def _span(seconds: float) -> str:
@@ -50,65 +65,192 @@ def _span(seconds: float) -> str:
     return "%dd" % (seconds // 86400)
 
 
-def _channel_state(cfg) -> tuple:
-    """(NotifyConfig | None, raison d'invalidité | None).
+def _fresh(rows, human, now: float, alive_s: float) -> dict | None:
+    """Le battement frais le plus récent qui couvre `human` (None sinon)."""
+    best = None
+    for row in rows:
+        if row.get("human") not in (human, "*"):
+            continue
+        seen = float(row.get("seen_ts") or 0.0)
+        if seen < now - alive_s:
+            continue
+        if best is None or seen > float(best.get("seen_ts") or 0.0):
+            best = row
+    return best
 
-    Une configuration illisible ne peut pas pousser non plus : elle est
-    signalée comme le manque de route, avec sa raison (jamais une valeur :
-    `notify.NotifyConfigError` ne cite pas les secrets)."""
-    try:
-        from . import notify
-        return notify.parse_config(getattr(cfg, "notify", None)), None
-    except Exception as exc:  # noqa: BLE001 — une passe d'alerte ne tombe pas
-        reason = " ".join(str(exc).split()) or type(exc).__name__
-        return None, reason
+
+def _last(rows, human) -> dict | None:
+    """Le dernier battement qui couvre `human`, même périmé (pour le détail)."""
+    best = None
+    for row in rows:
+        if row.get("human") not in (human, "*"):
+            continue
+        if best is None or float(row.get("seen_ts") or 0.0) > float(
+                best.get("seen_ts") or 0.0):
+            best = row
+    return best
 
 
-def gaps(cfg, pending, now: float | None = None) -> list[dict]:
-    """Un écart par humain que la configuration de CET hôte ne joint pas.
+def gaps_for(pending, rows, now: float, *, alive_s: float = ALIVE_S) -> list[dict]:
+    """Un écart par propriétaire de décision qu'aucun battement frais ne couvre.
 
-    `pending` : les vues de `decisions.pending` (ou `queue()["pending"]`,
-    mêmes champs : `id`, `owner`, `created_ts`, `overdue`). Une demande sans
-    propriétaire (`owner` vide : `human:*`) est laissée aux autres passes :
-    la résolution du destinataire par `notify.Router` demanderait aussi
-    l'agent et le lot, et un faux constat serait pire que le silence.
-    Ordre stable par humain."""
-    now = time.time() if now is None else float(now)
-    ncfg, invalid = _channel_state(cfg)
+    `pending` : les vues de `decisions.pending` (ou `queue()["pending"]`, mêmes
+    champs : `id`, `owner`, `created_ts`, `overdue`). Une demande sans
+    propriétaire (`owner` vide) est laissée aux autres passes : la résolution
+    du destinataire par `notify.Router` demanderait aussi l'agent et le lot, et
+    un faux constat serait pire que le silence. Ordre stable par humain.
+
+    `rows` : tout l'instantané `notify_liveness` (`host`, `human`, `seen_ts`),
+    périmés compris. Table vide : aucun constat (rien n'a jamais été prouvé).
+    """
+    if not rows:
+        return []
+    now = float(now)
     grouped: dict[str, list] = {}
     for view in pending or ():
         human = view.get("owner")
         if not human:
             continue
         grouped.setdefault(str(human), []).append(view)
-    host = str(getattr(cfg, "host", "") or "?")
     out = []
     for human in sorted(grouped):
-        views = grouped[human]
-        if invalid is None and ncfg.channels_for(human):
+        if _fresh(rows, human, now, alive_s) is not None:
             continue
+        views = grouped[human]
         views.sort(key=lambda v: (float(v.get("created_ts") or 0.0),
                                   int(v.get("id") or 0)))
         ids = [int(v["id"]) for v in views]
         overdue = [int(v["id"]) for v in views if v.get("overdue")]
-        since = float(views[0].get("created_ts") or 0.0)
-        age = max(0.0, now - since) if since else 0.0
-        if invalid is not None:
-            prefix = "invalid notify configuration on host %s (%s)" % (host, invalid)
-            reason = "invalid_config"
+        oldest = float(views[0].get("created_ts") or 0.0)
+        age = max(0.0, now - oldest) if oldest else 0.0
+        last = _last(rows, human)
+        if last is None:
+            prefix = ("no notifier has ever reported covering %s while another "
+                      "notifier is alive" % human)
+            since = oldest or None
+            reason = "uncovered"
+            last_host = last_seen = last_human = None
         else:
-            prefix = ("no notification channel on host %s for %s "
-                      "(notify.routes / notify.default)" % (host, human))
-            reason = "no_channel"
+            last_seen = float(last["seen_ts"])
+            last_host = str(last.get("host") or "") or None
+            last_human = str(last.get("human") or "") or None
+            covered = " (via notify.default)" if last_human == "*" else ""
+            prefix = ("no living notifier covers %s: last heartbeat from host %s%s "
+                      "was %s ago" % (human, last_host or "?",
+                                      covered, _span(now - last_seen)))
+            since = last_seen
+            reason = "notifier_stale"
         detail = (
             "%s: %d decision request(s) pending (%d overdue, oldest #%d, %s) — "
-            "nothing is pushed to %s from this host; restore ameesh-notify on the "
-            "host that holds the routes, or configure a fallback route on a healthy "
-            "host and start it (docs/EXPLOITATION.md, \"Alertes poussées\"); the "
-            "requests stay readable with `ameesh decisions`"
+            "nothing is pushed to %s; restore ameesh-notify on the host that holds "
+            "the routes, or configure a fallback route on a healthy host and start "
+            "it (docs/EXPLOITATION.md, \"Alertes poussées\"); the requests stay "
+            "readable with `ameesh decisions`"
             % (prefix, len(ids), len(overdue), ids[0], _span(age), human))
-        out.append({"human": human, "host": host, "since": since or None,
-                    "count": len(ids), "overdue": overdue, "decisions": ids,
-                    "oldest": ids[0], "age_s": age, "reason": reason,
-                    "detail": detail})
+        out.append({"human": human, "last_host": last_host,
+                    "last_seen": last_seen, "last_human": last_human,
+                    "since": since, "count": len(ids), "overdue": overdue,
+                    "decisions": ids, "oldest": ids[0], "age_s": age,
+                    "reason": reason, "detail": detail})
     return out
+
+
+def gaps(db, pending, now: float | None = None) -> list[dict]:
+    """L'instantané partagé, puis les écarts. Jamais fatal à une passe."""
+    now = time.time() if now is None else float(now)
+    if db is None:
+        return []
+    try:
+        from . import storage
+        rows = storage.of(db).notify_liveness.latest()
+    except Exception:  # noqa: BLE001 — un constat non lisible n'est pas une preuve
+        return []
+    return gaps_for(pending, rows, now)
+
+
+def alert_of(gap: dict, orchestrators=None) -> dict:
+    """L'alerte `ameesh-alert/1` d'un écart (exploitation et passe de brief)."""
+    out = {"schema": ALERT_SCHEMA, "type": GAP_TYPE, "agent": None,
+           "since": None if gap.get("since") is None else round(float(gap["since"]), 3),
+           "value": gap["count"], "threshold": 0, "detail": gap["detail"],
+           "human": gap["human"], "responsible": gap["human"],
+           "last_host": gap.get("last_host"), "last_seen": gap.get("last_seen"),
+           "last_human": gap.get("last_human"),
+           "decisions": list(gap["decisions"]), "overdue": list(gap["overdue"]),
+           "reason": gap["reason"]}
+    if orchestrators is not None:
+        out["orchestrators"] = list(orchestrators)
+    return out
+
+
+def beat(cfg, db, ncfg, now: float | None = None) -> int:
+    """Le battement de CE notificateur : ses routes + `*` si `notify.default`."""
+    humans = sorted(str(human) for human in (ncfg.routes or {}) if human)
+    if ncfg.default:
+        humans.append("*")
+    if not humans:
+        return 0
+    from . import storage
+    host = str(getattr(cfg, "host", "") or "?")
+    return storage.of(db).notify_liveness.beat(host, humans, now=now)
+
+
+def brief_once(cfg, db, now: float | None = None) -> dict:
+    """Brief hors du poste : les orchestrateurs et l'auditeur, sans doublon.
+
+    Appelée par le ménage du runner sur chaque hôte (VM comprises) : le brief
+    ne dépend donc pas du notificateur qu'il signale. Une réclamation partagée
+    par `(destinataire, humain)` espace les envois de
+    `alert_briefs.REMIND_AFTER_S` ; un envoi échoué rend la réclamation pour
+    la passe suivante. Rend `{"sent": [...], "skipped": n, "failed": [...]}`.
+    """
+    now = time.time() if now is None else float(now)
+    report = {"sent": [], "skipped": 0, "failed": []}
+    if db is None:
+        return report
+    try:
+        from . import alert_briefs, canon as canon_mod, decisions, mail, storage, \
+            sous_utilisation, work
+        pending = decisions.pending(db, now)
+        gaps = gaps_for(pending, storage.of(db).notify_liveness.latest(), now)
+        if not gaps:
+            return report
+        listing = storage.of(db).operations.listing()
+        try:
+            canons = canon_mod.load_configured(cfg) if getattr(cfg, "canon", None) else []
+        except Exception:  # noqa: BLE001 — sans canon, l'auditeur par son nom suffit
+            canons = []
+        auditors = alert_briefs.auditors(listing, canons)
+        orchestrators = sorted(sous_utilisation.role_orchestrators(canons))
+        since = now - alert_briefs.REMIND_AFTER_S
+        for gap in gaps:
+            alert = alert_of(gap, orchestrators)
+            texts = alert_briefs.briefs(
+                alert, listing, auditor_names=auditors,
+                orchestrator_names=set(orchestrators))
+            for recipient, text in sorted(texts.items()):
+                claim = storage.of(db).notify_liveness.claim_brief(
+                    recipient, gap["human"], since=since, now=now)
+                if not claim["claimed"]:
+                    report["skipped"] += 1
+                    continue
+                body = text
+                if claim.get("previous_ts") is not None:
+                    body = alert_briefs.reminder(text, claim["previous_ts"], now)
+                try:
+                    mail.send(db, work.SYSTEM_SENDER, recipient, body, kind="event",
+                              payload={"alert": GAP_TYPE, "human": gap["human"],
+                                       "decisions": list(gap["decisions"]),
+                                       "reason": gap["reason"]})
+                except Exception as exc:  # noqa: BLE001 — un destinataire ne bloque pas
+                    storage.of(db).notify_liveness.release_brief(recipient, gap["human"])
+                    report["failed"].append({"recipient": recipient,
+                                             "human": gap["human"], "error": str(exc)})
+                else:
+                    report["sent"].append({"recipient": recipient,
+                                           "human": gap["human"],
+                                           "reminder": claim.get("previous_ts") is not None,
+                                           "decisions": list(gap["decisions"])})
+    except Exception as exc:  # noqa: BLE001 — la passe du runner ne tombe pas
+        report["failed"].append({"recipient": None, "human": None, "error": str(exc)})
+    return report

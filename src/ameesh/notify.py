@@ -101,7 +101,7 @@ from dataclasses import dataclass, field
 
 from . import config as config_mod
 from . import db as db_mod
-from . import alert_briefs, exploitation, fil, sous_utilisation, storage
+from . import alert_briefs, exploitation, fil, notify_gap, sous_utilisation, storage
 from .config import Config
 from .platform import notify as platform_notify
 
@@ -1198,6 +1198,15 @@ class Notifier:
         from .mediated_executor import availability
         observed_ts = storage.of(db).alert_acknowledgements.clock() if db is not None else None
         now = float(self.clock())
+        # #3007 : ce passage prouve, pour tout le maillage, que CE notificateur
+        # joint ses humains. Un poste sain ne lève donc plus d'alerte de voie
+        # depuis les VM ; son silence, lui, se voit partout.
+        if db is not None and not self.dry_run:
+            try:
+                notify_gap.beat(self.cfg, db, self.ncfg, now=now)
+            except Exception as exc:  # noqa: BLE001 — un battement ne fait pas le passage
+                self.log("[%s] heartbeat not recorded (%s)"
+                         % (notify_gap.GAP_TYPE, exc))
         #: #1901 : familles qu'une passe n'a pas pu lire du tout (porte d'hôte
         #: au registre illisible) ; une alerte absente d'un relevé incomplet
         #: n'est pas résolue pour autant.
@@ -1796,7 +1805,12 @@ class Notifier:
         une absence transitoire ne l'oublie pas. Indépendant de `notify.types`
         (qui ne règle que l'humain). Jamais fatal au passage."""
         sent = self.state["briefs"]
-        alive = {key_of(a): a for a in current if a.get("type") in alert_briefs.BRIEFED_TYPES}
+        # #3007 : le brief de `notify_undeliverable` dépend de la vie de CE
+        # notificateur ; c'est `notify_gap.brief_once`, au ménage du runner,
+        # qui le porte hors du poste (aucune duplication : réclamation en base).
+        alive = {key_of(a): a for a in current
+                 if a.get("type") in alert_briefs.BRIEFED_TYPES
+                 and a.get("type") not in alert_briefs.NOTIFIER_EXCLUDED}
         open_lots = None
         for key in list(sent):
             if key not in alive:
