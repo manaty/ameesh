@@ -161,11 +161,14 @@ class BriefsLivenessTest(unittest.TestCase):
                                              auditor_names=["auditeur"]), {})
 
 
-class NotifierLivenessTest(PgTestCase):
-    """La livraison réelle : pas de dépôt chez un mort, remise au retour."""
+class LivenessFixture:
+    """Registre, baux et notificateur des témoins de livraison (repris par
+    #3057) ; à placer avant `PgTestCase`."""
 
     def setUp(self):
         super().setUp()
+        self.notifiers = []
+        self.long_dead = set()
         for name in ("dev1", "orch", "bureau", "auditeur", "claude3"):
             registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
             self.db.execute("UPDATE agent_registry SET team = 'ameesh'"
@@ -175,21 +178,38 @@ class NotifierLivenessTest(PgTestCase):
 
     def lease(self, *names):
         for name in names:
+            self.long_dead.discard(name)
             self.db.execute(
                 "UPDATE agent_registry SET lease_owner = 'runner-' || name,"
                 " lease_expires_at = now() + interval '1 hour' WHERE name = %s",
                 (name,))
 
     def dead(self, *names):
+        """Une perte qui dure : le notificateur a déjà vu ces agents sans bail
+        au-delà de la grâce de #3057 (`release` pour un bail tout juste rendu)."""
+        self.release(*names)
+        self.long_dead.update(names)
+        for notifier in self.notifiers:
+            self._seen_dead(notifier)
+
+    def release(self, *names):
         for name in names:
             self.db.execute(
                 "UPDATE agent_registry SET lease_owner = NULL,"
                 " lease_expires_at = NULL WHERE name = %s", (name,))
 
+    def _seen_dead(self, notifier):
+        since = notifier.state.setdefault("leaseless_since", {})
+        for name in self.long_dead:
+            since[name] = self.now - HEURE
+
     def notifier(self):
-        return notify.Notifier(self.cfg, notify.parse_config({"default": []}),
-                               sender=object(), log=lambda text: None,
-                               clock=lambda: self.now)
+        notifier = notify.Notifier(self.cfg, notify.parse_config({"default": []}),
+                                   sender=object(), log=lambda text: None,
+                                   clock=lambda: self.now)
+        self._seen_dead(notifier)
+        self.notifiers.append(notifier)
+        return notifier
 
     def mails(self, name):
         return self.db.query("SELECT body, payload FROM agent_mailbox"
@@ -197,6 +217,11 @@ class NotifierLivenessTest(PgTestCase):
 
     def thread(self, project, lot):
         return fil.transport_for(self.cfg).read(fil.ThreadRef(project, lot))
+
+
+
+class NotifierLivenessTest(LivenessFixture, PgTestCase):
+    """La livraison réelle : pas de dépôt chez un mort, remise au retour."""
 
     def test_agent_mort_sur_hote_perdu_ne_recoit_rien_et_est_nomme(self):
         self.dead("orch")
