@@ -163,6 +163,33 @@ def pilot_holds(db, events, *, cfg=None) -> dict[int, dict]:
     return explicit_holds(events, allowed=_pilot_allowed(db, cfg))
 
 
+def current_holds(db, events, *, cfg=None) -> dict[int, dict]:
+    """#3219 : la retenue courante de chaque lot, et son autorité.
+
+    Même lecture que `explicit_holds` (dernière retenue non levée), avec
+    `pilot` : le hold courant est-il aussi un hold de pilote
+    (`pilot_holds`, même auteur et même instant) ? C'est la seule question
+    que posent la levée (#3219 : son auteur, ou un pilote) et la fermeture
+    par le contenu (#2744 : la règle 1 de l'assigné ne retient pas) ; les
+    deux chemins lisent donc la même réponse. `pilot_holds` ignore un hold
+    ordinaire posé par-dessus un hold de pilote : l'instant et l'auteur
+    évitent de confondre les deux.
+
+    Rend `{lot: {what, by, since, pilot}}`."""
+    events = list(events or ())
+    held = explicit_holds(events)
+    if not held:
+        return {}
+    pilots = pilot_holds(db, events, cfg=cfg)
+    out: dict[int, dict] = {}
+    for lot, hold in held.items():
+        pilot = pilots.get(lot) or {}
+        out[lot] = dict(hold, pilot=bool(
+            (pilot.get("by"), pilot.get("since"))
+            == (hold.get("by"), hold.get("since"))))
+    return out
+
+
 def pilot_hold_releases(db, events, *, cfg=None) -> dict[int, list]:
     """#2916 : les instants où un hold de pilote a été levé, par lot.
 

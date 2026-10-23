@@ -65,8 +65,10 @@ ou qu'une note `hold:` n'est pas levée (le contenu fusionné est constaté, le
 journal le dit, le détenteur est réveillé, le lot reste ouvert) ; le contrôle
 et la fermeture partagent le verrou de ligne du lot avec les notes hold/lift
 (`work.close_merged(content_guard=…)`), et une lecture du journal en erreur
-retient aussi. `sync-branches` et les unités de paquet (`sync-packets`)
-portent la même garde.
+retient aussi. #3219 : la retenue ordinaire de l'assigné (règle 1) ne retient
+pas — le contenu prouvé la lève et la note de fusion garde la trace ; celles
+d'un pilote ou d'un autre acteur retiennent. `sync-branches` et les unités de
+paquet (`sync-packets`) portent la même garde.
 
 Un lot absorbé par un autre ou remplacé se clôt par
 `ameesh work close <id> --superseded-by <id>` ; jamais de réouverture d'un
@@ -874,7 +876,13 @@ def content_retention(st, row: dict) -> dict | None:
     note `unhold:` ou un changement d'état lève la retenue. Une lecture du
     journal qui échoue rend une retenue `unreadable` : une erreur ne doit
     jamais autoriser une fermeture. Rend `{what, motif, by, since}`, ou None.
-    """
+
+    #3219 : la retenue ordinaire de l'assigné (règle 1, non comptée par
+    `planned_waits.pilot_holds`) ne retient plus la fermeture — son auteur la
+    lèverait lui-même, mais le contenu prouvé est déjà la livraison ; la passe
+    la lève et `work.close_merged` écrit la levée dans sa note de fusion
+    (`lift: True`). Un hold de pilote, ou d'un autre acteur que l'assigné,
+    retient toujours : sa levée reste un geste autorisé (règle #1664)."""
     row = row or {}
     try:
         lot = int(row["id"])
@@ -888,7 +896,15 @@ def content_retention(st, row: dict) -> dict | None:
                 "motif": "journal des retenues illisible (%s: %s)"
                          % (type(exc).__name__, " ".join(str(exc).split())[:120]),
                 "by": str(row.get("assignee") or ""), "since": None}
-    held = planned_waits.explicit_holds(events).get(lot)
+    if state in CONTENT_HELD_STATES:
+        transitions = [e for e in events if e.get("state") in CONTENT_HELD_STATES]
+        last = transitions[-1] if transitions else {}
+        by = str(last.get("actor") or row.get("assignee") or "")
+        return {"what": "blocked", "motif": "état %s" % state, "by": by,
+                "since": last.get("created_ts")}
+    db = getattr(st, "db", None)
+    held = planned_waits.current_holds(db, events,
+                                       cfg=getattr(db, "cfg", None)).get(lot)
     if held:
         by = str(held.get("by") or "")
         reason = ""
@@ -900,17 +916,17 @@ def content_retention(st, row: dict) -> dict | None:
                     reason = reason[5:].strip()
                 reason = reason[:160]
                 break
+        if by and by == str(row.get("assignee") or "") and not held.get("pilot"):
+            lift = "levée du hold de l'assigné %s" % by
+            if reason:
+                lift += " : %s" % reason
+            return {"what": "hold", "lift": True, "motif": lift, "by": by,
+                    "since": held.get("since")}
         motif = "hold" + (" de %s" % by if by else "")
         if reason:
             motif += " : %s" % reason
         return {"what": "hold", "motif": motif, "by": by,
                 "since": held.get("since")}
-    if state in CONTENT_HELD_STATES:
-        transitions = [e for e in events if e.get("state") in CONTENT_HELD_STATES]
-        last = transitions[-1] if transitions else {}
-        by = str(last.get("actor") or row.get("assignee") or "")
-        return {"what": "blocked", "motif": "état %s" % state, "by": by,
-                "since": last.get("created_ts")}
     return None
 
 
@@ -930,6 +946,17 @@ def mark_withheld(entry: dict, retention: dict, *, target: str,
     entry["result"] = "would-withhold" if dry_run else "withheld"
     entry["detail"] = "%s — %s" % (entry.get("detail") or "", text)
     return text
+
+
+def mark_lifted(entry: dict, retention: dict) -> None:
+    """#3219 : la retenue ordinaire de l'assigné que la fermeture lèverait.
+
+    Un relevé à blanc (`dry_run`) ne doit pas annoncer `would-withhold` quand
+    la passe réelle fermerait : il dit la levée dans le détail, sans retenir."""
+    entry["retention"] = retention
+    entry["detail"] = "%s — %s" % (
+        entry.get("detail") or "",
+        retention.get("motif") or "hold de l'assigné levé par le contenu")
 
 
 def mark_retained(entry: dict, retention: dict, *, target: str,
@@ -1127,13 +1154,16 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
                                       "branch": member.get("package_branch") or "",
                                       "unit": member["unit_sha"]})
             if dry_run:
-                # #2744 : la même retenue que la fermeture par le gel.
+                # #2744 : la même retenue que la fermeture par le gel ;
+                # #3219 : celle de l'assigné est levée par le contenu.
                 retention = content_retention(st, row)
-                if retention is not None:
+                if retention is not None and not retention.get("lift"):
                     mark_retained(entry, retention, target=composition["target"],
                                   dry_run=True)
                     results.append(entry)
                     continue
+                if retention is not None:
+                    mark_lifted(entry, retention)
                 entry["result"] = "would-merge"
             else:
                 done = work_mod.close_merged(
@@ -1226,10 +1256,12 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
                      detail=found_proof["detail"])
         if dry_run:
             retention = content_retention(st, row)
-            if retention is not None:
+            if retention is not None and not retention.get("lift"):
                 mark_retained(entry, retention, target=found_target, dry_run=True)
                 results.append(entry)
                 continue
+            if retention is not None:
+                mark_lifted(entry, retention)
             entry["result"] = "would-merge"
         else:
             done = work_mod.close_merged(
@@ -3006,10 +3038,12 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             continue
         if dry_run:
             retention = content_retention(st, row)
-            if retention is not None:
+            if retention is not None and not retention.get("lift"):
                 mark_retained(entry, retention, target=target, dry_run=True)
                 results.append(entry)
                 continue
+            if retention is not None:
+                mark_lifted(entry, retention)
             entry["result"] = "would-merge"
             results.append(entry)
             continue

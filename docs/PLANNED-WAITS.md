@@ -91,11 +91,17 @@ A lot is stale when it is open and inactive beyond the configured threshold
   The write path authenticates the claim: `ameesh work note` and
   `ameesh work move --note` refuse a `hold:`/lift note that claims a pilot
   identity the writing session cannot prove (same guard as a state
-  correction, `history=False`). The runner wake keeps its own, older
-  convention (`LotSessions.HOLD_PREFIX`, last non-empty note decides): any
-  assignee may write a plain `hold:` to stop its own wake, but such a hold is
-  not a pilot's and does not defer this alert; the two conventions are
-  deliberately separate.
+  correction, `history=False`). A lift is not reserved to a pilot: the actor
+  who posed the hold — the exact author recorded on it — may lift it, if its
+  session proves that identity (`--actor` spoofed is refused); anyone else
+  needs a pilot, so the hold of another actor stays reserved (#3219). The
+  runner wake keeps its own, older convention (`LotSessions.HOLD_PREFIX`, last
+  non-empty note decides): any assignee may write a plain `hold:` to stop its
+  own wake, but such a hold is not a pilot's and does not defer this alert; the
+  two conventions are deliberately separate. A closure by content does not
+  wait for that rule-1 hold of the assignee either (see
+  [the work plan](PLAN-DE-TRAVAIL.md)): the proven content lifts it and the
+  merge note records the lift.
 
 Grouped views (`work list`, `progress --json`, the stale alert, the dependency
 labels) read the hold from a targeted storage stream
