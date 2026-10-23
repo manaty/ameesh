@@ -166,10 +166,17 @@ class BasculeTest(unittest.TestCase):
         alias = self.venv / "bin" / "python3"
         alias.unlink()
         alias.symlink_to(os.path.realpath(sys.executable))
-        for nom in ("agent-mail", "agent-runner"):
-            script = self.venv / "bin" / nom
-            script.write_text("#!%s\nimport pkg1969\nprint(pkg1969.VALUE)\n" % alias)
-            script.chmod(0o755)
+        script = self.venv / "bin" / "agent-mail"
+        script.write_text("#!%s\nimport pkg1969\nprint(pkg1969.VALUE)\n" % alias)
+        script.chmod(0o755)
+        # #3135 : un script hérité valide peut commencer par une docstring et un
+        # `from __future__` ; le préambule /bin/sh ne doit pas invalider
+        # l'ordre exigé par Python (relecture ameesh-cx2, B1).
+        script = self.venv / "bin" / "agent-runner"
+        script.write_text("#!%s\n\"\"\"Legacy command.\"\"\"\n"
+                          "from __future__ import annotations\n"
+                          "import pkg1969\nprint(pkg1969.VALUE)\n" % alias)
+        script.chmod(0o755)
         vrai_venv(self.base, "v2", "v2", "new_only")
         (self.base / "venv-v2" / bascule.MARKER).write_text('{}')
         self.assertEqual(0, activer(self.venv, "v2", precedent="v1"))

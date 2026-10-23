@@ -36,6 +36,7 @@ idempotent. Aucun octet d'un venv versionné n'est modifié après préparation.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -78,8 +79,13 @@ exit 1
 #: l'interpréteur est lui-même un script (`Exec format error`), là où le noyau
 #: Linux enchaîne les shebangs. sh exécute la ligne 2, qui remplace sh par
 #: l'interpréteur ; la ligne 3 ferme la chaîne triple et le fichier reste un
-#: script Python valide.
-_PREAMBULE = b"#!/bin/sh\n'''exec' %s \"$0\" \"$@\"\n' '''\n"
+#: script Python valide (#3135 : les imports __future__ sont remontés, voir
+#: `_preambuler`).
+_SHEBANG = b"#!/bin/sh\n"
+_PREAMBULE = b"'''exec' %s \"$0\" \"$@\"\n' '''\n"
+
+#: Ligne de codage PEP 263 : elle doit rester en ligne 1 ou 2 du source.
+_CODAGE = re.compile(rb"^[ \t\f]*#.*?coding[:=][ \t]*[-_.a-zA-Z0-9]+")
 
 
 def _die(message, code=1):
@@ -315,6 +321,42 @@ def preparer(args):
 # lanceurs stables : le processus voit un chemin concret, pas le lien
 # --------------------------------------------------------------------------
 
+def _preambuler(data, interpreteur):
+    """Donne à un script hérité un préambule /bin/sh sans changer son Python.
+
+    Pour Python, le préambule est une expression (la docstring du module) :
+    un `from __future__` ne peut donc pas la suivre sans SyntaxError. Les
+    imports __future__ du script sont remontés juste après le préambule ; une
+    ligne de codage (PEP 263) reste en ligne 2, où l'interpréteur la lit. La
+    docstring d'origine reste une expression : `__doc__` devient le préambule,
+    sans effet sur un point d'entrée. Rend None si le script n'est pas
+    analysable : on ne le réécrit pas au hasard.
+    """
+    lignes = data.splitlines(keepends=True)
+    if not lignes:
+        return None
+    try:
+        arbre = ast.parse(data)
+    except (SyntaxError, ValueError):
+        return None
+    debut = 1                       # ligne 0 : shebang d'origine, remplacé
+    codage = b""
+    if len(lignes) > 1 and _CODAGE.match(lignes[1]):
+        codage = lignes[1]
+        debut = 2
+    futurs = []
+    for noeud in arbre.body:
+        if isinstance(noeud, ast.ImportFrom) and noeud.module == "__future__":
+            fin = noeud.end_lineno or noeud.lineno
+            futurs.extend(range(noeud.lineno - 1, fin))
+    # Hors du haut du module, un `from __future__` serait déjà une SyntaxError.
+    retirer = set(futurs)
+    corps = [ligne for index, ligne in enumerate(lignes)
+             if index >= debut and index not in retirer]
+    return (_SHEBANG + codage + _PREAMBULE % interpreteur
+            + b"".join(lignes[index] for index in futurs) + b"".join(corps))
+
+
 def _convertir_scripts_herites(venv):
     """Rend portables les scripts dont l'interpréteur devient un lanceur.
 
@@ -350,8 +392,11 @@ def _convertir_scripts_herites(venv):
         interpreteur = data[2:fin].rstrip()
         if not motif.fullmatch(interpreteur):
             continue
+        converti = _preambuler(data, interpreteur)
+        if converti is None:
+            continue
         mode = os.stat(chemin).st_mode & 0o777
-        _write_bytes(chemin, _PREAMBULE % interpreteur + data[fin + 1:], mode)
+        _write_bytes(chemin, converti, mode)
 
 
 def _installer_lanceurs(venv, version):
