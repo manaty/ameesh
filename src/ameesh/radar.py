@@ -1438,6 +1438,9 @@ def _status_success(contexts, required) -> list:
 
 def latest_rollup(rollup) -> list:
     """#2524 : les derniers checks par (workflow, nom), statuts par contexte.
+    #3008 : une suite connue (`checkSuiteId`, rollup construit depuis les
+    check runs de la tête) entre dans la clé : deux workflows homonymes ne se
+    masquent pas.
 
     Seule une date strictement plus récente remplace une entrée. Dates
     absentes, invalides ou ex aequo : garder les entrées ambiguës afin de ne
@@ -1451,7 +1454,8 @@ def latest_rollup(rollup) -> list:
                    or "state" in entry and "conclusion" not in entry)
         name = entry.get("context" if context else "name")
         key = (("context", name) if context else
-               ("check", entry.get("workflowName"), name)) if name else ("unknown", index)
+               ("check", entry.get("workflowName"), entry.get("checkSuiteId"), name)
+               ) if name else ("unknown", index)
         # `gh` exporte la date d'un StatusContext sous `startedAt` (son
         # `createdAt` GraphQL) ; `createdAt` reste lu pour un rollup GraphQL brut.
         raw = (entry.get("startedAt") or entry.get("createdAt")) if context else entry.get("startedAt")
