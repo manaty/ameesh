@@ -173,6 +173,14 @@ class BasculeTest(unittest.TestCase):
         vrai_venv(self.base, "v2", "v2", "new_only")
         (self.base / "venv-v2" / bascule.MARKER).write_text('{}')
         self.assertEqual(0, activer(self.venv, "v2", precedent="v1"))
+        # #3135 : python3 est devenu un lanceur /bin/sh ; un script hérité qui
+        # garderait `#!…/bin/python3` serait un shebang imbriqué, que macOS
+        # refuse (Errno 8). Il porte le préambule /bin/sh de pip.
+        for nom in ("agent-mail", "agent-runner"):
+            lignes = (self.venv / "bin" / nom).read_text().splitlines()
+            self.assertEqual(lignes[0], "#!/bin/sh", nom)
+            self.assertTrue(lignes[1].startswith("'''exec' "), lignes[1])
+            self.assertEqual(lignes[2], "' '''", nom)
         for valeur in ("v2", "v1"):
             for nom in ("python", "python3", "agent-mail", "agent-runner"):
                 with self.subTest(version=valeur, commande=nom):

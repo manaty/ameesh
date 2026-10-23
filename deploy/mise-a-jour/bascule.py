@@ -73,6 +73,14 @@ echo "bascule: pip est interdit dans le venv vivant ; préparez un venv versionn
 exit 1
 """
 
+#: Préambule /bin/sh de pip (#2156), réutilisé pour un script hérité dont
+#: l'interpréteur devient un lanceur : macOS refuse un shebang dont
+#: l'interpréteur est lui-même un script (`Exec format error`), là où le noyau
+#: Linux enchaîne les shebangs. sh exécute la ligne 2, qui remplace sh par
+#: l'interpréteur ; la ligne 3 ferme la chaîne triple et le fichier reste un
+#: script Python valide.
+_PREAMBULE = b"#!/bin/sh\n'''exec' %s \"$0\" \"$@\"\n' '''\n"
+
 
 def _die(message, code=1):
     print("bascule: %s" % message, file=sys.stderr)
@@ -107,6 +115,21 @@ def _write(path, data, mode=0o755):
     tmp = "%s.tmp.%d" % (path, os.getpid())
     try:
         with open(tmp, "w") as handle:
+            handle.write(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass  # déjà renommé, ou nettoyage impossible : garder l'erreur initiale
+
+
+def _write_bytes(path, data, mode=0o755):
+    """Comme `_write`, pour un contenu binaire (script hérité) : temp + rename."""
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    try:
+        with open(tmp, "wb") as handle:
             handle.write(data)
         os.chmod(tmp, mode)
         os.replace(tmp, path)
@@ -292,12 +315,56 @@ def preparer(args):
 # lanceurs stables : le processus voit un chemin concret, pas le lien
 # --------------------------------------------------------------------------
 
+def _convertir_scripts_herites(venv):
+    """Rend portables les scripts dont l'interpréteur devient un lanceur.
+
+    Un script de `bin/` resté d'une version quittée garde un shebang vers
+    `<venv>/bin/python*`. Après l'activation, cet interpréteur est un lanceur
+    `/bin/sh` : le noyau macOS refuse de chaîner deux scripts (`Exec format
+    error`), là où Linux le fait. Le préambule /bin/sh de pip (#2156) exécute
+    le lanceur ; le script continue de suivre la version vivante.
+    """
+    bin_dir = os.path.join(venv, "bin")
+    try:
+        noms = sorted(os.listdir(bin_dir))
+    except OSError:
+        return
+    motif = re.compile(re.escape(os.fsencode(os.path.join(bin_dir, "python")))
+                       + rb"[0-9]*(?:\.[0-9]+)*")
+    for nom in noms:
+        if _LANCEURS_RESERVES.fullmatch(nom):
+            continue
+        chemin = os.path.join(bin_dir, nom)
+        if os.path.islink(chemin) or not os.path.isfile(chemin):
+            continue
+        try:
+            with open(chemin, "rb") as handle:
+                data = handle.read()
+        except OSError:
+            continue
+        if not data.startswith(b"#!"):
+            continue
+        fin = data.find(b"\n")
+        if fin < 0:
+            continue
+        interpreteur = data[2:fin].rstrip()
+        if not motif.fullmatch(interpreteur):
+            continue
+        mode = os.stat(chemin).st_mode & 0o777
+        _write_bytes(chemin, _PREAMBULE % interpreteur + data[fin + 1:], mode)
+
+
 def _installer_lanceurs(venv, version):
     bin_dir = os.path.join(venv, "bin")
     try:
         os.makedirs(bin_dir, exist_ok=True)
     except OSError as exc:
         raise OSError("bin/ inscriptible requis dans %s : %s" % (venv, exc))
+    # Les scripts hérités d'une version quittée pointent sur le python stable,
+    # qui devient un lanceur : on les rend exécutables sous macOS AVANT de
+    # remplacer les interpréteurs (une interruption laisse des scripts qui
+    # marchent encore).
+    _convertir_scripts_herites(venv)
     # Les scripts console installés par pip pointent souvent sur python3,
     # qui peut viser directement le binaire de base et contourner python.
     interpreteurs = {"python"} | {nom for nom in os.listdir(bin_dir)
@@ -313,8 +380,8 @@ def _installer_lanceurs(venv, version):
     # ameesh-approve, futur outil…) n'existaient dans le venv stable que s'ils
     # étaient là à l'adoption. On leur rend un lanceur qui suit `venv-courant`,
     # comme python et ameesh. Un script présent dans le stable mais absent de
-    # la version visée n'est PAS touché : il garde son shebang vers le python
-    # stable, qui résout la version vivante (témoin #1969 des alias).
+    # la version visée n'est pas remplacé : il garde son préambule /bin/sh vers
+    # le python stable, qui résout la version vivante (témoin #1969 des alias).
     cible_bin = os.path.join(_version_dir(venv, version), "bin")
     scripts = _scripts_console(cible_bin)
     for nom in scripts:
