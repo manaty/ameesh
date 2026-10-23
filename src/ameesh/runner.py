@@ -4413,6 +4413,10 @@ class AgentWorker(threading.Thread):
         if getattr(self.runner, "mediated", False):
             # Device relocation is controlled by the mesh server (L109).
             return False
+        # L165 (EP1) : un rôle élu ne se déplace pas par handoff ; un autre
+        # hôte candidat reprend le bail expiré, sans preuve de source.
+        if self.agent.get("releve") == "election":
+            return False
         from . import handoffs, host_lifecycle, storage, work
         try:
             api = storage.of(self.db)
@@ -8951,10 +8955,16 @@ class Runner:
             try:
                 if getattr(self, "_host_gate_rejected", ""):
                     self._note_unleased(agent, self._host_gate_rejected)
-                lease = registry.claim(self.db, agent["name"], self.runner_id, self.lease_ttl)
+                lease = registry.claim(self.db, agent["name"], self.runner_id,
+                                       self.lease_ttl, host=self.host)
                 if not lease:
                     self._release_slot(agent["name"])
                     continue  # un autre exécuteur a gagné la course
+                # L165 (EP1) : un rôle élu peut être réclamé depuis cet hôte
+                # alors que sa ligne était chez un autre candidat ; le worker
+                # doit lire l'hôte et le dossier effectivement acquis.
+                agent = dict(agent, host=lease.get("host") or self.host,
+                             cwd=lease.get("cwd", agent.get("cwd")))
                 log("lease acquired: %s (epoch %s, host %s)"
                     % (agent["name"], lease["lease_epoch"], self.host))
                 worker = AgentWorker(self, agent, lease)

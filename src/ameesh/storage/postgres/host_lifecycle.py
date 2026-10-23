@@ -26,8 +26,12 @@ class HostLifecycle(interface.HostLifecycle):
             host = candidate["host"]
             with self.db.transaction() as tx:
                 Hosts._lock_gate(tx, host)
+                # L165 (EP1) : un rôle élu n'est pas déplacé par L232e ; son
+                # bail expiré est repris par un autre candidat, sans preuve de
+                # source. Il n'entre donc pas dans le journal de l'hôte perdu.
                 agents = tx.query("SELECT name FROM agent_registry WHERE host=%s "
-                                  "AND mode='execute' ORDER BY name FOR UPDATE", (host,))
+                                  "AND mode='execute' AND releve <> 'election' "
+                                  "ORDER BY name FOR UPDATE", (host,))
                 old = HostLifecycle(tx).get(host)
                 if not agents or (old and old["mode"] == "lost"):
                     continue
@@ -72,8 +76,11 @@ class HostLifecycle(interface.HostLifecycle):
             Hosts._lock_gate(tx, host)
             # A claim or turn that wins this lock finishes before withdrawal;
             # a waiter reevaluates the volatile claim predicate afterwards.
+            # L165 (EP1) : même exclusion qu'à la détection de perte ; le drain
+            # ferme quand même les réclamations de l'hôte (host_lifecycle).
             agents = tx.query("SELECT name FROM agent_registry WHERE host=%s "
-                              "AND mode='execute' ORDER BY name FOR UPDATE", (host,))
+                              "AND mode='execute' AND releve <> 'election' "
+                              "ORDER BY name FOR UPDATE", (host,))
             old = HostLifecycle(tx).get(host)
             if old and old["mode"] in ("draining", "lost"):
                 return old

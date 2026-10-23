@@ -118,6 +118,10 @@ def advance_host(db, host, *, limits_for, adapter=None, requirements_for=None):
         agent = registry.get(db, origin["agent"])
         if not agent or agent.get("mode") != "execute" or agent.get("status") == "stopped":
             continue
+        # L165 (EP1) : un rôle élu se reprend par élection (bail expiré), sans
+        # preuve de source L232e ; il n'a rien à faire dans un handoff.
+        if agent.get("releve") == "election":
+            continue
         demand = api.host_lifecycle.demand(agent["name"], agent["host"])
         op = api.handoffs.active(agent["name"])
         missing = []
