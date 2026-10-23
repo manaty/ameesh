@@ -57,15 +57,24 @@ Chaque commit de composition a le lot en second parent, son sujet nomme le lot
 et sa tête, et il porte un trailer `ameesh-work:`. La composition part de
 `c14f9095` ; aucun commit de `main` n'est venu pendant la composition.
 
+Correction après revue : `6234551d4` (B/P1 cx2 et auditeur du 17:35Z) place le
+battement de #3007 **après** le retour restreint de #3057, avec le témoin
+`test_une_passe_restreinte_ne_bat_pas` ; le gel et la suite complète portent
+sur la tête qui la contient.
+
 ## Résolutions de composition
 
-**#3007 × main** (`7a9c2d855`) : `notify.py` garde la passe restreinte d'une
-minuterie de rôle (#3057, retour avant observation) et place le battement de
-#3007 **avant** elle : il prouve le notificateur, pas le périmètre observé.
+**#3007 × main** (`7a9c2d855`, corrigé par `6234551d4`) : `notify.py` garde la
+passe restreinte d'une minuterie de rôle (#3057, retour avant observation) et
+place le battement de #3007 **après** elle : seule une passe qui livre les
+alertes humaines prouve le notificateur, une minuterie de rôle ne peut donc
+plus rafraîchir `notify_liveness` et masquer un notificateur arrêté (B/P1 de
+cx2 et de l'auditeur du 17:35Z sur la tête `a1a9afbe`).
 `docs/EXECUTEUR-MEDIEE.md` : les deux comptes en conflit sont remplacés par
 ceux du contrat fusionné (72 opérations, 425 refusées, interface 497).
 Témoins : `tests.test_3007_notify_fallback` + `tests.test_3057_panier_vivacite`
-**37/37**.
+**38/38**, dont `test_une_passe_restreinte_ne_bat_pas` (`--only ci`,
+`--only take`).
 
 **#3085 × main** (`5c5f2748e`) : `merge_queue._required_ci` réunit la
 signature (#3080 : `branch`, message `requirement`) et l'option
@@ -106,8 +115,9 @@ h-1700) ; il n'est pas recomposé.
   **8/8 prêts composés**, plus #3007 et #3085 sur directive (avis complets,
   conflits résolus). Aucun lot prêt laissé hors paquet.
 - **Contrôles statiques** : `scripts/freeze-checks.py` **6/6** verts.
-- **Tests ciblés des résolutions** : 37/37 (#3007/#3057) et 206/206
-  (#3085 et portes de CI), 2 sautés non concluants.
+- **Tests ciblés des résolutions** : 38/38 (#3007/#3057, témoin de la passe
+  restreinte compris) et 206/206 (#3085 et portes de CI), 2 sautés non
+  concluants.
 - **Prévalidation** : indisponible (`card-stale`, carte de sélection de plus de
   48 h), non bloquant (§3) ; motif consigné.
 - **Migrations** : `0474_notify_liveness.sql` seule ajoutée (additive), aucun
