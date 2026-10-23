@@ -397,3 +397,70 @@ class InheritedHeadingInDeletedDocTest(_InheritedHeadingFixture):
         self.assertEqual({row["name"]: row["family"] for row in authors},
                          {"impl": "deepseek"})
         self.assertEqual(correctors, [])
+
+
+class MovedRemovalTest(_SurvivingRemovalFixture):
+    """B/P1 cx2 : le fichier corrigé est déplacé, le retrait subsiste."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo.git("reset", "--hard", self.base)
+        self.repo.write("relocated/gate.py", "require_session_identity()\n")
+        self.repo.git("rm", "-q", "src/ameesh/gate.py")
+        self.head_b = self.repo.commit(
+            "impl: garde corrigée déplacée, document omis", agent="impl")
+        self.receipt("impl", "deepseek", [self.head_b])
+        self.freeze_b = self.freeze(self.head_b)
+        self.milestone = {"id": int(self.freeze_b["id"]), "sha": self.head_b,
+                          "actor": "impl", "at_ts": self.freeze_b.get("at_ts")}
+
+    def test_the_moved_file_keeps_the_surviving_removal(self):
+        authors, unknown, correctors = self.reading(
+            self.milestone, [self.head_b], self.base, self.head_b)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+        self.assertIn("cx3", {row["name"] for row in correctors})
+
+    def test_the_gate_refuses_the_corrector_with_a_moved_removal(self):
+        klass = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "relocated/gate.py",
+                            "class": "sensitive",
+                            "rule": ["relocated/gate.py"]}],
+                 "repo": self.repo.root, "target": self.base,
+                 "base_sha": self.base}
+        for actor in ("cx3", "dev1"):
+            self.verdict(actor, self.head_b)
+        out = merge_queue.review_gate(
+            self.db, work.milestones(self.db, self.lot), self.head_b,
+            repo=self.repo.root, klass=klass, item=self.lot_item(), required=2)
+        self.assertFalse(out.get("error"), out)
+        self.assertFalse(out["ok"], out["why"])
+        self.assertEqual([entry["actor"] for entry in out["accepted"]],
+                         ["dev1"], out)
+        self.assertIn("cx3", {row["name"] for row in out["authors"]})
+
+
+class MovedCopyTest(_MixedCopyFixture):
+    """B/P1 cx2 : la copie héritée est déplacée avec le fichier corrigé."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo.git("reset", "--hard", self.base)
+        self.repo.write("relocated/gate.py",
+                        "# gate\nrequire_session_identity()\n")
+        self.repo.git("rm", "-q", "src/ameesh/gate.py")
+        self.head_b = self.repo.commit(
+            "impl: copie déplacée, document omis", agent="impl")
+        self.receipt("impl", "deepseek", [self.head_b])
+        self.freeze_b = self.freeze(self.head_b)
+        self.milestone = {"id": int(self.freeze_b["id"]), "sha": self.head_b,
+                          "actor": "impl", "at_ts": self.freeze_b.get("at_ts")}
+
+    def test_the_moved_copy_keeps_the_corrector(self):
+        authors, unknown, correctors = self.reading(
+            self.milestone, [self.head_b], self.base, self.head_b)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+        self.assertIn("cx3", {row["name"] for row in correctors})
