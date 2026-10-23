@@ -107,6 +107,11 @@ class GestureFenceTest(PgTestCase):
                             (self.name,))[0]
         self.epoch = int(row["lease_epoch"])
 
+    def steal_to_h2(self) -> dict | None:
+        """Une relève croisée réelle (EP3) : sans brief, le CAS la refuse."""
+        return registry.claim(self.db, self.name, "runner-h2", 600, host="h2",
+                              election_brief="relève EP3")
+
     def new_lot(self, *, branch: str | None = None) -> int:
         return int(work.add(self.db, title="geste %s" % self.name, app="ameesh",
                             branch=branch)["id"])
@@ -169,7 +174,7 @@ class GestureFenceTest(PgTestCase):
     def test_ancienne_epoque_refusee_et_nomme_le_detenteur(self):
         old = self.epoch
         self.assertTrue(registry.release(self.db, self.name, "runner-h1", old))
-        lease = registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+        lease = self.steal_to_h2()
         self.assertIsNotNone(lease)
         new = int(lease["lease_epoch"])
         with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
@@ -219,7 +224,7 @@ class GestureFenceTest(PgTestCase):
     def test_role_timer_epoque_perimee_refusee(self):
         old = self.epoch
         registry.release(self.db, self.name, "runner-h1", old)
-        lease = registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+        lease = self.steal_to_h2()
         self.assertIsNotNone(lease)
         with self.role_env(role=self.name, epoch=old):
             with self.assertRaises(pilot_gesture.GestureRefused) as caught:
@@ -281,7 +286,7 @@ class GestureFenceTest(PgTestCase):
         lot = self.new_lot()
         old = self.epoch
         registry.release(self.db, self.name, "runner-h1", old)
-        registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+        self.steal_to_h2()
         with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
             with self.assertRaises(pilot_gesture.GestureRefused):
                 work.assign(self.db, lot, worker, cfg=self.cfg)
@@ -294,7 +299,7 @@ class GestureFenceTest(PgTestCase):
                         cwd=self.tmp, status="idle")
         old = self.epoch
         registry.release(self.db, self.name, "runner-h1", old)
-        registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+        self.steal_to_h2()
         with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
             with self.assertRaises(pilot_gesture.GestureRefused):
                 work.add(self.db, title="attribué par un pilote", assignee=worker,
@@ -313,7 +318,7 @@ class GestureFenceTest(PgTestCase):
         def steal(*args, **kwargs):
             check = original(*args, **kwargs)
             registry.release(self.db, self.name, "runner-h1", old)
-            registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+            self.steal_to_h2()
             return check
 
         title = "attribué pendant la course 3013"
@@ -331,7 +336,7 @@ class GestureFenceTest(PgTestCase):
 
         def steal(*args, **kwargs):
             registry.release(self.db, self.name, "runner-h1", old)
-            registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+            self.steal_to_h2()
             return "a" * 40
 
         with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
@@ -347,7 +352,7 @@ class GestureFenceTest(PgTestCase):
         lot = self.new_lot()
         old = self.epoch
         registry.release(self.db, self.name, "runner-h1", old)
-        registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+        self.steal_to_h2()
         with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
             with mock.patch.object(work, "_declared_merge_commit",
                                    side_effect=AssertionError("preuve lue")):
@@ -376,7 +381,7 @@ class GestureFenceTest(PgTestCase):
 
         def steal(*args, **kwargs):
             registry.release(self.db, self.name, "runner-h1", old)
-            registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+            self.steal_to_h2()
             return {"state": "MERGED", "baseRefName": "main",
                     "headRefName": "lot/3013-exception", "headRefOid": head,
                     "mergeCommit": {"oid": head}}
@@ -395,7 +400,7 @@ class GestureFenceTest(PgTestCase):
     def test_merge_pr_stale_refuse_avant_github(self):
         old = self.epoch
         registry.release(self.db, self.name, "runner-h1", old)
-        registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+        self.steal_to_h2()
         with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
             with mock.patch.object(merge_pr, "pr_view",
                                    side_effect=AssertionError("lecture GitHub")):
@@ -406,7 +411,7 @@ class GestureFenceTest(PgTestCase):
     def test_file_stale_refuse_avant_la_preparation(self):
         old = self.epoch
         registry.release(self.db, self.name, "runner-h1", old)
-        registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+        self.steal_to_h2()
         with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
             with mock.patch.object(merge_queue, "readiness",
                                    side_effect=AssertionError("préparation lue")):
@@ -417,7 +422,7 @@ class GestureFenceTest(PgTestCase):
         lot = self.new_lot(branch="integration/paquet-test")
         old = self.epoch
         registry.release(self.db, self.name, "runner-h1", old)
-        registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+        self.steal_to_h2()
         with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
             with mock.patch.object(packet_link.work, "lot_repository",
                                    side_effect=AssertionError("dépôt lu")):
@@ -428,7 +433,7 @@ class GestureFenceTest(PgTestCase):
         lot = self.new_lot()
         old = self.epoch
         registry.release(self.db, self.name, "runner-h1", old)
-        registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+        self.steal_to_h2()
         with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
             with self.assertRaises(decisions.DecisionError) as caught:
                 decisions.ask(self.cfg, self.db, requester=self.name,
@@ -440,7 +445,7 @@ class GestureFenceTest(PgTestCase):
     def test_decision_new_lot_stale_ne_cree_rien(self):
         old = self.epoch
         registry.release(self.db, self.name, "runner-h1", old)
-        registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+        self.steal_to_h2()
         with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
             with self.assertRaises(decisions.DecisionError):
                 decisions.ask(self.cfg, self.db, requester=self.name,
@@ -468,7 +473,7 @@ class GestureFenceTest(PgTestCase):
                   "required=tests" % ("a" * 40), actor=self.name)
         old = self.epoch
         registry.release(self.db, self.name, "runner-h1", old)
-        registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+        self.steal_to_h2()
         called = []
         with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
             with mock.patch.object(packet_automerge, "merge_into",
@@ -482,7 +487,7 @@ class GestureFenceTest(PgTestCase):
         lot = self.new_lot()
         old = self.epoch
         registry.release(self.db, self.name, "runner-h1", old)
-        registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+        self.steal_to_h2()
         with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
             with mock.patch.object(packet_automerge, "_arm_locked",
                                    side_effect=AssertionError("armement atteint")):
@@ -499,7 +504,7 @@ class GestureFenceTest(PgTestCase):
 
         def steal(*args, **kwargs):
             registry.release(self.db, self.name, "runner-h1", old)
-            registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+            self.steal_to_h2()
             return [("tests", "app")]
 
         with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
@@ -525,7 +530,7 @@ class GestureFenceTest(PgTestCase):
 
         def steal(*args, **kwargs):
             registry.release(self.db, self.name, "runner-h1", old)
-            registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+            self.steal_to_h2()
             return True
 
         with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
@@ -540,7 +545,7 @@ class GestureFenceTest(PgTestCase):
         lot = self.new_lot()
         old = self.epoch
         registry.release(self.db, self.name, "runner-h1", old)
-        registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+        self.steal_to_h2()
         with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
             with self.assertRaises(fire.FireError) as caught:
                 fire.give(self.db, lot, sha="a" * 40, actor=self.name)

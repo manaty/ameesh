@@ -110,7 +110,9 @@ class ElectionSyncTest(test_canon._CanonDbCase):
         self.sync("atelier")
         self.sync("banc")
         self.assertIn("relecteur", [r["name"] for r in registry.claimable(self.db, "banc")])
-        lease = registry.claim(self.db, "relecteur", "runner-banc", 600, host="banc")
+        # L165/EP3 : une relève croisée exige un brief de reprise.
+        lease = registry.claim(self.db, "relecteur", "runner-banc", 600, host="banc",
+                               election_brief="brief-banc")
         self.assertIsNotNone(lease)
         row = self.row("relecteur")
         self.assertEqual((row["host"], row["cwd"]), ("banc", "/srv/acme/acme-web"))
@@ -125,7 +127,8 @@ class ElectionSyncTest(test_canon._CanonDbCase):
         self.assertIsNone(registry.claim(self.db, "relecteur", "runner-atelier", 600,
                                          host="atelier"))
         registry.release(self.db, "relecteur", "runner-banc", lease["lease_epoch"])
-        lease = registry.claim(self.db, "relecteur", "runner-atelier", 600, host="atelier")
+        lease = registry.claim(self.db, "relecteur", "runner-atelier", 600, host="atelier",
+                               election_brief="brief-atelier")
         self.assertIsNotNone(lease)
         row = self.row("relecteur")
         self.assertEqual((row["host"], row["cwd"]),
@@ -287,7 +290,8 @@ class ElectionSyncTest(test_canon._CanonDbCase):
         # une clôture L232e posée à la main ne ferme pas non plus la relève
         self.db.execute("UPDATE agent_registry SET handoff_fenced = true "
                         "WHERE name = 'relecteur'")
-        lease = registry.claim(self.db, "relecteur", "runner-banc", 600, host="banc")
+        lease = registry.claim(self.db, "relecteur", "runner-banc", 600, host="banc",
+                               election_brief="brief-banc")
         self.assertIsNotNone(lease)
         self.assertFalse(self.row("relecteur")["handoff_fenced"])
 

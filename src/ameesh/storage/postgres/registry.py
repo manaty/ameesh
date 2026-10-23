@@ -35,6 +35,9 @@ LINEAGE_MAX = 32
 AGENT_COLUMNS = """
     name, aliases, chantier, harness, host, cwd, session_id, status, status_text, model,
     budget_usd, spent_usd, turns, pending_prompt, current_prompt, last_error,
+    -- L165 (EP3) : brief de reprise d'une relève élue, lu une fois par le
+    -- nouveau détenteur (contenu libre, jamais lisible par le superviseur)
+    election_brief,
     lease_owner, lease_epoch, runner_seen_host, runner_seen_owner,
     extract(epoch from runner_seen_at)::float8 as runner_seen_ts,
     extract(epoch from lease_wait_since)::float8 as lease_wait_since_ts,
@@ -519,6 +522,12 @@ class Agents(interface.Agents):
         rows = self.db.query(sql, tuple(params))
         for row in rows:
             row["cwd"] = row.pop("claim_cwd", row.get("cwd"))
+            # L165 (EP3) : l'hôte de la ligne reste l'ancien détenteur (ou
+            # l'hôte de la dernière synchronisation). Le candidat qui va
+            # réclamer a besoin de le connaître pour distinguer une relève
+            # croisée d'une simple reprise sur le même hôte (briefing, session
+            # neuve) ; `host` reste, lui, l'hôte qui réclame.
+            row["previous_host"] = row.get("host")
             row["host"] = host
         return rows
 
@@ -562,17 +571,21 @@ class Agents(interface.Agents):
         # écriture (NULL : hôte sans comptes déclarés) ; #408 (0384) : et le
         # harnais et le dossier de son OUVERTURE s'ils sont donnés ; sinon
         # (session reprise) l'origine notée reste celle de son ouverture si
-        # elle décrit cette session, inconnue sinon (déclencheur de 0384)
+        # elle décrit cette session, inconnue sinon (déclencheur de 0384).
+        # L165 (EP3) : une session ouverte consomme le brief de relève ; le
+        # garder le ferait réapparaître à la prochaine session neuve.
         if harness is not None or cwd is not None:
             self.db.execute(
                 "UPDATE agent_registry SET session_id = %s, session_account = %s,"
                 " session_harness = %s, session_cwd = %s, session_origin = %s,"
+                " election_brief = NULL,"
                 " updated_at = now() WHERE name = %s",
                 (session_id, account, harness, cwd, session_id, name),
             )
         else:
             self.db.execute(
                 "UPDATE agent_registry SET session_id = %s, session_account = %s,"
+                " election_brief = NULL,"
                 " updated_at = now() WHERE name = %s",
                 (session_id, account, name),
             )
@@ -687,7 +700,7 @@ class Agents(interface.Agents):
 class Leases(interface.Leases):
 
     def claim(self, name, owner, ttl_seconds, *, require_responsible,
-              host=None) -> dict | None:
+              host=None, election_brief=None) -> dict | None:
         """Prend le bail s'il est libre ou expiré. Renvoie la ligne, sinon None.
 
         Le verrou de ligne est pris **d'abord** (`SELECT ... FOR UPDATE`), puis
@@ -705,16 +718,48 @@ class Leases(interface.Leases):
         travail local à publier, le bail et son epoch suffisent. Un agent
         `hote` ignore `host` et ne peut être réclamé que sur l'hôte de sa
         ligne.
+
+        L165 (EP3) : `election_brief` est le briefing de reprise construit par
+        l'hôte qui gagne une relève CROISÉE (l'ancien détenteur est un autre
+        hôte). La même instruction oublie la session de l'ancien hôte
+        (`session_id`, `session_work_item`, `session_account`, `session_reset_at`),
+        écrit le brief dans `election_brief` (résumé de la session neuve),
+        met une consigne courte EN TÊTE de `pending_prompt` et passe l'agent
+        `queued` : aucun état « bail pris sans briefing » n'est visible, et
+        l'ancien détenteur reste fencé par l'epoch. Même hôte (redémarrage de
+        l'exécuteur) ou agent `hote` : le brief est ignoré, la session est
+        gardée. Une relève croisée SANS brief (`p.brief` NULL, cas du contrat
+        médié qui le force) est **refusée** : le CAS ne déplace pas la ligne,
+        sinon l'hôte changerait en gardant la session et le compte de
+        l'ancien. Rend en plus `previous_host`, `previous_owner`,
+        `previous_epoch`, `previous_session` et `elected` (vrai seulement si
+        le brief a été appliqué).
         """
         h = _host_expr("r", host)
+        # L165 (EP3) : une relève n'est croisée que si la ligne était encore
+        # chez un AUTRE hôte. Le brief ne peut alors pas être un reste d'un
+        # tour local : la session de l'ancien hôte n'est jamais reprise ici.
+        takeover = """(p.brief IS NOT NULL AND r.releve = 'election'
+                       AND verrou.host IS DISTINCT FROM __H__)"""
+        r5 = """CASE
+                           WHEN r.current_prompt IS NOT NULL
+                                AND (r.lease_owner IS DISTINCT FROM %s
+                                     OR r.lease_expires_at IS NULL
+                                     OR r.lease_expires_at < clock_timestamp())
+                           THEN CASE
+                               WHEN r.pending_prompt IS NULL THEN r.current_prompt
+                               ELSE r.current_prompt || E'\\n\\n' || r.pending_prompt
+                           END
+                           ELSE r.pending_prompt END"""
         sql = """
             WITH verrou AS (
-                SELECT name FROM agent_registry WHERE name = %s FOR UPDATE
-            )
+                SELECT name, host, session_id, lease_owner, lease_epoch
+                  FROM agent_registry WHERE name = %s FOR UPDATE
+            ), p AS (SELECT %s::text AS brief)
             UPDATE agent_registry AS r
                SET lease_owner      = %s,
                    lease_expires_at = clock_timestamp() + make_interval(secs => %s),
-                   lease_epoch      = lease_epoch + 1,
+                   lease_epoch      = r.lease_epoch + 1,
                    -- L165 (EP1) : le détenteur élu est l'hôte qui réclame ;
                    -- son dossier et son verdict de placement sont ceux de ce
                    -- candidat, pour que le profil reste celui de l'hôte.
@@ -751,32 +796,69 @@ class Leases(interface.Leases):
                    -- exécuteur relancé avec le même identifiant), la consigne
                    -- inachevée repart en attente. Si une consigne était déjà en
                    -- attente, les deux sont conservées (B6b, B6c).
-                   pending_prompt   = CASE
-                       WHEN r.current_prompt IS NOT NULL
-                            AND (r.lease_owner IS DISTINCT FROM %s
-                                 OR r.lease_expires_at IS NULL
-                                 OR r.lease_expires_at < clock_timestamp())
-                       THEN CASE
-                           WHEN r.pending_prompt IS NULL THEN r.current_prompt
-                           ELSE r.current_prompt || E'\n\n' || r.pending_prompt
-                       END
-                       ELSE r.pending_prompt END,
+                   -- L165 (EP3) : sur une relève croisée, le brief de reprise
+                   -- est écrit à part (`election_brief`, lu comme résumé de la
+                   -- session neuve) et une consigne courte ouvre le premier
+                   -- tour ; la consigne inachevée de l'ancien hôte la suit.
+                   pending_prompt   = CASE WHEN __TAKEOVER__
+                       THEN concat_ws(E'\n\n',
+                                      'Elected on host ' || __H__ || ': your session is '
+                                      'new; read the resume briefing that opens this turn, '
+                                      'then check the mesh state (lots, mail, decisions, '
+                                      'alerts) before acting.', __R5__)
+                       ELSE __R5__ END,
                    current_prompt   = CASE
+                       WHEN __TAKEOVER__ THEN NULL
                        WHEN r.lease_owner IS DISTINCT FROM %s
                             OR r.lease_expires_at IS NULL
                             OR r.lease_expires_at < clock_timestamp()
                        THEN NULL
                        ELSE r.current_prompt END,
-                   status           = CASE WHEN r.status = 'dead' THEN 'idle' ELSE r.status END,
+                   -- L165 (EP3) : briefing persisté de la relève, consommé par
+                   -- le nouveau détenteur ; aucune session ne traverse un hôte.
+                   election_brief   = CASE WHEN __TAKEOVER__ THEN p.brief
+                                           ELSE r.election_brief END,
+                   -- L165 (EP3) : aucune session ne traverse un hôte. La
+                   -- remise à zéro est durable (`session_reset_at`), donc un
+                   -- fichier local périmé ne ressuscite pas la session, et
+                   -- l'ancien compte est laissé au choix de cet hôte.
+                   session_id       = CASE WHEN __TAKEOVER__ THEN NULL
+                                           ELSE r.session_id END,
+                   session_work_item = CASE WHEN __TAKEOVER__ THEN NULL
+                                            ELSE r.session_work_item END,
+                   session_reset_at = CASE WHEN __TAKEOVER__ THEN clock_timestamp()
+                                           ELSE r.session_reset_at END,
+                   session_account  = CASE WHEN __TAKEOVER__ THEN NULL
+                                           ELSE r.session_account END,
+                   -- une demande de redémarrage de l'ancien hôte ne doit pas
+                   -- effacer la session neuve que ce brief vient d'ouvrir.
+                   restart_brief    = CASE WHEN __TAKEOVER__ THEN NULL
+                                           ELSE r.restart_brief END,
+                   restart_requested_at = CASE WHEN __TAKEOVER__ THEN NULL
+                                           ELSE r.restart_requested_at END,
+                   status           = CASE
+                       WHEN __TAKEOVER__ AND r.status <> 'stopped' THEN 'queued'
+                       WHEN r.status = 'dead' THEN 'idle'
+                       ELSE r.status END,
+                   status_text      = CASE
+                       WHEN __TAKEOVER__ AND r.status <> 'stopped'
+                       THEN 'elected: new session from resume brief'
+                       ELSE r.status_text END,
                    last_error       = CASE
                        WHEN starts_with(coalesce(r.last_error, ''), 'lease_not_taken: ')
                        THEN NULL ELSE r.last_error END,
                    updated_at       = now()
-              FROM verrou
+              FROM verrou, p
              WHERE r.name = verrou.name
                -- L46 : même règle que `claimable` — jamais un agent `externe`.
                AND r.mode = 'execute'
                AND (r.releve = 'election' OR r.host = __H__)
+               -- L165 (EP3) : une relève CROISÉE d'un rôle élu ne se fait
+               -- jamais sans brief. Sans lui, la ligne changerait d'hôte en
+               -- gardant la session et le compte de l'ancien (le contrat médié
+               -- force le brief à null) : le CAS refuse, sans rien écrire.
+               AND (r.releve <> 'election' OR verrou.host = __H__
+                    OR p.brief IS NOT NULL)
                AND (r.lease_owner IS NULL OR r.lease_owner = %s
                     OR r.lease_expires_at < clock_timestamp())
                AND (NOT r.ephemeral OR r.ephemeral_expires_at > clock_timestamp())
@@ -791,15 +873,26 @@ class Leases(interface.Leases):
                AND (r.releve = 'election' OR NOT r.handoff_fenced)
                AND __CANON__
             RETURNING r.name, r.lease_owner, r.lease_epoch, r.host, r.cwd,
+                      r.election_brief,
+                      verrou.host AS previous_host,
+                      verrou.lease_owner AS previous_owner,
+                      verrou.lease_epoch AS previous_epoch,
+                      verrou.session_id AS previous_session,
+                      __TAKEOVER__ AS elected,
+                      extract(epoch from r.session_reset_at)::float8 as session_reset_ts,
                       extract(epoch from r.lease_expires_at)::float8 as lease_expires_ts
         """
+        # `__TAKEOVER__` porte lui-même `__H__` : le remplacer AVANT l'hôte.
+        sql = sql.replace("__TAKEOVER__", takeover)
         sql = sql.replace("__H__", h)
+        sql = sql.replace("__R5__", r5)
         sql = sql.replace("__RESPONSABLE__",
                           "AND coalesce(r.responsible, '') <> ''" if require_responsible else "")
         # L232b : réclamation d'un agent nommé (pas de tour du contrôleur) —
         # seul l'agent sonde de la fermeture de release rouvre la condition.
         sql = sql.replace("__CANON__", canon_claim_predicate_sql("r", probe=True, host=host))
-        rows = self.db.query(sql, (name, owner, ttl_seconds, owner, owner, owner, owner))
+        rows = self.db.query(sql, (name, election_brief, owner, ttl_seconds,
+                                   owner, owner, owner, owner, owner))
         return rows[0] if rows else None
 
     def attach_claim(self, name, owner, ttl_seconds, *, require_responsible) -> dict | None:
@@ -951,6 +1044,9 @@ class Leases(interface.Leases):
         n'a pas pu retirer (PermissionError) reste ainsi antérieur au dernier
         oubli, donc `AgentWorker.current_session` ne le reprend pas — y compris
         sur un worker recréé, qui relit ce champ au registre.
+
+        L165 (EP3) : un brief de relève non consommé part avec la session ; il
+        décrivait la session qu'on oublie et ne doit pas rouvrir la suivante.
         """
         rows = self.db.query(
             """
@@ -960,6 +1056,7 @@ class Leases(interface.Leases):
             )
             UPDATE agent_registry AS r
                SET session_id = NULL, session_work_item = NULL,
+                   election_brief = NULL,
                    session_reset_at = clock_timestamp(), updated_at = now()
               FROM verrou
              WHERE r.name = verrou.name
