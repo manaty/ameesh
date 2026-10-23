@@ -79,6 +79,17 @@ class Runtime:
     def dependencies(self, rows):
         return self.admissions.dependencies(rows)
 
+    def admitted(self, rows, slot):
+        """#2965: rows admissible at the cutoff, dated by their admission.
+
+        The proofs of this pass's enrollment are the fast path; a packet row
+        replayed from storage reads the same gate instant. A manual admission
+        is never re-dated by its freeze/verdicts and stays late when queued
+        after the cutoff.
+        """
+        return self.admissions.admitted(rows, slot, self.target(),
+                                        proofs=self.enrollment_result)
+
     def qualify(self, rows, base, mode):
         if mode != self.policy.ci_mode:
             raise TrainError("runtime and engine CI policy differ")

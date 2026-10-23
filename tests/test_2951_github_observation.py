@@ -6,7 +6,7 @@ import dataclasses
 from unittest import mock
 
 from .support import PgTestCase
-from ameesh import exploitation, github_observation, notify, storage
+from ameesh import ci, exploitation, github_observation, notify, storage
 
 
 REPO = "acme/widget"
@@ -38,8 +38,12 @@ class GithubObservationTest(PgTestCase):
         self.assertEqual(alert["repo"], REPO)
         self.assertEqual(alert["last_seen_ts"], NOW - FRESH_S - 1)
         for text in (REPO, exploitation._stamp(NOW - FRESH_S - 1),
-                     "github.host (not designated)", "ameesh-notify", "gh token"):
+                     "designated observer", "ameesh-notify", "gh token"):
             self.assertIn(text, alert["detail"])
+        # #2957 N2 : ce que l'hôte local ne dit pas ne doit pas être présenté
+        # comme une absence d'observateur.
+        self.assertIn("not set in this host's local configuration", alert["detail"])
+        self.assertNotIn("not designated", alert["detail"])
 
     def test_fresh_empty_queue_and_exact_threshold_are_healthy(self):
         for seen in (NOW, NOW - FRESH_S):
@@ -74,7 +78,8 @@ class GithubObservationTest(PgTestCase):
         (alert,) = self.alerts(cfg)
         self.assertEqual(alert["repo"], REPO)
         self.assertEqual(alert["last_seen_ts"], NOW - FRESH_S - 1)
-        self.assertIn("github.host (not designated)", alert["detail"])
+        self.assertIn("designated observer", alert["detail"])
+        self.assertIn("not set in this host's local configuration", alert["detail"])
         self.reading()
         self.assertEqual(self.alerts(cfg), [])
 
@@ -120,3 +125,53 @@ class GithubObservationTest(PgTestCase):
         own = [r for r in records if r["type"] == "github_observation_stale"]
         self.assertEqual([r["event"] for r in own], ["resolved"])
         self.assertEqual(len(sender.sent), 2)
+
+    def test_diagnostic_names_the_designated_host_when_configured(self):
+        """#2957 N2 : quand la configuration locale désigne l'observateur, le
+        diagnostic le nomme et ne parle pas d'une configuration absente."""
+        self.reading(seen=NOW - FRESH_S - 1)
+        cfg = dataclasses.replace(
+            self.cfg, github={"projects": {"widget": REPO},
+                              "host": "observer-host"})
+        (alert,) = self.alerts(cfg)
+        self.assertIn("github.host (observer-host)", alert["detail"])
+        self.assertNotIn("local configuration", alert["detail"])
+
+    def test_designated_observer_prunes_removed_repositories(self):
+        """#2957 : un dépôt retiré du périmètre actif perd sa ligne de file ;
+        le repli des hôtes sans configuration ne l'alerte plus à jamais."""
+        self.reading()
+        self.reading(repo="acme/removed", seen=NOW - FRESH_S - 1)
+        cfg = dataclasses.replace(
+            self.cfg, github={"projects": {"widget": REPO},
+                              "host": self.cfg.host})
+        watcher = ci.Watcher(cfg, api=object())
+        with mock.patch.object(watcher, "watch", return_value=[]):
+            watcher.tick(self.db)
+        self.assertEqual(
+            [row["repo"] for row in storage.of(self.db).ci.queued_oldest()],
+            [REPO])
+        self.assertEqual(self.alerts(self.cfg), [])
+
+    def test_a_host_that_is_not_the_observer_does_not_prune(self):
+        """#2957 : seul l'hôte désigné définit le périmètre actif ; un autre
+        hôte qui porte une configuration ne purge pas les relevés partagés."""
+        self.reading()
+        self.reading(repo="acme/removed", seen=NOW - FRESH_S - 1)
+        cfg = dataclasses.replace(
+            self.cfg, github={"projects": {"widget": REPO},
+                              "host": "elsewhere"})
+        watcher = ci.Watcher(cfg, api=object())
+        watcher.tick(self.db)
+        self.assertEqual(
+            [row["repo"] for row in storage.of(self.db).ci.queued_oldest()],
+            ["acme/removed", REPO])
+
+    def test_no_perimeter_never_purges(self):
+        """#2957 : un périmètre vide ne prouve pas un retrait ; il ne doit pas
+        effacer les relevés partagés."""
+        self.reading()
+        storage.of(self.db).ci.prune_queue([])
+        self.assertEqual(
+            [row["repo"] for row in storage.of(self.db).ci.queued_oldest()],
+            [REPO])

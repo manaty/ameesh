@@ -242,6 +242,64 @@ def _mark_order(mark: dict) -> tuple:
     return (float(mark.get("at_ts") or 0.0), int(mark.get("id") or 0))
 
 
+def _gate_completed_ts(on_freeze, eligible: dict, *, required: int,
+                      waived: bool, distinct_families: bool):
+    """#2965 : début de la période ouverte courante, relu chronologiquement.
+
+    La porte ne retient que le **dernier** verdict de chaque acteur ; relire
+    son état final ne dit donc pas quand la période ouverte courante a
+    commencé. On rejoue ici sa chronologie exacte, du plus ancien au plus
+    récent : un blocage courant ferme la porte jusqu'au `ok` du même acteur,
+    et l'instant d'admissibilité est celui du verdict qui a **rouvert** la
+    porte après la dernière fermeture. Un `ok` redondant sur une porte déjà
+    ouverte ne la redate pas.
+
+    Sans avis requis ni blocage, la porte est ouverte dès le gel : la fonction
+    rend `None` pour que l'appelant conserve le gel, même si un `ok` arrive
+    plus tard. Un blocage, lui, la referme et sa levée date l'ouverture.
+
+    `eligible` associe le nom (casefold) d'un relecteur dont l'avis `ok` est
+    retenu par la porte à sa famille ; les avis des auteurs, des correcteurs
+    et des familles non prouvées n'y sont pas.
+    """
+    state: dict = {}
+    open_ = bool(waived) or required == 0
+    opened_at = None
+    for mark in sorted(on_freeze, key=_mark_order):
+        actor = str(mark.get("actor") or "").strip().casefold()
+        state[actor] = mark
+        if any((other.get("verdict") or "") == "blocked" for other in state.values()):
+            open_ = False
+            continue
+        if waived or required == 0:
+            complete = True
+        else:
+            retained = []
+            for other in state.values():
+                if (other.get("verdict") or "") != "ok":
+                    continue
+                name = str(other.get("actor") or "").strip().casefold()
+                if name not in eligible:
+                    continue
+                retained.append((_mark_order(other), eligible[name]))
+            retained.sort()
+            if required >= 2 and distinct_families:
+                families = []
+                for _order, family in retained:
+                    if family not in families:
+                        families.append(family)
+                complete = len(families) >= required
+            else:
+                complete = len(retained) >= required
+        if not complete:
+            open_ = False
+            continue
+        if not open_:
+            open_ = True
+            opened_at = float(mark.get("at_ts") or 0.0)
+    return opened_at if open_ else None
+
+
 def _same_sha(a, b, repo: str | None = None) -> bool:
     """Deux identifiants de commit qui nomment le même commit : égaux, ou
     résolus dans `repo` (un verdict peut citer une abréviation)."""
@@ -556,9 +614,16 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     `blocked`, et sa famille ne peut plus faire passer la porte. Les verdicts
     écartés sont rendus dans `unproven`.
 
+    #2965 : `completed_ts` publie le début de la période ouverte courante,
+    # relu chronologiquement (dernier verdict de chaque acteur, blocage levé
+    # par le `ok` du même acteur) : un `ok` redondant ne redate pas une porte
+    # déjà ouverte, un blocage la referme et sa levée date la réouverture. Sans
+    # blocage ni avis requis, il vaut None (la porte est ouverte au gel). C'est
+    # l'instant d'admissibilité du train, pas une nouvelle règle pour la file.
+
     Rend `{ok, why, class, required, accepted, blocked, waived, author,
-    author_family, authors, corrections, on_freeze, unproven, vehicle}` ; ne
-    lève jamais.
+    author_family, authors, corrections, on_freeze, unproven, completed_ts,
+    vehicle}` ; ne lève jamais.
     """
     from . import lot_class
     klass = klass or {}
@@ -689,10 +754,13 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                       % (frozen[:12], cls, ", ".join(sorted(
                           str(m.get("actor") or "relecteur sans nom") for m in blocked))))
         return out
-    if waived:
-        out["ok"] = True
-        return out
-    if required == 0:
+    if waived or required == 0:
+        # #2965 : sans avis requis, la porte est ouverte dès le gel ; un
+        # blocage courant la referme jusqu'à sa levée, et c'est alors le `ok`
+        # qui la rouvre qui date l'admissibilité, jamais le gel (B2).
+        out["completed_ts"] = _gate_completed_ts(
+            on_freeze, {}, required=required, waived=waived,
+            distinct_families=distinct_families)
         out["ok"] = True
         return out
     if family_of is None and families is None and db is not None:
@@ -954,6 +1022,16 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 continue                  # la famille d'un auteur ne compte pas
         accepted.append({"actor": actor, "family": family, "id": mark.get("id"),
                          "at_ts": mark.get("at_ts")})
+    # #2965 : la période ouverte courante se lit sur **tous** les avis
+    # retenus, pas seulement sur les `required` premiers choisis pour la
+    # famille : un avis d'une troisième famille peut être celui qui a rouvert
+    # la porte après un blocage, et la troncature ci-dessous l'écarterait. On
+    # calcule donc avant la troncature.
+    out["completed_ts"] = _gate_completed_ts(
+        on_freeze,
+        {str(entry["actor"] or "").strip().casefold(): entry["family"]
+         for entry in accepted},
+        required=required, waived=False, distinct_families=distinct_families)
     if required >= 2 and distinct_families:
         chosen, seen = [], set()
         for entry in accepted:
@@ -1346,7 +1424,7 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
     comme la porte historique. Toute lecture illisible — lecteur partagé,
     cible, gel, `git log`, registre — lève `_ProvenanceError` : la porte
     refuse au lieu d'accepter une liste partielle."""
-    from . import review_authors, review_lot
+    from . import resolutions, review_authors, review_lot
     if not repo:
         raise _ProvenanceError("no repository for the frozen delta")
     try:
@@ -1372,7 +1450,8 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
         if not text:
             continue
         try:
-            url = (plan_git._out(text, "remote", "get-url", "origin") or "").strip()
+            url = resolutions._local_from(  # #3041 : relatif à `text`
+                text, plan_git._out(text, "remote", "get-url", "origin") or "")
         except Exception:  # noqa: BLE001 - remote illisible : pas de source
             url = ""
         if url and url not in sources:
@@ -1754,7 +1833,9 @@ def fetch_fresh(repo: str, names, clone=None,
     from . import resolutions
     names = sorted({n for n in names if n})
     remote = {n: _remote_branch(n) for n in names}
-    url = plan_git._out(repo, "remote", "get-url", "origin")
+    # #3041 : l'URL est rejouée dans le clone ; un chemin relatif se lit
+    # depuis `repo`.
+    url = resolutions._local_from(repo, plan_git._out(repo, "remote", "get-url", "origin") or "")
     if not url:
         return {n: plan_git._commit(repo, "refs/heads/" + remote[n]) for n in names}, repo
     what = "branch%s %s" % ("es" if len(names) > 1 else "", ", ".join(names))

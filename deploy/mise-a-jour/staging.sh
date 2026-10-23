@@ -305,10 +305,25 @@ PY
 }
 
 # --- gestes par hote ------------------------------------------------------
+poste_transitoire() {  # redemarrer|retour
+  # #3039 : le tick tourne dans ameesh-release.service. Le dispatcher poste
+  # refuse ce cgroup (#2950), y compris pour le retour automatique. Seuls ces
+  # gestes quittent le service ; les VM et les controles restent synchrones
+  # dans le staging. Aucun repli direct : un echec doit declencher echec_hote.
+  local unite="poste-maj-staging-$$-$1" env_args=()
+  env_args+=(--setenv=BASCULE_ENV="$BASCULE_ENV")
+  [ -n "${AMEESH_CONFIG:-}" ] && env_args+=(--setenv=AMEESH_CONFIG="$AMEESH_CONFIG")
+  systemd-run --user --collect --wait --pipe --unit "$unite" \
+    --working-directory "$PWD" "${env_args[@]}" "$POSTE_SH" "$@"
+}
 exec_hote() {  # nom action [args…]
   local nom=$1; shift
   case "$(mode_de "$nom")" in
-    poste) "$POSTE_SH" "$@" ;;
+    poste)
+      case "$1" in
+        redemarrer|retour) poste_transitoire "$@" ;;
+        *) "$POSTE_SH" "$@" ;;
+      esac ;;
     agents) env BASCULE_ENV="${FICHIER_HOTE[$nom]}" "$VM_SH" agents "$@" ;;
     serveur) env BASCULE_ENV="${FICHIER_HOTE[$nom]}" "$VM_SH" "$@" ;;
   esac

@@ -44,6 +44,8 @@ AGENT_COLUMNS = """
     extract(epoch from last_turn_at)::float8      as last_turn_ts,
     extract(epoch from last_event_at)::float8     as last_event_ts,
     responsible, team, projects, provider, credential_mode, capabilities, canon_ref, canon,
+    -- L165 (EP1) : relève (`hote`/`election`) et hôtes candidats d'un rôle élu
+    releve, candidats,
     ephemeral, created_by, priority, admitted_hosts, admitted_tags, memory_repository,
     extract(epoch from ephemeral_expires_at)::float8 as ephemeral_expires_ts,
     session_policy, effort, tier, session_work_item,
@@ -110,27 +112,78 @@ def canon_governed_sql(alias: str = "agent_registry") -> str:
         "a": a, "max": LINEAGE_MAX}
 
 
-def canon_claim_predicate_sql(alias: str = "agent_registry", *, probe: bool = False) -> str:
+def _host_expr(alias: str, host: str | None = None) -> str:
+    """Expression SQL de l'hôte qui réclame : la ligne, ou un hôte validé."""
+    if host is None:
+        return "%s.host" % _alias(alias)
+    # NAME_RE interdit déjà les guillemets ; on garde l'échappement explicite.
+    return "'%s'" % check_name(host).replace("'", "''")
+
+
+def _pinned_placement_sql(alias: str) -> str:
+    """Verdict de placement de l'agent épinglé sur l'hôte de SA ligne.
+
+    ADMISSION seule : l'état du canon de l'hôte est jugé séparément par
+    `canon_claim_predicate_sql`, jamais ici (un canon momentanément invalide
+    ne bloque pas une attribution, seule une réclamation)."""
+    a = _alias(alias)
+    return """(coalesce(%(a)s.placement_ok, false)
+       AND %(a)s.placement_profile IS NOT DISTINCT FROM ameesh_placement_profile(
+               %(a)s.host, %(a)s.harness, %(a)s.provider, %(a)s.model,
+               %(a)s.credential_mode))""" % {"a": a}
+
+
+def _election_placement_sql(alias: str, host: str | None = None) -> str:
+    """Verdict de placement de l'agent élu sur l'hôte candidat qui le réclame.
+
+    L'hôte de la ligne n'est que le dernier détenteur (ou l'hôte de la
+    dernière synchronisation) : le verdict qui compte est celui du candidat
+    qui prend le bail, écrit par `canon sync` sur cet hôte dans
+    `agent_candidates` (L165, EP1). Le profil évalué est comparé aux colonnes
+    de la ligne, donc une inscription, un import ou un SQL à la main qui
+    change harnais, fournisseur, modèle ou mode ferme la réclamation.
+    """
+    a = _alias(alias)
+    h = _host_expr(a, host)
+    return """(%(a)s.releve = 'election'
+       AND %(h)s = ANY(%(a)s.candidats)
+       AND %(h)s = ANY(%(a)s.admitted_hosts)
+       AND EXISTS (SELECT 1 FROM agent_candidates c
+                    WHERE c.name = %(a)s.name AND c.host = %(h)s
+                      AND c.canon = coalesce(%(a)s.canon, '')
+                      AND c.placement_ok
+                      AND c.placement_profile IS NOT DISTINCT FROM ameesh_placement_profile(
+                              %(h)s, %(a)s.harness, %(a)s.provider, %(a)s.model,
+                              %(a)s.credential_mode)))""" % {"a": a, "h": h}
+
+
+def canon_claim_predicate_sql(alias: str = "agent_registry", *, probe: bool = False,
+                              host: str | None = None) -> str:
     """Condition SQL de réclamation liée au canon (§4.1), pour un `WHERE`.
 
     Vraie si l'agent de la ligne `alias` (une ligne de `agent_registry`, ou de
     la vue `agent_mesh_overview`) n'est pas gouverné par le canon
-    (`canon_governed_sql`), ou si le dernier état de **son canon** sur **son
-    hôte** (`canon_state`, clé (host, canon) depuis L42/0031 ; colonne `canon`
-    de la ligne, NULL = canon par défaut ; écrit par `ameesh canon sync`) est
-    `ok` **et** que son
-    placement sur cet hôte est admis par la politique de l'hôte
-    (`placement_ok`, colonne déclarative écrite par `canon sync`, recopiée du
-    créateur pour un éphémère ; C4, 0022) **pour le profil qu'il a
-    maintenant** : `placement_profile` (le profil évalué, écrit avec le
-    verdict) égal à `ameesh_placement_profile` de ses colonnes hôte,
-    harnais, fournisseur, modèle et mode d'identifiants. Un canon `invalid`
-    ou `unreadable`, l'absence d'état, un placement refusé, absent de cet
-    hôte ou pas encore évalué (`placement_ok` faux ou NULL), un profil
-    divergé depuis l'évaluation (inscription, import ou SQL à la main)
+    (`canon_governed_sql`), ou si le dernier état de **son canon** sur l'hôte
+    qui le réclame (`canon_state`, clé (host, canon) depuis L42/0031 ; colonne
+    `canon` de la ligne, NULL = canon par défaut ; écrit par
+    `ameesh canon sync`) est `ok` **et** que son placement sur cet hôte est
+    admis par la politique de l'hôte (`placement_ok`, colonne déclarative
+    écrite par `canon sync`, recopiée du créateur pour un éphémère ; C4, 0022)
+    **pour le profil qu'il a maintenant** : `placement_profile` (le profil
+    évalué, écrit avec le verdict) égal à `ameesh_placement_profile` de ses
+    colonnes hôte, harnais, fournisseur, modèle et mode d'identifiants. Un
+    canon `invalid` ou `unreadable`, l'absence d'état, un placement refusé,
+    absent de cet hôte ou pas encore évalué (`placement_ok` faux ou NULL), un
+    profil divergé depuis l'évaluation (inscription, import ou SQL à la main)
     refusent donc toute NOUVELLE réclamation d'un agent du canon (et de ses
     éphémères) jusqu'au prochain `canon sync`, sans rien toucher aux baux,
     sessions ni tours en cours : fail closed.
+
+    `host` (L165, EP1) : l'hôte qui réclame, pour un agent `releve: election`.
+    La condition porte alors sur le verdict de placement de CET hôte candidat
+    (`agent_candidates`) et sur son état de canon, pas sur l'hôte de la ligne.
+    None : l'hôte de la ligne. Un agent `hote` ignore ce paramètre : son
+    verdict reste celui de sa ligne.
 
     Indépendante de la configuration (AMEESH_CANON, AMEESH_REQUIRE_RESPONSIBLE) :
     un agent venu du canon sur un hôte où aucune synchronisation n'a constaté
@@ -144,36 +197,48 @@ def canon_claim_predicate_sql(alias: str = "agent_registry", *, probe: bool = Fa
     fermeture de release au seul agent sonde enrôlé de l'hôte. Les décisions
     d'ordonnancement (`claimable`, `wakeable`, aperçu) gardent le prédicat
     strict d'une fermeture.
+
+    Un agent `releve: election` n'est pas fencé par L232e : le pilote n'a pas
+    de travail local à publier, et le bail (epoch) suffit à fencer l'ancien
+    détenteur (EP1).
     """
     a = _alias(alias)
-    # L42 (0031) : l'état est celui du canon DE L'AGENT sur son hôte (colonne
-    # `canon` ; NULL = canon par défaut, clé '') — un canon invalide ne ferme
-    # que ses propres agents et leurs éphémères (qui portent son canon)
-    open_sql = ("ameesh_agent_claims_open(%(a)s.host, %(a)s.name)" if probe
-                else "ameesh_host_claims_open(%(a)s.host)")
-    sql = """(""" + open_sql + """ AND NOT ameesh_handoff_fenced(%(a)s.name) AND (NOT %(governed)s
-       OR (EXISTS (SELECT 1 FROM canon_state s
-                    WHERE s.host = %(a)s.host AND s.canon = coalesce(%(a)s.canon, '')
-                      AND s.status = 'ok')
-           AND coalesce(%(a)s.placement_ok, false)
-           AND %(a)s.placement_profile IS NOT DISTINCT FROM ameesh_placement_profile(
-                   %(a)s.host, %(a)s.harness, %(a)s.provider, %(a)s.model,
-                   %(a)s.credential_mode))))"""
-    return sql % {"governed": canon_governed_sql(a), "a": a}
+    # L42 (0031) : l'état est celui du canon DE L'AGENT sur l'hôte qui réclame
+    # (colonne `canon` ; NULL = canon par défaut, clé '')
+    h = _host_expr(a, host)
+    open_sql = ("ameesh_agent_claims_open(%s, %s.name)" % (h, a) if probe
+                else "ameesh_host_claims_open(%s)" % h)
+    sql = """(%(open)s
+       AND (%(a)s.releve = 'election' OR NOT ameesh_handoff_fenced(%(a)s.name))
+       AND (NOT %(governed)s
+            OR (EXISTS (SELECT 1 FROM canon_state s
+                         WHERE s.host = %(h)s
+                           AND s.canon = coalesce(%(a)s.canon, '')
+                           AND s.status = 'ok')
+                AND CASE WHEN %(a)s.releve = 'election' THEN %(election)s
+                         ELSE %(pinned)s END)))"""
+    return sql % {"governed": canon_governed_sql(a), "a": a,
+                  "h": _host_expr(a, host), "open": open_sql,
+                  "election": _election_placement_sql(a, host),
+                  "pinned": _pinned_placement_sql(a)}
 
 
-def placement_admitted_sql(alias: str = "agent_registry") -> str:
+def placement_admitted_sql(alias: str = "agent_registry",
+                           *, host: str | None = None) -> str:
     """L46 : l'ADMISSION seule (placement admis pour le profil actuel), sans
     l'état du canon de l'hôte — ce que `registry.wakeable` juge : un canon
     momentanément invalide ne bloque pas une attribution (la réclamation,
-    elle, reste fermée par `canon_claim_predicate_sql`)."""
+    elle, reste fermée par `canon_claim_predicate_sql`).
+
+    `host` (L165, EP1) : l'hôte candidat jugé pour un agent `releve: election`
+    (None : l'hôte de la ligne)."""
     a = _alias(alias)
     return """(NOT %(governed)s
-       OR (coalesce(%(a)s.placement_ok, false)
-           AND %(a)s.placement_profile IS NOT DISTINCT FROM ameesh_placement_profile(
-                   %(a)s.host, %(a)s.harness, %(a)s.provider, %(a)s.model,
-                   %(a)s.credential_mode)))""" % {
-        "governed": canon_governed_sql(a), "a": a}
+       OR (CASE WHEN %(a)s.releve = 'election' THEN %(election)s
+                ELSE %(pinned)s END))""" % {
+        "governed": canon_governed_sql(a), "a": a,
+        "election": _election_placement_sql(a, host),
+        "pinned": _pinned_placement_sql(a)}
 
 
 def write_runner_seen(db, host, owner, names, *, admission_sql=None, admission_params=()):
@@ -395,7 +460,12 @@ class Agents(interface.Agents):
                    (SELECT extract(epoch from s.checked_at)::float8 FROM canon_state s
                      WHERE s.host = o.host
                        AND s.canon = coalesce(o.canon, '')) AS canon_checked_ts,
-                   __CLAIM_OK__ AS canon_claim_ok,
+                   -- L165 (EP1) : la vue est figée à sa création et ne porte
+                   -- pas `releve`/`candidats` ; le prédicat les lit sur la
+                   -- ligne du registre, sous-requête plutôt qu'une jointure
+                   -- pour ne pas qualifier toutes les colonnes de la vue.
+                   (SELECT __CLAIM_OK__ FROM agent_registry r
+                     WHERE r.name = o.name) AS canon_claim_ok,
                    -- #1250 : le harnais de la session VIVANTE (0384), absent de
                    -- la vue dont les colonnes sont figées à sa création ;
                    -- sous-requête pour ne pas qualifier toutes les colonnes.
@@ -410,14 +480,23 @@ class Agents(interface.Agents):
             ) p ON true
             ORDER BY last_seen_ts DESC NULLS LAST
             """.replace("__GOVERNED__", canon_governed_sql("o"))
-               .replace("__CLAIM_OK__", canon_claim_predicate_sql("o"))
+               .replace("__CLAIM_OK__", canon_claim_predicate_sql("r"))
         )
 
     def claimable(self, host, names, *, require_responsible) -> list[dict]:
+        # L165 (EP1) : un agent `releve: election` est visible sur tout hôte
+        # candidat, même si sa ligne est encore sur un autre. Le dossier et
+        # l'hôte rendus sont ceux du candidat qui va réclamer.
         sql = """
-            SELECT %s
+            SELECT %s,
+                   CASE WHEN releve = 'election' THEN
+                     (SELECT c.cwd FROM agent_candidates c
+                       WHERE c.name = agent_registry.name AND c.host = %%s
+                         AND c.canon = coalesce(agent_registry.canon, ''))
+                   ELSE cwd END AS claim_cwd
             FROM agent_registry
-            WHERE host = %%s
+            WHERE ((releve <> 'election' AND host = %%s)
+                   OR (releve = 'election' AND %%s = ANY(candidats)))
               AND status <> 'stopped'
               -- L46 : un agent `externe` (session humaine) n'est jamais mené
               -- par l'exécuteur, même avec une session et du courrier.
@@ -426,17 +505,22 @@ class Agents(interface.Agents):
               AND (NOT ephemeral OR ephemeral_expires_at > clock_timestamp())
               -- #254 : un hôte en pause ne prend aucun bail
               AND NOT EXISTS (SELECT 1 FROM host_holds hh
-                               WHERE hh.host = agent_registry.host
+                               WHERE hh.host = CASE WHEN releve = 'election' THEN %%s
+                                                    ELSE agent_registry.host END
                                  AND hh.until > clock_timestamp())
               AND %s
-        """ % (AGENT_COLUMNS, canon_claim_predicate_sql("agent_registry"))
+        """ % (AGENT_COLUMNS, canon_claim_predicate_sql("agent_registry", host=host))
         if require_responsible:
             sql += " AND coalesce(responsible, '') <> ''"
-        params: list[Any] = [host]
+        params: list[Any] = [host, host, host, host]
         if names:
             sql += " AND name IN (%s)" % name_list(names)
         sql += " ORDER BY last_seen"
-        return self.db.query(sql, tuple(params))
+        rows = self.db.query(sql, tuple(params))
+        for row in rows:
+            row["cwd"] = row.pop("claim_cwd", row.get("cwd"))
+            row["host"] = host
+        return rows
 
     def runner_seen(self, host, owner, names) -> None:
         write_runner_seen(self.db, host, owner, names)
@@ -448,20 +532,22 @@ class Agents(interface.Agents):
             """
             WITH verrou AS (
                 SELECT name, host, mode, status, lease_owner, lease_expires_at,
-                       last_error
+                       last_error, releve, candidats
                   FROM agent_registry WHERE name = %s FOR UPDATE
             )
             UPDATE agent_registry AS r
                SET last_error = %s, updated_at = now()
               FROM verrou
-             WHERE r.name = verrou.name AND verrou.host = %s
+             WHERE r.name = verrou.name
+               AND (verrou.host = %s
+                    OR (verrou.releve = 'election' AND %s = ANY(verrou.candidats)))
                AND verrou.mode = 'execute'
                AND verrou.status IN ('idle', 'queued', 'dead')
                AND (verrou.lease_owner IS NULL OR verrou.lease_expires_at IS NULL
                     OR verrou.lease_expires_at <= clock_timestamp())
                AND verrou.last_error IS DISTINCT FROM %s
             RETURNING r.name
-            """, (name, error, host, error))
+            """, (name, error, host, host, error))
         return bool(rows)
 
     def mark_event_wake(self, name) -> None:
@@ -600,7 +686,8 @@ class Agents(interface.Agents):
 
 class Leases(interface.Leases):
 
-    def claim(self, name, owner, ttl_seconds, *, require_responsible) -> dict | None:
+    def claim(self, name, owner, ttl_seconds, *, require_responsible,
+              host=None) -> dict | None:
         """Prend le bail s'il est libre ou expiré. Renvoie la ligne, sinon None.
 
         Le verrou de ligne est pris **d'abord** (`SELECT ... FOR UPDATE`), puis
@@ -610,7 +697,16 @@ class Leases(interface.Leases):
         FOR UPDATE` sans modifier la ligne (EvalPlanQual ne réévalue pas un
         `WHERE` sans nouvelle version — grille codex3). Mêmes règles que
         `claimable`, dans la même instruction.
+
+        L165 (EP1) : pour un agent `releve: election`, `host` est l'hôte
+        candidat qui réclame. La réclamation déplace la ligne sur cet hôte
+        (dossier et verdict de placement du candidat, lus dans
+        `agent_candidates`) et lève la clôture L232e : le pilote n'a pas de
+        travail local à publier, le bail et son epoch suffisent. Un agent
+        `hote` ignore `host` et ne peut être réclamé que sur l'hôte de sa
+        ligne.
         """
+        h = _host_expr("r", host)
         sql = """
             WITH verrou AS (
                 SELECT name FROM agent_registry WHERE name = %s FOR UPDATE
@@ -619,6 +715,38 @@ class Leases(interface.Leases):
                SET lease_owner      = %s,
                    lease_expires_at = clock_timestamp() + make_interval(secs => %s),
                    lease_epoch      = lease_epoch + 1,
+                   -- L165 (EP1) : le détenteur élu est l'hôte qui réclame ;
+                   -- son dossier et son verdict de placement sont ceux de ce
+                   -- candidat, pour que le profil reste celui de l'hôte.
+                   host             = CASE WHEN r.releve = 'election' THEN __H__
+                                            ELSE r.host END,
+                   cwd              = CASE WHEN r.releve = 'election' THEN
+                         (SELECT c.cwd FROM agent_candidates c
+                           WHERE c.name = r.name AND c.host = __H__
+                             AND c.canon = coalesce(r.canon, ''))
+                       ELSE r.cwd END,
+                   placement_ok     = CASE WHEN r.releve = 'election' THEN
+                         (SELECT c.placement_ok FROM agent_candidates c
+                           WHERE c.name = r.name AND c.host = __H__
+                             AND c.canon = coalesce(r.canon, ''))
+                       ELSE r.placement_ok END,
+                   placement_diagnostic = CASE WHEN r.releve = 'election' THEN
+                         (SELECT c.placement_diagnostic FROM agent_candidates c
+                           WHERE c.name = r.name AND c.host = __H__
+                             AND c.canon = coalesce(r.canon, ''))
+                       ELSE r.placement_diagnostic END,
+                   placement_ref    = CASE WHEN r.releve = 'election' THEN
+                         (SELECT c.placement_ref FROM agent_candidates c
+                           WHERE c.name = r.name AND c.host = __H__
+                             AND c.canon = coalesce(r.canon, ''))
+                       ELSE r.placement_ref END,
+                   placement_profile = CASE WHEN r.releve = 'election' THEN
+                         (SELECT c.placement_profile FROM agent_candidates c
+                           WHERE c.name = r.name AND c.host = __H__
+                             AND c.canon = coalesce(r.canon, ''))
+                       ELSE r.placement_profile END,
+                   handoff_fenced   = CASE WHEN r.releve = 'election' THEN false
+                                           ELSE r.handoff_fenced END,
                    -- R5 : si le bail n'était plus vivant (autre main, ou même
                    -- exécuteur relancé avec le même identifiant), la consigne
                    -- inachevée repart en attente. Si une consigne était déjà en
@@ -648,6 +776,7 @@ class Leases(interface.Leases):
              WHERE r.name = verrou.name
                -- L46 : même règle que `claimable` — jamais un agent `externe`.
                AND r.mode = 'execute'
+               AND (r.releve = 'election' OR r.host = __H__)
                AND (r.lease_owner IS NULL OR r.lease_owner = %s
                     OR r.lease_expires_at < clock_timestamp())
                AND (NOT r.ephemeral OR r.ephemeral_expires_at > clock_timestamp())
@@ -655,19 +784,21 @@ class Leases(interface.Leases):
                -- encore vivant, se renouvelle)
                AND ((r.lease_owner = %s AND r.lease_expires_at >= clock_timestamp())
                     OR NOT EXISTS (SELECT 1 FROM host_holds hh
-                                    WHERE hh.host = r.host
+                                    WHERE hh.host = CASE WHEN r.releve = 'election'
+                                                         THEN __H__ ELSE r.host END
                                       AND hh.until > clock_timestamp()))
                __RESPONSABLE__
-               AND NOT r.handoff_fenced
+               AND (r.releve = 'election' OR NOT r.handoff_fenced)
                AND __CANON__
-            RETURNING r.name, r.lease_owner, r.lease_epoch,
+            RETURNING r.name, r.lease_owner, r.lease_epoch, r.host, r.cwd,
                       extract(epoch from r.lease_expires_at)::float8 as lease_expires_ts
         """
+        sql = sql.replace("__H__", h)
         sql = sql.replace("__RESPONSABLE__",
                           "AND coalesce(r.responsible, '') <> ''" if require_responsible else "")
         # L232b : réclamation d'un agent nommé (pas de tour du contrôleur) —
         # seul l'agent sonde de la fermeture de release rouvre la condition.
-        sql = sql.replace("__CANON__", canon_claim_predicate_sql("r", probe=True))
+        sql = sql.replace("__CANON__", canon_claim_predicate_sql("r", probe=True, host=host))
         rows = self.db.query(sql, (name, owner, ttl_seconds, owner, owner, owner, owner))
         return rows[0] if rows else None
 
@@ -712,7 +843,7 @@ class Leases(interface.Leases):
                                     WHERE hh.host = r.host
                                       AND hh.until > clock_timestamp()))
                __RESPONSABLE__
-               AND NOT r.handoff_fenced
+               AND (r.releve = 'election' OR NOT r.handoff_fenced)
                AND __CANON__
             RETURNING r.name, r.lease_owner, r.lease_epoch,
                       extract(epoch from r.lease_expires_at)::float8 as lease_expires_ts,
@@ -1108,15 +1239,17 @@ class PendingSpend(interface.PendingSpend):
     #: a été écrite par une connexion dont `extra_float_digits` pouvait être
     #: réduit : à -5, PostgreSQL n'imprime que 10 chiffres significatifs, soit
     #: la seconde entière pour une époque actuelle (~1,8e9 s) — un arrondi
-    #: pouvant atteindre 0,5 s, pas 123 ms. On ne compare donc pas à une
-    #: fenêtre : l'époque de la clé doit être EXACTEMENT l'un des arrondis que
-    #: l'ancienne connexion a pu produire (0 à 6 décimales, les deux voisins
-    #: en cas d'égalité car PostgreSQL arrondit au pair). Un tour étranger
-    #: à un autre instant n'en fait pas partie, même à 0,2 s ; une clé ISO
-    #: (repli exact) est lue comme son époque. La ligne ou la réservation doit
-    #: aussi suivre le marqueur : au même arrondi d'une seconde, celle d'un
-    #: tour antérieur reste étrangère.
+    #: pouvant atteindre 0,5 s, pas 123 ms. À -6, 9 chiffres significatifs
+    #: arrondissent aux dizaines de secondes ; à -7, aux centaines. On couvre
+    #: donc -2 à 6 décimales : l'époque de la clé doit être EXACTEMENT l'un
+    #: des arrondis que l'ancienne connexion a pu produire (les deux voisins
+    #: en cas d'égalité car PostgreSQL arrondit au pair), jamais une fenêtre
+    #: de proximité. Un tour étranger à un autre instant n'en fait pas partie,
+    #: même à 0,2 s ; une clé ISO (repli exact) est lue comme son époque. La
+    #: ligne ou la réservation doit aussi suivre le marqueur : au même
+    #: arrondi, celle d'un tour antérieur reste étrangère.
     _HISTORICAL_ROUNDINGS = 6
+    _HISTORICAL_FLOOR = -2
 
     def _get_sql(self) -> str:
         """`get` en UNE instruction : marqueur et clé durable du MÊME état.
@@ -1126,15 +1259,17 @@ class PendingSpend(interface.PendingSpend):
         sinon, pour une ligne d'avant 0423, l'époque portée par sa clé, qui
         doit être un arrondi historique exact de l'instant du marqueur. Une
         ligne ou une réservation antérieure au marqueur est étrangère, même
-        quand son arrondi tombe dans la même seconde. L'index de début seul ne
-        prouve rien : il est réutilisé après une rotation du flux, donc une
+        quand son arrondi tombe dans le même intervalle. L'index de début seul
+        ne prouve rien : il est réutilisé après une rotation du flux, donc une
         réservation (ou une ligne) au même index mais à un autre instant est
         étrangère. Elle n'est jamais retenue ; une réservation étrangère sans
         candidat, une réservation étrangère encore ouverte, ou une ligne
         étrangère au repli rendent la clé indémontrable (`ledger_ambiguous`), et
         l'appelant suspend au lieu de deviner. Un ancien worker peut écrire sa
         ligne APRÈS le marqueur de son remplaçant (#1469) : la première ligne
-        après `created_at` n'est pas forcément celle du marqueur.
+        après `created_at` n'est pas forcément celle du marqueur. Le repli lit
+        les lignes de l'agent par son index (#2920) ; il est transitoire, le
+        temps d'effacer les marqueurs d'avant 0471.
 
         La colonne `spend_key` n'est crue que si elle EST l'identité exacte du
         marqueur (`agent:index:created_at`, le format de `put`, #2905). Après un
@@ -1154,6 +1289,7 @@ WITH marqueur_brut AS (
       FROM spend_pending WHERE agent = %s
 ), marqueur AS (
     SELECT m.*,
+           (m.agent || ':' || m.start_index || ':') AS prefix,
            -- #2905 : la clé du marqueur n'est crue que si elle EST l'identité
            -- de ce marqueur (`agent:index:created_at`, le format de `put`).
            -- Après un retour arrière (§14), l'ancien `put` réécrit l'identité
@@ -1164,7 +1300,8 @@ WITH marqueur_brut AS (
                      || m.created_at
                 THEN m.spend_key END AS cle_exacte,
            ARRAY(SELECT v
-                   FROM generate_series(0, {self._HISTORICAL_ROUNDINGS}) AS g(d)
+                   FROM generate_series({self._HISTORICAL_FLOOR},
+                                        {self._HISTORICAL_ROUNDINGS}) AS g(d)
                    CROSS JOIN LATERAL (
                        SELECT round(m.epoch, d) AS v
                        UNION
@@ -1180,14 +1317,11 @@ WITH marqueur_brut AS (
     SELECT tc.spend_key, tc.turn_id, tc.started_at, tc.recorded_at,
            m.turn_id AS marqueur_turn_id,
            m.epoques AS epoques,
-           (left(tc.spend_key,
-                 length(m.agent || ':' || m.start_index || ':'))
-                = m.agent || ':' || m.start_index || ':') AS meme_index,
+           (left(tc.spend_key, length(m.prefix)) = m.prefix) AS meme_index,
            -- une ligne du tour ne peut pas précéder son marqueur : celle d'un
            -- index réutilisé, même au même arrondi, est étrangère.
            (tc.recorded_at >= m.created_at::timestamptz) AS posterieure,
-           substr(tc.spend_key,
-                  length(m.agent || ':' || m.start_index || ':') + 1) AS suffixe
+           substr(tc.spend_key, length(m.prefix) + 1) AS suffixe
       FROM turn_costs tc
       JOIN marqueur m ON tc.agent = m.agent
      WHERE m.cle_exacte IS NULL
@@ -1237,14 +1371,11 @@ WITH marqueur_brut AS (
        AND posterieure AND debut_historique <> epoque_historique
 ), reservations_lues AS (
     SELECT ar.spend_key, ar.state, ar.created_at AS pose,
-           (left(ar.spend_key,
-                 length(m.agent || ':' || m.start_index || ':'))
-                = m.agent || ':' || m.start_index || ':') AS meme_index,
+           (left(ar.spend_key, length(m.prefix)) = m.prefix) AS meme_index,
            -- une réservation du tour est prise APRÈS son marqueur : celle
            -- d'un tour antérieur, même au même arrondi, est étrangère.
            (ar.created_at >= m.created_at::timestamptz) AS posterieure,
-           substr(ar.spend_key,
-                  length(m.agent || ':' || m.start_index || ':') + 1) AS suffixe,
+           substr(ar.spend_key, length(m.prefix) + 1) AS suffixe,
            m.epoques AS epoques
       FROM account_reservations ar
       JOIN marqueur m ON ar.agent = m.agent

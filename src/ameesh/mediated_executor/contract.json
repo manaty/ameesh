@@ -1,6 +1,6 @@
 {
  "schema": "ameesh-exec-contract/1",
- "version": "1.7.0",
+ "version": "1.8.0",
  "prefix": "/api/exec/v1",
  "description": "Contrat de l'API d'exécuteur médiée (L107) : la liste FERMÉE des opérations de storage.interface qu'un exécuteur d'appareil peut appeler, leur portée et leur fencing. Référence : docs/EXECUTEUR-MEDIEE.md.",
  "scopes": {
@@ -686,7 +686,9 @@
    ],
    "fence": false,
    "param_agent": "name",
-   "forced": {},
+   "forced": {
+    "host": "executor_host"
+   },
    "params": [
     {
      "name": "name",
@@ -719,6 +721,18 @@
       "type": "boolean"
      },
      "required": true
+    },
+    {
+     "name": "host",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "required": false,
+     "default": null
     }
    ],
    "result": {
@@ -4557,9 +4571,12 @@
     "put"
    ],
    "canon": [
+    "candidate_names",
     "claim_commit",
+    "clear_candidate",
     "clear_pending_stop",
     "clear_responsible",
+    "close_candidates",
     "close_others",
     "flag_default",
     "host_rows",
@@ -4574,10 +4591,12 @@
     "relocate",
     "revive",
     "set_default_id",
+    "set_election",
     "set_placement",
     "state",
     "states",
     "stop_removed",
+    "write_candidate",
     "write_declared"
    ],
    "catalog": [
@@ -4607,6 +4626,7 @@
     "observe_runners",
     "open_run",
     "prune_guard_runs",
+    "prune_queue",
     "queued_oldest",
     "reopen_run",
     "run",

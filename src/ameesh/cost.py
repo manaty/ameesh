@@ -1074,11 +1074,14 @@ class CostBook:
         """Le dernier relevé connu de chaque jauge d'un compte (#1132)."""
         return storage.of(self.db).operations.gauge_latest(harness=harness, account=account)
 
-    def codex_gauges(self, sessions: str | None = None) -> list:
+    def codex_gauges(self, sessions: str | None = None, *, plan: str | None = None) -> list:
         """Les fenêtres `rate_limits` des journaux récents du compte.
 
         #2839 : une lecture partielle ne masque aucune fenêtre ; des relevés
         vivants contradictoires refusent le compte au lieu de choisir au mtime.
+        #3034 : `plan` est le forfait du compte vivant (`auth.json`) ; quand il
+        est connu et l'identité unique, les relevés d'un autre forfait sont
+        ignorés au lieu de rendre le compte ambigu.
 
         Lecture **JSON structurée**, pas une expression régulière : l'ordre des clés
         n'est pas garanti (`plan_type` peut précéder `primary`), `secondary` peut
@@ -1100,7 +1103,7 @@ class CostBook:
                 truncated = truncated or sample.truncated
             except OSError:
                 continue
-        return reconcile(readings, now, truncated=truncated)
+        return reconcile(readings, now, truncated=truncated, plan=plan)
 
     def gauges(self, harness: str | None = None, *, record: bool = True) -> Gauges:
         """Les jauges de forfait, par **source déclarée** dans les descripteurs (L16).

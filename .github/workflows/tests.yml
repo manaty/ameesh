@@ -824,36 +824,104 @@ jobs:
             /dev/shm/ameesh-autre-fs-*|*/ameesh-autre-fs) rm -rf -- "$TMPDIR" ;;
           esac
 
-  # L63 : la couche plateforme (ameesh.platform) et son lint, sans base, sous
-  # macOS avec psutil. Sous Linux, les parts psycopg passent par psutil et les
-  # parts psql (sans psutil) par le repli /proc.
+  # L63 : la couche plateforme (ameesh.platform) et son lint, sous macOS avec
+  # psutil. Sous Linux, les parts psycopg passent par psutil et les parts psql
+  # (sans psutil) par le repli /proc.
+  # L68 : ce job exécute désormais la **suite** sous macOS, pas seulement la
+  # couche plateforme. macOS n'a pas de conteneurs de service : PostgreSQL 17
+  # est installé et démarré dans une étape (le poste, lui, reste en base
+  # distante — la règle de l'answer #9414 ne vaut pas pour la CI). La sélection
+  # est celle du plan, la même que les parts psycopg : toute la suite sur
+  # main/release/**/paquet (plan complet), les seuls impactés et le contrat
+  # sur une PR de lot (#1211). Les outils GNU et bash 5 de Homebrew donnent à
+  # la suite le même socle shell que sur les hôtes Linux qu'elle teste.
   # #987 : image x64 explicite (`macos-26-intel`), pas `macos-latest` (macOS 26
   # arm64) — le 13/10/2026, la capacité arm64 a annulé ce job après ~15 min
   # sans runner (« not acquired by Runner of type hosted »), ce qui rougissait
   # le check requis sans défaut de code. L'image est un runner standard
-  # (gratuit), pas un runner « large » payant (canon §3) ; le job ne teste que
-  # psutil et la couche plateforme, indifférents à l'architecture. Défense en
+  # (gratuit), pas un runner « large » payant (canon §3). Défense en
   # profondeur : .github/workflows/relance-hosted.yml rejoue les jobs annulés
   # faute de runner.
+  # L68 — DÉCISION DE CONCEPTION (revue #393, 23/10) : ce job exécute la
+  # suite du plan sous macOS, mais n'est pas encore exigé par `tests`. La
+  # suite complète n'a jamais tourné sous macOS et il n'y a pas de CI de lot
+  # entre deux coupures (§11 bis) : l'exiger ferait rougir le premier paquet
+  # pour tous les lots. Il reste visible et ses échecs sont corrigés ; il
+  # entrera dans les `needs` de `tests` quand un run du plan complet sera
+  # vert sous macOS (preuve : URL du run dans la note du lot #393).
   platform-macos:
     name: plateforme macOS
     needs: plan
     if: needs.plan.outputs.code == 'true'
     runs-on: macos-26-intel
-    timeout-minutes: 10
+    # La suite complète compte 8 parts psycopg (#1476), exécutées ici l'une
+    # après l'autre sur un runner Intel 3 vCPU : ~90 min de travail mesuré
+    # sous Linux, jamais mesuré sous macOS. Plafond provisoire de 240 min
+    # (assez large pour ne pas annuler le premier run, borné sous le maximum
+    # GitHub de 6 h) : il sera resserré après la première mesure réelle.
+    timeout-minutes: 240
     env:
-      AMEESH_REQUIRE_DB: "0"
+      AMEESH_REQUIRE_DB: "1"
     steps:
       - uses: actions/checkout@v4
+      - *git
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: psutil
-        run: python -m pip install 'psutil>=5.9'
-      - name: couche plateforme, lint et notification de bureau (L66)
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      # macOS n'a pas de conteneurs : PostgreSQL est installé puis démarré
+      # dans l'étape suivante. bash 5 et les outils GNU évitent de tester
+      # bash 3.2 et les variantes BSD des scripts de déploiement, qui visent
+      # des hôtes Linux ; ce qui est testé ici est le code ameesh sous macOS.
+      - name: PostgreSQL et outils GNU (Homebrew)
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          set -euo pipefail
+          # #3042 : `find -printf` (deploy/mise-a-jour/poste.sh) est GNU ;
+          # le banc l'exécute aussi via son faux ssh, sous macOS comme sous
+          # Linux. findutils fournit ce `find` dans libexec/gnubin.
+          brew install postgresql@17 bash coreutils gnu-sed findutils
+          {
+            echo "$(brew --prefix postgresql@17)/bin"
+            echo "$(brew --prefix bash)/bin"
+            echo "$(brew --prefix coreutils)/libexec/gnubin"
+            echo "$(brew --prefix gnu-sed)/libexec/gnubin"
+            echo "$(brew --prefix findutils)/libexec/gnubin"
+          } >> "$GITHUB_PATH"
+      - name: base jetable (PostgreSQL dans une étape, pas un service)
+        run: |
+          set -euo pipefail
+          export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
+          PGDATA="$RUNNER_TEMP/pgdata"
+          rm -rf -- "$PGDATA"
+          initdb -D "$PGDATA" -U ameesh --auth=trust --encoding=UTF8 --locale=en_US.UTF-8 --no-sync
+          pg_ctl -D "$PGDATA" -l "$RUNNER_TEMP/postgres.log" -o \
+            "-p 5432 -k $RUNNER_TEMP -c listen_addresses=127.0.0.1 -c fsync=off -c synchronous_commit=off -c full_page_writes=off" \
+            start
+          tries=0
+          until pg_isready -h 127.0.0.1 -p 5432 -U ameesh >/dev/null 2>&1; do
+            tries=$((tries + 1))
+            if [ "$tries" -ge 30 ]; then
+              cat "$RUNNER_TEMP/postgres.log" >&2 || true
+              echo "::error::PostgreSQL n'a pas démarré sous 30 s" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          createdb -h 127.0.0.1 -p 5432 -U ameesh ameesh
+          psql -h 127.0.0.1 -p 5432 -U ameesh -d ameesh -v ON_ERROR_STOP=1 -c 'select version()'
+      - name: dépendances Python (psutil, psycopg, chiffrement, PyYAML)
+        run: >-
+          python -m pip install 'psutil>=5.9' 'psycopg[binary]>=3.1'
+          'cryptography>=41' 'pyyaml>=6' 'coverage>=7.10'
+      - name: couche plateforme, lint, garanties et notification de bureau (L63, L66, L68)
         run: >-
           python -m unittest -v tests.test_l63_platform.PlatformTest
-          tests.test_l63_platform.LintTest tests.test_l66_desktop.PlatformNotifyTest
+          tests.test_l63_platform.LintTest tests.test_l63_platform.GuaranteeTest
+          tests.test_l66_desktop.PlatformNotifyTest
       - name: osascript réel sur le script produit (L66)
         run: |
           set -euo pipefail
@@ -867,6 +935,50 @@ jobs:
             echo "osascript: le script AppleScript produit ne compile pas" >&2
             exit 1
           fi
+      # L68 : la sélection vient du plan, comme pour les parts Linux ; son
+      # empreinte est vérifiée (canal artefacts, #1256 B4) avant de l'exécuter.
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: ${{ runner.temp }}
+      - name: le plan téléchargé est celui du plan (empreinte, #1256 B4)
+        run: echo "${{ needs.plan.outputs.plan_sha256 }}  $RUNNER_TEMP/plan.json" | sha256sum -c -
+      - name: suite du plan (L68, pilote psycopg)
+        # #3042 : le job macOS n'est pas requis (décision de conception #393)
+        # et la porte de fusion ameesh exige un run vert ; la suite macOS reste
+        # visible et journalisée, tolérée jusqu'au correctif de portabilité
+        # #3042. #3026 retirera cette tolérance en rendant le job requis après
+        # un run complet vert.
+        continue-on-error: true
+        env:
+          AMEESH_DRIVER: psycopg
+          # socket Unix court : macOS place TMPDIR sous /var/folders, au-delà
+          # de la limite AF_UNIX pour les tests qui ouvrent un socket.
+          TMPDIR: /tmp/ameesh-ci
+        run: |
+          set -euo pipefail
+          mkdir -p "$TMPDIR"
+          parts="${{ needs.plan.outputs.psycopg_parts }}"
+          case "$parts" in
+            ''|0)
+              echo "::error::le plan ne donne aucune part psycopg alors que du code a changé" >&2
+              exit 1 ;;
+          esac
+          # N1 de la revue #393 : toutes les parts tournent, même après un
+          # échec ; le job échoue à la fin avec le code accumulé. Sous `set -e`
+          # une première part rouge masquerait les suivantes (une CI de paquet
+          # ne verrait qu'un défaut à la fois).
+          rc=0
+          part=1
+          while [ "$part" -le "$parts" ]; do
+            python3 scripts/test-parts.py run --plan "$RUNNER_TEMP/plan.json" \
+              --part "$part" --driver psycopg || rc=1
+            part=$((part + 1))
+          done
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::une ou plusieurs parts psycopg ont échoué (voir les tests ci-dessus)" >&2
+          fi
+          exit "$rc"
 
   # L161a : PR de documentation seule, ses lecteurs déclarés seulement, sans base
   doc-readers:
@@ -976,7 +1088,7 @@ jobs:
     # `always()` (une exécution annulée le conclut en rouge) ; l'attente en file
     # de cet agrégat après annulation est la saturation des runners (lot #828).
     if: always()
-    needs: [plan, version, psycopg, psql, platform-macos, doc-readers, fs-class]
+    needs: [plan, version, psycopg, psql, doc-readers, fs-class]
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
@@ -994,7 +1106,8 @@ jobs:
           echo "doc     : ${{ needs.doc-readers.result }}"
           echo "psycopg : ${{ needs.psycopg.result }} (parts ${{ needs.plan.outputs.psycopg }})"
           echo "psql    : ${{ needs.psql.result }} (parts ${{ needs.plan.outputs.psql }})"
-          echo "macOS   : ${{ needs.platform-macos.result }}"
+          # L68 : platform-macos n'est pas encore requis (voir le job) ;
+          # il n'est pas dans les `needs`, donc rien à vérifier ici.
           echo "autre FS: ${{ needs.fs-class.result }}"
           echo "version : ${{ needs.version.result }}"
           # un plan refusé (étiquette étrangère, SHA qui ne nomme pas la tête,
@@ -1027,7 +1140,6 @@ jobs:
           # vides) doit rougir le check requis, jamais conclure SUCCESS.
           test "${{ needs.psycopg.result }}" = success
           test "${{ needs.psql.result }}" = success || { test '${{ needs.plan.outputs.psql }}' = '[]' && test "${{ needs.psql.result }}" = skipped; } || exit 1
-          test "${{ needs.platform-macos.result }}" = success
           # #748 : la part sur l'autre système de fichiers n'existe que pour une
           # release (ou à la main) ; quand elle a tourné, elle compte
           test "${{ needs.fs-class.result }}" = success || test "${{ needs.fs-class.result }}" = skipped

@@ -1331,6 +1331,13 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             print("agent-mail: %s is driven by the runner (live lease of %s) — "
                   "mail left in place" % (name, holder), file=sys.stderr)
             return 0
+    # L480 : préfixe littéral pour ne pas importer `chat` à chaque hook non-chat
+    if name.startswith("chat-") and event in ("SessionStart", "UserPromptSubmit",
+                                              "PostToolUse", "Stop"):
+        # L480 : l'état du harnais pour la garde d'écriture de la veille du
+        # chat. `Stop` = prompt rendu ; les autres = un tour est en cours.
+        from . import chat as chat_mod
+        chat_mod.write_phase(cfg, name, chat_mod.hook_phase(event))
     session_id = None if binding.bound_to_lease else data.get("session_id")
     try:
         inscription = [tool, data.get("cwd"), session_id,
@@ -1433,6 +1440,11 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                     return 0
                 # Écrire d'abord : si le harnais a fermé son entrée, on ne
                 # consomme pas les messages pour autant.
+                if name.startswith("chat-"):
+                    # L480 : le Stop bloque pour un message, un tour repart :
+                    # le prompt n'est plus rendu, la veille ne doit pas écrire
+                    from . import chat as chat_mod
+                    chat_mod.write_phase(cfg, name, chat_mod.PHASE_BUSY)
                 if not _emit({"decision": "block",
                               "reason": render(msgs, verdicts_for(bk, msgs), envelopes) + avis}):
                     return 0

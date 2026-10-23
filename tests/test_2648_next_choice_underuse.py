@@ -39,7 +39,7 @@ class _Book:
     def __init__(self, gauges):
         self._gauges = list(gauges)
 
-    def codex_gauges(self, sessions=None):
+    def codex_gauges(self, sessions=None, *, plan=None):
         return cost.Gauges(self._gauges)
 
     def record_gauges(self, gauges, account=None):

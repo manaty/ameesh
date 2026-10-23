@@ -1011,7 +1011,11 @@ class NotifyLivreTest(_Base):
             self.cfg, notify.parse_config(raw), None, log=self.logs.append,
             clock=lambda: self.now,
             sender=notify.Sender(env={
+                # #3042 : le canal desktop suit l'OS ; le faux binaire doit
+                # couvrir les deux backends du banc (Linux notify-send, macOS
+                # osascript), qui journalisent tous deux argv dans `desk`.
                 "AMEESH_NOTIFY_SEND_BIN": FAKE_NOTIFY_SEND,
+                "AMEESH_OSASCRIPT_BIN": FAKE_NOTIFY_SEND,
                 "AMEESH_FAKE_NOTIFY_LOG": self.desk,
                 "PATH": os.environ.get("PATH", "")}))
 

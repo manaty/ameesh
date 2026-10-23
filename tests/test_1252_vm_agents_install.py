@@ -224,8 +224,14 @@ if info.is_dir():
 # (journalisé) et `ameesh` reste le stub du registre — avec les shebangs du venv
 # versionné, pour que la bascule n'assèche aucune commande. Toute autre
 # invocation va au vrai python (c'est lui qui exécute le helper).
+#
+# #3042 : `ameesh` reçoit le préambule /bin/sh que pip écrit quand le shebang
+# direct ne tient pas dans 127 octets (#2156). Un shebang imbriqué
+# (`#!<venv>/bin/python`, lui-même un script) passe sous Linux mais macOS rend
+# `[Errno 8] Exec format error` : le banc doit exercer le préambule réellement
+# produit par pip, pas une forme que le noyau Linux tolère seul.
 PYTHON3 = r'''#!@@SHEBANG@@
-import os, sys
+import os, shlex, sys
 from pathlib import Path
 argv = sys.argv[1:]
 if argv[:2] == ['-m', 'venv'] and len(argv) >= 3:
@@ -247,7 +253,13 @@ if argv[:2] == ['-m', 'venv'] and len(argv) >= 3:
     pip.write_text(@@PIP@@)
     pip.chmod(0o755)
     ameesh = dest / 'bin/ameesh'
-    ameesh.write_text(@@AMEESH@@.replace('#!/usr/bin/env python3', '#!%s' % python, 1))
+    # Préambule pip (#2156) : sh exécute CE venv/bin/python ; le noyau ne voit
+    # qu'un shebang (/bin/sh), jamais un interpréteur qui serait lui-même un
+    # script. La troisième ligne reste un littéral Python valide.
+    tq = "'" * 3
+    preambule = ("#!/bin/sh\n" + tq + "exec' %s \"$0\" \"$@\"\n' " + tq + "\n"
+                 ) % shlex.quote(str(python))
+    ameesh.write_text(preambule + @@AMEESH@@.removeprefix('#!/usr/bin/env python3\n'))
     ameesh.chmod(0o755)
     sys.exit(0)
 os.execv(@@PY@@, [@@PY@@] + argv)
@@ -464,6 +476,15 @@ class VmAgentsInstallTest(VmAgentsHarness):
         self.assertFalse((self.parts / 'installation-en-cours').exists())
         self.assertIn('installé depuis src-', p.stdout)
         self.assertIn('redemarrer', p.stdout)
+        # #3042 : le venv versionné porte le préambule /bin/sh de pip, pas un
+        # shebang imbriqué que seul Linux accepterait.
+        courant = self.parts / 'venv-courant'
+        cible = os.readlink(courant)
+        vivant = Path(cible) if cible.startswith('/') else self.parts / cible
+        lignes = (vivant / 'bin/ameesh').read_text().splitlines()
+        self.assertEqual(lignes[0], '#!/bin/sh')
+        self.assertTrue(lignes[1].startswith("'''exec' "), lignes[1])
+        self.assertEqual(lignes[2], "' '''")
 
     def test_install_does_not_restart_the_runners(self):
         p = self.run_vm('installer', self.target)

@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -60,6 +61,13 @@ if [ "$(basename "$0")" = vm.sh ]; then
   fi
 fi
 action=${1:-}
+if [ "$host" = pc-smichea ]; then
+  case "$action" in
+    redemarrer|retour)
+      . "$state/garde.sh"
+      verifier_hors_agent || exit 1 ;;
+  esac
+fi
 printf 'call host=%s action=%s args=%s\n' "$host" "$action" "$*" >> "$state/calls.log"
 if grep -qx "ko=$host:$action" "$state/scenario" 2>/dev/null; then
   grep -vx "ko=$host:$action" "$state/scenario" > "$state/scenario.tmp" || true
@@ -116,6 +124,49 @@ printf 'ssh %s\n' "$*" >> "${FAKE_STATE:?}/calls.log"
 exit 255
 '''
 
+SYSTEMD_RUN = r'''
+import json, os, subprocess, sys
+from pathlib import Path
+args = iter(sys.argv[1:])
+env = dict(os.environ)
+# Le gestionnaire ne transmet pas l'environnement de l'appelant.
+for name in ('BASCULE_ENV', 'AMEESH_CONFIG'):
+    env.pop(name, None)
+unit = cwd = None
+flags = []
+for arg in args:
+    if arg in ('--user', '--collect', '--wait', '--pipe'):
+        flags.append(arg)
+    elif arg == '--unit':
+        unit = next(args)
+    elif arg == '--working-directory':
+        cwd = next(args)
+    elif arg.startswith('--setenv='):
+        name, value = arg.removeprefix('--setenv=').split('=', 1)
+        env[name] = value
+    else:
+        command = [arg, *args]
+        break
+assert set(flags) == {'--user', '--collect', '--wait', '--pipe'}
+assert unit.startswith('poste-maj-') and cwd
+env['FAKE_CGROUP'] = '0::/user.slice/app.slice/' + unit + '.service'
+state = Path(env['FAKE_STATE'])
+with (state / 'units.jsonl').open('a') as log:
+    log.write(json.dumps(dict(unit=unit, cwd=cwd, command=command,
+                             bascule=env.get('BASCULE_ENV'),
+                             config=env.get('AMEESH_CONFIG'))) + '\n')
+if ('unit-ko=' + command[-1]) in (state / 'scenario').read_text().splitlines():
+    sys.exit(23)
+sys.exit(subprocess.run(command, env=env, cwd=cwd).returncode)
+'''
+
+CAT = r'''#!/bin/sh
+case "$1" in
+  /proc/*/cgroup) printf '%s\n' "${FAKE_CGROUP:-0::/user.slice/session.scope}" ;;
+  *) exec /usr/bin/cat "$@" ;;
+esac
+'''
+
 
 class StagingTest(unittest.TestCase):
     maxDiff = None
@@ -127,6 +178,10 @@ class StagingTest(unittest.TestCase):
         self.state = self.root / 'state'; self.state.mkdir()
         (self.state / 'calls.log').touch()
         (self.state / 'scenario').write_text('')
+        # La vraie garde #2950, sans lancer les gestes du dispatcher poste.
+        poste = (DEPLOY / 'poste.sh').read_text()
+        garde = poste.split('verifier_hors_agent() {', 1)[1].split('\nredemarrer() {', 1)[0]
+        (self.state / 'garde.sh').write_text('verifier_hors_agent() {' + garde)
         self.home = self.root / 'home'; self.home.mkdir()
         self.repo = self.root / 'repo'
         self.script_dir = self.repo / 'deploy/mise-a-jour'
@@ -138,9 +193,11 @@ class StagingTest(unittest.TestCase):
             path.write_text(source)
             path.chmod(0o755)
         self.bin = self.root / 'bin'; self.bin.mkdir()
-        for name in ('ssh',):
+        (self.bin / 'python3').symlink_to(sys.executable)
+        for name, source in (('ssh', SSH), ('cat', CAT),
+                             ('systemd-run', '#!' + sys.executable + '\n' + SYSTEMD_RUN)):
             path = self.bin / name
-            path.write_text(SSH)
+            path.write_text(source)
             path.chmod(0o755)
         venv = self.home / '.local/share/ameesh/venv/bin'; venv.mkdir(parents=True)
         for name, source in (('python', VENV_PYTHON), ('ameesh', VENV_AMEESH)):
@@ -333,6 +390,55 @@ class StagingTest(unittest.TestCase):
                                 and t['verdict'] == 'ok' for t in traces), traces)
         self.assertEqual((self.home / '.local/state/ameesh/mise-a-jour').stat().st_mode & 0o777, 0o700)
         self.assertEqual(list(self.script_dir.glob('staging-*.env')), [])
+
+    def units(self):
+        return [json.loads(line) for line in
+                (self.state / 'units.jsonl').read_text().splitlines()]
+
+    def test_release_cgroup_restarts_and_rolls_back_in_separate_units(self):
+        self.env['FAKE_CGROUP'] = '0::/user.slice/app.slice/ameesh-release.service'
+        # Un chemin relatif avec espaces exige aussi le bon cwd dans l'unite.
+        relative = Path(os.path.relpath(self.config, Path.cwd())).with_name('bascule test.env')
+        self.config.rename(relative)
+        self.env['BASCULE_ENV'] = str(relative)
+        self.env['AMEESH_CONFIG'] = 'config test.json'
+        (self.state / 'scenario').write_text('ko=sante:pc-smichea\n')
+        p = self.run_staging()
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        units = self.units()
+        self.assertEqual([u['command'][-1] for u in units], ['redemarrer', 'retour'])
+        self.assertNotEqual(units[0]['unit'], units[1]['unit'])
+        for unit in units:
+            self.assertEqual(unit['cwd'], str(Path.cwd()))
+            self.assertEqual(unit['bascule'], str(relative))
+            self.assertEqual(unit['config'], 'config test.json')
+        self.assertIn(('pc-smichea', 'redemarrer'), self.actions())
+        self.assertIn(('pc-smichea', 'retour'), self.actions())
+        self.assertTrue(any(t['etape'] == 'retour' and t['verdict'] == 'ok'
+                            for t in self.traces()))
+
+    def test_transient_failure_attempts_rollback_then_notifies(self):
+        self.env['FAKE_CGROUP'] = '0::/user.slice/app.slice/ameesh-release.service'
+        for rollback_fails in (False, True):
+            with self.subTest(rollback_fails=rollback_fails):
+                (self.state / 'calls.log').write_text('')
+                (self.state / 'units.jsonl').write_text('')
+                scenario = 'unit-ko=redemarrer\n'
+                if rollback_fails:
+                    scenario += 'unit-ko=retour\n'
+                (self.state / 'scenario').write_text(scenario)
+                p = self.run_staging()
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertEqual([u['command'][-1] for u in self.units()],
+                                 ['redemarrer', 'retour'])
+                # Aucun repli direct apres l'echec de systemd-run.
+                self.assertNotIn(('pc-smichea', 'redemarrer'), self.actions())
+                notifications = [l for l in self.calls() if l.startswith('venv-python - ')]
+                self.assertEqual(len(notifications), 1)
+                expected = 'retour de pc-smichea en ECHEC' if rollback_fails else 'retour effectue'
+                self.assertIn(expected, notifications[0])
+                self.assertEqual(('pc-smichea', 'retour') in self.actions(),
+                                 not rollback_fails)
 
     def test_failure_stops_sequence_and_rolls_back_host(self):
         (self.state / 'scenario').write_text('ko=manaty-mesh-1:controler\n')

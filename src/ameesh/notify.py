@@ -1855,6 +1855,28 @@ class Notifier:
             # initial), et si la relance de 6 h est échue à cette passe
             reminders: set = set()
             remind_due = False
+            covered: set = set()
+            if kind == "slo_breach":
+                # One successful delivery per recipient and escalation
+                # level. Failed deliveries and newly designated pilots retry.
+                # #3036 : une entrée écrite par l'ancien notificateur peut
+                # nommer des destinataires dont la remise était allée sur un
+                # hôte perdu. On ne se fie à son `to` que pour un destinataire
+                # encore vivant ; un nom mort à cette passe est retiré, pour
+                # être remis quand il revient — sans rafale vers les vivants.
+                # #3100 : une entrée de ce notificateur (`live_routed`) n'a
+                # remis qu'à des vivants ; son `to` fait foi même si un bail
+                # cligne (redémarrage d'exécuteur, clôture de release) — le
+                # courrier est dans la boîte, lu au retour — et couvre le
+                # palier : ni second courrier ni escalade.
+                previous = {name: "" for name in (entry or {}).get("to") or ()}
+                if entry is not None and not entry.get("live_routed"):
+                    still_live, gone = alert_briefs._split_live(previous, by_name, closed)
+                    entry["to"] = sorted(still_live)
+                    entry["dead"] = sorted(gone)
+                    covered = set(still_live)
+                else:
+                    covered = set(previous)
             try:
                 titles = {}
                 for lot in (alert.get("lots") or ())[:12]:
@@ -1865,7 +1887,7 @@ class Notifier:
                     alert, listing, titles,
                     module_auditors if kind == "module_deviation" else auditors,
                     orchestrator_names=module_orchestrators,
-                    closed_hosts=closed, dead_out=dead)
+                    closed_hosts=closed, dead_out=dead, covered=covered)
             except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
                 self.log("[%s] mail to agents not prepared (%s)" % (kind, exc))
                 unevaluated.add(key)
@@ -1886,19 +1908,7 @@ class Notifier:
                 # palier effectivement visé, avec ses absents nommés.
                 briefs.setdefault("thread:bureau", alert_briefs._slo_breach(alert))
             if kind == "slo_breach":
-                # One successful delivery per recipient and escalation
-                # level. Failed deliveries and newly designated pilots retry.
-                # #3036 : une entrée écrite par l'ancien notificateur peut
-                # nommer des destinataires dont la remise était allée sur un
-                # hôte perdu. On ne se fie à `to` que pour un destinataire
-                # encore vivant ; un nom mort à cette passe est retiré, pour
-                # être remis quand il revient — sans rafale vers les vivants.
-                previous = {name: "" for name in (entry or {}).get("to") or ()}
-                still_live, gone = alert_briefs._split_live(previous, by_name, closed)
-                if entry is not None:
-                    entry["to"] = sorted(still_live)
-                    entry["dead"] = sorted(gone)
-                briefs = {n: t for n, t in briefs.items() if n not in still_live}
+                briefs = {n: t for n, t in briefs.items() if n not in covered}
             if not briefs:
                 # #3036 : une remise en attente sans destinataire à cette
                 # passe ne doit pas faire tourner les passages à vide ; les
@@ -2007,6 +2017,9 @@ class Notifier:
                                  # actual assignee or an absent pass resends.
                                  "agent": alert.get("agent") or alert.get("responsible"),
                                  "reminded": True,
+                                 # #3100 : remis par ce notificateur, aux
+                                 # seuls vivants ; `to` fait foi ensuite.
+                                 "live_routed": True,
                                  "to": sorted(set((entry or {}).get("to") or ()) | set(delivered))}
             elif entry is None:
                 sent[key] = {"type": kind, "sent_ts": now,
