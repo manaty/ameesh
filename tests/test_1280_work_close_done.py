@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import unittest
 
-from ameesh import registry, work
+from ameesh import registry, storage, work
 
 from .support import PgTestCase
 
@@ -102,11 +102,14 @@ class CloseDoneTest(PgTestCase):
                         source="mail", issue_ref="manaty/ameesh#941",
                         app="ameesh", **kwargs)
 
-    def verdict(self, parent=None):
-        """Le verdict rendu sur le parent relu, preuve exigée par `done`."""
+    def verdict(self, parent=None, verdict="ok", sha="e" * 40, actor="relecteur"):
+        """Le verdict rendu sur le parent relu, preuve exigée par `done`.
+
+        Posé au stockage : ces témoins lisent la garde de clôture, pas la
+        porte d'écriture du verdict (#2962)."""
         parent = parent or self.parent
-        return work.milestone(self.db, parent["id"], "verdict", verdict="ok",
-                              sha="e" * 40, actor="relecteur")
+        return storage.of(self.db).work.add_milestone(
+            parent["id"], "verdict", sha=sha, actor=actor, verdict=verdict, note="")
 
     def closed_milestones(self, item_id):
         return [m for m in work.milestones(self.db, item_id) if m["kind"] == "closed"]
@@ -162,8 +165,7 @@ class CloseDoneTest(PgTestCase):
         sur le verdict livré du parent — `blocked` compris, qui est une
         relecture livrée et pas un GO produit."""
         review = self.manual_review()
-        work.milestone(self.db, self.parent["id"], "verdict", verdict="blocked",
-                       sha="f" * 40, actor="relecteur")
+        self.verdict(verdict="blocked", sha="f" * 40)
         out = work.close(self.db, review["id"], done=True, actor="regul")
         self.assertEqual((out["state"], out["close_reason"]), ("closed", "done"))
 
@@ -171,8 +173,7 @@ class CloseDoneTest(PgTestCase):
         """Régularisation du cas #1249 : fermé `superseded by` son parent relu,
         rectifié `done` sans rouvrir ni effacer la fermeture et son jalon."""
         review = self.manual_review()
-        work.milestone(self.db, self.parent["id"], "verdict", verdict="blocked",
-                       sha="f" * 40, actor="relecteur")
+        self.verdict(verdict="blocked", sha="f" * 40)
         work.close(self.db, review["id"], superseded_by=self.parent["id"],
                    note="clôture administrative du suivi de revue", actor="qa")
         before = work.get(self.db, review["id"])
@@ -227,8 +228,7 @@ class CloseDoneTest(PgTestCase):
         """R codex3 B1 : un verdict existe sur le parent, mais il est d'un
         autre agent ; la mission assignée à `reader-due` n'est pas prouvée."""
         review = self.review(assignee="reader-due")
-        work.milestone(self.db, self.parent["id"], "verdict", verdict="ok",
-                       sha="e" * 40, actor="another-reader")
+        self.verdict(actor="another-reader")
         with self.assertRaises(work.WorkError) as caught:
             work.close(self.db, review["id"], done=True, actor="reader-due")
         self.assertIn("no verdict milestone on its parent", str(caught.exception))
@@ -297,8 +297,7 @@ class CloseDoneTest(PgTestCase):
         """La rectification `done` porte la même garde : le verdict du parent
         doit être celui du lecteur de la mission, pas d'un autre."""
         review = self.review(assignee="reader-due")
-        work.milestone(self.db, self.parent["id"], "verdict", verdict="ok",
-                       sha="e" * 40, actor="another-reader")
+        self.verdict(actor="another-reader")
         work.close(self.db, review["id"], superseded_by=self.parent["id"], actor="qa")
         with self.assertRaises(work.WorkError) as caught:
             work.close(self.db, review["id"], done=True, actor="reader-due")

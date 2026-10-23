@@ -4626,6 +4626,7 @@
     "observe_runners",
     "open_run",
     "prune_guard_runs",
+    "prune_queue",
     "queued_oldest",
     "reopen_run",
     "run",

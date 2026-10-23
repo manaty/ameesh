@@ -36,14 +36,17 @@ def _group_gone(pgid: int, timeout: float = 5.0) -> bool:
 
 
 def _state(pid: int) -> str:
-    try:
-        with open("/proc/%d/stat" % pid, encoding="utf-8") as fh:
-            return fh.read().rsplit(")", 1)[1].split()[0]
-    except OSError:
+    """`Z` for a zombie, `S` for a live process, "" when gone (L68: through
+    the platform layer, never a direct /proc read)."""
+    from ameesh import platform
+    row = next((p for p in platform.process_table() if p["pid"] == pid), None)
+    if row is None:
         return ""
+    return "Z" if row["zombie"] else "S"
 
 
-@unittest.skipUnless(os.path.isdir("/proc/self") and hasattr(os, "WNOWAIT"), "Linux")
+@unittest.skipUnless(all(hasattr(os, name) for name in ("waitid", "WNOWAIT", "P_PID")),
+                     "POSIX waitid(WNOWAIT) absent")
 class LeaderPopenTest(unittest.TestCase):
     """codex r2 (#417): the leader is reaped only after its group is killed."""
 

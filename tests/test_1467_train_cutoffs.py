@@ -70,6 +70,30 @@ class CutoffTest(unittest.TestCase):
         self.assertEqual(engine.step(stamp("2026-10-15T15:00:00"))["result"], "ci")
         self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 3)
 
+    def test_landed_packet_frees_a_cutoff_it_overran_in_the_same_event(self):
+        """#2965 (c): a missed cutoff is composed as soon as the target frees.
+
+        The packet CI spans the next cutoff; a candidate admissible before
+        that cutoff must not wait for the calendar hour after the landing.
+        """
+        # Hourly packets, as the compiled calendar feeds them (#1616): the
+        # fixture's 11:00/23:00 releases are not the packet cadence.
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 3600)
+        engine = self.engine([admitted(1, "2026-10-15T10:00:00")], schedule=schedule)
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        # The packet CI is still in flight across the 12:00 cutoff.
+        self.assertEqual(engine.step(stamp("2026-10-15T12:00:00"))["result"], "ci")
+        self.ports.ci_by_head[first["head"]] = "green"
+        self.assertEqual(engine.step(stamp("2026-10-15T12:00:05"))["result"], "landed")
+        # The landed lot left the queue; a candidate became admissible during
+        # the CI, before the 12:00 cutoff the packet overran.
+        self.ports.rows = [admitted(2, "2026-10-15T11:30:00")]
+        # The runner re-passes the landed passage at once (see the service
+        # test): the 12:00 packet is composed here, not at 13:00.
+        result = engine.step(stamp("2026-10-15T12:00:06"))
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [2])
+
     def test_repeated_paris_hour_starts_distinct_packets_across_restart(self):
         # Explicit supplier epochs: this checks the consumer, not how #1757
         # computes the calendar. Both instants are 02:00 in Europe/Paris.

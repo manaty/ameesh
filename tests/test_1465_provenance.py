@@ -273,8 +273,12 @@ class PgProvenanceTest(PgTestCase):
 
     def test_milestone_outside_a_turn_stays_unknown(self):
         """Hors tour managé, le jalon s'écrit, l'origine reste inconnue."""
+        # #2962 : un SHA complet doit se résoudre lui aussi ; ce témoin simule
+        # le dépôt qui porte le commit, comme `_verdict` le fait pour une
+        # abréviation (#2674). Le sujet du test est la provenance, pas la tête.
         with mock.patch.dict(os.environ, {"AMEESH_TURN_ID": "", "AMEESH_HARNESS": ""},
-                             clear=False):
+                             clear=False), \
+                mock.patch("ameesh.freeze_checks.commit_in", return_value=SHA1):
             mark = work.milestone(self.db, int(self.lot["id"]), "verdict",
                                   sha=SHA1, actor="mty-amh-impl-07", verdict="ok")
         self.assertIsNone(prov.receipt_for_milestone(self.db, mark["id"]))

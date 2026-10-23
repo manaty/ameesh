@@ -40,7 +40,7 @@ comme rouge. Le même test est vert dans le run `tests`
 [39491160526](https://github.com/manaty/ameesh/actions/runs/39491160526) :
 c’est une course de la suite, sans rapport avec #2889.
 
-Correction `1b88e90f3b3c` (adaptation, sans trailer) : les six témoins « 127 »
+Correction `1b88e90f37a9d5aaa579b8377985a7be307717b4` (adaptation, sans trailer) : les six témoins « 127 »
 de `DoctorHooksTest` portent désormais sur le message `exits 127` du doctor,
 et non sur un nombre libre de la sortie ; le sens est conservé des deux côtés
 (binaire absent → KO, binaire présent → aucun KO). Test seul, aucun code de

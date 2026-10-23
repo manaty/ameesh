@@ -7,10 +7,10 @@ GitHub annule un job hébergé quand aucun runner ne l'a pris après plusieurs
 tentatives — annotation « The job was not acquired by Runner of type hosted »,
 sous contrainte de capacité (macOS arm64, 13/10/2026, run 38428931108). Le job
 `platform-macos` conclut alors `cancelled` : `runner_name` vide, aucune étape
-exécutée. L'agrégat requis `tests` (.github/workflows/tests.yml) exige
-`needs.platform-macos.result == success`, donc le check requis rougit sans
-aucun défaut de code ; et l'API refuse de rejouer le job tant que l'exécution
-tourne (« workflow run containing this job is already running »).
+exécutée. Le job macOS n'est pas encore requis par l'agrégat `tests` (décision
+de la revue #393) ; une annulation de capacité doit rester visible et reprise
+par cette garde. L'API refuse de rejouer le job tant que l'exécution tourne
+(« workflow run containing this job is already running »).
 
 `.github/workflows/relance-hosted.yml` se déclenche à la conclusion de
 « tests » et de « paquet » (#2119 : `paquet.yml` appelle `tests.yml` par
@@ -179,8 +179,8 @@ class GitHub:
         return self.call("GET", "actions/runs/%s" % run_id)
 
     def relancer(self, run_id: str) -> None:
-        """Rejoue les jobs en échec et leurs dépendants (l'agrégat `tests`
-        dépend de `platform-macos`) : c'est la reprise documentée d'un job
+        """Rejoue les jobs en échec et leurs dépendants : c'est la reprise
+        documentée d'un job
         annulé, et elle exige l'exécution terminée."""
         self.call("POST", "actions/runs/%s/rerun-failed-jobs" % run_id)
 

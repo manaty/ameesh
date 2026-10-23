@@ -101,11 +101,23 @@ class ReviewedHeadTest(PgTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual([m["sha"] for m in self.verdicts()], [FROZEN[:12]])
 
-    def test_une_tete_complete_est_acceptee_sans_depot(self):
-        # Le cas d'un relecteur qui n'a pas le dépôt : la tête complète suffit.
+    def test_une_tete_complete_inconnue_est_refusee_sans_depot(self):
+        # #2962 : la longueur ne prouve rien. Une tête complète qu'aucun dépôt
+        # ne résout et qui n'est pas la tête gelée est refusée comme une
+        # abréviation ; un relecteur qui n'a pas le dépôt cite la tête gelée.
         proc = self.milestone("blocked", "--sha", OTHER.upper())
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("head-unresolved", proc.stderr)
+        self.assertIn(OTHER, proc.stderr)
+        self.assertIn(FROZEN[:12], proc.stderr)
+        self.assertEqual(self.verdicts(), [])
+
+    def test_une_tete_complete_sur_la_tete_gelee_est_acceptee_sans_depot(self):
+        # Le cas d'un relecteur qui n'a pas le dépôt : la tête gelée complète
+        # fait foi, même si aucun dépôt local ne la porte.
+        proc = self.milestone("blocked", "--sha", FROZEN.upper())
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual([m["sha"] for m in self.verdicts()], [OTHER])
+        self.assertEqual([m["sha"] for m in self.verdicts()], [FROZEN])
 
     def test_directement_le_milestone_refuse_aussi(self):
         with self.assertRaises(work.WorkError) as caught:

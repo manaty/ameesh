@@ -4218,6 +4218,14 @@ class CiResults(Domain):
         """Le dernier relevé de file par dépôt : `{repo, oldest_id, oldest_ts,
         queued, seen_ts}` (les dépôts sans job `queued` ont `oldest_ts` NULL)."""
 
+    @abc.abstractmethod
+    def prune_queue(self, repos: Sequence[str]) -> None:
+        """Retire les relevés de file des dépôts hors du périmètre actif
+        `repos`. Un dépôt sorti de `github.projects` ne doit pas laisser une
+        ligne qui fonderait une alerte de silence perpétuelle sur les autres
+        hôtes (#2957). Un périmètre vide ne purge rien : il ne prouve pas que
+        des dépôts ont été retirés."""
+
     # -- #845 (revue N/P2 2328) : fenêtre et cache du relevé ----------------
     @abc.abstractmethod
     def claim_guard_scan(self, repo: str, *, now: float, window_s: float) -> bool:

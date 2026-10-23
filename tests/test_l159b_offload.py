@@ -27,13 +27,21 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import adapters, offload
+from ameesh import adapters, offload, platform
 from ameesh.platform import offload_shell
 
 from .support import REPO
 
 FAKE_SSH = os.path.join(REPO, "tests", "fakebin", "fake-offload-ssh")
 AMEESH = os.path.join(REPO, "bin", "ameesh")
+
+
+def setUpModule():
+    # L68: the offload shell is the Linux VM side by construction (systemd,
+    # /proc, user separation). Its tests run on the Linux fleet only; the
+    # macOS job must not pretend to verify an interface macOS never hosts.
+    if not platform.is_linux():
+        raise unittest.SkipTest("offload (L159b) : le côté VM est Linux seulement")
 
 
 def git(cwd: str, *args: str) -> str:

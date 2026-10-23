@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """L63 : couche plateforme (`ameesh.platform`), adoption fail-closed, lint.
 
-`PlatformTest` et `LintTest` tournent sans base : ce sont eux que la CI lance
-aussi sous macOS (job `platform-macos`). Sous Linux, chacun passe deux fois : avec psutil (s'il est
+`PlatformTest`, `LintTest` et `GuaranteeTest` tournent sans base : la CI les
+lance aussi sous macOS (job `platform-macos`), où L68 exécute en plus la suite
+sélectionnée par le plan. Sous Linux, chacun passe deux fois : avec psutil (s'il est
 installé) et par le repli /proc (psutil retiré).
 """
 from __future__ import annotations
@@ -11,6 +12,7 @@ import ast
 import contextlib
 import io
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -732,6 +734,55 @@ class AdoptFailClosedTest(PgTestCase):
                 ["adopt", "coord", "--session", sid, "--harness", "codex", "--force"]))
         self.assertNotEqual(code, 0)
         self.assertIn("with or without --force", sortie.getvalue())
+
+
+# --------------------------------------------------------------------------
+# L68 : une garantie muette lève, jamais une observation vide
+# --------------------------------------------------------------------------
+
+class GuaranteeTest(unittest.TestCase):
+    """L68: on a mute OS every guarantee raises `NotAvailable`.
+
+    `platform.GUARANTEES` is the contract list; this test names the call for
+    each entry, so adding a guarantee without its witness fails here, and a
+    function that goes back to returning `[]`/`None` fails its subTest. The
+    OS is made mute *and* told it is macOS: the test proves on Linux exactly
+    what the macOS job runs (psutil removed, no `/proc`), without a macOS host.
+    """
+
+    CALLS = {
+        "ancestry": lambda: platform.ancestry(),
+        "boot_time": lambda: platform.boot_time(),
+        "children": lambda: platform.children(),
+        "env_values": lambda: platform.env_values("AMEESH_L68"),
+        "environ": lambda: platform.environ(os.getpid()),
+        "holders": lambda: platform.holders(__file__, "x"),
+        "open_fd_count": lambda: platform.open_fd_count(),
+        "process_table": lambda: platform.process_table(),
+        "self_cgroup_paths": lambda: platform.self_cgroup_paths(),
+        "start_time": lambda: platform.start_time(os.getpid()),
+    }
+
+    def test_the_contract_names_every_guarantee(self):
+        self.assertEqual(len(platform.GUARANTEES), len(set(platform.GUARANTEES)))
+        self.assertEqual(set(self.CALLS), set(platform.GUARANTEES),
+                         "une garantie de platform.GUARANTEES n'a pas son témoin ici")
+
+    def test_a_mute_os_raises_instead_of_an_empty_answer(self):
+        # un /proc vide : la couche ne peut ni lister ni lire, comme sur un OS
+        # sans cette interface ; SYSTEM=macos rend le cas identique partout.
+        vide = tempfile.mkdtemp(prefix="l68-sans-proc-")
+        self.addCleanup(shutil.rmtree, vide, True)
+        for name in platform.GUARANTEES:
+            with self.subTest(name), \
+                    mock.patch.object(platform, "psutil", None), \
+                    mock.patch.object(platform, "SYSTEM", "macos"), \
+                    mock.patch.object(platform.process, "PROC", vide):
+                with self.assertRaises(platform.NotAvailable) as ctx:
+                    self.CALLS[name]()
+                self.assertEqual(ctx.exception.system, "macos")
+                self.assertTrue(str(ctx.exception).strip(),
+                                "le refus doit dire pourquoi, pas seulement lever")
 
 
 # --------------------------------------------------------------------------
