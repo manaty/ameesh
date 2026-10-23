@@ -176,6 +176,57 @@ class ElectionSyncTest(test_canon._CanonDbCase):
         self.assertIsNotNone(registry.claim(self.db, "ouvrier", "runner-banc", 600,
                                             host="banc"))
 
+    def test_refus_candidat_ne_ferme_pas_un_agent_epingle_abonne(self):
+        self.sync("atelier")
+        # reproducteur cx3 : ouvrier passe en subscription, banc n'admet que
+        # subscription ; relecteur (api-key) est refusé, ouvrier reste sain.
+        for path, old, new in (
+                ("agents/ouvrier.md", "credential_mode: api-key",
+                 "credential_mode: subscription"),
+                ("placements/ouvrier-banc.md", "credential_mode: api-key",
+                 "credential_mode: subscription")):
+            with open(os.path.join(self.root, path), encoding="utf-8") as fh:
+                text = fh.read()
+            write(self.root, path, text.replace(old, new))
+        write(self.root, "hotes/banc.md", host_card(
+            "banc", "human:alice", harnesses=["deepseek", "codex"],
+            providers=["deepseek", "openai"], credential_modes=["subscription"],
+            max_agents="2"))
+        self.sync("banc")
+        state = self.db.query("SELECT status FROM canon_state WHERE host = 'banc'")[0]
+        self.assertEqual(state["status"], canon_sync.CANON_OK)
+        self.assertIs(self.candidates()["banc"]["placement_ok"], False)
+        self.assertIn("ouvrier", [r["name"] for r in registry.claimable(self.db, "banc")])
+        self.assertIsNotNone(registry.claim(self.db, "ouvrier", "runner-banc", 600,
+                                            host="banc"))
+        self.assertNotIn("relecteur", [r["name"] for r in registry.claimable(self.db, "banc")])
+
+    def test_releve_invalide_ferme_la_reclamation_apres_normalisation(self):
+        self.sync("atelier")
+        self.sync("banc")
+        write(self.root, "agents/relecteur.md", election_agent(releve="hasard"))
+        report = self.sync("banc")
+        self.assertIn("agent-releve-invalid", {f.code for f in report.findings})
+        row = self.row("relecteur")
+        self.assertEqual(row["releve"], "election")   # repli fail closed
+        self.assertIsNone(row["responsible"])
+        self.assertEqual({r["placement_ok"] for r in self.candidates().values()}, {False})
+        self.assertNotIn("relecteur", [r["name"] for r in registry.claimable(self.db, "atelier")])
+        self.assertIsNone(registry.claim(self.db, "relecteur", "runner-atelier", 600,
+                                         host="atelier"))
+
+    def test_lecture_incomplete_ne_retire_pas_le_role_du_detenteur(self):
+        self.sync("atelier")
+        self.sync("banc")
+        partial = self.load()
+        partial.agents = [a for a in partial.agents if a.title != "relecteur"]
+        partial.loaded_members = lambda: []
+        canon_sync.sync(self.db, partial, "banc")
+        row = self.row("relecteur")
+        self.assertNotEqual(row["status"], "stopped")
+        self.assertIs(self.candidates()["banc"]["placement_ok"], True)
+        self.assertIn("relecteur", [r["name"] for r in registry.claimable(self.db, "banc")])
+
     def test_profil_divergé_ferme_le_candidat(self):
         self.sync("atelier")
         self.sync("banc")

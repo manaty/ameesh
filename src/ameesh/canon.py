@@ -2834,10 +2834,15 @@ class _Loader:
         # Placement (contrôlé par `validate`, qui connaît les hôtes).
         releve = (_text(fiche.data.get("releve")) or "hote").strip().lower()
         if releve not in ("hote", "election"):
+            # Valeur illisible : repli sur `election` (fail closed). Un repli
+            # sur `hote` rouvrirait la ligne sur l'hôte courant, alors que la
+            # fiche est fautive ; `election` exige un verdict candidat, que la
+            # fiche en erreur ferme partout.
             self.add("agent-releve-invalid", ERROR,
-                     "`releve`: `hote` or `election` expected, not %r (treated as `hote`)"
+                     "`releve`: `hote` or `election` expected, not %r "
+                     "(treated as `election`, not claimable)"
                      % fiche.data.get("releve"), **where, **subject)
-            releve = "hote"
+            releve = "election"
         candidats = self._list(fiche, "candidats", where, "agent-candidats-invalid", **subject)
         if candidats is not None:
             candidats = list(dict.fromkeys(c for c in candidats if c))

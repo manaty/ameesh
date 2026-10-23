@@ -1473,6 +1473,9 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     #: sa fiche Host). La réclamation est déjà fermée par `canon_state` : une
     #: telle erreur ne doit pas détruire le dernier responsable résolu.
     host_wide = bool(block.global_errors or block.by_host.get(host))
+    #: L165 : membres réellement lus, pour ne jamais retirer un rôle élu sur
+    #: la foi d'une lecture locale incomplète (clone ou membre fédéré absent).
+    loaded = canon.loaded_members()
     actions: list[SyncAction] = []
 
     # L31 (0029) : une fiche `Placement` est une ADMISSION (hôtes nommés ou
@@ -1508,6 +1511,13 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         if stale in admitted_here:
             continue
         declared = canon.agent(stale)
+        known = registry.get(db, stale)
+        cross = known is not None and (known.get("host") or host) != host
+        if cross and (block.global_errors
+                      or _member_of(known.get("canon_ref")) not in loaded):
+            # Lecture locale incomplète : ne pas retirer le rôle au détenteur
+            # sain ; son propre sync (ou une lecture complète) jugera.
+            continue
         if declared is None:
             # Fiche retirée : fermer la candidature tout de suite, même si la
             # ligne appartient désormais à un autre canon ; la boucle de
@@ -1517,7 +1527,6 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         errors = block.by_agent.get(stale, ())
         if errors:
             _close_card_candidates(db, stale, canon_key, errors)
-            known = registry.get(db, stale)
             if known is not None and mine(known):
                 _clear_responsible(db, stale, known.get("host") or host, owner)
         else:
@@ -1565,8 +1574,12 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         # périmé est vidé même si la ligne est chez un autre détenteur.
         if row is not None and row.get("host") not in (None, host) \
                 and row.get("host") in other_admitted.get(name, []):
-            if candidate:
-                if card_errors:
+            election_card = agent.releve == "election" and bool(card_errors)
+            if candidate or election_card:
+                if block.global_errors:
+                    # Lecture locale incomplète : le sync du détenteur jugera.
+                    pass
+                elif card_errors:
                     _close_card_candidates(db, name, canon_key, card_errors)
                     if mine(row):
                         _clear_responsible(db, name, row.get("host") or host, owner)
@@ -1706,7 +1719,6 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         elif row is not None and (row.get("status_text") or "").startswith(PENDING_MARK):
             storage.of(db).canon.clear_pending_stop(name, PENDING_MARK)
 
-    loaded = canon.loaded_members()
     for name, row in sorted(rows.items()):
         if name in admitted_here:
             continue
@@ -1719,6 +1731,10 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         if not mine(row):
             continue  # L42 : ligne d'un autre canon, jamais touchée
         member = _member_of(row.get("canon_ref"))
+        if cross and (block.global_errors or member not in loaded):
+            # Lecture locale incomplète : le sync du détenteur jugera, on ne
+            # touche ni son responsable ni son placement ni son bail.
+            continue
         unverifiable = ("member %s not read" % member if member not in loaded
                         else "invalid canon" if block.global_errors else "")
         if unverifiable:
