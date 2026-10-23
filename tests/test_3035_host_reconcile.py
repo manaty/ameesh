@@ -109,10 +109,10 @@ class HostReconcileTest(PgTestCase):
         self.assertEqual(event["data"]["readings"], 3)
         self.assertEqual(event["data"]["readings_since_loss"], 3)
         self.assertEqual(event["data"]["suffix_start_ts"], event["data"]["first_fresh_ts"])
+        self.assertEqual(event["data"]["live_lease_agents"], [])
         self.assertEqual(event["data"]["checks"],
                          ["fresh_reading", "sustained_readings", "no_reading_gap",
-                          "agents_home", "no_live_lease", "no_active_handoff",
-                          "no_recovery_attempt"])
+                          "agents_home", "no_active_handoff", "no_recovery_attempt"])
 
     def test_a_single_fresh_reading_does_not_reopen(self):
         self.fresh()
@@ -191,13 +191,21 @@ class HostReconcileTest(PgTestCase):
         self.assertEqual(result["missing"], ["agent_moved:dev"])
         self.assertEqual(self.api.host_lifecycle.get("source")["mode"], "lost")
 
-    def test_live_lease_keeps_the_host_closed(self):
+    def test_live_lease_of_a_returning_agent_does_not_block(self):
+        # #3180: the host's own runner takes its lease back as soon as the
+        # machine reboots, before the sustained-reading window closes. That
+        # lease is the returning executor, not a second one; only a move away
+        # (next test) must keep the host closed.
         self.returned()
-        self.db.execute("UPDATE agent_registry SET lease_owner='runner', "
+        self.db.execute("UPDATE agent_registry SET lease_owner='runner-returning@source', "
                         "lease_expires_at=clock_timestamp()+interval '5 minutes' WHERE name='dev'")
         result = self.reconcile()
-        self.assertIn("live_lease:dev", result["missing"])
-        self.assertEqual(self.api.host_lifecycle.get("source")["mode"], "lost")
+        self.assertTrue(result["reconciled"], result)
+        self.assertEqual(self.api.host_lifecycle.get("source")["mode"], "available")
+        self.assertEqual(self.event()["data"]["live_lease_agents"], ["dev"])
+        self.assertEqual(self.event()["data"]["checks"], [
+            "fresh_reading", "sustained_readings", "no_reading_gap",
+            "agents_home", "no_active_handoff", "no_recovery_attempt"])
 
     def test_fenced_agent_keeps_the_host_closed(self):
         self.returned()
@@ -282,6 +290,22 @@ class HostReconcileTest(PgTestCase):
         row = self.api.host_lifecycle.get("source")
         self.assertEqual((row["mode"], row["actor"]), ("available", "runner-mty-x@peer"))
         self.assertIsNotNone(registry.claim(self.db, "dev", "runner", ttl_seconds=300))
+
+    def test_runner_lifecycle_pass_reopens_a_rebooting_host_that_holds_its_leases(self):
+        # #3180 (pc-smichea, 23/10): the runners of the returning machine take
+        # their leases back at boot, so the first lifecycle pass sees home
+        # agents with live leases while the sustained readings are still
+        # incomplete; once they cover the window the host must reopen alone.
+        self.returned()
+        self.db.execute("UPDATE agent_registry SET lease_owner='runner-returning@source', "
+                        "lease_expires_at=clock_timestamp()+interval '5 minutes' WHERE name='dev'")
+        runner = object.__new__(Runner)
+        runner.runner_id = "runner-returning@source"
+        runner.cfg = self.cfg
+        runner.handoff_limits_for = lambda host: None
+        Runner.host_lifecycle_once(runner, self.db)
+        row = self.api.host_lifecycle.get("source")
+        self.assertEqual((row["mode"], row["actor"]), ("available", "runner-returning@source"))
 
     def test_cli_dispatch_routes_host_reconcile(self):
         from ameesh import main as main_mod

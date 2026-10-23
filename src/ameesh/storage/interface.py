@@ -3685,11 +3685,13 @@ class HostLifecycle(Domain):
 
         Readings in database time must cover at least `fresh_within` without a
         hole that large, with no reading dated in the future; every origin
-        agent must still be home and unfenced, with no live lease, no active
-        handoff and no `recover_source` attempt since the loss. The transition
-        `lost -> returning -> available` is atomic and leaves its actor and
-        evidence in `ameesh_events`. Returns `{"host", "mode", "reconciled",
-        "missing", ...}`; a refusal names the missing proof.
+        agent must still be home and unfenced, with no active handoff and no
+        `recover_source` attempt since the loss. A live lease of an agent that
+        is home is the returning host's own runner and does not block the
+        proof (#3180). The transition `lost -> returning -> available` is
+        atomic and leaves its actor and evidence in `ameesh_events`. Returns
+        `{"host", "mode", "reconciled", "missing", ...}`; a refusal names the
+        missing proof.
         """
 
 
