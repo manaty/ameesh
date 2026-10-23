@@ -20,7 +20,9 @@
 #  3. Le digest rendu est celui du push de ce run, et c'est un manifeste simple
 #     linux/amd64 : la sortie de `docker push` est comparée au manifeste relu,
 #     le blob de configuration est comparé à l'image construite, et le label de
-#     révision est vérifié. Un index multi-architecture est refusé.
+#     révision est vérifié. Un index multi-architecture est refusé ; un blob
+#     redirigé (307 de GHCR vers son stockage) est relu à la Location https
+#     SANS le bearer, qui ne quitte jamais l'origine du registre.
 #
 #  4. Le jeton GHCR et le bearer du registre ne passent jamais par argv : curl
 #     les lit dans sa configuration sur stdin (`-K -`) et `docker login` reçoit
@@ -159,10 +161,30 @@ verify_manifest() {
       "$work/body" 2>/dev/null)" \
     || die "manifeste $ref illisible : aucun blob de configuration"
   [ -n "$config" ] || die "manifeste $ref sans blob de configuration"
+  # B1 (ameesh-cx2, 23/10/2026) : GHCR répond 307 vers son stockage pour un
+  # blob. Le premier appel porte le bearer et ne suit pas la redirection ; la
+  # Location (https seulement) est ensuite lue SANS authentification : le
+  # bearer ne quitte jamais l'origine du registre.
   code="$({ config_value header "Authorization: Bearer $token"; } \
-      | curl -sS -K - -o "$work/config" -w '%{http_code}' \
+      | curl -sS -K - -o "$work/config" -D "$work/blob.headers" -w '%{http_code}' \
         -H 'Accept: application/octet-stream' \
         "$api/blobs/$config" || true)"
+  case "${code:-000}" in
+    200) ;;
+    301|302|303|307|308)
+      location="$(sed -n 's/^[Ll]ocation:[[:space:]]*//p' "$work/blob.headers" \
+        | tr -d '\r' | head -1)"
+      [ -n "$location" ] || die "redirection sans Location pour le blob $config"
+      case "$location" in
+        https://*) ;;
+        *) die "redirection non https pour le blob $config : $location" ;;
+      esac
+      code="$(curl -sS -L --proto-redir '=https' --max-redirs 5 \
+          -o "$work/config" -w '%{http_code}' \
+          -H 'Accept: application/octet-stream' "$location" || true)"
+      ;;
+    *) die "blob de configuration $config illisible ($code)" ;;
+  esac
   [ "${code:-000}" = 200 ] || die "blob de configuration $config illisible ($code)"
   got="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("%s/%s" % (d.get("os",""), d.get("architecture","")))' \
       "$work/config" 2>/dev/null)" \

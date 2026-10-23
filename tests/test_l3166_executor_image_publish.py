@@ -116,13 +116,15 @@ with (FAKE / "requests.log").open("a") as journal:
     journal.write(method + " " + url + "\\n")
 
 
-def respond(code, body=b"", ctype=None, digest=None):
+def respond(code, body=b"", ctype=None, digest=None, location=None):
     if dump:
         lines = ["HTTP/1.1 %d" % code]
         if ctype:
             lines.append("Content-Type: " + ctype)
         if digest:
             lines.append("Docker-Content-Digest: " + digest)
+        if location:
+            lines.append("Location: " + location)
         pathlib.Path(dump).write_text("\\r\\n".join(lines) + "\\r\\n\\r\\n")
     if out:
         pathlib.Path(out).write_bytes(body)
@@ -143,8 +145,18 @@ if (FAKE / "network-down").exists():
     sys.exit(7)
 
 path = urllib.parse.urlparse(url).path
+with (FAKE / "auth.log").open("a") as journal:
+    journal.write(("yes" if headers.get("authorization") else "no") + " " + url + "\\n")
 blob_prefix = "/v2/manaty/ameesh-executor/blobs/"
 manifest_prefix = "/v2/manaty/ameesh-executor/manifests/"
+storage_prefix = "/storage/"
+if path.startswith(storage_prefix):
+    # la Location signee du stockage : aucun bearer attendu
+    ref = urllib.parse.unquote(path[len(storage_prefix):])
+    blob = BLOBS / ref
+    if blob.exists():
+        respond(200, blob.read_bytes(), "application/octet-stream")
+    respond(404, b'{"errors": [{"code": "BLOB_UNKNOWN"}]}', "application/json")
 if not path.startswith(blob_prefix) and not path.startswith(manifest_prefix):
     sys.stderr.write("faux curl : URL inattendue " + url + "\\n")
     sys.exit(3)
@@ -157,6 +169,12 @@ if path.startswith(blob_prefix):
     ref = urllib.parse.unquote(path[len(blob_prefix):])
     if (ERRORS / ref).exists():
         respond(int((ERRORS / ref).read_text().strip()))
+    if (FAKE / "redirect-blob").exists():
+        respond(307, b"", "text/plain",
+                location="https://storage.example.invalid/storage/" + ref)
+    if (FAKE / "redirect-http").exists():
+        respond(307, b"", "text/plain",
+                location="http://storage.example.invalid/storage/" + ref)
     blob = BLOBS / ref
     if blob.exists():
         respond(200, blob.read_bytes(), "application/octet-stream")
@@ -379,6 +397,17 @@ class ScriptInvariantsTest(unittest.TestCase):
         self.assertIn('export DOCKER_CONFIG="$work/docker"', self.text)
         self.assertIn('mkdir -m 700 "$DOCKER_CONFIG"', self.text)
 
+    def test_redirection_de_blob_sans_bearer(self):
+        # B1 (ameesh-cx2, 23/10/2026) : GHCR renvoie 307 vers son stockage. Le
+        # premier appel porte le bearer ; la Location https est lue SANS
+        # authentification (pas de -K -, pas de --location-trusted).
+        self.assertIn("301|302|303|307|308", self.text)
+        self.assertIn("--proto-redir '=https'", self.text)
+        self.assertNotIn("--location-trusted", self.text)
+        apres = self.text.split('code="$(curl -sS -L --proto-redir', 1)
+        self.assertEqual(len(apres), 2)
+        self.assertNotIn("-K -", apres[1].split("|| true)", 1)[0])
+
     def test_les_secrets_ne_passent_pas_en_argv(self):
         self.assertNotIn('-u "$GHCR_USER:$GHCR_TOKEN"', self.text)
         self.assertNotIn('-H "Authorization: Bearer $token"', self.text)
@@ -561,6 +590,28 @@ class PublishBehaviourTest(unittest.TestCase):
         # le dossier $work (donc la configuration docker) est effacé à la sortie
         self.assertFalse(pathlib.Path(lignes[0]).exists())
         self.assertFalse((self.fake / "home" / ".docker").exists())
+
+    def test_un_blob_redirige_est_relu_sans_bearer(self):
+        # B1 (ameesh-cx2, 23/10/2026) : le 307 de GHCR vers son stockage est
+        # suivi, et le bearer ne part pas vers l'hote de stockage.
+        (self.fake / "redirect-blob").write_text("", encoding="utf-8")
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("digest=", proc.stdout)
+        auths = (self.fake / "auth.log").read_text(encoding="utf-8").splitlines()
+        self.assertTrue(any(ligne.startswith("yes ") and "/blobs/" in ligne
+                            for ligne in auths), auths)
+        self.assertFalse(any(ligne.startswith("yes https://storage.")
+                             for ligne in auths), auths)
+        self.assertTrue(any(ligne.startswith("no https://storage.")
+                            for ligne in auths), auths)
+
+    def test_une_redirection_non_https_est_refusee(self):
+        (self.fake / "redirect-http").write_text("", encoding="utf-8")
+        proc = self._run()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("redirection non https", proc.stderr)
+        self.assertFalse((self.fake / "digest.txt").exists())
 
     def test_une_autre_architecture_locale_est_refusee_avant_reseau(self):
         (self.fake / "local-platform").write_text("linux/arm64", encoding="utf-8")

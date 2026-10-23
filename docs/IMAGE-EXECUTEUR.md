@@ -267,11 +267,15 @@ Il relie le digest à **ce run** : le digest imprimé par `docker push` doit
 configuration du manifeste servi doit être l'ID de l'image construite, et
 le label `org.opencontainers.image.revision` doit valoir la révision
 publiée. Une absence de tag ne se conclut que sur un 404 ; un index
-multi-architecture ou une autre architecture arrête le run. Si le tag
-existait déjà, rien n'est poussé : le script ne rend que le digest existant
-après avoir vérifié sa révision, et le dit dans le journal. Le digest signé
-est donc toujours celui que le registre sert à la fin du run, lié soit au
-push de ce run, soit au label de révision du tag existant.
+multi-architecture ou une autre architecture arrête le run. Le blob de
+configuration est lu en suivant la redirection HTTPS du registre (307 chez
+GHCR) **sans le bearer** : le premier appel authentifié ne suit pas la
+redirection, la `Location` signée est appelée sans authentification, et une
+redirection non HTTPS arrête le run. Si le tag existait déjà, rien n'est
+poussé : le script ne rend que le digest existant après avoir vérifié sa
+révision, et le dit dans le journal. Le digest signé est donc toujours celui
+que le registre sert à la fin du run, lié soit au push de ce run, soit au
+label de révision du tag existant.
 
 L'auteur du lot reporte la ligne `image_ref` sur le fil du lot et la remet
 au bureau pour la signature O4 (§9.2) ; c'est cette valeur, et elle seule,
