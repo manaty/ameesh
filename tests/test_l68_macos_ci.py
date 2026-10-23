@@ -95,6 +95,18 @@ class MacosSuiteJobTest(unittest.TestCase):
         self.assertNotIn("platform-macos", needs.group(1))
         self.assertIn("platform-macos n'est pas encore requis", aggregate)
 
+    def test_the_plan_guard_is_outside_the_tolerated_step(self):
+        # #3048 (N de la revue #3030) : `continue-on-error` de #3042 ne
+        # tolère que la portabilité de la suite ; la garde « aucune part
+        # psycopg » est une étape à part, sans tolérance, avant la suite.
+        garde = self.job.index("- name: le plan donne des parts psycopg (L68)")
+        suite = self.job.index("- name: suite du plan (L68, pilote psycopg)")
+        self.assertLess(garde, suite)
+        etape = self.job[garde:suite]
+        self.assertIn("aucune part psycopg", etape)
+        self.assertIn("exit 1", etape)
+        self.assertNotIn("continue-on-error", etape)
+
 
 class LinuxOnlyWitnessesAreBoundedTest(unittest.TestCase):
     """Les lectures Linux qui restent (pas de couche possible) sont bornées."""

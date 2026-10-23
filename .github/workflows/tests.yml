@@ -939,6 +939,17 @@ jobs:
           path: ${{ runner.temp }}
       - name: le plan téléchargé est celui du plan (empreinte, #1256 B4)
         run: echo "${{ needs.plan.outputs.plan_sha256 }}  $RUNNER_TEMP/plan.json" | sha256sum -c -
+      # #3048 : la garde du plan est une étape à part, hors de la tolérance
+      # #3042 qui ne couvre que la portabilité de la suite ; un plan sans part
+      # psycopg alors que du code a changé rougit le job au lieu d'être avalé
+      # par `continue-on-error`.
+      - name: le plan donne des parts psycopg (L68)
+        run: |
+          case "${{ needs.plan.outputs.psycopg_parts }}" in
+            ''|0)
+              echo "::error::le plan ne donne aucune part psycopg alors que du code a changé" >&2
+              exit 1 ;;
+          esac
       - name: suite du plan (L68, pilote psycopg)
         # #3042 : le job macOS n'est pas requis (décision de conception #393)
         # et la porte de fusion ameesh exige un run vert ; la suite macOS reste
