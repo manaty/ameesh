@@ -234,6 +234,39 @@ chantier_of = workstream_of
 #: l'agent côté appareil (`mediated_executor/work_repo.py`).
 GIT_EMAIL_DOMAIN = "ameesh.invalid"
 
+#: #3111 : l'ancien domaine, d'avant la convention #834. Le code l'a fixée le
+#: 13/10/2026 10:00Z, mais des harnais ont encore commité sous
+#: `<agent>@ameesh.local` jusqu'au 14/10 14:32:09Z (deepseek6, nexlink ; dernier
+#: commit observé dans les dépôts ameesh et nexlink). Ces commits survivent
+#: dans des plages gelées reportées (#2924) : la porte les lit, rien d'autre.
+LEGACY_GIT_EMAIL_DOMAIN = "ameesh.local"
+#: 2026-10-14T15:00:00Z : un commit `.local` daté d'après n'est jamais lu
+LEGACY_GIT_EMAIL_UNTIL = 1791990000.0
+
+
+def agent_of_git_email(email: str, at_ts: float, *, legacy: bool = True) -> str:
+    """Le nom d'agent porté par une adresse git, ou "".
+
+    `<nom>@ameesh.invalid` nomme l'agent. L'ancien `<nom>@ameesh.local` ne le
+    nomme que pour un commit daté d'avant `LEGACY_GIT_EMAIL_UNTIL` (#3111), et
+    seulement si l'appelant l'accepte (`legacy`). L'adresse ne prouve ni la
+    famille ni même l'agent : l'appelant exige encore le registre et le journal
+    des tours ou un reçu. Toute autre adresse rend ""."""
+    email = str(email or "").strip().lower()
+    name, separator, domain = email.rpartition("@")
+    if not separator or not name or "@" in name:
+        return ""
+    if domain == GIT_EMAIL_DOMAIN:
+        return name
+    if legacy and domain == LEGACY_GIT_EMAIL_DOMAIN:
+        try:
+            stamp = float(at_ts)
+        except (TypeError, ValueError):
+            return ""
+        if 0 < stamp < LEGACY_GIT_EMAIL_UNTIL:
+            return name
+    return ""
+
 
 def git_identity(name: str) -> dict:
     """L'identité git d'une session (#834) : auteur ET committer.
