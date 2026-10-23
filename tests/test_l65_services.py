@@ -84,6 +84,11 @@ class ServicePayloadTest(unittest.TestCase):
         # le fichier de l'hôte est sourcé ; le plist ne porte aucun secret
         self.assertIn(os.path.join(self.tmp, ".config/ameesh/env"),
                       runner["ProgramArguments"][2])
+        # N1 de la revue #390 : notify source aussi ses secrets de canaux,
+        # comme `EnvironmentFile=-%h/.config/ameesh/notify.env` sous systemd.
+        self.assertNotIn(launchd.NOTIFY_ENV_FILE, runner["ProgramArguments"][2])
+        self.assertIn(os.path.join(self.tmp, launchd.NOTIFY_ENV_FILE),
+                      notify["ProgramArguments"][2])
         self.assertNotIn("AMEESH_DSN", str(runner))
         self.assertEqual(runner["KeepAlive"], {"SuccessfulExit": False})
         self.assertTrue(runner["RunAtLoad"])
@@ -350,6 +355,43 @@ class ServiceInstallTest(unittest.TestCase):
         run = _fake_run({
             "bootout": 1,
             "bootout:err": 'Could not find service "ameesh.runner" in domain'})
+        code, run = self._install(run)
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.isfile(self.path))
+        self.assertEqual([call[1] for call in run.calls], ["bootout", "bootstrap"])
+
+    def test_bootout_113_est_une_absence(self):
+        """B3 de la revue #390 : `bootout` récent dit « Boot-out failed: 113:
+        Could not find specified service » — absence, pas échec réel."""
+        self._install(_fake_run())
+        run = _fake_run({
+            "bootout": 113,
+            "bootout:err": "Boot-out failed: 113: Could not find specified service"})
+        out = io.StringIO()
+        with mock.patch.object(platform, "SYSTEM", "macos"), \
+                contextlib.redirect_stdout(out):
+            code = service_cli.main(["uninstall", "--no-notify"],
+                                    env=self.env, run=run)
+        self.assertEqual(code, 0)
+        self.assertIn("removed", out.getvalue())
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual([call[1] for call in run.calls], ["bootout"])
+
+    def test_uninstall_jamais_installe_dit_absent_sur_bootout_113(self):
+        run = _fake_run({
+            "bootout": 113,
+            "bootout:err": "Boot-out failed: 113: Could not find specified service"})
+        out = io.StringIO()
+        with mock.patch.object(platform, "SYSTEM", "macos"), \
+                contextlib.redirect_stdout(out):
+            code = service_cli.main(["uninstall", "--no-notify"],
+                                    env=self.env, run=run)
+        self.assertEqual(code, 0)
+        self.assertIn("absent", out.getvalue())
+        self.assertEqual([call[1] for call in run.calls], ["bootout"])
+
+    def test_install_jamais_charge_ne_replie_pas_sur_unload(self):
+        run = _fake_run({"bootout": 113})  # code seul, sans message
         code, run = self._install(run)
         self.assertEqual(code, 0)
         self.assertTrue(os.path.isfile(self.path))

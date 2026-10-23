@@ -40,6 +40,9 @@ LABEL_PREFIX = "ameesh"
 #: fichier d'environnement de l'hôte, le même que celui des unités systemd
 #: (relatif au dossier de l'utilisateur : launchd n'étend pas `~`)
 HOST_ENV_FILE = ".config/ameesh/env"
+#: secrets des canaux de `ameesh notify` (Slack, ntfy) : la même variable que
+#: `EnvironmentFile=-%h/.config/ameesh/notify.env` de l'unité systemd
+NOTIFY_ENV_FILE = ".config/ameesh/notify.env"
 #: PATH explicite des services : une session launchd n'importe pas celui du
 #: shell (mise, ~/.local/bin), et le runner doit y trouver ses harnais (L106)
 SERVICE_PATH = ("~/.local/share/mise/shims", "~/.local/bin",
@@ -60,9 +63,13 @@ NOTIFY_EXIT_TIMEOUT_S = 90
 #: `bootout` et `unload` attendent la sortie du job (au plus `ExitTimeOut`) :
 #: borner le client plus court tuerait launchctl avant l'arrêt du service.
 LAUNCHCTL_STOP_TIMEOUT_S = EXIT_TIMEOUT_S + 30.0
-#: messages de launchd qui confirment qu'un service n'est pas chargé
-NOT_LOADED_MARKERS = ("could not find service", "no such process",
-                      "service not found", "not loaded")
+#: messages de launchd qui confirment qu'un service n'est pas chargé.
+#: `bootout` récent dit « Boot-out failed: 113: Could not find specified
+#: service » (B3 de la revue #390) — plus précis que le message de `print`.
+NOT_LOADED_MARKERS = ("could not find service", "could not find specified service",
+                      "no such process", "service not found", "not loaded")
+#: code de sortie de launchd pour un service absent (`bootout`/`print`)
+NOT_LOADED_CODES = (113,)
 
 
 class ServiceError(RuntimeError):
@@ -86,6 +93,9 @@ class Service:
     label_name: str = ""
     #: borne d'arrêt du job (secondes), portée dans le plist (`ExitTimeOut`)
     exit_timeout: int = EXIT_TIMEOUT_S
+    #: fichiers d'environnement supplémentaires, relatifs au dossier de l'hôte
+    #: (`ameesh notify` source `notify.env`, comme son unité systemd)
+    extra_env_files: tuple[str, ...] = ()
 
     @property
     def label(self) -> str:
@@ -140,16 +150,18 @@ def shell_command(service: Service, ameesh_bin: str,
 
     `launchd` ne sait pas lire un `EnvironmentFile=` ; le shell lit le fichier
     de l'hôte (facultatif, 0600) pour que le DSN et les jetons ne soient pas
-    recopiés dans le plist (0644). Un fichier absent n'est pas une erreur :
-    la configuration peut venir de `config.json` ou du trousseau.
+    recopiés dans le plist (0644), puis les fichiers propres au service
+    (`notify.env`). Un fichier absent n'est pas une erreur : la configuration
+    peut venir de `config.json` ou du trousseau.
     """
     argv = " ".join(shlex.quote(str(item)) for item in (ameesh_bin, *service.args))
-    env_file = os.path.join(_home(env), HOST_ENV_FILE)
-    return ("set -a\n"
-            "if [ -r %(env)s ]; then . %(env)s; fi\n"
-            "set +a\n"
-            "exec %(argv)s\n"
-            % {"env": shlex.quote(env_file), "argv": argv})
+    lines = ["set -a"]
+    for relative in (HOST_ENV_FILE, *service.extra_env_files):
+        env_file = os.path.join(_home(env), relative)
+        quoted = shlex.quote(env_file)
+        lines.append("if [ -r %s ]; then . %s; fi" % (quoted, quoted))
+    lines += ["set +a", "exec %s" % argv]
+    return "\n".join(lines) + "\n"
 
 
 def payload(service: Service, ameesh_bin: str,
@@ -209,6 +221,8 @@ def _output(result) -> str:
 
 def _not_loaded(result) -> bool:
     """launchd confirme-t-il que le service n'est pas chargé ?"""
+    if getattr(result, "returncode", None) in NOT_LOADED_CODES:
+        return True
     text = _output(result).lower()
     return any(marker in text for marker in NOT_LOADED_MARKERS)
 

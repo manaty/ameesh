@@ -126,6 +126,14 @@ ameesh migrate
 ameesh doctor
 ```
 
+`~/.config/ameesh/env` is a **shell fragment** sourced by `/bin/sh`, not a
+systemd `EnvironmentFile=`: quote values that contain spaces, `&`, `$` or
+other shell metacharacters (`AMEESH_DSN='host=… user=… password=…'`), or the
+line will not reach the service as written. `ameesh notify` also sources
+`~/.config/ameesh/notify.env` (mode `0600`) for its channel secrets
+(`AMEESH_SLACK_WEBHOOK`, `AMEESH_NTFY_TOKEN`), like its systemd unit; the
+runner does not read that file.
+
 Install the services (launchd, user session):
 
 ```bash
