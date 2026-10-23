@@ -48,7 +48,7 @@ Le train reste en shadow ; le repli manuel s'applique.
 Chaque commit de composition a le lot en second parent, son sujet nomme le lot
 et son SHA, et il porte un trailer `ameesh-work: <lot>`.
 
-## Résolutions préparées et adaptations d'intégration
+## Résolutions préparées, retraits et adaptations de contenu
 
 | lot | paire | réf | contenu |
 |---|---|---|---|
@@ -57,6 +57,11 @@ et son SHA, et il porte un trailer `ameesh-work: <lot>`.
 Le lot #3035 garde sa tête gelée `b598739371f1` et ses deux avis ; le commit de
 résolution est composé comme source de l'unité 11. La résolution #2954×#3035
 reste disponible pour l'autre paire.
+
+- **#2954 — adaptation de contenu, pas un retrait** : les deux lignes de
+  compteurs ajoutées par #2954 (`490`/`418`) sont réécrites par l'union avec
+  #3035 (`491`/`419`) dans `docs/EXECUTEUR-MEDIEE.md` ; le contenu du lot est
+  bien porté, seule la valeur d'union diffère.
 
 Aucune autre adaptation de code ou de banc n'a été nécessaire : les 10 autres
 unités se sont composées sans conflit.
