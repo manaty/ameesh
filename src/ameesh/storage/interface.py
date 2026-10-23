@@ -370,8 +370,12 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def claim(self, name: str, owner: str, ttl_seconds: float, *,
-              require_responsible: bool) -> dict | None:
-        """Prend le bail s'il est libre ou expiré ; rend la ligne, sinon None."""
+              require_responsible: bool, host: str | None = None) -> dict | None:
+        """Prend le bail s'il est libre ou expiré ; rend la ligne, sinon None.
+
+        `host` (L165, EP1) : l'hôte qui réclame, pour un agent
+        `releve: election`. None : l'hôte de la ligne (comportement d'un agent
+        épinglé). Le serveur médié force cet argument à l'hôte de l'exécuteur."""
 
     @abc.abstractmethod
     def attach_claim(self, name: str, owner: str, ttl_seconds: float, *,
@@ -1445,6 +1449,11 @@ class WorkItems(Domain):
         """L118c: journaled project correction, atomically with its old value."""
 
     @abc.abstractmethod
+    def set_type(self, item_id: int, type: str, *, current: str, actor: str) -> dict | None:
+        """#2954: journaled lot type correction, if the lot still carries
+        `current` (compare-and-set, no lost concurrent correction)."""
+
+    @abc.abstractmethod
     def without_project(self) -> list[dict]:
         """L118c: open lots with empty app, once per id, including waiting_human."""
 
@@ -1462,7 +1471,7 @@ class WorkItems(Domain):
             estimate_source: str | None = None, change_size: str | None = None,
             queued_note: str | None = None, forced_note: str | None = None,
             mark_item_id: int | None = None, mark_note: str = "",
-            parent_lot: int | None = None) -> dict:
+            parent_lot: int | None = None, unique_ref: bool = False) -> dict:
         """Crée le lot en `intake` (rattaché à une fiche WorkPackage si
         `package_id`, L29 ; avec sa branche si `branch`, L118 ; sa priorité
         si `priority`, L130 ; avec sa durée estimée et sa ligne d'historique
@@ -1489,6 +1498,13 @@ class WorkItems(Domain):
         **same** transaction — a blocking edge if the parent is still open, a
         journal trace if it is already finished, everything rolled back if it
         is unknown.
+
+        `unique_ref` (#2954): with an `issue_ref`, take a transaction advisory
+        lock on the reference and refuse the creation (`DbError`) when any lot,
+        whatever its state, already carries it. Two hosts creating the incident
+        of the same run serialize: the second sees the first and the caller
+        re-reads the winner. Off by default: several lots may legitimately
+        share a reference except where the identity is one per execution.
 
         L'ordre des verrous est commun avec `assign` (#540, revue R1 delta) :
         les lignes de lots d'abord (`mark_item_id` et `parent_lot`, par
@@ -2624,6 +2640,40 @@ class Canon(Domain):
         si le CAS refuse une lecture périmée : la politique n'est pas appliquée."""
 
     @abc.abstractmethod
+    def set_election(self, name: str, releve: str, candidats: Sequence[str] | None,
+                     *, canon: str) -> None:
+        """L165 (EP1) : écrit `releve` / `candidats` de la ligne du canon et
+        retire les verdicts de candidats qui ne sont plus des candidats (ou
+        tous si le rôle redevient `hote`). Ne déplace jamais l'agent."""
+
+    @abc.abstractmethod
+    def write_candidate(self, name: str, host: str, *, canon: str, cwd: str | None,
+                        ok: bool | None, diagnostic: str, ref: str | None,
+                        harness: str | None, provider: str | None,
+                        model: str | None, credential_mode: str | None) -> None:
+        """L165 (EP1) : inscrit le verdict de placement de `name` sur l'hôte
+        candidat `host` (profil évalué calculé dans la même instruction), pour
+        que la réclamation depuis cet hôte soit jugée sur SA politique."""
+
+    @abc.abstractmethod
+    def candidate_names(self, host: str, canon: str = "") -> list[str]:
+        """L165 (EP1) : noms des agents qui ont un verdict de candidat sur
+        `host`, pour que le sync de CET hôte voie aussi les fiches retirées
+        dont la ligne est encore chez un autre détenteur."""
+
+    @abc.abstractmethod
+    def close_candidates(self, name: str, *, canon: str, diagnostic: str) -> None:
+        """L165 (EP1) : ferme TOUS les verdicts candidats d'un agent dont la
+        fiche est en erreur (responsable non résolu, candidat non admis…),
+        quel que soit l'hôte qui l'a constaté. Laisse `releve` intact ; une
+        synchronisation ultérieure rouvrira les hôtes valides."""
+
+    @abc.abstractmethod
+    def clear_candidate(self, name: str, host: str, *, canon: str) -> None:
+        """L165 (EP1) : retire le verdict candidat de `name` sur `host` (hôte
+        qui n'est plus admis), sans toucher aux autres candidats."""
+
+    @abc.abstractmethod
     def clear_responsible(self, name: str, host: str,
                           owner: tuple[str, bool] | None = None) -> None:
         """Vide le responsable d'un agent non éphémère de l'hôte ; `owner`
@@ -2671,11 +2721,15 @@ class Canon(Domain):
 
     @abc.abstractmethod
     def stop_removed(self, name: str, host: str, *, pending_text: str,
-                     stop_text: str, owner: tuple[str, bool] | None = None) -> dict | None:
+                     stop_text: str, owner: tuple[str, bool] | None = None,
+                     expected_lease_epoch: int | None = None) -> dict | None:
         """Arrête un agent retiré du canon (sauf en plein tour : arrêt demandé) ;
         rend name et status, ou None s'il n'y avait rien à faire. `owner` (L42) :
         (id, défaut) du canon auquel la ligne doit appartenir — jamais celle
-        d'un autre canon."""
+        d'un autre canon. `expected_lease_epoch` (L165) : le retrait constaté
+        sur un AUTRE hôte que celui de la ligne ne s'applique que si le bail
+        n'a pas changé depuis la lecture (aucune réclamation concurrente
+        n'est tuée)."""
 
 
 class Ephemerals(Domain):
@@ -3569,6 +3623,19 @@ class HostLifecycle(Domain):
     def detect_losses(self, *, actor: str, older_than: int,
                       critical: Sequence[str] = ()) -> list[dict]:
         """Close stale known hosts atomically; loss is not a quiescence proof."""
+
+    @abc.abstractmethod
+    def reconcile_loss(self, host: str, *, actor: str, fresh_within: int) -> dict:
+        """Reopen a lost host only on a verified proof.
+
+        Readings in database time must cover at least `fresh_within` without a
+        hole that large, with no reading dated in the future; every origin
+        agent must still be home and unfenced, with no live lease, no active
+        handoff and no `recover_source` attempt since the loss. The transition
+        `lost -> returning -> available` is atomic and leaves its actor and
+        evidence in `ameesh_events`. Returns `{"host", "mode", "reconciled",
+        "missing", ...}`; a refusal names the missing proof.
+        """
 
 
 class HostResources(Domain):

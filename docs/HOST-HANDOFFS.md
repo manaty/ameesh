@@ -125,6 +125,7 @@ request takes precedence over later resource readings that say `available`.
 The controller considers critical agents first, checks receiving-host
 readiness and uses a handoff at a turn boundary. `ameesh host undrain HOST`
 requests their return; an elapsed `--for` duration makes the same request.
+`ameesh host reconcile HOST` reopens a lost host on the verified proof below.
 Missing helper, secret requirements and host-scoped logins remain named
 refusals. These paths currently use simulated adapters.
 
@@ -136,9 +137,18 @@ as lost. An existing drain retains its generation and agent origins, but
 its automatic return timer is removed. A new heartbeat does not reopen
 claims on a lost host.
 `undrain` refuses a lost host; the planned-return path cannot bypass the
-recovery proof. A returning machine stays withdrawn until it is independently
-reconciled. Lost-host recovery moves agents forward rather than restoring an
-uncertain source executor.
+recovery proof. A returning machine stays withdrawn until a verified
+reconciliation proves a sustained fresh reading history in database time
+(covering one detection window without a hole, and no reading dated in the
+future), every origin agent still home with no live lease, no fence and no
+active handoff, and no `recover_source` attempt since the loss. The next
+lifecycle pass of a healthy runner, or `ameesh host reconcile HOST`, then
+records `lost -> returning -> available` with its actor and evidence in the
+event log. A single fresh heartbeat does not reopen claims, and an agent moved
+elsewhere by a recovery keeps the automatic proof closed.
+`ameesh_host_gate_state` names a lost host `lost` (the generic `draining` it
+used to return hid the bound). Lost-host recovery moves agents forward rather
+than restoring an uncertain source executor.
 
 Detection preserves agent placement, expired leases and running-turn state;
 it is not proof that an executor has stopped. Critical agents become eligible
@@ -182,3 +192,79 @@ quiescence reconciliation.
 All L232e host effects are currently tested with simulated adapters. The
 runner records `helper:L232b` when no enrolled implementation is supplied;
 real SSH, secret delivery and provider login integration depend on L232b/c/d.
+
+## Elected roles across candidate hosts (L165/EP1)
+
+A governance role can be declared on its Agent card as:
+
+```yaml
+releve: election
+candidats: [ameesh-agents-1, ameesh-agents-2, manaty-mesh-1, pc-smichea]
+```
+
+`releve` defaults to `hote` (today's behaviour: the claim only happens on the
+host of the registry row). With `election`, every host in `candidats` must be
+covered by the same Placement admission. `ameesh canon sync` evaluates and
+stores the placement verdict of each candidate host in `agent_candidates`
+(host policy and visibility included, with its evaluated profile), or refuses
+that candidate without blocking the others. A host policy that refuses the
+agent closes only that candidate (`agent_candidates.placement_ok=false`): it
+does not invalidate the host, and a pinned agent of the same host stays
+claimable. A card-level error (unresolved responsible, missing admission,
+invalid `releve`/`candidats`) closes **every** candidate, whichever candidate
+host read it. Removing the Agent or Placement
+card is noticed from any candidate host: the standby verdicts are deleted and
+the holder's own row is stopped on its host, guarded by its lease epoch so a
+concurrent claim is not killed.
+
+The lease is still the only permission to run: the first candidate whose
+runner finds the lease free or expired claims it. The claim moves the row to
+that host, with the candidate's work directory and placement verdict, and
+increments `lease_epoch`; the former holder is fenced from renewing, ending
+its turn or reclaiming. The holder is the one that renews, so only it takes
+turns.
+
+These roles are outside L232e: `host drain`, loss detection and handoff
+planning skip them, and a pending `handoff_fenced` does not close their claim.
+There is nothing to publish from a local worktree — the pilot's state lives in
+the mesh database, the canon and GitHub — so the L232e source proof does not
+apply. A stopped host loses the role when its lease expires (the L232e timing,
+180 s by default); a returning host goes back to standby until the lease is
+free again. This lot only makes the cross-host claim possible; EP2 decides
+which candidate wins and when (next section).
+
+## Candidate score, rank delay and hysteresis (L165/EP2)
+
+Each candidate host publishes, once a minute, a standing for every elected
+role it may hold (`role_standings`, migration 0476): seven-day availability
+from `host_resources`, a capacity tie-break, and **only the local part** of
+readiness — harness present, no known failing credential, and
+`account_turn.turn_hold` empty (account pause/ceiling, mesh and agent budget).
+Placement, host gate (`host_lifecycle`, `host_holds`, the gate state of the
+latest reading), canon state and freshness are recomputed by every reader
+from the database; a host's own word never covers them.
+
+**Availability** is the share of the last seven days covered by a fresh
+reading. A reading stands for the host's own staleness threshold —
+`host_lifecycle.staleness_s`: `max(180 s, 3 × its reading cadence)` — never a
+fixed window, and readings or standings dated in the future are refused. The
+denominator is always seven days, even for a host that appeared an hour ago:
+a newcomer has to prove itself before it beats an old VM. **Capacity** (load
+and memory headroom, 0..1) only orders equal availabilities; it never enters
+the five-point margin.
+
+Ranking keeps only fresh, fully ready candidates: a dead better candidate
+does not make the second wait. The best ready candidate claims with no delay,
+the second waits 20 s, the third 40 s… from the first time its runner saw the
+lease free. The delay is client-side and polite — `registry.claim` remains
+the only arbiter, so two hosts that try together still produce one holder.
+
+A holder keeps the role while it renews. A **planned handover** happens only
+when a challenger has stayed at least 5 availability points above the holder
+for a full hour (standing history, no hole beyond the freshness threshold)
+and both are fresh and ready: the holder releases at the end of its turn
+(epoch++), and does not reclaim for the challenger's rank delay plus 60 s, so
+a challenger that dies after the release does not leave the role free. A
+workstation that boots therefore does not take the role back from a VM.
+`ameesh role status [ROLE] [--json]` prints the holder, the epoch and the
+ranked candidates with the diagnostic of each refusal.

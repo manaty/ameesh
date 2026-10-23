@@ -245,7 +245,7 @@ def brief_once(cfg, db, now: float | None = None) -> dict:
     if db is None:
         return report
     try:
-        from . import alert_briefs, canon as canon_mod, decisions, mail, storage, \
+        from . import alert_briefs, canon as canon_mod, decisions, fil, mail, storage, \
             sous_utilisation, work
         pending = decisions.pending(db, now)
         gaps = gaps_for(pending, storage.of(db).notify_liveness.latest(), now)
@@ -257,6 +257,10 @@ def brief_once(cfg, db, now: float | None = None) -> dict:
         except Exception:  # noqa: BLE001 — sans canon, l'auditeur par son nom suffit
             canons = []
         auditors = alert_briefs.auditors(listing, canons)
+        # #3036 : un agent sans bail vivant ou sur un hôte aux claims fermés
+        # ne lira pas le brief ; `briefs` l'écarte et replie sur le fil du
+        # bureau au lieu de compter une remise perdue (N1 dev1/cx1).
+        closed = alert_briefs.claims_closed_hosts(db)
         # #3007 N1 (dev4) : les destinataires du brief sont ceux de l'alerte,
         # orchestrateurs DÉCLARÉS (`AMEESH_ALERT_ORCHESTRATORS`, défaut de
         # `--orchestrators`) et rôles du canon, pas les seuls rôles du canon.
@@ -271,7 +275,8 @@ def brief_once(cfg, db, now: float | None = None) -> dict:
             alert = alert_of(gap, orchestrators)
             texts = alert_briefs.briefs(
                 alert, listing, auditor_names=auditors,
-                orchestrator_names=set(orchestrators))
+                orchestrator_names=set(orchestrators),
+                closed_hosts=closed)
             for recipient, text in sorted(texts.items()):
                 claim = storage.of(db).notify_liveness.claim_brief(
                     recipient, gap["human"], since=since, now=now)
@@ -281,11 +286,23 @@ def brief_once(cfg, db, now: float | None = None) -> dict:
                 body = text
                 if claim.get("previous_ts") is not None:
                     body = alert_briefs.reminder(text, claim["previous_ts"], now)
+                payload = {"alert": GAP_TYPE, "human": gap["human"],
+                           "decisions": list(gap["decisions"]),
+                           "reason": gap["reason"]}
                 try:
-                    mail.send(db, work.SYSTEM_SENDER, recipient, body, kind="event",
-                              payload={"alert": GAP_TYPE, "human": gap["human"],
-                                       "decisions": list(gap["decisions"]),
-                                       "reason": gap["reason"]})
+                    if recipient == "thread:bureau":
+                        # #3036 : plus aucun agent vivant à joindre — la route
+                        # humaine est le fil lisible, pas une boîte fictive
+                        # (B1 dev1/cx1 : `thread:bureau` n'est pas un agent).
+                        if fil.record(cfg, db, sender=work.SYSTEM_SENDER,
+                                      recipients=["bureau"], text=body,
+                                      project=getattr(cfg, "project", None),
+                                      meta=payload) is None:
+                            raise RuntimeError(
+                                "readable thread did not take the brief")
+                    else:
+                        mail.send(db, work.SYSTEM_SENDER, recipient, body,
+                                  kind="event", payload=payload)
                 except Exception as exc:  # noqa: BLE001 — un destinataire ne bloque pas
                     storage.of(db).notify_liveness.release_brief(recipient, gap["human"])
                     report["failed"].append({"recipient": recipient,
