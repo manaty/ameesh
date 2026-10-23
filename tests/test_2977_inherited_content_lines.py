@@ -284,3 +284,48 @@ class CommitSurvivesTest(TestCase):
         self.assertEqual(review_authors._lines_in_tree(
             self.repo.root, root + "^", ["root_line_of_corrector()"]), set())
         self.assertTrue(self.survives(root, root))
+
+    def test_a_copy_regrouped_with_an_extra_line_keeps_the_corrector(self):
+        # #3220 B8 (revue cx2) : le chemin d'origine existe encore dans la
+        # tête, mais la copie a été reprise dans un fichier voisin, enrichi.
+        self.repo.write("a.py", "existing_call_here()\n")
+        self.repo.write("dest.py", "header_of_dest()\n")
+        base = self.repo.commit("base")
+        self.repo.write("b.py", "existing_call_here()\n")
+        fix = self.repo.commit("fix", agent="cx3")
+        self.repo.git("reset", "-q", "--hard", base)
+        self.repo.write("b.py", "rewritten_call_here()\n")
+        self.repo.write("dest.py", "header_of_dest()\n"
+                                   "existing_call_here()\n"
+                                   "audit_extra_line()\n")
+        head = self.repo.commit("impl: copie regroupée", agent="impl")
+        self.assertTrue(self.survives(head, fix, base))
+
+    def test_a_changed_file_with_only_the_inherited_heading_does_not_carry(self):
+        # #3216 garde : un autre document, même modifié par la tête, ne porte
+        # que l'en-tête hérité du document supprimé ; le contenu complet du
+        # document corrigé n'y est pas, donc son auteur ne revient pas.
+        heading = "heading line of the codex review\n"
+        self.repo.write("docs/other.md", heading)
+        base = self.repo.commit("base")
+        self.repo.write("docs/review/3211.md",
+                        heading + "second own line of codex\n"
+                        + "third own line of codex\n")
+        fix = self.repo.commit("fix", agent="cx3")
+        self.repo.git("reset", "-q", "--hard", base)
+        self.repo.write("docs/other.md", heading + "impl rewrite line\n")
+        head = self.repo.commit("impl: autre document modifié", agent="impl")
+        self.assertFalse(self.survives(head, fix, base))
+
+    def test_a_changed_original_does_not_carry_a_withdrawn_copy(self):
+        # #2977 B1 : l'original de la ligne copiée est modifié par la tête ;
+        # ce n'est pas la copie, retirée de son chemin destinataire.
+        self.repo.write("a.py", "existing_call_here()\n")
+        base = self.repo.commit("base")
+        self.repo.write("b.py", "existing_call_here()\n")
+        fix = self.repo.commit("fix", agent="cx3")
+        self.repo.git("reset", "-q", "--hard", base)
+        self.repo.write("b.py", "rewritten_call_here()\n")
+        self.repo.write("a.py", "existing_call_here()\n# impl comment\n")
+        head = self.repo.commit("impl: original modifié", agent="impl")
+        self.assertFalse(self.survives(head, fix, base))

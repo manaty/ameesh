@@ -592,3 +592,110 @@ class MovedCopyTest(_MixedCopyFixture):
         self.assertEqual({row["name"]: row["family"] for row in authors},
                          {"impl": "deepseek", "cx3": "codex"})
         self.assertIn("cx3", {row["name"] for row in correctors})
+
+
+class RegroupedRemovalAuditTest(_RegroupedRemovalFixture):
+    """B/P1 cx2 (3e témoin B5) : le fichier de reprise reçoit une ligne de plus.
+
+    Le regroupement n'est plus exact : `relocated/gate.py` vaut le contenu
+    corrigé **plus** `audit_session_identity()`. Git ne voit toujours aucun
+    `R` ; seul le contenu corrigé, retrouvé dans un chemin modifié depuis le
+    parent du correctif, prouve la survie."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo.write("relocated/gate.py",
+                        "require_session_identity()\n"
+                        "audit_session_identity()\n")
+        self.head_b = self.repo.commit(
+            "impl: garde corrigée regroupée puis auditée", agent="impl")
+        self.receipt("impl", "deepseek", [self.head_b])
+        self.freeze_b = self.freeze(self.head_b)
+        self.milestone = {"id": int(self.freeze_b["id"]), "sha": self.head_b,
+                          "actor": "impl", "at_ts": self.freeze_b.get("at_ts")}
+
+    def test_git_sees_no_rename_after_the_extra_line(self):
+        status = self.repo.git("diff", "--name-status", "-M",
+                               self.review_doc, self.head_b)
+        kinds = {line.split("\t", 1)[0][:1]
+                 for line in status.splitlines() if line}
+        self.assertNotIn("R", kinds)
+
+    def test_the_enriched_regrouped_removal_keeps_the_corrector(self):
+        authors, unknown, correctors = self.reading(
+            self.milestone, [self.head_b], self.base, self.head_b)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+        self.assertIn("cx3", {row["name"] for row in correctors})
+
+    def test_the_gate_refuses_the_corrector_with_an_enriched_regrouping(self):
+        klass = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "relocated/gate.py",
+                            "class": "sensitive",
+                            "rule": ["relocated/gate.py"]}],
+                 "repo": self.repo.root, "target": self.base,
+                 "base_sha": self.base}
+        for actor in ("cx3", "dev1"):
+            self.verdict(actor, self.head_b)
+        out = merge_queue.review_gate(
+            self.db, work.milestones(self.db, self.lot), self.head_b,
+            repo=self.repo.root, klass=klass, item=self.lot_item(), required=2)
+        self.assertFalse(out.get("error"), out)
+        self.assertFalse(out["ok"], out["why"])
+        self.assertEqual([entry["actor"] for entry in out["accepted"]],
+                         ["dev1"], out)
+        self.assertIn("cx3", {row["name"] for row in out["authors"]})
+
+
+class RegroupedCopyAuditTest(_RegroupedCopyFixture):
+    """B/P1 cx2 (3e témoin B5) : la copie reprise est enrichie après coup.
+
+    Même témoin que le retrait, sur une copie héritée : `relocated/gate.py`
+    contient le fichier corrigé **plus** `audit_session_identity()`."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo.write("relocated/gate.py",
+                        "# gate\n"
+                        "require_session_identity()\n"
+                        "audit_session_identity()\n")
+        self.head_b = self.repo.commit(
+            "impl: copie regroupée puis auditée", agent="impl")
+        self.receipt("impl", "deepseek", [self.head_b])
+        self.freeze_b = self.freeze(self.head_b)
+        self.milestone = {"id": int(self.freeze_b["id"]), "sha": self.head_b,
+                          "actor": "impl", "at_ts": self.freeze_b.get("at_ts")}
+
+    def test_git_sees_no_rename_after_the_extra_line(self):
+        status = self.repo.git("diff", "--name-status", "-M",
+                               self.review_doc, self.head_b)
+        kinds = {line.split("\t", 1)[0][:1]
+                 for line in status.splitlines() if line}
+        self.assertNotIn("R", kinds)
+
+    def test_the_enriched_regrouped_copy_keeps_the_corrector(self):
+        authors, unknown, correctors = self.reading(
+            self.milestone, [self.head_b], self.base, self.head_b)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+        self.assertIn("cx3", {row["name"] for row in correctors})
+
+    def test_the_gate_refuses_the_corrector_with_an_enriched_regrouped_copy(self):
+        klass = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "relocated/gate.py",
+                            "class": "sensitive",
+                            "rule": ["relocated/gate.py"]}],
+                 "repo": self.repo.root, "target": self.base,
+                 "base_sha": self.base}
+        for actor in ("cx3", "dev1"):
+            self.verdict(actor, self.head_b)
+        out = merge_queue.review_gate(
+            self.db, work.milestones(self.db, self.lot), self.head_b,
+            repo=self.repo.root, klass=klass, item=self.lot_item(), required=2)
+        self.assertFalse(out.get("error"), out)
+        self.assertFalse(out["ok"], out["why"])
+        self.assertEqual([entry["actor"] for entry in out["accepted"]],
+                         ["dev1"], out)
+        self.assertIn("cx3", {row["name"] for row in out["authors"]})
