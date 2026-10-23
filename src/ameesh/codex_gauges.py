@@ -29,6 +29,10 @@ _CACHE_LOCK = threading.Lock()
 MAX_FILES = 32
 TAIL_BYTES = 256 * 1024
 META_BYTES = 64 * 1024
+#: #3044 : longueur de la fenêtre courte Codex (5 h). Une courte vivante ne
+#: peut être observée que depuis moins d'une fenêtre courte ; au-delà, aucun
+#: relevé de l'échantillon ne peut la cacher, le compte est au repos.
+SHORT_WINDOW_S = 5 * 3600.0
 
 
 class SessionReadings(list):
@@ -176,6 +180,12 @@ def reconcile(readings, now, *, truncated=False, plan=None):
     saturée ou en overage, l'ignorer masquerait une pause ou une dépense
     (argent, overage) — le compte reste refusé. Sans forfait vivant lisible,
     ou avec plusieurs identités, le refus d'ambiguïté reste la règle.
+
+    #3044 : un échantillon tronqué d'un compte non-pro sans fenêtre courte
+    **vivante** est accepté quand une courte a été retenue (échue) et que le
+    relevé le plus récent est plus vieux qu'une fenêtre courte — le compte est
+    au repos, la courte échue vaut 0 % (L71). Un relevé récent sans courte
+    vivante, ou un échantillon sans aucune courte, garde le refus #2843.
     """
     from .cost import Gauges, _codex_overage
 
@@ -246,9 +256,24 @@ def reconcile(readings, now, *, truncated=False, plan=None):
         # sampled short observations have all expired is refused (a pause)
         # until a live one appears — the same prudence as for a sample with no
         # short window at all, accepting that bounded residual.
-        if sample_plans != {"pro"} and not any(
-                g.window_s <= 5 * 3600 and not g.reset_passed(now)
-                for g, _limits in windows.values()):
+        # #3044: an account left unused longer than the short window cannot
+        # produce a live short observation: a live short seen at `now` would
+        # have been observed less than one short window ago. When the newest
+        # observation of the plan-filtered sample is that old *and a short was
+        # observed* (even expired), the account is at rest — the retained
+        # short is expired and counts 0 % (L71), and refusing would deadlock it
+        # (never chosen, never refreshed). A recent observation without a live
+        # short keeps the #2843 refusal: it can hide a saturated short outside
+        # the bounded sample. A sample with no short at all keeps it too: the
+        # layout is not proven.
+        short_windows = [g for g, _limits in windows.values()
+                         if g.window_s <= SHORT_WINDOW_S]
+        short_live = any(not g.reset_passed(now) for g in short_windows)
+        newest = max((g.read_at for g, _limits in windows.values()
+                      if g.read_at is not None), default=None)
+        at_rest = newest is not None and now - newest >= SHORT_WINDOW_S
+        if sample_plans != {"pro"} and not short_live \
+                and not (short_windows and at_rest):
             missing.append("short window")
         if not any(g.window_s > 5 * 3600 for g, _limits in windows.values()):
             missing.append("weekly window")

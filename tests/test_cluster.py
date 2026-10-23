@@ -77,7 +77,8 @@ SIGNATURES = {
 CONTENUS = {
     "agent_peek": {"payload"},
     "agent_mailbox": {"body", "payload", "meta"},
-    "agent_registry": {"pending_prompt", "current_prompt", "restart_brief"},
+    "agent_registry": {"pending_prompt", "current_prompt", "restart_brief",
+                       "election_brief"},
     "agent_mesh_overview": {"pending_prompt", "current_prompt", "restart_brief"},
     "thread_index": {"last_excerpt"},
     "conversation_log": {"text", "meta", "thread_text"},
@@ -170,6 +171,11 @@ FERMEES = {
     # `ameesh cost turns --message` ; le contrat des rôles superviseur reste
     # inchangé : colonne fermée aux deux rôles, aucun GRANT modifié.
     "turn_costs": {"inputs"},
+    # L165 (EP2, 0476) : scores de candidats d'un rôle élu, lus par les
+    # exécuteurs candidats et `ameesh role status`, pas par le rôle
+    # superviseur ; table interne fermée aux deux rôles, aucun GRANT ajouté.
+    "role_standings": {"id", "name", "host", "evaluated_at", "availability",
+                       "capacity", "score", "ready", "diagnostic"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).

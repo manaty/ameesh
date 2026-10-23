@@ -125,6 +125,7 @@ request takes precedence over later resource readings that say `available`.
 The controller considers critical agents first, checks receiving-host
 readiness and uses a handoff at a turn boundary. `ameesh host undrain HOST`
 requests their return; an elapsed `--for` duration makes the same request.
+`ameesh host reconcile HOST` reopens a lost host on the verified proof below.
 Missing helper, secret requirements and host-scoped logins remain named
 refusals. These paths currently use simulated adapters.
 
@@ -136,9 +137,18 @@ as lost. An existing drain retains its generation and agent origins, but
 its automatic return timer is removed. A new heartbeat does not reopen
 claims on a lost host.
 `undrain` refuses a lost host; the planned-return path cannot bypass the
-recovery proof. A returning machine stays withdrawn until it is independently
-reconciled. Lost-host recovery moves agents forward rather than restoring an
-uncertain source executor.
+recovery proof. A returning machine stays withdrawn until a verified
+reconciliation proves a sustained fresh reading history in database time
+(covering one detection window without a hole, and no reading dated in the
+future), every origin agent still home with no live lease, no fence and no
+active handoff, and no `recover_source` attempt since the loss. The next
+lifecycle pass of a healthy runner, or `ameesh host reconcile HOST`, then
+records `lost -> returning -> available` with its actor and evidence in the
+event log. A single fresh heartbeat does not reopen claims, and an agent moved
+elsewhere by a recovery keeps the automatic proof closed.
+`ameesh_host_gate_state` names a lost host `lost` (the generic `draining` it
+used to return hid the bound). Lost-host recovery moves agents forward rather
+than restoring an uncertain source executor.
 
 Detection preserves agent placement, expired leases and running-turn state;
 it is not proof that an executor has stopped. Critical agents become eligible
@@ -224,5 +234,67 @@ claim without waiting for the TTL, the drained host cannot claim again, and the
 former holder is fenced from renewing, ending its turn or reclaiming. An
 unplanned stop loses the role when its lease expires (the L232e timing, 180 s
 by default); a returning host goes back to standby until the lease is free
-again. Candidate ranking, rank delays and hysteresis are EP2; this lot only
-makes the cross-host claim and the planned-drain release possible.
+again. This lot only makes the cross-host claim and the planned-drain release
+possible; EP2 decides which candidate wins and when (next section).
+
+## Candidate score, rank delay and hysteresis (L165/EP2)
+
+Each candidate host publishes, once a minute, a standing for every elected
+role it may hold (`role_standings`, migration 0476): seven-day availability
+from `host_resources`, a capacity tie-break, and **only the local part** of
+readiness — harness present, no known failing credential, and
+`account_turn.turn_hold` empty (account pause/ceiling, mesh and agent budget).
+Placement, host gate (`host_lifecycle`, `host_holds`, the gate state of the
+latest reading), canon state and freshness are recomputed by every reader
+from the database; a host's own word never covers them.
+
+**Availability** is the share of the last seven days covered by a fresh
+reading. A reading stands for the host's own staleness threshold —
+`host_lifecycle.staleness_s`: `max(180 s, 3 × its reading cadence)` — never a
+fixed window, and readings or standings dated in the future are refused. The
+denominator is always seven days, even for a host that appeared an hour ago:
+a newcomer has to prove itself before it beats an old VM. **Capacity** (load
+and memory headroom, 0..1) only orders equal availabilities; it never enters
+the five-point margin.
+
+Ranking keeps only fresh, fully ready candidates: a dead better candidate
+does not make the second wait. The best ready candidate claims with no delay,
+the second waits 20 s, the third 40 s… from the first time its runner saw the
+lease free. The delay is client-side and polite — `registry.claim` remains
+the only arbiter, so two hosts that try together still produce one holder.
+
+A holder keeps the role while it renews. A **planned handover** happens only
+when a challenger has stayed at least 5 availability points above the holder
+for a full hour (standing history, no hole beyond the freshness threshold)
+and both are fresh and ready: the holder releases at the end of its turn
+(epoch++), and does not reclaim for the challenger's rank delay plus 60 s, so
+a challenger that dies after the release does not leave the role free. A
+workstation that boots therefore does not take the role back from a VM.
+`ameesh role status [ROLE] [--json]` prints the holder, the epoch and the
+ranked candidates with the diagnostic of each refusal.
+
+## Standby executors and the election briefing (L165/EP3)
+
+Every candidate host runs the role's runner, and none of them takes a turn
+before the claim: the runner only creates a worker after `registry.claim`
+returns a live lease, the worker renews it before each turn, and a lost lease
+kills the harness before any further turn. Standby costs no tokens and opens
+no session.
+
+When the winner is a DIFFERENT host from the previous holder, no session
+crosses hosts. The same claim resets the session, its account and its lot
+(`session_reset_at` set durably) and persists the resume briefing built by
+the winner in `agent_registry.election_brief`. The new holder consumes it as
+the resume summary of its new session; the first turn is a short "you are
+elected" instruction framed by that briefing. The briefing is deterministic
+and built from the last persisted state (role card and canon, assigned and
+takeable lots, unread mail, pending decisions, alerts, GitHub observation per
+repository); it names the previous holder, the epoch and the session left
+behind. A same-host re-claim (runner restart) keeps the local session: it is
+not an election. A cross-host claim **without** the brief is refused (the CAS
+writes nothing): a mediated executor, whose brief is forced to null, therefore
+stays on standby. The brief is dropped with its session (`set_session`,
+`clear_session`) so it never resurfaces in a later session. The first turn
+after an election may open a lot session: the lot's minimal brief then
+completes the election briefing, it never replaces it (the role state is not
+lost when the first turn is a lot turn).

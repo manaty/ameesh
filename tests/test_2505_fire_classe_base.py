@@ -109,7 +109,10 @@ class StaleLocalTargetGitTest(unittest.TestCase):
                                              project=None, target="main")
         self.assertTrue(ok, why)
         self.assertEqual(klass["class"], "light")
-        self.assertEqual(klass["target"], "origin/main")
+        # #3091 : la trace nomme la cible déclarée ; la révision exacte lue
+        # (origin/main, B) est `base_sha`. La preuve du diff reste la même.
+        self.assertEqual(klass["target"], "main")
+        self.assertEqual(klass["base_sha"], "origin/main")
         self.assertEqual([entry["path"] for entry in klass["files"]], ["README.md"])
 
 
@@ -133,7 +136,10 @@ class ClassBaseResolutionTest(unittest.TestCase):
     def test_origin_is_read_first(self):
         read, of_lot = self.verdicts("origin/main")
         read.assert_called_once_with("/repo", "main")
-        self.assertEqual(of_lot.call_args.kwargs["base"], "origin/main")
+        # #3091 : le nom de la cible déclarée reste `main` ; la ref lue
+        # (`origin/main`) est épinglée en révision exacte `base_sha`.
+        self.assertEqual(of_lot.call_args.kwargs["base"], "main")
+        self.assertEqual(of_lot.call_args.kwargs["base_sha"], FROZEN)
 
     def test_the_local_target_is_the_fallback(self):
         """Un dépôt sans `origin/<cible>` (clone local, test) garde sa cible."""
