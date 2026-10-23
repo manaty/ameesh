@@ -259,6 +259,14 @@ rapporteurs déclarés avec `--lots "917 988"` et
 `--rapporteurs "mty-amh-docs-01"` (ou `LOTS_VERIF` / `RAPPORTEURS_VERIF` dans
 `BASCULE_ENV`).
 
+Sur le poste, `redemarrer` et `retour` passent par des unités transitoires
+`poste-maj-staging-<pid>-<action>` (`systemd-run --user --collect --wait --pipe`,
+#3039). Le staging attend leur résultat et conserve leur sortie dans son
+journal ; un échec suit le retour automatique puis la notification habituels.
+Cette enveloppe dans `staging.sh` couvre aussi le retour depuis le tick
+`ameesh-release.service`, sans modifier la garde #2950 de `poste.sh` qui
+refuse les appels directs depuis une unité `ameesh-*`.
+
 Le courrier nomme les hôtes, le commit **relu actif** sur chacun après la
 séquence, les preuves `installer`/`redemarrer`/`controler`/`sante` et les lots
 concernés. Un échec, un retour automatique, une séquence partielle

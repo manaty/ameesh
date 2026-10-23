@@ -258,6 +258,19 @@ compte. `creator_account_id` ne suffit pas à attribuer un relevé : une session
 reprise peut conserver son créateur alors que ses nouvelles jauges portent
 un autre forfait. Aucune valeur d'identifiant n'apparaît dans le diagnostic.
 Les fenêtres échues ne maintiennent pas ce refus.
+
+#3034 : pour un compte déclaré, le `auth.json` du compte vivant est lu ; son
+`id_token` nomme le forfait (`chatgpt_plan_type`). Si les relevés partagent
+une identité unique, ceux d'un autre forfait ne comptent plus pour
+l'ambiguïté ni dans les fenêtres, au lieu de rendre le compte inutilisable
+après une bascule. Ce forfait n'est pas une certitude : un relevé d'un autre
+forfait peut être plus récent que le dernier du forfait vivant. Aussi, si une
+de ses fenêtres vivantes est saturée ou en overage, le compte reste refusé —
+l'ignorer masquerait une pause ou une dépense. Une fenêtre de l'autre forfait
+déjà remise à zéro ne maintient pas ce refus. Le jeton n'est jamais affiché ni
+journalisé. Sans forfait vivant lisible (fichier absent, vide ou sans jeton),
+ou avec plusieurs identités de créateur, le refus d'ambiguïté reste la règle ;
+le compte non déclaré garde le comportement précédent.
 Sans compte déclaré, l'exécuteur met l'agent en pause avec la raison
 d'ambiguïté ; le rapport de coût affiche cette raison avec des jauges vides.
 La lecture porte sur les 32 journaux les plus récemment modifiés, avec
