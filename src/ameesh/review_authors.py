@@ -556,6 +556,50 @@ def _path_absent(repo: str, head: str, path: str, cache: dict):
     return cache[key]
 
 
+def _renamed_targets(repo: str, head: str, sha: str, cache: dict):
+    """Les renommages `sha..head` (`{ancien: nouveau}`), None si illisible.
+
+    #3220 B5 (revue cx2) : un chemin absent de la tête peut avoir été
+    **déplacé** ; le retrait ou la copie qui y vivait subsiste alors au
+    nouveau chemin. `git diff --name-status -z -M` donne la correspondance
+    exacte ; une lecture impossible est un doute (None), jamais une absence."""
+    key = ("renames", sha, head)
+    if key not in cache:
+        text = plan_git._out(repo, "diff", "--name-status", "-z", "-M",
+                             sha, head)
+        if text is None:
+            cache[key] = None
+        else:
+            renames = {}
+            fields = str(text).split("\0")
+            at = 0
+            while at < len(fields):
+                status = fields[at]
+                if not status:
+                    at += 1
+                    continue
+                if status[0] in ("R", "C"):
+                    if at + 2 >= len(fields):
+                        renames = None
+                        break
+                    if status[0] == "R" and fields[at + 1] and fields[at + 2]:
+                        renames[fields[at + 1]] = fields[at + 2]
+                    at += 3
+                else:
+                    at += 2
+            cache[key] = renames
+    return cache[key]
+
+
+def _renamed_target(repo: str, head: str, sha: str, path: str, cache: dict):
+    """Le nouveau chemin de `path`, "" s'il n'a pas été renommé, None si la
+    lecture des renommages est impossible (#3220 B5)."""
+    renames = _renamed_targets(repo, head, sha, cache)
+    if renames is None:
+        return None
+    return renames.get(path, "")
+
+
 def _path_line_counts(repo: str, rev: str, path: str, cache: dict):
     """Le nombre d'occurrences de chaque ligne (dépouillée) de `path` dans
     `rev`, ou None si le chemin y est absent ou illisible (#2977 B2)."""
@@ -720,23 +764,54 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
                 # existait après le commit, une suppression ultérieure a pu
                 # emporter l'édition entière ; une lecture impossible reste
                 # un doute.
-                if (added and _path_absent(repo, head, path, cache) is True
-                        and _path_absent(repo, sha, path, cache) is False):
-                    continue
+                if added:
+                    absent_head = _path_absent(repo, head, path, cache)
+                    absent_after = _path_absent(repo, sha, path, cache)
+                    if absent_head is None or absent_after is None:
+                        return True
+                    if absent_head and not absent_after:
+                        # #3220 B5 (revue cx2) : le fichier corrigé a pu être
+                        # déplacé ; le retrait subsiste alors au nouveau
+                        # chemin. Sans renommage prouvé, on ne conclut pas.
+                        moved = _renamed_target(repo, head, sha, path, cache)
+                        if moved is None:
+                            return True
+                        if moved:
+                            target = _head_lines(repo, head, moved, cache)
+                            if target is None or row.strip() not in target:
+                                return True
+                        continue
                 return True
             if row.strip() not in lines:
                 return True
     if copied:
-        # #2977 B1/B2 et #3220 B2 (revue cx2) : une copie ne subsiste qu'à
-        # son chemin. Une occurrence de plus que dans le parent la prouve ;
-        # un chemin absent ne la prouve pas quand des additions propres ont
-        # disparu (sinon une ligne d'en-tête commune rouvrirait #3216). Sans
-        # addition propre, un chemin absent reste le doute B8.
+        # #2977 B1/B2 et #3220 B2/B5 (revues cx2) : une copie ne subsiste
+        # qu'à son chemin, ou au chemin déplacé du fichier. Une occurrence de
+        # plus que dans le parent la prouve ; un chemin absent sans renommage
+        # ne la prouve pas quand des additions propres ont disparu (sinon une
+        # ligne d'en-tête commune rouvrirait #3216). Sans addition propre, un
+        # chemin absent reste le doute B8.
         for path, row in copied:
             present = _path_line_counts(repo, head, path, cache)
             if present is None:
-                if added and _path_absent(repo, head, path, cache) is True:
-                    continue
+                if added:
+                    absent = _path_absent(repo, head, path, cache)
+                    if absent is None:
+                        return True
+                    if absent:
+                        moved = _renamed_target(repo, head, sha, path, cache)
+                        if moved is None:
+                            return True
+                        if moved:
+                            target = _path_line_counts(repo, head, moved, cache)
+                            if target is None:
+                                return True
+                            before = _path_line_counts(
+                                repo, str(sha) + "^", path, cache) or {}
+                            if target.get(row.strip(), 0) > before.get(
+                                    row.strip(), 0):
+                                return True
+                        continue
                 return True
             before = _path_line_counts(repo, str(sha) + "^", path, cache) or {}
             if present.get(row.strip(), 0) > before.get(row.strip(), 0):
