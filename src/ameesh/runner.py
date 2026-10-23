@@ -4413,6 +4413,10 @@ class AgentWorker(threading.Thread):
         if getattr(self.runner, "mediated", False):
             # Device relocation is controlled by the mesh server (L109).
             return False
+        # L165 (EP1) : un rôle élu ne se déplace pas par handoff ; un autre
+        # hôte candidat reprend le bail expiré, sans preuve de source.
+        if self.agent.get("releve") == "election":
+            return False
         from . import handoffs, host_lifecycle, storage, work
         try:
             api = storage.of(self.db)
@@ -7943,6 +7947,36 @@ class AgentWorker(threading.Thread):
             return {"error": "unreadable stream: %s" % exc}
 
     # -- boucles -----------------------------------------------------------
+    #: L165 (EP2) : fréquence de vérification d'une bascule planifiée
+    HANDOVER_CHECK_S = 60.0
+
+    def _election_handover(self) -> dict | None:
+        """Une bascule planifiée est-elle due à cette fin de tour ? (EP2)
+
+        Lit la ligne fraîche du registre (l'échéance du bail y est renouvelée)
+        et laisse `election.handover_due` juger l'hystérésis : un challenger
+        resté ≥ 5 points de disponibilité au-dessus du détenteur pendant une
+        heure. Le retour est le challenger et la durée de la supériorité.
+        """
+        if (self.agent or {}).get("releve") != "election":
+            return None
+        now = _clock_of(self).monotonic()
+        if now < getattr(self, "_handover_next", 0.0):
+            return None
+        self._handover_next = now + self.HANDOVER_CHECK_S
+        from . import election
+        try:
+            row = registry.get(self.db, self.name)
+            if row is None:
+                return None
+            return election.handover_due(self.db, row, self.runner.host)
+        except db_mod.DbError as exc:
+            message = "elected-role handover not evaluated (%s)" % db_mod.explain(exc)
+            if message != getattr(self, "_handover_error", None):
+                log_async(message)
+            self._handover_error = message
+            return None
+
     def ensure_peek(self) -> None:
         if getattr(self, "_peek_publisher", None) is None:
             from .agent_peek import Publisher
@@ -8023,6 +8057,27 @@ class AgentWorker(threading.Thread):
                         break
                     self.apply_restart_if_requested()
                     self.maybe_rotate()
+                    # L165 (EP2) : bascule planifiée — le détenteur rend le bail
+                    # en fin de tour, le challenger le réclame à son rang.
+                    handover = self._election_handover()
+                    if handover:
+                        log("[%s] elected role: %s has stayed %.1f availability points "
+                            "ahead for %d min; lease released at end of turn"
+                            % (self.name, handover["challenger"], handover["gap"],
+                               max(1, int(handover["seconds"] // 60))))
+                        self._fil_note(
+                            "Elected role handed over to %s: it has stayed %.1f "
+                            "availability points ahead for %d min (planned switch at "
+                            "the end of this holder's turn)."
+                            % (handover["challenger"], handover["gap"],
+                               max(1, int(handover["seconds"] // 60))),
+                            meta={"action": "election-handover",
+                                  "challenger": handover["challenger"],
+                                  "ahead_s": round(handover["seconds"], 1)})
+                        self.runner.note_handover_release(
+                            self.name, handover["challenger"],
+                            float(handover.get("delay_s") or 0.0))
+                        break
                     # #1270 B1 : l'échéance de reprise durable garde le
                     # lancement du tour ; un courrier, un reset ou le budget
                     # ne la court-circuitent pas — l'attente consomme les
@@ -8182,6 +8237,19 @@ class Runner:
         #: `ameesh alerts` et `ameesh notify` (`exploitation.balance_thresholds`).
         self.take_balance = dict(take_balance or {})
         self._take_next = 0.0
+        #: L165 (EP2) : publication périodique des scores de candidats de cet
+        #: hôte (rôles `releve: election`), élagage de leur historique, et
+        #: instant (monotone) du premier bail libre vu par rôle pour le délai
+        #: par rang. Aucune écriture hors de `role_evaluation_once`.
+        self._role_eval_next = 0.0
+        self._role_prune_next = 0.0
+        self._role_error: str | None = None
+        self._election_free_since: dict[str, float] = {}
+        #: L165 (EP2) : `{rôle: (échéance monotone, challenger)}` — un détenteur
+        #: qui a rendu le bail pour une bascule planifiée ne le reprend qu'au-delà
+        #: du délai de rang du challenger plus une marge, sinon un challenger
+        #: mort laisserait le rôle libre pour toujours.
+        self._handover_released: dict[str, tuple[float, str]] = {}
         # #1467: explicit qualified passages only; no live policy selected here.
         self.train_passages = tuple(train_passages)
         # #2446: the exclusive service lease assembled from `train.host`.
@@ -8532,6 +8600,102 @@ class Runner:
         for agent in registry.claimable(self.db, self.host, self.agents_filter):
             self._note_unleased(agent, reason)
 
+    # -- rôles élus (L165, EP2) -------------------------------------------
+    #: fréquence de publication des scores de candidats de cet hôte
+    ROLE_EVAL_INTERVAL_S = 60.0
+    #: l'hystérésis lit une heure ; l'historique garde deux jours
+    ROLE_PRUNE_EVERY_S = 6 * 3600.0
+
+    def role_evaluation_once(self) -> int | None:
+        """Publie le score de cet hôte pour chaque rôle élu dont il est candidat.
+
+        Une ligne par rôle et par minute (`role_standings`), lue par les autres
+        hôtes et par `ameesh role status`. Silencieux en exécuteur médié (les
+        comptes et le budget sont sur le serveur) et en `--dry-run` (aucune
+        écriture). Seule la partie LOCALE est publiée (harnais, compte,
+        budget) : la porte, le canon, le placement et la fraîcheur sont
+        recalculés par le lecteur depuis la base.
+        """
+        if self.dry_run or getattr(self, "mediated", False):
+            return None
+        now = self.clock.monotonic()
+        if self._role_eval_next and now < self._role_eval_next:
+            return None
+        self._role_eval_next = now + self.ROLE_EVAL_INTERVAL_S
+        from . import election, role_standings_pg as pg
+        try:
+            published = election.publish_self(self.cfg, self.db, self.host)
+            self._role_error = None
+        except Exception as exc:  # un score de rôle ne fait jamais tomber l'exécuteur
+            message = "role standings not published (%s)" % db_mod.brief(exc)
+            if message != self._role_error:
+                log_async(message)
+            self._role_error = message
+            return None
+        if published and now >= self._role_prune_next:
+            self._role_prune_next = now + self.ROLE_PRUNE_EVERY_S
+            try:
+                pg.prune(self.db)
+            except db_mod.DbError as exc:
+                log_async("role standings not pruned (%s)" % db_mod.explain(exc))
+        return published
+
+    def note_handover_release(self, name: str, challenger: str,
+                              delay_s: float = 0.0) -> None:
+        """L165 (EP2) : ce détenteur vient de rendre le rôle pour une bascule.
+
+        Le challenger est le mieux classé : il tente le CAS tout de suite. Si
+        son exécuteur est mort, l'ancien détenteur ne reprend qu'après
+        `délai de rang du challenger + HANDOVER_RECLAIM_MARGIN_S`.
+        """
+        from . import election
+        self._handover_released[name] = (
+            self.clock.monotonic()
+            + max(0.0, float(delay_s)) + election.HANDOVER_RECLAIM_MARGIN_S,
+            challenger)
+
+    def handover_wait_s(self, name: str, now: float | None = None) -> float:
+        """Temps restant avant que ce détenteur puisse reprendre un rôle rendu."""
+        now = self.clock.monotonic() if now is None else float(now)
+        mark = self._handover_released.get(name)
+        if mark is None:
+            return 0.0
+        deadline, _challenger = mark
+        if now >= deadline:
+            del self._handover_released[name]
+            return 0.0
+        return deadline - now
+
+    def election_claim_allowed(self, agent: dict) -> tuple[bool, str, dict | None]:
+        """L165 (EP2) : ce rôle élu peut-il être tenté maintenant, à son rang ?
+
+        `free_since` est l'instant monotone où CETTE passe a vu le bail libre
+        pour la première fois ; le délai vaut `rang × 20 s`. Un hôte sans
+        relevé frais, non prêt, ou illisible ne tente pas : le CAS refuserait
+        de toute façon, mais il ne doit pas prendre la place d'un candidat prêt.
+        """
+        if self.dry_run or getattr(self, "mediated", False):
+            return True, "", None
+        from . import election
+        name = agent["name"]
+        now = self.clock.monotonic()
+        released = self._handover_released.get(name)
+        if released is not None:
+            left = self.handover_wait_s(name, now)
+            if left > 0:
+                return (False,
+                        "handover: waits %ds for %s" % (int(left) + 1, released[1]),
+                        None)
+        since = self._election_free_since.setdefault(name, now)
+        try:
+            return election.claim_wait(self.db, agent, self.host, since, now=now)
+        except Exception as exc:  # idem : fail closed, jamais un tour sans rang
+            message = "role standings unreadable (%s)" % db_mod.brief(exc)
+            if message != self._role_error:
+                log_async(message)
+            self._role_error = message
+            return False, "not ready: " + message, None
+
     def _start_host_gate(self) -> None:
         with self._host_gate_lock:
             self._gate_running = True
@@ -8867,6 +9031,7 @@ class Runner:
 
     def sweep(self) -> None:
         self.report_liveness()
+        self.role_evaluation_once()  # L165 (EP2) : score des candidats de l'hôte
         self.expire_delegations_once()
         for row in registry.reap(self.db, self.host):
             log("lease expired: %s (owner %s)" % (row["name"], row.get("lease_owner")))
@@ -8920,9 +9085,19 @@ class Runner:
             except Exception as exc:
                 log_async("auto-take pass failed (%s): %s; runner continues"
                           % (type(exc).__name__, db_mod.brief(exc)))
-        for agent in registry.claimable(self.db, self.host, self.agents_filter):
+        candidates = registry.claimable(self.db, self.host, self.agents_filter)
+        for agent in candidates:
             with self.lock:
                 if not self.once and agent["name"] in self.workers:
+                    continue
+            # L165 (EP2) : un rôle élu attend son rang avant de tenter le CAS ;
+            # le bail (EP1) reste le seul arbitre, ce délai n'est que la
+            # politesse qui laisse le meilleur candidat passer d'abord.
+            if agent.get("releve") == "election":
+                allowed, reason, _standing = self.election_claim_allowed(agent)
+                if not allowed:
+                    if reason.startswith("not ready"):
+                        self._note_unleased(agent, "election: " + reason)
                     continue
             admitted, slot = self._gate_slot(agent) if self.host_gate is not None \
                 else (True, None)
@@ -8951,10 +9126,17 @@ class Runner:
             try:
                 if getattr(self, "_host_gate_rejected", ""):
                     self._note_unleased(agent, self._host_gate_rejected)
-                lease = registry.claim(self.db, agent["name"], self.runner_id, self.lease_ttl)
+                lease = registry.claim(self.db, agent["name"], self.runner_id,
+                                       self.lease_ttl, host=self.host)
                 if not lease:
                     self._release_slot(agent["name"])
                     continue  # un autre exécuteur a gagné la course
+                self._election_free_since.pop(agent["name"], None)
+                # L165 (EP1) : un rôle élu peut être réclamé depuis cet hôte
+                # alors que sa ligne était chez un autre candidat ; le worker
+                # doit lire l'hôte et le dossier effectivement acquis.
+                agent = dict(agent, host=lease.get("host") or self.host,
+                             cwd=lease.get("cwd", agent.get("cwd")))
                 log("lease acquired: %s (epoch %s, host %s)"
                     % (agent["name"], lease["lease_epoch"], self.host))
                 worker = AgentWorker(self, agent, lease)
@@ -9009,6 +9191,19 @@ class Runner:
                 if not registered:
                     self._release_slot(agent["name"])
                 raise
+
+        # L165 (EP2) : un rôle qui n'est plus libre (bail repris ailleurs)
+        # repart de zéro au prochain bail libre : le délai par rang se compte
+        # depuis la première observation de CETTE liberté.
+        free = {agent["name"] for agent in candidates
+                if agent.get("releve") == "election"
+                and agent["name"] in self._election_free_since}
+        for name in list(self._election_free_since):
+            if name not in free:
+                del self._election_free_since[name]
+        for name in list(self._handover_released):
+            if name not in free:
+                del self._handover_released[name]
 
     #: `--once` : intervalle des nouveaux essais d'un bail non rendu
     RELEASE_RETRY_S = 5.0
@@ -9818,7 +10013,8 @@ class Runner:
         try:
             api = storage.of(db).host_lifecycle
             api.detect_losses(actor=self.runner_id,
-                              older_than=max(180, int(self.cfg.resource_interval * 3)),
+                              older_than=int(host_lifecycle.staleness_s(
+                                  self.cfg.resource_interval)),
                               critical=host_lifecycle.critical_names(self.cfg, db))
             api.expire_returns()
             for control in api.listing():

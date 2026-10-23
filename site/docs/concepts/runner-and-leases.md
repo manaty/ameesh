@@ -32,6 +32,20 @@ unless moving between admitted hosts is enabled (see
 [below](#host-resources-and-back-pressure)). The **lease is the only
 permission to run**.
 
+An Agent card may instead declare `releve: election` with a list of
+`candidats` (hosts its Placement already admits). The runner is installed on
+every candidate; any of them may take the lease when it is free or expired,
+and the winner becomes the holder. `canon sync` writes the placement verdict
+of **each** candidate host, so the host policy and visibility rule are still
+checked on the host that claims. Such a role is not moved by L232e: there is
+no local work to publish, and the lease epoch fences the former holder. The
+repository note `docs/HOST-HANDOFFS.md` has the full election rules. The
+best *ready* candidate wins, with a short per-rank delay before the claim
+(0 s, 20 s, 40 s…); availability over seven days decides, capacity only breaks
+ties, and a holder is replaced only after a challenger has stayed 5 points
+ahead for an hour, at the end of the holder's turn. `ameesh role status` shows
+the holder, the epoch and the ranking.
+
 - **Exclusive claim.** A claim is one conditional, atomic `UPDATE`: two runners
   cannot win the same agent. This is tested with 2 and 4 concurrent
   connections, and with two runner processes competing for the same lease.
