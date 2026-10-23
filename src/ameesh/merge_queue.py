@@ -1346,7 +1346,7 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
     comme la porte historique. Toute lecture illisible — lecteur partagé,
     cible, gel, `git log`, registre — lève `_ProvenanceError` : la porte
     refuse au lieu d'accepter une liste partielle."""
-    from . import review_authors, review_lot
+    from . import resolutions, review_authors, review_lot
     if not repo:
         raise _ProvenanceError("no repository for the frozen delta")
     try:
@@ -1372,7 +1372,8 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
         if not text:
             continue
         try:
-            url = (plan_git._out(text, "remote", "get-url", "origin") or "").strip()
+            url = resolutions._local_from(  # #3041 : relatif à `text`
+                text, plan_git._out(text, "remote", "get-url", "origin") or "")
         except Exception:  # noqa: BLE001 - remote illisible : pas de source
             url = ""
         if url and url not in sources:
@@ -1754,7 +1755,9 @@ def fetch_fresh(repo: str, names, clone=None,
     from . import resolutions
     names = sorted({n for n in names if n})
     remote = {n: _remote_branch(n) for n in names}
-    url = plan_git._out(repo, "remote", "get-url", "origin")
+    # #3041 : l'URL est rejouée dans le clone ; un chemin relatif se lit
+    # depuis `repo`.
+    url = resolutions._local_from(repo, plan_git._out(repo, "remote", "get-url", "origin") or "")
     if not url:
         return {n: plan_git._commit(repo, "refs/heads/" + remote[n]) for n in names}, repo
     what = "branch%s %s" % ("es" if len(names) > 1 else "", ", ".join(names))
