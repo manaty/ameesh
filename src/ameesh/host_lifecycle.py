@@ -8,6 +8,22 @@ from . import config, db as db_mod, estimates, handoffs, host_preflight, registr
 from .config import NAME_RE
 
 
+#: L232e/L165 : a host is stale after three readings, and never under 180 s
+#: (a resource poll faster than a minute would otherwise declare a lost host
+#: after a hiccup). The election uses the same threshold for a candidate's
+#: reading and its standing, so one rule decides freshness everywhere.
+MIN_STALENESS_S = 180.0
+
+
+def staleness_s(interval_s) -> float:
+    """The staleness threshold of a host whose readings come every `interval_s`."""
+    try:
+        interval = max(0.0, float(interval_s or 0.0))
+    except (TypeError, ValueError):
+        interval = 0.0
+    return max(MIN_STALENESS_S, 3.0 * interval)
+
+
 def drain(cfg, db, host, *, duration=None, critical=(), actor=None):
     """`actor`: the human the API authenticated (L87); otherwise the session's
     corrector (a human, an orchestrator or a design agent)."""
