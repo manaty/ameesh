@@ -214,11 +214,15 @@ increments `lease_epoch`; the former holder is fenced from renewing, ending
 its turn or reclaiming. The holder is the one that renews, so only it takes
 turns.
 
-These roles are outside L232e: `host drain`, loss detection and handoff
-planning skip them, and a pending `handoff_fenced` does not close their claim.
-There is nothing to publish from a local worktree — the pilot's state lives in
-the mesh database, the canon and GitHub — so the L232e source proof does not
-apply. A stopped host loses the role when its lease expires (the L232e timing,
-180 s by default); a returning host goes back to standby until the lease is
-free again. Candidate ranking, rank delays and hysteresis are EP2; this lot
-only makes the cross-host claim possible.
+These roles are outside L232e's handoff: loss detection and handoff planning
+skip them, and a pending `handoff_fenced` does not close their claim. There is
+nothing to publish from a local worktree — the pilot's state lives in the mesh
+database, the canon and GitHub — so the L232e source proof does not apply. A
+planned `host drain` still returns the holder's lease immediately, in the same
+transaction as the drain and with `lease_epoch` incremented: a standby can
+claim without waiting for the TTL, the drained host cannot claim again, and the
+former holder is fenced from renewing, ending its turn or reclaiming. An
+unplanned stop loses the role when its lease expires (the L232e timing, 180 s
+by default); a returning host goes back to standby until the lease is free
+again. Candidate ranking, rank delays and hysteresis are EP2; this lot only
+makes the cross-host claim and the planned-drain release possible.

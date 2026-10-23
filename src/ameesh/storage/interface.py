@@ -3580,7 +3580,13 @@ class HostLifecycle(Domain):
     @abc.abstractmethod
     def drain(self, host: str, *, actor: str, duration: int | None = None,
               critical: Sequence[str] = ()) -> dict:
-        """Close claims/enable atomically and retain agents' original host."""
+        """Close claims/enable atomically and retain agents' original host.
+
+        #3029: an elected role holding its lease on this host is returned in
+        the same transaction, with its epoch bumped, so another candidate can
+        claim at once instead of waiting for the TTL. It stays out of the
+        L232e handoff journal (there is no local work to publish).
+        """
 
     @abc.abstractmethod
     def undrain(self, host: str, *, actor: str) -> dict | None:
