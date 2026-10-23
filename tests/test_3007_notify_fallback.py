@@ -70,8 +70,19 @@ class GapsTest(unittest.TestCase):
         self.assertEqual(notify_gap.gaps_for(_pending(), [_row(seen_ts=900.0)],
                                              1000.0), [])
 
+    def test_une_demande_toute_neuve_n_est_pas_encore_un_ecart(self):
+        # Grâce ALIVE_S : une demande qui vient de naître peut précéder le
+        # prochain battement (30 s) ; un autre notificateur est vivant.
+        rows = [_row(human=BOB, seen_ts=900.0)]
+        neuve = [{"id": 9, "owner": ALICE, "created_ts": 995.0, "overdue": False}]
+        self.assertEqual(notify_gap.gaps_for(neuve, rows, 1000.0), [])
+        vieille = [{"id": 9, "owner": ALICE, "created_ts": 300.0, "overdue": False}]
+        (gap,) = notify_gap.gaps_for(vieille, rows, 1000.0)
+        self.assertEqual((gap["human"], gap["reason"]), (ALICE, "uncovered"))
+
     def test_un_autre_humain_couvert_ne_couvre_pas_alice(self):
-        (gap,) = notify_gap.gaps_for(_pending(), [_row(human=BOB, seen_ts=900.0)], 1000.0)
+        (gap,) = notify_gap.gaps_for(_pending(now=700.0),
+                                     [_row(human=BOB, seen_ts=900.0)], 1000.0)
         self.assertEqual((gap["reason"], gap["last_host"], gap["last_seen"]),
                          ("uncovered", None, None))
         self.assertIn("no notifier has ever reported covering human:alice",
@@ -82,7 +93,8 @@ class GapsTest(unittest.TestCase):
                                              [_row(seen_ts=100.0)], 1000.0), [])
 
     def test_deux_humains_deux_ecarts_ordre_stable(self):
-        pending = _pending(ids=(7,), owner=BOB) + _pending(ids=(8,), owner=ALICE)
+        pending = _pending(ids=(7,), owner=BOB) + _pending(ids=(8,), owner=ALICE,
+                                                          now=700.0)
         gaps = notify_gap.gaps_for(pending, [_row(human=BOB, seen_ts=100.0)], 1000.0)
         self.assertEqual([g["human"] for g in gaps], [ALICE, BOB])
 
@@ -220,8 +232,24 @@ class AlertesTest(PgTestCase):
         (again,) = self.alerts(now=now + 60)
         self.assertEqual(exploitation.alert_key(alert), exploitation.alert_key(again))
 
+    def test_un_autre_hote_qui_couvre_ferme_l_ecart(self):
+        # cx1 : un autre hôte réellement couvrant doit fermer l'écart, même
+        # quand le poste perdu avait couvert l'humain et que la VM l'exclut.
+        self.ask()
+        now = self.beat(age=3600)
+        ncfg = notify.parse_config({"routes": {ALICE: []}, "default": ["app"]})
+        notify_gap.beat(self.cfg, self.db, ncfg, now=now)
+        self.assertEqual(len(self.alerts(now=now)), 1)
+        storage.of(self.db).notify_liveness.beat("ameesh-agents-1", [ALICE], now=now)
+        self.assertEqual(self.alerts(now=now), [])
+
     def test_un_autre_humain_couvert_laisse_alice_decouverte(self):
         view = self.ask()
+        # Grâce ALIVE_S : la demande doit être plus vieille que la fenêtre
+        # pour que l'absence de couverture soit un constat, pas une course.
+        self.db.execute(
+            "UPDATE agent_mailbox SET created_at = now() - interval '20 minutes'"
+            " WHERE id = %s", (view["id"],))
         now = self.beat(human=BOB)
         (alert,) = self.alerts(now=now)
         self.assertEqual((alert["reason"], alert["last_host"]), ("uncovered", None))

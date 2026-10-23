@@ -131,6 +131,11 @@ def gaps_for(pending, rows, now: float, *, alive_s: float = ALIVE_S) -> list[dic
         oldest = float(views[0].get("created_ts") or 0.0)
         age = max(0.0, now - oldest) if oldest else 0.0
         last = _last(rows, human)
+        if last is None and oldest and now - oldest < alive_s:
+            # Une demande toute neuve peut précéder le prochain battement du
+            # notificateur (30 s) : laisser à un notificateur vivant le temps
+            # de la couvrir avant de dire qu'aucun ne l'a jamais couverte.
+            continue
         if last is None:
             prefix = ("no notifier has ever reported covering %s while another "
                       "notifier is alive" % human)
