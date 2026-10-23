@@ -7969,7 +7969,9 @@ class AgentWorker(threading.Thread):
             row = registry.get(self.db, self.name)
             if row is None:
                 return None
-            return election.handover_due(self.db, row, self.runner.host)
+            return election.handover_due(
+                self.db, row, self.runner.host,
+                skip=self.runner.handover_failed(self.name))
         except db_mod.DbError as exc:
             message = "elected-role handover not evaluated (%s)" % db_mod.explain(exc)
             if message != getattr(self, "_handover_error", None):
@@ -8250,6 +8252,12 @@ class Runner:
         #: du délai de rang du challenger plus une marge, sinon un challenger
         #: mort laisserait le rôle libre pour toujours.
         self._handover_released: dict[str, tuple[float, str]] = {}
+        #: L165 (EP2) : `{rôle: {challenger: échéance monotone}}` — un
+        #: challenger qui n'a pas réclamé dans sa fenêtre est écarté des
+        #: bascules pendant `HYSTERESIS_S` : sans cela, le détenteur repris
+        #: redonnerait le rôle au même challenger mort à chaque nouveau worker
+        #: et ne prendrait jamais un tour (B1 de la relecture #3011).
+        self._handover_failed: dict[str, dict[str, float]] = {}
         # #1467: explicit qualified passages only; no live policy selected here.
         self.train_passages = tuple(train_passages)
         # #2446: the exclusive service lease assembled from `train.host`.
@@ -8655,16 +8663,46 @@ class Runner:
             challenger)
 
     def handover_wait_s(self, name: str, now: float | None = None) -> float:
-        """Temps restant avant que ce détenteur puisse reprendre un rôle rendu."""
+        """Temps restant avant que ce détenteur puisse reprendre un rôle rendu.
+
+        À l'échéance de la marge, le challenger est enregistré comme ayant
+        échoué : le détenteur peut reprendre, mais ne redonne plus le rôle à ce
+        challenger pendant `HYSTERESIS_S` (`handover_failed`, lu par
+        `_election_handover`).
+        """
         now = self.clock.monotonic() if now is None else float(now)
         mark = self._handover_released.get(name)
         if mark is None:
             return 0.0
-        deadline, _challenger = mark
+        deadline, challenger = mark
         if now >= deadline:
+            from . import election
+            self._handover_failed.setdefault(name, {})[challenger] = (
+                now + election.HYSTERESIS_S)
             del self._handover_released[name]
             return 0.0
         return deadline - now
+
+    def handover_failed(self, name: str, now: float | None = None) -> tuple[str, ...]:
+        """Challengers écartés des bascules de ce rôle (cooldown non expiré).
+
+        Un challenger qui publie un relevé prêt mais ne réclame jamais (filtre
+        d'agents de son exécuteur, porte d'hôte, refus du CAS non couvert par
+        la préparation) ne doit pas faire tourner le rôle en boucle : le
+        détenteur repris l'ignore pendant `HYSTERESIS_S`, puis la bascule
+        redevient possible s'il est toujours ≥ 5 points devant.
+        """
+        now = self.clock.monotonic() if now is None else float(now)
+        current = self._handover_failed.get(name)
+        if not current:
+            return ()
+        for host, until in list(current.items()):
+            if until <= now:
+                del current[host]
+        if not current:
+            self._handover_failed.pop(name, None)
+            return ()
+        return tuple(sorted(current))
 
     def election_claim_allowed(self, agent: dict) -> tuple[bool, str, dict | None]:
         """L165 (EP2) : ce rôle élu peut-il être tenté maintenant, à son rang ?

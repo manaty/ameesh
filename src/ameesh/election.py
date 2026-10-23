@@ -641,17 +641,23 @@ def _streak(history: Sequence[Mapping], challenger: str, holder: str,
 
 
 def handover(db, role: Mapping, holder_host: str, *,
-             now: float | None = None) -> dict | None:
+             now: float | None = None,
+             skip: Sequence[str] = ()) -> dict | None:
     """Is a planned handover due at the holder's end of turn?
 
     `role` is the registry row of the elected role, `holder_host` the host
     that currently holds the lease and renews it. A challenger must be fully
     ready now, the holder fully ready and fresh, and the challenger must have
-    stayed `HYSTERESIS_POINTS` above the holder for a full hour.
+    stayed `HYSTERESIS_POINTS` above the holder for a full hour. `skip` names
+    challengers the caller has just seen fail to claim after a planned
+    release: they are ignored until their cooldown expires, so the holder
+    does not hand the role over to the same dead challenger every minute
+    (B1 of the #3011 review).
     """
     now = pg.now_ts(db) if now is None else float(now)
+    skipped = {str(host) for host in skip}
     declared = [host for host in (role.get("candidats") or [])
-                if host != holder_host]
+                if host != holder_host and host not in skipped]
     if not declared:
         return None
     latest = pg.latest(db, role["name"])
@@ -685,13 +691,14 @@ def handover(db, role: Mapping, holder_host: str, *,
 
 
 def handover_due(db, role: Mapping, holder_host: str, *,
-                 now: float | None = None) -> dict | None:
+                 now: float | None = None,
+                 skip: Sequence[str] = ()) -> dict | None:
     """`handover`, plus the holder-side lease check, for the worker loop."""
     now = pg.now_ts(db) if now is None else float(now)
     expires = role.get("lease_expires_ts")
     if not role.get("lease_owner") or expires is None or float(expires) <= now:
         return None
-    return handover(db, role, holder_host, now=now)
+    return handover(db, role, holder_host, now=now, skip=skip)
 
 
 # --------------------------------------------------------------------------

@@ -434,6 +434,17 @@ class HysteresisTest(_RoleCase):
         self.assertGreaterEqual(due["seconds"], 3600.0)
         self.assertAlmostEqual(due["gap"], 6.0, delta=0.01)
 
+    def test_une_bascule_peut_ecarter_un_challenger(self):
+        # B1 de la relecture #3011 : un challenger qui n'a pas réclamé après
+        # la libération est écarté par le runner ; le lecteur doit accepter
+        # cet écarte, sans éteindre la bascule pour les autres.
+        now = self.history("pilote", "banc", 90.0)
+        self.history("pilote", "atelier", 96.0, now=now)
+        self.assertIsNotNone(
+            election.handover(self.db, self.role_row, "banc", now=now))
+        self.assertIsNone(election.handover(
+            self.db, self.role_row, "banc", now=now, skip=("atelier",)))
+
     def test_pas_de_bascule_avant_une_heure(self):
         now = self.history("pilote", "banc", 90.0, minutes=45)
         self.history("pilote", "atelier", 96.0, minutes=45, now=now)
@@ -529,6 +540,13 @@ class RunnerWiringTest(_RoleCase):
         self.addCleanup(obj.stop.set)
         return obj
 
+    def history(self, name: str, host: str, score: float, *, minutes: int = 70,
+                now: float | None = None) -> float:
+        now = pg.now_ts(self.db) if now is None else now
+        for minute in range(minutes):
+            self.standing(name, host, score, evaluated_ts=now - minute * 60.0)
+        return now
+
     def test_le_runner_attend_son_rang_avant_de_reclamer(self):
         self.standing("pilote", "atelier", 99.0)
         self.standing("pilote", "banc", 90.0)
@@ -558,6 +576,28 @@ class RunnerWiringTest(_RoleCase):
         obj._handover_released["pilote"] = (now - 1.0, "atelier")
         allowed, reason, _ = obj.election_claim_allowed(self.role_row)
         self.assertTrue(allowed, reason)
+        self.assertIn("atelier", obj.handover_failed("pilote"))
+
+    def test_le_detenteur_repris_ne_redonne_pas_au_challenger_defaillant(self):
+        # B1 de la relecture #3011 : après la reprise passée la marge, le
+        # challenger qui n'a pas réclamé est écarté ; le worker suivant prend
+        # un tour au lieu de rendre le bail aussitôt (boucle sans tour).
+        now = self.history("pilote", "banc", 90.0)
+        self.history("pilote", "atelier", 96.0, now=now)
+        role_row = self.hold("pilote", "banc", epoch=7, expires_in=300)
+        obj = self.runner()
+        obj.note_handover_release("pilote", "atelier", 0.0)
+        obj._handover_released["pilote"] = (obj.clock.monotonic() - 1.0, "atelier")
+        self.assertEqual(obj.handover_wait_s("pilote"), 0.0)
+        self.assertIn("atelier", obj.handover_failed("pilote"))
+        worker = runner.AgentWorker(obj, registry.get(self.db, "pilote"), role_row)
+        self.addCleanup(worker.watchdog_stop.set)
+        self.assertIsNone(worker._election_handover())
+        # Sans refroidissement, la bascule reste due : le correctif l'écarte
+        # seulement pour le challenger qui a échoué.
+        obj._handover_failed.clear()
+        worker._handover_next = 0.0
+        self.assertIsNotNone(worker._election_handover())
 
     def test_le_runner_publie_le_score_de_l_hote(self):
         self.ready_host("pilote", "banc")
