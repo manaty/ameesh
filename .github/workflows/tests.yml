@@ -1030,6 +1030,15 @@ jobs:
       actions: read   # #856 : relire l'état terminal des jobs d'une exécution
       checks: write   # #856 : conclure les checks « tests (flux) » orphelins
     steps:
+      # #3251 (décision #128512) : un run annulé n'a produit aucun agrégat
+      # conclu. `always()` sur le job laisse cette étape s'exécuter ; elle
+      # échoue explicitement pour que le check requis reste rouge, même si
+      # des parts avaient déjà conclu avant l'annulation.
+      - name: run annulé
+        if: cancelled()
+        run: |
+          echo "::error title=tests : run annulé::l'agrégat requis ne conclut pas sur un run annulé (#3251, décision #128512)."
+          exit 1
       # #3251 : le bilan lit `scripts/ci-agregat.py` du dépôt ; le checkout
       # doit donc précéder l'étape (le job n'avait jusque-là besoin d'aucun
       # fichier avant la réconciliation #856). `continue-on-error` : un
@@ -1047,14 +1056,16 @@ jobs:
           # l'agrégat conclut sur ce que les parts ont prouvé. Un job interne
           # **annulé** (capacité hébergée, runner perdu : `cancelled`,
           # `timed_out`, `startup_failure`) n'est pas un négatif : l'agrégat
-          # conclut vert et le classifieur publie le check de détail
-          # `tests (bilan des parts)` en `neutral`, que fire et radar
-          # consignent (lot de correction #3209) sans retenir paquet ni
-          # release (canon §3). Un **échec** (`FAILURE`), une part sautée qui
-          # devait tourner ou un plan refusé restent un négatif : `tests`
-          # rougit. #940 n'est pas rouvert : si une annulation ne peut pas être
-          # consignée (jeton en lecture seule, API en panne), le classifieur
-          # échoue et `tests` reste rouge — jamais de SUCCESS muet.
+          # conclut vert **s'il garde au moins une part réussie**, et le
+          # classifieur publie le check de détail `tests (bilan des parts)` en
+          # `neutral`, que fire et radar consignent (lot de correction #3209)
+          # sans retenir paquet ni release (canon §3). Un **échec**
+          # (`FAILURE`), une part sautée qui devait tourner, un plan refusé
+          # **ou aucune part réussie** (toutes annulées : preuve absente,
+          # #128512) restent un négatif : `tests` rougit. #940 n'est pas
+          # rouvert : si une annulation ne peut pas être consignée (jeton en
+          # lecture seule, API en panne), le classifieur échoue et `tests`
+          # reste rouge — jamais de SUCCESS muet.
           #
           # La classification est dans scripts/ci-agregat.py (pur, testé sans
           # CI) ; l'étape ne fait que lui passer les résultats des `needs`.

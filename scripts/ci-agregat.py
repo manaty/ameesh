@@ -19,10 +19,15 @@ Ce script sépare donc les deux :
   négatif : l'agrégat conclut rouge (code retour 1) ;
 * une **annulation interne** (`cancelled`, `timed_out`, `startup_failure`,
   `stale`, `action_required`) est un non concluant : l'agrégat conclut vert
-  — il a conclu — mais publie le check de détail `tests (bilan des parts)`
-  en `neutral`, avec la part et son état. `fire` et `radar` le consignent
-  (lot de correction #3209) sans retenir le paquet ni la release. Le détail
-  est aussi écrit en annotation `::warning::`, jamais muet.
+  s'il garde **au moins une part réussie** — il a conclu — et publie le
+  check de détail `tests (bilan des parts)` en `neutral`, avec la part et son
+  état. `fire` et `radar` le consignent (lot de correction #3209) sans
+  retenir le paquet ni la release. Le détail est aussi écrit en annotation
+  `::warning::`, jamais muet. Si **aucune** part due n'a réussi (toutes
+  annulées ou sautées), c'est l'absence de toute preuve : l'agrégat rougit
+  (décision #128512, #940).
+* un **run annulé** ne conclut pas : l'étape `if: cancelled()` du workflow
+  échoue explicitement avant le bilan, et le check requis reste rouge.
 
 Le check de détail est publié à **chaque** exécution (vert quand toutes les
 parts ont conclu) : une tentative ultérieure sur la même tête remplace ainsi
@@ -101,8 +106,9 @@ def classify(*, event, plan, version, version_only, docs_only, doc_readers,
              platform_macos=None, fs_class=None) -> dict:
     """Classe l'agrégat sans réseau : `{state, red, consigned, parts}`.
 
-    `state` vaut `green` quand l'agrégat a conclu (même avec des annulations
-    internes), `red` sur un négatif. `red` liste les manques prouvés,
+    `state` vaut `green` quand l'agrégat a conclu avec au moins une part
+    réussie (même avec des annulations internes), `red` sur un négatif ou
+    quand aucune part due n'a réussi. `red` liste les manques prouvés,
     `consigned` les parts non concluantes (dans l'ordre du workflow), `parts`
     le détail de chaque part exigée (pour le check publié)."""
     red: list[str] = []
@@ -170,6 +176,16 @@ def classify(*, event, plan, version, version_only, docs_only, doc_readers,
         # #748 : la part « autre système de fichiers » ne tourne qu'à la
         # release (ou à la main) ; sautée ailleurs, elle n'a rien à prouver.
         add("autre système de fichiers", fs_class, "", skipped_ok=True)
+
+    # Décision #128512 : « agrégat requis jamais conclu = preuve absente, donc
+    # bloquant ». L'agrégat peut tolérer un non-concluant **à l'intérieur**
+    # d'un agrégat qui a conclu, mais il lui faut au moins une part qui a
+    # prouvé quelque chose : toutes les parts annulées (ou sautées) sont
+    # l'absence de toute preuve, et #940 reste fermé (jamais de tests SUCCESS
+    # sans test). Le saut légitime de psql (aucune part) ne compte pas comme
+    # preuve : un autre job doit avoir conclu.
+    if parts and not any(row["result"] == "success" for row in parts):
+        red.append("aucune part n'a conclu (preuve absente)")
 
     return {"state": RED if red else GREEN, "red": red,
             "consigned": consigned, "parts": parts}

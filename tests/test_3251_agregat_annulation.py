@@ -78,6 +78,31 @@ class ClassifierTest(unittest.TestCase):
         self.assertEqual(result["state"], agregat.RED)
         self.assertEqual([row["part"] for row in result["consigned"]], ["psycopg"])
 
+    def test_toutes_les_parts_annulees_sont_une_preuve_absente(self):
+        # Décision #128512 : un agrégat qui n'a aucune part réussie n'a rien
+        # prouvé. Toutes les parts annulées ne doivent pas verdir `tests`.
+        result = classify(psycopg="cancelled", psql="cancelled",
+                          platform_macos="cancelled", fs_class="cancelled")
+        self.assertEqual(result["state"], agregat.RED)
+        self.assertIn("aucune part n'a conclu (preuve absente)", result["red"])
+        self.assertEqual([row["part"] for row in result["consigned"]],
+                         ["psycopg", "psql", "plateforme macOS",
+                          "autre système de fichiers"])
+
+    def test_un_saut_legitime_ne_remplace_pas_une_preuve(self):
+        # psql saute sans part ([]), ce n'est pas un test ; si tout le reste
+        # est annulé, l'agrégat reste sans preuve et rougit.
+        result = classify(psycopg="cancelled", psql="skipped", psql_parts="[]")
+        self.assertEqual(result["state"], agregat.RED)
+        self.assertIn("aucune part n'a conclu (preuve absente)", result["red"])
+
+    def test_une_part_reussie_suffit_pour_conclure(self):
+        result = classify(psycopg="success", psql="cancelled",
+                          platform_macos="cancelled")
+        self.assertEqual(result["state"], agregat.GREEN)
+        self.assertEqual([row["part"] for row in result["consigned"]],
+                         ["psql", "plateforme macOS"])
+
     def test_psql_saute_sans_part_reste_legitime(self):
         result = classify(psql="skipped", psql_parts="[]")
         self.assertEqual((result["state"], result["consigned"]), (agregat.GREEN, []))

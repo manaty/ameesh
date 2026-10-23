@@ -134,6 +134,19 @@ class WorkflowContractTest(unittest.TestCase):
         before = job[:job.index(_STEP)]
         self.assertIn("- uses: actions/checkout@v4", before)
 
+    def test_un_run_annule_rougit_avant_le_bilan(self):
+        # Décision #128512 : un run annulé n'a pas conclu du tout. L'étape
+        # `if: cancelled()` échoue explicitement avant le bilan, sinon un run
+        # annulé pourrait publier un `tests` vert à partir des parts déjà
+        # conclues.
+        text = WORKFLOW.read_text(encoding="utf-8")
+        job = text[text.index("\n  tests:\n"):]
+        start = job.index("- name: run annulé")
+        self.assertLess(start, job.index(_STEP))
+        block = job[start:job.index("\n      - ", start)]
+        self.assertIn("if: cancelled()", block)
+        self.assertIn("exit 1", block)
+
 
 class SilentSuccessTest(unittest.TestCase):
     """#940 : une annulation ne verdit jamais sans consignation publiée."""
@@ -162,6 +175,15 @@ class SilentSuccessTest(unittest.TestCase):
         self.assertEqual(self.run_main(["--psql", "cancelled", "--psql-parts", "[1]"],
                                        gh=gh), 0)
         self.assertEqual(gh.created, [(agregat.DETAIL_CHECK, "neutral")])
+
+    def test_toutes_les_parts_annulees_rougissent_et_publient_failure(self):
+        # #128512 : aucune part réussie = preuve absente. Le check requis
+        # rougit, même si la consignation est possible ; le détail le dit.
+        gh = self.FakeGh()
+        self.assertEqual(self.run_main(["--psycopg", "cancelled",
+                                        "--psql", "cancelled",
+                                        "--psql-parts", "[1]"], gh=gh), 1)
+        self.assertEqual(gh.created, [(agregat.DETAIL_CHECK, "failure")])
 
     def test_annulation_non_consignable_rougit(self):
         # #940 : on ne peut pas verdir quand l'annulation ne peut pas être
