@@ -39,7 +39,7 @@ class CloneFollowsForgeTest(unittest.TestCase):
     forge sans que le checkout ne récupère rien."""
 
     def setUp(self) -> None:
-        self.tmp = tempfile.mkdtemp(prefix="ameesh-3001-")
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="ameesh-3001-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.forge = os.path.join(self.tmp, "forge.git")
         _git(self.tmp, "init", "-q", "--bare", "-b", "main", self.forge)

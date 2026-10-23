@@ -1345,8 +1345,6 @@ class Notifier:
                     entry["escalated"] = bool(alert.get("critical"))
                 self._raise(entry, router, now)
                 self._event(db, "alert.raised", key, alert)
-                if alert.get("type") not in alert_briefs.BRIEFED_TYPES:
-                    self._brief_orchestrators(db, alert, router)
             elif (alert.get("type") in exploitation.ESCALATING and alert.get("critical")
                   and not entry.get("escalated")):
                 # #246 : même épisode, niveau critique atteint — poussée une
@@ -1740,59 +1738,19 @@ class Notifier:
                              for c in channels}
         self._attempt(entry, "raised", now)
 
-    # -- orchestrateurs (L118) ------------------------------------------------
-    def _brief_orchestrators(self, db, alert: dict, router: Router) -> None:
-        """`idle_capacity` levée : l'orchestrateur de chaque projet reçoit, par
-        courrier `event`, ses agents au repos sans lot et les lots ouverts sans
-        agent — c'est lui qui peut répartir. `mail_undeliverable` levée : les
-        orchestrateurs de l'équipe reçoivent le courrier en souffrance et le
-        geste (`ameesh mail forward`). Une fois par levée (même dédoublonnage
-        que les canaux) ; jamais fatal au passage."""
-        from . import undeliverable
-        try:
-            if alert.get("type") == "mail_undeliverable":
-                briefs = undeliverable.orchestrator_briefs(alert)
-            else:
-                listing = list(router.agents().values())
-                titles = {}
-                for lot in (alert.get("lots") or ())[:12]:
-                    item = storage.of(db).work.get(int(lot))
-                    if item:
-                        titles[int(lot)] = item.get("title") or ""
-                briefs = sous_utilisation.orchestrator_briefs(alert, listing, titles)
-        except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
-            self.log("mail to orchestrators not prepared (%s)" % exc)
-            return
-        from . import mail, work
-        for orch, text in sorted(briefs.items()):
-            if self.dry_run:
-                self.log("[%s] mail to orchestrator %s (dry run): %s"
-                         % (alert.get("type"), orch, text))
-                continue
-            try:
-                payload = {"alert": alert.get("type"),
-                           "agents": list(alert.get("agents") or ()),
-                           "lots": list(alert.get("lots") or ())}
-                if alert.get("type") == "mail_undeliverable":
-                    payload.update(recipient=alert.get("agent"), reason=alert.get("reason"),
-                                   count=alert.get("value"))
-                mail.send(db, work.SYSTEM_SENDER, orch, text, kind="event", payload=payload)
-                self.log("[%s] mail delivered to orchestrator %s"
-                         % (alert.get("type"), orch))
-            except Exception as exc:  # noqa: BLE001
-                self.log("[%s] mail to orchestrator %s not delivered (%s)"
-                         % (alert.get("type"), orch, exc))
-
     # -- agents qui peuvent agir (L132) ---------------------------------------
     def _brief_agents(self, db, current: list, router: Router, now: float) -> None:
-        """`idle_capacity`, `stale_lot`, `plan_underused` : courrier `event` aux
-        orchestrateurs et à l'auditeur, avec l'action attendue
-        (`alert_briefs` ; `stale_lot` excepté pour l'auditeur, L713 : il le lit
-        à sa passe, `ameesh alerts --json`). Une fois à la levée, une relance
-        si l'alerte dure `REMIND_AFTER_S`. Pour les SLO (#2602), un envoi
-        réussi par destinataire, état du lot et palier, sans relance périodique ;
-        une absence transitoire ne l'oublie pas. Indépendant de `notify.types`
-        (qui ne règle que l'humain). Jamais fatal au passage."""
+        """`idle_capacity`, `stale_lot`, `plan_underused`, `mail_undeliverable` :
+        courrier `event` aux orchestrateurs et à l'auditeur, avec l'action
+        attendue (`alert_briefs` ; `stale_lot` excepté pour l'auditeur, L713 :
+        il le lit à sa passe, `ameesh alerts --json`). Une fois à la levée, une
+        relance si l'alerte dure `REMIND_AFTER_S`. Pour les SLO (#2602), un
+        envoi réussi par destinataire, état du lot et palier, sans relance
+        périodique ; une absence transitoire ne l'oublie pas. #3036 : un agent
+        sans bail vivant (ou sur un hôte aux claims fermés) n'est pas un
+        destinataire ; sa remise ne compte pas, et la passe suivante réévalue
+        puis remet à qui est revenu. Indépendant de `notify.types` (qui ne règle
+        que l'humain). Jamais fatal au passage."""
         sent = self.state["briefs"]
         alive = {key_of(a): a for a in current if a.get("type") in alert_briefs.BRIEFED_TYPES}
         open_lots = None
@@ -1824,6 +1782,12 @@ class Notifier:
             entry = sent.get(key)
             if entry is None or alert.get("type") == "slo_breach":
                 due.append((key, alert, entry))
+            elif entry.get("dead") or entry.get("pending"):
+                # #3036 : des destinataires avaient été écartés (bail mort,
+                # hôte aux claims fermés) ou une remise a échoué ; la passe
+                # réévalue pour remettre à qui est revenu, sans redéposer
+                # chez les morts ni oublier l'échec transitoire.
+                due.append((key, alert, entry))
             elif not entry.get("reminded") and now - float(entry["sent_ts"]) \
                     >= alert_briefs.REMIND_AFTER_S:
                 due.append((key, alert, entry))
@@ -1841,11 +1805,19 @@ class Notifier:
             module_auditors = alert_briefs.auditors(listing, canons, explicit_only=True)
             from . import sous_utilisation
             module_orchestrators = sous_utilisation.role_orchestrators(canons)
+            # #3036 : un agent dont le bail est mort ou dont l'hôte a les
+            # claims fermés ne lira pas ; la résolution des destinataires
+            # l'écarte au lieu de compter une remise perdue.
+            closed = alert_briefs.claims_closed_hosts(db)
         except Exception as exc:  # noqa: BLE001
             self.log("mail to agents not prepared (%s)" % exc)
             return
         for key, alert, entry in due:
             kind = alert.get("type")
+            # #3036 : les destinataires écartés par la vivacité, pour que les
+            # passes suivantes sachent qu'il reste quelqu'un à remettre.
+            dead: dict = {}
+            is_reminder = entry is not None and kind != "slo_breach"
             try:
                 titles = {}
                 for lot in (alert.get("lots") or ())[:12]:
@@ -1855,7 +1827,8 @@ class Notifier:
                 briefs = alert_briefs.briefs(
                     alert, listing, titles,
                     module_auditors if kind == "module_deviation" else auditors,
-                    orchestrator_names=module_orchestrators)
+                    orchestrator_names=module_orchestrators,
+                    closed_hosts=closed, dead_out=dead)
             except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
                 self.log("[%s] mail to agents not prepared (%s)" % (kind, exc))
                 continue
@@ -1866,28 +1839,56 @@ class Notifier:
                 # Keep the desk's copy in the readable lot thread, without
                 # growing a mailbox nobody wakes to read. No `home` project
                 # exception (#2640): canon lots are `app=ameesh` (#2511).
-                briefs["thread:bureau"] = alert_briefs._slo_breach(alert)
-            if not briefs:
-                continue        # personne à prévenir : on réessaie au passage suivant
+                # #3036 : `setdefault` — un repli a pu y placer le texte du
+                # palier effectivement visé, avec ses absents nommés.
+                briefs.setdefault("thread:bureau", alert_briefs._slo_breach(alert))
             if kind == "slo_breach":
                 # One successful delivery per recipient and escalation
                 # level. Failed deliveries and newly designated pilots retry.
-                keep = set((entry or {}).get("to") or ())
-                briefs = {n: t for n, t in briefs.items() if n not in keep}
-                if not briefs:
-                    continue
-            elif entry is not None:
+                # #3036 : une entrée écrite par l'ancien notificateur peut
+                # nommer des destinataires dont la remise était allée sur un
+                # hôte perdu. On ne se fie à `to` que pour un destinataire
+                # encore vivant ; un nom mort à cette passe est retiré, pour
+                # être remis quand il revient — sans rafale vers les vivants.
+                by_name = {row["name"]: row for row in listing}
+                previous = {name: "" for name in (entry or {}).get("to") or ()}
+                still_live, gone = alert_briefs._split_live(previous, by_name, closed)
+                if entry is not None:
+                    entry["to"] = sorted(still_live)
+                    entry["dead"] = sorted(gone)
+                briefs = {n: t for n, t in briefs.items() if n not in still_live}
+            if not briefs:
+                # #3036 : une remise en attente sans destinataire à cette
+                # passe ne doit pas faire tourner les passages à vide ; les
+                # morts restent nommés dans `dead`.
+                if entry is not None and kind != "slo_breach":
+                    entry["dead"] = sorted(dead)
+                    entry["pending"] = []
+                continue        # personne à prévenir : on réessaie au passage suivant
+            if kind != "slo_breach" and entry is not None:
                 # #1787 N1 : la relance repart aux destinataires de la levée,
                 # pas à ceux que l'état vivant désignerait maintenant (le brief
-                # d'un lot sans assigné est atomique, #1026) ; si aucun n'est
-                # plus joignable, rien ne part et `reminded` reste à poser.
-                keep = {str(n) for n in entry.get("to") or ()}
-                briefs = {n: t for n, t in briefs.items() if n in keep}
-                if not briefs:
+                # d'un lot sans assigné est atomique, #1026).
+                # #3036 : un destinataire écarté à la levée n'a rien reçu ;
+                # s'il est vivant maintenant, il reçoit le brief initial (pas
+                # une relance), et rien n'est redéposé chez les morts.
+                already = {str(n) for n in entry.get("to") or ()}
+                fresh = {n: t for n, t in briefs.items() if n not in already}
+                if fresh:
+                    briefs = fresh
+                    is_reminder = False
+                elif entry.get("reminded") or now - float(entry["sent_ts"]) \
+                        < alert_briefs.REMIND_AFTER_S:
+                    entry["dead"] = sorted(dead)
                     continue
-                raised = float(entry["sent_ts"])
-                briefs = {n: alert_briefs.reminder(t, raised, now) for n, t in briefs.items()}
-            payload = {"alert": kind, "reminder": entry is not None and kind != "slo_breach"}
+                else:
+                    raised = float(entry["sent_ts"])
+                    briefs = {n: alert_briefs.reminder(t, raised, now)
+                              for n, t in briefs.items() if n in already}
+                    if not briefs:
+                        entry["dead"] = sorted(dead)
+                        continue
+            payload = {"alert": kind, "reminder": is_reminder}
             # #789 t2 (canon §9) : l'urgence portée par l'alerte elle-même
             # (un P1) est propagée au courrier d'agent ; le type reste la
             # règle générale (L242b (5) : le point de l'auditeur).
@@ -1898,6 +1899,16 @@ class Notifier:
                            "idle_agents"):
                 if alert.get(field_) is not None:
                     payload[field_] = alert[field_]
+            if kind == "mail_undeliverable":
+                # Contrat du courrier d'orchestrateur (L118/#3036) : le
+                # destinataire mort, la raison et le compte, pour que le
+                # lecteur puisse relivrer sans relire l'alerte.
+                payload.update(recipient=alert.get("agent"), reason=alert.get("reason"),
+                               count=alert.get("value"),
+                               # contrat historique du courrier d'orchestrateur
+                               # (`_brief_orchestrators`), pour ses lecteurs
+                               agents=list(alert.get("agents") or ()),
+                               lots=list(alert.get("lots") or ()))
             # pas de `work_item_id` : un message lié au lot compterait comme
             # son activité (stagnation) et effacerait l'alerte qu'il signale
             delivered = []
@@ -1906,7 +1917,9 @@ class Notifier:
                     self.log("[%s] mail to %s (dry run): %s" % (kind, name, text))
                     continue
                 try:
-                    if kind == "slo_breach" and name == "thread:bureau":
+                    if name == "thread:bureau":
+                        # #3036 : la route humaine — le fil lisible du lot,
+                        # comme la copie du bureau externe (#2602/#2640).
                         if fil.record(self.cfg, db, sender=work.SYSTEM_SENDER,
                                       recipients=["bureau"], text=text,
                                       project=alert.get("project"), lot=alert.get("lot"),
@@ -1923,7 +1936,18 @@ class Notifier:
                         kind, "reminder" if payload["reminder"] else "mail", name))
                 except Exception as exc:  # noqa: BLE001
                     self.log("[%s] mail to %s not delivered (%s)" % (kind, name, exc))
-            if kind == "module_deviation" and not delivered:
+            # #3036 : une remise qui n'a pas eu lieu (destinataire filtré,
+            # envoi en échec) ne crée pas d'entrée et ne compte pas « fait » :
+            # le passage suivant réessaie. Une remise au fil lisible compte,
+            # elle.
+            if not delivered and not self.dry_run:
+                if entry is not None:
+                    entry["dead"] = sorted(dead)
+                    if kind != "slo_breach":
+                        # #3036 : l'échec transitoire d'un destinataire reste
+                        # à tenter ; il n'est ni dans `to` (réussi) ni dans
+                        # `dead` (écarté).
+                        entry["pending"] = sorted(set(briefs) - set(dead))
                 continue
             if kind == "slo_breach":
                 if delivered:
@@ -1936,10 +1960,23 @@ class Notifier:
                                  "reminded": True,
                                  "to": sorted(set((entry or {}).get("to") or ()) | set(delivered))}
             elif entry is None:
-                sent[key] = {"type": kind, "sent_ts": now, "reminded": False,
-                             "to": delivered if kind == "module_deviation" else sorted(briefs)}
+                sent[key] = {"type": kind, "sent_ts": now,
+                             # `mail_undeliverable` reste un envoi unique à la
+                             # levée (comportement L118) : une relance de 6 h
+                             # n'ajouterait rien au courrier déjà en souffrance.
+                             "reminded": kind == "mail_undeliverable",
+                             "to": sorted(set(delivered)),
+                             # #3036 : les écartés, pour réévaluer la passe
+                             # suivante et remettre à qui est revenu, et les
+                             # remises en échec, distinctes des réussies.
+                             "dead": sorted(dead),
+                             "pending": sorted(set(briefs) - set(delivered) - set(dead))}
             else:
-                entry["reminded"] = True
+                entry["to"] = sorted(set(entry.get("to") or ()) | set(delivered))
+                entry["dead"] = sorted(dead)
+                entry["pending"] = sorted(set(briefs) - set(delivered) - set(dead))
+                if is_reminder:
+                    entry["reminded"] = True
 
     def _send_module_brief(self, db, alert, name, text, payload):
         """Reauthorize under a recipient row lock, held through mailbox commit.

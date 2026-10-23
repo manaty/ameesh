@@ -51,6 +51,10 @@ class _Base(PgTestCase):
         super().setUp()
         for name in ("orch", "dev1", "bureau", "auditeur"):
             registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
+        # #3036 : un brief n'est plus déposé à un destinataire sans bail
+        # vivant ; ces agents simulent un runner qui les tient (régime normal).
+        self.db.execute("UPDATE agent_registry SET lease_owner = 'runner-' || name,"
+                        " lease_expires_at = now() + interval '1 hour'")
         # le lot reste en intake : « prêt, pas démarré » — l'étape qui court
         self.lot = work.add(self.db, title="un lot SLO", assignee="dev1")
         self.now = time.time()
@@ -1007,7 +1011,11 @@ class NotifyLivreTest(_Base):
             self.cfg, notify.parse_config(raw), None, log=self.logs.append,
             clock=lambda: self.now,
             sender=notify.Sender(env={
+                # #3042 : le canal desktop suit l'OS ; le faux binaire doit
+                # couvrir les deux backends du banc (Linux notify-send, macOS
+                # osascript), qui journalisent tous deux argv dans `desk`.
                 "AMEESH_NOTIFY_SEND_BIN": FAKE_NOTIFY_SEND,
+                "AMEESH_OSASCRIPT_BIN": FAKE_NOTIFY_SEND,
                 "AMEESH_FAKE_NOTIFY_LOG": self.desk,
                 "PATH": os.environ.get("PATH", "")}))
 

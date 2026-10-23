@@ -119,6 +119,19 @@ credential_mode: api-key
 
 Every agent needs a `responsible` human, and none may have `approve`.
 
+A role that must survive its host being switched off can be elected among
+several candidate hosts (the Placement must admit every one of them):
+
+```yaml
+releve: election              # default: hote
+candidats: [banc, atelier]
+```
+
+Any candidate may take the lease when it is free or expired; the host that
+takes it holds the role and the others stay on standby. `releve: election`
+without `candidats`, an unknown host or a host its admission does not cover is
+an error in `canon check`.
+
 ## 5. Placements
 
 ```yaml title="placements/ouvrier-banc.md"

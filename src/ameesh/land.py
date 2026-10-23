@@ -114,7 +114,11 @@ def _branch_of(target: str) -> str:
 
 
 def _origin(project) -> str:
-    return plan_git._out(project.repo, "remote", "get-url", "origin") or ""
+    """#3041 : l'URL `origin` du checkout, un chemin relatif lu depuis lui
+    (elle est rejouée dans le clone du radar)."""
+    from . import resolutions
+    url = plan_git._out(project.repo, "remote", "get-url", "origin") or ""
+    return resolutions._local_from(project.repo, url)
 
 
 def _passive(db, to, lot: int, text: str, data: dict) -> None:
