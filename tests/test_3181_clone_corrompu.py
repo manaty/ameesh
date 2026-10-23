@@ -14,6 +14,7 @@ reste réservé à une vraie erreur de la forge.
 """
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import subprocess
@@ -239,6 +240,78 @@ class CorruptedCloneTest(unittest.TestCase):
         with open(obj, "rb") as handle:
             self.assertEqual(handle.read(), valid)
         _git(self.agents, "cat-file", "-e", tip)
+
+    def test_a_second_pass_waits_and_git_rewrite_is_never_carried_away(self):
+        # B1 résiduel (cx2) : A voit l'objet vide ; une passe B le met en
+        # quarantaine ; Git (réglage par défaut) réécrit l'objet complet ; A
+        # emportait l'objet valide. Le verrou du dépôt tient B hors de la
+        # fenêtre, et Git par défaut ne remplace pas le fichier vide présent.
+        tip = self.publish("lot/f")
+        raw = subprocess.run(["git", "-C", self.agents, "cat-file", "commit", tip],
+                             capture_output=True, check=True).stdout
+        obj = _loose(self.agents, tip)
+        open(obj, "w").close()
+        real_rename = os.rename
+        seen = {}
+
+        def race_then_rename(source, target):
+            # entre la relecture `lstat` de A et son `rename` : B, puis Git
+            if source == obj and "b" not in seen:
+                seen["b"] = None
+                with mock.patch.object(resolutions, "QUARANTINE_LOCK_WAIT_S", 0.2):
+                    seen["b"] = resolutions.quarantine_empty(self.agents)
+                subprocess.run(["git", "-C", self.agents, "hash-object", "-t", "commit",
+                                "-w", "--stdin"], input=raw, capture_output=True)
+            return real_rename(source, target)
+        with mock.patch("os.rename", side_effect=race_then_rename):
+            moved = resolutions.quarantine_empty(self.clone.path)
+        self.assertEqual(seen["b"], [])  # B n'a pas eu le dépôt
+        self.assertEqual(moved, [obj])
+        # tout ce qui est parti en quarantaine est vide : aucun objet valide
+        root = os.path.join(self.agents, ".git", resolutions.QUARANTINE_DIR)
+        for base, _dirs, files in os.walk(root):
+            for name in files:
+                if name != "moved.log":
+                    self.assertEqual(os.path.getsize(os.path.join(base, name)), 0, name)
+        # l'objet se réécrit ensuite normalement
+        subprocess.run(["git", "-C", self.agents, "hash-object", "-t", "commit", "-w",
+                        "--stdin"], input=raw, capture_output=True, check=True)
+        _git(self.agents, "cat-file", "-e", tip)
+
+    def test_a_replacing_git_writer_refuses_the_object_repair(self):
+        tip = self.publish("lot/g")
+        obj = _loose(self.agents, tip)
+        open(obj, "w").close()
+        _git(self.agents, "config", "core.createObject", "rename")
+        self.assertEqual(resolutions.quarantine_empty(self.clone.path), [])
+        self.assertTrue(os.path.exists(obj))
+
+    def test_a_failed_restore_names_where_the_valid_object_is(self):
+        tip = self.publish("lot/h")
+        obj = _loose(self.agents, tip)
+        with open(obj, "rb") as handle:
+            valid = handle.read()
+        open(obj, "w").close()
+        real_rename = os.rename
+
+        def replace_then_rename(source, target):
+            if source == obj:
+                with open(obj + ".tmp_obj_banc", "wb") as handle:
+                    handle.write(valid)
+                real_rename(obj + ".tmp_obj_banc", obj)
+            return real_rename(source, target)
+        with mock.patch("os.rename", side_effect=replace_then_rename), \
+                mock.patch("os.link", side_effect=OSError(errno.EIO, "EIO banc")), \
+                mock.patch("sys.stderr") as err:
+            self.assertEqual(resolutions.quarantine_empty(self.clone.path), [])
+        said = "".join(str(c.args[0]) for c in err.write.call_args_list if c.args)
+        self.assertIn("NOT restored", said)
+        kept = [p for p in self.quarantined(os.path.join(self.agents, ".git"))
+                if p.endswith("objects/%s/%s" % (tip[:2], tip[2:]))]
+        self.assertEqual(len(kept), 1, kept)
+        root = os.path.join(self.agents, ".git", resolutions.QUARANTINE_DIR)
+        with open(os.path.join(root, kept[0]), "rb") as handle:
+            self.assertEqual(handle.read(), valid)  # rien n'est perdu
 
     def test_two_quarantines_in_the_same_second_keep_both_proofs(self):
         first = self.empty_ref("une")
