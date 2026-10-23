@@ -14,7 +14,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import adapters, heavy
+from ameesh import adapters, heavy, platform
 
 SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 
@@ -139,20 +139,15 @@ class RunChildTest(unittest.TestCase):
 
     @staticmethod
     def _gone(pid: int, timeout: float = 10.0) -> bool:
+        """Parti, ou zombie : `waitpid` pour nos enfants, puis la couche
+        plateforme (L63/L68), qui lit psutil ou le repli /proc selon l'OS."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
                 waited, _ = os.waitpid(pid, os.WNOHANG)
             except ChildProcessError:
                 waited = 0          # not ours: probe it
-                try:
-                    os.kill(pid, 0)
-                    with open("/proc/%d/stat" % pid, encoding="utf-8") as fh:
-                        if fh.read().split(") ")[-1].startswith("Z"):
-                            return True
-                except (ProcessLookupError, FileNotFoundError):
-                    return True
-            if waited:
+            if waited or not platform.alive(pid):
                 return True
             time.sleep(0.05)
         return False
@@ -203,9 +198,11 @@ class RunChildTest(unittest.TestCase):
         proc.send_signal(signal.SIGTERM)
         self.assertTrue(self._gone(suite))
         # codex r3: the command stays unreaped while its group drains — its
-        # zombie keeps the group's number from being reused
-        with open("/proc/%d/stat" % suite, encoding="utf-8") as fh:
-            self.assertEqual(fh.read().rsplit(") ", 1)[-1].split()[0], "Z")
+        # zombie keeps the group's number from being reused (L68: the state
+        # comes from the platform layer, never from a direct /proc read)
+        row = next((p for p in platform.process_table() if p["pid"] == suite), None)
+        self.assertIsNotNone(row, "le chef de groupe doit rester visible en zombie")
+        self.assertTrue(row["zombie"], "le numéro du chef doit rester réservé (zombie)")
         # the suite is gone, its worker is not: the slot stays held
         self.assertFalse(self._gone(worker, timeout=0.3))
         self.assertIsNone(proc.poll())

@@ -180,6 +180,11 @@ class ShadowPassageTest(PgTestCase):
         self.ops = storage.of(self.db).work
         self.mark = self.ops.add_milestone(self.item["id"], "frozen", sha=self.head,
                                            actor="fixture", verdict=None, note="")
+        # #2965 : un gel réel est antérieur au créneau qu'il alimente. Le
+        # dater avant le cutoff évite qu'un plan d'ombre ne voie la porte
+        # s'ouvrir « après » le créneau par simple horloge de fixture.
+        self.db.execute("UPDATE work_item_milestones SET at = to_timestamp(%s)"
+                        " WHERE id = %s", (self.now - 30, self.mark["id"]))
         self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s",
                         (self.item["id"],))
         self.notices = []
@@ -255,6 +260,34 @@ class ShadowPassageTest(PgTestCase):
                     deferred=[])
         return dict(state, plans=[plan])
 
+    def train_row(self, *, queued_at=None):
+        """#2965 : une ligne enrôlée par le train, avec son reçu « packet »."""
+        row = self.ops.queue_add(
+            self.item["id"], target="main", frozen_sha=self.head,
+            frozen_id=self.mark["id"], source=merge_queue.source_of(
+                self.project_repo.root), actor="fixture", note="")
+        self.assertIsNotNone(row)
+        self.db.execute(
+            "INSERT INTO integration_train_queue_receipts"
+            " (work_item_id, generation, frozen_id, kind) VALUES (%s, %s, %s, 'packet')",
+            (self.item["id"], row["generation"], self.mark["id"]))
+        if queued_at is not None:
+            self.db.execute("UPDATE merge_queue SET queued_at = to_timestamp(%s)"
+                            " WHERE work_item_id = %s",
+                            (queued_at, self.item["id"]))
+        return self.ops.queue(None)[0]
+
+    def dated_mark(self, kind, actor, *, stamp, verdict=None, sha=None, harness=None):
+        mark = self.ops.add_milestone(self.item["id"], kind, sha=sha or self.head,
+                                      actor=actor, verdict=verdict, note="")
+        self.db.execute("UPDATE work_item_milestones SET at = to_timestamp(%s)"
+                        " WHERE id = %s", (stamp, mark["id"]))
+        if harness is not None:
+            self.db.execute("INSERT INTO turn_costs (agent, harness, session,"
+                            " recorded_at) VALUES (%s, %s, %s, to_timestamp(%s))",
+                            (actor, harness, "s-" + actor, stamp))
+        return mark
+
     def numbered_packet(self, lots, name="paquet-97-nexlink", *, branch_at=None,
                         merge_at=None, merge=True, manifest=True):
         """A numbered packet (`integration/paquet-<n>-nexlink`, #2733)."""
@@ -295,6 +328,10 @@ class ShadowPassageTest(PgTestCase):
                         branch_target="main")
         mark = self.ops.add_milestone(item["id"], "frozen", sha=head,
                                       actor="fixture", verdict=None, note="")
+        # #2965 : un candidat prêt au cutoff a été gelé avant lui ; le dater
+        # ainsi laisse l'ombre lire son instant d'admissibilité (gel + porte).
+        self.db.execute("UPDATE work_item_milestones SET at = to_timestamp(%s)"
+                        " WHERE id = %s", (self.now - 30, mark["id"]))
         self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s",
                         (item["id"],))
         self.receipts[head] = dataclasses.asdict(author(head))
@@ -424,7 +461,8 @@ class ShadowPassageTest(PgTestCase):
         self.assertEqual(plan["deferred"], [])
 
     def test_a_late_queued_admission_is_deferred_but_a_candidate_is_projected(self):
-        """Le filtre late ne vise que les admissions en file, pas l'inventaire."""
+        """#2965 : la ligne en file est datée par son admission ; le candidat
+        déjà prêt au cutoff (gel antérieur) est projeté par le même instant."""
         self.queue_item(self.item, self.mark, self.head)
         self.db.execute("UPDATE merge_queue SET queued_at = to_timestamp(%s)"
                         " WHERE work_item_id = %s",
@@ -438,7 +476,7 @@ class ShadowPassageTest(PgTestCase):
         reasons = {row["work_item_id"]: row["reason"]
                    for row in plan["deferred"]}
         self.assertEqual(reasons[self.item["id"]],
-                         "late admission: queued after the cutoff")
+                         "late admission: not admissible at the cutoff")
 
     def test_a_compose_error_is_notified_and_fails_the_plan(self):
         """N P3 auditeur : une branche bougée fait échouer le plan, notifié."""
@@ -739,6 +777,50 @@ class ShadowPassageTest(PgTestCase):
         self.assertEqual((comparison["missing"], comparison["extra"]), ([], []))
         self.assertEqual(self.ops.queue(None), [])
 
+    def test_a_train_row_admissible_before_the_cutoff_is_a_member(self):
+        """#2965 (B3, parité) : une ligne enrôlée après le cutoff mais dont
+        l'admission (gel + porte) est antérieure y est membre, comme en actif."""
+        self.db.execute("UPDATE work_item_milestones SET at = to_timestamp(%s)"
+                        " WHERE id = %s", (self.now - 600, self.mark["id"]))
+        row = self.train_row()
+        self.assertGreater(row["queued_ts"], self.now)
+        result, _ = self.shadow.scheduled_step(self.db, self.now)
+        self.assertEqual(result["result"], "shadow-plan", result)
+        self.assertEqual([member["work_item_id"] for member in result["plan"]["members"]],
+                         [self.item["id"]], result["plan"]["deferred"])
+        self.assertEqual(result["plan"]["deferred"], [])
+
+    def test_a_train_row_admissible_after_the_cutoff_is_late(self):
+        """#2965 (B3) : un dernier avis après le cutoff rend la ligne late,
+        même si sa file a été écrite avant — l'ombre lit l'instant d'admission."""
+        self.db.execute("UPDATE work_item_milestones SET at = to_timestamp(%s)"
+                        " WHERE id = %s", (self.now - 600, self.mark["id"]))
+        self.train_row(queued_at=self.now - 300)
+        self.dated_mark("verdict", "r1", stamp=self.now + 60, verdict="blocked",
+                        harness="claude")
+        self.dated_mark("verdict", "r1", stamp=self.now + 120, verdict="ok",
+                        harness="claude")
+        result, _ = self.shadow.scheduled_step(self.db, self.now)
+        self.assertEqual(result["result"], "shadow-plan", result)
+        self.assertEqual(result["plan"]["members"], [])
+        reasons = {row["work_item_id"]: row["reason"]
+                   for row in result["plan"]["deferred"]}
+        self.assertIn("late admission", reasons[self.item["id"]])
+
+    def test_a_candidate_whose_gate_opens_after_the_cutoff_is_late(self):
+        """#2965 (b, ombre) : le dernier avis tombe à slot+60, la porte ne
+        s'ouvre qu'à slot+120 : le candidat est late, comme dans l'actif."""
+        self.dated_mark("verdict", "r1", stamp=self.now + 60, verdict="blocked",
+                        harness="claude")
+        self.dated_mark("verdict", "r1", stamp=self.now + 120, verdict="ok",
+                        harness="claude")
+        result, _ = self.shadow.scheduled_step(self.db, self.now)
+        self.assertEqual(result["result"], "shadow-plan", result)
+        self.assertEqual(result["plan"]["members"], [])
+        reasons = {row["work_item_id"]: row["reason"]
+                   for row in result["plan"]["deferred"]}
+        self.assertIn("late admission", reasons[self.item["id"]])
+
     def test_missing_lot_is_named_and_explained(self):
         self.shadow.scheduled_step(self.db, self.now)
         self.manual_packet([self.item["id"], 999])
@@ -836,6 +918,10 @@ class ShadowMainSyncTest(PgTestCase):
         self.ops = storage.of(self.db).work
         self.mark = self.ops.add_milestone(self.item["id"], "frozen", sha=self.head,
                                            actor="fixture", verdict=None, note="")
+        # #2965 : même horloge que ShadowPassageTest — le gel précède le
+        # créneau pour que l'ombre lise une porte déjà ouverte.
+        self.db.execute("UPDATE work_item_milestones SET at = to_timestamp(%s)"
+                        " WHERE id = %s", (self.now - 30, self.mark["id"]))
         self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s",
                         (self.item["id"],))
         self.notices = []

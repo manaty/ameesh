@@ -11,6 +11,8 @@ import unittest
 
 from tests import support  # noqa: F401 — environnement isolé du poste
 
+from ameesh import platform
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "deploy/mise-a-jour/poste.sh"
@@ -137,6 +139,7 @@ esac
         self.assertIn("MainPID vivant sur le venv courant", done.stdout)
         self.assertIn("contrôles verts", done.stdout)
 
+    @unittest.skipUnless(platform.is_linux(), "témoin /proc/<pid>/exe : Linux seulement")
     def test_notify_old_process_fails_despite_same_system_executable(self):
         child = self.process(self.old)
         self.assertTrue((Path("/proc") / str(child.pid) / "exe").samefile(

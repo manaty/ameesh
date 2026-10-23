@@ -304,7 +304,14 @@ class Service:
             return None
         db = ScopedDb(self.cfg)
         try:
-            _, deadline = self.passages[index].scheduled_step(db, now)
+            result, deadline = self.passages[index].scheduled_step(db, now)
+            if isinstance(result, dict) and result.get("result") == "landed":
+                # #2965: the target just freed. A cutoff the landed packet
+                # overran is composed at once, with the candidates admissible
+                # at that cutoff, instead of waiting for the next calendar
+                # hour (the "créneau manqué, traité dans la foulée" rule).
+                with self.condition:
+                    self.pending.add(index)
             return deadline
         except Exception as exc:
             self.report("train passage failed (%s: %s)" % (type(exc).__name__, exc))
