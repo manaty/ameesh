@@ -678,6 +678,8 @@ jq '.plan' train-status.json > train-manifest.json
 PYTHONPATH=src python -m ameesh.train_cli --project ameesh give --manifest train-manifest.json
 # Le numéro vient du reçu JSON de give, ou du champ fire.id de show :
 PYTHONPATH=src python -m ameesh.train_cli --project ameesh withdraw --manifest train-manifest.json --receipt 123
+# Un plan persisté jamais tiré (aucun feu actif) se solde sans reçu :
+PYTHONPATH=src python -m ameesh.train_cli --project ameesh abandon --manifest train-manifest.json --reason "…"
 ```
 
 La session liée est résolue par `work.corrector(history=False)` ; aucun
@@ -688,12 +690,25 @@ le reçu courant exact, et reste disponible sans dépendre du lecteur canon
 ou du contrat CI. La réservation d'une promotion reste irréversible par
 cette commande et requiert alors la réconciliation déjà prévue.
 
+`abandon` couvre le plan non tiré qui n'a pas de reçu à retirer (incident du
+23/10 : plan `publishing` sans feu, verrou tenu par un runner arrêté). Il
+refuse un feu actif, incertain ou déjà promu (retrait ou réconciliation
+d'abord), puis prend le bail cible — ou l'adopte s'il a expiré —, écrit la
+phase terminale `invalidated` avec l'acteur et le motif, et rend le bail. Un
+bail vivant tenu par un autre train est refusé jusqu'à son expiration ; le
+créneau suivant peut alors composer un nouveau plan. Retirer le projet de
+`train.projects` ne construit plus de passage, donc plus aucun renouvellement
+de ce bail ; `abandon` solde le plan resté en base.
+
 Quatre témoins de commande sur SQL réel sont verts avec psycopg et psql :
 lecture sans mutation, retrait/réattribution avec nouvel identifiant et session
 liée, refus de manifeste périmé/diagnostique, et parcours CLI par fichier avec
-fermeture de connexion. L'autorité pilote est simulée dans ces témoins ;
-aucun feu réel n'est donné. Les huit scénarios de port #1616 sont également
-verts avec les deux pilotes sur `488681e0dbb00f53a39f8244819b3faf362b74c1`.
+fermeture de connexion. Les témoins d'`abandon` (#3138) couvrent en plus le
+plan non tiré, le feu actif, la promotion incertaine, le manifeste exact, le
+feu révoqué et le bail vivant puis expiré. L'autorité pilote est simulée dans
+ces témoins ; aucun feu réel n'est donné. Les huit scénarios de port #1616
+sont également verts avec les deux pilotes sur
+`488681e0dbb00f53a39f8244819b3faf362b74c1`.
 Restent le canon mécanique qualifié, le contrat complet Nexlink et le point
 d'appel du runner, puis les revues requises, avant gel et activation.
 
