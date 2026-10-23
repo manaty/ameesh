@@ -699,3 +699,121 @@ class RegroupedCopyAuditTest(_RegroupedCopyFixture):
         self.assertEqual([entry["actor"] for entry in out["accepted"]],
                          ["dev1"], out)
         self.assertIn("cx3", {row["name"] for row in out["authors"]})
+
+
+class _UnrelatedCommonLineFixture(_RewriteFixture):
+    """B10 : le contenu corrigé est regroupé à côté d'une fonction qui porte
+    déjà la même ligne banale (`return None`) que le retrait du correcteur.
+
+    Le correcteur cx3 retire `if user.is_admin: return None` de `gate.py` et
+    ajoute un document ; la tête repart de la base, supprime `gate.py` et
+    regroupe `gate` corrigé dans `relocated/gate.py`, à côté d'`old_feature`
+    (qui contient déjà `return None`). `EXTRA` ajoute la fonction indépendante
+    du témoin B10."""
+
+    EXTRA = ""
+
+    def _build_head_a(self):
+        self.repo.write("gate.py",
+                        "def gate(user):\n"
+                        "    if user.is_admin:\n"
+                        "        return None\n"
+                        "    guard_line_1()\n"
+                        "    guard_line_2()\n"
+                        "    guard_line_3()\n"
+                        "    guard_line_4()\n")
+        self.repo.write("relocated/gate.py",
+                        "def old_feature():\n"
+                        "    return None\n"
+                        "    old_line()\n")
+        self.base = self.repo.commit("base")
+        self.repo.write("gate.py",
+                        "def gate(user):\n"
+                        "    guard_line_1()\n"
+                        "    guard_line_2()\n"
+                        "    guard_line_3()\n"
+                        "    guard_line_4()\n")
+        self.repo.write(DOC, DOC_TEXT)
+        self.review_doc = self.repo.commit(
+            "cx3: retire la garde admin et documente", agent="cx3")
+        self.receipt("cx3", "codex", [self.review_doc])
+        self.head_a = self.review_doc
+        self.db.execute("UPDATE work_items SET branch_target = %s WHERE id = %s",
+                        (self.base, self.lot))
+        self.freeze(self.head_a)
+
+    def build_head(self):
+        self.repo.git("reset", "--hard", self.base)
+        self.repo.git("rm", "-q", "gate.py")
+        self.repo.write("relocated/gate.py",
+                        "def gate(user):\n"
+                        "    guard_line_1()\n"
+                        "    guard_line_2()\n"
+                        "    guard_line_3()\n"
+                        "    guard_line_4()\n"
+                        "def old_feature():\n"
+                        "    return None\n"
+                        "    old_line()\n" + self.EXTRA)
+        self.head_b = self.repo.commit(
+            "impl: garde corrigée regroupée, document omis", agent="impl")
+        self.receipt("impl", "deepseek", [self.head_b])
+        self.freeze_b = self.freeze(self.head_b)
+        self.milestone = {"id": int(self.freeze_b["id"]), "sha": self.head_b,
+                          "actor": "impl", "at_ts": self.freeze_b.get("at_ts")}
+
+
+class UnrelatedCommonLineTest(_UnrelatedCommonLineFixture):
+    """B10 (revues cx2 + cx3) : la fonction indépendante n'annule pas le retrait.
+
+    Le `return None` d'`unrelated_feature()` compte une occurrence de plus
+    dans le fichier ; l'ancien compte global en faisait une annulation et
+    retirait cx3 des auteurs, ouvrant la porte sensible à tort."""
+
+    EXTRA = ("def unrelated_feature():\n"
+             "    return None\n")
+
+    def setUp(self):
+        super().setUp()
+        self.build_head()
+
+    def test_the_unrelated_common_line_does_not_annul_the_removal(self):
+        authors, unknown, correctors = self.reading(
+            self.milestone, [self.head_b], self.base, self.head_b)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+        self.assertIn("cx3", {row["name"] for row in correctors})
+
+    def test_the_gate_refuses_the_corrector_with_the_surviving_removal(self):
+        klass = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "relocated/gate.py",
+                            "class": "sensitive",
+                            "rule": ["relocated/gate.py"]}],
+                 "repo": self.repo.root, "target": self.base,
+                 "base_sha": self.base}
+        for actor in ("cx3", "dev1"):
+            self.verdict(actor, self.head_b)
+        out = merge_queue.review_gate(
+            self.db, work.milestones(self.db, self.lot), self.head_b,
+            repo=self.repo.root, klass=klass, item=self.lot_item(), required=2)
+        self.assertFalse(out.get("error"), out)
+        self.assertFalse(out["ok"], out["why"])
+        self.assertEqual([entry["actor"] for entry in out["accepted"]],
+                         ["dev1"], out)
+        self.assertIn("cx3", {row["name"] for row in out["authors"]})
+
+
+class CommonLineControlTest(_UnrelatedCommonLineFixture):
+    """Témoin B10 : sans la fonction indépendante, le retrait garde cx3."""
+
+    def setUp(self):
+        super().setUp()
+        self.build_head()
+
+    def test_the_surviving_removal_keeps_the_corrector(self):
+        authors, unknown, correctors = self.reading(
+            self.milestone, [self.head_b], self.base, self.head_b)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+        self.assertIn("cx3", {row["name"] for row in correctors})
