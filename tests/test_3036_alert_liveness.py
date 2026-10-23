@@ -347,6 +347,51 @@ class NotifierLivenessTest(PgTestCase):
         self.assertEqual(len(self.mails("orch")), 1)
         self.assertEqual(len(self.mails("orch2")), 1)
 
+    def test_bail_qui_cligne_ne_redouble_ni_n_escalade(self):
+        # #3100 : remis au pilote, puis son bail meurt une passe (redémarrage
+        # d'exécuteur) et revient. Le courrier était dans sa boîte : un seul
+        # courrier, et ni le bureau ni l'auditeur ne reçoivent d'escalade.
+        notifier = self.notifier()
+        alert = _slo(level=2, targets=("pilot",))
+        notifier.run_pass(self.db, current=[alert])
+        self.assertEqual(len(self.mails("orch")), 1)
+        self.dead("orch")
+        self.now += 60.0
+        notifier.run_pass(self.db, current=[alert])
+        self.lease("orch")
+        self.now += 60.0
+        notifier.run_pass(self.db, current=[alert])
+        self.assertEqual(len(self.mails("orch")), 1)
+        self.assertEqual(self.mails("bureau"), [])
+        self.assertEqual(self.mails("auditeur"), [])
+        self.assertEqual(self.thread("ameesh", 42), [])
+        [entry] = notifier.state["briefs"].values()
+        self.assertEqual(entry["to"], ["orch"])
+
+    def test_cloture_de_release_de_l_hote_ne_redouble_rien(self):
+        # #3100 : une clôture de release ferme les claims de l'hôte pour tous
+        # ses agents à la fois ; les paliers déjà prévenus restent couverts.
+        notifier = self.notifier()
+        alerts = [_slo(level=1, targets=("assignee",)),
+                  _slo(level=2, targets=("pilot",), lot=43, agent="dev1")]
+        notifier.run_pass(self.db, current=alerts)
+        self.assertEqual(len(self.mails("dev1")), 1)
+        self.assertEqual(len(self.mails("orch")), 1)
+        self.db.execute("INSERT INTO host_lifecycle(host, mode, actor)"
+                        " VALUES (%s, 'draining', 'test')"
+                        " ON CONFLICT (host) DO UPDATE SET mode = 'draining'",
+                        (self.cfg.host,))
+        self.now += 60.0
+        notifier.run_pass(self.db, current=alerts)
+        self.db.execute("UPDATE host_lifecycle SET mode = 'available'"
+                        " WHERE host = %s", (self.cfg.host,))
+        self.now += 60.0
+        notifier.run_pass(self.db, current=alerts)
+        self.assertEqual(len(self.mails("dev1")), 1)
+        self.assertEqual(len(self.mails("orch")), 1)
+        self.assertEqual(self.mails("bureau"), [])
+        self.assertEqual(self.mails("auditeur"), [])
+
 
 if __name__ == "__main__":
     unittest.main()

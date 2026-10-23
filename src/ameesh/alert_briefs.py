@@ -115,14 +115,16 @@ def _escalation_note(dead: dict, from_level: int, to_level: int) -> str:
                or "none designated", int(from_level), int(to_level)))
 
 
-def _split_live(out: dict, by_name: dict, closed: set) -> tuple[dict, dict]:
+def _split_live(out: dict, by_name: dict, closed: set,
+                covered=()) -> tuple[dict, dict]:
     """#3036 : sépare les briefs des destinataires vivants de ceux qui ne
     liront pas. Un nom hors registre (les pseudo-destinataires `thread:…`)
-    n'est pas filtré : il n'a pas de bail à contrôler."""
+    n'est pas filtré : il n'a pas de bail à contrôler. #3100 : un nom de
+    `covered` (déjà remis) non plus : son courrier l'attend."""
     live: dict = {}
     dead: dict = {}
     for name, text in out.items():
-        if name.startswith("thread:"):
+        if name.startswith("thread:") or name in covered:
             live[name] = text
             continue
         row = by_name.get(name)
@@ -565,7 +567,7 @@ def _target_names(role: str, alert: dict, by_name: dict, orchestras, teams: set,
 
 
 def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
-                auditor_names, closed: set) -> dict:
+                auditor_names, closed: set, covered=()) -> dict:
     """#3036 : destinataires d'un `slo_breach`, filtrés par vivacité, avec
     passage au palier suivant quand le palier atteint n'a personne qui lise.
 
@@ -573,7 +575,13 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
     palier suivant de l'échelle §9 (assigné → pilote → bureau/auditeur), puis
     la route humaine (copie au fil du bureau). Le brief dit toujours qui
     manquait (« No live recipient: X (no live lease). ») et le texte du geste
-    est celui du palier qui reçoit, pas celui du palier muet."""
+    est celui du palier qui reçoit, pas celui du palier muet.
+
+    #3100 : `covered` (les destinataires déjà remis, `to` du registre des
+    briefs) compte comme vivant : le courrier est dans leur boîte, lu au
+    retour ; un bail qui cligne (redémarrage d'exécuteur, clôture de release)
+    ne fait ni escalader ni nommer absent un palier déjà prévenu."""
+    covered = set(covered or ())
     roles = set(alert.get("targets") or ("assignee",))
     text = _slo_breach(alert)
     raw: dict = {}
@@ -581,7 +589,7 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
         for name in _target_names(role, alert, by_name, orchestras, teams,
                                   auditor_names):
             raw.setdefault(name, role)
-    live, dead = _split_live({name: text for name in raw}, by_name, closed)
+    live, dead = _split_live({name: text for name in raw}, by_name, closed, covered)
     if live:
         note = _dead_note(dead)
         return {name: note + body for name, body in live.items()}
@@ -598,7 +606,7 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
                      + _target_names("auditeur", alert, by_name, orchestras, teams,
                                      auditor_names))
         candidates = {name: next_text for name in dict.fromkeys(names)}
-        live, more = _split_live(candidates, by_name, closed)
+        live, more = _split_live(candidates, by_name, closed, covered)
         dead.update(more)
         if live:
             note = _escalation_note(dead, current, next_level)
@@ -611,7 +619,7 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
     # bureau), en nommant les absents. Sans bureau, rien n'est inventé — le
     # passage suivant réessaiera (l'alerte reste dans `ameesh alerts`).
     fallback = _fallback_bureau(by_name, _slo_breach(alert, level=3))
-    live, more = _split_live(fallback, by_name, closed)
+    live, more = _split_live(fallback, by_name, closed, covered)
     dead.update(more)
     if live:
         note = _dead_note(dead)
@@ -665,7 +673,7 @@ def _mail_undeliverable_briefs(alert: dict, by_name: dict, auditor_names,
 
 def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
            auditor_names=(), *, orchestrator_names=(),
-           closed_hosts=(), dead_out: dict | None = None) -> dict:
+           closed_hosts=(), dead_out: dict | None = None, covered=()) -> dict:
     """`{agent: texte}` pour une alerte de `BRIEFED_TYPES` (vide sinon).
 
     Orchestrateurs : `idle_capacity`, ceux de L118 ; `stale_lot`, ceux de
@@ -689,7 +697,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     auditeurs puis au bureau. Le brief nomme les absents ("No live recipient:
     …") pour que les vivants couvrent le geste. `dead_out`, quand l'appelant
     le fournit, reçoit ces absents (nom → raison) : le notificateur garde la
-    liste pour réévaluer à la passe suivante et remettre à qui est revenu."""
+    liste pour réévaluer à la passe suivante et remettre à qui est revenu.
+    `covered` (#3100, `slo_breach`) : les destinataires déjà remis, comptés
+    vivants pour le palier même si leur bail cligne à cette passe."""
     kind = alert.get("type")
     if kind not in BRIEFED_TYPES:
         return {}
@@ -733,7 +743,7 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         # `orchestrators` (niveau 1 d'une passe sans autre lot de niveau 2) ;
         # le notificateur fournit les rôles vivants du canon.
         return _slo_briefs(alert, by_name, orchestras or orchestrator_names,
-                           teams, auditor_names, closed)
+                           teams, auditor_names, closed, covered)
     else:
         extra: dict[str, str] = {}
         no_reviewer = False
