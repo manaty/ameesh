@@ -247,6 +247,16 @@ def collect_batch(api, sub, since, now, scan):
                 state["recheck_from"] = 1
                 state["recheck_to"] = max([int(state.get("page", 1)) - 1]
                                           + old_pages)
+        # #3096: an already scheduled recheck must also reach page 1.
+        if state.get("recheck_from") is not None:
+            state["recheck_from"] = 1
+        pending = state.get("recheck")
+        if pending:
+            if "pages" in pending:
+                pending["to"] = max([int(state.get("page", 1))]
+                                    + [int(page) for page in pending.pop("pages")])
+                pending["index"] = 0
+            pending["from"] = 1
     else:
         state = dict(since=since, window_since=since, until=now,
                      settled=now - lag, kind="issue", page=1)
