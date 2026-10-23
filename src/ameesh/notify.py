@@ -1846,24 +1846,61 @@ class Notifier:
                         continue
                 del sent[key]
         due = []
+        dead_only = set()
         for key, alert in alive.items():
             entry = sent.get(key)
             if entry is None or alert.get("type") == "slo_breach":
                 due.append((key, alert, entry))
-            elif entry.get("dead") or entry.get("pending"):
-                # #3036 : des destinataires avaient été écartés (bail mort,
-                # hôte aux claims fermés) ou une remise a échoué ; la passe
-                # réévalue pour remettre à qui est revenu, sans redéposer
-                # chez les morts ni oublier l'échec transitoire.
+            elif entry.get("pending"):
+                # #3036 : une remise a échoué ; la passe la retente.
                 due.append((key, alert, entry))
             elif not entry.get("reminded") and now - float(entry["sent_ts"]) \
                     >= alert_briefs.REMIND_AFTER_S:
                 due.append((key, alert, entry))
+            elif entry.get("dead"):
+                # #3036 : des destinataires avaient été écartés (bail mort,
+                # hôte aux claims fermés) ; la passe réévalue pour remettre à
+                # qui est revenu, sans redéposer chez les morts. #3057 :
+                # seulement si l'un d'eux a changé (filtre plus bas).
+                due.append((key, alert, entry))
+                dead_only.add(key)
         if not due:
             return
         from . import mail, work
         try:
             listing = storage.of(db).operations.listing()
+            # #3036 : un agent dont le bail est mort ou dont l'hôte a les
+            # claims fermés ne lira pas ; la résolution des destinataires
+            # l'écarte au lieu de compter une remise perdue.
+            closed = alert_briefs.claims_closed_hosts(db)
+            # #3057 : un bail rendu depuis quelques secondes (redémarrage)
+            # compte vivant pour le routage, mais rien ne lui est remis avant
+            # son retour ou la fin de la grâce.
+            listing, held = alert_briefs.lease_grace(
+                listing, closed, self.state.setdefault("leaseless_since", {}), now)
+            by_name = {row["name"]: row for row in listing}
+
+            def down(entry: dict) -> list:
+                # les destinataires d'une entrée (remis ou écartés) qui ne
+                # liraient pas à cette passe ; le fil n'a pas de bail
+                names = set(entry.get("to") or ()) | set(entry.get("dead") or ())
+                return sorted(n for n in names if not n.startswith("thread:") and (
+                    n not in by_name or alert_briefs._unavailable(by_name[n], closed)))
+
+            # #3057 : un destinataire mort qui le reste (agent arrêté des
+            # jours) ne refait pas, à chaque passe, briefs et titres du lot.
+            # L'entrée est réévaluée dès que l'un des écartés revient (ou est
+            # en grâce) ou quitte le registre, et dès que l'ensemble des
+            # indisponibles change depuis la dernière évaluation — un
+            # destinataire déjà servi qui tombe peut appeler le repli.
+            due = [(key, alert, entry) for key, alert, entry in due
+                   if key not in dead_only
+                   or entry.get("down") != down(entry)
+                   or any(name not in by_name
+                          or not alert_briefs._unavailable(by_name[name], closed)
+                          for name in entry["dead"])]
+            if not due:
+                return
             from . import canon as canon_mod
             try:
                 canons = canon_mod.load_configured(self.cfg) if self.cfg.canon else []
@@ -1873,19 +1910,19 @@ class Notifier:
             module_auditors = alert_briefs.auditors(listing, canons, explicit_only=True)
             from . import sous_utilisation
             module_orchestrators = sous_utilisation.role_orchestrators(canons)
-            # #3036 : un agent dont le bail est mort ou dont l'hôte a les
-            # claims fermés ne lira pas ; la résolution des destinataires
-            # l'écarte au lieu de compter une remise perdue.
-            closed = alert_briefs.claims_closed_hosts(db)
         except Exception as exc:  # noqa: BLE001
             self.log("mail to agents not prepared (%s)" % exc)
             return
+        unevaluated: set = set()
         for key, alert, entry in due:
             kind = alert.get("type")
             # #3036 : les destinataires écartés par la vivacité, pour que les
             # passes suivantes sachent qu'il reste quelqu'un à remettre.
             dead: dict = {}
-            is_reminder = entry is not None and kind != "slo_breach"
+            # les destinataires qui reçoivent la relance (les autres, le brief
+            # initial), et si la relance de 6 h est échue à cette passe
+            reminders: set = set()
+            remind_due = False
             try:
                 titles = {}
                 for lot in (alert.get("lots") or ())[:12]:
@@ -1899,7 +1936,13 @@ class Notifier:
                     closed_hosts=closed, dead_out=dead)
             except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
                 self.log("[%s] mail to agents not prepared (%s)" % (kind, exc))
+                unevaluated.add(key)
                 continue
+            for name in held & set(briefs):
+                # #3057 : bail rendu il y a moins de la grâce ; ni remise ni
+                # escalade, la passe suivante remet à son retour.
+                briefs.pop(name)
+                dead[name] = "lease returned, grace"
             if kind == "slo_breach" and "bureau" in (alert.get("targets") or ()) \
                     and any(
                         row.get("name") == "bureau" and row.get("mode") == "externe"
@@ -1918,7 +1961,6 @@ class Notifier:
                 # hôte perdu. On ne se fie à `to` que pour un destinataire
                 # encore vivant ; un nom mort à cette passe est retiré, pour
                 # être remis quand il revient — sans rafale vers les vivants.
-                by_name = {row["name"]: row for row in listing}
                 previous = {name: "" for name in (entry or {}).get("to") or ()}
                 still_live, gone = alert_briefs._split_live(previous, by_name, closed)
                 if entry is not None:
@@ -1942,21 +1984,27 @@ class Notifier:
                 # une relance), et rien n'est redéposé chez les morts.
                 already = {str(n) for n in entry.get("to") or ()}
                 fresh = {n: t for n, t in briefs.items() if n not in already}
-                if fresh:
-                    briefs = fresh
-                    is_reminder = False
-                elif entry.get("reminded") or now - float(entry["sent_ts"]) \
-                        < alert_briefs.REMIND_AFTER_S:
-                    entry["dead"] = sorted(dead)
-                    continue
-                else:
+                remind_due = not entry.get("reminded") and now - float(
+                    entry["sent_ts"]) >= alert_briefs.REMIND_AFTER_S
+                if remind_due:
+                    # #3057 : la relance échue part dans la même passe que le
+                    # brief initial d'un destinataire revenu, et la relance
+                    # est alors consommée : il ne la reçoit pas à la passe
+                    # suivante, quelques minutes après le brief initial.
                     raised = float(entry["sent_ts"])
-                    briefs = {n: alert_briefs.reminder(t, raised, now)
-                              for n, t in briefs.items() if n in already}
-                    if not briefs:
-                        entry["dead"] = sorted(dead)
-                        continue
-            payload = {"alert": kind, "reminder": is_reminder}
+                    reminders = {n for n in briefs if n in already}
+                    briefs = {**fresh, **{n: alert_briefs.reminder(briefs[n], raised, now)
+                                          for n in reminders}}
+                else:
+                    briefs = fresh
+                if not briefs:
+                    entry["dead"] = sorted(dead)
+                    # #3057 : un `pending` encore destinataire serait dans
+                    # `fresh` ; ce qui reste a quitté les briefs ou a été
+                    # remis depuis : oublié, la passe ne tourne pas à vide.
+                    entry["pending"] = []
+                    continue
+            payload = {"alert": kind, "reminder": False}
             # #789 t2 (canon §9) : l'urgence portée par l'alerte elle-même
             # (un P1) est propagée au courrier d'agent ; le type reste la
             # règle générale (L242b (5) : le point de l'auditeur).
@@ -1984,6 +2032,7 @@ class Notifier:
                 if self.dry_run:
                     self.log("[%s] mail to %s (dry run): %s" % (kind, name, text))
                     continue
+                meta = dict(payload, reminder=name in reminders)
                 try:
                     if name == "thread:bureau":
                         # #3036 : la route humaine — le fil lisible du lot,
@@ -1991,17 +2040,17 @@ class Notifier:
                         if fil.record(self.cfg, db, sender=work.SYSTEM_SENDER,
                                       recipients=["bureau"], text=text,
                                       project=alert.get("project"), lot=alert.get("lot"),
-                                      meta=payload) is None:
+                                      meta=meta) is None:
                             continue
                     elif kind == "module_deviation":
-                        if not self._send_module_brief(db, alert, name, text, payload):
+                        if not self._send_module_brief(db, alert, name, text, meta):
                             continue
                     else:
                         mail.send(db, work.SYSTEM_SENDER, name, text, kind="event",
-                                  payload=payload)
+                                  payload=meta)
                     delivered.append(name)
                     self.log("[%s] %s delivered to %s" % (
-                        kind, "reminder" if payload["reminder"] else "mail", name))
+                        kind, "reminder" if meta["reminder"] else "mail", name))
                 except Exception as exc:  # noqa: BLE001
                     self.log("[%s] mail to %s not delivered (%s)" % (kind, name, exc))
             # #3036 : une remise qui n'a pas eu lieu (destinataire filtré,
@@ -2043,8 +2092,16 @@ class Notifier:
                 entry["to"] = sorted(set(entry.get("to") or ()) | set(delivered))
                 entry["dead"] = sorted(dead)
                 entry["pending"] = sorted(set(briefs) - set(delivered) - set(dead))
-                if is_reminder:
+                if remind_due:
                     entry["reminded"] = True
+        # #3057 : l'état des destinataires vu à cette évaluation, pour que les
+        # passes suivantes sachent si quelque chose a changé ; une entrée non
+        # évaluée (préparation en échec) garde l'ancien et sera reprise.
+        for key, _alert, _entry in due:
+            entry = sent.get(key)
+            if entry is not None and entry.get("type") != "slo_breach" \
+                    and key not in unevaluated:
+                entry["down"] = down(entry)
 
     def _send_module_brief(self, db, alert, name, text, payload):
         """Reauthorize under a recipient row lock, held through mailbox commit.

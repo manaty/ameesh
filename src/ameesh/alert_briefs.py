@@ -43,6 +43,10 @@ BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias"
                  "mail_undeliverable")
 #: une relance, si l'alerte dure encore 6 h après le premier courrier
 REMIND_AFTER_S = 6 * 3600.0
+#: #3057 : un bail rendu depuis moins de ce délai (redémarrage d'exécuteur,
+#: quelques secondes) n'est pas encore une perte : le brief attend, sans
+#: escalade ni copie au fil ; trois passes du notificateur (30 s)
+LEASE_GRACE_S = 90.0
 #: rôles d'une fiche Agent du canon qui désignent l'auditeur
 AUDITOR_ROLES = ("auditeur", "auditor")
 #: nom de la persona de l'auditeur (docs/AUDITEUR.md, « Mise en service »)
@@ -80,10 +84,13 @@ def _unavailable(row: dict, closed: set) -> str:
 
     Trois preuves : son hôte a les claims fermés ; il est `stopped`/`dead` (il
     ne prendra plus de tour) ; ou son bail n'est plus vivant (le runner qui le
-    lisait est mort ou l'a rendu). Un état `queued` n'est pas consulté : un
-    agent qui attend un créneau a un runner vivant et lira. Une ligne sans
-    information de bail (appel hors base, test) n'est pas déclarée morte : on
-    ne remplace pas une preuve absente par une supposition."""
+    lisait est mort ou l'a rendu). L'état `queued` n'est pas une preuve en
+    soi, seul le bail compte : un `queued` qui tient son bail lira, un
+    `queued` sans bail vivant (hôte plein, `max_agents`, porte fermée) est
+    écarté comme tout agent sans bail — rien ne dit quand il prendra un tour.
+    Une ligne sans information de bail (appel hors base, test) n'est pas
+    déclarée morte : on ne remplace pas une preuve absente par une
+    supposition."""
     host = str(row.get("host") or "")
     if host and host in closed:
         return "host %s: claims closed" % host
@@ -93,6 +100,39 @@ def _unavailable(row: dict, closed: set) -> str:
     if "lease_live" in row and not row.get("lease_live"):
         return "no live lease"
     return ""
+
+
+def lease_grace(listing: list, closed: set, since: dict, now: float) -> tuple[list, set]:
+    """#3057 : la grâce d'un bail tout juste rendu.
+
+    Un exécuteur qui redémarre rend ses baux quelques secondes ; sans grâce,
+    les briefs de cette fenêtre partent au palier suivant ou au fil du bureau,
+    puis au destinataire à son retour (deux remises pour une absence de
+    secondes). `since` (état du notificateur, nom → première passe vue sans
+    bail) date l'absence. Rend le registre où un agent sans bail depuis moins
+    de `LEASE_GRACE_S` compte vivant pour le routage, et l'ensemble de ces
+    agents `held` : l'appelant ne leur remet rien encore. Seule l'absence de
+    bail a une grâce : un hôte aux claims fermés ou un agent `stopped` est une
+    perte prouvée. Une perte réelle n'est retardée que de la grâce."""
+    out: list = []
+    held: set = set()
+    for row in listing:
+        name = row["name"]
+        if "lease_live" not in row or row.get("lease_live") \
+                or _unavailable(dict(row, lease_live=True), closed):
+            since.pop(name, None)
+            out.append(row)
+            continue
+        first = float(since.setdefault(name, now))
+        if now - first < LEASE_GRACE_S:
+            held.add(name)
+            out.append(dict(row, lease_live=True))
+        else:
+            out.append(row)
+    names = {row["name"] for row in listing}
+    for name in [n for n in since if n not in names]:
+        del since[name]
+    return out, held
 
 
 def _dead_note(dead: dict) -> str:
@@ -573,7 +613,14 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
     palier suivant de l'échelle §9 (assigné → pilote → bureau/auditeur), puis
     la route humaine (copie au fil du bureau). Le brief dit toujours qui
     manquait (« No live recipient: X (no live lease). ») et le texte du geste
-    est celui du palier qui reçoit, pas celui du palier muet."""
+    est celui du palier qui reçoit, pas celui du palier muet.
+
+    #3057 (route voulue) : un lot sans assigné, ou assigné au bureau
+    `externe` qui ne lit pas sa boîte, n'a personne au palier 1 ; il part au
+    pilote dès le niveau 1, comme un assigné mort. Un palier 1 muet laisserait
+    le lot sans lecteur jusqu'au double du délai, et le pilote est celui qui
+    peut l'affecter (§9 : assigné → pilote). Le brief nomme le bureau externe
+    parmi les absents au lieu de « none designated »."""
     roles = set(alert.get("targets") or ("assignee",))
     text = _slo_breach(alert)
     raw: dict = {}
@@ -582,6 +629,9 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
                                   auditor_names):
             raw.setdefault(name, role)
     live, dead = _split_live({name: text for name in raw}, by_name, closed)
+    if "assignee" in roles and alert.get("agent") == "bureau" \
+            and _bureau_externe(by_name):
+        dead.setdefault("bureau", "external desk, reads the lot thread")
     if live:
         note = _dead_note(dead)
         return {name: note + body for name, body in live.items()}
