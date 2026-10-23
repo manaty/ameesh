@@ -71,6 +71,13 @@ class MacosSuiteJobTest(unittest.TestCase):
         self.assertIn("createdb", self.job)
         self.assertIn('AMEESH_REQUIRE_DB: "1"', self.job)
 
+    def test_the_gnu_find_of_the_deployment_scripts_is_installed(self):
+        # #3042 : poste.sh utilise `find -printf` (GNU) ; le faux ssh du banc
+        # l'exécute sous macOS, où le find BSD refuse cette primaire.
+        self.assertIn("brew install postgresql@17 bash coreutils gnu-sed findutils",
+                      self.job)
+        self.assertIn("$(brew --prefix findutils)/libexec/gnubin", self.job)
+
     def test_the_platform_contract_still_runs_on_macos(self):
         for nom in ("tests.test_l63_platform.PlatformTest",
                     "tests.test_l63_platform.LintTest",
