@@ -17,16 +17,17 @@
 #  2. Le tag est immuable et ne porte que la révision (`sha-<12>`). Un tag déjà
 #     publié n'est jamais réécrit : la même révision rend le même digest.
 #
-#  3. Le digest rendu est celui du manifeste linux/amd64 que le bureau signe :
-#     l'architecture de l'image locale est vérifiée avant tout réseau, puis le
-#     manifeste et le blob de configuration servis par le registre sont relus
-#     après le push. Un index multi-architecture est refusé.
+#  3. Le digest rendu est celui du push de ce run, et c'est un manifeste simple
+#     linux/amd64 : la sortie de `docker push` est comparée au manifeste relu,
+#     le blob de configuration est comparé à l'image construite, et le label de
+#     révision est vérifié. Un index multi-architecture est refusé.
 #
 #  4. Le jeton GHCR et le bearer du registre ne passent jamais par argv : curl
 #     les lit dans sa configuration sur stdin (`-K -`) et `docker login` reçoit
-#     le mot de passe par `--password-stdin`. Sur l'hôte ameesh-ci, plusieurs
-#     runners partagent l'utilisateur : /proc/<pid>/cmdline exposerait un
-#     secret passé en ligne de commande.
+#     le mot de passe par `--password-stdin`. La configuration docker vit dans
+#     $work (DOCKER_CONFIG, 0700), jamais dans le ~/.docker partagé de
+#     l'utilisateur : sur l'hôte ameesh-ci, plusieurs runners le lisent, et
+#     /proc/<pid>/cmdline exposerait un secret passé en ligne de commande.
 #
 # Entrées (environnement) : IMAGE, SHA_TAG, GHCR_USER, GHCR_TOKEN ; VERSION,
 # REVISION et PLATFORM sont facultatives (résumé ; PLATFORM vaut linux/amd64).
@@ -59,9 +60,17 @@ api="https://$registry/v2/$repo"
 accept='application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
 
 work="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ameesh-executor-publish.XXXXXX")"
+# B1 (relecture auditeur, 23/10/2026) : `docker login` écrit ses identifiants
+# dans $DOCKER_CONFIG/config.json. Sans configuration propre, il écrirait le
+# jeton `packages:write` dans le ~/.docker partagé de l'utilisateur, lisible
+# par les jobs concurrents des autres runners ; `docker logout` les
+# déconnecterait. La configuration vit donc sous $work (0700) et disparaît
+# avec lui.
+export DOCKER_CONFIG="$work/docker"
+mkdir -m 700 "$DOCKER_CONFIG"
 cleanup() {
-  rm -rf "$work"
   docker logout "$registry" >/dev/null 2>&1 || true
+  rm -rf "$work"
 }
 trap cleanup EXIT
 
@@ -136,11 +145,12 @@ lookup() {
   esac
 }
 
-# verify_platform : le manifeste servi est un manifeste simple, et son blob de
-# configuration dit bien l'OS et l'architecture attendus. C'est cette valeur
-# @sha256 que le bureau signe (O4) ; un index multi-architecture n'a pas de config.
-verify_platform() {
-  local ref="$1" config code
+# verify_manifest : le manifeste servi est un manifeste simple, et son blob de
+# configuration dit bien l'OS, l'architecture et la révision attendus. C'est
+# cette valeur @sha256 que le bureau signe (O4) ; un index multi-architecture
+# n'a pas de config, et le label de révision lie le tag au commit relu.
+verify_manifest() {
+  local ref="$1" config code got got_revision
   case "$LOOKUP_TYPE" in
     application/vnd.oci.image.index.v1+json|application/vnd.docker.distribution.manifest.list.v2+json)
       die "le registre sert un index multi-architecture pour $ref : le digest signé doit être celui du manifeste $PLATFORM" ;;
@@ -154,12 +164,19 @@ verify_platform() {
         -H 'Accept: application/octet-stream' \
         "$api/blobs/$config" || true)"
   [ "${code:-000}" = 200 ] || die "blob de configuration $config illisible ($code)"
-  local got
   got="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("%s/%s" % (d.get("os",""), d.get("architecture","")))' \
       "$work/config" 2>/dev/null)" \
     || die "blob de configuration $config illisible"
   [ "$got" = "$PLATFORM" ] \
     || die "le registre sert $got pour $ref, $PLATFORM attendu : le digest signé serait celui d'une autre architecture"
+  MANIFEST_CONFIG="$config"
+  if [ "$REVISION" != unknown ]; then
+    got_revision="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(((d.get("config") or {}).get("Labels") or {}).get("org.opencontainers.image.revision",""))' \
+        "$work/config" 2>/dev/null)" \
+      || die "blob de configuration $config illisible"
+    [ "$got_revision" = "$REVISION" ] \
+      || die "le registre sert la révision '${got_revision:-absente}' pour $ref, ${REVISION} attendu : ce n'est pas l'image de ce commit"
+  fi
 }
 
 # --- tag de révision : poussé seulement si le registre prouve son absence ----
@@ -167,13 +184,24 @@ lookup "$SHA_TAG"
 if [ "$LOOKUP_STATE" = present ]; then
   digest="$LOOKUP_DIGEST"
   echo "tag $SHA_TAG déjà publié ($digest) : jamais réécrit, image locale ignorée"
-  verify_platform "$SHA_TAG"
+  verify_manifest "$SHA_TAG"
 else
   docker push "$IMAGE:$SHA_TAG" | tee "$work/push.log"
+  # B2 (relecture auditeur, 23/10/2026) : le digest à signer est celui du push
+  # de ce run, pas celui qu'un acteur pourrait poser sur le tag entre le push
+  # et la relecture.
+  pushed="$(sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' "$work/push.log" | tail -1)"
+  [ -n "$pushed" ] || die "docker push n'a pas rendu de digest : le digest à signer ne serait pas lié à ce push"
   lookup "$SHA_TAG"
   [ "$LOOKUP_STATE" = present ] || die "le registre ne sert pas $SHA_TAG après le push"
+  [ "$LOOKUP_DIGEST" = "$pushed" ] \
+    || die "le registre sert $LOOKUP_DIGEST pour $SHA_TAG, le push a poussé $pushed : un autre manifeste a pris le tag, rien à signer"
   digest="$LOOKUP_DIGEST"
-  verify_platform "$SHA_TAG"
+  verify_manifest "$SHA_TAG"
+  local_config="$(docker image inspect --format '{{.Id}}' "$IMAGE:$SHA_TAG" 2>/dev/null)" \
+    || die "image locale $IMAGE:$SHA_TAG illisible après le push"
+  [ "$MANIFEST_CONFIG" = "$local_config" ] \
+    || die "le manifeste servi configure $MANIFEST_CONFIG, l'image construite $local_config : ce n'est pas le manifeste de ce build"
   echo "tag $SHA_TAG publié : $digest"
 fi
 
@@ -188,7 +216,7 @@ for attempt in 1 2 3 4 5; do
   sleep 3
 done
 [ "$servi" = 1 ] || die "le registre ne sert pas $IMAGE@$digest après publication"
-verify_platform "$digest"
+verify_manifest "$digest"
 
 image_ref="$IMAGE@$digest"
 {

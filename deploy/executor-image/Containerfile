@@ -13,7 +13,9 @@
 # tini. AUCUN SECRET : ni clé de fournisseur, ni identifiant de forge, ni DSN,
 # ni clé de release. La clé de l'exécuteur naît dans le volume, à l'enrôlement.
 #
-# Deux épinglages, pour que la même source donne le même contenu :
+# Deux épinglages des dépendances mouvantes du binaire ; les paquets apt
+# (python3, git, tini) suivent les dépôts Debian bookworm au moment du build,
+# et c'est le digest publié qui fait référence :
 #   - l'image de base Node est épinglée par le digest de son manifeste
 #     linux/amd64 (et non par le tag mobile `22-bookworm-slim`) ;
 #   - dsh est installé par `npm ci` depuis package.json + package-lock.json
@@ -72,7 +74,7 @@ RUN set -eux; \
 COPY deploy/executor-image/package.json deploy/executor-image/package-lock.json /opt/dsh/
 RUN set -eux; \
     cd /opt/dsh; \
-    npm ci --omit=dev --no-audit --no-fund; \
+    npm ci --omit=dev --ignore-scripts --no-audit --no-fund; \
     npm cache clean --force; \
     test "$(node -p 'require("/opt/dsh/node_modules/@deepseek-ai/dsh/package.json").version')" = "$DSH_VERSION"; \
     ln -s /opt/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js /usr/local/bin/dsh; \

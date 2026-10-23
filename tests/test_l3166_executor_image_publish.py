@@ -43,6 +43,7 @@ POLICY = REPO / "docs" / "IMAGE-EXECUTEUR.md"
 IMAGE = "ghcr.io/manaty/ameesh-executor"
 SHA_TAG = "sha-0123456789ab"
 VERSION = "9.9.9"
+REVISION = "a708792e61d14a9cf15b69610bb006932ae19e15"
 TOKEN = "canari-ghcr-3166"      # jeton GHCR injecté : jamais en argv
 BEARER = "canari-bearer-3166"   # bearer rendu par le faux registre
 
@@ -206,14 +207,39 @@ import sys
 FAKE = pathlib.Path(os.environ["FAKE_DIR"])
 with (FAKE / "docker.log").open("a") as journal:
     journal.write("docker " + " ".join(sys.argv[1:]) + "\\n")
+with (FAKE / "docker-config.log").open("a") as journal:
+    journal.write(os.environ.get("DOCKER_CONFIG", "") + "\\n")
 
 if "--password-stdin" in sys.argv[1:]:
     sys.stdin.read()
+
+
+def config_bytes():
+    if (FAKE / "config-body").exists():
+        return (FAKE / "config-body").read_bytes()
+    revision = os.environ.get("FAKE_REVISION", "")
+    return json.dumps({
+        "os": "linux",
+        "architecture": "amd64",
+        "config": {"Labels": {"org.opencontainers.image.revision": revision}},
+        "rootfs": {"type": "layers", "diff_ids": []},
+    }).encode()
+
+
+def config_digest():
+    return "sha256:" + hashlib.sha256(config_bytes()).hexdigest()
+
 
 args = sys.argv[1:]
 if args[:2] == ["image", "inspect"]:
     if (FAKE / "no-local-image").exists():
         sys.exit(1)
+    if "{{.Id}}" in args:
+        if (FAKE / "config-id").exists():
+            print((FAKE / "config-id").read_text().strip())
+        else:
+            print(config_digest())
+        sys.exit(0)
     platform = "linux/amd64"
     if (FAKE / "local-platform").exists():
         platform = (FAKE / "local-platform").read_text().strip()
@@ -223,17 +249,16 @@ if args[:2] == ["image", "inspect"]:
 if args[:1] == ["push"]:
     image = args[1]
     tag = image.split(":", 1)[1]
-    config = (FAKE / "config-body").read_bytes() if (FAKE / "config-body").exists() \\
-        else b'{"os":"linux","architecture":"amd64","rootfs":{"type":"layers","diff_ids":[]}}'
-    config_digest = "sha256:" + hashlib.sha256(config).hexdigest()
+    config = config_bytes()
+    digest = config_digest()
     blobs = FAKE / "blobs"
     blobs.mkdir(parents=True, exist_ok=True)
-    (blobs / config_digest).write_bytes(config)
+    (blobs / digest).write_bytes(config)
     manifest = json.dumps({
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
         "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
-                   "digest": config_digest, "size": len(config)},
+                   "digest": digest, "size": len(config)},
         "layers": [],
     }).encode()
     registry = FAKE / "registry"
@@ -241,6 +266,19 @@ if args[:1] == ["push"]:
     (registry / tag).write_bytes(manifest)
     (registry / (tag + ".type")).write_text(
         "application/vnd.oci.image.manifest.v1+json")
+    if (FAKE / "push-tamper").exists():
+        # un autre manifeste prend le tag : le digest imprime reste celui du
+        # vrai push, le lookup doit refuser l'ecart.
+        tampered = json.dumps({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                       "digest": "sha256:" + "1" * 64, "size": 1},
+            "layers": [],
+        }).encode()
+        (registry / tag).write_bytes(tampered)
+    print("%s: digest: sha256:%s size: %d" % (
+        tag, hashlib.sha256(manifest).hexdigest(), len(manifest)))
 sys.exit(0)
 '''
 
@@ -307,8 +345,8 @@ class ScriptInvariantsTest(unittest.TestCase):
         cls.text = SCRIPT.read_text(encoding="utf-8")
 
     def test_un_seul_push_et_c_est_le_sha(self):
-        self.assertEqual(self.text.count("docker push "), 1)
-        self.assertIn('docker push "$IMAGE:$SHA_TAG"', self.text)
+        self.assertEqual(self.text.count('docker push "$IMAGE:$SHA_TAG"'), 1)
+        self.assertIn('docker push "$IMAGE:$SHA_TAG" | tee', self.text)
 
     def test_absence_prouvee_par_un_404(self):
         self.assertIn("404) LOOKUP_STATE=absent", self.text)
@@ -322,9 +360,24 @@ class ScriptInvariantsTest(unittest.TestCase):
                       self.text)
         self.assertIn("application/vnd.oci.image.index.v1+json", self.text)
         self.assertIn("manifeste $PLATFORM", self.text)
-        self.assertIn("verify_platform", self.text)
+        self.assertIn("verify_manifest", self.text)
         self.assertIn("blobs/$config", self.text)
         self.assertIn('image_ref="$IMAGE@$digest"', self.text)
+        self.assertIn("org.opencontainers.image.revision", self.text)
+
+    def test_le_digest_signe_est_lie_au_push_de_ce_run(self):
+        # B2 (auditeur, 23/10/2026) : le digest rendu est celui du push, pas
+        # celui qu'un acteur aurait pose sur le tag entre le push et la relecture.
+        self.assertIn(r"digest: \(sha256:[0-9a-f]\{64\}\)", self.text)
+        self.assertIn("$work/push.log", self.text)
+        self.assertIn('"$LOOKUP_DIGEST" = "$pushed"', self.text)
+        self.assertIn("docker image inspect --format '{{.Id}}'", self.text)
+        self.assertIn('"$MANIFEST_CONFIG" = "$local_config"', self.text)
+
+    def test_config_docker_privee(self):
+        # B1 (auditeur, 23/10/2026) : jamais le ~/.docker partage des runners.
+        self.assertIn('export DOCKER_CONFIG="$work/docker"', self.text)
+        self.assertIn('mkdir -m 700 "$DOCKER_CONFIG"', self.text)
 
     def test_les_secrets_ne_passent_pas_en_argv(self):
         self.assertNotIn('-u "$GHCR_USER:$GHCR_TOKEN"', self.text)
@@ -346,6 +399,7 @@ class PublishBehaviourTest(unittest.TestCase):
         (self.fake / "registry").mkdir()
         (self.fake / "errors").mkdir()
         (self.fake / "blobs").mkdir()
+        (self.fake / "home").mkdir()
         self._bin("curl", FAKE_CURL)
         self._bin("docker", FAKE_DOCKER)
         self.env = dict(os.environ)
@@ -357,6 +411,9 @@ class PublishBehaviourTest(unittest.TestCase):
             "IMAGE": IMAGE,
             "SHA_TAG": SHA_TAG,
             "VERSION": VERSION,
+            "REVISION": REVISION,
+            "FAKE_REVISION": REVISION,
+            "HOME": str(self.fake / "home"),
             "GHCR_USER": "x-access-token",
             "GHCR_TOKEN": TOKEN,
         })
@@ -372,7 +429,10 @@ class PublishBehaviourTest(unittest.TestCase):
                                                               encoding="utf-8")
 
     def _put_valid(self, ref, config=None):
-        config = config or b'{"os":"linux","architecture":"amd64"}'
+        config = config or json.dumps({
+            "os": "linux", "architecture": "amd64",
+            "config": {"Labels": {"org.opencontainers.image.revision": REVISION}},
+        }).encode()
         config_digest = "sha256:" + hashlib.sha256(config).hexdigest()
         (self.fake / "blobs" / config_digest).write_bytes(config)
         manifest = json.dumps({
@@ -458,6 +518,50 @@ class PublishBehaviourTest(unittest.TestCase):
         self.assertIn("déjà publié", proc.stdout)
         self.assertIn("digest=" + digest, proc.stdout)
 
+    def test_le_tag_change_apres_le_push_est_refuse(self):
+        # B2 (auditeur, 23/10/2026) : le digest du push et le manifeste relu
+        # doivent etre le meme ; sinon rien ne doit etre propose a la signature.
+        (self.fake / "push-tamper").write_text("", encoding="utf-8")
+        proc = self._run()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("un autre manifeste a pris le tag", proc.stderr)
+        self.assertFalse((self.fake / "digest.txt").exists())
+
+    def test_le_manifeste_servi_doit_etre_la_config_du_build(self):
+        (self.fake / "config-id").write_text("sha256:" + "2" * 64, encoding="utf-8")
+        proc = self._run()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("ce n'est pas le manifeste de ce build", proc.stderr)
+        self.assertFalse((self.fake / "digest.txt").exists())
+
+    def test_revision_servie_differente_refusee(self):
+        config = json.dumps({
+            "os": "linux", "architecture": "amd64",
+            "config": {"Labels": {"org.opencontainers.image.revision": "deadbeef"}},
+        }).encode()
+        self._put_valid(SHA_TAG, config)
+        proc = self._run()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("révision 'deadbeef'", proc.stderr)
+        self.assertEqual(self._pushed(), [])
+
+    def test_config_docker_privee_pas_dans_le_home(self):
+        # B1 (auditeur, 23/10/2026) : le login ecrit dans $work/docker, jamais
+        # dans le ~/.docker partage de l'utilisateur des runners.
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lignes = [ligne for ligne in
+                  (self.fake / "docker-config.log").read_text(encoding="utf-8").splitlines()
+                  if ligne]
+        self.assertTrue(lignes)
+        for ligne in lignes:
+            self.assertTrue(ligne.endswith("/docker"), ligne)
+            self.assertIn("ameesh-executor-publish", ligne)
+            self.assertNotIn(str(self.fake / "home"), ligne)
+        # le dossier $work (donc la configuration docker) est effacé à la sortie
+        self.assertFalse(pathlib.Path(lignes[0]).exists())
+        self.assertFalse((self.fake / "home" / ".docker").exists())
+
     def test_une_autre_architecture_locale_est_refusee_avant_reseau(self):
         (self.fake / "local-platform").write_text("linux/arm64", encoding="utf-8")
         proc = self._run()
@@ -539,6 +643,9 @@ class ContainerfileTest(unittest.TestCase):
     def test_base_et_dsh_epingles(self):
         self.assertIn("node:22-bookworm-slim@sha256:", self.text)
         self.assertIn("npm ci --omit=dev", self.text)
+        # N de la relecture auditeur : aucun script d'installation npm ne
+        # s'exécute dans l'image ; dsh 0.2.0-rc.2 fonctionne sans (vérifié).
+        self.assertIn("--ignore-scripts", self.text)
         self.assertIn("package-lock.json", self.text)
         self.assertIn("DSH_VERSION=0.2.0-rc.2", self.text)
         # plus de binaire dsh fourni au contexte : l'arbre npm est le verrou

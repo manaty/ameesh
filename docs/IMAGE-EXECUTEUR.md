@@ -219,6 +219,10 @@ avant fusion est le build local du `Containerfile` sur `linux/amd64`, les
 tests et la CI ; aucun tag n'est publié depuis une branche de lot ou une PR.
 Le run se déclenche par `workflow_dispatch` sur `main` (onglet Actions, ou
 `gh workflow run image-executor.yml --ref main`), avec le feu du pilote.
+Le garde `refs/heads/main` écarte une erreur de déclenchement ; il ne fait
+pas frontière d'autorité contre un acteur qui peut écrire dans le dépôt :
+c'est la signature O4 (§9.2), faite hors CI avec la clé de release, qui fait
+la porte — et Nexlink épingle ensuite le digest dans la recette.
 
 Aucun tag mobile, aucun `latest` : un consommateur épingle un **digest**.
 Un tag `sha-<12>` déjà publié n'est jamais réécrit ; une seconde exécution
@@ -226,13 +230,24 @@ sur le même commit rend le digest existant. Le tag ne porte que la
 révision : le digest est l'identité de release, et c'est lui que Nexlink
 épingle.
 
+Les paquets apt suivent les dépôts Debian au moment de la construction, et
+`npm ci` s'exécute avec `--ignore-scripts` : les deux dépendances les plus
+mouvantes sont épinglées (base Node par digest, arbre dsh par
+`package-lock.json`), et le digest publié est la référence de contenu. Une
+reconstruction du même commit peut donc différer ; un tag `sha-<12>` déjà
+publié n'est pas reconstruit.
+
 Le workflow n'utilise que le `GITHUB_TOKEN` du dépôt, avec la seule
 permission `packages: write` (`contents: read` par ailleurs). Aucun jeton
 personnel n'est employé ni stocké. Le jeton GHCR et le bearer du registre ne
 passent jamais par la ligne de commande : `publish.sh` les donne à `curl`
 par sa configuration lue sur stdin (`-K -`), et `docker login` reçoit le mot
 de passe par `--password-stdin` (plusieurs runners partagent l'utilisateur
-de l'hôte ; `/proc/<pid>/cmdline` exposerait un secret passé en argv).
+de l'hôte ; `/proc/<pid>/cmdline` exposerait un secret passé en argv). La
+configuration docker du run vit dans `$DOCKER_CONFIG`, sous le dossier
+temporaire du job (`0700`), jamais dans le `~/.docker` partagé de
+l'utilisateur : un `docker logout` global déconnecterait les jobs
+concurrents.
 
 **Preuve de publication.** `publish.sh` écrit, dans le résumé du run et dans
 `digest.txt` :
@@ -247,12 +262,20 @@ digest=sha256:<64 hex>
 image_ref=ghcr.io/manaty/ameesh-executor@sha256:<64 hex>
 ```
 
-Il relit le manifeste et le blob de configuration **servis par le registre**
-avant de conclure : une absence de tag ne se conclut que sur un 404, un index
-multi-architecture est refusé, et une architecture autre que `linux/amd64`
-arrête le run. L'auteur du lot reporte la ligne `image_ref` sur le fil du
-lot et la remet au bureau pour la signature O4 (§9.2) ; c'est cette valeur,
-et elle seule, que le bureau signe.
+Il relie le digest à **ce run** : le digest imprimé par `docker push` doit
+être celui que le registre sert ensuite pour le tag, le blob de
+configuration du manifeste servi doit être l'ID de l'image construite, et
+le label `org.opencontainers.image.revision` doit valoir la révision
+publiée. Une absence de tag ne se conclut que sur un 404 ; un index
+multi-architecture ou une autre architecture arrête le run. Si le tag
+existait déjà, rien n'est poussé : le script ne rend que le digest existant
+après avoir vérifié sa révision, et le dit dans le journal. Le digest signé
+est donc toujours celui que le registre sert à la fin du run, lié soit au
+push de ce run, soit au label de révision du tag existant.
+
+L'auteur du lot reporte la ligne `image_ref` sur le fil du lot et la remet
+au bureau pour la signature O4 (§9.2) ; c'est cette valeur, et elle seule,
+que le bureau signe.
 
 Le paquet est **privé** par défaut sur ghcr ; son passage en public est une
 décision de l'owner (ou du bureau sur délégation), pas du workflow. Le
