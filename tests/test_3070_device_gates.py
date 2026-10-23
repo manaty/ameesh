@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import datetime
+import threading
 import time
 import types
 import unittest
 from unittest import mock
 
-from ameesh import canon, device_gates, runner, storage, work
+from ameesh import canon, db as D, device_gates, runner, storage, work
 from tests.support import PgTestCase
 from tests.test_canon import _TmpMixin, codes, fiche, write
 
@@ -109,6 +110,22 @@ class AssessTest(unittest.TestCase):
         self.assertIsNone(self.assess(events[:3], host("nx-carina", FUTURE),
                                       item=dict(BLOCKED, state="build")))
 
+    def test_declaration_illisible_garde_le_lot_bloque(self):
+        # #3070 B2 : une séance illisible après une séance lisible retient le lot
+        events = self.journal(ev(4, "blocked", "séance: appareil/inconnu — cas B"))
+        view = self.assess(events, host("nx-carina", FUTURE))
+        self.assertFalse(view["liftable"])
+        self.assertEqual(view["others"], [
+            "unreadable session declaration 'séance: appareil/inconnu — cas B'"])
+        self.assertEqual(view["cases"], "cas iOS")
+        # la même, posée en retenue ; et seule, elle est encore dite
+        events = self.journal(ev(4, "blocked", "hold: séance: — cas B"))
+        self.assertFalse(self.assess(events, host("nx-carina", FUTURE))["liftable"])
+        alone = [ev(1, "build", "x"), ev(2, "blocked", "séance: a/b")]
+        view = self.assess(alone, host("nx-carina", FUTURE))
+        self.assertFalse(view["liftable"])
+        self.assertIn("session declaration unreadable → stays blocked", device_gates.label(view))
+
     def test_lot_de_verification_jamais_leve(self):
         item = dict(BLOCKED, title="%s de nx-carina : séance reportée de #1 — x"
                     % device_gates.VERIFY_TITLE)
@@ -199,6 +216,55 @@ class LiftTest(PgTestCase):
         storage.of(self.db).work_dependencies.remove(ident, other, actor="test")
         done = device_gates.lift(self.db, canons=gates)
         self.assertEqual([(d["lot"], d["state"]) for d in done], [(ident, "build")])
+
+    def test_vue_perimee_jamais_appliquee(self):
+        # #3070 B1 : la levée réévalue sous verrou ; une dépendance posée après
+        # la lecture groupée garde le lot bloqué, sans lot de vérification
+        ident = self.blocked()
+        gates = canons(host("nx-carina", FUTURE))
+        views = device_gates.candidates(self.db, canons=gates)
+        self.assertTrue(views[0]["liftable"])
+        other = work.add(self.db, title="prérequis")["id"]
+        storage.of(self.db).work_dependencies.add(ident, other, actor="test")
+        hosts = device_gates.hosts_by_name(gates)
+        self.assertIsNone(device_gates.lift_one(self.db, ident, hosts=hosts, now=time.time()))
+        self.assertEqual(work.get(self.db, ident)["state"], "blocked")
+        self.assertEqual(len(work.list_items(self.db)), 2)
+        # une séance illisible ajoutée après la lecture, de même
+        storage.of(self.db).work_dependencies.remove(ident, other, actor="test")
+        work.note(self.db, ident, "séance: x/y — cas B", actor="dev")
+        self.assertIsNone(device_gates.lift_one(self.db, ident, hosts=hosts, now=time.time()))
+        self.assertEqual(work.get(self.db, ident)["state"], "blocked")
+
+    def test_levee_attend_une_arete_en_cours_et_la_voit(self):
+        # #3070 B1 : une arête en cours d'écriture (verrou de graphe tenu par
+        # une autre transaction) est attendue par la levée, puis relue
+        ident = self.blocked()
+        other = work.add(self.db, title="prérequis")["id"]
+        hosts = device_gates.hosts_by_name(canons(host("nx-carina", FUTURE)))
+        conn = D.connect(self.cfg)
+        self.addCleanup(conn.close)
+        scope = conn.transaction()
+        tx = scope.__enter__()
+        committed = False
+        try:
+            self.assertEqual(storage.of(tx).work_dependencies.add(ident, other, actor="test"),
+                             {"added": True})
+            results = []
+            worker = threading.Thread(target=lambda: results.append(device_gates.lift_one(
+                D.connect(self.cfg), ident, hosts=hosts, now=time.time())), daemon=True)
+            worker.start()
+            worker.join(timeout=1.5)
+            self.assertTrue(worker.is_alive(), "the lift must wait for the graph lock")
+            scope.__exit__(None, None, None)
+            committed = True
+            worker.join(timeout=20)
+            self.assertFalse(worker.is_alive())
+        finally:
+            if not committed:
+                scope.__exit__(RuntimeError, RuntimeError("abort"), None)
+        self.assertEqual(results, [None])
+        self.assertEqual(work.get(self.db, ident)["state"], "blocked")
 
     def test_dry_run_n_ecrit_rien(self):
         ident = self.blocked()

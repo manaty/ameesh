@@ -40,6 +40,8 @@ SESSION_PREFIX = "séance:"
 _SESSION = re.compile(r"^s[ée]ance\s*:\s*(?P<devices>[^—;]*?)\s*(?:[—;]\s*(?P<cases>.*))?$",
                       re.I | re.S)
 _DEVICE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+#: une note qui SE DONNE pour une séance : illisible, elle retient le lot
+_SESSION_START = re.compile(r"^s[ée]ance\s*:", re.I)
 _HOLD = re.compile("^" + re.escape(LotSessions.HOLD_PREFIX) + r"\s*", re.I)
 _SPACE = "[" + HOLD_NOTE_WHITESPACE + "]"
 _LIFT = re.compile(
@@ -83,10 +85,12 @@ def parse_session(text) -> dict | None:
 def episode(events) -> dict | None:
     """Le séjour courant du lot en `blocked`, lu dans son journal.
 
-    Rend `{before, devices, cases, holds}` : l'état d'avant `blocked`, les
-    appareils déclarés depuis l'entrée (union, dans l'ordre), les cas non joués
-    et les autres retenues `hold:` encore en vigueur (non levées) ; None si le
-    lot n'est pas `blocked` ou si aucune séance n'est déclarée."""
+    Rend `{before, devices, cases, holds, unreadable}` : l'état d'avant
+    `blocked`, les appareils déclarés depuis l'entrée (union, dans l'ordre),
+    les cas non joués, les autres retenues `hold:` encore en vigueur (non
+    levées) et les déclarations de séance illisibles (#3070 B2 : une seule
+    suffit à garder le lot bloqué, même à côté d'une déclaration lisible) ;
+    None si le lot n'est pas `blocked` ou si rien ne s'y donne pour une séance."""
     ordered = sorted(events or (), key=lambda e: (float(e.get("created_ts") or 0.0),
                                                    int(e.get("id") or 0)))
     start, before, previous = None, None, None
@@ -100,23 +104,27 @@ def episode(events) -> dict | None:
     devices: list[str] = []
     cases: list[str] = []
     holds: list[dict] = []
+    unreadable: list[str] = []
     for event in ordered[start:]:
         text = str(event.get("note") or "").strip()
         if _LIFT.match(text):
             holds = []
             continue
         held = _HOLD.match(text)
-        declared = parse_session(text[held.end():] if held else text)
+        body = text[held.end():] if held else text
+        declared = parse_session(body)
         if declared is not None:
             devices.extend(d for d in declared["devices"] if d not in devices)
             if declared["cases"] and declared["cases"] not in cases:
                 cases.append(declared["cases"])
+        elif _SESSION_START.match(body):
+            unreadable.append(text)
         elif held:
             holds = [{"by": event.get("actor") or None, "note": text}]
-    if not devices:
+    if not devices and not unreadable:
         return None
     return {"before": before, "devices": devices, "cases": "; ".join(cases),
-            "holds": holds}
+            "holds": holds, "unreadable": unreadable}
 
 
 def hosts_by_name(canons) -> dict:
@@ -167,6 +175,8 @@ def assess(item: dict, events, *, hosts: dict, dependencies=(), decisions=(),
         others.append("open decision request #%s" % request.get("id"))
     for hold in found["holds"]:
         others.append("hold by %s" % (hold["by"] or "unknown"))
+    for text in found["unreadable"]:
+        others.append("unreadable session declaration %r" % text)
     if str(item.get("workflow_ref") or ""):
         # #1922 : un lot pinné ne bouge que par le registre des processus
         others.append("pinned to Process revision %s" % item["workflow_ref"])
@@ -189,7 +199,7 @@ def label(view: dict) -> str:
                 " (%s)" % device["reason"] if device.get("reason") else ""))
         else:
             parts.append("%s available" % device["name"])
-    text = "session " + ", ".join(parts)
+    text = "session " + (", ".join(parts) or "declaration unreadable")
     if view["liftable"]:
         return text + " → %s, test deemed compliant: back to %s at the next pass" % (
             TRACE, view["back_to"])
@@ -230,16 +240,22 @@ def _verify_body(item: dict, view: dict) -> str:
     ])
 
 
-def of_item(db, item: dict, *, canons, now: float | None = None) -> dict | None:
-    """L'évaluation d'un seul lot (`work show`), ou None hors séance déclarée."""
+def _assess_read(db, item: dict, *, hosts: dict, now: float) -> dict | None:
+    """`assess` sur ce que la base dit maintenant du lot (journal complet,
+    arêtes, demandes de décision), lu par `db` (la transaction de la levée)."""
     if item.get("state") != "blocked":
         return None
     ident = int(item["id"])
     st = storage.of(db)
-    return assess(item, work.events(db, ident, None), hosts=hosts_by_name(canons),
+    return assess(item, work.events(db, ident, None), hosts=hosts,
                   dependencies=st.work_dependencies.for_items([ident]),
-                  decisions=st.decisions.pending_for_lot(str(ident)),
-                  now=time.time() if now is None else float(now))
+                  decisions=st.decisions.pending_for_lot(str(ident)), now=now)
+
+
+def of_item(db, item: dict, *, canons, now: float | None = None) -> dict | None:
+    """L'évaluation d'un seul lot (`work show`), ou None hors séance déclarée."""
+    return _assess_read(db, item, hosts=hosts_by_name(canons),
+                        now=time.time() if now is None else float(now))
 
 
 def candidates(db, *, canons, now: float | None = None) -> list[dict]:
@@ -266,19 +282,30 @@ def candidates(db, *, canons, now: float | None = None) -> list[dict]:
     return out
 
 
-def lift_one(db, view: dict, *, actor: str = ACTOR) -> dict | None:
+def lift_one(db, ident: int, *, hosts: dict, now: float,
+             actor: str = ACTOR) -> dict | None:
     """Sort un lot de `blocked` : lot de vérification puis transition, dans
-    une transaction ; None (rien d'écrit) si le lot a bougé entre-temps."""
-    ident = view["lot"]
+    une transaction ; None (rien d'écrit) si le lot n'est plus levable.
 
-    class _Moved(Exception):
+    #3070 B1 : l'évaluation qui décide est refaite DANS la transaction, sous
+    les verrous des écritures concurrentes, jamais reprise d'une lecture
+    antérieure. Ordre graphe puis lot, celui de `work_dependencies.add` : le
+    verrou de graphe sérialise les éditions d'arêtes et les fermetures de
+    prérequis ; la ligne du lot `FOR UPDATE` (`work.lock`, #2744) tient les
+    notes (`work.note` la prend), les transitions et toute insertion au journal
+    (sa clé étrangère attend le verrou). Ce qui a été écrit avant les verrous
+    est relu ; ce qui vient après attend la fin de la levée."""
+
+    class _NotLiftable(Exception):
         pass
 
     try:
         with db.transaction() as tx:
-            item = work.get(tx, ident)
-            if item is None or item.get("state") != "blocked":
-                raise _Moved
+            storage.of(tx).work_dependencies.lock()
+            item = storage.of(tx).work.lock(int(ident))
+            view = None if item is None else _assess_read(tx, item, hosts=hosts, now=now)
+            if view is None or not view["liftable"]:
+                raise _NotLiftable
             verify = work.add(
                 tx, title="%s de %s : séance reportée de #%d — %s" % (
                     VERIFY_TITLE, ", ".join(d["name"] for d in view["devices"]),
@@ -293,8 +320,8 @@ def lift_one(db, view: dict, *, actor: str = ACTOR) -> dict | None:
                                            loops=0, note=_trace(view, int(verify["id"])),
                                            actor=actor)
             if row is None:
-                raise _Moved
-    except _Moved:
+                raise _NotLiftable
+    except _NotLiftable:
         return None
     return {"lot": ident, "state": view["back_to"], "verify": int(verify["id"])}
 
@@ -303,7 +330,11 @@ def lift(db, *, canons, now: float | None = None, actor: str = ACTOR,
          dry_run: bool = False) -> list[dict]:
     """Lève les portes : chaque lot `liftable` sort de `blocked` (`lift_one`).
 
-    En dry-run, rend les évaluations levables sans rien écrire."""
+    La lecture groupée ne fait que choisir les candidats : chaque levée
+    réévalue son lot sous verrou (`lift_one`). En dry-run, rend les
+    évaluations levables sans rien écrire."""
+    now = time.time() if now is None else float(now)
+    hosts = hosts_by_name(canons)
     done = []
     for view in candidates(db, canons=canons, now=now):
         if not view["liftable"]:
@@ -311,7 +342,7 @@ def lift(db, *, canons, now: float | None = None, actor: str = ACTOR,
         if dry_run:
             done.append({"lot": view["lot"], "state": view["back_to"], "dry_run": True})
             continue
-        result = lift_one(db, view, actor=actor)
+        result = lift_one(db, view["lot"], hosts=hosts, now=now, actor=actor)
         if result is not None:
             done.append(result)
     return done
