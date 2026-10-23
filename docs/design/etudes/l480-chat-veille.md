@@ -83,11 +83,13 @@ $human ──frappes──► lanceur ──pty maître──► harnais interac
   ligne reste en attente pour le tour suivant (échec fermé). Le lanceur
   invalide au démarrage le marqueur d'une session précédente.
 * **Garde de brouillon** : une frappe de `$human` qui ne se termine pas par
-  `Entrée` (`\r`/`\n`) ni par `Ctrl-C` (`\x03`) laisse un brouillon ouvert ;
-  la veille ne sert alors rien, même au-delà des 15 min, pour ne jamais coller
-  sa ligne au début d'un message humain non validé. `Entrée` soumet, `Ctrl-C`
-  abandonne ; la garde est volontairement conservatrice (une flèche ou un
-  effacement ne la referment pas).
+  `Entrée` (un `\r` final non précédé d'un antislash ou d'`ESC`) ni par
+  `Ctrl-C` (`\x03`) laisse un brouillon ouvert ; la veille ne sert alors rien,
+  même au-delà des 15 min, pour ne jamais coller sa ligne au début d'un
+  message humain non validé. En mode brut, `Ctrl+J` (`\n`), un antislash suivi
+  d'Entrée et `Alt+Entrée` insèrent un saut de ligne et laissent le brouillon
+  ouvert ; `Entrée` soumet, `Ctrl-C` abandonne ; la garde est volontairement
+  conservatrice (une flèche ou un effacement ne la referment pas).
 * **Fermeture** : si le proxy du terminal rend la main alors que le harnais
   vit encore (SIGHUP/SIGTERM à la fermeture du terminal, erreur du pty), le
   lanceur ferme le maître du pty et tue le groupe du harnais avant d'attendre :

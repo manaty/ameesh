@@ -857,10 +857,19 @@ def write_phase(cfg: Config, name: str, phase: str) -> bool:
 
 
 def _draft_submitted(data: bytes) -> bool:
-    """La dernière frappe soumet-elle le brouillon (`\\r`/`\\n`) ou l'abandonne-t-elle
-    (`Ctrl-C`, `\\x03`) ? Toute autre frappe laisse un brouillon ouvert, que la
-    veille ne doit jamais recouvrir (échec fermé)."""
-    return bool(data) and data[-1:] in (b"\r", b"\n", b"\x03")
+    """La dernière frappe soumet-elle le brouillon, ou l'abandonne-t-elle ?
+
+    En mode brut, Entrée envoie un \r et jamais un \n ; Ctrl+J (\n), un
+    antislash suivi d'Entrée et Alt+Entrée (\x1b\r) insèrent un saut de ligne
+    dans Claude Code et laissent le brouillon ouvert. Seuls Ctrl-C (\x03) et
+    un \r final non précédé d'un antislash ou d'ESC ferment le brouillon."""
+    if not data:
+        return False
+    if data[-1:] == b"\x03":
+        return True
+    if data[-1:] != b"\r":
+        return False
+    return data[-2:-1] not in (b"\\", b"\x1b")
 
 
 class Veille:
@@ -928,10 +937,11 @@ class Veille:
         """`$human` vient de taper : on ne lui écrit pas par-dessus.
 
         `data` sont les octets lus sur l'entrée du terminal. Un brouillon
-        reste ouvert tant que la dernière frappe ne le soumet pas (`\\r`/`\\n`)
-        ni ne l'abandonne (`Ctrl-C`, `\\x03`) : la veille ne sert alors rien,
-        même au-delà de `max_defer`, pour ne jamais coller sa ligne au début
-        d'un message humain non validé."""
+        reste ouvert tant que la dernière frappe ne le soumet pas (Entrée, un
+        \r final non précédé d'un antislash ou d'ESC) ni ne l'abandonne
+        (Ctrl-C, \x03) : la veille ne sert alors rien, même au-delà de
+        `max_defer`, pour ne jamais coller sa ligne au début d'un message
+        humain non validé."""
         self._last_human = self.now() if now is None else float(now)
         if data:
             self._draft_open = not _draft_submitted(data)

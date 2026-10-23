@@ -247,6 +247,24 @@ class VeilleDraftGuardTest(unittest.TestCase):
         self.clock.t += chat.VEILLE_IDLE_S + 0.1
         self.assertIn("1 nouvelle décision", self.veille.due())
 
+    def test_ctrl_j_insere_un_saut_de_ligne(self):
+        self.veille.note_human(self.clock.t, b"ligne")
+        self.veille.note_human(self.clock.t, b"\n")
+        self.clock.t += chat.VEILLE_MAX_DEFER_S + 10.0
+        self.assertIsNone(self.veille.due())
+
+    def test_antislash_entree_insere_un_saut_de_ligne(self):
+        self.veille.note_human(self.clock.t, b"ligne")
+        self.veille.note_human(self.clock.t, b"\\\r")
+        self.clock.t += chat.VEILLE_MAX_DEFER_S + 10.0
+        self.assertIsNone(self.veille.due())
+
+    def test_alt_entree_insere_un_saut_de_ligne(self):
+        self.veille.note_human(self.clock.t, b"ligne")
+        self.veille.note_human(self.clock.t, b"\x1b\r")
+        self.clock.t += chat.VEILLE_MAX_DEFER_S + 10.0
+        self.assertIsNone(self.veille.due())
+
     def test_une_frappe_apres_entree_rouvre_un_brouillon(self):
         self.veille.note_human(self.clock.t, b"\r")
         self.veille.note_human(self.clock.t, b"a")
