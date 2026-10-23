@@ -19,11 +19,11 @@ them. This module is that gate, and nothing more:
   every gesture outside the database calls EP4's unique transaction guard
   (``pilot_gesture``), which compares the epoch and renews under the same
   owner. This module never writes a lease, an epoch or an event;
-* the command's identity is the **role**, bound to that lease
-  (``AGENT_MAIL_NAME`` + ``AMEESH_RUNNER_ID`` = lease owner + epoch): a gesture
-  is never anonymous, and a command that drops the epoch is refused by EP4's
-  guard instead of passing unfenced. ``AMEESH_TURN_ID`` is removed: a timer is
-  not an agent turn.
+* the command carries an explicit actor, the **role** (``AMEESH_ROLE``), with
+  its lease **epoch** (``AMEESH_LEASE_EPOCH``); the agent identity is removed.
+  EP4's guard reads that pair and refuses a role without an epoch, so a timer
+  can never pass as a process without identity. ``AMEESH_TURN_ID`` is removed:
+  a timer is not an agent turn.
 
 The command is an argument vector, never a shell string. Its exit code is
 returned unchanged. The wrapper's own refusals are:
@@ -152,6 +152,35 @@ def holder(db, name: str, host: str, *, epoch: int | None = None) -> bool:
                 and not report.get("code"))
 
 
+def role_host_authorized(cfg) -> bool:
+    """Is this process a timer of the role on the host it designates?
+
+    `role run` sets both variables for the command it launches, after checking
+    the live lease. The host-designated passes (`github.host`) accept this
+    host when the pair matches theirs: the role gate has already decided who
+    runs, so the static host pin must not silence the elected host's timer.
+    A bare `AMEESH_ROLE`, without the host of the same process, changes
+    nothing (fail closed).
+    """
+    role = (os.environ.get(ENV_ROLE) or "").strip()
+    host = (os.environ.get(ENV_HOST) or "").strip()
+    here = (getattr(cfg, "host", None) or "").strip()
+    return bool(role) and bool(host) and bool(here) and host == here
+
+
+def host_authorized(cfg, designated: str | None) -> bool:
+    """May this process run a pass pinned to ``github.host``?
+
+    Historical behaviour without a role timer: only the designated host. A
+    role timer accepts its own host, because the lease already chose it. An
+    empty designation is not a match: the pass still requires the role timer.
+    """
+    here = (getattr(cfg, "host", None) or "").strip()
+    if designated and designated == here:
+        return True
+    return role_host_authorized(cfg)
+
+
 def _detail(code: str, report: dict) -> str:
     if code == "no-live-lease":
         return "no live lease (owner %s, expires %s)" % (
@@ -230,24 +259,26 @@ def run(cfg, args) -> int:
             emit(report, result="would-run")
             return 0
         env = os.environ.copy()
-        # The command is not an agent turn: never inherit the shell's turn or
-        # a foreign tenure. It acts as the ROLE, under the very lease read
-        # above: the owner and the epoch are the ones EP4's guard will check
-        # and renew, so an old host cannot present a newer epoch by accident.
+        # The command is not an agent turn: never inherit the shell's turn,
+        # identity or a foreign tenure. Its explicit actor is the ROLE, under
+        # the very lease read above; EP4's guard reads AMEESH_ROLE and the
+        # epoch, and refuses a role without an epoch instead of treating the
+        # timer as an anonymous process that may pass.
         for key in ("AGENT_MAIL_NAME", "AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID",
-                    "AMEESH_TURN_ID", "AMEESH_LEASE_EPOCH", "AMEESH_LEASE_OWNER",
-                    "AMEESH_LEASE_LEFT", "AMEESH_ROLE", "AMEESH_ROLE_HOST"):
+                    "AMEESH_TURN_ID", "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH",
+                    "AMEESH_LEASE_OWNER", "AMEESH_LEASE_LEFT", "AMEESH_ROLE",
+                    "AMEESH_ROLE_HOST"):
             env.pop(key, None)
         env.update({
             # a child loads the same host, even when its AMEESH_HOST was unset
             "AMEESH_HOST": host,
             # explicit actor = the role, bound to the live lease (EP4 gate).
-            "AGENT_MAIL_NAME": report["role"],
-            "AMEESH_RUNNER_ID": str(report.get("owner") or ""),
             ENV_ROLE: report["role"],
             ENV_HOST: host,
-            ENV_EPOCH: str(report.get("epoch") or ""),
-            ENV_LEFT: str(int(report.get("left_s") or 0)),
+            ENV_EPOCH: ("" if report.get("epoch") is None
+                        else str(report["epoch"])),
+            ENV_LEFT: ("" if report.get("left_s") is None
+                       else str(int(report["left_s"]))),
             ENV_OWNER: str(report.get("owner") or ""),
         })
         try:

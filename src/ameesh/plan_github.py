@@ -84,6 +84,7 @@ from . import plan as plan_mod
 from . import process_projection as projection_mod
 from . import process_workflow as workflow_mod
 from . import projects as projects_mod
+from . import role_run
 from . import storage
 from . import work as work_mod
 from .connectors import ConnectorError
@@ -2833,15 +2834,15 @@ class Projector:
         if not settings.projects:
             return []
         here = getattr(self.cfg, "host", None)
-        if not settings.host:
-            self._once("no-host", "GitHub issues: no designated host (`github.host`): no "
-                                  "automatic projection; `ameesh work project-github --app "
-                                  "<project>` remains possible")
-            return []
-        if settings.host != here:
-            self._once(("elsewhere", settings.host),
-                       "GitHub issues: the projection is run by host %s, not %s"
-                       % (settings.host, here))
+        if not role_run.host_authorized(self.cfg, settings.host):
+            if not settings.host:
+                self._once("no-host", "GitHub issues: no designated host (`github.host`): no "
+                                      "automatic projection; `ameesh work project-github --app "
+                                      "<project>` remains possible")
+            else:
+                self._once(("elsewhere", settings.host),
+                           "GitHub issues: the projection is run by host %s, not %s"
+                           % (settings.host, here))
             return []
         reports: list[dict] = []
         feed = None

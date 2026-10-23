@@ -18,9 +18,11 @@ import os
 import tempfile
 import unittest
 from argparse import Namespace
+from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import notify, role_run, train_assembly, train_runner
+from ameesh import (ci, github_watch, notify, plan_github, role_run,
+                    train_assembly, train_runner)
 
 from .support import PgTestCase
 
@@ -112,15 +114,17 @@ class RoleRunGuardTest(PgTestCase):
             with open(marker, encoding="utf-8") as source:
                 self.assertEqual(source.read(), "%s banc 11" % NAME)
 
-    def test_the_command_acts_as_the_role_under_the_lease(self):
+    def test_the_command_carries_the_role_actor_and_removes_the_identity(self):
         self.lease(epoch=7, owner="runner-test")
         with tempfile.TemporaryDirectory() as folder:
             marker = os.path.join(folder, "env")
             command = ["python3", "-c",
                        "import os, pathlib; pathlib.Path(%r).write_text('|'.join(["
+                       "os.environ.get('AMEESH_ROLE', 'none'),"
+                       " os.environ.get('AMEESH_ROLE_HOST', 'none'),"
+                       "os.environ.get('AMEESH_LEASE_EPOCH', 'none'),"
                        "os.environ.get('AGENT_MAIL_NAME', 'none'),"
-                       " os.environ.get('AMEESH_RUNNER_ID', 'none'),"
-                       " os.environ.get('AMEESH_LEASE_EPOCH', 'none'),"
+                       "os.environ.get('AMEESH_RUNNER_ID', 'none'),"
                        " os.environ.get('AMEESH_TURN_ID', 'none')]))" % marker]
             with mock.patch.dict(os.environ, {"AGENT_MAIL_NAME": "foreign",
                                              "AMEESH_RUNNER_ID": "foreign-runner",
@@ -128,7 +132,8 @@ class RoleRunGuardTest(PgTestCase):
                 code, _ = self.run_cli(self._cfg(), self.args(command))
             self.assertEqual(code, 0)
             with open(marker, encoding="utf-8") as source:
-                self.assertEqual(source.read(), "%s|runner-test|7|none" % NAME)
+                self.assertEqual(source.read(),
+                                 "%s|banc|7|none|none|none" % NAME)
 
     def test_other_host_is_standby_and_runs_nothing(self):
         self.lease(host="banc")
@@ -244,6 +249,90 @@ class NotifyOnlyTest(unittest.TestCase):
         fake.run_pass.assert_called_once()
 
 
+class RoleHostGateTest(unittest.TestCase):
+    """L165 (EP5): `github.host` no longer silences the elected host's timer.
+
+    The three host-designated passes read `AMEESH_ROLE`/`AMEESH_ROLE_HOST`
+    (set by `role run` after the lease check). Without that pair the historical
+    pin is unchanged. These witnesses exercise the real gates, not a mock of
+    them; only the GitHub API and the projection's downstream call are fake.
+    """
+
+    def cfg(self, host="candidate-b"):
+        return SimpleNamespace(
+            host=host, state_dir=tempfile.mkdtemp(prefix="3014-gate-"),
+            github={"host": "candidate-a",
+                    "projects": {"ameesh": "manaty/ameesh"},
+                    "interval": 900})
+
+    def role_env(self, host="candidate-b"):
+        return mock.patch.dict(os.environ, {"AMEESH_ROLE": "mesh-design",
+                                           "AMEESH_ROLE_HOST": host})
+
+    def test_host_gate_needs_the_role_pair(self):
+        cfg = self.cfg()
+        self.assertFalse(role_run.host_authorized(cfg, "candidate-a"))
+        self.assertTrue(role_run.host_authorized(cfg, "candidate-b"))
+        with self.role_env():
+            self.assertTrue(role_run.host_authorized(cfg, "candidate-a"))
+            self.assertTrue(role_run.host_authorized(cfg, None))
+        with self.role_env(host="candidate-a"):
+            self.assertFalse(role_run.host_authorized(cfg, "candidate-a"))
+
+    def test_ci_repos_accepts_the_role_host(self):
+        cfg = self.cfg()
+        self.assertEqual(ci.Watcher(cfg).repos(), [])
+        with self.role_env():
+            self.assertEqual(ci.Watcher(cfg).repos(), ["manaty/ameesh"])
+
+    def test_github_watch_tick_crosses_the_host_gate_with_the_role(self):
+        cfg = self.cfg()
+        subscription = github_watch.Subscription(
+            project="ameesh", repo="manaty/ameesh", agent="docs-3014", interval=900)
+        fake = mock.Mock()
+        fake.github_watch.cursor.return_value = None
+        fake.github_watch.scan.return_value = None
+        log = mock.Mock()
+        watcher = github_watch.Watcher(
+            cfg, api=mock.Mock(), log=log, declarations=[subscription])
+        with self.role_env(), \
+                mock.patch.object(github_watch.storage, "of", return_value=fake), \
+                mock.patch.object(github_watch, "collect_batch",
+                                  side_effect=RuntimeError("gate-passed-3014")):
+            self.assertEqual(watcher.tick(object(), 1000.0), [])
+        self.assertTrue(any("gate-passed-3014" in str(call)
+                            for call in log.call_args_list))
+
+        log.reset_mock()
+        watcher = github_watch.Watcher(
+            cfg, api=mock.Mock(), log=log, declarations=[subscription])
+        with mock.patch.object(github_watch.storage, "of", return_value=fake), \
+                mock.patch.object(github_watch, "collect_batch",
+                                  side_effect=RuntimeError("gate-passed-3014")):
+            self.assertEqual(watcher.tick(object(), 1000.0), [])
+        self.assertFalse(any("gate-passed-3014" in str(call)
+                             for call in log.call_args_list))
+
+    def test_projector_tick_runs_on_the_role_host(self):
+        cfg = self.cfg()
+        fake = mock.Mock()
+        fake.work.issue_feed.return_value = []
+        projector = plan_github.Projector(cfg, dry_run=True)
+        projector._journal = mock.Mock()
+        with mock.patch.object(plan_github.storage, "of", return_value=fake), \
+                mock.patch.object(plan_github, "project_lots",
+                                  return_value={"errors": []}) as project:
+            self.assertEqual(projector.tick(object(), now=0), [])
+        project.assert_not_called()
+
+        with self.role_env(), \
+                mock.patch.object(plan_github.storage, "of", return_value=fake), \
+                mock.patch.object(plan_github, "project_lots",
+                                  return_value={"errors": []}) as project:
+            self.assertEqual(projector.tick(object(), now=0), [{"errors": []}])
+        project.assert_called_once()
+
+
 class TrainRoleTest(unittest.TestCase):
     def raw(self, *, role="pilote"):
         return {
@@ -279,6 +368,31 @@ class TrainRoleTest(unittest.TestCase):
             assembly = train_assembly.assemble(cfg, notify=lambda text: None)
         self.assertEqual(assembly.role, "pilote")
         self.assertEqual(len(assembly.passages), 1)
+
+    def test_single_candidate_role_keeps_the_historical_assembly(self):
+        # The current deployment has one candidate host (the train runs on
+        # agents-2). Enabling `role` on that host must not change the packet
+        # assembly: same mode, same passages, same service lease, shadow and
+        # active alike.
+        for mode in ("shadow", "active"):
+            raw = self.raw(role="pilote")
+            raw["mode"] = mode
+            cfg = mock.Mock(host="pc-smichea", runner="runner-3014", train=raw)
+            with mock.patch.object(train_assembly, "_passage", return_value=object()):
+                with_role = train_assembly.assemble(cfg, notify=lambda text: None)
+            pinned_raw = dict(raw)
+            pinned_raw.pop("role")
+            pinned = mock.Mock(host="pc-smichea", runner="runner-3014",
+                              train=pinned_raw)
+            with mock.patch.object(train_assembly, "_passage", return_value=object()):
+                without_role = train_assembly.assemble(pinned, notify=lambda text: None)
+            self.assertEqual(len(with_role.passages), len(without_role.passages))
+            self.assertEqual(with_role.settings.mode, mode)
+            self.assertEqual(without_role.settings.mode, mode)
+            self.assertIsNotNone(with_role.lease)
+            self.assertIsNotNone(without_role.lease)
+            self.assertEqual(with_role.role, "pilote")
+            self.assertIsNone(without_role.role)
 
     def test_assembly_keeps_the_host_pin_without_a_role(self):
         cfg = mock.Mock(host="ameesh-agents-1", runner="runner-3014",

@@ -2751,7 +2751,7 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
     #: mechanical passes (`issues`, `github-watch`, `ci`) use database state
     #: only, so a role timer can run them beside the alert producer.
     alerts_pass = only is None or "alerts" in only
-    if not ncfg.configured:
+    if alerts_pass and not ncfg.configured:
         _stderr_log("no channel configured (`notify` key of the host configuration: "
                     "routes, default): alerts will be logged, not sent")
     path = state_path(cfg)

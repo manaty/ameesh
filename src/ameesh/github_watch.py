@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
-from . import canon, mail, plan_github, storage
+from . import canon, mail, plan_github, role_run, storage
 from .config import NAME_RE
 from .fil import UnreadableBody, unreadable_reason
 
@@ -684,7 +684,7 @@ class Watcher:
 
     def tick(self, db, now):
         settings = plan_github.settings_of(self.cfg)
-        if not settings.host or settings.host != self.cfg.host:
+        if not role_run.host_authorized(self.cfg, settings.host):
             return []
         declared = (self.declarations if self.declarations is not None else
                     subscriptions(canon.load_configured(self.cfg), self._warn))
