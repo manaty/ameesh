@@ -57,22 +57,60 @@ class Fires:
         return actor.startswith(work.HUMAN_PREFIX) or assignments.is_orchestrator(
             self.cfg, self.db, actor, roles=work.CORRECTOR_ROLES, history=False)
 
+    def _fence(self, ref: str):
+        """L165 (EP4) : la garde d'époque du geste de paquet, en TrainError.
+
+        Rend la garde (ou None) ; le hold est fait dans la transaction du reçu
+        par `give`/`withdraw`, jamais avant les lectures de préparation
+        (revue cx2 B3).
+        """
+        from . import pilot_gesture
+        try:
+            return pilot_gesture.gate(self.cfg, self.db, "packet", ref)
+        except pilot_gesture.GestureRefused as exc:
+            raise TrainError(str(exc)) from exc
+
     def give(self, plan, *, actor=None):
         who = self._pilot(actor)
+        # L165 (EP4) : le feu du train est un geste de paquet du pilote hors
+        # base (il autorisera la fusion) ; l'époque du bail élu est vérifiée
+        # avant tout reçu durable.
+        fence = self._fence("train fire %s" % plan.get("id"))
         document = dict(schema="ameesh-train-fire/1", plan=json.loads(json.dumps(plan)),
                         binding=binding(plan), actor=who)
-        receipt = self.ops.train_fire_give(self.ledger.key, document)
+        from . import pilot_gesture
+        try:
+            if fence is None:
+                receipt = self.ops.train_fire_give(self.ledger.key, document)
+            else:
+                with self.db.transaction() as tx:
+                    fence.hold(tx)
+                    receipt = storage.of(tx).work.train_fire_give(self.ledger.key, document)
+        except pilot_gesture.GestureRefused as exc:
+            raise TrainError(str(exc)) from exc
         if receipt is None:
             raise TrainError("fire plan changed or already has an active/uncertain promotion")
         return receipt
 
     def withdraw(self, plan, fire_id, *, actor=None):
         who = self._pilot(actor)
+        fence = self._fence("train unfire %s" % plan.get("id"))
         fingerprint = binding(plan)
         current = self.ops.train_fire_read(self.ledger.key, plan["id"])
         if not current or current["id"] != fire_id or binding(current["plan"]) != fingerprint:
             raise TrainError("withdrawal does not name the current exact fire receipt")
-        receipt = self.ops.train_fire_change(self.ledger.key, fire_id, "revoked", actor=who)
+        from . import pilot_gesture
+        try:
+            if fence is None:
+                receipt = self.ops.train_fire_change(self.ledger.key, fire_id, "revoked",
+                                                    actor=who)
+            else:
+                with self.db.transaction() as tx:
+                    fence.hold(tx)
+                    receipt = storage.of(tx).work.train_fire_change(
+                        self.ledger.key, fire_id, "revoked", actor=who)
+        except pilot_gesture.GestureRefused as exc:
+            raise TrainError(str(exc)) from exc
         if receipt is None:
             raise TrainError("fire no longer active: promotion may be in progress; reconcile first")
         return receipt

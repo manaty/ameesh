@@ -446,7 +446,8 @@
               "receipt.attached",
               "approval.recorded",
               "alert.raised",
-              "alert.resolved"
+              "alert.resolved",
+              "pilot.gesture"
             ]
           }
         },

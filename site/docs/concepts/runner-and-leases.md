@@ -56,6 +56,17 @@ the holder, the epoch and the ranking.
 - **Fencing.** Renewing, starting a turn and taking a prompt all require a live
   lease. An expired lease cannot be extended; the runner has to claim again,
   with a new epoch.
+- **Fencing the pilot's gestures.** For an elected role, a merge, a merge
+  queue entry or landing, an assignment, a recorded packet composition and a
+  decision request are refused unless the session holds the live lease at its
+  own epoch. The check renews the lease and journals the gesture in the same
+  transaction; a stale session is refused, naming the current holder. An EP5
+  timer passes `AMEESH_ROLE` and its epoch: a role without an epoch is
+  refused. Just before an external call (push, `gh pr merge`) the lease is
+  renewed with a margin at least the call's worst case; the residual race is
+  documented in `docs/HOST-HANDOFFS.md`. Humans, host-pinned agents and
+  runner-internal sweeps without `AMEESH_ROLE` are unchanged
+  (`pilot_gesture.py`).
 - **Lease loss stops the harness.** The lease is renewed by a heartbeat during
   turns. If it is lost, the harness's whole process group receives `SIGKILL`
   and the turn is not counted.
