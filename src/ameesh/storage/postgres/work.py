@@ -2590,6 +2590,18 @@ class WorkItems(interface.WorkItems):
                             " AND epoch = %s AND expires_at > clock_timestamp()",
                             (service[0], service[1], int(service[2]))):
                 return None
+            # The role lease can also expire while those locks wait: FOR SHARE
+            # blocks a claim, not time. Recheck the exact epoch, liveness and
+            # status after every lock, next to the final service check
+            # (B/P1 cx2, #3142×#3014).
+            if role is not None:
+                current = tx.query(
+                    "SELECT 1 FROM agent_registry WHERE name = %s AND lease_epoch = %s"
+                    " AND lease_expires_at > clock_timestamp()"
+                    " AND coalesce(status, '') <> 'stopped' FOR SHARE",
+                    (role[0], role[1]))
+                if not current:
+                    return None
             epoch = int(tx.query(
                 "UPDATE merge_locks SET owner = %s, epoch = epoch + 1,"
                 " expires_at = clock_timestamp() + %s * interval '1 second'"

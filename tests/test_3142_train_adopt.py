@@ -244,6 +244,47 @@ class AdoptionTest(PgTestCase):
             service=(new_key, new_owner, 1), ttl_s=1800))
         self.assertEqual(self.lock(), ("train:runner-b@host-b", held + 1))
 
+    def test_a_role_lease_expiring_during_the_lock_wait_adopts_nothing(self):
+        """B/P1 cx2 (#3142×#3014) : le rôle vivant au premier contrôle peut
+        expirer pendant l'attente du verrou cible ; FOR SHARE ne suspend pas
+        le temps, le recontrôle final doit refuser l'adoption."""
+        role = "mesh-design"
+        registry.upsert(self.db, role, chantier="ameesh", harness="claude",
+                        host="host-b", cwd="/tmp", session_id=None, status="idle",
+                        status_text="", model=None, budget_usd=None)
+        # Le bail de rôle est vivant au premier contrôle puis expire pendant
+        # l'attente du verrou cible ; le bail de service, lui, reste vivant.
+        self.db.execute(
+            "UPDATE agent_registry SET releve = 'election', lease_owner = 'runner-b',"
+            " lease_epoch = 2, lease_expires_at = clock_timestamp() + interval '2 seconds'"
+            " WHERE name = %s", (role,))
+        key, owner = "train-service:%s:2" % role, "train-service:runner-b:new"
+        self.assertEqual(self.ops.land_lock(key, owner, 900), 1)
+        held = self.ops.land_lock(self.key, "train:runner-a@host-a", 1800)
+        adopting, blocker = self.connect(), self.connect()
+        self.addCleanup(adopting.close)
+        self.addCleanup(blocker.close)
+        result = {}
+
+        def adopt():
+            result["adopted"] = storage.of(adopting).work.train_adopt(
+                self.key, "train:runner-b@host-b", revision=0, previous=None,
+                service=(key, owner, 1), ttl_s=1800)
+
+        with blocker.transaction() as tx:
+            tx.query("SELECT 1 FROM merge_locks WHERE target = %s FOR UPDATE", (self.key,))
+            thread = threading.Thread(target=adopt)
+            thread.start()
+            deadline = time.monotonic() + 5
+            while not self.db.query("SELECT 1 FROM pg_locks WHERE NOT granted") \
+                    and time.monotonic() < deadline:
+                time.sleep(0.05)
+            tx.query("SELECT pg_sleep(3.0)")
+        thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, {"adopted": None})
+        self.assertEqual(self.lock(), ("train:runner-a@host-a", held))
+
 
 if __name__ == "__main__":
     import unittest
