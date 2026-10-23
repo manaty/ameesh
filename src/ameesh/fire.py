@@ -685,7 +685,7 @@ def _disarm_auto(slug: str, status: dict, *, gh) -> tuple:
 # --------------------------------------------------------------------------
 
 def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
-                   project, target: str) -> tuple:
+                   project, target: str, base_sha: str | None = None) -> tuple:
     """La première porte, celle qui ne doit rien déclencher (#1374, B) : la
     classe du lot et les **avis requis** sur la tête gelée, comptés et
     indépendants (`merge_queue.review_gate`). Rend `(ok, raison, classe)`.
@@ -700,6 +700,12 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
     retard y ajouterait des commits déjà fusionnés, dont des chemins
     sensibles, et surclasserait le lot au-dessus de ses vrais avis.
 
+    #3091 : `base_sha` est la cible **déjà résolue** par l'appelant (le
+    `baseRefOid` de la PR pour l'auto-fusion d'un paquet). Elle sert de
+    révision de classe et de preuve de la base de composition ; la ref locale
+    peut être en retard, jamais cette lecture. Sans elle, la ref résolue par
+    `_class_base` fait foi, comme avant.
+
     Cette porte s'évalue **avant** toute PR, toute entrée en file et toute CI :
     un feu peut être enregistré au gel, mais rien ne part avant les avis."""
     lot = int(row["id"])
@@ -709,9 +715,12 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
     base = target or None
     if repo and target:
         base = merge_queue._class_base(repo, target) or target
-    base_sha = merge_queue.pinned(repo, base) if (repo and base) else None
+    class_sha = str(base_sha or "").strip() or None
+    if class_sha and repo:
+        class_sha = merge_queue.pinned(repo, class_sha) or class_sha
+    resolved = class_sha or (merge_queue.pinned(repo, base) if (repo and base) else None)
     klass = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=repo or None,
-                             base=base, base_sha=base_sha, head=head)
+                             base=target, base_sha=resolved or base, head=head)
     if str(klass.get("class") or "") == lot_class.RELEASE:
         return False, ("class: release (%s) — the release procedure belongs to the pilot: "
                        "a fire never arms an automatic merge on a release"
@@ -743,8 +752,11 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
                     % (frozen[:12], klass.get("class") or "?", exc)), klass
             gate_authors = {"authors": authors, "families": families,
                             "authors_complete": True}
+    # #3091 : la base de composition du véhicule est prouvée sur cette cible
+    # résolue, jamais sur la ref du checkout.
     gate = merge_queue.review_gate(db, marks, frozen, repo=repo, klass=klass,
-                                   item=row, cfg=cfg, target=base, **gate_authors)
+                                   item=row, cfg=cfg, target=resolved or base,
+                                   **gate_authors)
     if not gate["ok"]:
         return False, gate["why"], klass
     return True, "", klass
