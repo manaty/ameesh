@@ -30,6 +30,10 @@ from . import (merge_queue, radar, resolutions, storage, train, train_admissions
 SERVICE_LEASE_KEY = "train-service"
 SERVICE_LEASE_TTL_S = 900.0
 SERVICE_LEASE_RETRY_S = 60.0
+#: #3134: how long the runner's shutdown waits for a train effect still in
+#: flight (push, promotion, SQL write) before releasing the lease. Far below
+#: the runner units' `TimeoutStopSec`; past it the lease expires with its TTL.
+SERVICE_STOP_EFFECT_S = 120.0
 
 
 class HostLease:
@@ -123,10 +127,12 @@ class HostLease:
 
 #: #3134: the runtime calls that write. The target reservation check
 #: (`ledger.acquire`) precedes every effect; publication is fenced at its
-#: push, so a long prevalidation never holds the service lease's lock.
+#: push and composition at its migration reservations, so a long
+#: prevalidation or replay never holds the service lease's lock.
 _FENCED = (("save", "release", "enroll", "quarantine", "start_ci", "reconcile", "promote"),
            ("acquire", "before_publish"),
-           ("publish",))
+           ("publish",),
+           ("reserve", "landed"))
 
 
 def _fenced(runtime, guard):
@@ -140,7 +146,10 @@ def _fenced(runtime, guard):
                 return call(*args, **kwargs)
         return run
 
-    for port, names in zip((runtime, runtime.ledger, runtime.repository), _FENCED):
+    ports = (runtime, runtime.ledger, runtime.repository, runtime.migrations)
+    for port, names in zip(ports, _FENCED):
+        if port is None:
+            continue
         for name in names:
             call = getattr(port, name, None)
             if callable(call):
@@ -440,7 +449,7 @@ class Service:
         from .scoped_db import ScopedDb
         db = ScopedDb(self.cfg)
         try:
-            if self.lease.close(db, timeout=timeout) is None:
+            if self.lease.close(db, timeout=timeout) is None and timeout:
                 self.report("train service lease kept: a train effect is still running;"
                             " it expires with its TTL")
         except Exception as exc:
@@ -499,7 +508,7 @@ class Service:
         self.thread = threading.Thread(target=self.run, daemon=True, name="integration-trains")
         self.thread.start()
 
-    def shutdown(self, *, join=2.0, effect=5.0):
+    def shutdown(self, *, join=2.0):
         # The runner sets its stop event before calling this method.
         with self.condition:
             self.condition.notify_all()
@@ -508,5 +517,12 @@ class Service:
             if self.thread.is_alive():
                 # #3134: a passage outlives the stop. The runner will exit
                 # immediately (`_sortie_sure`) and this thread's `finally`
-                # never runs: close the lease here, after the effect in flight.
-                self._release_lease(timeout=effect)
+                # never runs: fence every later effect now, and release the
+                # lease at once unless an effect is in flight (`finish`).
+                self._release_lease(timeout=0)
+
+    def finish(self, timeout=SERVICE_STOP_EFFECT_S):
+        """#3134: at the end of the runner's shutdown, wait for the effect
+        still in flight, then release the lease before the process exits."""
+        if self.lease is not None and self.lease.epoch is not None:
+            self._release_lease(timeout=timeout)
