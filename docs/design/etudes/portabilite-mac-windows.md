@@ -284,10 +284,14 @@ already route host memory, swap, load and pressure through
 `ameesh.platform` (psutil, `None` for load without `os.getloadavg`); the
 `platform-macos` job now runs the suite selected by the CI plan against a
 PostgreSQL installed in its own step (L68), with the `/proc` tests going
-through the platform layer. It is not a required check yet: the full plan has
-not run green under macOS, and requiring it would redden the first package
-for every lot (§11 bis); it joins `tests` once that proof exists. WSL2 is a
-Linux: what runs on Linux runs there, except reaching the Windows desktop.
+through the platform layer. #3198 split it: `tests.yml` keeps only a short
+platform-layer verdict (L63/L66, no database, 20 minutes), while the full
+suite lives in `.github/workflows/macos.yml` — nightly on `main` and on the
+`ci-macos` label — outside the packet's merge path. It is not a required
+check yet: the full plan has not run green under macOS, and requiring it
+would redden the first package for every lot (§11 bis); #3026 will join the
+short job to `tests` once that proof exists. WSL2 is a Linux: what runs on
+Linux runs there, except reaching the Windows desktop.
 
 | Lot | Content after the answers | Depends on | Estimate |
 |---|---|---|---|

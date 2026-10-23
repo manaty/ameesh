@@ -1,22 +1,29 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""L68 : la CI exécute la suite sous macOS, PostgreSQL installé dans une étape.
+"""L63/L66/L68 : macOS dans la CI — verdict court par PR, suite en nocturne.
 
-Le job `platform-macos` de `tests.yml` est le seul à tourner sous macOS. Avant
-L68 il n'exécutait que la couche plateforme ; il porte désormais la sélection
-du plan (toute la suite sur main/release/**/paquet, les impactés d'une PR de
-lot) avec le pilote psycopg. macOS n'a pas de conteneurs de service : la base
-est installée et démarrée dans une étape, jamais par `services:`.
+#3198 : le job `platform-macos` de `tests.yml` exécutait la suite complète du
+plan sous macOS (8 parts psycopg, PostgreSQL installé dans une étape) ; elle
+durait jusqu'à 3 h 50 et retenait tout le rollup de fusion (`fire.ready_pr` et
+`packet_automerge` attendent tous les checks). Ce job est désormais **court**
+(L63/L66, sans base, 20 min au plus) et la suite complète vit dans
+`.github/workflows/macos.yml` : nocturne sur main, à la main, et à la demande
+par l'étiquette `ci-macos` sur une PR. Ce workflow utilise
+`pull_request_target` pour ne pas entrer dans le workflow de gel `tests.yml`
+(où `labeled` est déjà le déclencheur du check requis) ni dans le rollup de la
+PR.
 
-Décision de la revue #393 (23/10) : tant que la suite complète n'a pas tourné
-verte sous macOS, ce job reste **indépendant** du check requis `tests` —
-l'exiger ferait rougir le premier paquet pour tous les lots (§11 bis). Il
-entre dans les `needs` de `tests` quand cette preuve existe (lot de suite).
+macOS n'a pas de conteneurs de service : la base est installée et démarrée
+dans une étape, jamais par `services:`.
 
-Ces témoins lisent le workflow (sous-ensemble de texte, pas de PyYAML), les
+Décision de la revue #393 (23/10), conservée : tant que #3026 n'a pas livré
+macOS vert, aucun job macOS n'est requis par `tests` — l'exiger ferait rougir
+le premier paquet pour tous les lots (§11 bis).
+
+Ces témoins lisent les workflows (sous-ensemble de texte, pas de PyYAML), les
 tests `/proc` réécrits et les témoins Linux-only gardés par
-`platform.is_linux()` (#3132) : une régression du job, un retour à une lecture
-directe de `/proc`, ou un témoin Linux-only non gardé rougit ici, sans
-attendre un runner macOS.
+`platform.is_linux()` (#3132) : une régression du job, un retour de la suite
+longue dans le chemin du paquet, une lecture directe de `/proc`, ou un témoin
+Linux-only non gardé rougit ici, sans attendre un runner macOS.
 """
 from __future__ import annotations
 
@@ -31,6 +38,7 @@ import unittest
 from .support import REPO
 
 WORKFLOW = os.path.join(REPO, ".github", "workflows", "tests.yml")
+MACOS = os.path.join(REPO, ".github", "workflows", "macos.yml")
 
 #: tests réécrits par L68 pour lire l'OS par `ameesh.platform`.
 REWRITTEN = (
@@ -42,7 +50,9 @@ REWRITTEN = (
 )
 
 
-class MacosSuiteJobTest(unittest.TestCase):
+class MacosShortJobTest(unittest.TestCase):
+    """Le job macOS des PR de paquet : la couche plateforme, sans la suite."""
+
     @classmethod
     def setUpClass(cls):
         with open(WORKFLOW, encoding="utf-8") as fh:
@@ -52,24 +62,90 @@ class MacosSuiteJobTest(unittest.TestCase):
         fin = text.index("\n  doc-readers:\n", debut)
         cls.job = text[debut:fin]
 
-    def test_the_full_suite_comes_from_the_plan(self):
-        # same selection as the Linux psycopg parts: full on the full-suite
-        # lanes, impacted + contract on a lot PR (#1211).
+    def test_the_job_is_short_and_carries_no_suite(self):
+        # #3198 : 20 min au plus, sans base ; la suite complète est partie
+        # dans macos.yml, sinon elle retient tout le rollup du paquet.
+        self.assertIn("timeout-minutes: 20", self.job)
+        self.assertIn('AMEESH_REQUIRE_DB: "0"', self.job)
+        self.assertNotIn("services:", self.job)
+        self.assertNotIn("test-parts.py run", self.job)
+        self.assertNotIn("psycopg[binary]", self.job)
+        self.assertNotIn("actions/download-artifact", self.job)
+
+    def test_the_platform_contract_still_runs_on_macos(self):
+        for nom in ("tests.test_l63_platform.PlatformTest",
+                    "tests.test_l63_platform.LintTest",
+                    "tests.test_l63_platform.GuaranteeTest",
+                    "tests.test_l66_desktop.PlatformNotifyTest"):
+            self.assertIn(nom, self.job)
+        self.assertIn("psutil", self.job)
+        self.assertIn("osascript", self.job)
+
+    def test_the_runner_is_the_standard_x64_image(self):
+        # #987 : pas de `macos-latest` arm64, qui n'obtenait pas de capacité.
+        self.assertIn("runs-on: macos-26-intel", self.job)
+
+    def test_the_job_is_not_required_before_macos_vert(self):
+        # Décision de conception de la revue #393 : aucun paquet ne doit
+        # rougir pour un job macOS tant que #3026 n'a pas livré macOS vert.
+        debut = self.text.index("\n  tests:\n")
+        aggregate = self.text[debut:]
+        needs = re.search(r"(?m)^    needs: \[(.*)\]$", aggregate)
+        self.assertIsNotNone(needs, "job tests : ligne needs introuvable")
+        self.assertNotIn("platform-macos", needs.group(1))
+        self.assertNotIn("needs.platform-macos.result", aggregate)
+
+
+class MacosFullSuiteWorkflowTest(unittest.TestCase):
+    """La suite complète sous macOS, hors du chemin du paquet (#3198)."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(MACOS, encoding="utf-8") as fh:
+            cls.text = fh.read()
+        debut = cls.text.index("\n  suite:\n")
+        cls.job = cls.text[debut:]
+
+    def test_it_runs_nightly_on_main(self):
+        self.assertRegex(self.text, r"(?m)^  schedule:\n")
+        self.assertRegex(self.text, r"(?m)^    - cron: \"[0-9 ]+ \* \* \*\"$")
+
+    def test_it_runs_by_hand_and_on_the_ci_macos_label(self):
+        self.assertRegex(self.text, r"(?m)^  workflow_dispatch:\n")
+        self.assertRegex(self.text, r"(?m)^  pull_request_target:\n")
+        self.assertIn("types: [labeled]", self.text)
+        self.assertIn("github.event.label.name == 'ci-macos'", self.job)
+
+    def test_the_label_run_does_not_enter_the_freeze_workflow(self):
+        # `pull_request` + `labeled` est déjà le déclencheur du gel dans
+        # tests.yml, qui refuse toute étiquette étrangère : la suite macOS
+        # passe par `pull_request_target`, jamais par cet évènement.
+        self.assertIn("pull_request_target:", self.text)
+        self.assertNotRegex(self.text, r"(?m)^  pull_request:")
+        with open(WORKFLOW, encoding="utf-8") as fh:
+            tests = fh.read()
+        self.assertIn("types: [labeled]", tests)
+
+    def test_only_a_head_of_the_repository_runs(self):
+        self.assertIn(
+            "github.event.pull_request.head.repo.full_name == github.repository",
+            self.job)
+
+    def test_its_permissions_are_read_only(self):
+        self.assertIn("permissions:\n  contents: read", self.text)
+        self.assertNotRegex(self.text, r"(?m):\s+write(?:-only|-all)?\s*$")
+
+    def test_it_runs_the_whole_plan_under_macos(self):
+        self.assertIn("test-plan.py plan", self.job)
+        self.assertIn("--mode full", self.job)
         self.assertIn("test-parts.py run --plan", self.job)
         self.assertIn("--driver psycopg", self.job)
-        self.assertIn("plan.outputs.plan_sha256", self.job)
-        self.assertIn("sha256sum -c -", self.job)
-
-    def test_every_part_runs_before_the_job_fails(self):
-        # N1 de la revue #393 : sous `set -e`, une première part rouge
-        # arrêtait la boucle et masquait les suivantes.
+        # N1 de la revue #393 : toutes les parts tournent avant l'échec.
         self.assertIn("rc=0", self.job)
         self.assertIn("|| rc=1", self.job)
         self.assertIn('exit "$rc"', self.job)
 
     def test_postgresql_is_installed_and_started_in_a_step(self):
-        # `services:` runs Linux containers only: on macOS the database is a
-        # step, and the suite must not silently skip its database tests.
         self.assertNotIn("services:", self.job)
         self.assertIn("brew install postgresql@17", self.job)
         self.assertIn("initdb -D", self.job)
@@ -84,48 +160,11 @@ class MacosSuiteJobTest(unittest.TestCase):
                       self.job)
         self.assertIn("$(brew --prefix findutils)/libexec/gnubin", self.job)
 
-    def test_the_platform_contract_still_runs_on_macos(self):
-        for nom in ("tests.test_l63_platform.PlatformTest",
-                    "tests.test_l63_platform.LintTest",
-                    "tests.test_l63_platform.GuaranteeTest",
-                    "tests.test_l66_desktop.PlatformNotifyTest"):
-            self.assertIn(nom, self.job)
-        self.assertIn("osascript", self.job)
-
     def test_the_runner_is_the_standard_x64_image(self):
-        # #987 : pas de `macos-latest` arm64, qui n'obtenait pas de capacité.
         self.assertIn("runs-on: macos-26-intel", self.job)
-        # N1 de la revue #393 : 8 parts en série sous macOS, ~90 min mesuré
-        # sous Linux ; plafond provisoire, resserré après la première mesure.
+        # La suite complète reste bornée (jusqu'à 3 h 50 mesuré), hors du
+        # chemin du paquet : le plafond de 240 min ne bloque aucune fusion.
         self.assertIn("timeout-minutes: 240", self.job)
-
-    def test_the_git_identity_step_is_taken_from_the_linux_jobs(self):
-        # B2 de la revue #393 : un runner hébergé macOS n'a pas d'identité git
-        # globale ; les dépôts temporaires des tests en ont besoin.
-        self.assertIn("- *git", self.job)
-        self.assertIn("GIT_CONFIG_GLOBAL=", self.text)
-
-    def test_the_job_is_not_required_before_its_first_full_green_run(self):
-        # Décision de conception de la revue #393 : aucun paquet ne doit
-        # rougir pour un job macOS qui n'a jamais exécuté le plan complet.
-        debut = self.text.index("\n  tests:\n")
-        aggregate = self.text[debut:]
-        needs = re.search(r"(?m)^    needs: \[(.*)\]$", aggregate)
-        self.assertIsNotNone(needs, "job tests : ligne needs introuvable")
-        self.assertNotIn("platform-macos", needs.group(1))
-        self.assertIn("platform-macos n'est pas encore requis", aggregate)
-
-    def test_the_plan_guard_is_outside_the_tolerated_step(self):
-        # #3048 (N de la revue #3030) : `continue-on-error` de #3042 ne
-        # tolère que la portabilité de la suite ; la garde « aucune part
-        # psycopg » est une étape à part, sans tolérance, avant la suite.
-        garde = self.job.index("- name: le plan donne des parts psycopg (L68)")
-        suite = self.job.index("- name: suite du plan (L68, pilote psycopg)")
-        self.assertLess(garde, suite)
-        etape = self.job[garde:suite]
-        self.assertIn("aucune part psycopg", etape)
-        self.assertIn("exit 1", etape)
-        self.assertNotIn("continue-on-error", etape)
 
 
 class BenchTmpdirTest(unittest.TestCase):

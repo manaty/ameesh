@@ -21,7 +21,10 @@ the same caller run (prefixed by the caller job). There is **no** separate
 ``tests.yml?event=workflow_call`` run. The contract therefore pins the caller
 workflow, the called suite and the planning blobs, and requires the called
 jobs (prefixed by the caller job) — the full 8 psycopg + 16 psql matrix, the
-macOS platform job and the aggregate ``tests`` check.
+short macOS platform job and the aggregate ``tests`` check. #3198: the full
+macOS suite is no longer part of the packet run (it moved to ``macos.yml``,
+nightly and on the ``ci-macos`` label); what this contract requires is the
+short platform verdict (L63/L66) that stays in ``tests.yml``.
 """
 import re
 import types
@@ -41,9 +44,15 @@ def ameesh() -> tuple[Workflow, ...]:
     jobs prefixed by the caller job (e.g. ``suite complète du paquet / plan``).
     A covered push (open PR) leaves ``suite`` skipped, so the called jobs are
     absent and supply no packet CI: the train refuses it.
-    The full matrix is 8 psycopg parts, 16 psql parts, the macOS platform job
-    and the aggregate ``tests`` check; doc-only and version lanes are
-    conditional outside this contract.
+    The full matrix is 8 psycopg parts, 16 psql parts, the short macOS
+    platform job and the aggregate ``tests`` check; doc-only and version lanes
+    are conditional outside this contract.
+
+    #3198: the packet run no longer carries the full macOS suite (8 psycopg
+    parts under macOS, hours long); it lives in ``.github/workflows/macos.yml``
+    — nightly on ``main`` and on demand with the ``ci-macos`` label — and is
+    not part of the packet proof. The ``plateforme macOS`` job required here is
+    the short L63/L66 platform verdict that remains in ``tests.yml``.
 
     #3098: the blobs are also declared by this file at the target's base
     commit, and that versioned copy is the reference for a packet head. The
@@ -59,7 +68,7 @@ def ameesh() -> tuple[Workflow, ...]:
         event="push",
         called=".github/workflows/tests.yml",
         sources=((".github/workflows/paquet.yml", "0d4e4c9cae703575b33aa393d6a1c95a81e5c896"),
-                 (".github/workflows/tests.yml", "1c5f0427b947ea148600c4be5d41891c0a222a10"),
+                 (".github/workflows/tests.yml", "20e5d6c919dbe3595fa63fdb5072eeadf0dd87df"),
                  ("scripts/test-plan.py", "b930dd3e4224372b0667f06691c17a935fc289b4"),
                  ("scripts/test-parts.py", "2265308c9fed248852bfd9ec41ba8f79266f0647"),
                  ("scripts/ci-flow.py", "ac574bd1f38eb788c70800095efde70bd2b8b751"),

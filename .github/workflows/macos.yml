@@ -1,0 +1,169 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #3198 — la suite complète sous macOS, hors du chemin du paquet.
+#
+# Le job `platform-macos` de « tests » exécutait la suite du plan sous macOS
+# (8 parts psycopg, PostgreSQL installé dans une étape) : 2 h 40 à 3 h 50 par
+# tête (runs 39934625577, 39919541641, 39895964473). `fire.ready_pr` et
+# `packet_automerge` attendent tout le rollup, donc la PR de paquet ne partait
+# pas seule (#2415, run 39983066190), et les minutes macOS pèsent ~10× le
+# Linux sur le budget Actions. Ce workflow sort cette suite du `pull_request`
+# des paquets :
+#   - `schedule` : une fois par nuit sur main, la preuve de portabilité
+#     complète, sans retenir aucun paquet ;
+#   - `workflow_dispatch` : la même suite à la main (main, release/**,
+#     integration/**), pour mesurer ou rejouer sans attendre la nuit ;
+#   - label `ci-macos` sur une PR : la suite complète sur la tête de cette PR.
+#
+# `pull_request_target` et non `pull_request` (décision #3198) : l'évènement
+# `labeled` de `pull_request` est déjà le déclencheur de la CI de gel de
+# tests.yml, et toute autre étiquette y est refusée (le check requis `tests`
+# rougit). `pull_request_target` n'entre pas dans ce workflow-là, n'ajoute
+# aucun check au rollup de la PR et ne peut donc pas retarder la fusion ; le
+# job vérifie lui-même que la tête appartient au dépôt (jamais une fourche),
+# part du code de la branche de base pour le déclencheur, ne demande que
+# `contents: read` et n'utilise aucun secret. Le seul code exécuté est celui
+# de la PR, comme dans tests.yml pour une PR du dépôt.
+#
+# Le job court `platform-macos` de tests.yml (couche plateforme L63/L66, sans
+# base, borné à 20 min) reste le verdict rapide de chaque PR de paquet. Quand
+# #3026 (macOS vert) sera livré, c'est ce job court qui deviendra le check
+# requis, sans ramener la suite longue dans le chemin du paquet.
+#
+# #3042 : PostgreSQL n'est pas un `service:` — macOS n'a pas de conteneurs —
+# et les outils GNU (findutils pour `find -printf`) viennent de Homebrew, pour
+# donner à la suite le même socle shell que les hôtes Linux qu'elle teste.
+name: macos
+
+on:
+  schedule:
+    # 03:17 UTC (05:17 Europe/Paris en été) : hors des coupures horaires de
+    # paquet, une seule suite macOS complète par nuit.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+  pull_request_target:
+    types: [labeled]
+    branches: [main, "release/**", "integration/**"]
+
+permissions:
+  contents: read
+
+# Une étiquette `ci-macos` posée deux fois remplace la suite de la même PR ;
+# le nocturne n'est jamais annulé par le suivant (il attend son tour).
+concurrency:
+  group: macos-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
+
+jobs:
+  suite:
+    name: suite macOS complète
+    # `labeled` se déclenche pour toute étiquette : ici seulement `ci-macos`,
+    # sur une tête du dépôt (une fourche n'exécute pas notre code sur un
+    # runner hébergé avec le jeton du dépôt).
+    if: >-
+      github.event_name == 'schedule'
+      || github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'pull_request_target'
+          && github.event.label.name == 'ci-macos'
+          && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: macos-26-intel
+    # 8 parts psycopg exécutées l'une après l'autre : ~90 min de travail
+    # mesuré sous Linux, jusqu'à 3 h 50 mesuré sous macOS. Plafond de 240 min
+    # (sous le maximum GitHub de 6 h) : il ne retient aucun runner de la
+    # flotte et ne bloque aucune fusion.
+    timeout-minutes: 240
+    env:
+      AMEESH_REQUIRE_DB: "1"
+      AMEESH_CI_TETE: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # La tête de la PR pour `ci-macos`, le commit du déclencheur sinon.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0  # carte et ascendance pour le plan
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: PostgreSQL et outils GNU (Homebrew)
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          set -euo pipefail
+          brew install postgresql@17 bash coreutils gnu-sed findutils
+          {
+            echo "$(brew --prefix postgresql@17)/bin"
+            echo "$(brew --prefix bash)/bin"
+            echo "$(brew --prefix coreutils)/libexec/gnubin"
+            echo "$(brew --prefix gnu-sed)/libexec/gnubin"
+            echo "$(brew --prefix findutils)/libexec/gnubin"
+          } >> "$GITHUB_PATH"
+      - name: base jetable (PostgreSQL dans une étape, pas un service)
+        run: |
+          set -euo pipefail
+          export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
+          PGDATA="$RUNNER_TEMP/pgdata"
+          rm -rf -- "$PGDATA"
+          initdb -D "$PGDATA" -U ameesh --auth=trust --encoding=UTF8 --locale=en_US.UTF-8 --no-sync
+          pg_ctl -D "$PGDATA" -l "$RUNNER_TEMP/postgres.log" -o \
+            "-p 5432 -k $RUNNER_TEMP -c listen_addresses=127.0.0.1 -c fsync=off -c synchronous_commit=off -c full_page_writes=off" \
+            start
+          tries=0
+          until pg_isready -h 127.0.0.1 -p 5432 -U ameesh >/dev/null 2>&1; do
+            tries=$((tries + 1))
+            if [ "$tries" -ge 30 ]; then
+              cat "$RUNNER_TEMP/postgres.log" >&2 || true
+              echo "::error::PostgreSQL n'a pas démarré sous 30 s" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          createdb -h 127.0.0.1 -p 5432 -U ameesh ameesh
+          psql -h 127.0.0.1 -p 5432 -U ameesh -d ameesh -v ON_ERROR_STOP=1 -c 'select version()'
+      - name: dépendances Python (psutil, psycopg, chiffrement, PyYAML)
+        run: >-
+          python -m pip install 'psutil>=5.9' 'psycopg[binary]>=3.1'
+          'cryptography>=41' 'pyyaml>=6' 'coverage>=7.10'
+      - id: plan
+        name: plan complet (toute la suite, quel que soit le diff)
+        # `--mode full` : la preuve macOS ne dépend pas de la sélection
+        # impactés du lot ; même une PR de documentation passe toute la suite.
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          python3 scripts/test-plan.py plan --out plan.json --mode full \
+            --event "$EVENT" --base HEAD^1 --ref "$GITHUB_REF" \
+            --base-ref "$BASE_REF" --head-ref "$HEAD_REF" \
+            --github-output "$GITHUB_OUTPUT" --summary "$GITHUB_STEP_SUMMARY"
+      - name: le plan donne des parts psycopg
+        run: |
+          case "${{ steps.plan.outputs.psycopg_parts }}" in
+            ''|0)
+              echo "::error::le plan complet ne donne aucune part psycopg" >&2
+              exit 1 ;;
+          esac
+      - name: suite complète (pilote psycopg)
+        env:
+          AMEESH_DRIVER: psycopg
+          AMEESH_TEST_DSN: postgresql://ameesh@127.0.0.1:5432/ameesh
+          # socket Unix court : macOS place TMPDIR sous /var/folders, au-delà
+          # de la limite AF_UNIX pour les tests qui ouvrent un socket.
+          TMPDIR: /tmp/ameesh-ci
+        run: |
+          set -euo pipefail
+          mkdir -p "$TMPDIR"
+          parts="${{ steps.plan.outputs.psycopg_parts }}"
+          rc=0
+          part=1
+          while [ "$part" -le "$parts" ]; do
+            python3 scripts/test-parts.py run --plan plan.json \
+              --part "$part" --driver psycopg || rc=1
+            part=$((part + 1))
+          done
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::une ou plusieurs parts psycopg ont échoué (voir les tests ci-dessus)" >&2
+          fi
+          exit "$rc"
