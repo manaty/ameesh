@@ -5472,6 +5472,20 @@ class AgentWorker(threading.Thread):
         (L42/L43 ; verdict codex #510 r2, P1)."""
         return (self.agent or {}).get("canon")
 
+    def _with_election_brief(self, text: str) -> str:
+        """L165 (EP3) : ne jamais livrer une session neuve sans le brief de
+        relève en attente, même quand un repli (`_ecarte_session`) a remplacé
+        le résumé par un brief générique (verdict cx2 B2, session mise de côté
+        inconnue du harnais)."""
+        election = getattr(self, "_election_brief", "")
+        if not election:
+            return text
+        if not text:
+            return election
+        if text == election or election in text:
+            return text
+        return election + "\n\n" + text
+
     def _resume_prompt(self) -> str:
         """Le cadre et le résumé de reprise qui ouvriront la session neuve après
         une rotation (0018), ou "" sans résumé en attente. Le résumé est
@@ -5484,7 +5498,7 @@ class AgentWorker(threading.Thread):
             return ""
         from . import reprise
         resume = reprise.with_process_rules(
-            self.cfg, self.resume_summary, agent=self.name,
+            self.cfg, self._with_election_brief(self.resume_summary), agent=self.name,
             canon_id=self._canon_id(),
             host=(self.agent or {}).get("host") or self.cfg.host)
         return adapters.resume_prompt(resume, origin=self.resume_origin)

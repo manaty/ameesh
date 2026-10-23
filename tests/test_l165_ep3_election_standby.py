@@ -18,7 +18,7 @@ import unittest
 from unittest import mock
 
 from ameesh import mail, registry, reprise, storage, work
-from ameesh.runner import Runner
+from ameesh.runner import AgentWorker, Runner
 
 from .support import FAKEBIN
 from .test_canon import _CanonDbCase, fiche, write
@@ -281,6 +281,36 @@ class RunnerStandbyTest(_ElectionCase):
         self.assertIn("## Election", prompt)
         self.assertIn("#%s" % lot["id"], prompt)
         self.assertIn("previous holder: host atelier", prompt)
+
+    def test_le_repli_sur_session_inconnue_ne_perd_pas_le_brief(self):
+        """Verdict cx2 B2 (2) : session de lot mise de côté, inconnue du harnais."""
+        self.sync_both()
+        self.hold_atelier()
+        lot = work.add(self.db, title="lot de relève", app="ameesh")
+        self.db.execute("UPDATE work_items SET assignee = 'relecteur' WHERE id = %s",
+                        (int(lot["id"]),))
+        mail.send(self.db, "agent:autre", "relecteur", "message du lot",
+                  work_item_id=str(lot["id"]))
+        self.db.execute(
+            "INSERT INTO agent_lot_sessions (agent, work_item_id, session_id,"
+            " harness, account, cwd, parked_at) VALUES ('relecteur', %s,"
+            " 'missing-old-lot-session', 'codex', NULL, %s, clock_timestamp())",
+            (int(lot["id"]), self.workdirs["banc"]))
+        runner = self.runner_for("banc")
+        with mock.patch.object(AgentWorker, "_session_connue",
+                               return_value=lambda sid: False), \
+                mock.patch.dict(os.environ, {
+                    "AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log},
+                    clear=False):
+            runner.sweep()
+        self.assertTrue(runner.did_turn, "le gagnant doit prendre son premier tour")
+        with open(self.turns_log, encoding="utf-8") as fh:
+            entries = [json.loads(line) for line in fh if line.strip()]
+        self.assertEqual(len(entries), 1)
+        prompt = entries[0]["argv"][-1]
+        self.assertIn("## Election", prompt)
+        self.assertIn("#%s" % lot["id"], prompt)
+        self.assertIn("session unknown to the harness", prompt)
 
 
 if __name__ == "__main__":  # pragma: no cover
