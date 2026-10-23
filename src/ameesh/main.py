@@ -73,8 +73,6 @@
         durable withdrawal, return and verified lost-host recovery (L232e);
   ameesh host enroll|revoke|list|show   enroll lending devices (L110,
         authorized human only);
-  ameesh role status [ROLE] [--json]   elected roles: holder, epoch, ranked
-                                        candidates (L165); the runners publish;
   ameesh hosts [--json] [HOST]          host resources (L31);
   ameesh hosts HOST --hold --until 2h --reason R | --release
                                         the owner holds a host on purpose: its
@@ -136,6 +134,8 @@
         turn's account can resume it, otherwise a deterministic resume brief;
   ameesh review-class [--project P] [--diff REF | FILE ...]
         review class of the changed files from the project's policy;
+  ameesh role status [ROLE] [--json]   elected roles: holder, epoch, ranked
+                                        candidates (L165); the runners publish;
   ameesh run [options]        the machine's runner; `agent-runner` remains
         an alias;
   ameesh serve --exec-only --auth-file FILE [--listen HOST:PORT] …
