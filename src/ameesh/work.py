@@ -2509,6 +2509,42 @@ def _merged_pr(item: dict, ref: str, *, sha: str = "", db=None, announce=None,
     return merge, pr_ref, int(freeze["id"]) if freeze is not None else None
 
 
+def _merge_proof_repo(item: dict, repo: str | None, cfg=None, *,
+                      pr_ref: str | None = None) -> str:
+    """#3201 : le clone local où la fusion a été prouvée, indice de classe.
+
+    `merged()` le connaissait au moment de la preuve — le clone vérifié par
+    `_declared_merge_commit` pour une déclaration `--sha`, le dépôt de la PR
+    pour `--pr` — et le perdait en appelant `close_merged` : sur un hôte sans
+    le dossier de travail de l'assigné ni le projet radar (le rattrapage d'un
+    exécuteur), `class_at_merge` rendait « dépôt inconnu » et la relecture §2
+    d'un lot léger ne s'ouvrait jamais (#3029, #3011, #3105). Best effort :
+    sans clone vérifiable, la chaîne vide laisse à `class_at_merge` ses replis
+    (dossier de l'assigné, dépôt du projet) et son doute conservateur.
+    """
+    slugs: list[str] = []
+    if pr_ref:
+        slug = str(pr_ref).rpartition("#")[0].strip()
+        if "/" in slug:
+            slugs.append(slug)
+    try:
+        slug = lot_repository(item, cfg)
+    except WorkError:
+        slug = ""
+    if slug and slug not in slugs:
+        slugs.append(slug)
+    for slug in slugs:
+        # le chemin donné ne vaut que pour son dépôt (une PR du canon pour un
+        # lot d'ameesh) : `_checkout` le refuse par son `origin`, puis le clone
+        # déclaré de l'hôte est essayé
+        for path in (repo, None):
+            try:
+                return _checkout(slug, path, cfg)
+            except Exception:  # noqa: BLE001 - indice de classe, jamais la fusion
+                continue
+    return ""
+
+
 def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = "",
            repo: str | None = None, migration_landed: int | None = None, cfg=None,
            announce=None, pr: str | None = None) -> dict:
@@ -2543,7 +2579,14 @@ def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = 
     quand la renumérotation du paquet a changé celui de la réservation (452 au
     lieu de 457). Il est écrit dans la transaction de la fusion ; sur un lot
     déjà fusionné ou promu, il enregistre (ou corrige) le fait après coup,
-    journalisé."""
+    journalisé.
+
+    #3201 : le clone où la preuve a été lue (`repo`, ou le dépôt de `--pr`)
+    est transmis à `close_merged` (`repo`) et sert d'indice de classe à la
+    relecture §2 ; sans lui, un hôte qui ne connaît ni le dossier de
+    l'assigné ni le projet radar rendait « dépôt inconnu » et la relecture
+    d'un lot léger ne s'ouvrait jamais. Le même dépôt rejoue une relecture
+    manquante sur un lot déjà fusionné (dans les bornes du rattrapage)."""
     pr_text = (pr or "").strip()
     text = (sha or "").strip().lower()
     if not text and not pr_text:
@@ -2557,6 +2600,7 @@ def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = 
         raise WorkError("lot %s not found" % item_id)
     pr_ref = None
     proof_guard = {}
+    proof_repo = ""
     # Preserve idempotency and the closed-lot diagnostic without requiring
     # that an old clone or object still be available.
     fence = None
@@ -2572,8 +2616,14 @@ def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = 
             text, pr_ref, frozen_id = _merged_pr(
                 item, pr_text, sha=text, db=db, announce=announce)
             proof_guard = {"frozen_id": frozen_id, "unfrozen": frozen_id is None}
+            proof_repo = _merge_proof_repo(item, repo, cfg, pr_ref=pr_ref)
         else:
             text = _declared_merge_commit(item, text, repo=repo, cfg=cfg, announce=announce)
+            proof_repo = _merge_proof_repo(item, repo, cfg)
+    else:
+        # #3201 : un lot déjà fusionné peut rejouer sa relecture manquante ; le
+        # dépôt donné (ou celui de la PR) reste l'indice de classe.
+        proof_repo = _merge_proof_repo(item, repo, cfg, pr_ref=pr_text or None)
     landed = None
     if migration_landed is not None:
         number = _landed_number(migration_landed)
@@ -2594,14 +2644,15 @@ def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = 
         if fence is None:
             done = close_merged(db, item_id, sha=text, actor=actor,
                                 source=actor or UNKNOWN_ACTOR, declared=True, extra=extra,
-                                landed=landed, pr_ref=pr_ref, **proof_guard)
+                                landed=landed, pr_ref=pr_ref, repo=proof_repo,
+                                **proof_guard)
         else:
             with db.transaction() as tx:
                 fence.hold(tx)
                 done = close_merged(tx, item_id, sha=text, actor=actor,
                                     source=actor or UNKNOWN_ACTOR, declared=True,
                                     extra=extra, landed=landed, pr_ref=pr_ref,
-                                    **proof_guard)
+                                    repo=proof_repo, **proof_guard)
     except DbError as exc:
         # #1567 : course perdue sur l'index unique (dépôt, numéro atterri) —
         # message lisible plutôt que la DbError brute ; la pré-vérification a
