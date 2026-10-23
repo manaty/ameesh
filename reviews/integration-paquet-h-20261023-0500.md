@@ -85,5 +85,27 @@ et son SHA, et il porte un trailer `ameesh-work: <lot>`. Arbre composé :
 - Contrôle d'inclusion (`scripts/paquet-inclusion.py --manifest … --head 7d6648f69dd6 --ready-file prets-0500.txt --no-expected`, tête de composition avant ce manifeste) : **aucun défaut** — 8 entrées de composition, verdicts « présent » 8/8, 8 lots prêts, 8/8 contenus à la tête ; exclusions #2994, #2914, #3007, #3010 consignées.
 - Contrôles statiques du gel (`scripts/freeze-checks.py`) : rejoués par le gel
   de la tête finale ; le gate les exige.
-- Tests ciblés : aucun test local n'a été relancé pour ce paquet ; la suite
-  complète de la CI sur la tête gelée fait foi.
+- Tests ciblés : après la CI rouge, les bancs des quatre incompatibilités ont
+  été rejoués localement (166 tests, tous verts) ; la suite complète de la CI
+  sur la tête finale fait foi.
+
+## CI rouge sur 427d165ba (23/10 03:15Z–03:30Z)
+
+La première suite complète a échoué sur quatre incompatibilités entre unités,
+toutes dans des bancs de test — aucun code produit modifié.
+
+| unités | symptôme | correctif |
+|---|---|---|
+| #3034 | `TypeError: _Book.codex_gauges() got an unexpected keyword argument 'plan'` (8× `test_1176`, 5× `test_1227`, 2× `test_1075`, 2× `test_2648`) | les quatre doubles de test acceptent `plan=None` |
+| #2989 × #3004 | `freeze refused (head-unresolved)` sur les SHA synthétiques de `PendingLoadTest` | le témoin gèle de vrais commits de son dépôt (`repo=`) et fixe `branch_target` |
+| #3039 | le banc #1323 laisse le vrai `systemd-run` échouer (pas de bus utilisateur), la séquence finit en retour | lanceur direct `systemd-run` dans le `PATH` du banc, comme #1155 |
+| #3004 × #2541 | le rejeu forcé choisit rev3 (charge 0) au lieu de rev1 (charge 1) | rev3 reçoit un lot ouvert ; rev1 reste le moins chargé à nom égal |
+
+Ciblés rejoués le 23/10 : 1176 35/35, 1227 12/12, 1075 17/17, 2648 3/3,
+`PendingLoadTest` 4/4, `StagingSignalTest` 9/9, `ForceReplayMailTest` 4/4,
+1155+2950 82/82. Aucun avis supplémentaire n'est requis : ces changements ne
+touchent que des bancs de test (adaptation de test, §11 bis).
+
+Correctif : `ab2caa7770c5` (7 fichiers de test, +74/−20). La tête de la
+branche devient le commit qui porte ce manifeste ; la CI complète unique est
+relancée sur elle.
