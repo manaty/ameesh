@@ -29,6 +29,9 @@ SOURCES = (
     "scripts/map.py",
 )
 CONTRACT = "src/ameesh/train_contracts.py"
+#: #3098 relecture cx2 : une source que la base épingle et que la version
+#: installée ne connaît pas encore (paquet atterri par « déblocage CI »).
+EXTRA = "scripts/new-required-test.py"
 STALE = "0" * 40
 
 
@@ -44,10 +47,10 @@ def contract_text(pins, omit=()):
              '        event="push",',
              '        called=".github/workflows/tests.yml",',
              "        sources=("]
-    for path in SOURCES:
+    for path, blob in pins.items():
         if path in omit:
             continue
-        lines.append('            (%r, %r),' % (path, pins[path]))
+        lines.append('            (%r, %r),' % (path, blob))
     lines += ["        ),", '        pins_at="%s",' % CONTRACT, "    ),)"]
     return "\n".join(lines) + "\n"
 
@@ -100,6 +103,17 @@ class PinsFixture(unittest.TestCase):
         self.write(CONTRACT, contract_text(self.pins))
         return self.commit()
 
+    def base_with_extra_pin(self, name=EXTRA, text="new required test\n"):
+        """A base contract that adds a source to the installed pin set.
+
+        A packet landed through the CI-unblock lane may add a pin the release
+        module does not know yet; the base commit is still the reference.
+        """
+        self.write(name, text)
+        self.pins[name] = self.blob(name)
+        self.write(CONTRACT, contract_text(self.pins))
+        return self.commit()
+
 
 class VersionedSourcesTest(PinsFixture):
     def test_a_base_pin_equal_to_the_head_blob_is_a_cut(self):
@@ -129,6 +143,23 @@ class VersionedSourcesTest(PinsFixture):
         self.plan.update(base=base, head=base)
         train_ci.verify_local(self.repo, self.plan, (self.installed,))
 
+    def test_a_source_first_pinned_by_the_base_cuts_when_unchanged(self):
+        # The installed release does not know this pin yet, but the base
+        # contract does: refusing the base outright would block the cut.
+        base = self.base_with_extra_pin()
+        self.plan.update(base=base, head=base)
+        train_ci.verify_local(self.repo, self.plan, (self.installed,))
+
+    def test_a_source_first_pinned_by_the_base_cannot_move_at_the_head(self):
+        # #3098 relecture cx2 : `own` ne venait que du module installé ; une
+        # source ajoutée par la base échappait donc au contrôle de la tête.
+        base = self.base_with_extra_pin()
+        self.write(EXTRA, "changed by the packet\n")
+        self.plan.update(base=base, head=self.commit())
+        with self.assertRaisesRegex(train.TrainError,
+                                    "source differs from audited CI contract"):
+            train_ci.verify_local(self.repo, self.plan, (self.installed,))
+
     def test_a_base_contract_that_forgets_a_source_is_refused(self):
         self.write(CONTRACT, contract_text(self.pins, omit=("scripts/map.py",)))
         self.plan["base"] = self.commit()
@@ -152,6 +183,13 @@ class VersionedSourcesTest(PinsFixture):
             pins_at=CONTRACT)
         train_ci.verify_local(self.repo, self.plan, (self.installed,))
 
+    def test_a_missing_base_commit_is_refused_not_silently_fallen_back(self):
+        # A base absent from the clone is not a pre-#3098 bootstrap: falling
+        # back to the installed snapshot there would skip the base pins.
+        self.plan["base"] = "f" * 40
+        with self.assertRaisesRegex(train.TrainError, "base commit cannot be read"):
+            train_ci.verify_local(self.repo, self.plan, (self.installed,))
+
 
 class VersionedGitHubTest(PinsFixture):
     def gh(self, blobs):
@@ -173,6 +211,28 @@ class VersionedGitHubTest(PinsFixture):
 
     def test_remote_check_refuses_a_head_outside_the_base_pins(self):
         blobs = {path: STALE for path in SOURCES}
+        gh, _ = self.gh(blobs)
+        with self.assertRaisesRegex(train.TrainError, "source differs"):
+            train_ci.GitHub("o/r", (self.installed,), gh=gh,
+                            repo=self.repo).verify(self.plan)
+
+    def test_remote_check_also_covers_a_source_first_pinned_by_the_base(self):
+        base = self.base_with_extra_pin()
+        self.plan.update(base=base, head=base)
+        blobs = {path: git(self.repo, "rev-parse", "HEAD:" + path)
+                 for path in (*SOURCES, EXTRA)}
+        gh, calls = self.gh(blobs)
+        train_ci.GitHub("o/r", (self.installed,), gh=gh,
+                        repo=self.repo).verify(self.plan)
+        asked = [call[-1].split("/contents/", 1)[1].split("?", 1)[0] for call in calls]
+        self.assertEqual(sorted(asked), sorted((*SOURCES, EXTRA)))
+
+    def test_remote_check_refuses_a_head_moving_a_base_only_pin(self):
+        base = self.base_with_extra_pin()
+        self.plan.update(base=base, head=base)
+        blobs = {path: git(self.repo, "rev-parse", "HEAD:" + path)
+                 for path in (*SOURCES, EXTRA)}
+        blobs[EXTRA] = STALE
         gh, _ = self.gh(blobs)
         with self.assertRaisesRegex(train.TrainError, "source differs"):
             train_ci.GitHub("o/r", (self.installed,), gh=gh,

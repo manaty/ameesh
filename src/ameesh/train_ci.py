@@ -219,7 +219,18 @@ def _declared_pins(text, path):
                 isinstance(item, (tuple, list)) and len(item) == 2
                 and all(isinstance(part, str) for part in item) for item in sources):
             raise TrainError("the base contract pins malformed sources: %s" % path)
-        return dict(sources)
+        pins = {}
+        for pin_path, pin_blob in sources:
+            if not re.fullmatch(r"[\w./-]+", pin_path) or any(
+                    part in ("", ".", "..") for part in pin_path.split("/")):
+                raise TrainError("the base contract pins a malformed source path: %s"
+                                 % pin_path)
+            if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", pin_blob):
+                raise TrainError("the base contract pins a malformed blob: %s" % pin_path)
+            if pin_path in pins and pins[pin_path] != pin_blob:
+                raise TrainError("the base contract pins %s twice differently" % pin_path)
+            pins[pin_path] = pin_blob
+        return pins
     return None
 
 
@@ -233,21 +244,32 @@ def versioned_sources(repo, base, workflows):
     the next deploy the installed blobs are stale, so every cut would fail
     until the release lands; the base commit is reviewed, landed code and is
     the reference for the packet head. A packet that moves a source under the
-    base pins is still refused: the base is what it is based on, and its own
-    contract is not widened by an unknown file.
+    base pins is still refused.
+
+    #3098 relecture cx2 : la base peut épingler une source que la version
+    installée ne connaît pas encore (le paquet qui l'a ajoutée a atterri par
+    « déblocage CI »). Toutes les sources déclarées par la base sont donc
+    vérifiées et rendues immuables pour la tête ; s'arrêter aux seules sources
+    installées laisserait la tête déplacer une épingle de la base sans refus.
     """
     installed = audited_sources(workflows)
     if not any(getattr(workflow, "pins_at", "") for workflow in workflows):
         return installed
     if not base:
         raise TrainError("the base commit is required to read the versioned CI contract")
+    versioned = {}
     for workflow in workflows:
         if not getattr(workflow, "pins_at", ""):
             continue
         proc = resolutions._run(repo, "show", "%s:%s" % (base, workflow.pins_at))
         if proc.returncode:
             # Bootstrap: a base that predates the versioned contract keeps the
-            # installed pins, exactly as before #3098.
+            # installed pins, exactly as before #3098. A base commit absent
+            # from the clone is not a bootstrap: fail closed rather than fall
+            # back to the release snapshot.
+            probe = resolutions._run(repo, "cat-file", "-e", "%s^{commit}" % base)
+            if probe.returncode:
+                raise TrainError("the base commit cannot be read for the versioned CI contract")
             continue
         declared = _declared_pins(resolutions._text(proc), workflow.path)
         if declared is None:
@@ -258,13 +280,16 @@ def versioned_sources(repo, base, workflows):
         if missing:
             raise TrainError("the base contract no longer pins the audited sources: %s"
                              % ", ".join(missing))
-        for path in sorted(own):
+        for path in sorted(declared):
             proc = resolutions._run(repo, "ls-tree", base, "--", path)
             fields = resolutions._text(proc).strip().split()
             if proc.returncode or len(fields) != 4 or fields[0] not in ("100644", "100755") \
                     or fields[1] != "blob" or fields[2] != declared[path] or fields[3] != path:
                 raise TrainError("the base contract pins %s differently from its tree" % path)
-            installed[path] = declared[path]
+            if path in versioned and versioned[path] != declared[path]:
+                raise TrainError("conflicting versioned audited CI sources: %s" % path)
+            versioned[path] = declared[path]
+    installed.update(versioned)
     return installed
 
 

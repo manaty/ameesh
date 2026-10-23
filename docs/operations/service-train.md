@@ -179,9 +179,12 @@ reste l'instantané de la release, mais dans `src/ameesh/train_contracts.py` au
 fournit toujours les chemins et les jobs du contrat. Un paquet qui change une
 source est donc refusé, et une fois ce paquet atterri par la voie « déblocage
 CI » (§11 bis) avec son ré-épinglage, la coupure suivante repart immédiatement,
-sans attendre la release et le déploiement suivants. Une base dont les épingles
-ne correspondent pas à son propre arbre, ou qui omet une source auditée, est
-refusée par un message nommé. Témoins : `tests/test_3098_train_contract_pins.py`.
+sans attendre la release et le déploiement suivants. **Toutes** les sources
+déclarées par la base sont vérifiées, y compris celles que le module installé ne
+connaît pas encore : la tête ne peut pas les déplacer. Une base dont les épingles
+ne correspondent pas à son propre arbre, qui omet une source auditée, ou dont le
+commit est absent du clone, est refusée par un message nommé. Témoins :
+`tests/test_3098_train_contract_pins.py`.
 
 ### Nexlink — les parts dues (#2503)
 
