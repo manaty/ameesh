@@ -10373,10 +10373,12 @@ class Runner:
                               critical=host_lifecycle.critical_names(self.cfg, db))
             api.expire_returns()
             controls = api.listing()
-            # #3035: a lost host that publishes fresh readings again is reopened
-            # only on the database proof (origins home, no live lease, no active
-            # handoff or recovery since the loss). Any healthy runner may make
-            # that decision; the returning machine's own heartbeat is not it.
+            # #3035/#3180: a lost host that publishes fresh readings again is
+            # reopened only on the database proof (origins home and unfenced, no
+            # active handoff or recovery since the loss). A live lease of a home
+            # agent is that host's own runner taking its lease back and does not
+            # block the proof; any healthy runner may make that decision, never
+            # the returning machine's own heartbeat.
             for control in controls:
                 if control["mode"] != "lost":
                     continue
