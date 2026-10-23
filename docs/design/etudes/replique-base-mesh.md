@@ -232,9 +232,10 @@ is a voter and an asynchronous standby with `nofailover: true` and
 promoted automatically and never enters `synchronous_standby_names`, so no
 commit waits for the smallest, hub-loaded host. If both agent VMs are lost,
 the surviving hub has no etcd quorum (1/3) and does not promote; the mesh
-stops. The hub is asynchronous and may miss the last commits; the WAL archive
-(section 6) holds them. That is a double failure, not the single failure this
-study removes.
+stops. The hub is asynchronous and may miss the last commits; a restore from
+the WAL archive (section 6) stops at the last segment actually archived, so
+those commits can be lost. That is a double failure, not the single failure
+this study removes.
 
 The primary starts on `ameesh-agents-1` and follows the EP2 candidate score
 (availability, readiness, capacity) on a planned switchover. The current
@@ -262,7 +263,8 @@ no swap.
   synchronous standby, so the cluster never pays the hub's latency on a
   commit, and it never becomes the only synchronous standby when an agent VM
   is down (the primary then runs without a synchronous standby, as
-  `synchronous_mode_strict: false` allows, and the archive bounds the loss).
+  `synchronous_mode_strict: false` allows, and a further loss is bounded by
+  the last archived WAL segment).
   A second synchronous standby would add no availability anyway, because a
   double host loss also loses the etcd quorum. The lot verifies that Patroni
   reports the other agent VM as `sync_state=sync` and the hub as `async` in
@@ -415,7 +417,7 @@ postgresql://ameesh@<private-1>,<private-2>,<private-3>:5432/ameesh
 | A standby agent VM stops | the primary continues; Patroni reconfigures the sync set | 0 | no outage |
 | `manaty-mesh-1` (hub) stops | the two agents keep working on the private network; the PC loses database access; etcd keeps 2/3 | 0 | 0 for the VMs; the PC when the hub returns |
 | The PC stops | no effect on the database or the VMs | 0 | 0 |
-| The primary and one other node stop | the surviving etcd is 1/3: no quorum, the mesh stops; the survivor may be the asynchronous (`nosync`) hub and miss the last commits, which the WAL archive holds; it cannot serve alone | 0 on the sync survivor; possibly the last commits on the asynchronous hub | repair or restore; a fourth voter would be needed to survive two |
+| The primary and one other node stop | the surviving etcd is 1/3: no quorum, the mesh stops; the survivor may be the asynchronous (`nosync`) hub and miss the last commits, which a restore recovers only up to the last archived WAL segment; it cannot serve alone | 0 on the sync survivor; possibly the last commits on the asynchronous hub | repair or restore; a fourth voter would be needed to survive two |
 | The whole `fr-par-1` zone | restore from the off-region S3 archive, or from the PC copy if it is current, on a new VM | up to the last archived WAL | hours |
 | A logical error (bad migration, bad delete) | point-in-time recovery to before the error | 0 at the restore point | 30–60 min |
 
@@ -460,7 +462,8 @@ exists and the restart window (decision 8) is agreed.
 3. **Synchronous set**: not an open choice. The count is 1 (the two agent
    VMs); the hub is tagged `nosync` and stays asynchronous, because a second
    synchronous standby would add its latency to every commit and no
-   availability. The double-failure copy is the WAL archive, not the hub.
+   availability. The double-failure copy is the WAL archive, not the hub;
+   it is complete only up to the last archived segment.
 4. **A fourth voter**: not for one-host tolerance. A small witness VM would
    let the mesh survive two host failures at a new monthly cost; the owner
    decides if that is worth it.
