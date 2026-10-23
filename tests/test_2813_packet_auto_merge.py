@@ -882,10 +882,12 @@ class HeldTest(Journal):
         for _ in range(3):
             self.check(FakeGh(tests="pending"))
         self.assertEqual(len(self.holds()), 1, self.notes())
-        out = self.check(FakeGh(tests="failure"))
+        self.gate = (False, "2 independent reviews missing on 1111111111", None)
+        out = self.check(FakeGh(tests="pending"))
         self.assertEqual(out["result"], "pending", out)
         self.assertEqual(len(self.holds()), 2, self.notes())
         self.assertIn(" ".join(out["why"].split()), self.holds()[-1])
+        self.gate = (True, "", None)
         self.check(FakeGh(tests="pending"))
         self.assertEqual(len(self.holds()), 3, self.notes())
 
