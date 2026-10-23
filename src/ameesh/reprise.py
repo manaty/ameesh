@@ -50,7 +50,7 @@ DEFAULT_RESUME = ("Resuming (ameesh resume): read your mail, pick up the state o
                   "work, end each turn with a clear status.")
 
 #: bornes du brief de reprise déterministe (octets UTF-8)
-BRIEF_MAX_BYTES = 16000
+BRIEF_MAX_BYTES = 19000
 FIL_ENTRIES = 30
 FIL_MAX_BYTES = 8000
 FIL_ENTRY_CHARS = 400
@@ -61,7 +61,9 @@ LOTS_MAX = 40
 #: tronqué ensuite — jamais l'inverse, sinon un résumé plein fait disparaître
 #: les règles (verdict codex #510 r3, P2) ; mais les règles ne l'effacent pas
 #: pour autant : le texte plus court que cette part reste entier.
-BRIEF_TEXT_MIN_BYTES = BRIEF_MAX_BYTES // 4
+#: #3126 : réserve fixe de 4 000 octets ; relever le plafond du brief donne
+#: toute la place supplémentaire aux règles, sans agrandir cette réserve.
+BRIEF_TEXT_MIN_BYTES = 4000
 
 #: #538 : les règles de travail des fiches Process du canon ouvrent le brief
 #: (nouvelle session, rotation, reprise), avant le rôle et la consigne.
@@ -375,7 +377,7 @@ def _process_fragment(process) -> tuple[str, str]:
         corps = proj
     elif _octets(corps) > canon_mod.PROCESS_BODY_MAX:
         # #1624 (N2) : la carte peut tenir entière dans le bloc (jusqu'à
-        # ~11 900 o) ; ce diagnostic annonce donc une coupe POSSIBLE, pas une
+        # ~14 900 o) ; ce diagnostic annonce donc une coupe POSSIBLE, pas une
         # coupe acquise — seul le constat de coupe du bloc est exact.
         diag = ('the card "%s" has no short projection (%d bytes of rules): '
                 "the brief may keep only what fits"

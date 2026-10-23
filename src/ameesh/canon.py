@@ -87,12 +87,12 @@ PROCESS_BODY_MAX = 6000
 #: carte, par le même responsable).
 PROCESS_PROJECTION_START = "<!-- projection courte : début -->"
 PROCESS_PROJECTION_END = "<!-- projection courte : fin -->"
-#: #1372 : budget d'une projection (octets UTF-8). La part de règles d'un brief
-#: est GARANTIE à ≈ 11 900 octets (`BRIEF_MAX_BYTES` 16 000, moins la part texte
-#: réservée 4 000 et l'en-tête/le pied du bloc, 80) : 11 600 gardent la marge du
-#: bloc (diagnostics, autre fiche courte). Une projection au-delà est signalée
-#: et coupée à ce budget, jamais silencieusement.
-PROCESS_PROJECTION_MAX = 11600
+#: #1372, #3126 : budget d'une projection (octets UTF-8). `BRIEF_MAX_BYTES`
+#: 19 000 - réserve texte 4 000 - en-tête/pied 80 - marge du bloc 320 = 14 600.
+#: La marge garde la place des diagnostics et d'une autre fiche courte. Une
+#: projection au-delà est signalée et coupée à ce budget, jamais silencieusement ;
+#: dès 90 % du budget, `canon check` prévient avant la coupe.
+PROCESS_PROJECTION_MAX = 14600
 #: les sortes de fiches WorkPackage (plan de travail, L29) et les parents admis
 PACKAGE_KINDS = ("milestone", "epic", "lot")
 #: L96 : dates d'une fiche WorkPackage (`date` = date d'un jalon, alias de `delivery`)
@@ -4005,6 +4005,11 @@ def _validate_processes(canon: Canon, add) -> None:
                 "Process card %s: short projection of %d bytes (limit %s) — a "
                 "brief cuts its end" % (process.title, proj, PROCESS_PROJECTION_MAX),
                 where, **subject)
+        elif process.projection and proj * 10 >= PROCESS_PROJECTION_MAX * 9:
+            add("process-projection-near-limit", WARNING,
+                "Process card %s: short projection of %d bytes (limit %s) — at "
+                "least 90%% of its budget; shorten it before a brief cuts its end"
+                % (process.title, proj, PROCESS_PROJECTION_MAX), where, **subject)
         elif not process.projection and taille > PROCESS_BODY_MAX:
             add("process-too-long", WARNING,
                 "Process card %s: %d bytes of rules (limit %s, about two pages); "
