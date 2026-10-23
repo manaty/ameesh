@@ -1,8 +1,8 @@
-# Paquet integration/paquet-h-20261023-1300 — composition (§12)
+# Paquet integration/paquet-h-20261023-1500 — composition (§12)
 
 Base : `main` **`18204348c558`** (tête au 23/10 13:08Z). Branche
-`integration/paquet-h-20261023-1300`, cible `main`. Paquet manuel ameesh
-(créneau 13:00Z), sur la délégation mesh-design #127546 et l'audit P1 de
+`integration/paquet-h-20261023-1500`, cible `main`. Paquet manuel ameesh
+(créneau 15:00 (13:00Z)), sur la délégation mesh-design #127546 et l'audit P1 de
 13:07Z : trois P1 prêts étaient en attente. Le train ameesh est hors service
 (`train.projects = ['nexlink']`), le repli manuel s'applique.
 
