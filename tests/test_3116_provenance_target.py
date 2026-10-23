@@ -217,3 +217,60 @@ class SurvivingUnknownTest(_TargetFixture):
         _authors, unknown, _correctors = self.reading(
             [self.new_lot, self.new_fix, self.copied], strict=False)
         self.assertIn(self.kept[:12], unknown)
+
+
+class MovedUnknownTest(_TargetFixture):
+    """#3116 B1 : un inconnu déplacé (old.py → new.py) survit et bloque."""
+
+    def old_extra(self):
+        self.repo.write("old.py", "def unique_unknown_guard_3116():\n"
+                                  "    return enforce_review_receipts_3116\n")
+        self.moved = self.repo.commit("u: third-party content", agent="u")
+
+    def new_extra(self):
+        # old.py n'existe pas sur la branche rejouée (base) : le contenu du
+        # tiers y arrive déplacé dans new.py.
+        self.repo.write("new.py", "def unique_unknown_guard_3116():\n"
+                                  "    return enforce_review_receipts_3116\n")
+        self.copied = self.repo.commit("impl: move the guard", agent="impl")
+        self.receipt("impl", "deepseek", [self.copied])
+
+    def test_the_moved_unknown_still_blocks_closed(self):
+        # B1 cx2 : le contenu du tiers subsiste, déplacé ; le déclarer réécrit
+        # effaçait son doute. La preuve de réécriture doit chercher l'arbre.
+        _authors, unknown, _correctors = self.reading(
+            [self.new_lot, self.new_fix, self.copied], strict=False)
+        self.assertIn(self.moved[:12], unknown)
+
+
+class BareTargetTest(_TargetFixture):
+    """#3116 B2 : une cible nue `main` se lit sur origin/main, pas sur la locale.
+
+    La branche locale `main` porte le commit du correcteur non fusionné ; la
+    cible réelle est `origin/main`. La lire sur la locale écarterait le
+    correcteur de la provenance.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.repo.git("update-ref", "refs/remotes/origin/main", self.target)
+        self.repo.git("update-ref", "refs/heads/main", self.new_fix)
+
+    def test_target_commit_prefers_the_remote_ref(self):
+        self.assertEqual(review_authors.target_commit(self.repo.root, "main"),
+                         self.target)
+
+    def test_a_bare_target_keeps_the_unmerged_corrector(self):
+        authors, unknown, _correctors = self.reading(
+            [self.new_lot, self.new_fix], target="main")
+        self.assertEqual(unknown, [])
+        self.assertEqual(self.names(authors).get("cx"), "codex")
+
+    def test_the_merge_gate_bare_target_keeps_the_corrector(self):
+        marks = work.milestones(self.db, self.lot)
+        authors, _correctors = merge_queue._attribution_on_freeze(
+            self.db, marks, self.new_head, repo=self.repo.root,
+            klass={"base_sha": self.base, "class": "normal"},
+            item=work.get(self.db, self.lot), families=FAMILIES,
+            strict=True, target="main")
+        self.assertEqual(self.names(authors).get("cx"), "codex")

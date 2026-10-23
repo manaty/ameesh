@@ -429,14 +429,31 @@ def target_commit(repo: str, target: str) -> str:
     La cible peut être un commit complet ou une ref (`origin/develop`) : c'est
     la cible **au moment de la lecture**. Une cible illisible rend "" et le
     lecteur garde son comportement d'avant (aucun commit n'est écarté) : le
-    doute ne retire jamais un auteur."""
+    doute ne retire jamais un auteur.
+
+    #3116 B2 : une cible NUE (`main`) se résout sur sa ref **distante**
+    (`origin/main`) en priorité — même règle que `_resolve_base` et
+    `_delta_base`. Une branche locale peut porter un commit non fusionné (le
+    correcteur) et masquer la cible réelle ; la lire écarterait ce correcteur
+    de la provenance. Une cible explicitement qualifiée est gardée telle
+    quelle."""
     text = str(target or "").strip()
     if not repo or not text:
         return ""
+    remote = None
     try:
-        return plan_git._commit(repo, text) or ""
-    except Exception:  # noqa: BLE001 - cible illisible : pas d'écart
-        return ""
+        from . import canon as canon_mod
+        remote = canon_mod.remote_branch(repo, text)
+    except Exception:  # noqa: BLE001 - résolution distante impossible : ref nue
+        remote = None
+    for ref in ([remote] if remote else []) + [text]:
+        try:
+            found = plan_git._commit(repo, ref) or ""
+        except Exception:  # noqa: BLE001 - cible illisible : pas d'écart
+            found = ""
+        if found:
+            return found
+    return ""
 
 
 def _not_in_target(repo: str, commits, target: str) -> list:
@@ -477,8 +494,11 @@ def _survives_rewrite(repo: str, head: str, sha: str, cache: dict,
         return False
     if _is_ancestor(repo, sha, head) is True:
         return True
-    return _commit_survives(repo, head, sha, cache, base,
-                            absent_path_keeps=False, moved_search=False)
+    # #3116 B1 : la preuve de réécriture cherche le contenu DÉPLACÉ (un
+    # fichier renommé garde ses lignes) et garde le doute quand un chemin a
+    # disparu — les drapeaux stricts réservés aux lignes génériques faisaient
+    # disparaître un inconnu dont le contenu subsistait dans un autre fichier.
+    return _commit_survives(repo, head, sha, cache, base)
 
 
 def _tree_of(repo: str, rev: str) -> Optional[str]:
