@@ -42,7 +42,8 @@ def job(nom, conclusion, runner="", etapes=(), labels=()):
 
 #: le job annulé faute de runner : jamais pris, aucune étape (signature #987)
 MACOS_ANNULE = job("plateforme macOS", "cancelled", labels=["macos-26-intel"])
-#: l'agrégat requis, rouge parce qu'il exige platform-macos == success
+#: l'agrégat requis, rouge sur un vrai échec d'une part (le job macOS n'est
+#: plus dans ses `needs` depuis la décision de la revue #393)
 AGREGAT = job("tests", "failure", runner="ameesh-ci-1-1",
               etapes=["bilan des parts"],
               labels=["self-hosted", "linux", "ameesh-ci"])
