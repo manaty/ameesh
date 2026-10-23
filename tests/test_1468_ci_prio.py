@@ -252,7 +252,6 @@ class RunsOnTest(unittest.TestCase):
         # de capacité hébergée et était annulé sans qu'une étape ne tourne.
         # Le littéral reste épinglé : toute dérive de l'image est vue.
         self.assertEqual(self.jobs["platform-macos"], "macos-26-intel")
-        self.assertEqual(self.jobs["platform-macos-short"], "macos-26-intel")
 
     def test_switch_off_keeps_previous_routing(self):
         for vars_ in ({}, {"AMEESH_CI_PRIO": "off"}, {"AMEESH_CI_PRIO": ""},

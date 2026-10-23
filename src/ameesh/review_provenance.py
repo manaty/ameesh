@@ -506,7 +506,7 @@ def prepare_commit_creation(cwd: str | None = None, *, environ=None,
 
 
 def proof_for_current_turn(db, *, actor: str = "", sha: str = "",
-                           cwd: str | None = None) -> dict | None:
+                           cwd: str | None = None, required: bool = False) -> dict | None:
     """L'identité exacte du tour courant, ou None si le fait n'y est pas déclaré.
 
     None couvre quatre cas, tous « origine inconnue » : pas de tour managé
@@ -515,11 +515,18 @@ def proof_for_current_turn(db, *, actor: str = "", sha: str = "",
     branche), ou un `sha` hexadécimal que le dépôt ne résout pas. Un jalon hors
     tour — ou dont le `sha` n'est pas un commit lisible — s'écrit donc sans
     preuve, jamais avec une preuve que `receipt_for_milestone` devrait ensuite
-    refuser à jamais (N1 de la relecture Claude de #1465)."""
+    refuser à jamais (N1 de la relecture Claude de #1465).
+
+    `required` (#3104) refuse ces cas par une `ProvenanceError` qui en nomme
+    la cause : un verdict de tour managé ne doit jamais réussir sans reçu.
+    Les gels et les déclarations hors tour gardent le comportement facultatif.
+    """
     try:
         ident = capture(actor=actor, families=compiled_families(db))
         ident["session"] = live_session(db, ident["actor"], harness=ident["harness"])
     except ProvenanceError:
+        if required:
+            raise
         return None
     declared = str(sha or "").strip().lower()
     if declared:
@@ -528,9 +535,16 @@ def proof_for_current_turn(db, *, actor: str = "", sha: str = "",
         # une valeur non hexadécimale. On n'écrit donc aucune preuve pour un nom
         # symbolique — le jalon reste lisible, son origine inconnue.
         if not ABBREV.fullmatch(declared):
+            if required:
+                raise ProvenanceError("commit id expected, got %r" % sha)
             return None
         full = resolve_commit(declared, cwd=cwd)
         if full is None:
+            if required:
+                raise ProvenanceError(
+                    "sha %s does not resolve to a commit in %s; "
+                    "pass --repo <clone> pointing to the repository holding this commit"
+                    % (declared, cwd or os.getcwd()))
             return None
         ident["sha"] = full
     else:

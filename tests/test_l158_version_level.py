@@ -443,7 +443,7 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("python3 scripts/version-level.py pr HEAD^1 HEAD", text)
         self.assertIn(
             "needs: [plan, version, psycopg, psql, platform-macos, "
-            "platform-macos-short, doc-readers, fs-class]", text)
+            "doc-readers, fs-class]", text)
         # checked before the early exits of version-only and documentation-only PRs
         self.assertLess(text.index('test "${{ needs.version.result }}" = success'),
                         text.index("PR de version seule"))

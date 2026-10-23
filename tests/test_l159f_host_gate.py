@@ -422,7 +422,9 @@ class PartialSyncKeepsTheGateTest(unittest.TestCase):
         from ameesh.runner import Runner
         calls: list = []
         runner = types.SimpleNamespace(host="h1", _sync_host_gate=lambda *a: calls.append(a))
-        canon = types.SimpleNamespace(host=None, hosts=[])
+        # #3101 : refresh_host_limits compte les admissions épinglées du canon ;
+        # le faux canon d'un sync partiel en porte zéro.
+        canon = types.SimpleNamespace(host=None, hosts=[], placements=[])
         mine = {"limits": {}, "max_agents": None, "origin": None}
         with mock.patch("ameesh.resources.host_limits", return_value=mine), \
                 mock.patch("ameesh.menage.effective", return_value=None):

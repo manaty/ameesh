@@ -8,6 +8,22 @@ from . import config, db as db_mod, estimates, handoffs, host_preflight, registr
 from .config import NAME_RE
 
 
+#: L232e/L165 : a host is stale after three readings, and never under 180 s
+#: (a resource poll faster than a minute would otherwise declare a lost host
+#: after a hiccup). The election uses the same threshold for a candidate's
+#: reading and its standing, so one rule decides freshness everywhere.
+MIN_STALENESS_S = 180.0
+
+
+def staleness_s(interval_s) -> float:
+    """The staleness threshold of a host whose readings come every `interval_s`."""
+    try:
+        interval = max(0.0, float(interval_s or 0.0))
+    except (TypeError, ValueError):
+        interval = 0.0
+    return max(MIN_STALENESS_S, 3.0 * interval)
+
+
 def drain(cfg, db, host, *, duration=None, critical=(), actor=None):
     """`actor`: the human the API authenticated (L87); otherwise the session's
     corrector (a human, an orchestrator or a design agent)."""
@@ -35,6 +51,26 @@ def critical_names(cfg, db):
         if agent["name"] in sous_utilisation.role_orchestrators(own, roles):
             names.add(agent["name"])
     return names
+
+
+def reconcile(cfg, db, host, *, actor=None):
+    """#3035: verified reopening of a lost host, for a lifecycle pass or the command.
+
+    The proof is database state read under the host gate lock (readings in
+    database time covering one detection window without a hole, origins home
+    and unfenced, no active handoff, no recovery attempt since the loss),
+    never the returning machine's own declaration. A live lease of an agent
+    that is home is the returning host's own runner and does not block the
+    proof (#3180); a recovery that moved the agent elsewhere still closes it.
+    A refusal names the missing proof instead of forcing the host open.
+    """
+    if not isinstance(host, str) or not NAME_RE.fullmatch(host):
+        raise ValueError("invalid host name")
+    if actor is None:
+        actor = work.corrector(cfg, db)
+    fresh_within = max(180, int(getattr(cfg, "resource_interval", 60) * 3))
+    return storage.of(db).host_lifecycle.reconcile_loss(
+        host, actor=actor, fresh_within=fresh_within)
 
 
 def readiness(db, agent, target, *, adapter=None, requirements_for=None):
@@ -169,8 +205,14 @@ def main(argv=None):
     withdraw = commands.add_parser("drain", help="close new turns and prepare agents' evacuation")
     withdraw.add_argument("host")
     withdraw.add_argument("--for", dest="duration", help="request return after this duration, e.g. 8h")
+    withdraw.add_argument("--actor", help="who drains (human:<id>) from an unbound terminal")
     restore = commands.add_parser("undrain", help="reopen the host and request agents' return")
     restore.add_argument("host")
+    restore.add_argument("--actor", help="who reopens (human:<id>) from an unbound terminal")
+    recovered = commands.add_parser(
+        "reconcile", help="verified reopening of a lost host whose readings returned")
+    recovered.add_argument("host")
+    recovered.add_argument("--actor", help="who reconciles (human:<id>) from an unbound terminal")
     status = commands.add_parser("status", help="show durable drain and return progress")
     status.add_argument("host", nargs="?")
     args = parser.parse_args(argv)
@@ -180,16 +222,25 @@ def main(argv=None):
         api = storage.of(db).host_lifecycle
         if args.command == "drain":
             duration = estimates.parse(args.duration) * 60 if args.duration else None
-            result = drain(cfg, db, args.host, duration=duration)
+            # An explicit --actor is authenticated like every other correction:
+            # a bound agent session must not claim a human's name.
+            actor = work.corrector(cfg, db, args.actor) if args.actor else None
+            result = drain(cfg, db, args.host, duration=duration, actor=actor)
         elif args.command == "undrain":
-            result = api.undrain(args.host, actor=work.corrector(cfg, db))
+            result = api.undrain(args.host, actor=work.corrector(cfg, db, args.actor))
             if result is None:
                 raise ValueError("host has no drain request")
+        elif args.command == "reconcile":
+            result = reconcile(cfg, db, args.host,
+                               actor=work.corrector(cfg, db, args.actor))
         else:
             result = [api.get(args.host)] if args.host else api.listing()
         print(json.dumps(result, ensure_ascii=False))
+        if args.command == "reconcile" and not (
+                result.get("reconciled") or result.get("mode") == "available"):
+            return 1
         return 0
-    except (ValueError, db_mod.DbError) as exc:
+    except (ValueError, work.WorkError, db_mod.DbError) as exc:
         print("host request refused: " + str(exc))
         return 1
     finally:

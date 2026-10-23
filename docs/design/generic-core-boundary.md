@@ -1,0 +1,44 @@
+# Generic core boundary
+
+The generic core owns work tracking, communication, governance, resources and
+agent execution. Business modules own their domain vocabulary and behavior.
+Git used for the canon, identity and persona memory remains infrastructure;
+git branches and pull requests as work products belong to development tooling.
+
+`work_lifecycle` centralizes the current persisted lifecycle spellings and the
+compatibility delivery connector. `work` re-exports its public state groups.
+Readers should use these groups rather than repeat storage spellings:
+
+- `ACTIVE`: requested work and work in progress.
+- `WAITING`: blocked work and work waiting for a human decision.
+- `TO_VALIDATE`: work awaiting validation.
+- `DELIVERED`: delivery recorded or promoted.
+- `COMPLETED`: delivered work and explicitly closed work.
+- `TERMINAL`: states without further normal transitions. A recorded delivery
+  can still be promoted, so it is completed without being terminal.
+
+The legacy `closed` state also covers delivery outside the target and completed
+review missions. Its close reason must be checked before treating it as an
+abandonment. Public presentation states, action states, milestone kinds and
+remote issue states have separate contracts; their equal spelling does not
+make them interchangeable with work-item states.
+
+`tests/test_generic_core.py` scans Python literals and identifiers outside
+`modules/`, plus `progress_page.html`. Python docstrings and comments are
+excluded. Run `PYTHONPATH=src python -m tests.test_generic_core --report` to
+print current counts per file and motif. This lexical report is non-blocking;
+concurrent changes to vocabulary do not require updating an exact baseline.
+The scanners and their unit tests remain useful for inspecting the transition.
+
+Only direct imports of module implementations are blocking, including relative
+and aliased imports. The test lists two legacy storage adapter exceptions in
+`mesh_cli.py` and `work.py` until those interfaces use the registry. New imports
+fail, and removing an adapter requires removing its exception from the test.
+The blocking vocabulary boundary will be introduced with L98 through module
+imports and the registry, rather than word counts. Architectural review remains
+necessary.
+
+The boundary check preserves the current runtime behavior. Module activation,
+renamed persisted states, validation as a stored state, extraction of development
+and forge tooling, vocabulary selection and declarative pipelines are subsequent
+parts of the generic-core transition.

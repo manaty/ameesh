@@ -664,6 +664,12 @@ transitions, même si plusieurs étapes ont eu lieu entre deux passages ; elle
 relit les commentaires GitHub pour éviter un second envoi après une panne.
 Les commentaires portent `<!-- ameesh:work-stage:v1 … -->`, que la veille
 GitHub ignore. Ne pas retirer ce marqueur.
+Une annonce de release postée **à la main** sur un ticket (livraison, notes)
+est aussi un commentaire du maillage : elle porte le préfixe
+`<!-- ameesh: -->` écrit dans le corps, car ce geste se fait souvent hors
+d'un tour d'agent et le `gh` généré n'ajoute alors aucun marqueur (#2954,
+annonces 1.17.0/#2166 et 1.17.1/#1997). La projection automatique
+« Delivered in release X » porte déjà le marqueur `work-stage`.
 Ils suivent le ticket miroir sélectionné dans le dépôt du projet, même si
 `issue_ref` conserve la référence d'origine dans un autre dépôt ou outil.
 La reprise commence sur les tickets ouverts (y compris ceux fermés pendant
