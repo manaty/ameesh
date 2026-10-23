@@ -437,6 +437,8 @@ class Agents(interface.Agents):
         return self.db.query(
             """
             SELECT name, (SELECT r.aliases FROM agent_registry r WHERE r.name=o.name) AS aliases,
+                   -- #3185 : projets relus hors équipe (la vue ne porte pas la colonne)
+                   (SELECT r.relit FROM agent_registry r WHERE r.name=o.name) AS relit,
                    chantier, harness, host, cwd, session_id, status, status_text,
                    model, budget_usd, spent_usd, turns, pending_prompt, last_error,
                    lease_owner, lease_epoch, lease_expires_ts, last_seen_ts, last_turn_ts,
