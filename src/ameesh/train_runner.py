@@ -26,6 +26,8 @@ from . import (merge_queue, radar, resolutions, storage, train, train_admissions
 SERVICE_LEASE_KEY = "train-service"
 SERVICE_LEASE_TTL_S = 900.0
 SERVICE_LEASE_RETRY_S = 60.0
+#: L165 (EP5): how often a host without the elected role looks again.
+ROLE_RETRY_S = 60.0
 
 
 class HostLease:
@@ -265,10 +267,15 @@ class Service:
     a failed passage waits for a new event rather than retrying by itself.
     Connections and runtime ports never survive a passage.
     """
-    def __init__(self, cfg, passages, *, stop, report, clock=time.time, lease=None):
+    def __init__(self, cfg, passages, *, stop, report, clock=time.time, lease=None,
+                 role=None):
         self.cfg, self.passages = cfg, tuple(passages)
         self.stop, self.report, self.clock = stop, report, clock
         self.lease = lease
+        #: L165 (EP5): elected role (agent name) whose lease gates the passages;
+        #: None keeps the historical `train.host` pin only.
+        self.role = role
+        self._role_held = None
         self.condition = threading.Condition()
         self.pending = set(range(len(self.passages)))
         self.deadlines = {}
@@ -332,6 +339,42 @@ class Service:
         finally:
             db.close()
 
+    def _role_ready(self) -> bool:
+        """Is this host the live holder of the train's elected role?
+
+        A role that cannot be read is not held: the service waits instead of
+        running on a guess. A passage is only scheduled while the role is
+        held, and losing it releases the service lease so the new holder can
+        take over without waiting for its TTL.
+        """
+        if not self.role:
+            return True
+        from . import role_run
+        from .scoped_db import ScopedDb
+        db = None
+        error = ""
+        try:
+            db = ScopedDb(self.cfg)
+            held = bool(role_run.holder(db, self.role, self.cfg.host))
+        except Exception as exc:  # noqa: BLE001 - a broken read is not a lease
+            held = False
+            error = "%s: %s" % (type(exc).__name__, exc)
+        finally:
+            if db is not None:
+                db.close()
+        with self.condition:
+            if held and self._role_held is not True:
+                self.pending.update(range(len(self.passages)))
+                self.condition.notify_all()
+                self.report("train role %s acquired on %s" % (self.role, self.cfg.host))
+            elif not held and self._role_held is not False:
+                self.report("train role %s not held by %s: passages wait"
+                            % (self.role, self.cfg.host))
+            self._role_held = held
+        if error:
+            self.report("train role %s unreadable (%s)" % (self.role, error))
+        return held
+
     def _lease_ready(self, now=None):
         """Acquire or renew the exclusive service lease; False means wait."""
         if self.lease is None:
@@ -376,6 +419,15 @@ class Service:
     def run(self):
         try:
             while not self.stop.is_set():
+                if not self._role_ready():
+                    if self.lease is not None and self.lease.epoch is not None:
+                        self._release_lease()
+                        self.report("train role lost: service lease released")
+                    with self.condition:
+                        if self.stop.is_set():
+                            return
+                        self.condition.wait(timeout=ROLE_RETRY_S)
+                    continue
                 if not self._lease_ready():
                     with self.condition:
                         if self.stop.is_set():

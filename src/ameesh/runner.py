@@ -8148,6 +8148,7 @@ class Runner:
         take_balance: dict | None = None,
         train_passages=(),
         train_service_lease=None,
+        train_role=None,
         cfg_overrides: dict | None = None,
     ):
         from .host_gate import gate_choice
@@ -8190,6 +8191,8 @@ class Runner:
         self.train_passages = tuple(train_passages)
         # #2446: the exclusive service lease assembled from `train.host`.
         self.train_service_lease = train_service_lease
+        # L165 (EP5): the elected role that gates the train passages, or None.
+        self.train_role = train_role
         self.train_service = None
         self.lease_ttl = cfg.lease_ttl
         #: #2600 : horloge des workers de cet exécuteur (simulée en test).
@@ -10345,7 +10348,8 @@ class Runner:
         from .train_runner import Service
         self.train_service = Service(
             self.cfg, passages, stop=self.stop, report=log_async,
-            lease=getattr(self, "train_service_lease", None))
+            lease=getattr(self, "train_service_lease", None),
+            role=getattr(self, "train_role", None))
         self.train_service.start()
 
     def start_branch_sweep_poll(self) -> None:
@@ -12516,12 +12520,13 @@ def main(argv: list[str] | None = None) -> int:
         # #2446 : assemble the train service from the host configuration
         # before the runner starts. A missing or malformed piece is a named
         # refusal, never a fallback passage; the agent service keeps working.
-        train_passages, train_lease = (), None
+        train_passages, train_lease, train_role = (), None, None
         if not (parsed.once or parsed.dry_run or mediated):
             try:
                 from . import train as train_mod, train_assembly
                 assembly = train_assembly.assemble(cfg, notify=log_async)
                 train_passages, train_lease = assembly.passages, assembly.lease
+                train_role = assembly.role
                 log_async("train service: %s" % assembly.reason)
             except train_mod.TrainError as exc:
                 log_async("train service disabled: %s" % exc)
@@ -12533,6 +12538,7 @@ def main(argv: list[str] | None = None) -> int:
                 take_balance=_take_balance(parsed),
                 train_passages=train_passages,
                 train_service_lease=train_lease,
+                train_role=train_role,
                 cfg_overrides=overrides,
             )
         except db_mod.DbError as exc:

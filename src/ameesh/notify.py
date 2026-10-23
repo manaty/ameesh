@@ -2,7 +2,8 @@
 """Alerts pushed to the responsible human (lot L38, decision 0030 point 4).
 
   ameesh notify [--once] [--dry-run] [--json] [--interval S]
-                [--long-turn S] [--idle-mail S] [--dead-grace S]
+                [--only alerts|take|issues|github-watch|ci] [--long-turn S]
+                [--idle-mail S] [--dead-grace S]
                 [--session-tokens N] [--stale-lot S] [--orphan-lot S]
                 [--take-idle S] [--take-max-per-hour N]
                 [--take-lot-idle S] [--take-lot-max-per-hour N]
@@ -107,6 +108,11 @@ from .platform import notify as platform_notify
 
 NOTIFY_SCHEMA = "ameesh-notify/1"
 STATE_SCHEMA = "ameesh-notify-state/1"
+
+#: L165 (EP5): the mechanical passes a role timer may run alone.
+#: `alerts` owns the delivery state and its lock; `take` observes the alerts
+#: but writes no state; `issues`, `github-watch` and `ci` are independent.
+ONLY_PASSES = ("alerts", "take", "issues", "github-watch", "ci")
 
 #: L38 (0030) : types envoyés par défaut. `delegation_expired` arrive avec L40 :
 #: il est accepté ici sans dépendre de son code (un type absent n'est jamais
@@ -528,6 +534,25 @@ class Message:
     @property
     def text(self) -> str:
         return "%s\n%s" % (self.title, self.body)
+
+
+def _only_set(values) -> frozenset | None:
+    """Validate ``--only``; None means the historical full pass."""
+    if values is None:
+        return None
+    if isinstance(values, str):
+        values = [values]
+    selected = set()
+    for value in values:
+        for part in str(value).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if part not in ONLY_PASSES:
+                raise ValueError("unknown pass %r (known: %s)"
+                                 % (part, ", ".join(ONLY_PASSES)))
+            selected.add(part)
+    return frozenset(selected) if selected else None
 
 
 def _clean(text, limit: int = 300) -> str:
@@ -1167,8 +1192,11 @@ class Notifier:
     def __init__(self, cfg: Config, ncfg: NotifyConfig, state: dict | None = None, *,
                  sender=None, dry_run: bool = False, emit=None, log=None, clock=None,
                  take: dict | None = None, handoff: dict | None = None,
-                 wip: dict | None = None):
+                 wip: dict | None = None, only=None):
         self.cfg, self.ncfg = cfg, ncfg
+        #: L165 (EP5) : passages demandés par une minuterie de rôle ; None =
+        #: le passage complet historique.
+        self.only = _only_set(only)
         #: L119 : réglages de la prise automatique (`backlog.auto_take`) ; None la coupe
         self.take = take
         #: L233b : réglages de la reprise sur pause budget
@@ -1191,11 +1219,14 @@ class Notifier:
 
     # -- passage --------------------------------------------------------------
     def run_pass(self, db, current: list | None = None, thresholds: dict | None = None,
-                 ) -> list:
+                 only=None) -> list:
         from . import alert_ack
         from .mediated_executor import availability
-        observed_ts = storage.of(db).alert_acknowledgements.clock() if db is not None else None
+        selected = self.only if only is None else _only_set(only)
         now = float(self.clock())
+        if selected is not None and "alerts" not in selected:
+            return self._run_tail(db, now, selected)
+        observed_ts = storage.of(db).alert_acknowledgements.clock() if db is not None else None
         #: #1901 : familles qu'une passe n'a pas pu lire du tout (porte d'hôte
         #: au registre illisible) ; une alerte absente d'un relevé incomplet
         #: n'est pas résolue pour autant.
@@ -1378,15 +1409,19 @@ class Notifier:
             if not self._pending(entry):
                 del self.state["resolved"][key]
         self._summaries(now)
-        if self.handoff:
+        take = selected is None or "take" in selected
+        if take and self.handoff:
             self._budget_handoff(db, now)
-        if self.take:
+        if take and self.take:
             self._auto_take(db, current, now)
-        if self.wip:
+        if take and self.wip:
             self._wip_sweep(db, now)
-        self._github_issues(db, now)
-        self._github_inputs(db, now)
-        self._ci_failures(db)
+        if selected is None or "issues" in selected:
+            self._github_issues(db, now)
+        if selected is None or "github-watch" in selected:
+            self._github_inputs(db, now)
+        if selected is None or "ci" in selected:
+            self._ci_failures(db)
         for human in list(self.state["rate"]):
             window = [t for t in self.state["rate"][human] if now - t < RATE_WINDOW_S]
             if window:
@@ -1394,6 +1429,35 @@ class Notifier:
             else:
                 del self.state["rate"][human]
         self._prune_notified(now)
+        return records
+
+    def _run_tail(self, db, now: float, selected) -> list:
+        """The independent mechanical passes, without the alert delivery.
+
+        `--only github-watch`, `--only ci` and `--only issues` are the role
+        timers of EP5: they write no notify state and take no state lock, so
+        two of them may share a host with the alert producer. `--only take`
+        still observes the alerts first, because auto-take uses them.
+        """
+        records: list = []
+        self._records = records
+        if "take" in selected:
+            from . import alert_ack
+            thresholds = alert_ack.default_thresholds()
+            current = exploitation.alerts(self.cfg, db, now=now, local_pool=False,
+                                          **thresholds)
+            if self.handoff:
+                self._budget_handoff(db, now)
+            if self.take:
+                self._auto_take(db, current, now)
+            if self.wip:
+                self._wip_sweep(db, now)
+        if "issues" in selected:
+            self._github_issues(db, now)
+        if "github-watch" in selected:
+            self._github_inputs(db, now)
+        if "ci" in selected:
+            self._ci_failures(db)
         return records
 
     def run_local_pass(self, now: float | None = None) -> list:
@@ -2533,6 +2597,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "AMEESH_NOTIFY_INTERVAL, else 30)")
     parser.add_argument("--test", metavar="human:ID", default=None,
                         help="send a test message on each of this human's channels")
+    parser.add_argument("--only", action="append", metavar="PASS[,PASS]",
+                        default=None,
+                        help="L165: run only these passes (%s; repeatable, "
+                             "comma-separated); requires --once"
+                             % ", ".join(ONLY_PASSES))
     exploitation.add_threshold_arguments(parser)
     # L119 (0037) : prise automatique dans la file d'amélioration
     from . import backlog, handoff
@@ -2670,18 +2739,31 @@ def cmd_test(cfg: Config, ncfg: NotifyConfig, args) -> int:
 
 
 def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
+    try:
+        only = _only_set(getattr(args, "only", None))
+    except ValueError as exc:
+        print("ameesh notify: %s" % exc, file=sys.stderr)
+        return 2
+    if only is not None and not args.once:
+        print("ameesh notify: --only requires --once", file=sys.stderr)
+        return 2
+    #: L165: the alert delivery owns the local state file and its lock. The
+    #: mechanical passes (`issues`, `github-watch`, `ci`) use database state
+    #: only, so a role timer can run them beside the alert producer.
+    alerts_pass = only is None or "alerts" in only
     if not ncfg.configured:
         _stderr_log("no channel configured (`notify` key of the host configuration: "
                     "routes, default): alerts will be logged, not sent")
     path = state_path(cfg)
     lock = None
-    if not args.dry_run:
+    if alerts_pass and not args.dry_run:
         lock = _Lock(path + ".lock")
         if not lock.acquire():
             print("ameesh notify: another `ameesh notify` already holds %s.lock" % path,
                   file=sys.stderr)
             return 1
-    state = load_state(path, log=_stderr_log, move_aside=not args.dry_run)
+    state = (load_state(path, log=_stderr_log, move_aside=not args.dry_run)
+             if alerts_pass else empty_state())
 
     def emit(record):
         if args.json:
@@ -2691,7 +2773,7 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
 
     notifier = Notifier(cfg, ncfg, state, dry_run=args.dry_run, emit=emit,
                         take=take_settings(args), handoff=handoff_settings(args),
-                        wip=wip_settings(args))
+                        wip=wip_settings(args), only=only)
     seuils = exploitation.thresholds(args)
     interval = _interval(args, ncfg)
     db = None
@@ -2700,15 +2782,16 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
             # #532 : la console du pool local se lit depuis `cfg` seule, avant
             # la base — c'est ce qui fait survivre l'alerte au refus qu'elle
             # signale, puisque la base passe par ce même pool.
-            notifier.run_local_pass()
-            if not args.dry_run:
-                save_state(path, notifier.state)
+            if alerts_pass:
+                notifier.run_local_pass()
+                if not args.dry_run:
+                    save_state(path, notifier.state)
             try:
                 if db is None:
                     db = db_mod.connect(cfg)
                     db_mod.require_schema(db)
                 notifier.run_pass(db, thresholds=seuils)
-                if not args.dry_run:
+                if alerts_pass and not args.dry_run:
                     save_state(path, notifier.state)
             except db_mod.SchemaMissing:
                 raise
@@ -2747,6 +2830,9 @@ def main(argv: list | None = None) -> int:
         return cmd_test(cfg, ncfg, args)
     try:
         return cmd_notify(cfg, ncfg, args)
+    except ValueError as exc:
+        print("ameesh notify: %s" % exc, file=sys.stderr)
+        return 2
     except db_mod.SchemaMissing as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 1
