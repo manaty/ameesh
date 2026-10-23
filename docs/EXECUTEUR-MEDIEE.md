@@ -10,7 +10,9 @@ résolution d'alias des agents (#423, version `1.3.0`, compatible : voir
 `1.4.0`, compatible : voir « Contrat 1.4 »), puis par la recherche des
 humains du rang 2 au-delà du préfixe (#286/B13, version `1.5.0`, compatible :
 voir « Contrat 1.5 »), puis par le franchissement d'un préfixe de 200 humains
-actifs retenus (#286/B14, version `1.6.0`, compatible : voir « Contrat 1.6 »).
+actifs retenus (#286/B14, version `1.6.0`, compatible : voir « Contrat 1.6 »),
+puis par l'élection d'un pilote entre hôtes candidats (L165/EP1, version
+`1.8.0`, compatible : voir « Contrat 1.8 »).
 Étude et décision : `docs/design/etudes/executeur-mediee.md`,
 `docs/design/decisions/00xx-executeur-mediee.md`.
 
@@ -23,7 +25,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 72 opérations et la liste des 416 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 72 opérations et la liste des 421 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -71,7 +73,7 @@ Comptes : 72 opérations, dont 29 lectures et 43 écritures. 62 passent par
 lignes de `op` sont marquées `session: true` (contrats 1.1, 1.2, 1.3, 1.5 et
 1.6) : elles sont servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (488
+signature et les mêmes types. Il vérifie aussi que l'interface entière (493
 opérations) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
@@ -449,6 +451,25 @@ réessaie alors sans `inputs` — le tour reste compté, l'attribution est perdu
 et journalisée ; la comptabilité n'est jamais suspendue pour autant. Déployer
 le serveur avant les exécuteurs n'est pas nécessaire, mais le fait donne
 l'attribution dès le premier tour.
+
+## Contrat 1.8 : élection d'un pilote entre hôtes candidats (L165/EP1)
+
+Une fiche Agent peut déclarer `releve: election` et ses `candidats` : le
+bail n'est plus lié à l'hôte de la ligne, et le premier hôte candidat qui
+réclame un bail libre ou expiré le prend (`agent_candidates` porte le
+verdict de placement de chaque hôte, écrit par `canon sync`). Côté médié,
+`leases.claim` gagne un mot-clé facultatif `host`, **forcé à l'hôte de
+l'exécuteur authentifié** : un appelant ne peut pas réclamer pour un autre
+hôte. L'agent doit être admis sur cet hôte (`releve: election` et
+`candidats`, ou `host` de la ligne) ; la réclamation déplace alors la ligne,
+son dossier et son verdict sur cet hôte, et lève la clôture L232e — un rôle
+élu n'a pas de travail local à publier, le bail et son epoch suffisent.
+
+L'ajout est compatible : la version passe à `1.8.0` ; un client 1.7 omet
+`host` (le serveur le force de toute façon), aucune opération n'est retirée
+ni modifiée. Les deux écritures de `canon sync` (`canon.set_election`,
+`canon.write_candidate`) restent refusées à distance, comme le reste du
+canon.
 
 ## Porte d'hôte
 

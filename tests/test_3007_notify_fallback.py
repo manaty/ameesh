@@ -26,7 +26,7 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import actions_cli, alert_briefs, decisions, exploitation, mail, notify, \
+from ameesh import actions_cli, alert_briefs, decisions, exploitation, fil, mail, notify, \
     notify_gap, registry, storage, work
 
 from .support import PgTestCase
@@ -151,6 +151,11 @@ class AlertesTest(PgTestCase):
         super().setUp()
         for name in ("orch", "auditeur"):
             registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
+            # #3036 : un brief ne se dépose que chez un agent qui peut le lire
+            # (bail vivant) ; la porte de #3007 est testée avec des
+            # destinataires vivants, le cas mort étant couvert par #3036.
+            self.assertIsNotNone(
+                registry.claim(self.db, name, "runner-test", 3600))
         self.db.execute("UPDATE agent_registry SET responsible = %s WHERE name = 'orch'",
                         (ALICE,))
         self.lot = work.add(self.db, title="RT-9", assignee="orch")
@@ -238,6 +243,49 @@ class AlertesTest(PgTestCase):
             report = notify_gap.brief_once(self.cfg, self.db, now=now)
         self.assertIn("orch", {entry["recipient"] for entry in report["sent"]})
         self.assertIn("auditeur", {entry["recipient"] for entry in report["sent"]})
+
+    def test_sans_vivant_le_brief_va_au_fil_et_pas_dans_une_boite(self):
+        # B1 dev1/cx1 : #3036 replie sur `thread:bureau` quand plus aucun
+        # destinataire ne lit ; ce n'est pas une boîte d'agent. Le brief doit
+        # aller au fil lisible, sans courrier `recipient=thread:bureau` ni
+        # réclamation comptée sur une remise irréelle.
+        self.ask()
+        now = self.beat(age=3600)
+        for name in ("orch", "auditeur"):
+            self.db.execute(
+                "UPDATE agent_registry SET lease_owner = NULL,"
+                " lease_expires_at = NULL WHERE name = %s", (name,))
+        registry.upsert(self.db, "bureau", harness="claude", host=self.cfg.host)
+        self.db.execute("UPDATE agent_registry SET mode = 'externe'"
+                        " WHERE name = 'bureau'")
+        report = notify_gap.brief_once(self.cfg, self.db, now=now)
+        self.assertEqual([e["recipient"] for e in report["sent"]], ["thread:bureau"])
+        self.assertEqual(
+            self.db.query("SELECT count(*) FROM agent_mailbox"
+                          " WHERE recipient = 'thread:bureau'"), [{"count": 0}])
+        entries = fil.transport_for(self.cfg).read(
+            fil.ThreadRef(self.cfg.project, None))
+        self.assertEqual(len(entries), 1)
+        self.assertIn("no living notifier covers human:alice", entries[-1].text)
+
+    def test_un_hote_ferme_avec_bail_valide_ne_recoit_pas_le_brief(self):
+        # N1 dev1/cx1 : un bail encore valide sur un hôte aux claims fermés ne
+        # prouve pas que l'agent lira ; `closed_hosts` l'écarte et le brief ne
+        # le compte pas prévenu.
+        self.ask()
+        now = self.beat(age=3600)
+        self.db.execute(
+            "INSERT INTO host_lifecycle(host, mode, actor)"
+            " VALUES ('lost-host', 'lost', 'test')"
+            " ON CONFLICT (host) DO UPDATE SET mode = 'lost'")
+        self.db.execute("UPDATE agent_registry SET host = 'lost-host'"
+                        " WHERE name = 'auditeur'")
+        with mock.patch.dict(os.environ,
+                             {"AMEESH_ALERT_ORCHESTRATORS": "orch"}):
+            report = notify_gap.brief_once(self.cfg, self.db, now=now)
+        sent = {e["recipient"] for e in report["sent"]}
+        self.assertIn("orch", sent)
+        self.assertNotIn("auditeur", sent)
 
     def test_un_battement_perime_leve_l_alerte(self):
         view = self.ask()
