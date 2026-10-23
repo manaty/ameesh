@@ -247,6 +247,8 @@ LIVE_REVIEW_START_SLACK_S = 300.0
 MEASURE_CANONS_TTL_S = 300.0
 #: L85 : rétention du journal d'événements, au plus une fois par heure
 EVENTS_PRUNE_EVERY_S = 3600.0
+#: #3070 : levée des portes d'appareil indisponible, au plus toutes les 5 min
+DEVICE_GATES_EVERY_S = 300.0
 #: #2096 : bornes de l'affichage gardé pour un tour de résumé (repli d'un flux
 #: sans `final`). Le plafond en fragments ne borne pas la taille : un flux
 #: bavard gardait des mégaoctets jusqu'au tour suivant. Seule la tête est lue
@@ -8562,6 +8564,9 @@ class Runner:
         #: L85 : dernière rétention du journal d'événements (monotone), son erreur
         self._events_pruned_at: float | None = None
         self._events_prune_error: str | None = None
+        #: #3070 : dernière levée des portes d'appareil (monotone), son erreur
+        self._device_gates_at: float | None = None
+        self._device_gates_error: str | None = None
         #: L159f : porte d'hôte — None sans porte (hôte classique : rien ne
         #: change). Celle de la configuration dès maintenant ; celle d'un hôte
         #: prêteur (fiche Host avec `policy.lend`) au premier `canon sync`,
@@ -9091,6 +9096,45 @@ class Runner:
                              " [dry-run]" if row.get("dry_run") else ""))
         return done
 
+    def lift_device_gates_once(self, now: float | None = None) -> list[dict]:
+        """#3070 (canon §12) : les lots `blocked` dont la seule attente est une
+        séance sur un appareil déclaré indisponible en sortent, avec la trace
+        « qualification physique reportée » et un lot de vérification.
+
+        Au plus toutes les `DEVICE_GATES_EVERY_S` ; ni en dry-run (dit
+        seulement), ni en exécuteur médié. Deux exécuteurs simultanés ne lèvent
+        jamais deux fois un lot (transition gardée par l'état courant, lot de
+        vérification annulé avec elle). Une erreur est dite une fois, jamais
+        fatale à la passe."""
+        from . import device_gates, work as work_mod
+
+        now = time.monotonic() if now is None else now
+        last = getattr(self, "_device_gates_at", None)
+        if getattr(self, "mediated", False) or getattr(self, "db", None) is None or (
+                last is not None and now - last < DEVICE_GATES_EVERY_S):
+            return []
+        self._device_gates_at = now
+        try:
+            done = device_gates.lift(
+                self.db, canons=work_mod.configured_canons(getattr(self, "cfg", None)),
+                actor="%s (runner %s)" % (device_gates.ACTOR, getattr(self, "runner_id", "?")),
+                dry_run=getattr(self, "dry_run", False))
+        except (db_mod.DbError, work_mod.WorkError) as exc:
+            message = "device gates not lifted (%s)" % exc
+            if message != getattr(self, "_device_gates_error", None):
+                log_async(message)
+            self._device_gates_error = message
+            return []
+        self._device_gates_error = None
+        for row in done:
+            if row.get("dry_run"):
+                log_async("device gate: lot #%s would go back to %s [dry-run]"
+                          % (row["lot"], row["state"]))
+            else:
+                log_async("device gate lifted: lot #%s → %s (%s, verification lot #%s)"
+                          % (row["lot"], row["state"], device_gates.TRACE, row["verify"]))
+        return done
+
     def prune_events_once(self, now: float | None = None) -> int | None:
         """L85 : rétention du journal `ameesh_events` (0033 §9), au plus une
         fois par heure et par exécuteur, bornée (`PRUNE_MAX_BATCHES` lots,
@@ -9299,6 +9343,7 @@ class Runner:
         self.report_liveness()
         self.role_evaluation_once()  # L165 (EP2) : score des candidats de l'hôte
         self.expire_delegations_once()
+        self.lift_device_gates_once()
         for row in registry.reap(self.db, self.host):
             log("lease expired: %s (owner %s)" % (row["name"], row.get("lease_owner")))
         self.prune_events_once()   # L85 : après la moisson des baux, bornée
