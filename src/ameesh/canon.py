@@ -772,6 +772,7 @@ class Finding:
     member: str = ""        # membre de la fédération
     agent: str = ""         # agent concerné (une erreur bloque cet agent)
     host: str = ""          # hôte concerné (une erreur bloque ses agents)
+    candidate: str = ""     # L165 : agent élu, sur CET hôte candidat seulement
     untrusted: bool = False  # lu hors source approuvée
     package: str = ""       # fiche WorkPackage concernée (ne bloque aucun agent)
     process: str = ""       # fiche Process concernée (ne bloque aucun agent)
@@ -783,6 +784,8 @@ class Finding:
             out["agent"] = self.agent
         if self.host:
             out["host"] = self.host
+        if self.candidate:
+            out["candidate"] = self.candidate
         if self.package:
             out["package"] = self.package
         if self.process:
@@ -3761,11 +3764,17 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                     # refuse l'agent ne ferme QUE ce candidat ; les autres
                     # hôtes candidats gardent leur propre verdict. Un agent
                     # épinglé, lui, reste bloqué partout par son erreur.
-                    subject = ({"host": name} if agent.releve == "election"
-                               else {"agent": agent.title})
-                    add("placement-policy-violation", ERROR,
-                        "%s on %s: %s" % (agent.title, host.title, reason), f,
-                        **subject)
+                    if agent.releve == "election":
+                        # Un candidat refusé ne ferme que CE candidat : ni
+                        # l'hôte (les agents épinglés y restent réclamables),
+                        # ni les autres hôtes candidats.
+                        add("placement-policy-violation", ERROR,
+                            "%s on %s: %s" % (agent.title, host.title, reason), f,
+                            candidate=agent.title, host=name)
+                    else:
+                        add("placement-policy-violation", ERROR,
+                            "%s on %s: %s" % (agent.title, host.title, reason), f,
+                            agent=agent.title)
                 _check_work_dir(add, agent, host, placement)
     for name, group in by_agent.items():
         if len(group) > 1:
@@ -4017,12 +4026,16 @@ class Blocking:
     global_errors: list[Finding]
     by_agent: dict[str, list[Finding]]
     by_host: dict[str, list[Finding]]
+    #: L165 : erreurs qui ne ferment qu'un couple (agent élu, hôte candidat).
+    by_candidate: dict[tuple[str, str], list[Finding]]
 
     def reasons(self, agent: str, hosts: Iterable[str] = ()) -> list[str]:
         out = ["%s (%s)" % (f.code, f.where()) for f in self.global_errors]
         out += ["%s (%s)" % (f.code, f.where()) for f in self.by_agent.get(agent, [])]
         for host in hosts:
             out += ["%s (%s)" % (f.code, f.where()) for f in self.by_host.get(host, [])]
+            out += ["%s (%s)" % (f.code, f.where())
+                    for f in self.by_candidate.get((agent, host), [])]
         return list(dict.fromkeys(out))
 
 
@@ -4031,11 +4044,13 @@ def blocking(findings: Iterable[Finding]) -> Blocking:
     sont placés ; à une fiche du plan (WorkPackage, L29) ou à une règle de
     travail (Process, #538), aucun agent ; sinon (fédération, frontmatter d'une
     fiche du profil, …) tous."""
-    result = Blocking([], defaultdict(list), defaultdict(list))
+    result = Blocking([], defaultdict(list), defaultdict(list), defaultdict(list))
     for finding in errors(findings):
         if finding.package or finding.process:
             continue
-        if finding.agent:
+        if finding.candidate and finding.host:
+            result.by_candidate[(finding.candidate, finding.host)].append(finding)
+        elif finding.agent:
             result.by_agent[finding.agent].append(finding)
         elif finding.host:
             result.by_host[finding.host].append(finding)

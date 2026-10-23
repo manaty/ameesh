@@ -197,9 +197,12 @@ host of the registry row). With `election`, every host in `candidats` must be
 covered by the same Placement admission. `ameesh canon sync` evaluates and
 stores the placement verdict of each candidate host in `agent_candidates`
 (host policy and visibility included, with its evaluated profile), or refuses
-that candidate without blocking the others. A card-level error (unresolved
-responsible, missing admission, invalid `releve`/`candidats`) closes **every**
-candidate, whichever candidate host read it. Removing the Agent or Placement
+that candidate without blocking the others. A host policy that refuses the
+agent closes only that candidate (`agent_candidates.placement_ok=false`): it
+does not invalidate the host, and a pinned agent of the same host stays
+claimable. A card-level error (unresolved responsible, missing admission,
+invalid `releve`/`candidats`) closes **every** candidate, whichever candidate
+host read it. Removing the Agent or Placement
 card is noticed from any candidate host: the standby verdicts are deleted and
 the holder's own row is stopped on its host, guarded by its lease epoch so a
 concurrent claim is not killed.

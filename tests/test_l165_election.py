@@ -143,17 +143,38 @@ class ElectionSyncTest(test_canon._CanonDbCase):
 
     def test_verdict_refuse_sur_un_candidat(self):
         self.sync("atelier")
+        # banc refuse le modèle non déclaré de relecteur, mais admet ouvrier :
+        # le refus ne doit fermer que le candidat relecteur, pas l'hôte.
         write(self.root, "hotes/banc.md", host_card(
-            "banc", "human:alice", harnesses=["codex"], providers=["openai"],
-            credential_modes=["subscription"], max_agents="2"))
+            "banc", "human:alice", harnesses=["deepseek", "codex"],
+            providers=["deepseek", "openai"], credential_modes=["api-key"],
+            models=["deepseek-chat"], max_agents="2"))
         report = self.sync("banc")
-        self.assertEqual(report.status, canon_sync.CANON_INVALID)
+        self.assertEqual(report.status, canon_sync.CANON_OK)
         self.assertIn("placement-policy-violation", report.diagnostic)
         self.assertIs(self.candidates()["banc"]["placement_ok"], False)
         self.assertNotIn("relecteur", [r["name"] for r in registry.claimable(self.db, "banc")])
         self.assertIsNone(registry.claim(self.db, "relecteur", "runner-banc", 600, host="banc"))
+        # un agent épinglé sur banc, sans lien avec le candidat refusé, reste
+        # réclamable : le verdict de canon de l'hôte reste `ok`.
+        self.assertIn("ouvrier", [r["name"] for r in registry.claimable(self.db, "banc")])
+        self.assertIsNotNone(registry.claim(self.db, "ouvrier", "runner-banc", 600,
+                                            host="banc"))
         # le candidat sain reste réclamable
         self.assertIn("relecteur", [r["name"] for r in registry.claimable(self.db, "atelier")])
+
+    def test_refus_candidat_ne_ferme_pas_un_agent_epingle_de_l_hote(self):
+        self.sync("atelier")
+        write(self.root, "hotes/banc.md", host_card(
+            "banc", "human:alice", harnesses=["deepseek", "codex"],
+            providers=["deepseek", "openai"], credential_modes=["api-key"],
+            models=["deepseek-chat"], max_agents="2"))
+        self.sync("banc")
+        state = self.db.query("SELECT status FROM canon_state WHERE host = 'banc'")[0]
+        self.assertEqual(state["status"], canon_sync.CANON_OK)
+        self.assertIn("ouvrier", [r["name"] for r in registry.claimable(self.db, "banc")])
+        self.assertIsNotNone(registry.claim(self.db, "ouvrier", "runner-banc", 600,
+                                            host="banc"))
 
     def test_profil_divergé_ferme_le_candidat(self):
         self.sync("atelier")
