@@ -44,6 +44,11 @@ def ameesh() -> tuple[Workflow, ...]:
     The full matrix is 8 psycopg parts, 16 psql parts, the macOS platform job
     and the aggregate ``tests`` check; doc-only and version lanes are
     conditional outside this contract.
+
+    #3098: the blobs are also declared by this file at the target's base
+    commit, and that versioned copy is the reference for a packet head. The
+    installed module supplies the paths and jobs; its blobs are only a release
+    snapshot and go stale when a packet re-pins a source as it lands.
     """
     return (Workflow(
         path=".github/workflows/paquet.yml",
@@ -59,6 +64,7 @@ def ameesh() -> tuple[Workflow, ...]:
                  ("scripts/test-parts.py", "2265308c9fed248852bfd9ec41ba8f79266f0647"),
                  ("scripts/ci-flow.py", "ac574bd1f38eb788c70800095efde70bd2b8b751"),
                  ("scripts/map.py", "7a7516683643ff7cd66abf3d50147b25446a03bb")),
+        pins_at="src/ameesh/train_contracts.py",
     ),)
 
 
